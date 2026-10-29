@@ -1103,6 +1103,9 @@ impl ConsortApp {
         t: &Tokens,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        if let Some(hub_card) = approval.card.clone() {
+            return self.render_hub_card(approval, &hub_card, key, t, cx);
+        }
         let c = &t.colors;
         let answered = approval.state == RequestState::Answered;
         let card = div()

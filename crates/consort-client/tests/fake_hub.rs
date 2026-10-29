@@ -113,6 +113,9 @@ struct Hub {
     /// The request type and the body of every group, move and archive
     /// request, in order.
     recorded: Vec<(String, serde_json::Value)>,
+    /// `approval.answer` records the answer and stays connected, as the hub
+    /// does for a hub card.
+    record_answers: bool,
 }
 
 /// What the real hub writes at the end of a cut text.
@@ -642,6 +645,77 @@ async fn session(hub: Shared, mut socket: WebSocket) {
                     h.read_marks.push(mark.last_read_message_id);
                     req.respond_ok(&Empty {}).unwrap()
                 }
+            }
+            "approval.answer" if hub.lock().unwrap().record_answers => {
+                let answer: ApprovalAnswer = req.decode_as().unwrap();
+                let mut h = hub.lock().unwrap();
+                h.recorded.push((req.kind.clone(), req.body.clone()));
+                let mut approval = h.approval.clone().unwrap();
+                approval.status = ApprovalStatus::Allowed;
+                approval.answer_option_id = Some(answer.option_id);
+                h.approval = Some(approval.clone());
+                let event = feed(&mut h, EntityPayload::Approval(approval.clone()));
+                h.outbound.push(event);
+                h.push.notify_one();
+                req.respond_ok(&ApprovalResult { approval }).unwrap()
+            }
+            "channel.set_connection_enabled" => {
+                let body: consort_proto::client_api::ChannelSetConnectionEnabled =
+                    req.decode_as().unwrap();
+                let mut h = hub.lock().unwrap();
+                h.recorded.push((req.kind.clone(), req.body.clone()));
+                let mut channel = h.channel.clone().unwrap();
+                channel
+                    .disabled_connections
+                    .retain(|c| *c != body.connection_id);
+                if !body.enabled {
+                    channel.disabled_connections.push(body.connection_id);
+                }
+                h.channel = Some(channel.clone());
+                req.respond_ok(&consort_proto::client_api::ChannelResult { channel })
+                    .unwrap()
+            }
+            "connection.connect" => {
+                let body: consort_proto::client_api::ConnectionConnect = req.decode_as().unwrap();
+                let mut h = hub.lock().unwrap();
+                h.recorded.push((req.kind.clone(), req.body.clone()));
+                let mut connection = consort_proto::model::Connection {
+                    id: consort_proto::ids::ConnectionId::new(),
+                    name: body.name.clone(),
+                    handle: consort_proto::model::connection_handle(&body.name),
+                    service: body.service.clone(),
+                    service_name: "GitHub".into(),
+                    logo_url: None,
+                    identity: None,
+                    use_in: body.use_in.clone(),
+                    approvals: body.approvals,
+                    status: consort_proto::model::ConnectionStatus::Connecting {
+                        redirect_url: Some("https://connect.composio.dev/link/abc".into()),
+                        expires_at: ts(10_000_000),
+                    },
+                    last_used_at: None,
+                    created_at: ts(1),
+                    updated_at: ts(1),
+                };
+                let attempt = consort_proto::client_api::ConnectAttempt {
+                    connection: connection.clone(),
+                    redirect_url: Some("https://connect.composio.dev/link/abc".into()),
+                    expires_at: Some(ts(10_000_000)),
+                };
+                // The browser sign-in ends a moment later: the feed says so.
+                connection.status = consort_proto::model::ConnectionStatus::Active;
+                connection.identity = Some("chris@work.example".into());
+                connection.updated_at = ts(2);
+                let event = feed(&mut h, EntityPayload::Connection(connection));
+                h.outbound.push(event);
+                h.push.notify_one();
+                req.respond_ok(&attempt).unwrap()
+            }
+            "skill_directory.search" | "skill.preview" | "skill.install" => {
+                req.respond_error(ErrorBody::new(
+                    ErrorCode::Unsupported,
+                    format!("Not built yet: {}.", req.kind),
+                ))
             }
             "approval.answer" if hub.lock().unwrap().answer_conflict => req.respond_error(
                 ErrorBody::new(ErrorCode::Conflict, "This approval was already answered."),
@@ -2719,5 +2793,160 @@ async fn deleting_a_channel_keeps_the_text_of_its_waiting_messages() {
     assert!(
         done.is_ok(),
         "the send call hangs after the channel was deleted"
+    );
+}
+
+/// Step 2: a hub card is answered with `approval.answer` and the hub's
+/// option ID, a channel switch sends `channel.set_connection_enabled`, the
+/// connect flow follows the connection's status from the feed, and the
+/// skill directory shows an `unsupported` hub as such.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn connectors_and_hub_cards_use_their_requests() {
+    use consort_proto::model::{ConnectorCard, DisplayField, ToolKind};
+    let (url, hub) = start_hub().await;
+    {
+        let mut h = hub.lock().unwrap();
+        h.record_answers = true;
+        let approval = h.approval.as_mut().unwrap();
+        let details = ApprovalDetails::Connector(Box::new(ConnectorCard {
+            connection_id: consort_proto::ids::ConnectionId::new(),
+            connection_name: "Gmail Work".into(),
+            service_name: "Gmail".into(),
+            tool: "GMAIL_SEND_EMAIL".into(),
+            tool_kind: ToolKind::Change,
+            fields: vec![DisplayField {
+                label: "To".into(),
+                value: "dana@acme.dev".into(),
+            }],
+            arguments: serde_json::json!({"to": "dana@acme.dev"}),
+        }));
+        approval.options = details.hub_card_options().unwrap();
+        approval.details = details;
+        approval.request_id = consort_proto::model::hub_card_request_id(approval.id);
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let client = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
+    let channel = everything_id(&client);
+    let approval_id = hub
+        .lock()
+        .unwrap()
+        .approval
+        .as_ref()
+        .unwrap()
+        .id
+        .to_string();
+
+    // The card reads as a connector card with the hub's labels.
+    let state = wait_for(&client, "the card", |s| {
+        s.timelines
+            .iter()
+            .flat_map(|t| t.items.iter())
+            .any(|i| matches!(i, TimelineItem::TaskCard(c) if c.approval.is_some()))
+    })
+    .await;
+    let card = state
+        .timelines
+        .iter()
+        .flat_map(|t| t.items.iter())
+        .find_map(|i| match i {
+            TimelineItem::TaskCard(c) => c.approval.clone(),
+            _ => None,
+        })
+        .expect("the approval shows on the task card");
+    assert!(matches!(
+        card.card.as_deref(),
+        Some(consort_client::HubCardView::Connector(_))
+    ));
+    assert_eq!(card.choice_label(ApprovalChoice::AllowOnce), "Allow");
+    assert_eq!(card.choice_label(ApprovalChoice::Deny), "Don't");
+
+    client
+        .answer_approval(approval_id.clone(), ApprovalChoice::AllowOnce)
+        .await
+        .unwrap();
+    let connection_id = consort_proto::ids::ConnectionId::new().to_string();
+    client
+        .run(Command::SetChannelConnectionEnabled {
+            channel_id: channel.clone(),
+            connection_id: connection_id.clone(),
+            enabled: false,
+        })
+        .await
+        .unwrap();
+    let started = client
+        .run_for(Command::Connect(consort_client::NewConnection {
+            service: "github".into(),
+            name: "GitHub Work".into(),
+            use_in: consort_client::UseInView::Tags(vec!["work".into()]),
+            ..consort_client::NewConnection::default()
+        }))
+        .await
+        .unwrap();
+    let consort_client::CommandOutput::ConnectStarted {
+        connection_id: new_id,
+        redirect_url,
+    } = started
+    else {
+        panic!("a connect attempt");
+    };
+    assert_eq!(
+        redirect_url.as_deref(),
+        Some("https://connect.composio.dev/link/abc")
+    );
+    wait_for(&client, "the connection turns active", |s| {
+        s.connection(&new_id).is_some_and(|c| c.status.is_active())
+    })
+    .await;
+
+    let recorded = hub.lock().unwrap().recorded.clone();
+    let kinds: Vec<&str> = recorded.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(
+        kinds,
+        [
+            "approval.answer",
+            "channel.set_connection_enabled",
+            "connection.connect"
+        ]
+    );
+    assert_eq!(recorded[0].1["approval_id"], approval_id.as_str());
+    assert_eq!(recorded[0].1["option_id"], "allow");
+    assert_eq!(recorded[1].1["channel_id"], channel.as_str());
+    assert_eq!(recorded[1].1["connection_id"], connection_id.as_str());
+    assert_eq!(recorded[1].1["enabled"], false);
+    assert_eq!(recorded[2].1["use_in"]["kind"], "tags");
+    assert_eq!(recorded[2].1["approvals"]["change"], "ask_every_time");
+
+    // A hub without the skill pipeline.
+    client
+        .run(Command::SearchSkillDirectory {
+            search: "rust".into(),
+            source: None,
+        })
+        .await
+        .unwrap();
+    let state = wait_for(&client, "the directory answer", |s| {
+        s.skill_directory.load != consort_client::LoadState::NotLoaded
+            && s.skill_directory.load != consort_client::LoadState::Loading
+    })
+    .await;
+    assert_eq!(
+        state.skill_directory.load,
+        consort_client::LoadState::Unsupported(
+            "This hub cannot search skill directories yet. Update the hub, then try again.".into()
+        )
+    );
+    let err = client
+        .run(Command::PreviewSkill {
+            source: consort_client::SkillInstallInput::Git {
+                url: "https://github.com/anthropics/skills".into(),
+                path: None,
+                git_ref: None,
+            },
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "This hub cannot add skills yet. Update the hub, then try again."
     );
 }

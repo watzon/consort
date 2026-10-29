@@ -30,6 +30,7 @@ croner = { workspace = true }
 chrono = { workspace = true }
 chrono-tz = { workspace = true }
 reqwest = { workspace = true }
+aes-gcm = { workspace = true }
 
 [dev-dependencies]
 tokio-tungstenite = { workspace = true }

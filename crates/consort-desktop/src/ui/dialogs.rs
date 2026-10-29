@@ -507,7 +507,42 @@ impl ConsortApp {
     ) -> AnyElement {
         let c = &t.colors;
         let mut lead: Option<AnyElement> = None;
+        let mut ext_parts = match dialog {
+            Dialog::ComposioKey => Some(self.composio_key_dialog(t, window, cx)),
+            Dialog::AddConnector => Some(self.add_connector_dialog(t, window, cx)),
+            Dialog::Connect => Some(self.connect_dialog(t, window, cx)),
+            Dialog::ConfirmDisconnect(id) => Some(self.confirm_disconnect_dialog(id, t, cx)),
+            Dialog::AddSkill => Some(self.add_skill_dialog(t, window, cx)),
+            Dialog::ConfirmRemoveSkill(id) => Some(self.confirm_remove_skill_dialog(id, t, cx)),
+            Dialog::SkillFiles(id) => Some(self.skill_files_dialog(id, t, cx)),
+            Dialog::ChannelExtensions(id) => Some(self.channel_extensions_dialog(id, t, cx)),
+            Dialog::AccountSettings(w, a) => {
+                Some(self.account_settings_dialog(w, a, t, window, cx))
+            }
+            _ => None,
+        };
         let (title, description, width, body, actions) = match dialog {
+            Dialog::ComposioKey
+            | Dialog::AddConnector
+            | Dialog::Connect
+            | Dialog::ConfirmDisconnect(_)
+            | Dialog::AddSkill
+            | Dialog::ConfirmRemoveSkill(_)
+            | Dialog::SkillFiles(_)
+            | Dialog::ChannelExtensions(_)
+            | Dialog::AccountSettings(..) => match ext_parts.take() {
+                Some((title, description, width, body, actions, logo)) => {
+                    lead = logo;
+                    (title, description, width, body, actions)
+                }
+                None => (
+                    String::new(),
+                    String::new(),
+                    t.layout.dialog_width,
+                    div(),
+                    div(),
+                ),
+            },
             Dialog::AddAccount(_) => {
                 let (title, description, width, body, actions, logo) =
                     self.add_account_dialog(t, window, cx);
@@ -939,7 +974,7 @@ impl ConsortApp {
             .into_any_element()
     }
 
-    fn dialog_actions(
+    pub(crate) fn dialog_actions(
         &self,
         label: &str,
         t: &Tokens,
@@ -949,7 +984,7 @@ impl ConsortApp {
         self.dialog_actions_kind(label, ButtonKind::Primary, t, cx, on_confirm)
     }
 
-    fn dialog_actions_kind(
+    pub(crate) fn dialog_actions_kind(
         &self,
         label: &str,
         kind: ButtonKind,

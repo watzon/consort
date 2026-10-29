@@ -84,6 +84,8 @@ pub enum SettingsSection {
     Workers,
     Clients,
     Hub,
+    Connectors,
+    Skills,
     Memory,
     Routines,
 }
@@ -112,6 +114,24 @@ pub enum Dialog {
     ConfirmRemoveAccount(String, String),
     /// The worker tags of a channel.
     ChannelTags(String),
+    /// Change or remove the Composio key.
+    ComposioKey,
+    /// The connector catalog.
+    AddConnector,
+    /// Connect a service. The form is in `ConsortApp::ext.connect`.
+    Connect,
+    /// Disconnect a connection.
+    ConfirmDisconnect(String),
+    /// The skill directories, a git URL or an upload.
+    AddSkill,
+    /// Remove a skill.
+    ConfirmRemoveSkill(String),
+    /// The files of a skill.
+    SkillFiles(String),
+    /// The connectors and skills of a channel.
+    ChannelExtensions(String),
+    /// The settings of an account: the worker ID and the account ID.
+    AccountSettings(String, String),
 }
 
 /// The step of the Add account dialog.
@@ -311,6 +331,15 @@ pub struct ConsortApp {
     /// What Enter does in the open dialog: the confirm button, unless Enter
     /// must not confirm (a destructive dialog, or a box with many lines).
     pub(crate) dialog_confirm: RefCell<Option<DialogConfirm>>,
+    /// Connectors and skills: their dialogs and the cards that wait.
+    pub ext: crate::extensions::ExtState,
+    pub ext_inputs: crate::extensions::ExtInputs,
+    /// A name for the connector name field, set when no window was at hand.
+    pub pending_connection_name: Option<String>,
+    /// Why the Composio key on the Connectors page was refused.
+    pub key_error: Option<String>,
+    /// The connector state changed: the render follows it with a window.
+    ext_stale: bool,
     pub focus: FocusHandle,
     styled_for: Option<(gpui_kit::SharedString, consort_theme::Mode)>,
     _subscriptions: Vec<Subscription>,
@@ -367,6 +396,7 @@ impl ConsortApp {
             tag: field("New tag", window, cx),
             model_search: field("Search every account", window, cx),
         };
+        let ext_inputs = crate::extensions::ExtInputs::new(window, cx);
         let mut subscriptions = Vec::new();
         subscriptions.push(cx.subscribe_in(
             &inputs.composer,
@@ -583,10 +613,17 @@ impl ConsortApp {
             archived_open: false,
             spin_ticker: false,
             dialog_confirm: RefCell::new(None),
+            ext: crate::extensions::ExtState::default(),
+            ext_inputs,
+            pending_connection_name: None,
+            key_error: None,
+            ext_stale: false,
             focus: cx.focus_handle(),
             styled_for: None,
             _subscriptions: subscriptions,
         };
+        let ext_subscriptions = this.subscribe_ext_inputs(window, cx);
+        this._subscriptions.extend(ext_subscriptions);
         this.sync_lists();
         this.update_placeholder(window, cx);
         this.sync_draft_inputs(window, cx);
@@ -649,7 +686,10 @@ impl ConsortApp {
             &self.inputs.api_key,
             &self.inputs.tag,
             &self.inputs.model_search,
-        ] {
+        ]
+        .into_iter()
+        .chain(self.ext_inputs.all())
+        {
             let style = style.clone();
             field.update(cx, |s, cx| {
                 s.set_editor_style(style);
@@ -720,6 +760,8 @@ impl ConsortApp {
         self.report_send_failures(cx);
         self.track_unloaded(cx);
         self.mark_read(cx);
+        self.ext_stale = true;
+        self.follow_extensions(None, cx);
         cx.notify();
     }
 
@@ -1098,6 +1140,66 @@ impl ConsortApp {
             }
             "settings" => self.open_settings(SettingsSection::Appearance, cx),
             "workers" => self.open_settings(SettingsSection::Workers, cx),
+            // Connectors and skills, as the designs show them.
+            "connectors" => self.open_settings(SettingsSection::Connectors, cx),
+            "add-connector" | "connect" => {
+                self.open_settings(SettingsSection::Connectors, cx);
+                let _ = self
+                    .client
+                    .run_blocking(consort_client::Command::SearchConnectorCatalog {
+                        search: String::new(),
+                        category: None,
+                    });
+                if screen == "add-connector" {
+                    self.open_dialog(Dialog::AddConnector, window, cx);
+                } else if let Some(gmail) = self
+                    .client
+                    .state()
+                    .connector_catalog
+                    .services
+                    .iter()
+                    .find(|s| s.slug == "gmail")
+                    .cloned()
+                {
+                    self.state = self.client.state();
+                    self.open_connect(gmail, None, true, window, cx);
+                    self.ext.connect.use_in = consort_client::UseInView::Tags(vec!["work".into()]);
+                    self.ext_inputs
+                        .connect_name
+                        .update(cx, |input, cx| input.set_value("Gmail Work", window, cx));
+                }
+            }
+            "skills" => self.open_settings(SettingsSection::Skills, cx),
+            "add-skill" | "add-skill-unsupported" => {
+                self.open_settings(SettingsSection::Skills, cx);
+                self.open_dialog(Dialog::AddSkill, window, cx);
+                self.ext_inputs
+                    .skill_search
+                    .update(cx, |input, cx| input.set_value("rust", window, cx));
+                self.search_skills(cx);
+            }
+            "connectors-in-channel" | "channel-connectors" => {
+                self.open_channel(consort_client::mock_extensions::ACME.into(), window, cx);
+                if screen == "channel-connectors" {
+                    self.open_dialog(
+                        Dialog::ChannelExtensions(consort_client::mock_extensions::ACME.into()),
+                        window,
+                        cx,
+                    );
+                }
+            }
+            "hub-cards" => {
+                self.open_channel(consort_client::mock_extensions::HIRING.into(), window, cx);
+            }
+            "account-settings" => {
+                self.open_settings(SettingsSection::Workers, cx);
+                self.settings_worker = Some("wrk_bigboi".into());
+                self.open_dialog(
+                    Dialog::AccountSettings("wrk_bigboi".into(), "acc_bigboi_claude".into()),
+                    window,
+                    cx,
+                );
+            }
             // The Add account dialog on bigboi: the provider step, the name
             // step with a name used on other workers, and the Claude sign-in
             // that waits for its code.
@@ -1571,6 +1673,12 @@ impl ConsortApp {
         if section == SettingsSection::Workers {
             self.load_registry_for_logos(cx);
         }
+        if section == SettingsSection::Connectors {
+            self.enter_connectors(cx);
+        }
+        if section == SettingsSection::Skills {
+            self.enter_skills(cx);
+        }
         if self.settings_worker.is_none() {
             self.settings_worker = self
                 .state
@@ -1732,7 +1840,75 @@ impl ConsortApp {
             Dialog::ConfirmDeleteChannel(_)
             | Dialog::ConfirmRemoveWorker(_)
             | Dialog::ConfirmRemoveAccount(..)
-            | Dialog::ConfirmOpenLink(_) => {}
+            | Dialog::ConfirmOpenLink(_)
+            | Dialog::Connect
+            | Dialog::ConfirmDisconnect(_)
+            | Dialog::ConfirmRemoveSkill(_)
+            | Dialog::SkillFiles(_)
+            | Dialog::ChannelExtensions(_) => {}
+            Dialog::ComposioKey => {
+                let input = self.ext_inputs.composio_key.clone();
+                input.update(cx, |input, cx| {
+                    input.set_value("", window, cx);
+                    input.focus(window, cx);
+                });
+            }
+            Dialog::AddConnector => {
+                let input = self.ext_inputs.catalog_search.clone();
+                input.update(cx, |input, cx| {
+                    input.set_value("", window, cx);
+                    input.focus(window, cx);
+                });
+                let client = self.client.clone();
+                self.spawn_command(cx, async move {
+                    client
+                        .run(consort_client::Command::LoadConnectorCategories)
+                        .await?;
+                    client
+                        .run(consort_client::Command::SearchConnectorCatalog {
+                            search: String::new(),
+                            category: None,
+                        })
+                        .await
+                });
+            }
+            Dialog::AddSkill => {
+                self.ext.add_skill = crate::extensions::AddSkillForm {
+                    use_in: crate::extensions::default_use_in(&self.state, &self.channel_id),
+                    ..Default::default()
+                };
+                for input in [
+                    &self.ext_inputs.skill_search,
+                    &self.ext_inputs.git_url,
+                    &self.ext_inputs.git_path,
+                ] {
+                    input.update(cx, |input, cx| input.set_value("", window, cx));
+                }
+                let search = self.ext_inputs.skill_search.clone();
+                search.update(cx, |input, cx| input.focus(window, cx));
+                let client = self.client.clone();
+                self.spawn_command(cx, async move {
+                    client
+                        .run(consort_client::Command::LoadSkillDirectorySources)
+                        .await?;
+                    client
+                        .run(consort_client::Command::SearchSkillDirectory {
+                            search: String::new(),
+                            source: None,
+                        })
+                        .await
+                });
+            }
+            Dialog::AccountSettings(worker_id, account_id) => {
+                self.ext.extras_list_open = false;
+                let name = self
+                    .state
+                    .worker(worker_id)
+                    .and_then(|w| w.account(account_id))
+                    .map(|a| a.label.clone())
+                    .unwrap_or_default();
+                self.set_field(Field::Name, &name, window, cx);
+            }
         }
         self.dialog = Some(dialog);
         cx.notify();
@@ -2269,6 +2445,57 @@ impl ConsortApp {
                 window,
                 cx,
             ),
+            MenuAction::ChannelExtensions(id) => {
+                self.open_dialog(Dialog::ChannelExtensions(id), window, cx)
+            }
+            MenuAction::ReconnectConnection(id) => self.reconnect(id, window, cx),
+            MenuAction::Disconnect(id) => {
+                self.open_dialog(Dialog::ConfirmDisconnect(id), window, cx)
+            }
+            MenuAction::SetRule(target, kind, rule) => match target {
+                Some(id) => {
+                    let approvals = self
+                        .state
+                        .connection(&id)
+                        .map(|c| c.approvals.with(kind, rule));
+                    if let Some(approvals) = approvals {
+                        self.update_connection(
+                            id,
+                            consort_client::ConnectionChanges {
+                                approvals: Some(approvals),
+                                ..Default::default()
+                            },
+                            cx,
+                        );
+                    }
+                }
+                None => self.ext.connect.approvals = self.ext.connect.approvals.with(kind, rule),
+            },
+            MenuAction::ToggleScopeTag(target, tag) => {
+                let use_in = crate::extensions::toggle_tag(&self.use_in_of(&target), &tag);
+                self.set_use_in(target, use_in, cx);
+            }
+            MenuAction::SetSkillEnabled(id, enabled) => self.update_skill(
+                id,
+                consort_client::SkillChanges {
+                    enabled: Some(enabled),
+                    ..Default::default()
+                },
+                cx,
+            ),
+            MenuAction::SkillFiles(id) => self.open_skill_files(id, window, cx),
+            MenuAction::RemoveSkill(id) => {
+                self.open_dialog(Dialog::ConfirmRemoveSkill(id), window, cx)
+            }
+            MenuAction::AccountSettings(worker_id, account_id) => {
+                self.open_dialog(Dialog::AccountSettings(worker_id, account_id), window, cx)
+            }
+            MenuAction::RemoveComposioKey => {
+                self.spawn_command(cx, async move {
+                    client.run(consort_client::Command::RemoveComposioKey).await
+                });
+                self.close_dialog(window, cx);
+            }
             MenuAction::TextEdit(target, op) => self.text_edit(target, op, window, cx),
             MenuAction::Select(id, option) => self.pick_select(id, &option, window, cx),
         }
@@ -2504,6 +2731,10 @@ impl Render for ConsortApp {
         if self.placeholder_stale {
             self.placeholder_stale = false;
             self.update_placeholder(window, cx);
+        }
+        if self.ext_stale {
+            self.ext_stale = false;
+            self.follow_extensions(Some(window), cx);
         }
         let body = match self.page {
             Page::Onboarding => self.render_onboarding(&t, window, cx),

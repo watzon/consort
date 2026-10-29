@@ -57,6 +57,27 @@ pub enum MenuAction {
     RemoveAccount(String, String),
     PauseWorker(String, bool),
     RemoveWorker(String),
+    /// The Connectors and skills dialog of a channel.
+    ChannelExtensions(String),
+    /// Sign a connection in again.
+    ReconnectConnection(String),
+    /// Ask before a connection is disconnected.
+    Disconnect(String),
+    /// An approval rule: of a connection, or of the Connect dialog with
+    /// `None`.
+    SetRule(
+        Option<String>,
+        consort_client::ToolKindView,
+        consort_client::ApprovalRuleView,
+    ),
+    /// Add a tag to a Use in, or take it away.
+    ToggleScopeTag(crate::extensions::UseInTarget, String),
+    SetSkillEnabled(String, bool),
+    SkillFiles(String),
+    RemoveSkill(String),
+    /// The worker ID and the account ID.
+    AccountSettings(String, String),
+    RemoveComposioKey,
     /// Cut, Copy, Paste or Select all in one of the message boxes.
     TextEdit(TextTarget, EditOp),
     /// Pick the option with the stable ID `option` in the select `id`. The ID
@@ -100,15 +121,18 @@ pub fn worker_menu(worker_id: &str, paused: bool) -> Vec<MenuItem> {
     ]
 }
 
-/// The menu of an account row in Settings > Workers: Rename, Sign out and
-/// Remove. Sign out is there only for an account that is signed in or has a
+/// The menu of an account row in Settings > Workers: Account settings,
+/// Rename, Sign out and Remove. Sign out is there only for an account that is signed in or has a
 /// saved key.
 pub fn account_menu(worker_id: &str, account_id: &str, can_sign_out: bool) -> Vec<MenuItem> {
     let (w, a) = (worker_id.to_owned(), account_id.to_owned());
-    let mut items = vec![MenuItem::new(
-        "Rename",
-        MenuAction::RenameAccount(w.clone(), a.clone()),
-    )];
+    let mut items = vec![
+        MenuItem::new(
+            "Account settings",
+            MenuAction::AccountSettings(w.clone(), a.clone()),
+        ),
+        MenuItem::new("Rename", MenuAction::RenameAccount(w.clone(), a.clone())),
+    ];
     if can_sign_out {
         items.push(MenuItem::new(
             "Sign out",
@@ -124,7 +148,7 @@ pub fn account_menu(worker_id: &str, account_id: &str, can_sign_out: bool) -> Ve
 }
 
 /// The menu of a channel row: Rename, Instructions, Model, Worker tags,
-/// Change icon, Move to group, Archive and Delete.
+/// Connectors and skills, Change icon, Move to group, Archive and Delete.
 pub fn channel_menu(channel_id: &str) -> Vec<MenuItem> {
     let id = channel_id.to_owned();
     vec![
@@ -132,6 +156,10 @@ pub fn channel_menu(channel_id: &str) -> Vec<MenuItem> {
         MenuItem::new("Instructions", MenuAction::ChannelInstructions(id.clone())),
         MenuItem::new("Model", MenuAction::ChannelModel(id.clone())),
         MenuItem::new("Worker tags", MenuAction::ChannelTags(id.clone())),
+        MenuItem::new(
+            "Connectors and skills",
+            MenuAction::ChannelExtensions(id.clone()),
+        ),
         MenuItem::new("Change icon", MenuAction::ChangeIcon(id.clone())),
         MenuItem::new("Move to group", MenuAction::MoveToGroup(id.clone())),
         MenuItem::new("Archive", MenuAction::ArchiveChannel(id.clone())).separated(),
@@ -433,6 +461,35 @@ pub fn floating<V: 'static>(
 #[allow(dead_code)]
 fn _app(_: &App) {}
 
+/// The menu of a connection row in Settings > Connectors: Reconnect, Copy
+/// handle and Disconnect.
+pub fn connection_menu(connection_id: &str, handle: &str) -> Vec<MenuItem> {
+    let id = connection_id.to_owned();
+    vec![
+        MenuItem::new("Reconnect", MenuAction::ReconnectConnection(id.clone())),
+        MenuItem::new("Copy handle", MenuAction::Copy(handle.to_owned())),
+        MenuItem::new("Disconnect", MenuAction::Disconnect(id))
+            .danger()
+            .separated(),
+    ]
+}
+
+/// The menu of a skill row in Settings > Skills: Turn off (Turn on when it
+/// is off), View files and Remove.
+pub fn skill_menu(skill_id: &str, enabled: bool) -> Vec<MenuItem> {
+    let id = skill_id.to_owned();
+    vec![
+        MenuItem::new(
+            if enabled { "Turn off" } else { "Turn on" },
+            MenuAction::SetSkillEnabled(id.clone(), !enabled),
+        ),
+        MenuItem::new("View files", MenuAction::SkillFiles(id.clone())),
+        MenuItem::new("Remove", MenuAction::RemoveSkill(id))
+            .danger()
+            .separated(),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -488,6 +545,7 @@ mod tests {
                 "Instructions",
                 "Model",
                 "Worker tags",
+                "Connectors and skills",
                 "Change icon",
                 "Move to group",
                 "Archive",
@@ -503,16 +561,35 @@ mod tests {
     #[test]
     fn the_account_menu_keeps_the_names_and_the_order() {
         let signed_in = account_menu("wrk_1", "acc_1", true);
-        assert_eq!(labels(&signed_in), ["Rename", "Sign out", "Remove"]);
-        assert!(signed_in[2].danger && signed_in[2].separator_before);
         assert_eq!(
-            signed_in[1].action,
+            labels(&signed_in),
+            ["Account settings", "Rename", "Sign out", "Remove"]
+        );
+        assert!(signed_in[3].danger && signed_in[3].separator_before);
+        assert_eq!(
+            signed_in[2].action,
             MenuAction::SignOutAccount("wrk_1".into(), "acc_1".into())
         );
         assert_eq!(
             labels(&account_menu("wrk_1", "acc_1", false)),
-            ["Rename", "Remove"]
+            ["Account settings", "Rename", "Remove"]
         );
+    }
+
+    #[test]
+    fn the_connection_and_skill_menus_keep_the_names_and_the_order() {
+        let connection = connection_menu("con_1", "gmail_work");
+        assert_eq!(
+            labels(&connection),
+            ["Reconnect", "Copy handle", "Disconnect"]
+        );
+        assert_eq!(connection[1].action, MenuAction::Copy("gmail_work".into()));
+        assert!(connection[2].danger && connection[2].separator_before);
+        assert_eq!(
+            labels(&skill_menu("skl_1", true)),
+            ["Turn off", "View files", "Remove"]
+        );
+        assert_eq!(labels(&skill_menu("skl_1", false))[0], "Turn on");
     }
 
     #[test]

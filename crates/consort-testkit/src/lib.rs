@@ -632,6 +632,8 @@ mod tests {
             system_prompt_append: String::new(),
             mcp_servers: vec![],
             env: BTreeMap::new(),
+            extras_enabled: true,
+            skills: None,
             resume: None,
             process_watcher: None,
         }

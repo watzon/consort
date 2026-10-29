@@ -12,8 +12,8 @@ use consort_proto::error::{ErrorBody, ErrorCode};
 use consort_proto::frame::{Frame, FrameId, RequestFrame, SUPPORTED_PROTOCOL_VERSIONS};
 use consort_proto::ids::{AccountId, SessionId, SignInId, WorkerId};
 use consort_proto::model::{
-    AuthState, Capabilities, HarnessAccount, Inventory, LocalMcpServerInfo, Os, SessionState,
-    WorkerLoad,
+    AuthState, Capabilities, HarnessAccount, Inventory, LocalMcpServerInfo, Os, ProviderExtras,
+    SessionState, WorkerLoad,
 };
 use consort_proto::time::Timestamp;
 use consort_proto::worker_link::{HubToWorker, SessionEvent, SessionEvents};
@@ -214,6 +214,9 @@ pub(crate) fn kill_stale_groups(store: &Store) {
 /// the hub sends it again. The worker does not resume such a session: it
 /// leaves it for that start.
 pub(crate) fn restore_sessions(core: &Arc<Core>) -> Result<usize, WorkerError> {
+    // Skill folders of sessions that ended while the worker was down. A
+    // session that resumes writes its folder again from the cache.
+    crate::skills::sweep(&core.config_dir, &core.consort_home);
     let mut count = 0;
     for record in core.store.open_sessions()? {
         if record.state == SessionState::Starting && record.native_ref.is_none() {
@@ -742,6 +745,17 @@ impl Core {
         self.send_inventory(false);
     }
 
+    /// What the account brings from the provider's side, from folder names
+    /// in its profile folder (see `consort_harness::extras`).
+    fn provider_extras(&self, account: &AccountConfig) -> Option<ProviderExtras> {
+        let mut view = account.clone();
+        if account.profile {
+            view.runtime.env =
+                crate::profile::profile_env(account.harness, &self.profile_dir(account));
+        }
+        consort_harness::extras::report(&view)
+    }
+
     pub fn inventory(&self) -> Inventory {
         let config = self.config_snapshot();
         let statuses = lock(&self.statuses).clone();
@@ -788,10 +802,8 @@ impl Core {
                     plan: status.and_then(|s| s.plan.clone()),
                     secret_names: self.secret_names(account),
                     sign_in_methods: crate::accounts::sign_in_methods(account, status),
-                    // The extras toggle is not built yet: every account runs with its
-                    // provider extras, as before.
-                    extras_enabled: true,
-                    extras: None,
+                    extras_enabled: self.store.extras_enabled(account.id).unwrap_or(true),
+                    extras: self.provider_extras(account),
                 }
             })
             .collect();

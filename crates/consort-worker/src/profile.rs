@@ -122,6 +122,14 @@ pub fn profile_env(kind: HarnessKind, dir: &Path) -> BTreeMap<String, String> {
             env.insert("GEMINI_CLI_HOME".to_owned(), text(dir.join("gemini")));
         }
         HarnessKind::OpenCode => {
+            // OpenCode reads `~/.claude/skills`, `~/.agents/skills` and
+            // `~/.claude/CLAUDE.md` from the home folder. A home folder
+            // inside the profile keeps them out. `tool_path_pins` keeps the
+            // tools of the user where they are.
+            let home = text(dir.join(PROFILE_HOME_DIR));
+            #[cfg(windows)]
+            env.insert("USERPROFILE".to_owned(), home.clone());
+            env.insert("HOME".to_owned(), home);
             let xdg = dir.join("xdg");
             for (key, sub) in [
                 ("XDG_DATA_HOME", "data"),
@@ -136,6 +144,45 @@ pub fn profile_env(kind: HarnessKind, dir: &Path) -> BTreeMap<String, String> {
         HarnessKind::Pi | HarnessKind::Acp => {}
     }
     env
+}
+
+/// The folder in a profile that is the `HOME` of an OpenCode account. It
+/// holds nothing that Consort reads.
+pub const PROFILE_HOME_DIR: &str = "home";
+
+/// The variables that keep the user's own tools where they are, when an
+/// account runs with another `HOME`. Each entry is a variable, the path in
+/// the real home that it names, and whether the path is a file. A variable
+/// is set only when the path exists and the variable is not set already, so
+/// a tool that the user does not have gets no variable.
+const TOOL_PATHS: &[(&str, &str, bool)] = &[
+    // git reads `~/.gitconfig`.
+    ("GIT_CONFIG_GLOBAL", ".gitconfig", true),
+    // gpg signs commits with the keys in `~/.gnupg`.
+    ("GNUPGHOME", ".gnupg", false),
+    ("CARGO_HOME", ".cargo", false),
+    ("RUSTUP_HOME", ".rustup", false),
+    ("BUN_INSTALL", ".bun", false),
+    ("npm_config_cache", ".npm", false),
+];
+
+/// The environment variables that point the tools in `real_home` at their
+/// real places. `is_set` tells whether a variable has a value already, in
+/// the worker's environment, so the worker never overrides the user.
+pub fn tool_path_pins(real_home: &Path, is_set: &dyn Fn(&str) -> bool) -> BTreeMap<String, String> {
+    TOOL_PATHS
+        .iter()
+        .filter_map(|(name, rel, is_file)| {
+            let path = real_home.join(rel);
+            let exists = if *is_file {
+                path.is_file()
+            } else {
+                path.is_dir()
+            };
+            (exists && !is_set(name))
+                .then(|| ((*name).to_owned(), path.to_string_lossy().into_owned()))
+        })
+        .collect()
 }
 
 /// The top-level `config.toml` line that keeps the Codex login in a file in
@@ -362,12 +409,65 @@ mod tests {
             dir.join("gemini").to_string_lossy()
         );
         let opencode = profile_env(HarnessKind::OpenCode, dir);
-        assert_eq!(opencode.len(), 4);
+        assert_eq!(opencode.len(), 5 + usize::from(cfg!(windows)));
+        assert_eq!(opencode["HOME"], dir.join("home").to_string_lossy());
         assert_eq!(
             opencode["XDG_STATE_HOME"],
             dir.join("xdg").join("state").to_string_lossy()
         );
         assert!(profile_env(HarnessKind::Acp, dir).is_empty());
+    }
+
+    #[test]
+    fn opencode_runs_with_a_home_inside_the_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("opencode-profile");
+        prepare_profile(HarnessKind::OpenCode, &profile).unwrap();
+        let env = profile_env(HarnessKind::OpenCode, &profile);
+        let home = std::path::PathBuf::from(&env["HOME"]);
+        assert_eq!(home, profile.join("home"));
+        assert!(home.is_dir(), "the worker makes the home folder");
+        // `~/.claude/skills` and `~/.agents/skills` are not in it.
+        assert!(!home.join(".claude").exists() && !home.join(".agents").exists());
+        // The other harnesses keep their home.
+        for kind in [
+            HarnessKind::ClaudeCode,
+            HarnessKind::Codex,
+            HarnessKind::GeminiCli,
+            HarnessKind::Acp,
+        ] {
+            assert!(!profile_env(kind, &profile).contains_key("HOME"), "{kind}");
+        }
+    }
+
+    #[test]
+    fn tools_of_the_user_keep_their_real_places() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path();
+        std::fs::write(real.join(".gitconfig"), "[user]\n").unwrap();
+        std::fs::create_dir_all(real.join(".cargo")).unwrap();
+        std::fs::create_dir_all(real.join(".gnupg")).unwrap();
+        // A folder with the name of a file entry does not count, and a tool
+        // that the user does not have gets no variable.
+        std::fs::create_dir_all(real.join(".npm")).unwrap();
+        let pins = tool_path_pins(real, &|name| name == "npm_config_cache");
+        assert_eq!(
+            pins["GIT_CONFIG_GLOBAL"],
+            real.join(".gitconfig").to_string_lossy()
+        );
+        assert_eq!(pins["CARGO_HOME"], real.join(".cargo").to_string_lossy());
+        assert_eq!(pins["GNUPGHOME"], real.join(".gnupg").to_string_lossy());
+        assert!(!pins.contains_key("RUSTUP_HOME"), "{pins:?}");
+        assert!(!pins.contains_key("BUN_INSTALL"), "{pins:?}");
+        assert!(
+            !pins.contains_key("npm_config_cache"),
+            "a variable that the user set stays: {pins:?}"
+        );
+        // The pins never name the folders of the harnesses.
+        assert!(
+            pins.values()
+                .all(|v| !v.contains(".claude") && !v.contains(".agents"))
+        );
     }
 
     #[test]

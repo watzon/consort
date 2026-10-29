@@ -36,6 +36,8 @@ fn spec(dir: &std::path::Path, mode: ApprovalMode) -> SessionSpec {
         system_prompt_append: "You are a smoke test. Keep answers short.".into(),
         mcp_servers: Vec::new(),
         env: BTreeMap::new(),
+        extras_enabled: true,
+        skills: None,
         resume: None,
         process_watcher: None,
     }

@@ -48,6 +48,19 @@ pub struct ViewState {
     /// stays until the user dismisses it with
     /// [`crate::Command::DismissSendFailure`].
     pub send_failures: Vec<SendFailureView>,
+    /// The connected accounts of Composio services, oldest first.
+    pub connections: Vec<crate::connectors::ConnectionView>,
+    /// The installed skills, oldest first.
+    pub skills: Vec<crate::skills::SkillView>,
+    /// The Composio key and plan. The client loads it with
+    /// [`crate::Command::LoadComposioStatus`].
+    pub composio: crate::connectors::ComposioView,
+    /// The connector catalog of the Add connector dialog.
+    pub connector_catalog: crate::connectors::CatalogView,
+    /// The tools of the services that the client loaded.
+    pub service_tools: Vec<crate::connectors::ServiceToolsView>,
+    /// The skill directory search of the Add skill dialog.
+    pub skill_directory: crate::skills::SkillDirectoryView,
 }
 
 /// A message that the hub refused after it left the composer.
@@ -107,6 +120,19 @@ impl ViewState {
 
     pub fn worker(&self, id: &str) -> Option<&WorkerView> {
         self.workers.iter().find(|w| w.id == id)
+    }
+
+    pub fn connection(&self, id: &str) -> Option<&crate::connectors::ConnectionView> {
+        self.connections.iter().find(|c| c.id == id)
+    }
+
+    pub fn skill(&self, id: &str) -> Option<&crate::skills::SkillView> {
+        self.skills.iter().find(|s| s.id == id)
+    }
+
+    /// The tools of a service, once loaded.
+    pub fn tools_of(&self, service: &str) -> Option<&crate::connectors::ServiceToolsView> {
+        self.service_tools.iter().find(|t| t.service == service)
     }
 
     pub fn sign_in(&self, id: &str) -> Option<&SignInView> {
@@ -507,6 +533,11 @@ pub struct ChannelView {
     /// The worker tags that the channel requires: all work in it runs only
     /// on workers that have every one of them.
     pub tags: Vec<String>,
+    /// The connections that the channel turned off, though their Use in
+    /// gives them to it.
+    pub disabled_connections: Vec<String>,
+    /// The skills that the channel turned off.
+    pub disabled_skills: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -722,6 +753,12 @@ pub struct ApprovalView {
     /// is the harness's, and it can be wider than this task, so the button
     /// shows these words and not our own.
     pub allow_always_label: Option<String>,
+    /// The facts of a card that the hub made itself. `None` for an approval
+    /// from a harness.
+    pub card: Option<Box<crate::connectors::HubCardView>>,
+    /// The hub's words for the buttons of a hub card, such as "Continue in
+    /// browser" and "Not now".
+    pub button_labels: Vec<(ApprovalChoice, String)>,
 }
 
 impl ApprovalView {
@@ -730,6 +767,9 @@ impl ApprovalView {
     /// harness gave no words, it is "Allow for this task", or "Always allow"
     /// when the coordinator asks, because the first reads wrong there.
     pub fn choice_label(&self, choice: ApprovalChoice) -> String {
+        if let Some((_, label)) = self.button_labels.iter().find(|(c, _)| *c == choice) {
+            return label.clone();
+        }
         if choice == ApprovalChoice::AllowForTask {
             if let Some(label) = self
                 .allow_always_label
@@ -1134,6 +1174,11 @@ pub struct HarnessAccountView {
     pub secret_names: Vec<String>,
     /// Who is signed in, when the harness tells.
     pub email: Option<String>,
+    /// The worker starts the harness with the account's provider extras.
+    pub extras_enabled: bool,
+    /// What the account brings from the provider's side, when the worker
+    /// can tell.
+    pub extras: Option<crate::connectors::ProviderExtrasView>,
 }
 
 /// Where a managed tool is on a worker.

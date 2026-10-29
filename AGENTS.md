@@ -49,7 +49,10 @@ These come from the user's experience with GPUI. Follow them in every view.
    - A message: Copy text, Copy as Markdown, Reply in thread, Quote in reply. Your own message also has Edit and Delete.
    - A code or command block: Copy code.
    - A task card or task row: Open thread, Resolve (Ready for review only) or Not done (resolved only), Retry (failed only), Stop (working only), Archive (failed or resolved only), Copy task ID.
-   - A channel row: Rename, Instructions, Model, Worker tags, Change icon, Move to group, Archive, Delete.
+   - A channel row: Rename, Instructions, Model, Worker tags, Connectors and skills, Change icon, Move to group, Archive, Delete.
+   - A connection row (Settings > Connectors): Reconnect, Copy handle, Disconnect.
+   - A skill row (Settings > Skills): Turn off (Turn on when it is off), View files, Remove.
+   - An account row (Settings > Workers): Account settings, Rename, Sign out, Remove.
    - A worker row: Rename, Edit tags, Pause, Remove.
    - The composer: Cut, Copy, Paste, Select all.
 3. **The chat never has a hard edge.** The top and bottom of the timeline fade into the canvas, so text never stops at a sharp line. GPUI has no blur filter for elements, so use layered gradients from the canvas color to transparent (about 24 px at the top and 32 px above the composer).

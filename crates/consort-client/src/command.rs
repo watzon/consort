@@ -5,6 +5,8 @@ use std::fmt;
 
 pub use consort_proto::model::SecretEnv;
 
+use crate::connectors::{AuthKind, ConnectionCallsView, ToolApprovalsView, UseInView};
+use crate::skills::{SkillFileContentView, SkillFileView, SkillInstallInput, SkillPreviewView};
 use crate::view::{ApprovalChoice, Isolation, SelectionView, SignInChoice};
 
 /// A secret text, such as a sign-in code. `Debug` never shows it.
@@ -47,6 +49,58 @@ pub enum CommandOutput {
     AccountCreated(String),
     /// `sign_in.start` started a sign-in with this ID.
     SignInStarted(String),
+    /// `connection.connect` or `connection.reconnect` started a connect
+    /// attempt. The connection's status follows it in the view state.
+    ConnectStarted {
+        connection_id: String,
+        /// The sign-in page to open in the system browser. `None` for a
+        /// scheme with no browser step.
+        redirect_url: Option<String>,
+    },
+    /// What a skill install would bring.
+    SkillPreview(SkillPreviewView),
+    /// `skill.install` installed a skill with this ID.
+    SkillInstalled(String),
+    /// The files of a skill.
+    SkillFiles(Vec<SkillFileView>),
+    /// The text of one file of a skill.
+    SkillFile(SkillFileContentView),
+    /// A page of the audit log of a connection.
+    ConnectionCalls(ConnectionCallsView),
+}
+
+/// The fields of a new connection, from the Connect dialog.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct NewConnection {
+    /// The Composio toolkit slug.
+    pub service: String,
+    pub name: String,
+    pub use_in: UseInView,
+    pub approvals: ToolApprovalsView,
+    /// The scheme to sign in with. `None` lets the hub choose.
+    pub auth_scheme: Option<AuthKind>,
+    /// The values of the credential form, for a scheme with no browser
+    /// step. They go to the hub and on to Composio. `Debug` never shows them.
+    pub credentials: SecretEnv,
+    /// The connect card that this connect answers.
+    pub approval_id: Option<String>,
+}
+
+/// Changes to a connection. A `None` field stays as it is.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ConnectionChanges {
+    pub name: Option<String>,
+    pub use_in: Option<UseInView>,
+    pub approvals: Option<ToolApprovalsView>,
+}
+
+/// Changes to a skill. A `None` field stays as it is.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SkillChanges {
+    pub enabled: Option<bool>,
+    pub use_in: Option<UseInView>,
+    /// Move the pin to the new version that waits for review.
+    pub accept_new_version: bool,
 }
 
 /// The fields of a new channel, from the New channel dialog.
@@ -258,6 +312,112 @@ pub enum Command {
     /// Loads the ACP registry, and the icons of its agents. It does nothing
     /// while a load runs or after a load that worked.
     LoadAcpRegistry,
+    /// Turns the provider extras of an account on or off.
+    SetAccountExtras {
+        worker_id: String,
+        account_id: String,
+        enabled: bool,
+    },
+    // Connectors.
+    /// Asks the hub for the state of the Composio key and the plan.
+    LoadComposioStatus,
+    /// Saves the Composio project key on the hub. The key never comes back.
+    SetComposioKey {
+        api_key: SecretText,
+    },
+    RemoveComposioKey,
+    /// Loads the categories of the connector catalog.
+    LoadConnectorCategories,
+    /// Searches the catalog. The first page replaces the old results.
+    SearchConnectorCatalog {
+        search: String,
+        category: Option<String>,
+    },
+    /// Loads the next page of the last catalog search.
+    LoadMoreConnectorCatalog,
+    /// Loads the tools of a service, once.
+    LoadServiceTools {
+        service: String,
+    },
+    /// Starts a connection. The output is [`CommandOutput::ConnectStarted`].
+    Connect(NewConnection),
+    /// Starts a new sign-in for a connection. The output is
+    /// [`CommandOutput::ConnectStarted`].
+    ReconnectConnection {
+        connection_id: String,
+        credentials: SecretEnv,
+    },
+    UpdateConnection {
+        connection_id: String,
+        changes: ConnectionChanges,
+    },
+    DisconnectConnection {
+        connection_id: String,
+    },
+    /// Loads a page of the audit log of a connection. The output is
+    /// [`CommandOutput::ConnectionCalls`].
+    LoadConnectionCalls {
+        connection_id: String,
+        before: Option<String>,
+    },
+    /// Turns a connection off or on in one channel.
+    SetChannelConnectionEnabled {
+        channel_id: String,
+        connection_id: String,
+        enabled: bool,
+    },
+    // Skills.
+    /// Turns a skill off or on in one channel.
+    SetChannelSkillEnabled {
+        channel_id: String,
+        skill_id: String,
+        enabled: bool,
+    },
+    /// Searches the skill directories. The first page replaces the old
+    /// results.
+    SearchSkillDirectory {
+        search: String,
+        source: Option<String>,
+    },
+    LoadMoreSkillDirectory,
+    LoadSkillDirectorySources,
+    AddSkillDirectorySource {
+        url: String,
+    },
+    RemoveSkillDirectorySource {
+        id: String,
+    },
+    /// The output is [`CommandOutput::SkillPreview`].
+    PreviewSkill {
+        source: SkillInstallInput,
+    },
+    /// The output is [`CommandOutput::SkillInstalled`].
+    InstallSkill {
+        source: SkillInstallInput,
+        use_in: UseInView,
+        enabled: Option<bool>,
+        /// The install card that this install answers.
+        approval_id: Option<String>,
+    },
+    UpdateSkill {
+        skill_id: String,
+        changes: SkillChanges,
+    },
+    RemoveSkill {
+        skill_id: String,
+    },
+    /// The output is [`CommandOutput::SkillFiles`].
+    LoadSkillFiles {
+        skill_id: String,
+        /// The version that waits for review, not the installed one.
+        pending: bool,
+    },
+    /// The output is [`CommandOutput::SkillFile`].
+    ReadSkillFile {
+        skill_id: String,
+        path: String,
+        pending: bool,
+    },
 }
 
 /// Refuses a channel ID that cannot name a channel. The ID is empty until the

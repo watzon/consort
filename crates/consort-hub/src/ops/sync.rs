@@ -76,6 +76,8 @@ impl Hub {
                         routines: routines::routines(&tx)?,
                         sign_ins: sign_ins::open_sign_ins(&tx)?,
                         preferences: Some(preferences::preferences(&tx)?),
+                        connections: crate::store::connectors::connections(&tx)?,
+                        skills: crate::store::skills::skills(&tx)?,
                         ..Snapshot::default()
                     },
                     SnapshotScope::Channel(channel_id) => {

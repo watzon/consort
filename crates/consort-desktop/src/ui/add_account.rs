@@ -91,6 +91,43 @@ impl ConsortApp {
         self.start_sign_in_method(window, cx);
     }
 
+    /// Opens the dialog at step 3 on a sign-in that runs already, such as
+    /// one that the hub started for a sign-in card.
+    pub fn open_running_sign_in(
+        &mut self,
+        worker_id: String,
+        account_id: String,
+        sign_in_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let account = self
+            .state
+            .worker(&worker_id)
+            .and_then(|w| w.account(&account_id))
+            .cloned();
+        let provider = account.as_ref().map(|a| self.pick_of(a));
+        let method = account
+            .as_ref()
+            .and_then(|a| {
+                let running = self.state.sign_in(&sign_in_id)?.method.clone()?;
+                a.sign_in_methods.iter().position(|m| *m == running)
+            })
+            .unwrap_or(0);
+        self.open_dialog(Dialog::AddAccount(worker_id.clone()), window, cx);
+        self.add_account = AddAccountForm {
+            worker_id,
+            step: AccountStep::SignIn,
+            provider,
+            account_id: Some(account_id),
+            method,
+            sign_in_id: Some(sign_in_id),
+            auto_started: true,
+            ..AddAccountForm::default()
+        };
+        cx.notify();
+    }
+
     /// The provider of an account that exists.
     fn pick_of(&self, account: &HarnessAccountView) -> ProviderPick {
         if let Some((harness, ..)) = PROVIDERS.iter().find(|p| p.0 == account.harness) {

@@ -278,6 +278,7 @@ impl Hub {
                     end_reason: None,
                 };
                 tx.save_session(&session)?;
+                let extensions = tx.session_extensions(worker_id, channel_id)?;
                 tx.save_session_runtime(
                     session.id,
                     &work::SessionRuntime {
@@ -301,7 +302,7 @@ impl Hub {
                         system_prompt_append: system_prompt,
                         allowed_local_mcp_servers: local_mcp,
                         channel_files: files,
-                        extensions: Default::default(),
+                        extensions,
                         resume: None,
                         turn: Some(TurnInput {
                             text: first_turn,

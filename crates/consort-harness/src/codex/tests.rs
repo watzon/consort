@@ -324,6 +324,8 @@ fn thread_params_follow_the_approval_table_and_mcp_config() {
             bridge: None,
         }],
         env: BTreeMap::new(),
+        extras_enabled: true,
+        skills: None,
         resume: None,
         process_watcher: None,
     };
@@ -337,6 +339,11 @@ fn thread_params_follow_the_approval_table_and_mcp_config() {
     assert_eq!(
         params["config"]["mcp_servers"]["hub"]["http_headers"]["Authorization"],
         "Bearer tok"
+    );
+    // A connector call can wait minutes for approval; Codex's default is 60 s.
+    assert_eq!(
+        params["config"]["mcp_servers"]["hub"]["tool_timeout_sec"],
+        super::MCP_TOOL_TIMEOUT_SECS
     );
     assert!(
         params["config"]["mcp_servers"]["hub"]
@@ -356,6 +363,42 @@ fn thread_params_follow_the_approval_table_and_mcp_config() {
     let params = serde_json::to_value(thread_params(&spec, config)).unwrap();
     assert_eq!(params["config"]["features"]["shell_tool"], false);
     assert_eq!(params["config"]["features"]["unified_exec"], false);
+}
+
+#[test]
+fn extras_off_stops_apps_plugins_and_cloud_skills_for_one_thread() {
+    let mut spec = SessionSpec {
+        session_id: SessionId::new(),
+        workspace: "/w".into(),
+        runtime_dir: "/r".into(),
+        model: String::new(),
+        options: Default::default(),
+        approval_mode: ApprovalMode::Auto,
+        allow_shell: false,
+        system_prompt_append: String::new(),
+        mcp_servers: vec![],
+        env: BTreeMap::new(),
+        extras_enabled: true,
+        skills: None,
+        resume: Some(NativeRef::new("th1")),
+        process_watcher: None,
+    };
+    // Extras on: nothing about apps or plugins, on a new and a resumed thread.
+    let on = serde_json::to_value(thread_params(&spec, session_config(&spec))).unwrap();
+    assert!(on["config"]["features"].get("apps").is_none(), "{on}");
+    assert!(on["config"].get("cloud").is_none(), "{on}");
+
+    spec.extras_enabled = false;
+    for resume in [None, Some(NativeRef::new("th1"))] {
+        spec.resume = resume;
+        let off = serde_json::to_value(thread_params(&spec, session_config(&spec))).unwrap();
+        assert_eq!(off["config"]["features"]["apps"], false);
+        assert_eq!(off["config"]["features"]["plugins"], false);
+        assert_eq!(off["config"]["cloud"]["skills"]["enabled"], false);
+        // The keys of the shell switch stay in the same object.
+        assert_eq!(off["config"]["features"]["shell_tool"], false);
+        assert_eq!(off["config"]["features"]["unified_exec"], false);
+    }
 }
 
 #[test]
@@ -425,6 +468,21 @@ mod fake_server {
                     )
                     .await
                 }
+                // A folder with `reject` in its name makes the fake refuse.
+                Some("skills/extraRoots/set")
+                    if msg["params"]["extraRoots"][0]
+                        .as_str()
+                        .is_some_and(|p| p.contains("reject")) =>
+                {
+                    send(
+                        &mut write,
+                        json!({"id": id, "error": {"code": -32601, "message": "unknown method"}}),
+                    )
+                    .await
+                }
+                Some("skills/extraRoots/set") => {
+                    send(&mut write, json!({"id": id, "result": {}})).await
+                }
                 Some("turn/start") => {
                     turns += 1;
                     let turn = format!("t{turns}");
@@ -493,6 +551,95 @@ mod fake_server {
         }
     }
 
+    fn spec_with_skills(root: &str) -> SessionSpec {
+        SessionSpec {
+            session_id: SessionId::new(),
+            workspace: "/w".into(),
+            runtime_dir: "/r".into(),
+            model: String::new(),
+            options: Default::default(),
+            approval_mode: ApprovalMode::Ask,
+            allow_shell: true,
+            system_prompt_append: String::new(),
+            mcp_servers: vec![],
+            env: BTreeMap::new(),
+            extras_enabled: true,
+            skills: Some(crate::skills::SessionSkills::new(
+                std::path::PathBuf::from(root),
+                vec!["pdf-forms".into()],
+            )),
+            resume: None,
+            process_watcher: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn the_skill_folder_is_an_extra_root_before_the_thread_starts() {
+        let (client_side, server_side) = tokio::io::duplex(1 << 16);
+        let log = Arc::new(Mutex::new(Vec::new()));
+        tokio::spawn(run_server(server_side, log.clone()));
+        let (read, write) = tokio::io::split(client_side);
+        let (client, inbound) = RpcClient::start(write, read);
+        let spec = spec_with_skills("/runtime/ses_1/skills");
+        let (session, mut events) =
+            start_thread(spec, serde_json::Map::new(), client, inbound, None)
+                .await
+                .unwrap();
+        {
+            let log = log.lock().unwrap();
+            let methods: Vec<&str> = log.iter().filter_map(|m| m["method"].as_str()).collect();
+            assert_eq!(methods, ["skills/extraRoots/set", "thread/start"]);
+            assert_eq!(
+                log[0]["params"]["extraRoots"],
+                json!([std::path::PathBuf::from("/runtime/ses_1/skills/skills")
+                    .to_string_lossy()
+                    .into_owned()])
+            );
+        }
+        // A session with no skills sends no such request.
+        let (client_side, server_side) = tokio::io::duplex(1 << 16);
+        let log2 = Arc::new(Mutex::new(Vec::new()));
+        tokio::spawn(run_server(server_side, log2.clone()));
+        let (read, write) = tokio::io::split(client_side);
+        let (client, inbound) = RpcClient::start(write, read);
+        let mut plain = spec_with_skills("/x");
+        plain.skills = None;
+        let (other, _events) = start_thread(plain, serde_json::Map::new(), client, inbound, None)
+            .await
+            .unwrap();
+        assert_eq!(log2.lock().unwrap().len(), 1);
+        Box::new(other).close().await.unwrap();
+        // No note when Codex took the folder.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), events.recv())
+                .await
+                .map(|e| !matches!(e, Some(SessionEvent::Error { .. })))
+                .unwrap_or(true)
+        );
+        Box::new(session).close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_codex_that_refuses_the_skill_folder_still_starts_and_says_so() {
+        let (client_side, server_side) = tokio::io::duplex(1 << 16);
+        let log = Arc::new(Mutex::new(Vec::new()));
+        tokio::spawn(run_server(server_side, log.clone()));
+        let (read, write) = tokio::io::split(client_side);
+        let (client, inbound) = RpcClient::start(write, read);
+        let spec = spec_with_skills("/runtime/reject/skills");
+        let (session, mut events) =
+            start_thread(spec, serde_json::Map::new(), client, inbound, None)
+                .await
+                .unwrap();
+        let note = next_matching(&mut events, |e| matches!(e, SessionEvent::Error { .. })).await;
+        let SessionEvent::Error { code, message } = note else {
+            unreachable!()
+        };
+        assert_eq!(code, "skills_not_delivered");
+        assert!(message.contains("unknown method"), "{message}");
+        Box::new(session).close().await.unwrap();
+    }
+
     #[tokio::test]
     async fn approvals_questions_steer_and_interrupt() {
         let (client_side, server_side) = tokio::io::duplex(1 << 16);
@@ -513,6 +660,8 @@ mod fake_server {
             system_prompt_append: String::new(),
             mcp_servers: vec![],
             env: BTreeMap::new(),
+            extras_enabled: true,
+            skills: None,
             resume: None,
             process_watcher: None,
         };
@@ -702,6 +851,8 @@ mod fake_server {
             system_prompt_append: String::new(),
             mcp_servers: vec![],
             env: BTreeMap::new(),
+            extras_enabled: true,
+            skills: None,
             resume: None,
             process_watcher: None,
         };

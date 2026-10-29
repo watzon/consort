@@ -17,6 +17,7 @@ use consort_proto::time::Timestamp;
 use consort_proto::tools::ToolAudience;
 use tokio_util::sync::CancellationToken;
 
+use crate::connectors::Connectors;
 use crate::coordinator::Coordinators;
 use crate::error::Result;
 use crate::link::Links;
@@ -119,6 +120,7 @@ pub struct HubInner {
     pub handshakes: HandshakeSlots,
     pub revokes: RevokeWatch,
     pub registry: RegistryCache,
+    pub connectors: Connectors,
     pub shutdown: CancellationToken,
 }
 
@@ -151,6 +153,7 @@ impl Hub {
             handshakes: HandshakeSlots::default(),
             revokes: RevokeWatch::default(),
             registry: RegistryCache::default(),
+            connectors: Connectors::open(data_dir),
             shutdown: CancellationToken::new(),
         }));
         hub.bootstrap().await?;

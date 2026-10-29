@@ -9,6 +9,9 @@ mod assets;
 mod countdown;
 mod drafts;
 mod edit_keys;
+#[cfg(test)]
+mod ext_tests;
+mod extensions;
 mod fonts;
 #[cfg(test)]
 mod keys_tests;
@@ -29,7 +32,9 @@ actions!(consort, [Quit]);
 /// screenshots and reviews: everything, sayso, tasks, thread, settings,
 /// workers, add-account, add-account-name, sign-in, channel-tags,
 /// new-channel, add-worker, worker-added, review, failed, error, new-folder,
-/// onboarding. `--light` and `--dark` set
+/// onboarding, connectors, add-connector, connect, connectors-in-channel,
+/// channel-connectors, skills, add-skill, add-skill-unsupported,
+/// account-settings, hub-cards, everything-manages. `--light` and `--dark` set
 /// the mode, and `--theme <name>` the theme.
 #[derive(Clone, Debug, Default)]
 pub struct Args {
@@ -71,6 +76,15 @@ fn main() {
         Client::mock_with(consort_client::mock::view_state_with_requests())
     } else if mock && args.screen.as_deref() == Some("worker-added") {
         Client::mock_with(consort_client::mock::view_state_with_long_detail())
+    } else if mock && args.screen.as_deref() == Some("everything-manages") {
+        Client::mock_with(consort_client::mock::view_state_with_connect_card())
+    } else if mock && args.screen.as_deref() == Some("add-skill-unsupported") {
+        // The hub answers `unsupported` for the skill directories (step 3).
+        let mut state = consort_client::mock::view_state();
+        state.skill_directory.load = consort_client::LoadState::Unsupported(
+            "This hub cannot search skill directories yet. Update the hub, then try again.".into(),
+        );
+        Client::mock_with(state)
     } else if mock && args.screen.as_deref() == Some("model-picker-no-account") {
         // No account is signed in on any worker.
         let mut state = consort_client::mock::view_state();

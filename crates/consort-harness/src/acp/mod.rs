@@ -41,6 +41,7 @@ use crate::{
     HarnessError, HarnessKind, HarnessSession, McpServerSpec, SIGNED_OUT_ERROR_CODE, SessionSpec,
     SignInMethod, SteerFuture, sign_in_hint, sign_in_hint_for, steer_ready, turn_text,
 };
+use crate::{extras, skills};
 use mapper::{AcpMapper, stop_reason};
 
 /// The pinned `claude-agent-acp` package.
@@ -118,6 +119,19 @@ pub fn launch_recipe(
     allow_shell: bool,
     resolve: &dyn Fn(&str) -> Option<PathBuf>,
 ) -> Result<Launch, HarnessError> {
+    launch_recipe_with(kind, account, mode, allow_shell, None, resolve)
+}
+
+/// [`launch_recipe`] for a session that has skills. OpenCode reads them from
+/// the `skills` list of its config.
+pub fn launch_recipe_with(
+    kind: HarnessKind,
+    account: &AccountConfig,
+    mode: ApprovalMode,
+    allow_shell: bool,
+    skills: Option<&skills::SessionSkills>,
+    resolve: &dyn Fn(&str) -> Option<PathBuf>,
+) -> Result<Launch, HarnessError> {
     let explicit = |default: &str| -> Result<PathBuf, HarnessError> {
         let name = account.binary.as_deref().unwrap_or(default);
         resolve(name).ok_or_else(|| HarnessError::Spawn(format!("`{name}` is not on PATH")))
@@ -147,7 +161,7 @@ pub fn launch_recipe(
         HarnessKind::OpenCode => {
             env.insert(
                 "OPENCODE_CONFIG_CONTENT".to_owned(),
-                opencode_permission(mode, allow_shell).to_string(),
+                opencode_config(mode, allow_shell, skills).to_string(),
             );
             // The repo's `opencode.json` and `.opencode/` can start local
             // MCP servers, load plugins and allow tools per agent. Below
@@ -196,6 +210,22 @@ pub fn launch_recipe(
     };
     args.extend(account.args.iter().cloned());
     Ok(Launch { program, args, env })
+}
+
+/// The OpenCode config of a session (`OPENCODE_CONFIG_CONTENT`): the
+/// permissions of the approval mode, and the skill folder of the session in
+/// `skills`. OpenCode 2 takes a list of folders and adds them to the skills
+/// that it finds itself. It reads no file of the account for this.
+pub fn opencode_config(
+    mode: ApprovalMode,
+    allow_shell: bool,
+    skills: Option<&skills::SessionSkills>,
+) -> Value {
+    let mut config = opencode_permission(mode, allow_shell);
+    if let Some(skills) = skills {
+        config["skills"] = json!(skills::opencode_skill_paths(skills));
+    }
+    config
 }
 
 /// The capabilities that an ACP account has before the agent reports its
@@ -459,6 +489,18 @@ fn claude_meta_for(spec: &SessionSpec, probe: bool) -> Value {
     }
     if !spec.allow_shell {
         options.insert("disallowedTools".to_owned(), json!(CLAUDE_SHELL_TOOLS));
+    }
+    // Provider extras off: inline settings and one env variable, for this
+    // session only. The profile's own settings file stays as it is (see
+    // `crate::extras`).
+    if !spec.extras_enabled {
+        options.insert("settings".to_owned(), extras::claude_extras_off_settings());
+        let (name, value) = extras::CLAUDE_CONNECTORS_ENV;
+        options.insert("env".to_owned(), json!({ name: value }));
+    }
+    // The skills of the session are a plugin that holds only skills.
+    if let Some(skills) = &spec.skills {
+        options.insert("plugins".to_owned(), skills::claude_plugins_option(skills));
     }
     let mut meta = serde_json::Map::new();
     if !append.is_empty() {
@@ -1518,8 +1560,20 @@ pub fn agent_process_spec(
     resolve: &dyn Fn(&str) -> Option<PathBuf>,
 ) -> Result<ProcessSpec, HarnessError> {
     let mut env = prepare_home(account)?;
-    let launch = launch_recipe(kind, account, spec.approval_mode, spec.allow_shell, resolve)?;
+    let launch = launch_recipe_with(
+        kind,
+        account,
+        spec.approval_mode,
+        spec.allow_shell,
+        spec.skills.as_ref(),
+        resolve,
+    )?;
     env.extend(launch.env);
+    // The environment of the session's skills, such as the Gemini home of
+    // the session (see `crate::skills`).
+    if let Some(skills) = &spec.skills {
+        env.extend(skills.env.clone());
+    }
     env.extend(spec.env.clone());
     Ok(ProcessSpec {
         program: launch.program,
@@ -1762,6 +1816,8 @@ impl Harness for AcpHarness {
             system_prompt_append: String::new(),
             mcp_servers: Vec::new(),
             env: BTreeMap::new(),
+            extras_enabled: true,
+            skills: None,
             resume: None,
             process_watcher: None,
         };
@@ -2093,6 +2149,8 @@ async fn auth_op(
         system_prompt_append: String::new(),
         mcp_servers: Vec::new(),
         env: BTreeMap::new(),
+        extras_enabled: true,
+        skills: None,
         resume: None,
         process_watcher: None,
     };

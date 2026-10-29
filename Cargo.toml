@@ -68,6 +68,8 @@ gethostname = "1"
 croner = "4"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 chrono-tz = "0.10"
+# Encrypts the Composio key at rest (connectors, added by the hub agent)
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
 
 # Managed tools (added by the tools agent)
 consort-tools = { path = "crates/consort-tools", default-features = false }

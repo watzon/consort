@@ -1,5 +1,9 @@
 pub mod add_account;
+pub mod channel_extensions;
+pub mod connectors;
 pub mod dialogs;
+pub mod ext_parts;
+pub mod hub_cards;
 pub mod links;
 pub mod markdown;
 pub mod menu;
@@ -9,6 +13,7 @@ pub mod panels;
 pub mod parts;
 pub mod settings;
 pub mod sidebar;
+pub mod skills;
 pub mod startup_error;
 pub mod switcher;
 pub mod timeline;

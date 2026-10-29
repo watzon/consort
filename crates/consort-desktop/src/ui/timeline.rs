@@ -280,6 +280,33 @@ impl ConsortApp {
             t,
         )
         .on_click(cx.listener(|this, _, window, cx| this.start_task_draft(window, cx)));
+        // The connectors and skills of the channel, and the count of those
+        // that its sessions get.
+        let extensions_id = self.channel_id.clone();
+        let enabled = consort_client::channel_extensions(&state, &self.channel_id)
+            .map(|set| set.enabled_connector_ids().len() + set.enabled_skill_ids().len())
+            .unwrap_or(0);
+        let extensions_button = focusable(div().id("channel-extensions"), t)
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(t.space.xs + t.space.xxs)
+            .h(t.space.xxl)
+            .px(t.space.sm)
+            .rounded(t.radius.md)
+            .cursor_pointer()
+            .hover(|s| s.bg(c.hover_canvas))
+            .child(icon("link", t.icon.size, c.text_secondary))
+            .when(enabled > 0, |d| {
+                d.child(text(enabled.to_string(), t.text.ui, c.text_secondary))
+            })
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.open_dialog(
+                    crate::app::Dialog::ChannelExtensions(extensions_id.clone()),
+                    window,
+                    cx,
+                )
+            }));
         div()
             .flex()
             .flex_none()
@@ -320,6 +347,7 @@ impl ConsortApp {
             })
             .child(line(purpose, t.text.ui, c.text_tertiary).flex_1())
             .child(tasks_button)
+            .child(extensions_button)
             .child(new_task)
             .into_any_element()
     }
@@ -1067,7 +1095,26 @@ impl ConsortApp {
             .approval
             .clone()
             .filter(|a| a.state != RequestState::Answered);
-        if let Some(approval) = pending {
+        if let Some(approval) = pending.clone()
+            && let Some(hub_card) = approval.card.clone()
+        {
+            // A connector approval from the task: the hub card, inside the
+            // task card.
+            let key = format!("{}-hub-card", card.message_id);
+            body = body
+                .child(
+                    div()
+                        .pl(inset)
+                        .child(self.render_hub_card(&approval, &hub_card, &key, t, cx)),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .pl(inset)
+                        .child(div().flex_1())
+                        .child(self.open_thread_link(&card.task_id, open, t, cx)),
+                );
+        } else if let Some(approval) = pending {
             body = body
                 .child(
                     self.render_approval_detail(&approval, true, t, cx)

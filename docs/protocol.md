@@ -161,7 +161,7 @@ Every hub command is a request. The envelope `id` of a hub command is its comman
 | `item.detail` | `session_id`, `item_id` | `sha256`, `size` and `mime` of a blob with the full command output or diff |
 | `inventory.refresh` | Empty | None |
 | `account.create` | `account_id` (the hub chooses it), `harness`, `label`, optional `acp`, `env` | None. The worker makes the profile folder, writes `env` to `env.json` in it, adds the account to `worker.toml`, and sends a new inventory |
-| `account.update` | `account_id`, optional `label`, `env_set`, `env_remove`, `extras_enabled` | None. `extras_enabled` turns the provider extras of the account on or off from the next session. A worker that does not have the toggle yet refuses the whole command with `unsupported` |
+| `account.update` | `account_id`, optional `label`, `env_set`, `env_remove`, `extras_enabled` | None. `extras_enabled` turns the provider extras of the account on or off from the next session or resume. The worker keeps the setting for the account. A running session keeps what it started with |
 | `account.remove` | `account_id` | None. The worker signs out where it can and deletes the profile folder |
 | `account.sign_out` | `account_id` | None |
 | `sign_in.start` | `sign_in_id`, `account_id`, `method` | None. The worker sends each state as `sign_in.update` |

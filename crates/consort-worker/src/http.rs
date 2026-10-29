@@ -141,6 +141,56 @@ pub async fn upload_blob(
     Ok(())
 }
 
+/// Downloads a blob with `GET /v1/blobs/{sha256}` and the worker signature
+/// headers. The caller checks the bytes against the hash, and `max_bytes`
+/// stops a hub that sends more than the caller expects.
+pub async fn download_blob(
+    hub_url: &str,
+    worker_id: WorkerId,
+    identity: &Identity,
+    sha256: &Sha256Hash,
+    max_bytes: u64,
+) -> Result<Vec<u8>, WorkerError> {
+    let origin = normalize_origin(hub_url).map_err(|e| WorkerError::Config(e.to_string()))?;
+    let path = blob_path(sha256);
+    let timestamp = Timestamp::now();
+    let signature = identity.sign(&http_signing_payload(
+        "GET", &origin, &path, timestamp, worker_id,
+    ));
+    let url = format!("{}{path}", http_base(hub_url));
+    let response = client()?
+        .get(&url)
+        .header(HEADER_WORKER_ID, worker_id.to_string())
+        .header(HEADER_TIMESTAMP, timestamp.as_millis().to_string())
+        .header(HEADER_SIGNATURE, signature.to_hex())
+        .send()
+        .await
+        .map_err(|e| WorkerError::Network(e.to_string()))?;
+    if !response.status().is_success() {
+        return Err(hub_error(response).await);
+    }
+    if response.content_length().is_some_and(|len| len > max_bytes) {
+        return Err(WorkerError::Network(format!(
+            "the hub sent a blob that is larger than {max_bytes} bytes"
+        )));
+    }
+    let mut body = Vec::new();
+    let mut response = response;
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| WorkerError::Network(e.to_string()))?
+    {
+        if (body.len() as u64).saturating_add(chunk.len() as u64) > max_bytes {
+            return Err(WorkerError::Network(format!(
+                "the hub sent a blob that is larger than {max_bytes} bytes"
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

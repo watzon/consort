@@ -255,6 +255,14 @@ impl Core {
         let dir = self.profile_dir(account);
         prepare_profile(account.harness, &dir).map_err(worker_error)?;
         let mut env = profile_env(account.harness, &dir);
+        // OpenCode gets its own `HOME`, so its tools need their real places.
+        if account.harness == HarnessKind::OpenCode
+            && let Some(real_home) = consort_harness::account::user_home()
+        {
+            env.extend(crate::profile::tool_path_pins(&real_home, &|name| {
+                std::env::var_os(name).is_some_and(|v| !v.is_empty())
+            }));
+        }
         env.extend(read_secrets(&dir).map_err(worker_error)?);
         prepared.runtime.env = env;
         prepared.runtime.env_remove = LOGIN_VARIABLES.iter().map(|v| (*v).to_owned()).collect();
@@ -493,11 +501,6 @@ impl Core {
         self: &Arc<Self>,
         update: AccountUpdateCommand,
     ) -> Result<(), ErrorBody> {
-        // The provider extras toggle is not built yet. Refuse the whole
-        // command before it changes anything, so a retry is safe.
-        if update.extras_enabled.is_some() {
-            return Err(ErrorBody::not_built("account.update extras_enabled"));
-        }
         let account = self
             .config_snapshot()
             .account(update.account_id)
@@ -526,6 +529,12 @@ impl Core {
                 codex_key = update.env_set.get("OPENAI_API_KEY").map(str::to_owned);
             }
             tracing::info!(account = %account.id, set = ?update.env_set.names(), removed = ?update.env_remove, "changed the secret variables of an account");
+        }
+        if let Some(enabled) = update.extras_enabled {
+            self.store
+                .set_extras_enabled(account.id, enabled)
+                .map_err(worker_error)?;
+            tracing::info!(account = %account.id, enabled, "changed the provider extras of an account; the next session of the account uses the new setting");
         }
         if let Some(label) = label
             && label != account.label
@@ -675,6 +684,9 @@ impl Core {
         }
         if let Ok(mut statuses) = self.statuses.lock() {
             statuses.remove(&account.id);
+        }
+        if let Err(err) = self.store.delete_account_settings(account.id) {
+            tracing::warn!(account = %account.id, error = %err, "could not forget the settings of a removed account");
         }
         tracing::info!(account = %account.id, "removed an account");
         self.send_inventory(false);

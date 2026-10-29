@@ -84,7 +84,7 @@ Each account that Consort makes has its own profile folder, `<consort home>/prof
 | Claude Code | `CLAUDE_CONFIG_DIR=<profile>/claude` |
 | Codex | `CODEX_HOME=<profile>/codex`. Its `config.toml` gets `cli_auth_credentials_store = "file"` and `check_for_update_on_startup = false` |
 | Gemini CLI | `GEMINI_CLI_HOME=<profile>/gemini`. Gemini CLI reads `$GEMINI_CLI_HOME/.gemini/settings.json`, which gets `general.enableAutoUpdate: false` |
-| OpenCode | `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME` and `XDG_CACHE_HOME` under `<profile>/xdg/` |
+| OpenCode | `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME` and `XDG_CACHE_HOME` under `<profile>/xdg/`, and `HOME` (`USERPROFILE` too on Windows) set to `<profile>/home/`. OpenCode reads `~/.claude/skills`, `~/.agents/skills` and `~/.claude/CLAUDE.md` from the home folder, so an own `HOME` keeps the skills of the real home out. The worker pins the tools of the user to their real places, for each that exists and that the worker's own environment does not set already: `GIT_CONFIG_GLOBAL` (`~/.gitconfig`), `GNUPGHOME`, `CARGO_HOME`, `RUSTUP_HOME`, `BUN_INSTALL` and `npm_config_cache`. `env.json` can override them |
 | ACP agents | `HOME` stays as it is. Only the env is set |
 
 The worker merges `env.json` into the session env after the profile variables. It writes `env.json` with mode 0600 on Unix. The inventory reports the variable names (`secret_names`), never the values. The process of a profile account does not get the login variables of the worker's own environment (such as `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `CLAUDE_CONFIG_DIR` and `CODEX_HOME`), so it never uses a login that the machine already has.
@@ -136,6 +136,43 @@ Every session gets the worker's local MCP endpoint (see [Hub tools](protocol.md#
 | Pi RPC | The `--mcp-config` flag, with a generated config file in the session's runtime folder |
 
 The worker also adds the local MCP servers that the channel may use, with the same mechanism.
+
+## Provider extras and skills
+
+Two things reach a session from outside the account's own folders: the account's **provider extras**, and the **skills** that the hub gives to the session's channel. The reasons, the tests and the results of the live checks are in [notes/step2-worker.md](notes/step2-worker.md).
+
+### Provider extras
+
+Each account has a switch, on by default, which the worker keeps in `worker.db` (`account_settings`). `account.update` with `extras_enabled` sets it. A change reaches the next session or resume of the account. A running session keeps what it started with. The inventory reports `extras_enabled`, and `extras` where the worker can list them.
+
+| Harness | Account-synced extras | When the switch is off | Reported in `extras` |
+|---|---|---|---|
+| Claude Code | claude.ai connectors, synced plugins, synced skills | `_meta.claudeCode.options` of `session/new` and `session/load` gets `settings` `{"disableClaudeAiConnectors": true, "syncClaudeAiSkills": false, "syncClaudeAiPlugins": false}` and `env` `{"ENABLE_CLAUDEAI_MCP_SERVERS": "false"}`. Inline settings apply to the run only and move no file. The worker never writes the `syncClaudeAi*` keys to a settings file, because there Claude Code moves the synced folders to `.trash` | Counts and up to 20 names of the folders in `plugins/synced/*/` and `skills/synced/*/` of `CLAUDE_CONFIG_DIR`. The connectors need the network, so `mcp_servers` stays empty |
+| Codex | With ChatGPT sign-in: ChatGPT apps, plugins of the account, cloud skills | The `config` of `thread/start` and `thread/resume` gets `features.apps` and `features.plugins` false and `cloud.skills.enabled` false. `features.plugins` is one switch for all plugins, so it also stops plugins that the user installed by hand | Nothing (`None`) |
+| Gemini CLI | None for a personal Google account. The admin controls of an organization | No switch | `cannot_turn_off` says that organization settings apply |
+| OpenCode | Servers and providers of a connected OpenCode Console | No switch that spares the hub tools | `cannot_turn_off` says so |
+| ACP registry agents | Differs by agent, mostly enterprise settings | No switch | `cannot_turn_off` says so |
+
+### Skills
+
+`session.start` names the skills of a session in `extensions.skills`, each with a content hash. For a harness with native skills, the worker:
+
+1. reads the bundle from its cache, `<consort home>/cache/skills/<content hash>/`, and checks every file again;
+2. on a miss, asks the hub for the file list (`skill_bundle.get`), checks `SkillBundle::is_consistent`, downloads each file with the signed `GET /v1/blobs/{sha256}`, checks the size and SHA-256 of each file, and renames a finished folder into the cache;
+3. copies the files into `<config dir>/runtime/<session id>/skills/` in the layout of the harness;
+4. removes that folder when the session ends (also for a lost session, a stop and an account removal), and at the next start for the sessions that ended while the worker was down.
+
+A resume writes the folder again from the cache, so the session keeps the version that it started with, also when the hub is down. A skill that fails does not fail the session. The session starts without it, the context text leaves it out, and the worker records a `skills_not_delivered` error event.
+
+| Harness | Layout in the session folder | How the harness finds it |
+|---|---|---|
+| Claude Code | `consort-skills/.claude-plugin/plugin.json` and `consort-skills/skills/<name>/`. The plugin has no hooks, commands, agents or MCP servers | `plugins` `[{"type": "local", "path": ...}]` in `_meta.claudeCode.options`. Claude Code names the skills `consort-skills:<name>` |
+| Codex | `skills/<name>/` | `skills/extraRoots/set` on the session's own `app-server`, before `thread/start` |
+| Gemini CLI (Unix) | `gemini-home/`: a copy of the account's Gemini home in which every file and folder is a link, except `.gemini/skills/`, which is a real folder with links to the account's own skills and copies of the Consort skills | `GEMINI_CLI_HOME` of the agent process. At the end of the session the worker moves back what Gemini CLI made in the copy |
+| OpenCode | `skills/<name>/` | `skills` (a list of folders) in `OPENCODE_CONFIG_CONTENT` |
+| Other ACP agents, Pi, and Gemini CLI on Windows | Nothing is written | The hub tools `list_skills` and `read_skill`, and a line in the context text |
+
+The worker adds `SessionExtensions::prompt_blocks(native)` to the end of `system_prompt_append`, after the text from the hub. That text goes to the harness as the hub text always did: `systemPrompt.append` for Claude Code, `developerInstructions` for Codex, and in front of the first turn for the other ACP agents.
 
 ## Approval modes
 

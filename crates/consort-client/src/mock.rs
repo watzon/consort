@@ -3,7 +3,9 @@
 //! commands, so buttons do what they will do against a real hub.
 
 use crate::{
+    connectors::CatalogView,
     derive::{refresh, waiting_detail},
+    skills::SkillDirectoryView,
     view::*,
 };
 
@@ -65,6 +67,8 @@ fn channel(id: &str, name: &str, purpose: &str, icon: &str, group: Option<&str>)
         task_selection: Some(selection("Claude Personal", "claude-opus-5-5", "Opus 5.5")),
         default_isolation: Isolation::Worktree,
         tags: Vec::new(),
+        disabled_connections: Vec::new(),
+        disabled_skills: Vec::new(),
     }
 }
 
@@ -136,6 +140,8 @@ fn sayso_approval() -> ApprovalView {
         state: RequestState::Pending,
         answer: None,
         allow_always_label: Some(text("Yes, and don't ask again for cargo build commands")),
+        card: None,
+        button_labels: Vec::new(),
     }
 }
 
@@ -439,6 +445,8 @@ fn account(
         sign_in_methods: methods,
         secret_names,
         email: None,
+        extras_enabled: true,
+        extras: None,
     }
 }
 
@@ -1008,6 +1016,26 @@ fn timelines() -> Vec<TimelineView> {
             ],
         },
         TimelineView {
+            channel_id: crate::mock_extensions::ACME.into(),
+            has_older: false,
+            loaded: true,
+            items: {
+                let mut items = vec![day("day_acme_today", "Today")];
+                items.extend(crate::mock_extensions::acme_items());
+                items
+            },
+        },
+        TimelineView {
+            channel_id: crate::mock_extensions::HIRING.into(),
+            has_older: false,
+            loaded: true,
+            items: {
+                let mut items = vec![day("day_hiring_today", "Today")];
+                items.extend(crate::mock_extensions::hiring_items());
+                items
+            },
+        },
+        TimelineView {
             channel_id: LIGHTS.into(),
             has_older: false,
             loaded: true,
@@ -1255,6 +1283,20 @@ pub fn view_state() -> ViewState {
             Some("grp_personal"),
         ),
         channel(
+            crate::mock_extensions::ACME,
+            "acme",
+            "Contracts and support for Acme",
+            "inbox",
+            Some("grp_personal"),
+        ),
+        channel(
+            crate::mock_extensions::HIRING,
+            "hiring",
+            "Hiring for the Acme team",
+            "users",
+            Some("grp_personal"),
+        ),
+        channel(
             HOMELAB,
             "homelab",
             "Keep the home servers and their backups healthy",
@@ -1286,6 +1328,17 @@ pub fn view_state() -> ViewState {
             source: SelectionSource::Channel,
         });
         sayso.tags = vec![text("personal")];
+    }
+    for channel in channels.iter_mut() {
+        if channel.id == crate::mock_extensions::ACME
+            || channel.id == crate::mock_extensions::HIRING
+        {
+            channel.tags = vec![text("work")];
+        }
+        if channel.id == crate::mock_extensions::ACME {
+            channel.disabled_connections = vec![text(crate::mock_extensions::CON_GMAIL_PERSONAL)];
+            channel.disabled_skills = vec![text(crate::mock_extensions::SKL_RUST)];
+        }
     }
     let mut state = ViewState {
         connection: Connection::Demo,
@@ -1322,7 +1375,45 @@ pub fn view_state() -> ViewState {
         acp_registry: AcpRegistryView::default(),
         worker_pairing: None,
         send_failures: Vec::new(),
+        connections: crate::mock_extensions::connections(),
+        skills: crate::mock_extensions::skills(),
+        composio: crate::mock_extensions::composio(),
+        connector_catalog: CatalogView {
+            categories: crate::mock_extensions::categories(),
+            ..CatalogView::default()
+        },
+        service_tools: Vec::new(),
+        skill_directory: SkillDirectoryView {
+            sources: crate::mock_extensions::directory_sources(),
+            ..SkillDirectoryView::default()
+        },
     };
+    if let Some(account) = state
+        .workers
+        .iter_mut()
+        .flat_map(|w| w.accounts.iter_mut())
+        .find(|a| a.id == "acc_bigboi_claude")
+    {
+        account.email = Some(text("cawatson1993@gmail.com"));
+        account.extras = Some(crate::mock_extensions::claude_extras());
+    }
+    refresh(&mut state);
+    state
+}
+
+/// The mock with Everything as "Everything manages connectors and
+/// channels" shows it: a request and the connect card at the end.
+pub fn view_state_with_connect_card() -> ViewState {
+    let mut state = view_state();
+    if let Some(timeline) = state
+        .timelines
+        .iter_mut()
+        .find(|t| t.channel_id == EVERYTHING)
+    {
+        timeline
+            .items
+            .extend(crate::mock_extensions::everything_items());
+    }
     refresh(&mut state);
     state
 }
@@ -1352,6 +1443,8 @@ pub fn view_state_with_requests() -> ViewState {
                     allow_always_label: Some(text(
                         "Yes, and don't ask again for roofline-quotes.md",
                     )),
+                    card: None,
+                    button_labels: Vec::new(),
                 });
             }
         }
@@ -1375,6 +1468,8 @@ pub fn view_state_with_requests() -> ViewState {
                 state: RequestState::Pending,
                 answer: None,
                 allow_always_label: None,
+                card: None,
+                button_labels: Vec::new(),
             },
         }));
         timeline.items.push(TimelineItem::Decision(DecisionCardView {

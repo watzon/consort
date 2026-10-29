@@ -481,7 +481,9 @@ fn turn_waits_unsent(tx: &Tx<'_>, session_id: SessionId) -> Result<bool> {
 fn cancel_harness_requests(tx: &mut Tx<'_>, ctx: &mut Ctx<'_>) -> Result<()> {
     let (approvals, decisions) = work::pending_for_session(tx.db(), ctx.session.id)?;
     let mut canceled = false;
-    for mut approval in approvals {
+    // A hub card needs no harness request: the hub answers it, and the
+    // answer reaches the channel or the task, not the session.
+    for mut approval in approvals.into_iter().filter(|a| !a.is_hub_card()) {
         approval.status = ApprovalStatus::Canceled;
         tx.save_approval(&approval)?;
         canceled = true;

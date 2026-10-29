@@ -25,6 +25,7 @@ pub mod mcp;
 pub mod profile;
 mod sessions;
 mod signin;
+pub mod skills;
 pub mod store;
 pub mod tags;
 pub mod tools;

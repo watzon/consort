@@ -20,10 +20,12 @@ pub mod account;
 pub mod acp;
 pub mod approval;
 pub mod codex;
+pub mod extras;
 mod items;
 pub mod process;
 pub mod record;
 pub mod signin;
+pub mod skills;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -229,6 +231,14 @@ pub struct SessionSpec {
     pub mcp_servers: Vec<McpServerSpec>,
     /// Extra environment variables for the harness process.
     pub env: BTreeMap<String, String>,
+    /// Whether the account's provider extras are on (see [`extras`]). Off
+    /// means that the adapter starts the harness without the extras that
+    /// the provider syncs to the account, where the harness allows that.
+    pub extras_enabled: bool,
+    /// The skills that the worker wrote for this session, laid out for this
+    /// harness (see [`skills::write_session_skills`]). `None` when the
+    /// session has none, or when the harness has no native skills.
+    pub skills: Option<skills::SessionSkills>,
     /// Resume this harness session instead of starting a new one.
     pub resume: Option<NativeRef>,
     /// Learns the process groups of the harness processes, so the worker can

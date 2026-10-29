@@ -597,5 +597,6 @@ path = "C:/Users/chris/Code/sayso"
 - `processed_commands`: command ID, result and time, kept for 8 days (the 7 days that the hub keeps a queued command, and one more day) so that a repeated command runs once.
 - `sessions`: the local registry of sessions with their native references and workspace paths.
 - `harness_processes`: the process group of each harness that the worker started on Unix, with the start time of its leader. At the next start, the worker stops only the recorded groups whose start time still matches.
+- `account_settings`: one row per account with `extras_enabled`. A missing row means on. The worker deletes the row when it removes the account.
 
 On Unix the worker folder, `workspaces/` and `runtime/` have mode 0700, and `worker.db` has mode 0600.

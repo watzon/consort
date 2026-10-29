@@ -283,6 +283,19 @@ fn account_view(
         sign_in_methods: methods,
         secret_names: a.secret_names.clone(),
         email: a.email.clone(),
+        extras_enabled: a.extras_enabled,
+        extras: a.extras.as_ref().map(|e| {
+            let group = |g: &model::ExtrasGroup| crate::connectors::ExtrasGroupView {
+                count: g.count,
+                names: g.names.clone(),
+            };
+            crate::connectors::ProviderExtrasView {
+                mcp_servers: group(&e.mcp_servers),
+                plugins: group(&e.plugins),
+                skills: group(&e.skills),
+                cannot_turn_off: e.cannot_turn_off.clone(),
+            }
+        }),
     }
 }
 
@@ -409,6 +422,8 @@ fn closed_approval(m: &model::Message) -> ApprovalView {
         state: RequestState::Closed,
         answer: None,
         allow_always_label: None,
+        card: None,
+        button_labels: Vec::new(),
     }
 }
 
@@ -531,9 +546,9 @@ fn approval_detail(details: &ApprovalDetails) -> (Option<String>, Option<String>
                 .filter(|t| !t.is_empty())
                 .map(str::to_owned),
         ),
-        // Hub cards. The desktop draws its own card for each kind later.
-        // Until then, the detail block names the facts that the user
-        // decides on.
+        // Hub cards. The desktop draws each one from `ApprovalView::card`
+        // (`consort-desktop/src/ui/hub_cards.rs`). This plain text of the
+        // facts stays for a client that shows only the detail block.
         ApprovalDetails::Connector(card) => {
             let mut lines = vec![
                 format!(
@@ -580,8 +595,13 @@ fn approval_detail(details: &ApprovalDetails) -> (Option<String>, Option<String>
     }
 }
 
-fn approval_view(a: &model::Approval) -> ApprovalView {
+fn approval_view(cache: &Cache, a: &model::Approval) -> ApprovalView {
     let (folder, detail) = approval_detail(&a.details);
+    let (card, button_labels) =
+        match crate::extensions_view::hub_card(&a.details, &a.options, cache) {
+            Some((card, labels)) => (Some(Box::new(card)), labels),
+            None => (None, Vec::new()),
+        };
     let mut choices: Vec<ApprovalChoice> = Vec::new();
     for option in &a.options {
         if let Some(choice) = approval_choice(option.kind)
@@ -624,6 +644,8 @@ fn approval_view(a: &model::Approval) -> ApprovalView {
         },
         answer,
         allow_always_label,
+        card,
+        button_labels,
     }
 }
 
@@ -763,6 +785,12 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                 task_selection: c.task_selection.as_ref().map(|s| selection_view(cache, s)),
                 default_isolation: isolation(c.default_isolation),
                 tags: c.tags.clone(),
+                disabled_connections: c
+                    .disabled_connections
+                    .iter()
+                    .map(|id| id.to_string())
+                    .collect(),
+                disabled_skills: c.disabled_skills.iter().map(|id| id.to_string()).collect(),
             }
         })
         .collect();
@@ -915,7 +943,10 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                 && let Some(task) = task_by_card.get(&m.id.to_string())
             {
                 let status = task_status(task.status);
-                let approval = first_pending.get(&task.id).copied().map(approval_view);
+                let approval = first_pending
+                    .get(&task.id)
+                    .copied()
+                    .map(|a| approval_view(cache, a));
                 let worker = task
                     .worker_id
                     .as_ref()
@@ -960,7 +991,7 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                 let approval = approval_by_message
                     .get(&m.id)
                     .copied()
-                    .map(approval_view)
+                    .map(|a| approval_view(cache, a))
                     .unwrap_or_else(|| closed_approval(m));
                 items.push(TimelineItem::Approval(ApprovalCardView {
                     message_id: m.id.to_string(),
@@ -1047,7 +1078,7 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                         if a.status == ApprovalStatus::Pending {
                             approvals += 1;
                         }
-                        PostBody::Approval(approval_view(a))
+                        PostBody::Approval(approval_view(cache, a))
                     }
                     None => PostBody::Approval(closed_approval(m)),
                 }),
@@ -1391,6 +1422,38 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                 ),
             })
             .collect(),
+        connections: {
+            let mut list: Vec<&model::Connection> = cache.connections.values().collect();
+            list.sort_by_key(|c| (c.created_at.as_millis(), c.id.to_string()));
+            list.into_iter()
+                .map(|c| crate::extensions_view::connection_view(c, cache))
+                .collect()
+        },
+        skills: {
+            let mut list: Vec<&model::Skill> = cache.skills.values().collect();
+            list.sort_by_key(|s| (s.installed_at.as_millis(), s.id.to_string()));
+            list.into_iter()
+                .map(|s| crate::extensions_view::skill_view(s, now))
+                .collect()
+        },
+        composio: cache.extensions.composio.clone(),
+        connector_catalog: {
+            let mut catalog = cache.extensions.catalog.clone();
+            for service in &mut catalog.services {
+                service.logo =
+                    crate::extensions_view::with_logo(std::mem::take(&mut service.logo), cache);
+                // The count follows the connections that the feed brings.
+                let connected = cache
+                    .connections
+                    .values()
+                    .filter(|c| c.service == service.slug)
+                    .count();
+                service.connected_count = u32::try_from(connected).unwrap_or(u32::MAX);
+            }
+            catalog
+        },
+        service_tools: cache.extensions.service_tools.values().cloned().collect(),
+        skill_directory: cache.extensions.directory.clone(),
     };
     // Collapsed groups and unread counts come from the hub, so seed the
     // sidebar before the shared rules rebuild it.

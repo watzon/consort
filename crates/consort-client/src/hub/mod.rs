@@ -9,6 +9,7 @@
 //! - `url`: the hub URL rules.
 
 mod commands;
+mod extensions;
 mod link;
 mod outbox;
 mod url;
@@ -33,6 +34,7 @@ use tokio::sync::{Notify, mpsc, oneshot, watch};
 pub(crate) use commands::HubBackend;
 #[cfg(test)]
 pub(crate) use commands::option_for;
+pub(crate) use extensions::run_logos;
 pub use link::backoff;
 pub(crate) use link::{run_link, run_loader};
 pub(crate) use outbox::run_outbox;
@@ -160,6 +162,8 @@ pub(crate) struct Shared {
     outbox_wake: Notify,
     /// A channel may need its snapshot, or the link came up.
     loader_wake: Notify,
+    /// The view may use a logo that has not loaded.
+    logo_wake: Notify,
     /// The callers that wait for the outcome of a queued message.
     waiters: Mutex<std::collections::HashMap<String, oneshot::Sender<outbox::SendOutcome>>>,
     /// The outbox as last written to disk.
@@ -225,6 +229,7 @@ impl Shared {
             publish_wake: Notify::new(),
             outbox_wake: Notify::new(),
             loader_wake: Notify::new(),
+            logo_wake: Notify::new(),
             waiters: Mutex::new(std::collections::HashMap::new()),
             saved_outbox: Mutex::new(outbox),
         });
@@ -267,6 +272,7 @@ impl Shared {
         );
         drop(cache);
         state.worker_pairing = pairing;
+        self.logo_wake.notify_one();
         self.publish.send_if_modified(|current| {
             if **current == state {
                 false

@@ -91,32 +91,36 @@ pub(crate) async fn dispatch(hub: &Hub, caller: Caller, request: ClientRequest) 
         R::PreferencesSetFavoriteModel(r) => {
             to_value(&hub.preferences_set_favorite_model(caller, r).await?)
         }
-        // Connectors and skills (docs/CONNECTORS-SKILLS-PLAN.md). The
-        // contract is in place, the handlers are not. Take a request out of
-        // this list when its handler is built.
-        r @ (R::ComposioSetKey(_)
-        | R::ComposioRemoveKey(_)
-        | R::ComposioGetStatus(_)
-        | R::ConnectorCatalogSearch(_)
-        | R::ConnectorCatalogCategories(_)
-        | R::ConnectorCatalogService(_)
-        | R::ConnectionConnect(_)
-        | R::ConnectionUpdate(_)
-        | R::ConnectionDisconnect(_)
-        | R::ConnectionReconnect(_)
-        | R::ConnectionCalls(_)
-        | R::ChannelSetConnectionEnabled(_)
-        | R::ChannelSetSkillEnabled(_)
-        | R::SkillDirectorySearch(_)
+        R::ComposioSetKey(r) => to_value(&hub.composio_set_key(caller, r).await?),
+        R::ComposioRemoveKey(r) => to_value(&hub.composio_remove_key(caller, r).await?),
+        R::ComposioGetStatus(r) => to_value(&hub.composio_get_status(caller, r).await?),
+        R::ConnectorCatalogSearch(r) => to_value(&hub.connector_catalog_search(caller, r).await?),
+        R::ConnectorCatalogCategories(r) => {
+            to_value(&hub.connector_catalog_categories(caller, r).await?)
+        }
+        R::ConnectorCatalogService(r) => to_value(&hub.connector_catalog_service(caller, r).await?),
+        R::ConnectionConnect(r) => to_value(&hub.connection_connect(caller, r).await?),
+        R::ConnectionUpdate(r) => to_value(&hub.connection_update(caller, r).await?),
+        R::ConnectionDisconnect(r) => to_value(&hub.connection_disconnect(caller, r).await?),
+        R::ConnectionReconnect(r) => to_value(&hub.connection_reconnect(caller, r).await?),
+        R::ConnectionCalls(r) => to_value(&hub.connection_calls(caller, r).await?),
+        R::ChannelSetConnectionEnabled(r) => {
+            to_value(&hub.channel_set_connection_enabled(caller, r).await?)
+        }
+        R::ChannelSetSkillEnabled(r) => to_value(&hub.channel_set_skill_enabled(caller, r).await?),
+        R::SkillUpdate(r) => to_value(&hub.skill_update(caller, r).await?),
+        R::SkillRemove(r) => to_value(&hub.skill_remove(caller, r).await?),
+        R::SkillFiles(r) => to_value(&hub.skill_files(caller, r).await?),
+        R::SkillReadFile(r) => to_value(&hub.skill_read_file(caller, r).await?),
+        // The skill sources and the install pipeline are step 3 of
+        // docs/CONNECTORS-SKILLS-PLAN.md. Take a request out of this list
+        // when its handler is built.
+        r @ (R::SkillDirectorySearch(_)
         | R::SkillDirectorySources(_)
         | R::SkillDirectoryAddSource(_)
         | R::SkillDirectoryRemoveSource(_)
         | R::SkillPreview(_)
-        | R::SkillInstall(_)
-        | R::SkillUpdate(_)
-        | R::SkillRemove(_)
-        | R::SkillFiles(_)
-        | R::SkillReadFile(_)) => Err(not_built(&r)),
+        | R::SkillInstall(_)) => Err(not_built(&r)),
         R::Hello(_) | R::SyncSnapshot(_) | R::SyncSubscribe(_) | R::AuthHttpToken(_) => Err(
             HubError::invalid("This request belongs to the connection and cannot be routed."),
         ),

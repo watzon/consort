@@ -238,6 +238,19 @@ The model picker uses these sizes from `component`:
 | `effort_select` | 150 | The effort select next to a model field in a dialog |
 | `composer_chip` | 28 | The height of the model chip and the effort chip in the composer |
 
+Connectors and skills use these sizes. The Add connector and Add skill dialogs are `layout.dialog_catalog` (760 px) wide. Their list scrolls inside the dialog and fades at its edges.
+
+| Token | Size (px) | Use |
+|---|---|---|
+| `connector_tile` | 44 | The tile around a service logo at the top of a connector page and of the Connect dialog |
+| `connection_field` | 240 | The Name field in a row of a connector page |
+| `catalog_list` | 310 | The height of the service grid in the Add connector dialog |
+| `skill_results` | 300 | The height of the result list in the Add skill dialog |
+| `usage_bar` | 4 | The Composio usage bar under the connector list |
+| `files_list`, `files_view` | 200, 360 | The file list and the height of the skill files dialog |
+
+A service logo is the image that Composio gives. The client loads it (`https` only, at most 256 KiB, SVG, PNG, JPEG, WebP or GIF). Until it loads, and when it does not, the logo is a monogram: the first letter of the service on `surface.selected`.
+
 ## Provider logos
 
 Every provider shows with its logo, never as text alone. The logos are in `crates/consort-desktop/assets/providers/` (see the NOTICE there).

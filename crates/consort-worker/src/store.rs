@@ -14,7 +14,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use consort_proto::error::ErrorBody;
-use consort_proto::ids::{NativeRef, SessionId, TaskId};
+use consort_proto::ids::{AccountId, NativeRef, SessionId, TaskId};
 use consort_proto::model::SessionState;
 use consort_proto::time::Timestamp;
 use consort_proto::worker_link::{
@@ -89,6 +89,10 @@ CREATE TABLE IF NOT EXISTS harness_processes (
     program TEXT NOT NULL,
     started TEXT NOT NULL,
     recorded_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS account_settings (
+    account_id TEXT PRIMARY KEY,
+    extras_enabled INTEGER NOT NULL
 );
 ";
 
@@ -652,6 +656,45 @@ impl Store {
                 })
             })?;
             rows.collect()
+        })
+    }
+
+    // Account settings.
+
+    /// Whether the provider extras of an account are on. An account with no
+    /// row has them on.
+    pub fn extras_enabled(&self, account: AccountId) -> Result<bool, WorkerError> {
+        self.with(|c| {
+            c.query_row(
+                "SELECT extras_enabled FROM account_settings WHERE account_id = ?1",
+                params![account.to_string()],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()
+            .map(|value| value.is_none_or(|v| v != 0))
+        })
+    }
+
+    /// Turns the provider extras of an account on or off. A change reaches
+    /// the next session of the account.
+    pub fn set_extras_enabled(&self, account: AccountId, enabled: bool) -> Result<(), WorkerError> {
+        self.with(|c| {
+            c.execute(
+                "INSERT OR REPLACE INTO account_settings (account_id, extras_enabled) VALUES (?1, ?2)",
+                params![account.to_string(), i64::from(enabled)],
+            )
+            .map(|_| ())
+        })
+    }
+
+    /// Forgets the settings of an account.
+    pub fn delete_account_settings(&self, account: AccountId) -> Result<(), WorkerError> {
+        self.with(|c| {
+            c.execute(
+                "DELETE FROM account_settings WHERE account_id = ?1",
+                params![account.to_string()],
+            )
+            .map(|_| ())
         })
     }
 

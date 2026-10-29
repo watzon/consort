@@ -39,7 +39,46 @@ pub fn remote_icon(agent_id: &str, svg: &str) -> SharedString {
     path.into()
 }
 
-const FILES: [(&str, &[u8]); 59] = [
+/// The asset path of a service logo that the client loaded. It stores the
+/// image the first time, so a draw can use the path at once. GPUI reads the
+/// format from the bytes: SVG, PNG, JPEG, WebP or GIF.
+pub fn remote_image(key: &str, bytes: &[u8]) -> SharedString {
+    let safe: String = key
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let path = format!("remote/logo-{safe}");
+    let known = REMOTE.read().is_ok_and(|images| images.contains_key(&path));
+    if !known && let Ok(mut images) = REMOTE.write() {
+        images.insert(path.clone(), Arc::from(bytes));
+    }
+    path.into()
+}
+
+const FILES: [(&str, &[u8]); 64] = [
+    ("icons/box.svg", include_bytes!("../assets/icons/box.svg")),
+    (
+        "icons/inbox.svg",
+        include_bytes!("../assets/icons/inbox.svg"),
+    ),
+    (
+        "icons/users.svg",
+        include_bytes!("../assets/icons/users.svg"),
+    ),
+    (
+        "icons/upload.svg",
+        include_bytes!("../assets/icons/upload.svg"),
+    ),
+    (
+        "icons/file-text.svg",
+        include_bytes!("../assets/icons/file-text.svg"),
+    ),
     ("icons/star.svg", include_bytes!("../assets/icons/star.svg")),
     (
         "icons/star-filled.svg",

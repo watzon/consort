@@ -9,16 +9,23 @@
 
 pub mod cache;
 pub mod command;
+pub mod connectors;
 pub mod derive;
 pub mod error;
+pub mod extensions_view;
 pub mod format;
 pub mod hub;
 pub mod limits;
 pub mod mock;
 mod mock_backend;
+mod mock_backend_ext;
+pub mod mock_extensions;
 pub mod picker;
 pub mod reduce;
+pub mod skills;
 pub mod store;
+#[cfg(test)]
+mod test_entities;
 pub mod view;
 
 use std::sync::Arc;
@@ -26,9 +33,12 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, watch};
 
 pub use command::{
-    AcpSpec, ChannelChanges, Command, CommandOutput, NewAccount, NewChannel, SecretEnv, SecretText,
+    AcpSpec, ChannelChanges, Command, CommandOutput, ConnectionChanges, NewAccount, NewChannel,
+    NewConnection, SecretEnv, SecretText, SkillChanges,
 };
+pub use connectors::*;
 pub use error::ClientError;
+pub use skills::*;
 pub use store::Drafts;
 pub use view::*;
 
@@ -183,6 +193,7 @@ impl Client {
             tokio::spawn(hub::run_publisher(shared.clone()));
             tokio::spawn(hub::run_outbox(shared.clone()));
             tokio::spawn(hub::run_loader(shared.clone()));
+            tokio::spawn(hub::run_logos(shared.clone()));
             let backend = hub::HubBackend { shared };
             serve(backend, rx, publish, stop).await;
         })?;

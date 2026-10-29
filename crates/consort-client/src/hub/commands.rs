@@ -738,6 +738,8 @@ async fn run(shared: Arc<Shared>, command: Command) -> Result<CommandOutput, Cli
                 .await?;
         }
         Command::LoadAcpRegistry => load_registry(&shared).await?,
+        // Connectors, skills and the provider extras.
+        other => return super::extensions::run(&shared, other).await,
     }
     Ok(CommandOutput::Done)
 }

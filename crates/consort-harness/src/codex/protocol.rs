@@ -28,6 +28,8 @@ pub mod method {
     pub const TURN_STEER: &str = "turn/steer";
     /// Stop the running turn.
     pub const TURN_INTERRUPT: &str = "turn/interrupt";
+    /// Set the extra skill folders of the app-server (experimental).
+    pub const SKILLS_EXTRA_ROOTS_SET: &str = "skills/extraRoots/set";
     /// Read the account.
     pub const ACCOUNT_READ: &str = "account/read";
     /// Start a sign-in.

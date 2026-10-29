@@ -52,9 +52,9 @@ _Avoid_: dependency, global install, binary
 
 ## Conversation
 
-**Everything**:
-The main channel, where the assistant can read every other channel.
-_Avoid_: main chat, home, inbox, overview
+**Tutti**:
+The main channel, where the assistant can read every other channel and manage all of Consort. In music, "tutti" means that all voices play together. The code still calls it Everything (`ChannelKind::Everything`, `ToolAudience::EverythingCoordinator`) until the rename in the chat redesign.
+_Avoid_: Everything (the old name), main chat, home, inbox, overview
 
 **Channel**:
 A conversation scoped to one subject, with its own purpose, instructions, memory, tasks, routines, files and repos.
@@ -197,11 +197,11 @@ One markdown file in memory, addressed by its path.
 _Avoid_: memory entry, fact, record
 
 **Global memory**:
-The memory about the user that every channel reads and only Everything writes.
+The memory about the user that every channel reads and only Tutti writes.
 _Avoid_: user memory, shared memory, profile
 
 **Channel memory**:
-The memory that belongs to one channel, which Everything can also read.
+The memory that belongs to one channel, which Tutti can also read.
 _Avoid_: project memory, local memory
 
 **Memory suggestion**:
@@ -221,7 +221,7 @@ The tools that the hub gives every session so it can post messages, start tasks,
 _Avoid_: MCP tools, assistant tools, built-ins
 
 **Management tool**:
-A hub tool with which the assistant changes channels, workers, accounts, connections or skills. The Everything coordinator manages everything, and a channel's coordinator manages only its own channel. A risky change waits for the user on a management approval card.
+A hub tool with which the assistant changes channels, workers, accounts, connections or skills. The Tutti coordinator manages everything, and a channel's coordinator manages only its own channel. A risky change waits for the user on a management approval card.
 _Avoid_: admin tool, settings tool
 
 ## Connectors and skills
@@ -243,7 +243,7 @@ A folder in the Agent Skills format, with a `SKILL.md`, that the hub installs fr
 _Avoid_: plugin, prompt, recipe, tool
 
 **Use in**:
-Where a connection or a skill can be used: every channel, the channels that have all of some tags, or a list of channels. The Everything channel matches only "every channel", unless it has tags of its own.
+Where a connection or a skill can be used: every channel, the channels that have all of some tags, or a list of channels. Tutti matches only "every channel", unless it has tags of its own.
 _Avoid_: scope (in the UI), visibility, sharing
 
 **Channel exception**:

@@ -34,6 +34,7 @@ use tokio::sync::{broadcast, oneshot};
 
 use crate::error::{HubError, Result};
 
+pub mod connectors;
 pub mod conversation;
 pub mod coordinator;
 pub mod feed;
@@ -43,6 +44,7 @@ pub mod migrations;
 pub mod preferences;
 pub mod routines;
 pub mod sign_ins;
+pub mod skills;
 pub mod work;
 
 const READER_POOL_SIZE: usize = 8;

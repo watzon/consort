@@ -243,10 +243,10 @@ fn cut_event(event: &WakeEvent, room: usize) -> WakeEvent {
 /// A hash of what the system prompt of a coordinator says about its channel.
 /// When it changes, the hub replaces the session, so the new purpose,
 /// instructions or model reach the coordinator.
-fn prompt_fingerprint(channel: &Channel, everything: &Channel) -> String {
+fn prompt_fingerprint(channel: &Channel, everything: &Channel, extensions_key: &str) -> String {
     let selection = channel.effective_coordinator_selection(everything);
     let text = format!(
-        "{}\n{}\n{}\n{}",
+        "{}\n{}\n{}\n{}\n{extensions_key}",
         channel.name,
         channel.purpose,
         channel.instructions,
@@ -296,6 +296,8 @@ struct Inputs {
     channel_index: String,
     context: String,
     files: Vec<FileRef>,
+    /// The effective set of connectors and skills, for the fingerprint.
+    extensions_key: String,
 }
 
 impl Hub {
@@ -330,7 +332,8 @@ impl Hub {
             return Ok(());
         };
 
-        let fingerprint = prompt_fingerprint(&inputs.channel, &inputs.everything);
+        let fingerprint =
+            prompt_fingerprint(&inputs.channel, &inputs.everything, &inputs.extensions_key);
         let mut inputs = inputs;
         if let Some(session) = inputs.session.clone() {
             let current = self
@@ -480,6 +483,7 @@ impl Hub {
                     end_reason: None,
                 };
                 tx.save_session(&session)?;
+                let extensions = tx.session_extensions(worker_id, channel_id)?;
                 tx.save_session_runtime(
                     session.id,
                     &SessionRuntime {
@@ -515,7 +519,7 @@ impl Hub {
                         system_prompt_append: system_prompt,
                         allowed_local_mcp_servers: Vec::new(),
                         channel_files: files,
-                        extensions: Default::default(),
+                        extensions,
                         resume: None,
                         turn: Some(TurnInput {
                             text: first_turn,
@@ -689,6 +693,8 @@ impl Hub {
                 } else {
                     (String::new(), Vec::new())
                 };
+                let extensions_key =
+                    crate::connectors::extensions::effective_set_key(conn, channel_id)?;
                 Ok(Some(Inputs {
                     channel,
                     everything,
@@ -700,6 +706,7 @@ impl Hub {
                     channel_index: String::new(),
                     context,
                     files,
+                    extensions_key,
                 }))
             })
             .await?

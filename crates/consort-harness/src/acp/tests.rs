@@ -577,6 +577,8 @@ mod fake_agent {
                 bridge: None,
             }],
             env: BTreeMap::new(),
+            extras_enabled: true,
+            skills: None,
             resume: None,
             process_watcher: None,
         }
@@ -1201,6 +1203,70 @@ mod fake_agent {
     }
 
     #[tokio::test]
+    async fn extras_off_and_skills_reach_session_new_and_session_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills =
+            crate::skills::SessionSkills::new(dir.path().join("skills"), vec!["pdf-forms".into()]);
+        let plugin = crate::skills::claude_plugin_dir(&skills)
+            .to_string_lossy()
+            .into_owned();
+        for resume in [None, Some(NativeRef::new("s1"))] {
+            let mut s = spec();
+            s.extras_enabled = false;
+            s.skills = Some(skills.clone());
+            s.resume = resume.clone();
+            let (result, log) = connect_with(HarnessKind::ClaudeCode, s, Behavior::default()).await;
+            let (session, _events, _ready) = result.unwrap();
+            {
+                let log = log.lock().unwrap();
+                let method = if resume.is_some() {
+                    "session/load"
+                } else {
+                    "session/new"
+                };
+                let request = log.iter().find(|m| m["method"] == method).unwrap();
+                let options = &request["params"]["_meta"]["claudeCode"]["options"];
+                assert_eq!(
+                    options["settings"],
+                    json!({
+                        "disableClaudeAiConnectors": true,
+                        "syncClaudeAiSkills": false,
+                        "syncClaudeAiPlugins": false
+                    }),
+                    "{method}"
+                );
+                assert_eq!(
+                    options["env"],
+                    json!({"ENABLE_CLAUDEAI_MCP_SERVERS": "false"}),
+                    "{method}"
+                );
+                assert_eq!(
+                    options["plugins"],
+                    json!([{"type": "local", "path": plugin}]),
+                    "{method}"
+                );
+            }
+            Box::new(session).close().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn extras_on_send_no_settings_or_plugins() {
+        let (result, log) =
+            connect_with(HarnessKind::ClaudeCode, spec(), Behavior::default()).await;
+        let (session, _events, _ready) = result.unwrap();
+        {
+            let log = log.lock().unwrap();
+            let new = log.iter().find(|m| m["method"] == "session/new").unwrap();
+            let options = &new["params"]["_meta"]["claudeCode"]["options"];
+            assert!(options.get("settings").is_none(), "{options}");
+            assert!(options.get("env").is_none(), "{options}");
+            assert!(options.get("plugins").is_none(), "{options}");
+        }
+        Box::new(session).close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn a_steer_without_an_answer_does_not_block_the_session() {
         let behavior = Behavior {
             ignore_steer: true,
@@ -1728,6 +1794,65 @@ mod fake_agent {
 }
 
 #[test]
+fn the_skill_folder_goes_into_the_opencode_config() {
+    let found = |name: &str| (name == "opencode").then(|| PathBuf::from("/bin/opencode"));
+    let account = AccountConfig::default_for(HarnessKind::OpenCode);
+    let skills = crate::skills::SessionSkills::new(
+        PathBuf::from("/runtime/ses_1/skills"),
+        vec!["pdf-forms".into()],
+    );
+    let with = launch_recipe_with(
+        HarnessKind::OpenCode,
+        &account,
+        ApprovalMode::Auto,
+        true,
+        Some(&skills),
+        &found,
+    )
+    .unwrap();
+    let config: Value = serde_json::from_str(&with.env["OPENCODE_CONFIG_CONTENT"]).unwrap();
+    assert_eq!(
+        config["skills"],
+        json!([PathBuf::from("/runtime/ses_1/skills/skills").to_string_lossy()])
+    );
+    // The permissions stay.
+    assert_eq!(config["permission"]["bash"], "ask");
+    let without = launch_recipe(
+        HarnessKind::OpenCode,
+        &account,
+        ApprovalMode::Auto,
+        true,
+        &found,
+    )
+    .unwrap();
+    let config: Value = serde_json::from_str(&without.env["OPENCODE_CONFIG_CONTENT"]).unwrap();
+    assert!(config.get("skills").is_none(), "{config}");
+
+    // The agent process gets the same config from the session spec.
+    let mut spec = SessionSpec {
+        session_id: SessionId::new(),
+        workspace: PathBuf::from("/ws"),
+        runtime_dir: PathBuf::from("/runtime/ses_1"),
+        model: String::new(),
+        options: Default::default(),
+        approval_mode: ApprovalMode::Auto,
+        allow_shell: true,
+        system_prompt_append: String::new(),
+        mcp_servers: vec![],
+        env: BTreeMap::new(),
+        extras_enabled: true,
+        skills: Some(skills),
+        resume: None,
+        process_watcher: None,
+    };
+    let process = agent_process_spec(HarnessKind::OpenCode, &account, &spec, &found).unwrap();
+    assert!(process.env["OPENCODE_CONFIG_CONTENT"].contains("/runtime/ses_1/skills/skills"));
+    spec.skills = None;
+    let process = agent_process_spec(HarnessKind::OpenCode, &account, &spec, &found).unwrap();
+    assert!(!process.env["OPENCODE_CONFIG_CONTENT"].contains("skills"));
+}
+
+#[test]
 fn claude_meta_keeps_repo_settings_and_the_shell_out() {
     let dir = tempfile::tempdir().unwrap();
     let workspace = dir.path().join("repo");
@@ -1748,6 +1873,8 @@ fn claude_meta_keeps_repo_settings_and_the_shell_out() {
         system_prompt_append: "You are a task.".into(),
         mcp_servers: vec![],
         env: BTreeMap::new(),
+        extras_enabled: true,
+        skills: None,
         resume: None,
         process_watcher: None,
     };

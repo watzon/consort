@@ -267,6 +267,5 @@ The contract as built (the Rust names in `consort-proto`, and the wire names). S
 - Hub client requests: the or-pattern at the end of `consort-hub/src/api/mod.rs`.
 - Hub tools: `consort-hub/src/tools/mod.rs`, the `NOT_BUILT` list (which also keeps the tools out of `tool.list`) and the matching arm of `dispatch_tool`. Also make `tool.list` show the connector tools only when the session's channel has a connection, and `list_skills` and `read_skill` only for a harness with no native skills.
 - `skill_bundle.get`: `consort-hub/src/net/worker_ws.rs`.
-- The extras toggle: `consort-worker/src/accounts.rs` (`update_account` refuses `extras_enabled`), and `core.rs` reports `extras_enabled: true` and `extras: None`.
-- The worker ignores `SessionStart.extensions` today. The hub sends an empty set, so nothing changes yet.
-- The desktop shows hub cards with the generic approval card (`consort-client/src/reduce.rs`, `approval_detail`) until it has its own cards.
+- The extras toggle: built in the worker (`accounts.rs`, `store.rs`, `core.rs`). See `docs/notes/step2-worker.md`.
+- The worker reads `SessionStart.extensions`, fetches and caches the skill bundles, writes the per-session skill folder and adds the context text to the system prompt. See `docs/notes/step2-worker.md`.

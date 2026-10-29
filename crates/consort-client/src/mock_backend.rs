@@ -22,7 +22,7 @@ pub(crate) struct MockBackend {
 
 /// A change that the mock makes a while after a command, the way a worker
 /// answers later: a sign-in that ends, or an install that finishes.
-type Later = (Duration, Box<dyn FnOnce(&mut ViewState) + Send>);
+type Later = crate::mock_backend_ext::Later;
 
 /// What a command did to the mock.
 #[derive(Default)]
@@ -65,6 +65,7 @@ impl MockBackend {
         let time = format::time_label(now);
         let message_id = self.id("msg");
         let channel_id_new = self.id("chn");
+        let card_id = self.id("mock");
         let mut state = self
             .state
             .lock()
@@ -374,6 +375,13 @@ impl MockBackend {
                     approval.answer = Some(choice);
                     task_id = approval.task_id.clone();
                 });
+                crate::mock_backend_ext::after_card_answer(
+                    &mut state,
+                    &approval_id,
+                    choice,
+                    &card_id,
+                    &mut applied.later,
+                );
                 if let Some(task_id) = task_id {
                     settle(&mut state, &task_id);
                 }
@@ -503,6 +511,8 @@ impl MockBackend {
                     sign_in_methods: crate::mock::sign_in_methods(&harness),
                     secret_names: new.env.names(),
                     email: None,
+                    extras_enabled: true,
+                    extras: None,
                 });
                 applied.output = CommandOutput::AccountCreated(new_account_id);
             }
@@ -690,6 +700,15 @@ impl MockBackend {
                     agents: crate::mock::acp_agents(),
                 };
             }
+            // Connectors, skills and the provider extras.
+            other => {
+                applied.output = crate::mock_backend_ext::apply(
+                    &mut state,
+                    other,
+                    &card_id,
+                    &mut applied.later,
+                )?;
+            }
         }
         applied.reply_to = reply_to;
         Ok(applied)
@@ -796,7 +815,12 @@ fn set_account_status(account: &mut HarnessAccountView, status: AccountStatus, d
 }
 
 /// Ends a sign-in as a success, and signs its account in.
-fn finish_sign_in(state: &mut ViewState, sign_in_id: &str, worker_id: &str, account_id: &str) {
+pub(crate) fn finish_sign_in(
+    state: &mut ViewState,
+    sign_in_id: &str,
+    worker_id: &str,
+    account_id: &str,
+) {
     let Some(sign_in) = state.sign_ins.iter_mut().find(|s| s.id == sign_in_id) else {
         return;
     };

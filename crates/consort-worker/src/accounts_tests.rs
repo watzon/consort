@@ -99,6 +99,60 @@ impl Updates {
 }
 
 #[tokio::test]
+async fn an_opencode_account_runs_with_its_own_home() {
+    let (_dir, core, _rx) = worker(false);
+    let id = AccountId::new();
+    core.account_command(create(id, "opencode", &[]))
+        .await
+        .unwrap();
+    let account = core.config_snapshot().account(id).unwrap().clone();
+    let profile = core.profile_dir(&account);
+    let prepared = core.with_profile(&account).unwrap();
+    let env = &prepared.runtime.env;
+    // `HOME` is a folder in the profile, so `~/.claude/skills` and
+    // `~/.agents/skills` of the real home do not reach OpenCode.
+    assert_eq!(env["HOME"], profile.join("home").to_string_lossy());
+    assert!(profile.join("home").is_dir());
+    assert_eq!(
+        env["XDG_DATA_HOME"],
+        profile.join("xdg/data").to_string_lossy(),
+        "the sign-in stays where it was"
+    );
+    // The pins name tools of the user and nothing else.
+    let allowed = [
+        "HOME",
+        "USERPROFILE",
+        "XDG_DATA_HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_STATE_HOME",
+        "XDG_CACHE_HOME",
+        "GIT_CONFIG_GLOBAL",
+        "GNUPGHOME",
+        "CARGO_HOME",
+        "RUSTUP_HOME",
+        "BUN_INSTALL",
+        "npm_config_cache",
+    ];
+    for name in env.keys() {
+        assert!(allowed.contains(&name.as_str()), "{name}");
+    }
+    // Claude Code keeps no HOME of its own.
+    let claude = AccountId::new();
+    core.account_command(create(claude, "claude", &[]))
+        .await
+        .unwrap();
+    let claude = core.config_snapshot().account(claude).unwrap().clone();
+    assert!(
+        !core
+            .with_profile(&claude)
+            .unwrap()
+            .runtime
+            .env
+            .contains_key("HOME")
+    );
+}
+
+#[tokio::test]
 async fn create_update_and_remove_an_account_with_a_profile_folder() {
     let (_dir, core, _rx) = worker(false);
     let id = AccountId::new();
@@ -208,13 +262,48 @@ async fn create_update_and_remove_an_account_with_a_profile_folder() {
     assert_eq!(core.config_snapshot().accounts[0].label, "Claude Work");
     assert_eq!(core.inventory().accounts[0].secret_names, ["OTHER_KEY"]);
 
-    // The provider extras toggle is not built yet. The worker refuses the
-    // whole update, so the name does not change either.
+    // The provider extras are on until the user turns them off. The setting
+    // is kept in the worker store and shows in the inventory.
+    assert!(core.inventory().accounts[0].extras_enabled);
+    let set_extras = |enabled: bool| AccountUpdateCommand {
+        account_id: id,
+        label: None,
+        env_set: SecretEnv::new(),
+        env_remove: vec![],
+        extras_enabled: Some(enabled),
+    };
+    core.account_command(set_extras(false).into())
+        .await
+        .unwrap();
+    assert!(!core.inventory().accounts[0].extras_enabled);
+    assert!(!core.store.extras_enabled(id).unwrap());
+    // The same command again changes nothing.
+    core.account_command(set_extras(false).into())
+        .await
+        .unwrap();
+    assert!(!core.inventory().accounts[0].extras_enabled);
+    // An update without the field keeps the setting.
+    core.account_command(
+        AccountUpdateCommand {
+            account_id: id,
+            label: Some("Claude Other".into()),
+            env_set: SecretEnv::new(),
+            env_remove: vec![],
+            extras_enabled: None,
+        }
+        .into(),
+    )
+    .await
+    .unwrap();
+    assert!(!core.inventory().accounts[0].extras_enabled);
+    core.account_command(set_extras(true).into()).await.unwrap();
+    assert!(core.inventory().accounts[0].extras_enabled);
+    // An account that the worker does not know is refused.
     let err = core
         .account_command(
             AccountUpdateCommand {
-                account_id: id,
-                label: Some("Claude Other".into()),
+                account_id: AccountId::new(),
+                label: None,
                 env_set: SecretEnv::new(),
                 env_remove: vec![],
                 extras_enabled: Some(false),
@@ -223,14 +312,19 @@ async fn create_update_and_remove_an_account_with_a_profile_folder() {
         )
         .await
         .unwrap_err();
-    assert_eq!(err.code, ErrorCode::Unsupported);
-    assert_eq!(core.config_snapshot().accounts[0].label, "Claude Work");
-    assert!(core.inventory().accounts[0].extras_enabled);
+    assert_eq!(err.code, ErrorCode::NotFound);
+    core.account_command(set_extras(false).into())
+        .await
+        .unwrap();
 
     core.account_command(AccountRemoveCommand { account_id: id }.into())
         .await
         .unwrap();
     assert!(!profile.exists(), "the profile folder is gone");
+    assert!(
+        core.store.extras_enabled(id).unwrap(),
+        "the setting of a removed account is forgotten"
+    );
     assert!(
         WorkerToml::load(&core.config_dir)
             .unwrap()

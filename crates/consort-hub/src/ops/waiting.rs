@@ -46,6 +46,12 @@ impl Hub {
                 approval.answered_at = Some(tx.now());
                 approval.answered_by_client_id = client_id;
                 tx.save_approval(&approval)?;
+                if approval.is_hub_card() {
+                    // The hub made this card and carries out the answer
+                    // itself, after the commit. No session.respond.
+                    resume_if_nothing_waits(tx, approval.task_id)?;
+                    return Ok((approval, None));
+                }
                 let session = work::session_or_404(tx.db(), approval.session_id)?;
                 tx.queue_command(
                     session.worker_id,
@@ -60,10 +66,13 @@ impl Hub {
                 )?;
                 resume_if_nothing_waits(tx, approval.task_id)?;
                 let _ = &hub;
-                Ok((approval, session.worker_id))
+                Ok((approval, Some(session.worker_id)))
             })
             .await?;
-        self.pump_worker(worker_id);
+        match worker_id {
+            Some(worker_id) => self.pump_worker(worker_id),
+            None => self.hub_card_answered(approval.clone()),
+        }
         Ok(ApprovalResult { approval })
     }
 

@@ -139,6 +139,9 @@ pub struct Layout {
     pub dialog_worker: f32,
     /// The Add account dialog: the provider grid, the name and the sign-in.
     pub dialog_account: f32,
+    /// The Add connector and Add skill dialogs: a search and a list that
+    /// scrolls inside the dialog.
+    pub dialog_catalog: f32,
     /// The channel switcher.
     pub switcher_width: f32,
     /// The space above the switcher.
@@ -230,6 +233,23 @@ pub struct Components {
     pub effort_select: f32,
     /// The height of a chip in the composer, such as the model chip.
     pub composer_chip: f32,
+    /// The tile around a service logo at the top of a connector page and
+    /// of the Connect dialog.
+    pub connector_tile: f32,
+    /// A text field or a select in a row of a connector or skill page.
+    pub connection_field: f32,
+    /// The height of the service grid in the Add connector dialog. It
+    /// scrolls inside.
+    pub catalog_list: f32,
+    /// The height of the result list in the Add skill dialog. It scrolls
+    /// inside.
+    pub skill_results: f32,
+    /// The height of the Composio usage bar.
+    pub usage_bar: f32,
+    /// The file list of the skill files dialog.
+    pub files_list: f32,
+    /// The height of the skill files dialog body.
+    pub files_view: f32,
     /// The vertical padding of a text input: 36 px with its border.
     pub input_pad_y: f32,
     /// The vertical padding of a text button: 30 px high.

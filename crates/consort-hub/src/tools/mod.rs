@@ -13,44 +13,26 @@ use crate::hub::{Hub, ToolCtx};
 use crate::store::{conversation, work};
 
 mod chat;
+mod management;
 mod routines;
 mod tasks;
 
-/// The hub tools that the proto defines but the hub does not carry out yet
-/// (docs/CONNECTORS-SKILLS-PLAN.md). `tool.list` leaves them out, so no
-/// session sees them, and a call gets `unsupported`. Take a tool out of
-/// this list when its handler is built.
-pub(crate) const NOT_BUILT: &[HubTool] = &[
+/// The hub tools that the proto defines but the hub does not carry out yet:
+/// the skill sources of step 3 (docs/CONNECTORS-SKILLS-PLAN.md). `tool.list`
+/// leaves them out, so no session sees them, and a call gets
+/// `unsupported`. Take a tool out of this list when its handler is built.
+pub(crate) const NOT_BUILT: &[HubTool] = &[HubTool::SearchSkills, HubTool::AddSkill];
+
+/// The tools that work on the connectors of a session's channel.
+const CONNECTOR_TOOLS: &[HubTool] = &[
     HubTool::ListConnectorTools,
     HubTool::GetConnectorTool,
     HubTool::RunConnectorTool,
-    HubTool::ListSkills,
-    HubTool::ReadSkill,
-    HubTool::ListConnections,
-    HubTool::ListInstalledSkills,
-    HubTool::ConnectService,
-    HubTool::AddSkill,
-    HubTool::CreateChannel,
-    HubTool::UpdateChannel,
-    HubTool::ArchiveChannel,
-    HubTool::SetDefaultModel,
-    HubTool::SetWorkerTags,
-    HubTool::InstallTool,
-    HubTool::AddAccount,
-    HubTool::StartSignIn,
-    HubTool::SetAccountExtras,
-    HubTool::SearchConnectorCatalog,
-    HubTool::UpdateConnection,
-    HubTool::Disconnect,
-    HubTool::SearchSkills,
-    HubTool::UpdateSkill,
-    HubTool::RemoveSkill,
-    HubTool::UpdateThisChannel,
-    HubTool::SetChannelTags,
-    HubTool::SetChannelConnector,
-    HubTool::SetChannelSkill,
-    HubTool::RequestAccess,
 ];
+
+/// The tools that read skills, for a harness that does not load skills
+/// itself.
+const SKILL_TOOLS: &[HubTool] = &[HubTool::ListSkills, HubTool::ReadSkill];
 
 impl Hub {
     /// Builds the tool context of a session. A session that has ended or is
@@ -87,9 +69,17 @@ impl Hub {
         session_id: SessionId,
     ) -> Result<Vec<ToolDefinition>> {
         let ctx = self.tool_ctx(session_id).await?;
+        let has_connections = self.channel_has_connections(&ctx).await?;
+        let native_skills = crate::skills::harness_loads_skills(&ctx.session.harness);
         Ok(tools_for(ctx.audience)
             .into_iter()
-            .filter(|t| HubTool::from_name(&t.name).is_none_or(|tool| !NOT_BUILT.contains(&tool)))
+            .filter(|t| {
+                HubTool::from_name(&t.name).is_none_or(|tool| {
+                    !NOT_BUILT.contains(&tool)
+                        && (has_connections || !CONNECTOR_TOOLS.contains(&tool))
+                        && (!native_skills || !SKILL_TOOLS.contains(&tool))
+                })
+            })
             .collect())
     }
 
@@ -158,45 +148,25 @@ impl Hub {
             C::PostUpdate(a) => self.tool_post_update(ctx, a).await,
             C::SubmitForReview(a) => self.tool_submit_for_review(ctx, a).await,
             C::PublishArtifact(a) => self.tool_publish_artifact(ctx, a).await,
+            C::ListConnectorTools(a) => self.tool_list_connector_tools(ctx, a).await,
+            C::GetConnectorTool(a) => self.tool_get_connector_tool(ctx, a).await,
+            C::RunConnectorTool(a) => self.tool_run_connector_tool(ctx, a).await,
+            C::ListSkills(_) => self.tool_list_skills(ctx).await,
+            C::ReadSkill(a) => self.tool_read_skill(ctx, a).await,
             // See NOT_BUILT.
-            C::ListConnectorTools(_)
-            | C::GetConnectorTool(_)
-            | C::RunConnectorTool(_)
-            | C::ListSkills(_)
-            | C::ReadSkill(_)
-            | C::ListConnections(_)
-            | C::ListInstalledSkills(_)
-            | C::ConnectService(_)
-            | C::AddSkill(_)
-            | C::CreateChannel(_)
-            | C::UpdateChannel(_)
-            | C::ArchiveChannel(_)
-            | C::SetDefaultModel(_)
-            | C::SetWorkerTags(_)
-            | C::InstallTool(_)
-            | C::AddAccount(_)
-            | C::StartSignIn(_)
-            | C::SetAccountExtras(_)
-            | C::SearchConnectorCatalog(_)
-            | C::UpdateConnection(_)
-            | C::Disconnect(_)
-            | C::SearchSkills(_)
-            | C::UpdateSkill(_)
-            | C::RemoveSkill(_)
-            | C::UpdateThisChannel(_)
-            | C::SetChannelTags(_)
-            | C::SetChannelConnector(_)
-            | C::SetChannelSkill(_)
-            | C::RequestAccess(_) => Err(HubError::Api(ErrorBody::not_built(call.tool().name()))),
+            C::SearchSkills(_) | C::AddSkill(_) => {
+                Err(HubError::Api(ErrorBody::not_built(call.tool().name())))
+            }
+            other => self.tool_management(ctx, other).await,
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use consort_proto::client_api::{ClientRequest, ConnectionDisconnect, SkillDirectorySources};
+    use consort_proto::client_api::{ClientRequest, SkillDirectorySources, SkillPreview};
     use consort_proto::error::ErrorCode;
-    use consort_proto::ids::{AccountId, ConnectionId, WorkerId};
+    use consort_proto::ids::{AccountId, WorkerId};
     use consort_proto::model::{ModelOptions, Session, SessionState, Usage};
     use consort_proto::time::Timestamp;
     use serde_json::json;
@@ -257,8 +227,8 @@ mod tests {
         let result = hub
             .call_tool(
                 session_id,
-                "run_connector_tool",
-                json!({"connector": "gmail_work", "tool": "GMAIL_SEND_EMAIL", "arguments": {}}),
+                "add_skill",
+                json!({"source": "anthropics/skills", "path": "skills/pdf"}),
             )
             .await;
         assert!(result.is_error);
@@ -268,7 +238,7 @@ mod tests {
             body["error"]["message"]
                 .as_str()
                 .unwrap()
-                .contains("run_connector_tool")
+                .contains("add_skill")
         );
     }
 
@@ -276,8 +246,12 @@ mod tests {
     async fn requests_that_are_not_built_answer_unsupported() {
         let (hub, _dir) = test_hub().await;
         for request in [
-            ClientRequest::from(ConnectionDisconnect {
-                connection_id: ConnectionId::new(),
+            ClientRequest::from(SkillPreview {
+                source: consort_proto::client_api::SkillInstallSource::Git {
+                    url: "https://example.com/skills.git".to_owned(),
+                    path: None,
+                    git_ref: None,
+                },
             }),
             ClientRequest::from(SkillDirectorySources {}),
         ] {

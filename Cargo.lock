@@ -1452,6 +1452,7 @@ dependencies = [
 name = "consort-hub"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "axum",
  "chrono",
  "chrono-tz",

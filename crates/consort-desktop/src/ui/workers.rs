@@ -536,6 +536,7 @@ impl ConsortApp {
                 .into_any_element(),
         };
         let (menu_worker, menu_account) = (w.id.clone(), account.id.clone());
+        let (settings_worker, settings_account) = (w.id.clone(), account.id.clone());
         let can_sign_out = matches!(status, AccountStatus::SignedIn | AccountStatus::Ready);
         list_row(last, t)
             .id(SharedString::from(format!("account-row-{}", account.id)))
@@ -555,15 +556,41 @@ impl ConsortApp {
                     .flex_col()
                     .flex_1()
                     .min_w_0()
-                    .child(text(
-                        account.label.clone(),
-                        t.text.ui_strong,
-                        if quiet {
-                            c.text_secondary
-                        } else {
-                            c.text_primary
-                        },
-                    ))
+                    .child(
+                        // The name opens the account's settings: its name
+                        // and its provider extras.
+                        focusable(
+                            div().id(SharedString::from(format!(
+                                "account-settings-{}",
+                                account.id
+                            ))),
+                            t,
+                        )
+                        .rounded(t.radius.sm)
+                        .cursor_pointer()
+                        .hover(|s| s.underline())
+                        .child(text(
+                            account.label.clone(),
+                            t.text.ui_strong,
+                            if quiet {
+                                c.text_secondary
+                            } else {
+                                c.text_primary
+                            },
+                        ))
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                this.open_dialog(
+                                    crate::app::Dialog::AccountSettings(
+                                        settings_worker.clone(),
+                                        settings_account.clone(),
+                                    ),
+                                    window,
+                                    cx,
+                                )
+                            },
+                        )),
+                    )
                     .child(account_detail),
             )
             .child(

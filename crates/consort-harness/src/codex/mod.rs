@@ -90,12 +90,21 @@ pub fn codex_capabilities() -> Capabilities {
     }
 }
 
+/// Codex's limit for one MCP tool call, in seconds. The hub answers a
+/// connector call that waits for approval after 285 seconds, and the worker
+/// gives up on a hub request after 300.
+pub const MCP_TOOL_TIMEOUT_SECS: u64 = 310;
+
 /// The `config` object of `thread/start`: the `mcp_servers`, and with
 /// `allow_shell` off, the `features` that remove the shell tools.
 ///
 /// The bearer token of a server goes in `http_headers`. Tested with
 /// codex-cli 0.165.0: Codex sends it as the `Authorization` header to the
 /// MCP server, and does not write it to its home folder.
+///
+/// `tool_timeout_sec` raises Codex's per-call limit (60 seconds by default),
+/// because a connector call can wait minutes for the user's approval. It
+/// stays above the hub's approval wait, so the hub answers first.
 pub fn thread_config(
     servers: &[McpServerSpec],
     allow_shell: bool,
@@ -104,6 +113,10 @@ pub fn thread_config(
     for server in servers {
         let mut entry = serde_json::Map::new();
         entry.insert("url".to_owned(), Value::String(server.url.clone()));
+        entry.insert(
+            "tool_timeout_sec".to_owned(),
+            Value::from(MCP_TOOL_TIMEOUT_SECS),
+        );
         if let Some(token) = &server.bearer_token {
             entry.insert(
                 "http_headers".to_owned(),
@@ -124,6 +137,57 @@ pub fn thread_config(
         root.insert("features".to_owned(), Value::Object(features));
     }
     root
+}
+
+/// The `config` object of a session: [`thread_config`], and with the
+/// provider extras off, the keys that stop what ChatGPT sign-in syncs to the
+/// account (see [`extras_off_config`]).
+pub fn session_config(spec: &SessionSpec) -> serde_json::Map<String, Value> {
+    let mut config = thread_config(&spec.mcp_servers, spec.allow_shell);
+    if !spec.extras_enabled {
+        merge_config(&mut config, extras_off_config());
+    }
+    config
+}
+
+/// The Codex settings that stop the account-synced extras for one thread.
+///
+/// With ChatGPT sign-in, Codex adds a hosted `codex_apps` MCP server (the
+/// ChatGPT connectors), syncs the plugins that the account has installed
+/// and, when the host gives it a provider, loads cloud skills. These keys
+/// turn each of them off (`codex-rs/codex-mcp/src/mcp/mod.rs` and
+/// `core-plugins/src/manager.rs` in `openai/codex`). `features.plugins`
+/// is one switch for every plugin, so it also stops the plugins that the
+/// user installed by hand. Tested with codex-cli 0.165.0: `thread/start`
+/// accepts the `config`.
+pub fn extras_off_config() -> serde_json::Map<String, Value> {
+    match json!({
+        "features": {"apps": false, "plugins": false},
+        "cloud": {"skills": {"enabled": false}},
+    }) {
+        Value::Object(map) => map,
+        _ => serde_json::Map::new(),
+    }
+}
+
+/// Adds the keys of `extra` to `config`. An object that both have is
+/// merged one level down, so `features` keeps the keys of both.
+fn merge_config(
+    config: &mut serde_json::Map<String, Value>,
+    extra: serde_json::Map<String, Value>,
+) {
+    for (key, value) in extra {
+        match (config.get_mut(&key), value) {
+            (Some(Value::Object(have)), Value::Object(add)) => {
+                for (k, v) in add {
+                    have.insert(k, v);
+                }
+            }
+            (_, value) => {
+                config.insert(key, value);
+            }
+        }
+    }
 }
 
 /// The `thread/start` or `thread/resume` params for a session.
@@ -461,7 +525,7 @@ impl Harness for CodexHarness {
         account: &AccountConfig,
         spec: SessionSpec,
     ) -> Result<(Box<dyn HarnessSession>, EventReceiver), HarnessError> {
-        let config = thread_config(&spec.mcp_servers, spec.allow_shell);
+        let config = session_config(&spec);
         let conn = connect(
             account,
             &spec.runtime_dir,
@@ -486,6 +550,24 @@ pub(crate) async fn start_thread(
     process: Option<HarnessProcess>,
 ) -> Result<(CodexSession, EventReceiver), HarnessError> {
     let mut process = process;
+    // The skills of the session are an extra skill root of this app-server,
+    // which serves this session only. Codex reads no setting for it.
+    let skills_note = match &spec.skills {
+        Some(skills) => {
+            let roots = json!({"extraRoots": [crate::skills::codex_extra_root(skills)]});
+            match tokio::time::timeout(
+                OPEN_TIMEOUT,
+                client.request::<Value, Value>(method::SKILLS_EXTRA_ROOTS_SET, &roots),
+            )
+            .await
+            {
+                Ok(Ok(_)) => None,
+                Ok(Err(err)) => Some(err.to_string()),
+                Err(_) => Some("codex did not answer in time".to_owned()),
+            }
+        }
+        None => None,
+    };
     let params = thread_params(&spec, config);
     let method_name = if spec.resume.is_some() {
         method::THREAD_RESUME
@@ -515,6 +597,13 @@ pub(crate) async fn start_thread(
     let thread_id = started.thread.id;
     let (event_tx, event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
     let (command_tx, command_rx) = mpsc::channel(64);
+    if let Some(why) = skills_note {
+        // The thread runs without its Consort skills. The user sees why.
+        let _ = event_tx.try_send(SessionEvent::Error {
+            code: "skills_not_delivered".to_owned(),
+            message: format!("Codex did not take the skill folder of this session ({why}), so the session runs without these skills."),
+        });
+    }
     let native_ref = NativeRef::new(&thread_id);
     let effort = match spec.options.get("effort") {
         Some(OptionValue::Text(e)) => Some(e.clone()),

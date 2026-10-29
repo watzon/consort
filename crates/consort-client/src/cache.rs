@@ -8,8 +8,9 @@ use consort_proto::{
     client_api::{EntityKind, EntityPayload, FeedChange, FeedEntry, Snapshot},
     ids::{ChannelId, TaskId},
     model::{
-        AcpRegistryAgent, Approval, Channel, Decision, Group, ItemPayload, Message, MessageKind,
-        PREFERENCES_ENTITY_ID, Preferences, ReadMarker, Repo, SessionItem, SignIn, Task, Worker,
+        AcpRegistryAgent, Approval, Channel, Connection, Decision, Group, ItemPayload, Message,
+        MessageKind, PREFERENCES_ENTITY_ID, Preferences, ReadMarker, Repo, SessionItem, SignIn,
+        Skill, Task, Worker,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -128,6 +129,33 @@ pub struct Cache {
     /// The user's preferences, from the `all` snapshot and the feed. Empty
     /// until they load.
     pub preferences: Preferences,
+    /// The connections, by ID, from the `all` snapshot and the feed.
+    pub connections: BTreeMap<String, Connection>,
+    /// The installed skills, by ID, from the `all` snapshot and the feed.
+    pub skills: BTreeMap<String, Skill>,
+    /// What the client asked the hub about connectors and skills. These are
+    /// not feed entities, so a reload keeps them.
+    pub extensions: Extensions,
+}
+
+/// The parts of the connector and skill views that the client loads on
+/// request: the Composio status, the catalog, the tools of services, the
+/// skill directory and the logos.
+#[derive(Clone, Debug, Default)]
+pub struct Extensions {
+    pub composio: crate::connectors::ComposioView,
+    pub catalog: crate::connectors::CatalogView,
+    /// Counts the catalog searches, so an old answer does not replace a
+    /// newer one.
+    pub catalog_serial: u64,
+    pub service_tools: BTreeMap<String, crate::connectors::ServiceToolsView>,
+    pub directory: crate::skills::SkillDirectoryView,
+    pub directory_serial: u64,
+    /// The logos that loaded, by URL.
+    pub logos: BTreeMap<String, crate::connectors::LogoImage>,
+    /// The logo URLs that the client tried, so a logo that does not load is
+    /// not asked for again.
+    pub logos_tried: BTreeSet<String>,
 }
 
 /// Why a message that waited for a channel did not go out when the channel
@@ -154,7 +182,9 @@ impl Cache {
         let failures = std::mem::take(&mut self.send_failures);
         let threads = std::mem::take(&mut self.loaded_threads);
         let dismissed = std::mem::take(&mut self.sign_ins_dismissed);
+        let extensions = std::mem::take(&mut self.extensions);
         *self = Cache::default();
+        self.extensions = extensions;
         // A sign-in that the user closed stays closed after a reload.
         self.sign_ins_dismissed = dismissed;
         self.pending = pending;
@@ -360,6 +390,12 @@ impl Cache {
         snapshot
             .sign_ins
             .retain(|s| !self.changed_after(EntityKind::SignIn, &s.id.to_string(), at));
+        snapshot
+            .connections
+            .retain(|c| !self.changed_after(EntityKind::Connection, &c.id.to_string(), at));
+        snapshot
+            .skills
+            .retain(|s| !self.changed_after(EntityKind::Skill, &s.id.to_string(), at));
         if self.changed_after(EntityKind::Preferences, PREFERENCES_ENTITY_ID, at) {
             snapshot.preferences = None;
         }
@@ -445,10 +481,67 @@ impl Cache {
                 self.sign_ins.insert(id, s);
             }
         }
-        // Only the `all` snapshot has the preferences.
+        // Only the `all` snapshot has the preferences, the connections and
+        // the skills.
         if let Some(preferences) = snapshot.preferences {
             self.preferences = preferences;
         }
+        for c in snapshot.connections {
+            self.connections.insert(c.id.to_string(), c);
+        }
+        for s in snapshot.skills {
+            self.skills.insert(s.id.to_string(), s);
+        }
+    }
+
+    /// Adds or replaces one connection, as from the answer to
+    /// `connection.connect`. A feed entry that is newer wins: the answer
+    /// does not overwrite a status that the feed changed after it.
+    pub fn merge_connection(&mut self, connection: Connection) {
+        let id = connection.id.to_string();
+        let newer = self
+            .connections
+            .get(&id)
+            .is_some_and(|c| c.updated_at > connection.updated_at);
+        if !newer {
+            self.connections.insert(id, connection);
+        }
+    }
+
+    /// The same for a skill.
+    pub fn merge_skill(&mut self, skill: Skill) {
+        let id = skill.id.to_string();
+        let newer = self
+            .skills
+            .get(&id)
+            .is_some_and(|s| s.updated_at > skill.updated_at);
+        if !newer {
+            self.skills.insert(id, skill);
+        }
+    }
+
+    /// The logo URLs that the view uses and that the client has not tried
+    /// yet: those of the connections, of the catalog and of the cards.
+    pub fn wanted_logos(&self) -> Vec<String> {
+        let mut urls: BTreeSet<String> = BTreeSet::new();
+        urls.extend(self.connections.values().filter_map(|c| c.logo_url.clone()));
+        urls.extend(
+            self.extensions
+                .catalog
+                .services
+                .iter()
+                .filter_map(|s| s.logo.url.clone()),
+        );
+        for a in self.approvals.values() {
+            if let consort_proto::model::ApprovalDetails::ConnectService(card) = &a.details
+                && let Some(url) = &card.logo_url
+            {
+                urls.insert(url.clone());
+            }
+        }
+        urls.into_iter()
+            .filter(|u| !self.extensions.logos_tried.contains(u))
+            .collect()
     }
 
     fn insert_message(&mut self, message: Message) {
@@ -587,7 +680,15 @@ impl Cache {
                 // client's sign-in is not this user's flow to follow here.
                 EntityPayload::SignIn(sign_in) => {
                     let id = sign_in.id.to_string();
-                    if !self.sign_ins.contains_key(&id) || self.sign_ins_dismissed.contains(&id) {
+                    // A sign-in that the hub started for a sign-in card shows
+                    // too: the user follows it from the card.
+                    let from_card = self.approvals.values().any(|a| {
+                        matches!(&a.details, consort_proto::model::ApprovalDetails::SignIn(card)
+                            if card.sign_in_id == Some(sign_in.id))
+                    });
+                    if (!self.sign_ins.contains_key(&id) && !from_card)
+                        || self.sign_ins_dismissed.contains(&id)
+                    {
                         return false;
                     }
                     self.sign_ins.insert(id, sign_in);
@@ -597,6 +698,12 @@ impl Cache {
                         return false;
                     }
                     self.preferences = preferences;
+                }
+                EntityPayload::Connection(c) => {
+                    self.connections.insert(c.id.to_string(), c);
+                }
+                EntityPayload::Skill(skill) => {
+                    self.skills.insert(skill.id.to_string(), skill);
                 }
                 // Memory notes, files, routines and clients have no view
                 // yet.
@@ -618,6 +725,8 @@ impl Cache {
                     EntityKind::Decision => self.decisions.remove(id).is_some(),
                     EntityKind::ReadMarker => self.read_markers.remove(id).is_some(),
                     EntityKind::SignIn => self.sign_ins.remove(id).is_some(),
+                    EntityKind::Connection => self.connections.remove(id).is_some(),
+                    EntityKind::Skill => self.skills.remove(id).is_some(),
                     EntityKind::SessionItem => id.split_once(':').is_some_and(|(session, item)| {
                         let Some(items) = self.session_items.get_mut(session) else {
                             return false;
@@ -804,6 +913,48 @@ mod tests {
         assert_eq!(ids, ["opus", "haiku"]);
         assert!(view.is_favorite("Claude Work", "haiku"));
         assert!(!view.is_favorite("Claude Personal", "haiku"));
+    }
+
+    #[test]
+    fn the_cache_keeps_connections_and_skills_from_the_snapshot_and_the_feed() {
+        use consort_proto::model::{ConnectionStatus, UseIn};
+        let mut cache = Cache::default();
+        let work = crate::test_entities::connection("Gmail Work", UseIn::EveryChannel, 1);
+        let pdf = crate::test_entities::skill("pdf", 1);
+        let mut snapshot = snapshot_at(10);
+        snapshot.connections = vec![work.clone()];
+        snapshot.skills = vec![pdf.clone()];
+        cache.load_snapshot(snapshot);
+        assert_eq!(cache.connections.len(), 1);
+        assert_eq!(cache.skills.len(), 1);
+        // The feed changes the status, and a stale answer does not undo it.
+        let mut signed_out = work.clone();
+        signed_out.status = ConnectionStatus::NeedsSignIn { message: None };
+        signed_out.updated_at = Timestamp::from_millis(5);
+        assert!(cache.apply(upsert(11, EntityPayload::Connection(signed_out))));
+        cache.merge_connection(work.clone());
+        assert!(matches!(
+            cache.connections[&work.id.to_string()].status,
+            ConnectionStatus::NeedsSignIn { .. }
+        ));
+        // An older snapshot does not bring back what the feed deleted.
+        let delete = FeedEntry {
+            seq: 12,
+            at: Timestamp::from_millis(0),
+            entity_id: pdf.id.to_string(),
+            channel_id: None,
+            change: FeedChange::Delete(EntityKind::Skill),
+        };
+        assert!(cache.apply(delete));
+        let mut old = snapshot_at(9);
+        old.skills = vec![pdf.clone()];
+        cache.merge_entities(old);
+        assert!(cache.skills.is_empty());
+        // A reload keeps what the client loaded on request.
+        cache.extensions.composio.key_present = true;
+        cache.load_snapshot(snapshot_at(20));
+        assert!(cache.extensions.composio.key_present);
+        assert!(cache.connections.is_empty());
     }
 
     #[test]

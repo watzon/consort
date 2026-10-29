@@ -16,7 +16,7 @@ use consort_proto::auth::{
 use consort_proto::error::ErrorBody;
 use consort_proto::frame::{Frame, FrameId, Message as _, ResponseFrame};
 use consort_proto::ids::{SessionId, WorkerId};
-use consort_proto::model::Inventory;
+use consort_proto::model::{Inventory, Sha256Hash, SkillBundle, SkillFileInfo, skill_content_hash};
 use consort_proto::tools::{HubTool, ToolCallResult};
 use consort_proto::worker_link::{
     HubToWorker, SequencedEvent, SessionEventsAck, ToolCall, ToolListResult, WorkerToHub,
@@ -46,6 +46,14 @@ pub struct HubState {
     pub hellos: Mutex<Vec<WorkerHello>>,
     pub blobs: Mutex<Vec<String>>,
     pub tool_lists: Mutex<Vec<SessionId>>,
+    /// The skill bundles that the hub serves, by content hash.
+    pub bundles: Mutex<HashMap<String, SkillBundle>>,
+    /// The blob bodies that the hub serves, by SHA-256.
+    pub blob_bodies: Mutex<HashMap<String, Vec<u8>>>,
+    /// The content hashes that `skill_bundle.get` asked for.
+    pub bundle_requests: Mutex<Vec<String>>,
+    /// The blob paths of the GET requests whose worker signature was valid.
+    pub blob_gets: Mutex<Vec<String>>,
     pub kick: Notify,
 }
 
@@ -55,7 +63,7 @@ pub struct FakeHub {
     pub state: Arc<HubState>,
 }
 
-async fn read_http(stream: &mut TcpStream) -> (String, String, Vec<u8>) {
+async fn read_http(stream: &mut TcpStream) -> (String, String, Vec<u8>, String) {
     let mut buf = Vec::new();
     let mut chunk = [0_u8; 4096];
     let header_end = loop {
@@ -86,6 +94,7 @@ async fn read_http(stream: &mut TcpStream) -> (String, String, Vec<u8>) {
         parts.next().unwrap().to_owned(),
         parts.next().unwrap().to_owned(),
         body,
+        head,
     )
 }
 
@@ -125,7 +134,7 @@ impl FakeHub {
             self.websocket(stream).await;
             return;
         }
-        let (method, path, body) = read_http(&mut stream).await;
+        let (method, path, body, request_head) = read_http(&mut stream).await;
         match (method.as_str(), path.as_str()) {
             ("POST", "/v1/pair/worker") => {
                 let request: PairWorkerRequest = serde_json::from_slice(&body).unwrap();
@@ -148,6 +157,43 @@ impl FakeHub {
                 )
                 .await;
             }
+            ("GET", p) if p.starts_with("/v1/blobs/") => {
+                let signed = self.check_signature(&request_head, "GET", p);
+                let body = self
+                    .state
+                    .blob_bodies
+                    .lock()
+                    .unwrap()
+                    .get(p.trim_start_matches("/v1/blobs/"))
+                    .cloned();
+                match (signed, body) {
+                    (true, Some(bytes)) => {
+                        self.state.blob_gets.lock().unwrap().push(p.to_owned());
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-type: application/octet-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                            bytes.len()
+                        );
+                        stream.write_all(head.as_bytes()).await.unwrap();
+                        stream.write_all(&bytes).await.unwrap();
+                    }
+                    (false, _) => {
+                        write_http(
+                            &mut stream,
+                            "401 Unauthorized",
+                            &json!({"error": {"code": "unauthorized", "message": "bad signature"}}),
+                        )
+                        .await
+                    }
+                    (true, None) => {
+                        write_http(
+                            &mut stream,
+                            "404 Not Found",
+                            &json!({"error": {"code": "not_found", "message": "no blob"}}),
+                        )
+                        .await
+                    }
+                }
+            }
             ("PUT", p) if p.starts_with("/v1/blobs/") => {
                 self.state.blobs.lock().unwrap().push(p.to_owned());
                 write_http(&mut stream, "200 OK", &json!({})).await;
@@ -160,6 +206,89 @@ impl FakeHub {
                 )
                 .await
             }
+        }
+    }
+
+    /// Whether the request head has the signature of the paired worker for
+    /// this method and path.
+    fn check_signature(&self, head: &str, method: &str, path: &str) -> bool {
+        let header = |name: &str| {
+            head.lines().find_map(|l| {
+                let (key, value) = l.split_once(':')?;
+                key.trim()
+                    .eq_ignore_ascii_case(name)
+                    .then(|| value.trim().to_owned())
+            })
+        };
+        let (Some(worker), Some(timestamp), Some(signature)) = (
+            header(consort_proto::auth::HEADER_WORKER_ID),
+            header(consort_proto::auth::HEADER_TIMESTAMP),
+            header(consort_proto::auth::HEADER_SIGNATURE),
+        ) else {
+            return false;
+        };
+        let (Ok(worker), Ok(timestamp), Ok(signature)) = (
+            worker.parse::<WorkerId>(),
+            timestamp.parse::<i64>(),
+            signature.parse::<consort_proto::auth::Signature>(),
+        ) else {
+            return false;
+        };
+        if *self.state.worker_id.lock().unwrap() != Some(worker) {
+            return false;
+        }
+        let key = self.state.public_key.lock().unwrap().unwrap();
+        let vk = VerifyingKey::from_bytes(key.as_bytes()).unwrap();
+        let sig = ed25519_dalek::Signature::from_bytes(signature.as_bytes());
+        let payload = consort_proto::auth::http_signing_payload(
+            method,
+            &self.state.origin,
+            path,
+            consort_proto::time::Timestamp::from_millis(timestamp),
+            worker,
+        );
+        vk.verify(&payload, &sig).is_ok()
+    }
+
+    /// Serves a skill: its bundle and the bodies of its files. Returns the
+    /// content hash.
+    pub fn serve_skill(
+        &self,
+        name: &str,
+        files: &[(&str, &str, bool)],
+    ) -> consort_proto::model::SkillBundleRef {
+        use sha2::{Digest, Sha256};
+        let sha = |bytes: &[u8]| Sha256Hash::from_bytes(Sha256::digest(bytes).into());
+        let infos: Vec<SkillFileInfo> = files
+            .iter()
+            .map(|(path, content, executable)| SkillFileInfo {
+                path: (*path).to_owned(),
+                sha256: sha(content.as_bytes()),
+                size: content.len() as u64,
+                executable: *executable,
+            })
+            .collect();
+        for (_, content, _) in files {
+            self.state.blob_bodies.lock().unwrap().insert(
+                sha(content.as_bytes()).to_string(),
+                content.as_bytes().to_vec(),
+            );
+        }
+        let content_hash = skill_content_hash(&infos);
+        let skill_id = consort_proto::ids::SkillId::new();
+        self.state.bundles.lock().unwrap().insert(
+            content_hash.to_string(),
+            SkillBundle {
+                skill_id,
+                name: name.to_owned(),
+                content_hash: content_hash.clone(),
+                files: infos,
+            },
+        );
+        consort_proto::model::SkillBundleRef {
+            skill_id,
+            name: name.to_owned(),
+            content_hash,
         }
     }
 
@@ -317,6 +446,27 @@ impl FakeHub {
                         r.respond_ok(&ToolCallResult::json(&json!({"ok": true})))
                             .unwrap(),
                     );
+                }
+                WorkerToHub::SkillBundleGet(get) => {
+                    self.state
+                        .bundle_requests
+                        .lock()
+                        .unwrap()
+                        .push(get.content_hash.to_string());
+                    let bundle = self
+                        .state
+                        .bundles
+                        .lock()
+                        .unwrap()
+                        .get(get.content_hash.as_str())
+                        .cloned();
+                    match bundle {
+                        Some(bundle) => send(r.respond_ok(&bundle).unwrap()),
+                        None => send(r.respond_error(ErrorBody::new(
+                            consort_proto::error::ErrorCode::NotFound,
+                            "no such skill bundle",
+                        ))),
+                    }
                 }
                 other => panic!("unexpected request {other:?}"),
             },

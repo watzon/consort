@@ -45,6 +45,8 @@ const SECTIONS: [(&str, &[SectionEntry]); 3] = [
     (
         "Assistant",
         &[
+            (SettingsSection::Connectors, "Connectors", "link"),
+            (SettingsSection::Skills, "Skills", "box"),
             (SettingsSection::Memory, "Memory", "book-open"),
             (SettingsSection::Routines, "Routines", "clock"),
         ],
@@ -230,6 +232,8 @@ impl ConsortApp {
         let content = match self.settings_section {
             SettingsSection::Appearance => self.render_appearance(t, window, cx),
             SettingsSection::Workers => self.render_workers(t, window, cx),
+            SettingsSection::Connectors => self.render_connectors(t, window, cx),
+            SettingsSection::Skills => self.render_skills(t, window, cx),
             other => self.render_later(other, t),
         };
         div()

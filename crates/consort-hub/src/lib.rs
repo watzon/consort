@@ -16,6 +16,7 @@
 
 pub mod admin;
 mod api;
+mod connectors;
 mod coordinator;
 mod error;
 mod hub;
@@ -28,6 +29,7 @@ mod placement;
 mod prompts;
 mod schedule;
 mod scheduler;
+mod skills;
 pub mod store;
 mod tools;
 mod util;
@@ -139,8 +141,15 @@ pub async fn serve(config: HubConfig) -> Result<HubHandle> {
         .with_graceful_shutdown(async move { shutdown.cancelled().await })
         .await
     });
-    let background = vec![scheduler::spawn(&hub), maintenance::spawn(&hub)];
+    let background = vec![
+        scheduler::spawn(&hub),
+        maintenance::spawn(&hub),
+        spawn_connector_sweep(&hub),
+    ];
     hub.recover();
+    if let Err(err) = hub.resume_connect_polls().await {
+        tracing::warn!(error = %err, "could not resume the open connect attempts");
+    }
     tracing::info!(address = %local_addr, url = %public_url, "the hub listens");
     Ok(HubHandle {
         hub,
@@ -151,7 +160,65 @@ pub async fn serve(config: HubConfig) -> Result<HubHandle> {
     })
 }
 
+/// Checks every hour that the active connections still work. A connection
+/// that Composio reports as expired becomes "needs a new sign-in".
+fn spawn_connector_sweep(hub: &Hub) -> JoinHandle<()> {
+    let hub = hub.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                () = hub.shutdown.cancelled() => return,
+                () = tokio::time::sleep(connectors::STATUS_SWEEP_INTERVAL) => {}
+            }
+            if let Err(err) = hub.sweep_connection_status().await {
+                tracing::warn!(error = %err, "could not check the connections");
+            }
+        }
+    })
+}
+
 impl HubHandle {
+    /// Uses another Composio API base URL, for example a local fake server
+    /// in tests or a proxy. The default is the public v3.1 API. The
+    /// `CONSORT_COMPOSIO_URL` variable sets it at start too.
+    pub fn set_composio_url(&self, url: &str) {
+        self.hub.connectors.set_base_url(url);
+    }
+
+    /// Stores a skill from its files, with the checks of an install: the
+    /// `SKILL.md` front matter, the name rule and the file limits. A skill
+    /// with scripts stays off unless `enabled` says otherwise. Each file is
+    /// `(path, bytes, executable)`. The install pipeline of step 3 builds on
+    /// this; until then, tests and tools on the hub machine use it.
+    pub async fn add_skill_from_files(
+        &self,
+        file_name: &str,
+        files: Vec<(String, Vec<u8>, bool)>,
+        use_in: consort_proto::model::UseIn,
+        enabled: Option<bool>,
+    ) -> Result<consort_proto::model::Skill> {
+        self.hub
+            .store_skill(skills::NewSkill {
+                source: consort_proto::model::SkillSource::Upload {
+                    file_name: file_name.to_owned(),
+                },
+                commit: None,
+                files: files
+                    .into_iter()
+                    .map(|(path, bytes, executable)| skills::NewSkillFile {
+                        path,
+                        bytes,
+                        executable,
+                    })
+                    .collect(),
+                use_in,
+                enabled,
+                license: None,
+                audits: Vec::new(),
+            })
+            .await
+    }
+
     /// The address that the hub listens on, with the real port.
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr

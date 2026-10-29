@@ -406,6 +406,9 @@ struct Runtime {
     pump: Option<tokio::task::JoinHandle<()>>,
     /// Keeps the managed tool of the session from an update.
     tool_lease: Option<crate::tools::ToolLease>,
+    /// The skills of the session. The worker removes their folder when the
+    /// session ends.
+    skills: Option<consort_harness::skills::SessionSkills>,
 }
 
 fn harness_body(err: consort_harness::HarnessError) -> ErrorBody {
@@ -583,6 +586,45 @@ impl Runtime {
         let watcher = consort_harness::process::WatcherHandle(Arc::new(GroupLog {
             core: Arc::downgrade(&core),
         }));
+        // The skills of the session: fetched, checked and written into a
+        // folder of this session. A skill that fails does not fail the
+        // session.
+        let delivery = crate::skills::deliver(
+            &account,
+            &crate::skills::SkillCache::new(&core.consort_home),
+            &crate::skills::HubBundles { core: core.clone() },
+            &start.extensions,
+            &runtime_dir.join(crate::skills::SESSION_SKILLS_DIR),
+        )
+        .await;
+        self.skills = delivery.skills.clone();
+        if !delivery.failed.is_empty() {
+            core.record_event(
+                self.session_id,
+                &SessionEvent::Error {
+                    code: "skills_not_delivered".to_owned(),
+                    message: format!(
+                        "Some skills could not be set up, so this session runs without them. {}",
+                        delivery.failed.join(" ")
+                    ),
+                },
+            );
+        }
+        // The hub's text, then the connectors and skills of the channel.
+        let mut system_prompt_append = start.system_prompt_append.clone();
+        let blocks = delivery.prompt(&start.extensions);
+        if !blocks.is_empty() {
+            if !system_prompt_append.is_empty() {
+                system_prompt_append.push_str("\n\n");
+            }
+            system_prompt_append.push_str(&blocks);
+        }
+        // Provider extras follow the account's setting at each start and
+        // each resume.
+        let extras_enabled = core.store.extras_enabled(account.id).unwrap_or_else(|err| {
+            tracing::warn!(account = %account.id, error = %err, "could not read the provider extras setting; the session uses the extras");
+            true
+        });
         let spec = SessionSpec {
             session_id: self.session_id,
             workspace: workspace_path.to_path_buf(),
@@ -591,9 +633,11 @@ impl Runtime {
             options: start.options.clone(),
             approval_mode: mode,
             allow_shell: config.policy.allow_shell,
-            system_prompt_append: start.system_prompt_append.clone(),
+            system_prompt_append,
             mcp_servers: servers,
             env: BTreeMap::new(),
+            extras_enabled,
+            skills: delivery.skills,
             resume,
             process_watcher: Some(watcher),
         };
@@ -604,12 +648,15 @@ impl Runtime {
             account = %account.label,
             model = %spec.model,
             options = ?spec.options,
+            extras_enabled = spec.extras_enabled,
+            skills = ?spec.skills.as_ref().map(|s| &s.names),
             "opening a harness session"
         );
         let (session, events) = match adapter.open(&account, spec).await {
             Ok(s) => s,
             Err(err) => {
                 endpoint.stop().await;
+                self.remove_skills();
                 return Err(self.open_failed(&account, err));
             }
         };
@@ -876,6 +923,18 @@ impl Runtime {
             endpoint.stop().await;
         }
         self.tool_lease = None;
+        self.remove_skills();
+    }
+
+    /// Removes the skill folder of the session. A running session keeps
+    /// its skills until it ends, and a resumed session gets a new folder
+    /// from the same cached files.
+    fn remove_skills(&mut self) {
+        if let Some(skills) = self.skills.take()
+            && let Err(err) = consort_harness::skills::finish_session_skills(&skills)
+        {
+            tracing::warn!(session = %self.session_id, folder = %skills.root.display(), error = %err, "could not remove the skills of a session");
+        }
     }
 
     /// Runs one command. Returns what to do with the result, and whether
@@ -1019,6 +1078,7 @@ pub(crate) async fn run_session(
         mcp: None,
         pump: None,
         tool_lease: None,
+        skills: None,
     };
     while let Some(job) = jobs.recv().await {
         match job {
