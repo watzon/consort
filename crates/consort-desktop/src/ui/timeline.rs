@@ -106,32 +106,7 @@ pub fn task_menu(task_id: &str, status: TaskStatus) -> Vec<MenuItem> {
 
 /// Markdown with its marks taken out, for "Copy text".
 fn plain_text(markdown: &str) -> String {
-    let mut out = String::with_capacity(markdown.len());
-    let mut chars = markdown.chars().peekable();
-    while let Some(ch) = chars.next() {
-        match ch {
-            '*' | '_' | '`' => {}
-            '[' => {
-                let mut label = String::new();
-                for c in chars.by_ref() {
-                    if c == ']' {
-                        break;
-                    }
-                    label.push(c);
-                }
-                if chars.peek() == Some(&'(') {
-                    for c in chars.by_ref() {
-                        if c == ')' {
-                            break;
-                        }
-                    }
-                }
-                out.push_str(&label);
-            }
-            _ => out.push(ch),
-        }
-    }
-    out
+    consort_client::format::strip_marks(markdown)
 }
 
 /// Opens the selection menu when text is selected, else the given menu.
@@ -904,32 +879,60 @@ impl ConsortApp {
                         .child(self.open_thread_link(&card.task_id, open, t, cx)),
                 );
         } else {
+            // The newest update, as clean text of at most three lines: a
+            // review summary is Markdown with paragraphs and code.
             let summary = match &card.approval {
                 Some(a) => a
                     .answer
                     .map(|choice| answered_label(choice).to_owned())
                     .unwrap_or_default(),
-                None => card.latest.as_deref().map(plain_text).unwrap_or_default(),
+                None => card
+                    .latest
+                    .as_deref()
+                    .map(consort_client::format::card_summary)
+                    .unwrap_or_default(),
             };
+            if !summary.is_empty() {
+                body = body.child(
+                    div()
+                        .pl(inset)
+                        .min_w_0()
+                        .type_style(t.text.ui)
+                        .text_color(c.text_secondary)
+                        .line_clamp(3)
+                        .text_ellipsis()
+                        .child(summary),
+                );
+            }
+            // The actions sit in one row at the bottom, as on an approval:
+            // Resolve for a task in review, and Open thread at the right.
+            let task_id = card.task_id.clone();
             body = body.child(
                 div()
                     .pl(inset)
                     .flex()
                     .items_center()
                     .gap(t.space.sm)
-                    .when(!summary.is_empty(), |d| {
+                    .when(card.status == TaskStatus::Review, |d| {
                         d.child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .type_style(t.text.ui)
-                                .text_color(c.text_secondary)
-                                .child(summary),
+                            button(
+                                SharedString::from(format!("resolve-{}", card.message_id)),
+                                "Resolve",
+                                ButtonKind::Primary,
+                                t,
+                            )
+                            .on_click(cx.listener(
+                                move |this, _, window, cx| {
+                                    this.run_menu(
+                                        MenuAction::ResolveTask(task_id.clone()),
+                                        window,
+                                        cx,
+                                    )
+                                },
+                            )),
                         )
                     })
-                    .when(card.latest.is_none() && card.approval.is_none(), |d| {
-                        d.child(div().flex_1())
-                    })
+                    .child(div().flex_1())
                     .child(self.open_thread_link(&card.task_id, open, t, cx)),
             );
         }
@@ -981,14 +984,18 @@ impl ConsortApp {
             let mut summary = div()
                 .flex()
                 .flex_wrap()
+                .min_w_0()
+                .overflow_hidden()
                 .type_style(t.text.ui)
                 .text_color(c.text_secondary)
-                .child(approval.summary.clone());
+                .child(div().max_w_full().child(approval.summary.clone()));
             if let Some(folder) = &approval.folder {
                 summary = summary
                     .child(div().whitespace_nowrap().child(" in "))
                     .child(
                         div()
+                            .max_w_full()
+                            .truncate()
                             .font_family(t.font_mono.clone())
                             .text_color(c.text_primary)
                             .child(folder.clone()),

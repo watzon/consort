@@ -19,7 +19,8 @@ actions!(consort, [Quit]);
 
 /// Command line options. `--screen` opens one of the designed screens, for
 /// screenshots and reviews: everything, sayso, tasks, thread, settings,
-/// workers, new-channel, add-worker, onboarding. `--light` and `--dark` set
+/// workers, new-channel, add-worker, worker-added, review, new-folder,
+/// onboarding. `--light` and `--dark` set
 /// the mode, and `--theme <name>` the theme.
 #[derive(Clone, Debug, Default)]
 pub struct Args {
@@ -53,8 +54,14 @@ fn parse_args() -> Args {
 fn main() {
     let args = parse_args();
     let mock = args.mock;
-    let client = if mock && args.screen.as_deref() == Some("channel-requests") {
+    let client = if mock
+        && matches!(
+            args.screen.as_deref(),
+            Some("channel-requests" | "new-folder")
+        ) {
         Client::mock_with(consort_client::mock::view_state_with_requests())
+    } else if mock && args.screen.as_deref() == Some("worker-added") {
+        Client::mock_with(consort_client::mock::view_state_with_long_detail())
     } else if mock {
         Client::mock()
     } else {

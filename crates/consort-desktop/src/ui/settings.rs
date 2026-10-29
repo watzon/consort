@@ -4,9 +4,9 @@
 use consort_client::{ApprovalMode, AuthState, WorkerView};
 use consort_theme::{Appearance, Mode, TextSize, ThemeLibrary, Tokens, TypeExt as _};
 use gpui_kit::{
-    AnyElement, Context, Div, Hsla, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
-    ParentElement, SharedString, StatefulInteractiveElement as _, Styled, Window, div,
-    prelude::FluentBuilder as _, px,
+    AnyElement, Context, Div, HighlightStyle, Hsla, InteractiveElement, IntoElement, MouseButton,
+    MouseDownEvent, ParentElement, SharedString, StatefulInteractiveElement as _, Styled,
+    StyledText, Window, div, prelude::FluentBuilder as _, px,
 };
 
 use crate::{
@@ -1127,33 +1127,75 @@ fn limit_row(title: &str, hint: &str, control: AnyElement, border: bool, t: &Tok
 }
 
 /// A detail line with code spans in mono.
+/// An account detail as one text that wraps inside its column, with the
+/// code words in the mono face. A long detail (a harness error) stops at
+/// three lines.
 fn code_line(detail_text: &str, code: &[String], t: &Tokens) -> Div {
     let c = &t.colors;
-    let mut out = div()
-        .flex()
-        .flex_wrap()
+    let ranges = code_ranges(detail_text, code);
+    let mono = t.font_mono.clone();
+    div()
+        .w_full()
+        .min_w_0()
+        .overflow_hidden()
         .type_style(detail(t))
-        .text_color(c.text_tertiary);
-    let mut rest = detail_text;
+        .text_color(c.text_tertiary)
+        .line_clamp(3)
+        .text_ellipsis()
+        .child(
+            StyledText::new(detail_text.to_owned())
+                .with_highlights(
+                    ranges
+                        .iter()
+                        .map(|r| (r.clone(), HighlightStyle::default()))
+                        .collect::<Vec<_>>(),
+                )
+                .with_font_family_overrides(
+                    ranges
+                        .into_iter()
+                        .map(|r| (r, mono.clone()))
+                        .collect::<Vec<_>>(),
+                ),
+        )
+}
+
+/// The byte ranges of the code words in a detail, in order, with no overlap.
+/// A code word counts only as a whole word, so `gemini` does not match
+/// inside a link such as `from-gemini-code`.
+fn code_ranges(detail_text: &str, code: &[String]) -> Vec<std::ops::Range<usize>> {
+    let part_of_word = |c: char| c.is_alphanumeric() || matches!(c, '-' | '_' | '/' | '.');
+    let whole = |at: usize, len: usize| {
+        let before = detail_text[..at].chars().next_back();
+        let after = detail_text[at + len..].chars().next();
+        // A period after the word ends the sentence, so it does not count.
+        let after_joins = after.is_some_and(|c| part_of_word(c) && c != '.')
+            || (after == Some('.')
+                && detail_text[at + len + 1..]
+                    .chars()
+                    .next()
+                    .is_some_and(char::is_alphanumeric));
+        !before.is_some_and(part_of_word) && !after_joins
+    };
+    let mut out = Vec::new();
+    let mut from = 0;
     loop {
         let next = code
             .iter()
-            .filter_map(|word| rest.find(word.as_str()).map(|at| (at, word)))
+            .filter(|word| !word.is_empty())
+            .filter_map(|word| {
+                detail_text[from..]
+                    .match_indices(word.as_str())
+                    .map(|(at, _)| from + at)
+                    .find(|&at| whole(at, word.len()))
+                    .map(|at| (at, word.len()))
+            })
             .min_by_key(|(at, _)| *at);
         match next {
-            Some((at, word)) => {
-                if at > 0 {
-                    out = out.child(rest[..at].to_owned());
-                }
-                out = out.child(div().font_family(t.font_mono.clone()).child(word.clone()));
-                rest = &rest[at + word.len()..];
+            Some((at, len)) => {
+                out.push(at..at + len);
+                from = at + len;
             }
-            None => {
-                if !rest.is_empty() {
-                    out = out.child(rest.to_owned());
-                }
-                break;
-            }
+            None => break,
         }
     }
     out
@@ -1252,3 +1294,21 @@ fn theme_preview(theme: &consort_theme::ThemeFile, mode: Mode, t: &Tokens) -> Di
 /// Keeps the import list stable on every platform.
 #[allow(dead_code)]
 fn _unused(_: &MouseDownEvent, _: MouseButton) {}
+
+#[cfg(test)]
+mod tests {
+    use super::code_ranges;
+
+    #[test]
+    fn code_words_match_only_whole_words() {
+        let detail = "See https://x.y/from-gemini-code. Run gemini on bigboi. Then gemini.";
+        let ranges = code_ranges(detail, &["gemini".to_owned()]);
+        let words: Vec<&str> = ranges.iter().map(|r| &detail[r.clone()]).collect();
+        assert_eq!(words, ["gemini", "gemini"]);
+        assert_eq!(&detail[ranges[0].start - 4..ranges[0].start], "Run ");
+        let key = "API key from FIREWORKS_API_KEY.";
+        let ranges = code_ranges(key, &["FIREWORKS_API_KEY".to_owned()]);
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(&key[ranges[0].clone()], "FIREWORKS_API_KEY");
+    }
+}

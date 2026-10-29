@@ -132,9 +132,52 @@ fn closed_decision(m: &model::Message) -> DecisionView {
     }
 }
 
+/// A word that names a file by its full path.
+fn is_path(word: &str) -> bool {
+    word.len() > 1
+        && (word.starts_with('/')
+            || word.starts_with('~')
+            || word.get(1..3) == Some(":\\")
+            || word.contains('\\'))
+}
+
+/// The last part of a path.
+fn file_name(path: &str) -> &str {
+    path.trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(path)
+}
+
+/// A file change line with each full path cut to its file name, such as
+/// "Write hello.txt". The detail block keeps the full paths.
+fn file_change_summary(summary: &str, paths: &[String]) -> String {
+    let words: Vec<&str> = summary.split_whitespace().collect();
+    let mut out: Vec<String> = words
+        .iter()
+        .map(|w| {
+            if is_path(w) {
+                file_name(w).to_owned()
+            } else {
+                (*w).to_owned()
+            }
+        })
+        .collect();
+    if out.is_empty() {
+        out = match paths {
+            [one] => vec!["Change".to_owned(), file_name(one).to_owned()],
+            many => vec![format!("Change {} files", many.len())],
+        };
+    }
+    out.join(" ")
+}
+
 /// The line on an approval card. A tool approval reads "Consort wants to
 /// use post_message from hub", never a raw `mcp__hub__post_message`.
 fn approval_summary(a: &model::Approval) -> String {
+    if let ApprovalDetails::FileChange { paths } = &a.details {
+        return file_change_summary(&a.summary, paths);
+    }
     let ApprovalDetails::Tool { tool, server, .. } = &a.details else {
         return a.summary.clone();
     };
@@ -651,14 +694,11 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                 worker_name: w.name.clone(),
                 worker_os: os(w.os).label().to_owned(),
                 worker_online: w.state == WorkerState::Online,
-                harness: task
-                    .model_selection
-                    .as_ref()
-                    .map(selection_label)
-                    .unwrap_or_else(|| "The channel's default".to_owned()),
+                harness: task_harness(cache, task, w),
                 isolation: isolation(task.placement.isolation.unwrap_or(channel_isolation)),
                 path: String::new(),
                 branch: None,
+                repo: task_repo(cache, task),
             }),
             posts,
         });
@@ -677,27 +717,24 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                 .map(|inv| {
                     inv.accounts
                         .iter()
-                        .map(|a| HarnessAccountView {
-                            id: a.account_id.to_string(),
-                            label: a.label.clone(),
-                            detail: [
-                                Some(match &a.harness_version {
-                                    Some(v) => format!("{} {v}.", a.harness),
-                                    None => format!("{}.", a.harness),
-                                }),
-                                a.auth_detail.as_ref().map(|d| format!("{d}.")),
-                            ]
-                            .into_iter()
-                            .flatten()
-                            .collect::<Vec<_>>()
-                            .join(" "),
-                            detail_code: Vec::new(),
-                            auth: match a.auth_state {
-                                ProtoAuth::SignedIn => AuthState::SignedIn,
-                                ProtoAuth::SignedOut => AuthState::SignedOut,
-                                ProtoAuth::Error => AuthState::Error,
-                                ProtoAuth::Unknown => AuthState::Unknown,
-                            },
+                        .map(|a| {
+                            let (detail, detail_code) = account_detail(
+                                &a.harness.to_string(),
+                                a.harness_version.as_deref(),
+                                a.auth_detail.as_deref(),
+                            );
+                            HarnessAccountView {
+                                id: a.account_id.to_string(),
+                                label: a.label.clone(),
+                                detail,
+                                detail_code,
+                                auth: match a.auth_state {
+                                    ProtoAuth::SignedIn => AuthState::SignedIn,
+                                    ProtoAuth::SignedOut => AuthState::SignedOut,
+                                    ProtoAuth::Error => AuthState::Error,
+                                    ProtoAuth::Unknown => AuthState::Unknown,
+                                },
+                            }
                         })
                         .collect()
                 })
@@ -836,6 +873,98 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
     }
     refresh(&mut state);
     state
+}
+
+/// The detail line of a harness account: the harness and its version, then
+/// what the worker said about the sign-in. Words in backticks come back as
+/// code words, without the backticks.
+fn account_detail(
+    harness: &str,
+    version: Option<&str>,
+    auth_detail: Option<&str>,
+) -> (String, Vec<String>) {
+    let head = match version {
+        Some(v) => format!("{harness} {v}"),
+        None => harness.to_owned(),
+    };
+    let text = [Some(head.as_str()), auth_detail]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(sentence)
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut plain = String::with_capacity(text.len());
+    let mut code = Vec::new();
+    for (i, part) in text.split('`').enumerate() {
+        if i % 2 == 1 && !part.is_empty() {
+            code.push(part.to_owned());
+        }
+        plain.push_str(part);
+    }
+    (plain, code)
+}
+
+/// The text as a sentence: a period goes on the end only when the text
+/// does not already end with punctuation.
+fn sentence(text: &str) -> String {
+    let text = text.trim_end();
+    let stop = text
+        .trim_end_matches(['`', '"', '\'', ')', ']'])
+        .ends_with(['.', '!', '?', ':', ';', '\u{2026}']);
+    if stop {
+        text.to_owned()
+    } else {
+        format!("{text}.")
+    }
+}
+
+/// The account and model of a task, best known first: the task's own
+/// selection, its channel's default, the Everything default, and, once the
+/// task runs on a worker with one signed-in account, that account.
+fn task_harness(cache: &Cache, task: &model::Task, worker: &model::Worker) -> String {
+    let channel = cache.channels.get(&task.channel_id.to_string());
+    let everything = cache.channels.values().find(|c| c.kind == PK::Everything);
+    let chosen = task
+        .model_selection
+        .as_ref()
+        .or(channel.and_then(|c| c.task_selection.as_ref()))
+        .or(everything.and_then(|c| c.task_selection.as_ref()));
+    if let Some(selection) = chosen {
+        return selection_label(selection);
+    }
+    if task.current_session_id.is_some() {
+        let signed_in: Vec<&model::HarnessAccount> = worker
+            .inventory
+            .iter()
+            .flat_map(|i| i.accounts.iter())
+            .filter(|a| a.enabled && a.auth_state == ProtoAuth::SignedIn)
+            .collect();
+        if let [only] = signed_in.as_slice() {
+            return only.label.clone();
+        }
+    }
+    "The channel's default".to_owned()
+}
+
+/// The repo a task's workspace comes from: the task's own repos, else its
+/// channel's.
+fn task_repo(cache: &Cache, task: &model::Task) -> Option<String> {
+    let channel = cache.channels.get(&task.channel_id.to_string());
+    let ids = task
+        .placement
+        .repos
+        .clone()
+        .or_else(|| channel.map(|c| c.repo_ids.clone()))
+        .unwrap_or_default();
+    ids.first().map(|id| {
+        cache
+            .repos
+            .get(&id.to_string())
+            .map(|r| r.name.clone())
+            .unwrap_or_else(|| "a repo".to_owned())
+    })
 }
 
 fn plural<'a>(n: usize, one: &'a str, many: &'a str) -> &'a str {
@@ -1522,6 +1651,99 @@ mod tests {
         assert_eq!(decision.question, "Ship now?");
         // Closed requests do not wait for the user.
         assert_eq!(state.sidebar.everything.status, None);
+    }
+
+    #[test]
+    fn an_account_detail_ends_with_one_period_and_keeps_code_words() {
+        assert_eq!(
+            account_detail(
+                "codex",
+                Some("0.5.1"),
+                Some("Run `codex login` on this machine.")
+            ),
+            (
+                "codex 0.5.1. Run codex login on this machine.".to_owned(),
+                vec!["codex login".to_owned()]
+            )
+        );
+        assert_eq!(
+            account_detail("opencode", None, Some("Run `opencode auth list`")).0,
+            "opencode. Run opencode auth list."
+        );
+        assert_eq!(sentence("Signed in (Pro)"), "Signed in (Pro).");
+        assert_eq!(sentence("Is it signed in?"), "Is it signed in?");
+        assert_eq!(sentence("See the \"docs.\""), "See the \"docs.\"");
+    }
+
+    #[test]
+    fn a_file_change_summary_names_the_file_and_keeps_the_path() {
+        let mut w = world();
+        let path = "/private/tmp/consort-e2e-data/worker/workspaces/tsk_1/hello.txt";
+        if let Some(a) = w.cache.approvals.values_mut().next() {
+            a.summary = format!("Write {path}");
+            a.details = ApprovalDetails::FileChange {
+                paths: vec![path.into()],
+            };
+        }
+        let state = view(&w.cache);
+        let thread = state.thread(&w.task.to_string()).expect("thread");
+        let PostBody::Approval(approval) = &thread.posts[0].bodies[0] else {
+            panic!("not an approval");
+        };
+        assert_eq!(approval.summary, "Write hello.txt");
+        assert_eq!(approval.detail.as_deref(), Some(path));
+        assert_eq!(
+            file_change_summary("", &["C:\\Code\\a.rs".into()]),
+            "Change a.rs"
+        );
+    }
+
+    #[test]
+    fn the_placement_names_the_repo_or_a_new_folder_and_the_harness() {
+        let mut w = world();
+        let worker = consort_proto::model::Worker {
+            id: consort_proto::ids::WorkerId::new(),
+            name: "bigboi".into(),
+            hostname: "bigboi".into(),
+            os: consort_proto::model::Os::Windows,
+            arch: "x64".into(),
+            public_key: consort_proto::auth::PublicKey::from_bytes([1; 32]),
+            version: "0.1.0".into(),
+            protocol_version: 1,
+            labels: vec![],
+            paused: false,
+            state: consort_proto::model::WorkerState::Online,
+            last_seen_at: None,
+            inventory: None,
+            paired_at: Timestamp::from_millis(NOW),
+            revoked_at: None,
+        };
+        let worker_id = worker.id;
+        w.cache.workers.insert(worker_id.to_string(), worker);
+        if let Some(task) = w.cache.tasks.get_mut(&w.task.to_string()) {
+            task.worker_id = Some(worker_id);
+        }
+        let state = view(&w.cache);
+        let placement = state
+            .thread(&w.task.to_string())
+            .and_then(|t| t.placement.clone())
+            .expect("placement");
+        assert_eq!(placement.repo, None, "no repo: a new empty folder");
+        assert_eq!(placement.harness, "The channel's default");
+
+        if let Some(task) = w.cache.tasks.get_mut(&w.task.to_string()) {
+            task.model_selection = Some(consort_proto::model::ModelSelection {
+                account_label: "Claude Personal".into(),
+                model: "Opus 5.5".into(),
+                options: Default::default(),
+            });
+        }
+        let state = view(&w.cache);
+        let placement = state
+            .thread(&w.task.to_string())
+            .and_then(|t| t.placement.clone())
+            .expect("placement");
+        assert_eq!(placement.harness, "Claude Personal, Opus 5.5");
     }
 
     #[test]

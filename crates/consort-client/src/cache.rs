@@ -6,7 +6,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use consort_proto::{
     client_api::{EntityKind, EntityPayload, FeedChange, FeedEntry, Snapshot},
-    model::{Approval, Channel, Decision, Group, Message, ReadMarker, SessionItem, Task, Worker},
+    model::{
+        Approval, Channel, Decision, Group, Message, ReadMarker, Repo, SessionItem, Task, Worker,
+    },
 };
 
 /// A message that the user sent and the hub has not stored yet.
@@ -28,6 +30,7 @@ pub struct Cache {
     pub loaded: bool,
     pub groups: BTreeMap<String, Group>,
     pub channels: BTreeMap<String, Channel>,
+    pub repos: BTreeMap<String, Repo>,
     pub workers: BTreeMap<String, Worker>,
     pub messages: BTreeMap<String, Message>,
     pub tasks: BTreeMap<String, Task>,
@@ -100,6 +103,9 @@ impl Cache {
         for c in snapshot.channels {
             self.channels.insert(c.id.to_string(), c);
         }
+        for r in snapshot.repos {
+            self.repos.insert(r.id.to_string(), r);
+        }
         for w in snapshot.workers {
             self.workers.insert(w.id.to_string(), w);
         }
@@ -143,6 +149,9 @@ impl Cache {
                 EntityPayload::Channel(c) => {
                     self.channels.insert(c.id.to_string(), c);
                 }
+                EntityPayload::Repo(r) => {
+                    self.repos.insert(r.id.to_string(), r);
+                }
                 EntityPayload::Worker(w) => {
                     self.workers.insert(w.id.to_string(), w);
                 }
@@ -163,8 +172,8 @@ impl Cache {
                     self.session_items
                         .insert(format!("{}:{}", item.session_id, item.id), item);
                 }
-                // Memory notes, files, routines, repos and clients have no
-                // view yet.
+                // Memory notes, files, routines and clients have no view
+                // yet.
                 _ => return false,
             },
             FeedChange::Delete(kind) => {
@@ -173,6 +182,7 @@ impl Cache {
                     EntityKind::Group => self.groups.remove(id).is_some(),
                     EntityKind::Channel => self.channels.remove(id).is_some(),
                     EntityKind::Worker => self.workers.remove(id).is_some(),
+                    EntityKind::Repo => self.repos.remove(id).is_some(),
                     EntityKind::Message => self.messages.remove(id).is_some(),
                     EntityKind::Task => self.tasks.remove(id).is_some(),
                     EntityKind::Approval => self.approvals.remove(id).is_some(),

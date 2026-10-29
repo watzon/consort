@@ -508,6 +508,9 @@ pub struct PlacementView {
     pub isolation: Isolation,
     pub path: String,
     pub branch: Option<String>,
+    /// The repo the workspace comes from. `None` when the task has no repo:
+    /// it then runs in a new empty folder.
+    pub repo: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

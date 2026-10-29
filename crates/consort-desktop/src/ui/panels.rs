@@ -14,7 +14,7 @@ use crate::{
     app::{ConsortApp, Panel, TasksTab},
     ui::window_controls::DragArea as _,
     ui::{
-        menu::OpenMenu,
+        menu::{MenuAction, OpenMenu},
         parts::{
             ButtonKind, button, detail, icon, icon_button, line, status_color, status_glyph, text,
         },
@@ -433,14 +433,31 @@ impl ConsortApp {
                         )
                         .child(value)
                 };
+                // A known path in mono, else the repo, else a task with no
+                // repo, which runs in a new empty folder.
                 let workspace = div()
                     .flex()
                     .flex_wrap()
+                    .min_w_0()
                     .type_style(detail(t))
-                    .text_color(c.text_secondary)
-                    .child(format!("{} of ", p.isolation.label()))
-                    .child(div().font_family(t.font_mono.clone()).child(p.path.clone()))
-                    .when_some(p.branch.clone(), |d, b| d.child(format!(" at {b}")));
+                    .text_color(c.text_secondary);
+                // "Worktree of x", "Clone of x", but "In x" for in place.
+                let lead = match p.isolation {
+                    consort_client::Isolation::InPlace => "In ".to_owned(),
+                    other => format!("{} of ", other.label()),
+                };
+                let workspace = if !p.path.is_empty() {
+                    workspace
+                        .child(lead)
+                        .child(div().font_family(t.font_mono.clone()).child(p.path.clone()))
+                        .when_some(p.branch.clone(), |d, b| d.child(format!(" at {b}")))
+                } else if let Some(repo) = p.repo.clone() {
+                    workspace
+                        .child(lead)
+                        .child(div().font_family(t.font_mono.clone()).child(repo))
+                } else {
+                    workspace.child("A new empty folder")
+                };
                 div()
                     .flex()
                     .flex_col()
@@ -570,6 +587,71 @@ impl ConsortApp {
                 ))
         };
 
+        // Ready for review: the answer is the user's, so it sits by the reply
+        // box. Resolved: Not done puts the task back in review.
+        let review = match status {
+            TaskStatus::Review | TaskStatus::Resolved => {
+                let resolved = status == TaskStatus::Resolved;
+                let id = task_id.to_owned();
+                Some(
+                    div()
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .gap(t.space.sm)
+                        .mx(t.space.lg)
+                        .mb(t.space.sm)
+                        .py(t.space.sm)
+                        .px(t.space.md)
+                        .rounded(t.radius.lg)
+                        .border(t.border_width)
+                        .border_color(if resolved {
+                            c.border_subtle
+                        } else {
+                            c.accent_text
+                        })
+                        .bg(c.surface_card)
+                        .child(status_glyph("review-bar", status, t.icon.size, t, cx))
+                        .child(
+                            text(
+                                if resolved {
+                                    "You resolved this task."
+                                } else {
+                                    "Ready for review. Resolve it when the work is done."
+                                },
+                                t.text.ui,
+                                c.text_secondary,
+                            )
+                            .flex_1()
+                            .min_w_0(),
+                        )
+                        .child(
+                            button(
+                                "review-action",
+                                if resolved { "Not done" } else { "Resolve" },
+                                if resolved {
+                                    ButtonKind::Secondary
+                                } else {
+                                    ButtonKind::Primary
+                                },
+                                t,
+                            )
+                            .on_click(cx.listener(
+                                move |this, _, window, cx| {
+                                    let action = if resolved {
+                                        MenuAction::ReopenTask(id.clone())
+                                    } else {
+                                        MenuAction::ResolveTask(id.clone())
+                                    };
+                                    this.run_menu(action, window, cx)
+                                },
+                            )),
+                        ),
+                )
+            }
+            _ => None,
+        };
+
         frame(t)
             .child(head)
             .children(placement)
@@ -582,6 +664,7 @@ impl ConsortApp {
                     .child(fade(true))
                     .child(fade(false)),
             )
+            .children(review)
             .child(reply)
             .into_any_element()
     }

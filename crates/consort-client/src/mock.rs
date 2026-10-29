@@ -626,7 +626,7 @@ fn timelines() -> Vec<TimelineView> {
                     None,
                     "Ready for review, 4 replies",
                     Some(
-                        "The new rules are in `rules/new_members.toml`. Tests pass, and a dry run on last week's messages flags 41 of 43 spam posts.",
+                        "The new rules are in `rules/new_members.toml`.\n\n```toml\n[new_members]\nhold_first_link = true\nwindow_minutes = 1440\n```\n\nTests pass, and a dry run on last week's messages flags 41 of 43 spam posts and no real ones. Members who joined more than a day ago keep the current rules, so nothing changes for them.",
                     ),
                 ),
             ],
@@ -730,6 +730,7 @@ fn threads() -> Vec<TaskThreadView> {
                 isolation: Isolation::Worktree,
                 path: path.into(),
                 branch: branch.map(Into::into),
+                repo: None,
             })
         };
     vec![
@@ -825,14 +826,7 @@ fn threads() -> Vec<TaskThreadView> {
         },
         TaskThreadView {
             task_id: T_ROOF.into(),
-            placement: placement(
-                "hub",
-                "Linux",
-                true,
-                "Pi with Kimi K3",
-                "/srv/consort/house-lights",
-                None,
-            ),
+            placement: placement("hub", "Linux", true, "Pi with Kimi K3", "", None),
             posts: vec![post(
                 "pst_roof_1",
                 Speaker::Task,
@@ -985,6 +979,26 @@ pub fn view_state() -> ViewState {
 pub fn view_state_with_requests() -> ViewState {
     let mut state = view_state();
     if let Some(timeline) = state.timelines.iter_mut().find(|t| t.channel_id == LIGHTS) {
+        for item in &mut timeline.items {
+            if let TimelineItem::TaskCard(card) = item {
+                card.approval = Some(ApprovalView {
+                    id: text("apr_lights_write"),
+                    task_id: Some(T_ROOF.into()),
+                    summary: text("Write roofline-quotes.md"),
+                    folder: None,
+                    detail: Some(text(
+                        "/private/tmp/consort-e2e-data/worker/workspaces/tsk_0192f0c4-roofline/roofline-quotes.md",
+                    )),
+                    choices: vec![
+                        ApprovalChoice::AllowOnce,
+                        ApprovalChoice::AllowForTask,
+                        ApprovalChoice::Deny,
+                    ],
+                    state: RequestState::Pending,
+                    answer: None,
+                });
+            }
+        }
         timeline.items.push(TimelineItem::Approval(ApprovalCardView {
             message_id: text("msg_lights_approval"),
             speaker: Speaker::Consort,
@@ -1034,6 +1048,23 @@ pub fn view_state_with_requests() -> ViewState {
         }));
     }
     refresh(&mut state);
+    state
+}
+
+/// The mock with the long sign-in error that the Gemini CLI gives, on
+/// bigboi, for `--screen worker-added`.
+pub fn view_state_with_long_detail() -> ViewState {
+    let mut state = view_state();
+    if let Some(gemini) = state
+        .workers
+        .iter_mut()
+        .flat_map(|w| w.accounts.iter_mut())
+        .find(|a| a.id == "acc_bigboi_gemini")
+    {
+        gemini.detail = text(
+            "Gemini CLI through ACP. This client is no longer supported for Gemini Code Assist for individuals. To continue using Gemini, please migrate to the Antigravity suite of products: https://antigravity.google/docs/migrating-from-gemini-code-assist. Run gemini on bigboi to sign in again.",
+        );
+    }
     state
 }
 

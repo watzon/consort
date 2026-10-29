@@ -662,6 +662,9 @@ impl ConsortApp {
                 task_selection: form.selection,
                 isolation: form.isolation,
             };
+            // The new channel opens as soon as the hub sends it.
+            let before = this.state.channels.iter().map(|c| c.id.clone()).collect();
+            this.open_created = Some((channel.name.clone(), before));
             let client = this.client.clone();
             this.spawn_command(cx, async move { client.create_channel(channel).await });
             this.close_dialog(window, cx);
@@ -691,10 +694,18 @@ impl ConsortApp {
             .as_ref()
             .map(|p| p.hub_url.clone())
             .unwrap_or_default();
-        let install = match self.add_worker_os {
-            Os::Windows => "irm https://get.consort.dev/install.ps1 | iex",
-            Os::MacOs | Os::Linux => "curl -fsSL https://get.consort.dev | sh",
+        // There is no installer yet, so the step builds the consort command
+        // from a checkout. The command is the same on every system; what
+        // the build needs is not.
+        let install = "cargo install --path crates/consort-cli";
+        let needs = match self.add_worker_os {
+            Os::MacOs => "the Xcode command line tools",
+            Os::Windows => "the Visual Studio C++ build tools",
+            Os::Linux => "a C compiler",
         };
+        let install_note = format!(
+            "There is no installer yet. In a checkout of the Consort repo, build the consort command. It needs Rust from rustup.rs and {needs}."
+        );
         let pair = if hub_url.is_empty() {
             format!("consort worker pair --code {code}")
         } else {
@@ -841,7 +852,15 @@ impl ConsortApp {
                 "1",
                 "Install Consort on the machine",
                 Some(os_tabs.into_any_element()),
-                Some(command_box("install-command", install.to_owned(), t, cx).into_any_element()),
+                Some(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(t.space.sm)
+                        .child(text(install_note, t.text.ui, c.text_secondary))
+                        .child(command_box("install-command", install.to_owned(), t, cx))
+                        .into_any_element(),
+                ),
                 t,
             ))
             .child(step(
@@ -873,6 +892,47 @@ impl ConsortApp {
                 ),
                 t,
             ));
+        // The worker that this dialog paired: one that was not in the list
+        // when the dialog opened.
+        let added = self
+            .added_worker
+            .as_ref()
+            .and_then(|id| self.state.workers.iter().find(|w| &w.id == id));
+        let (status, note, done): (AnyElement, String, bool) = match added {
+            Some(w) if w.online => (
+                crate::ui::parts::worker_dot(true, sizes::STATE_DOT, t.icon.size, t)
+                    .into_any_element(),
+                format!("{} connected. It shows in the list, selected.", w.name),
+                true,
+            ),
+            Some(w) => (
+                crate::ui::parts::status_glyph(
+                    "waiting-worker",
+                    consort_client::TaskStatus::Working,
+                    t.icon.size,
+                    t,
+                    cx,
+                ),
+                format!("{} paired. Waiting for it to connect", w.name),
+                false,
+            ),
+            None => (
+                crate::ui::parts::status_glyph(
+                    "waiting-worker",
+                    consort_client::TaskStatus::Working,
+                    t.icon.size,
+                    t,
+                    cx,
+                ),
+                "Waiting for the worker to connect".to_owned(),
+                false,
+            ),
+        };
+        let close = if done {
+            button("dialog-done", "Done", ButtonKind::Primary, t)
+        } else {
+            button("dialog-cancel", "Cancel", ButtonKind::Secondary, t)
+        };
         let actions = div()
             .flex()
             .items_center()
@@ -880,24 +940,10 @@ impl ConsortApp {
             .pt(t.space.lg)
             .border_t(t.border_width)
             .border_color(c.border_subtle)
-            .child(crate::ui::parts::status_glyph(
-                "waiting-worker",
-                consort_client::TaskStatus::Working,
-                t.icon.size,
-                t,
-                cx,
-            ))
+            .child(status)
+            .child(text(note, t.text.ui, c.text_secondary).flex_1().min_w_0())
             .child(
-                text(
-                    "Waiting for the worker to connect",
-                    t.text.ui,
-                    c.text_secondary,
-                )
-                .flex_1(),
-            )
-            .child(
-                button("dialog-cancel", "Cancel", ButtonKind::Secondary, t)
-                    .on_click(cx.listener(|this, _, window, cx| this.close_dialog(window, cx))),
+                close.on_click(cx.listener(|this, _, window, cx| this.close_dialog(window, cx))),
             );
         (
             "Add a worker".to_owned(),

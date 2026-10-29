@@ -133,6 +133,17 @@ pub struct ConsortApp {
     pub narrow: bool,
     /// The channel whose older page is loading.
     pub loading_older: Option<String>,
+    /// The name of a channel the user just created. It opens when the hub
+    /// sends it.
+    pub open_created: Option<(String, Vec<String>)>,
+    /// The workers there were when the Add worker dialog opened. A worker
+    /// that is not in this list is the one the dialog paired.
+    pub add_worker_before: Vec<String>,
+    /// The worker that the open Add worker dialog paired.
+    pub added_worker: Option<String>,
+    /// The composer placeholder must follow a channel change made without a
+    /// window.
+    placeholder_stale: bool,
     /// The open switcher and its selected row.
     pub switcher: Option<usize>,
     pub onboarding: Onboarding,
@@ -270,6 +281,10 @@ impl ConsortApp {
             editing: None,
             narrow: false,
             loading_older: None,
+            open_created: None,
+            add_worker_before: Vec::new(),
+            added_worker: None,
+            placeholder_stale: false,
             switcher: None,
             onboarding: Onboarding::default(),
             triggers: TriggerBounds::default(),
@@ -354,6 +369,32 @@ impl ConsortApp {
         {
             self.panel = Panel::None;
         }
+        if let Some((name, before)) = self.open_created.clone()
+            && let Some(created) = self
+                .state
+                .channels
+                .iter()
+                .find(|c| c.name == name && !before.contains(&c.id))
+                .map(|c| c.id.clone())
+        {
+            self.open_created = None;
+            self.channel_id = created;
+            self.page = Page::Main;
+            self.placeholder_stale = true;
+        }
+        if self.dialog == Some(Dialog::AddWorker)
+            && self.added_worker.is_none()
+            && let Some(added) = self
+                .state
+                .workers
+                .iter()
+                .find(|w| !self.add_worker_before.contains(&w.id))
+                .map(|w| w.id.clone())
+        {
+            // The new worker shows behind the dialog, selected.
+            self.settings_worker = Some(added.clone());
+            self.added_worker = Some(added);
+        }
         self.sync_lists();
         cx.notify();
     }
@@ -415,6 +456,44 @@ impl ConsortApp {
             .first()
             .and_then(|s| s.task_ids.first().cloned());
         match screen {
+            // A task in review: its card in the timeline and its thread.
+            "review" => {
+                let channel = self
+                    .state
+                    .channels
+                    .iter()
+                    .find(|c| c.name == "miss-lucy-tg")
+                    .map(|c| c.id.clone());
+                let task = self
+                    .state
+                    .tasks
+                    .iter()
+                    .find(|t| t.status == consort_client::TaskStatus::Review)
+                    .map(|t| t.id.clone());
+                if let (Some(channel), Some(task)) = (channel, task) {
+                    self.open_channel(channel, window, cx);
+                    self.open_thread(task, cx);
+                }
+            }
+            // A task with no repo: the thread says it runs in a new folder.
+            "new-folder" => {
+                let channel = self
+                    .state
+                    .channels
+                    .iter()
+                    .find(|c| c.name == "house-lights")
+                    .map(|c| c.id.clone());
+                let task = self
+                    .state
+                    .tasks
+                    .iter()
+                    .find(|t| t.channel_name == "house-lights")
+                    .map(|t| t.id.clone());
+                if let (Some(channel), Some(task)) = (channel, task) {
+                    self.open_channel(channel, window, cx);
+                    self.open_thread(task, cx);
+                }
+            }
             "channel-requests" => {
                 if let Some(id) = self
                     .state
@@ -447,7 +526,7 @@ impl ConsortApp {
             }
             "settings" => self.open_settings(SettingsSection::Appearance, cx),
             "workers" => self.open_settings(SettingsSection::Workers, cx),
-            "add-worker" => {
+            "add-worker" | "worker-added" => {
                 self.open_settings(SettingsSection::Workers, cx);
                 // The window draws its first frame from this state, so the
                 // code must be there before it opens.
@@ -456,6 +535,17 @@ impl ConsortApp {
                     .run_blocking(consort_client::Command::WorkerPairingCode);
                 self.state = self.client.state();
                 self.dialog = Some(Dialog::AddWorker);
+                self.add_worker_before = self.state.workers.iter().map(|w| w.id.clone()).collect();
+                if screen == "worker-added" {
+                    // As if bigboi had just paired and connected.
+                    self.add_worker_before.retain(|id| {
+                        self.state
+                            .workers
+                            .iter()
+                            .any(|w| &w.id == id && w.name != "bigboi")
+                    });
+                    self.set_state(self.state.clone(), cx);
+                }
             }
             "new-channel" => {
                 self.open_dialog(Dialog::NewChannel, window, cx);
@@ -673,6 +763,8 @@ impl ConsortApp {
                     .update(cx, |input, cx| input.focus(window, cx));
             }
             Dialog::AddWorker => {
+                self.add_worker_before = self.state.workers.iter().map(|w| w.id.clone()).collect();
+                self.added_worker = None;
                 let client = self.client.clone();
                 self.spawn_command(cx, async move { client.worker_pairing_code().await });
             }
@@ -690,6 +782,7 @@ impl ConsortApp {
                     .run(consort_client::Command::CancelWorkerPairing)
                     .await
             });
+            self.added_worker = None;
         }
         self.dialog = None;
         self.focus.focus(window, cx);
@@ -1151,6 +1244,10 @@ impl Render for ConsortApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = Self::tokens(cx);
         self.style_inputs(&t, cx);
+        if self.placeholder_stale {
+            self.placeholder_stale = false;
+            self.update_placeholder(window, cx);
+        }
         let body = match self.page {
             Page::Onboarding => self.render_onboarding(&t, window, cx),
             Page::Settings => self.render_settings(&t, window, cx),
