@@ -11,6 +11,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod bridge;
+pub mod cap;
 pub mod config;
 mod core;
 mod error;
@@ -35,7 +36,7 @@ pub use crate::core::{Harnesses, default_harnesses};
 pub use crate::error::WorkerError;
 pub use crate::sessions::Coalescer;
 
-use crate::config::{DB_FILE, KEY_FILE, WorkerToml, harness_installed};
+use crate::config::{DB_FILE, KEY_FILE, WorkerToml, create_private_dir, harness_installed};
 use crate::core::Core;
 use crate::identity::Identity;
 use crate::link::Link;
@@ -69,7 +70,7 @@ pub async fn pair(
     let code: PairingCode = code
         .parse()
         .map_err(|e: consort_proto::auth::PairingCodeError| WorkerError::Config(e.to_string()))?;
-    std::fs::create_dir_all(config_dir)
+    create_private_dir(config_dir)
         .map_err(|e| WorkerError::io(format!("could not create {}", config_dir.display()), e))?;
     let identity = Identity::load_or_create(&config_dir.join(KEY_FILE))?;
     let request = PairWorkerRequest {
@@ -191,6 +192,13 @@ pub async fn run_with(
     let (Some(hub_url), Some(worker_id)) = (toml.hub_url.clone(), toml.worker_id) else {
         return Err(WorkerError::NotPaired);
     };
+    if let Some(warning) = http::cleartext_warning(&hub_url) {
+        tracing::warn!("{warning}");
+    }
+    // The folder holds the key, the spool and the workspaces. An older build
+    // made it with the default mode.
+    create_private_dir(&dir)
+        .map_err(|e| WorkerError::io(format!("could not create {}", dir.display()), e))?;
     if toml.discover_accounts(&harness_installed) {
         toml.save(&dir)?;
     }
@@ -201,6 +209,15 @@ pub async fn run_with(
     let identity = Identity::load(&key_path)?;
     let store = Store::open(&dir.join(DB_FILE))?;
     let _ = store.prune_commands(consort_proto::time::Timestamp::now());
+    // A worker that was killed can leave harness process groups behind on
+    // Unix. Kill the ones that it recorded before sessions resume.
+    #[cfg(unix)]
+    let store = tokio::task::spawn_blocking(move || {
+        crate::core::kill_stale_groups(&store);
+        store
+    })
+    .await
+    .map_err(|e| WorkerError::Config(format!("could not check old harness processes: {e}")))?;
     // The stdio bridge is this program's `mcp-bridge` subcommand. Tests and
     // embedders that run from another program set CONSORT_BRIDGE_PROGRAM.
     let bridge_program = std::env::var_os("CONSORT_BRIDGE_PROGRAM")
@@ -227,6 +244,7 @@ pub async fn run_with(
         inventory_notify: Notify::new(),
         last_inventory_hash: Mutex::new(None),
         bridge_program,
+        inflight: Mutex::new(Default::default()),
     });
 
     // Resume the sessions that were open when the worker stopped.

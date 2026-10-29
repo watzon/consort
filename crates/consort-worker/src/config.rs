@@ -1,8 +1,10 @@
 //! `worker.toml` and the files in the worker's configuration folder.
 //!
 //! The folder holds `worker.toml`, the key file `worker.key`, the database
-//! `worker.db` and the `workspaces/` folder. The format of `worker.toml` is
-//! in `docs/data-model.md` ("Worker-local state").
+//! `worker.db`, the `workspaces/` folder and the `runtime/` folder. The
+//! format of `worker.toml` is in `docs/data-model.md` ("Worker-local
+//! state"). On Unix the worker makes these folders with mode 0700 (see
+//! [`create_private_dir`]).
 
 use std::path::{Path, PathBuf};
 
@@ -21,6 +23,44 @@ pub const KEY_FILE: &str = "worker.key";
 pub const DB_FILE: &str = "worker.db";
 /// The name of the workspaces folder.
 pub const WORKSPACES_DIR: &str = "workspaces";
+/// The name of the folder with one runtime folder per session.
+pub const RUNTIME_DIR: &str = "runtime";
+
+/// Creates a folder and its parents. On Unix the folder gets mode 0700,
+/// also when it exists already, so only the user can read what the worker
+/// keeps in it. Parents that exist keep their mode.
+pub fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(path)
+    }
+}
+
+/// Why a local MCP server name cannot be used, or `None` when it can.
+///
+/// The name `hub` (in any case) is kept for the hub tools. A name with `__`
+/// could look like a hub tool: `hub__x` gives the tool `mcp__hub__x__tool`,
+/// which reads as the `hub` server with the tool `x__tool`.
+pub fn local_server_name_problem(name: &str) -> Option<&'static str> {
+    if name.trim().is_empty() {
+        Some("the name is empty")
+    } else if name.eq_ignore_ascii_case("hub") {
+        Some("Consort keeps the name `hub` for the hub tools")
+    } else if name.contains("__") {
+        Some("the name has `__`, which harnesses use between the server and the tool name")
+    } else {
+        None
+    }
+}
 
 fn default_true() -> bool {
     true
@@ -152,7 +192,7 @@ impl WorkerToml {
     /// Writes `worker.toml` through a temporary file, so a crash never
     /// leaves half a file.
     pub fn save(&self, config_dir: &Path) -> Result<(), WorkerError> {
-        std::fs::create_dir_all(config_dir).map_err(|e| {
+        create_private_dir(config_dir).map_err(|e| {
             WorkerError::io(format!("could not create {}", config_dir.display()), e)
         })?;
         let text = toml::to_string_pretty(self).map_err(|e| WorkerError::Config(e.to_string()))?;
@@ -257,6 +297,29 @@ path = "C:/Users/chris/Code/sayso"
         assert!(config.auto_discover);
         assert_eq!(config.local_mcp_servers[0].name, "home-assistant");
         assert_eq!(config.checkout_infos()[0].path, "C:/Users/chris/Code/sayso");
+    }
+
+    #[test]
+    fn local_server_names_that_look_like_hub_tools_are_refused() {
+        assert!(local_server_name_problem("home-assistant").is_none());
+        assert!(local_server_name_problem("github_tools").is_none());
+        for bad in ["hub", "HUB", "Hub", "hub__x", "a__b", " "] {
+            assert!(local_server_name_problem(bad).is_some(), "{bad}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_folders_have_mode_0700() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("a").join("worker");
+        create_private_dir(&folder).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&folder), 0o700);
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
+        WorkerToml::default().save(&folder).unwrap();
+        assert_eq!(mode(&folder), 0o700, "an existing folder becomes private");
     }
 
     #[test]

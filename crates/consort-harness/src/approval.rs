@@ -45,6 +45,18 @@ pub fn codex_policy(mode: ApprovalMode) -> (&'static str, &'static str) {
     }
 }
 
+/// The Claude Code tools that run shell commands. With `allow_shell` off,
+/// the adapter gives them to `claude-agent-acp` as `disallowedTools`, so the
+/// model never sees them. Checked against Claude Agent SDK 0.3.312
+/// (`BUILTIN_TOOL_NAMES`): `Monitor` runs a shell command too.
+pub const CLAUDE_SHELL_TOOLS: [&str; 3] = ["Bash", "PowerShell", "Monitor"];
+
+/// The Codex `features` that give the model a shell. With `allow_shell` off,
+/// the adapter sets both to false in the `thread/start` config. Tested with
+/// codex-cli 0.165.0: the model request then has no `exec_command` and no
+/// `write_stdin` tool.
+pub const CODEX_SHELL_FEATURES: [&str; 2] = ["shell_tool", "unified_exec"];
+
 /// The Gemini CLI `--approval-mode` value.
 pub fn gemini_mode(mode: ApprovalMode) -> &'static str {
     match mode {
@@ -55,13 +67,14 @@ pub fn gemini_mode(mode: ApprovalMode) -> &'static str {
 }
 
 /// The OpenCode `permission` configuration, passed in
-/// `OPENCODE_CONFIG_CONTENT`.
-pub fn opencode_permission(mode: ApprovalMode) -> Value {
+/// `OPENCODE_CONFIG_CONTENT`. With `allow_shell` off, `bash` is `deny`.
+pub fn opencode_permission(mode: ApprovalMode, allow_shell: bool) -> Value {
     let (edit, bash, webfetch) = match mode {
         ApprovalMode::Ask => ("ask", "ask", "ask"),
         ApprovalMode::AutoEdits => ("allow", "ask", "ask"),
         ApprovalMode::Auto | ApprovalMode::FullAccess => ("allow", "allow", "allow"),
     };
+    let bash = if allow_shell { bash } else { "deny" };
     json!({ "permission": { "edit": edit, "bash": bash, "webfetch": webfetch } })
 }
 
@@ -81,9 +94,12 @@ mod tests {
         );
         assert_eq!(gemini_mode(ApprovalMode::AutoEdits), "auto_edit");
         assert_eq!(
-            opencode_permission(ApprovalMode::AutoEdits)["permission"]["bash"],
+            opencode_permission(ApprovalMode::AutoEdits, true)["permission"]["bash"],
             "ask"
         );
+        let off = opencode_permission(ApprovalMode::AutoEdits, false);
+        assert_eq!(off["permission"]["bash"], "deny");
+        assert_eq!(off["permission"]["edit"], "allow");
     }
 
     #[test]

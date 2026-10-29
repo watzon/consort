@@ -161,7 +161,13 @@ The `event` field of a session event is one of these objects:
 | `reopened` | | The worker opened the session again after the worker restarted. The hub cancels the session's pending approvals and decisions and ends an open turn as failed |
 | `error` | `code`, `message` | |
 
-The worker answers an approval request for a tool of the `hub` MCP server itself, with the allow-once option, and does not send it. The hub checks its own tools. The name `hub` is kept for this server.
+The worker answers an approval request for a tool of the `hub` MCP server itself, with the allow-once option, and does not send it, but only when the tool is in the session's last `tool.list` result. Any other approval, also one that claims the server `hub`, goes to the hub like any other approval. The hub checks its own tools. The name `hub` is kept for this server: the worker refuses a local MCP server whose name is `hub` in any case or contains `__`.
+
+The worker cuts a session event to at most 192 KiB before it spools the event, and marks the cut. A large tool argument becomes `{consort_truncated, original_bytes, preview}`. A spool row that the worker cannot read goes out as an `error` event with the code `event_unreadable` and the same sequence number.
+
+The worker runs a command ID once. When the hub sends a command again while the first run still goes on, the worker answers once, when the first run ends.
+
+New `error` event codes from the worker: `event_unreadable`, `event_too_large`, `harness_unresponsive` (a turn did not end 30 s after an interrupt, so the worker stopped the harness and reports the session lost), `start_failed` (a first turn failed, followed by the state `lost`), and `signed_out` (a turn failed because the harness login is gone).
 
 The `details` of an approval request has a `kind` and the fields for that kind: `command` (`command`, `cwd`), `file_change` (`paths`), `tool` (`server`, `tool`, `arguments`), `network` (`target`) or `other` (`text`). The `details` of a question has `question`, `context` and `allow_free_text`. Each option has `id`, `label`, `kind` (`allow_once`, `allow_always`, `deny_once`, `deny_always` or `choice`) and an optional `description`.
 

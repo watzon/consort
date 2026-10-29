@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -40,12 +41,30 @@ pub enum Inbound {
 
 type Pending = Arc<Mutex<HashMap<i64, oneshot::Sender<Result<Value, HarnessError>>>>>;
 
+/// How long a request waits for its response by default.
+pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(90);
+
 /// The client half of the connection.
 #[derive(Debug, Clone)]
 pub struct RpcClient {
     writer: mpsc::UnboundedSender<String>,
     pending: Pending,
     next_id: Arc<AtomicI64>,
+    timeout: Duration,
+}
+
+/// The request ID of a response. The client sends integer IDs, but a
+/// server may echo one as a string or as a float.
+fn response_id(id: &Value) -> Option<i64> {
+    match id {
+        Value::Number(n) => n.as_i64().or_else(|| {
+            n.as_f64()
+                .filter(|f| f.fract() == 0.0 && f.abs() < 9.0e15)
+                .map(|f| f as i64)
+        }),
+        Value::String(text) => text.trim().parse().ok(),
+        _ => None,
+    }
 }
 
 /// Sorts one line from Codex. Responses go to `pending`.
@@ -70,7 +89,8 @@ fn dispatch(line: &str, pending: &Pending, inbound: &mpsc::UnboundedSender<Inbou
             let _ = inbound.send(Inbound::Notification { method, params });
         }
         (Some(id), None) => {
-            let Some(id) = id.as_i64() else {
+            let Some(id) = response_id(&id) else {
+                tracing::warn!(%id, "codex app-server answered with a request ID that the worker did not send");
                 return;
             };
             let sender = pending.lock().ok().and_then(|mut p| p.remove(&id));
@@ -131,9 +151,16 @@ impl RpcClient {
                 writer,
                 pending,
                 next_id: Arc::new(AtomicI64::new(1)),
+                timeout: REQUEST_TIMEOUT,
             },
             inbound_rx,
         )
+    }
+
+    /// The same client with another request timeout.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 
     fn send(&self, value: &Value) -> Result<(), HarnessError> {
@@ -155,11 +182,29 @@ impl RpcClient {
         }
         let params =
             serde_json::to_value(params).map_err(|e| HarnessError::Protocol(e.to_string()))?;
-        self.send(&json!({"id": id, "method": method, "params": params}))?;
-        let value = rx.await.map_err(|_| HarnessError::Closed)??;
+        if let Err(err) = self.send(&json!({"id": id, "method": method, "params": params})) {
+            self.forget(id);
+            return Err(err);
+        }
+        let value = match tokio::time::timeout(self.timeout, rx).await {
+            Ok(answer) => answer.map_err(|_| HarnessError::Closed)??,
+            Err(_) => {
+                self.forget(id);
+                return Err(HarnessError::Timeout(format!(
+                    "codex app-server did not answer `{method}` in {} seconds",
+                    self.timeout.as_secs()
+                )));
+            }
+        };
         serde_json::from_value(value).map_err(|e| {
             HarnessError::Protocol(format!("`{method}` returned an unexpected result: {e}"))
         })
+    }
+
+    fn forget(&self, id: i64) {
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.remove(&id);
+        }
     }
 
     /// Sends a notification.
@@ -231,5 +276,45 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, HarnessError::Closed));
+    }
+
+    #[tokio::test]
+    async fn a_request_without_an_answer_times_out() {
+        let (client_side, _server_side) = tokio::io::duplex(64 * 1024);
+        let (_server_out, client_in) = tokio::io::duplex(64 * 1024);
+        let (client, _inbound) = RpcClient::start(client_side, client_in);
+        let client = client.with_timeout(Duration::from_millis(100));
+        let started = std::time::Instant::now();
+        let err = client
+            .request::<_, Value>("turn/interrupt", &json!({}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, HarnessError::Timeout(_)), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(client.pending.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_response_with_a_string_or_float_id_resolves_its_request() {
+        let (client_side, server_side) = tokio::io::duplex(64 * 1024);
+        let (mut server_out, client_in) = tokio::io::duplex(64 * 1024);
+        let (client, _inbound) = RpcClient::start(client_side, client_in);
+        let client = client.with_timeout(Duration::from_secs(5));
+        let server = tokio::spawn(async move {
+            let mut lines = BufReader::new(server_side).lines();
+            for echo in [|id: i64| json!(id.to_string()), |id: i64| json!(id as f64)] {
+                let line = lines.next_line().await.unwrap().unwrap();
+                let request: Value = serde_json::from_str(&line).unwrap();
+                let id = request["id"].as_i64().unwrap();
+                let text = format!("{}\n", json!({"id": echo(id), "result": {"n": id}}));
+                server_out.write_all(text.as_bytes()).await.unwrap();
+            }
+            server_out
+        });
+        let first: Value = client.request("a", &json!({})).await.unwrap();
+        let second: Value = client.request("b", &json!({})).await.unwrap();
+        assert_eq!(first["n"], 1);
+        assert_eq!(second["n"], 2);
+        drop(server.await.unwrap());
     }
 }

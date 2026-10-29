@@ -31,7 +31,8 @@ fn recorded_claude_turn_maps_to_one_message() {
         let message: Value = serde_json::from_str(line).unwrap();
         events.extend(m.map_update(&message["params"]["update"]));
     }
-    events.extend(m.end_turn(stop_reason(Some("end_turn")), None));
+    let (reason, error) = stop_reason(Some("end_turn"));
+    events.extend(m.end_turn(reason, error));
     let all = items(&events);
     let (last, status) = all.last().unwrap();
     assert_eq!(*status, ItemStatus::Completed);
@@ -210,10 +211,32 @@ fn permission_requests_map_details_and_options() {
 
 #[test]
 fn stop_reasons() {
-    assert_eq!(stop_reason(Some("end_turn")), TurnEndReason::Completed);
-    assert_eq!(stop_reason(Some("max_tokens")), TurnEndReason::Completed);
-    assert_eq!(stop_reason(Some("cancelled")), TurnEndReason::Interrupted);
-    assert_eq!(stop_reason(Some("refusal")), TurnEndReason::Failed);
+    assert_eq!(
+        stop_reason(Some("end_turn")),
+        (TurnEndReason::Completed, None)
+    );
+    assert_eq!(
+        stop_reason(Some("cancelled")),
+        (TurnEndReason::Interrupted, None)
+    );
+    // A turn that stops before its work is done fails, with the reason.
+    for reason in [
+        Some("max_tokens"),
+        Some("max_turn_requests"),
+        Some("refusal"),
+        Some("something_new"),
+        None,
+    ] {
+        let (end, error) = stop_reason(reason);
+        assert_eq!(end, TurnEndReason::Failed, "{reason:?}");
+        assert!(error.is_some_and(|e| !e.is_empty()), "{reason:?}");
+    }
+    assert!(
+        stop_reason(Some("max_tokens"))
+            .1
+            .unwrap()
+            .contains("token limit")
+    );
 }
 
 #[test]
@@ -225,15 +248,33 @@ fn launch_recipes() {
     let no_npx =
         |name: &str| -> Option<PathBuf> { (name == "bunx").then(|| PathBuf::from("/bin/bunx")) };
     let claude = AccountConfig::default_for(HarnessKind::ClaudeCode);
-    let l = launch_recipe(HarnessKind::ClaudeCode, &claude, ApprovalMode::Ask, &found).unwrap();
+    let l = launch_recipe(
+        HarnessKind::ClaudeCode,
+        &claude,
+        ApprovalMode::Ask,
+        true,
+        &found,
+    )
+    .unwrap();
     assert_eq!(l.program, PathBuf::from("/bin/npx"));
     assert_eq!(l.args, vec!["-y", CLAUDE_AGENT_ACP]);
-    let l = launch_recipe(HarnessKind::ClaudeCode, &claude, ApprovalMode::Ask, &no_npx).unwrap();
+    let l = launch_recipe(
+        HarnessKind::ClaudeCode,
+        &claude,
+        ApprovalMode::Ask,
+        true,
+        &no_npx,
+    )
+    .unwrap();
     assert_eq!(l.args, vec![CLAUDE_AGENT_ACP]);
     assert!(
-        launch_recipe(HarnessKind::ClaudeCode, &claude, ApprovalMode::Ask, &|_| {
-            None
-        })
+        launch_recipe(
+            HarnessKind::ClaudeCode,
+            &claude,
+            ApprovalMode::Ask,
+            true,
+            &|_| { None }
+        )
         .is_err()
     );
 
@@ -243,6 +284,7 @@ fn launch_recipes() {
         HarnessKind::OpenCode,
         &open,
         ApprovalMode::AutoEdits,
+        true,
         &found,
     )
     .unwrap();
@@ -250,19 +292,37 @@ fn launch_recipes() {
     let config: Value = serde_json::from_str(&l.env["OPENCODE_CONFIG_CONTENT"]).unwrap();
     assert_eq!(config["permission"]["edit"], "allow");
     assert_eq!(config["permission"]["bash"], "ask");
+    // A shell-off worker denies OpenCode's shell tool.
+    let l = launch_recipe(
+        HarnessKind::OpenCode,
+        &open,
+        ApprovalMode::AutoEdits,
+        false,
+        &found,
+    )
+    .unwrap();
+    let config: Value = serde_json::from_str(&l.env["OPENCODE_CONFIG_CONTENT"]).unwrap();
+    assert_eq!(config["permission"]["bash"], "deny");
 
     let gemini = AccountConfig::default_for(HarnessKind::GeminiCli);
-    let l = launch_recipe(HarnessKind::GeminiCli, &gemini, ApprovalMode::Auto, &found).unwrap();
+    let l = launch_recipe(
+        HarnessKind::GeminiCli,
+        &gemini,
+        ApprovalMode::Auto,
+        true,
+        &found,
+    )
+    .unwrap();
     assert_eq!(
         l.args,
         vec!["--experimental-acp", "--approval-mode", "yolo"]
     );
 
     let mut generic = AccountConfig::default_for(HarnessKind::Acp);
-    assert!(launch_recipe(HarnessKind::Acp, &generic, ApprovalMode::Ask, &found).is_err());
+    assert!(launch_recipe(HarnessKind::Acp, &generic, ApprovalMode::Ask, true, &found).is_err());
     generic.binary = Some("my-agent".into());
     generic.args = vec!["acp".into()];
-    let l = launch_recipe(HarnessKind::Acp, &generic, ApprovalMode::Ask, &found).unwrap();
+    let l = launch_recipe(HarnessKind::Acp, &generic, ApprovalMode::Ask, true, &found).unwrap();
     assert_eq!(
         (l.program, l.args),
         (PathBuf::from("/bin/my-agent"), vec!["acp".to_owned()])
@@ -346,7 +406,8 @@ fn recorded_opencode_turn_maps_to_one_message() {
         let message: Value = serde_json::from_str(line).unwrap();
         events.extend(m.map_update(&message["params"]["update"]));
     }
-    events.extend(m.end_turn(stop_reason(Some("end_turn")), None));
+    let (reason, error) = stop_reason(Some("end_turn"));
+    events.extend(m.end_turn(reason, error));
     let all = items(&events);
     assert!(
         matches!(all.last(), Some((ItemPayload::AssistantMessage(a), ItemStatus::Completed)) if a.text.trim() == "OK")
@@ -366,15 +427,18 @@ mod fake_agent {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     fn spec() -> SessionSpec {
+        // An empty workspace, so no CLAUDE.md is in it.
+        let workspace = tempfile::tempdir().unwrap().keep();
         SessionSpec {
             session_id: consort_proto::ids::SessionId::new(),
-            workspace: std::env::temp_dir(),
-            runtime_dir: std::env::temp_dir(),
+            workspace: workspace.clone(),
+            runtime_dir: workspace,
             model: "sonnet".into(),
             options: [("effort".to_owned(), OptionValue::Text("high".into()))]
                 .into_iter()
                 .collect(),
             approval_mode: ApprovalMode::Ask,
+            allow_shell: true,
             system_prompt_append: "You are a coordinator.".into(),
             mcp_servers: vec![McpServerSpec {
                 name: "hub".into(),
@@ -384,11 +448,50 @@ mod fake_agent {
             }],
             env: BTreeMap::new(),
             resume: None,
+            process_watcher: None,
         }
+    }
+
+    /// How the fake agent misbehaves. The default behaves well.
+    #[derive(Debug, Clone, Copy, Default)]
+    struct Behavior {
+        /// `session/set_config_option` for `mode` answers but keeps the
+        /// old mode.
+        ignore_mode: bool,
+        /// The session has no mode option.
+        no_mode: bool,
+        /// `_session/steering` never answers.
+        ignore_steer: bool,
+        /// `session/cancel` does not end the turn.
+        ignore_cancel: bool,
+    }
+
+    /// The config options of the fake session.
+    fn fake_options(mode: &str, behavior: Behavior) -> Vec<Value> {
+        let mut options = vec![
+            json!({"id": "model", "name": "Model", "category": "model", "type": "select", "currentValue": "opus",
+             "options": [{"value": "opus", "name": "Opus"}, {"value": "sonnet", "name": "Sonnet"}]}),
+            json!({"id": "effort", "name": "Effort", "category": "thought_level", "type": "select", "currentValue": "medium",
+             "options": [{"value": "medium", "name": "Medium"}, {"value": "high", "name": "High"}]}),
+        ];
+        if !behavior.no_mode {
+            options.insert(0, json!({"id": "mode", "name": "Mode", "category": "mode", "type": "select", "currentValue": mode,
+             "options": [{"value": "default", "name": "Default"}, {"value": "acceptEdits", "name": "Accept edits"}]}));
+        }
+        options
     }
 
     /// A scripted ACP agent over an in-memory pipe.
     async fn run_agent(stream: tokio::io::DuplexStream, log: Arc<Mutex<Vec<Value>>>) {
+        run_agent_with(stream, log, Behavior::default()).await;
+    }
+
+    async fn run_agent_with(
+        stream: tokio::io::DuplexStream,
+        log: Arc<Mutex<Vec<Value>>>,
+        behavior: Behavior,
+    ) {
+        let mut mode = "acceptEdits".to_owned();
         let (read, mut write) = tokio::io::split(stream);
         let mut lines = BufReader::new(read).lines();
         let mut prompts = 0;
@@ -415,17 +518,27 @@ mod fake_agent {
                     }))).await;
                 }
                 Some("session/new") => {
-                    send(&mut write, reply(json!({"sessionId": "s1", "configOptions": [
-                        {"id": "mode", "name": "Mode", "category": "mode", "type": "select", "currentValue": "acceptEdits",
-                         "options": [{"value": "default", "name": "Default"}, {"value": "acceptEdits", "name": "Accept edits"}]},
-                        {"id": "model", "name": "Model", "category": "model", "type": "select", "currentValue": "opus",
-                         "options": [{"value": "opus", "name": "Opus"}, {"value": "sonnet", "name": "Sonnet"}]},
-                        {"id": "effort", "name": "Effort", "category": "thought_level", "type": "select", "currentValue": "medium",
-                         "options": [{"value": "medium", "name": "Medium"}, {"value": "high", "name": "High"}]}
-                    ]}))).await;
+                    send(&mut write, reply(json!({"sessionId": "s1", "configOptions": fake_options(&mode, behavior)}))).await;
+                }
+                Some("session/load") => {
+                    send(
+                        &mut write,
+                        reply(json!({"configOptions": fake_options(&mode, behavior)})),
+                    )
+                    .await;
                 }
                 Some("session/set_config_option") => {
-                    send(&mut write, reply(json!({"configOptions": []}))).await
+                    if msg["params"]["configId"] == "mode" && !behavior.ignore_mode {
+                        mode = msg["params"]["value"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_owned();
+                    }
+                    send(
+                        &mut write,
+                        reply(json!({"configOptions": fake_options(&mode, behavior)})),
+                    )
+                    .await
                 }
                 Some("session/prompt") => {
                     // A prompt that the test wants to fail. -32000 is the ACP
@@ -455,8 +568,14 @@ mod fake_agent {
                     }
                 }
                 Some("_session/steering") => {
-                    send(&mut write, reply(json!({"outcome": "injected"}))).await
+                    if behavior.ignore_steer {
+                        // No answer, but the turn goes on.
+                        send(&mut write, update("Still working. ")).await;
+                    } else {
+                        send(&mut write, reply(json!({"outcome": "injected"}))).await
+                    }
                 }
+                Some("session/cancel") if behavior.ignore_cancel => {}
                 Some("session/cancel") => {
                     if let Some(pid) = open_prompt.take() {
                         send(&mut write, json!({"jsonrpc": "2.0", "id": pid, "result": {"stopReason": "cancelled"}})).await;
@@ -791,4 +910,267 @@ mod fake_agent {
             "You are a coordinator.\n\nHello"
         );
     }
+
+    async fn connect_with(
+        kind: HarnessKind,
+        spec: SessionSpec,
+        behavior: Behavior,
+    ) -> (
+        Result<(AcpSession, EventReceiver, Ready), HarnessError>,
+        Arc<Mutex<Vec<Value>>>,
+    ) {
+        let (client_side, agent_side) = tokio::io::duplex(1 << 16);
+        let log = Arc::new(Mutex::new(Vec::new()));
+        tokio::spawn(run_agent_with(agent_side, log.clone(), behavior));
+        let (read, write) = tokio::io::split(client_side);
+        let result = connect(kind, spec, write, read, None, StderrTail::empty()).await;
+        (result, log)
+    }
+
+    #[tokio::test]
+    async fn a_claude_mode_that_does_not_stick_fails_the_open() {
+        let behavior = Behavior {
+            ignore_mode: true,
+            ..Behavior::default()
+        };
+        let (result, _log) = connect_with(HarnessKind::ClaudeCode, spec(), behavior).await;
+        let Err(err) = result else {
+            panic!("the open must fail when the mode stays acceptEdits")
+        };
+        assert!(err.to_string().contains("permission mode"), "{err}");
+        assert!(err.to_string().contains("acceptEdits"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_claude_session_without_a_mode_fails_the_open() {
+        let behavior = Behavior {
+            no_mode: true,
+            ..Behavior::default()
+        };
+        let (result, _log) = connect_with(HarnessKind::ClaudeCode, spec(), behavior).await;
+        let Err(err) = result else {
+            panic!("the open must fail when the agent has no mode")
+        };
+        assert!(err.to_string().contains("no permission mode"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn session_load_sends_the_system_prompt_and_the_limits() {
+        let mut s = spec();
+        s.resume = Some(NativeRef::new("s1"));
+        s.allow_shell = false;
+        let (result, log) = connect_with(HarnessKind::ClaudeCode, s, Behavior::default()).await;
+        let (session, _events, ready) = result.unwrap();
+        assert_eq!(ready.native_ref, NativeRef::new("s1"));
+        {
+            let log = log.lock().unwrap();
+            let load = log.iter().find(|m| m["method"] == "session/load").unwrap();
+            let meta = &load["params"]["_meta"];
+            assert_eq!(meta["systemPrompt"]["append"], "You are a coordinator.");
+            assert_eq!(
+                meta["claudeCode"]["options"]["settingSources"],
+                json!(["user"])
+            );
+            assert_eq!(
+                meta["claudeCode"]["options"]["disallowedTools"],
+                json!(["Bash", "PowerShell", "Monitor"])
+            );
+            assert!(
+                log.iter()
+                    .any(|m| m["method"] == "session/set_config_option"
+                        && m["params"]["configId"] == "mode"
+                        && m["params"]["value"] == "default"),
+                "the resumed session gets its mode again"
+            );
+        }
+        Box::new(session).close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_steer_without_an_answer_does_not_block_the_session() {
+        let behavior = Behavior {
+            ignore_steer: true,
+            ..Behavior::default()
+        };
+        let (result, log) = connect_with(HarnessKind::ClaudeCode, spec(), behavior).await;
+        let (session, mut events, _ready) = result.unwrap();
+        let mut session: Box<dyn HarnessSession> = Box::new(session);
+        // The first turn of the fake agent asks for a permission.
+        session
+            .turn(TurnInput {
+                text: "Push it".into(),
+                attachments: vec![],
+            })
+            .await
+            .unwrap();
+        let SessionEvent::RequestOpened(opened) =
+            next_matching(&mut events, |e| matches!(e, SessionEvent::RequestOpened(_))).await
+        else {
+            unreachable!()
+        };
+        // While the steer waits, the agent's updates still arrive.
+        let (steered, update) = tokio::join!(
+            session.steer(TurnInput {
+                text: "Also this".into(),
+                attachments: vec![],
+            }),
+            next_matching(&mut events, |e| matches!(
+                e,
+                SessionEvent::Item(i) if matches!(&i.payload, ItemPayload::AssistantMessage(m) if m.text.contains("Still working"))
+            ))
+        );
+        assert!(
+            matches!(steered, Err(HarnessError::Timeout(_))),
+            "{steered:?}"
+        );
+        assert!(matches!(update, SessionEvent::Item(_)));
+        // The approval still works after the steer.
+        session
+            .respond(
+                opened.request_id,
+                Answer {
+                    option_id: Some("yes".into()),
+                    text: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            next_matching(&mut events, |e| matches!(e, SessionEvent::TurnEnded { .. })).await,
+            SessionEvent::TurnEnded {
+                reason: TurnEndReason::Completed,
+                ..
+            }
+        ));
+        assert!(
+            log.lock()
+                .unwrap()
+                .iter()
+                .any(|m| m["method"] == "_session/steering")
+        );
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_ignored_cancel_loses_the_session() {
+        let behavior = Behavior {
+            ignore_cancel: true,
+            ..Behavior::default()
+        };
+        let (result, _log) = connect_with(HarnessKind::ClaudeCode, spec(), behavior).await;
+        let (session, mut events, _ready) = result.unwrap();
+        let mut session: Box<dyn HarnessSession> = Box::new(session);
+        // The first turn of the fake agent asks for a permission. The second
+        // turn runs until a cancel.
+        session
+            .turn(TurnInput {
+                text: "Push it".into(),
+                attachments: vec![],
+            })
+            .await
+            .unwrap();
+        let SessionEvent::RequestOpened(opened) =
+            next_matching(&mut events, |e| matches!(e, SessionEvent::RequestOpened(_))).await
+        else {
+            unreachable!()
+        };
+        session
+            .respond(
+                opened.request_id,
+                Answer {
+                    option_id: Some("yes".into()),
+                    text: None,
+                },
+            )
+            .await
+            .unwrap();
+        next_matching(&mut events, |e| matches!(e, SessionEvent::TurnEnded { .. })).await;
+        session
+            .turn(TurnInput {
+                text: "Wait".into(),
+                attachments: vec![],
+            })
+            .await
+            .unwrap();
+        session.interrupt().await.unwrap();
+        assert!(matches!(
+            next_matching(&mut events, |e| matches!(e, SessionEvent::TurnEnded { .. })).await,
+            SessionEvent::TurnEnded {
+                reason: TurnEndReason::Failed,
+                ..
+            }
+        ));
+        assert!(matches!(
+            next_matching(&mut events, |e| matches!(e, SessionEvent::Error { .. })).await,
+            SessionEvent::Error { code, .. } if code == "harness_unresponsive"
+        ));
+        assert!(matches!(
+            next_matching(&mut events, |e| matches!(e, SessionEvent::State { .. })).await,
+            SessionEvent::State {
+                state: SessionState::Lost
+            }
+        ));
+    }
+
+    #[test]
+    fn agents_start_in_the_runtime_folder() {
+        let mut s = spec();
+        s.runtime_dir = PathBuf::from("/runtime/ses_1");
+        let account = AccountConfig::default_for(HarnessKind::ClaudeCode);
+        let process = agent_process_spec(HarnessKind::ClaudeCode, &account, &s, &|name| {
+            Some(PathBuf::from(format!("/bin/{name}")))
+        })
+        .unwrap();
+        assert_eq!(process.cwd.as_deref(), Some(Path::new("/runtime/ses_1")));
+        assert_ne!(process.cwd.as_deref(), Some(s.workspace.as_path()));
+    }
+}
+
+#[test]
+fn claude_meta_keeps_repo_settings_and_the_shell_out() {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().join("repo");
+    std::fs::create_dir_all(workspace.join(".claude")).unwrap();
+    std::fs::write(workspace.join("CLAUDE.md"), "Use tabs.\n").unwrap();
+    let outside = dir.path().join("outside.txt");
+    std::fs::write(&outside, "do not read me").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside, workspace.join(".claude").join("CLAUDE.md")).unwrap();
+    let mut spec = SessionSpec {
+        session_id: SessionId::new(),
+        workspace: workspace.clone(),
+        runtime_dir: dir.path().to_path_buf(),
+        model: String::new(),
+        options: Default::default(),
+        approval_mode: ApprovalMode::AutoEdits,
+        allow_shell: false,
+        system_prompt_append: "You are a task.".into(),
+        mcp_servers: vec![],
+        env: BTreeMap::new(),
+        resume: None,
+        process_watcher: None,
+    };
+    let meta = claude_meta(&spec);
+    let append = meta["systemPrompt"]["append"].as_str().unwrap();
+    assert!(append.starts_with("You are a task."), "{append}");
+    assert!(append.contains("Use tabs."), "{append}");
+    assert!(
+        !append.contains("do not read me"),
+        "a linked CLAUDE.md is not read: {append}"
+    );
+    let options = &meta["claudeCode"]["options"];
+    assert_eq!(options["settingSources"], json!(["user"]));
+    assert_eq!(options["allowDangerouslySkipPermissions"], false);
+    assert_eq!(
+        options["disallowedTools"],
+        json!(["Bash", "PowerShell", "Monitor"])
+    );
+
+    // Full access with the shell on keeps Claude Code's own settings, and
+    // Claude Code loads CLAUDE.md itself.
+    spec.approval_mode = ApprovalMode::FullAccess;
+    spec.allow_shell = true;
+    let meta = claude_meta(&spec);
+    assert_eq!(meta["systemPrompt"]["append"], "You are a task.");
+    assert!(meta.get("claudeCode").is_none(), "{meta}");
 }

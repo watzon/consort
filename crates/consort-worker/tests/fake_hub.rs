@@ -235,7 +235,7 @@ async fn pair_connect_run_a_session_and_resend_after_reconnect() {
             hub_server.bearer_token.clone().unwrap(),
         )
     };
-    let client = McpHttpClient::new(&url, &token);
+    let client = McpHttpClient::new(&url, &token).unwrap();
     client
         .post(&json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "1"}}}))
         .await
@@ -440,7 +440,14 @@ async fn the_worker_allows_hub_tools_without_asking_the_hub() {
             FakeStep::ToolApproval {
                 request_id: "hub-1".into(),
                 server: "hub".into(),
-                tool: "post_message".into(),
+                tool: "post_update".into(),
+            },
+            // `mcp__hub__x__post_update` from a local server named `hub__x`
+            // parses as the `hub` server. It is not a listed hub tool.
+            FakeStep::ToolApproval {
+                request_id: "spoof-1".into(),
+                server: "hub".into(),
+                tool: "x__post_update".into(),
             },
             FakeStep::ToolApproval {
                 request_id: "other-1".into(),
@@ -451,6 +458,7 @@ async fn the_worker_allows_hub_tools_without_asking_the_hub() {
         ]],
     };
     let fake = FakeHarness::new(HarnessKind::ClaudeCode, script);
+    let record = fake.record();
     let mut harnesses: Harnesses = HashMap::new();
     harnesses.insert(
         HarnessKind::ClaudeCode,
@@ -466,22 +474,83 @@ async fn the_worker_allows_hub_tools_without_asking_the_hub() {
     .unwrap();
     hub.wait_connected().await;
     let session_id = SessionId::new();
-    let start = session_start(session_id, account_id);
+    let mut start = session_start(session_id, account_id);
+    start.turn = None;
     assert!(hub.command("start-1", start.into()).await.result.is_ok());
 
-    // The hub tool is allowed on the worker. The hub sees only the second
-    // approval, which is for a tool that is not a hub tool.
-    let request = hub
-        .wait_for("request.opened", |h| {
-            h.events(session_id)
-                .into_iter()
-                .find_map(|e| match e.event {
-                    SessionEvent::RequestOpened(r) => Some(r),
-                    _ => None,
-                })
-        })
+    // The harness lists the hub tools, as a real harness does when it
+    // starts. The worker allows only the tools in this list.
+    let (url, token) = {
+        let r = record.lock().unwrap();
+        let hub_server = &r.opened[0].mcp_servers[0];
+        (
+            hub_server.url.clone(),
+            hub_server.bearer_token.clone().unwrap(),
+        )
+    };
+    let client = McpHttpClient::new(&url, &token).unwrap();
+    client
+        .post(&json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "1"}}}))
+        .await
+        .unwrap();
+    client
+        .post(&json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}))
+        .await
+        .unwrap();
+    let turn = hub
+        .command(
+            "turn-1",
+            SessionTurn {
+                session_id,
+                turn: TurnInput {
+                    text: "Post it".into(),
+                    attachments: vec![],
+                },
+            }
+            .into(),
+        )
         .await;
-    assert_eq!(request.request_id.as_str(), "other-1");
+    assert!(turn.result.is_ok());
+
+    // The listed hub tool is allowed on the worker. The hub sees the
+    // spoofed one first.
+    let opened = |h: &FakeHub| -> Vec<String> {
+        h.events(session_id)
+            .into_iter()
+            .filter_map(|e| match e.event {
+                SessionEvent::RequestOpened(r) => Some(r.request_id.as_str().to_owned()),
+                _ => None,
+            })
+            .collect()
+    };
+    hub.wait_for("the spoofed request", |h| {
+        (!opened(h).is_empty()).then_some(())
+    })
+    .await;
+    assert_eq!(opened(&hub), vec!["spoof-1".to_owned()]);
+    let answer = hub
+        .command(
+            "answer-1",
+            SessionRespond {
+                session_id,
+                request_id: consort_proto::ids::RequestId::new("spoof-1"),
+                answer: RequestAnswer {
+                    option_id: Some("deny".into()),
+                    text: None,
+                },
+            }
+            .into(),
+        )
+        .await;
+    assert!(answer.result.is_ok());
+    hub.wait_for("the second request", |h| {
+        (opened(h).len() == 2).then_some(())
+    })
+    .await;
+    assert_eq!(
+        opened(&hub),
+        vec!["spoof-1".to_owned(), "other-1".to_owned()]
+    );
     let hub_tool_closed = hub
         .events(session_id)
         .into_iter()

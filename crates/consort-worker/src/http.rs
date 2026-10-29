@@ -34,6 +34,27 @@ pub fn worker_ws_url(hub_url: &str) -> Result<String, WorkerError> {
     Ok(format!("{ws}{}", consort_proto::auth::WORKER_WS_PATH))
 }
 
+/// A warning when the hub URL sends traffic without TLS to a host that is
+/// not this machine. The worker still connects, because a test on the local
+/// network can use `http`. `None` for `https`, `wss` and loopback hosts.
+pub fn cleartext_warning(hub_url: &str) -> Option<String> {
+    let parsed = url::Url::parse(base_url(hub_url).as_str()).ok()?;
+    if !matches!(parsed.scheme(), "http" | "ws") {
+        return None;
+    }
+    let loopback = match parsed.host()? {
+        url::Host::Domain(name) => name.eq_ignore_ascii_case("localhost"),
+        url::Host::Ipv4(ip) => ip.is_loopback(),
+        url::Host::Ipv6(ip) => ip.is_loopback(),
+    };
+    if loopback {
+        return None;
+    }
+    Some(format!(
+        "The hub URL {hub_url} has no TLS. Anyone on the network path can read the worker link and the pairing code, and can change what the hub sends. Use https:// for a hub that is not on this machine."
+    ))
+}
+
 /// The HTTP base URL, with `ws` read as `http`.
 fn http_base(hub_url: &str) -> String {
     let base = base_url(hub_url);
@@ -136,5 +157,25 @@ mod tests {
         );
         assert!(worker_ws_url("ftp://x").is_err());
         assert_eq!(http_base("wss://h"), "https://h");
+    }
+
+    #[test]
+    fn cleartext_to_another_host_gets_a_warning() {
+        for url in [
+            "http://192.168.188.138:7600",
+            "ws://hub.example.com",
+            "http://hub.example.com/",
+        ] {
+            assert!(cleartext_warning(url).is_some(), "{url}");
+        }
+        for url in [
+            "https://hub.example.com",
+            "wss://hub.example.com",
+            "http://127.0.0.1:7600",
+            "http://localhost:7600",
+            "http://[::1]:7600",
+        ] {
+            assert!(cleartext_warning(url).is_none(), "{url}");
+        }
     }
 }

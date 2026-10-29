@@ -26,6 +26,12 @@ use consort_worker::WorkerConfig;
 use consort_worker::config::WorkerToml;
 
 async fn hub_tools_reach(kind: HarnessKind) {
+    hub_tools_reach_with(kind, true).await;
+}
+
+/// Like `hub_tools_reach`, with the worker's `allow_shell` policy. With the
+/// shell off, the session starts with the harness's shell tools removed.
+async fn hub_tools_reach_with(kind: HarnessKind, allow_shell: bool) {
     let hub = FakeHub::start().await;
     let dir = tempfile::tempdir().unwrap();
     consort_worker::pair(&hub.url, CODE, dir.path(), None, vec![])
@@ -33,6 +39,7 @@ async fn hub_tools_reach(kind: HarnessKind) {
         .unwrap();
     let mut toml = WorkerToml::load(dir.path()).unwrap();
     toml.auto_discover = false;
+    toml.policy.allow_shell = allow_shell;
     let account = AccountConfig::default_for(kind);
     let account_id = account.id;
     toml.accounts = vec![account];
@@ -117,4 +124,16 @@ async fn claude() {
 #[ignore = "needs opencode; no model call"]
 async fn opencode() {
     hub_tools_reach(HarnessKind::OpenCode).await;
+}
+
+#[tokio::test]
+#[ignore = "needs codex signed in; no model call"]
+async fn codex_shell_off() {
+    hub_tools_reach_with(HarnessKind::Codex, false).await;
+}
+
+#[tokio::test]
+#[ignore = "needs claude-agent-acp through npx; no model call"]
+async fn claude_shell_off() {
+    hub_tools_reach_with(HarnessKind::ClaudeCode, false).await;
 }

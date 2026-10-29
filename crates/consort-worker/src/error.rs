@@ -52,6 +52,9 @@ pub enum WorkerError {
     /// The worker is shutting down.
     #[error("the worker is shutting down")]
     ShuttingDown,
+    /// A frame is larger than the 1 MiB frame limit.
+    #[error("the frame is too large to send: {0}")]
+    TooLarge(String),
 }
 
 impl WorkerError {

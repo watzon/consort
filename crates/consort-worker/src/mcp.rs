@@ -42,6 +42,10 @@ use crate::WorkerError;
 /// The most bytes that `publish_artifact` uploads (64 MiB).
 pub const MAX_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
 
+/// The hub tools of a session, as `tool.list` gave them. Empty until the
+/// harness lists the tools for the first time.
+pub type ToolCache = Arc<Mutex<Option<Vec<ToolDefinition>>>>;
+
 /// What the endpoint needs from the rest of the worker.
 #[async_trait]
 pub trait ToolBackend: Send + Sync {
@@ -60,11 +64,18 @@ pub struct McpEndpoint {
     pub url: String,
     /// The bearer token.
     pub token: String,
+    tools: ToolCache,
     cancel: CancellationToken,
     task: tokio::task::JoinHandle<()>,
 }
 
 impl McpEndpoint {
+    /// The hub tools that this endpoint gave the harness. The worker allows
+    /// an approval for a hub tool only when the tool is in this list.
+    pub fn tools(&self) -> ToolCache {
+        self.tools.clone()
+    }
+
     /// Stops the server.
     pub async fn stop(self) {
         self.cancel.cancel();
@@ -129,11 +140,12 @@ pub async fn start(
         .local_addr()
         .map_err(|e| WorkerError::io("could not read the MCP endpoint address", e))?;
     let cancel = CancellationToken::new();
+    let tools: ToolCache = Arc::new(Mutex::new(None));
     let server = HubToolsServer {
         session_id,
         workspace,
         backend,
-        tools: Arc::new(Mutex::new(None)),
+        tools: tools.clone(),
         calls: Arc::new(AtomicU64::new(0)),
     };
     let mut config = StreamableHttpServerConfig::default();
@@ -159,6 +171,7 @@ pub async fn start(
     Ok(McpEndpoint {
         url: format!("http://{addr}{path}"),
         token,
+        tools,
         cancel,
         task,
     })
@@ -169,7 +182,7 @@ struct HubToolsServer {
     session_id: SessionId,
     workspace: PathBuf,
     backend: Arc<dyn ToolBackend>,
-    tools: Arc<Mutex<Option<Vec<ToolDefinition>>>>,
+    tools: ToolCache,
     calls: Arc<AtomicU64>,
 }
 

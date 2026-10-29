@@ -79,3 +79,63 @@ async fn bridge_forwards_stdio_to_the_endpoint() {
     let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
     endpoint.stop().await;
 }
+
+/// The endpoint is on 127.0.0.1, so the bridge never sends the token
+/// through a proxy, also when the proxy variables are set.
+#[tokio::test]
+async fn bridge_ignores_proxy_variables() {
+    let dir = tempfile::tempdir().unwrap();
+    let backend = Arc::new(Backend::default());
+    let endpoint = mcp::start(SessionId::new(), dir.path().to_path_buf(), backend.clone())
+        .await
+        .unwrap();
+    // A "proxy" that counts connections and closes them at once.
+    let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_url = format!("http://{}", proxy.local_addr().unwrap());
+    let connections = Arc::new(Mutex::new(0_usize));
+    let counter = connections.clone();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = proxy.accept().await {
+            *counter.lock().unwrap() += 1;
+            drop(stream);
+        }
+    });
+
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_consort"));
+    command
+        .args(["mcp-bridge", "--url", &endpoint.url])
+        .env("CONSORT_MCP_TOKEN", &endpoint.token)
+        .env_remove("NO_PROXY")
+        .env_remove("no_proxy");
+    for variable in ["HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"] {
+        command.env(variable, &proxy_url);
+    }
+    let mut child = command
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let initialize = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "1"}}});
+    stdin
+        .write_all(format!("{initialize}\n").as_bytes())
+        .await
+        .unwrap();
+    stdin.flush().await.unwrap();
+    let line = tokio::time::timeout(Duration::from_secs(20), lines.next_line())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let value: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(
+        value["result"]["serverInfo"]["name"], "consort-hub",
+        "{value}"
+    );
+    assert_eq!(*connections.lock().unwrap(), 0, "nothing went to the proxy");
+    drop(stdin);
+    let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+    endpoint.stop().await;
+}

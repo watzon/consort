@@ -32,10 +32,12 @@ fn spec(dir: &std::path::Path, mode: ApprovalMode) -> SessionSpec {
         model: std::env::var("CONSORT_SMOKE_MODEL").unwrap_or_default(),
         options: Default::default(),
         approval_mode: mode,
+        allow_shell: true,
         system_prompt_append: "You are a smoke test. Keep answers short.".into(),
         mcp_servers: Vec::new(),
         env: BTreeMap::new(),
         resume: None,
+        process_watcher: None,
     }
 }
 

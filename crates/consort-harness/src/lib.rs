@@ -167,9 +167,14 @@ pub struct McpServerSpec {
 pub struct SessionSpec {
     /// The Consort session ID. Adapters put it in session items.
     pub session_id: SessionId,
-    /// The workspace folder. The session runs here.
+    /// The workspace folder. The session works here. The adapter gives this
+    /// folder to the harness in the protocol (`cwd` of `session/new` or
+    /// `thread/start`).
     pub workspace: PathBuf,
-    /// A folder that the adapter may use for generated files.
+    /// A folder that the adapter may use for generated files. The adapter
+    /// starts the harness process in this folder, not in the workspace, so a
+    /// launcher such as `npx` does not read the repo's `.npmrc` and a Windows
+    /// shell does not find programs in the repo.
     pub runtime_dir: PathBuf,
     /// The model ID. Empty means the harness default.
     pub model: String,
@@ -177,6 +182,10 @@ pub struct SessionSpec {
     pub options: ModelOptions,
     /// The effective approval mode, already capped by worker policy.
     pub approval_mode: ApprovalMode,
+    /// Whether the worker policy lets the session run shell commands. When
+    /// it is false, the adapter removes the harness's shell tools where the
+    /// harness allows that (see `docs/harness-adapters.md`).
+    pub allow_shell: bool,
     /// Text to append to the harness's system prompt.
     pub system_prompt_append: String,
     /// The MCP servers to give the session. The hub endpoint is first.
@@ -185,6 +194,9 @@ pub struct SessionSpec {
     pub env: BTreeMap<String, String>,
     /// Resume this harness session instead of starting a new one.
     pub resume: Option<NativeRef>,
+    /// Learns the process groups of the harness processes, so the worker can
+    /// kill the ones that outlive it.
+    pub process_watcher: Option<process::WatcherHandle>,
 }
 
 /// The errors of the harness layer.

@@ -275,13 +275,14 @@ fn approvals_and_questions() {
 
 #[test]
 fn thread_params_follow_the_approval_table_and_mcp_config() {
-    let spec = SessionSpec {
+    let mut spec = SessionSpec {
         session_id: SessionId::new(),
         workspace: "/w".into(),
         runtime_dir: "/r".into(),
         model: "gpt-5.5".into(),
         options: Default::default(),
         approval_mode: ApprovalMode::AutoEdits,
+        allow_shell: true,
         system_prompt_append: "Be brief.".into(),
         mcp_servers: vec![McpServerSpec {
             name: "hub".into(),
@@ -291,26 +292,60 @@ fn thread_params_follow_the_approval_table_and_mcp_config() {
         }],
         env: BTreeMap::new(),
         resume: None,
+        process_watcher: None,
     };
-    let (config, env) = mcp_config(&spec.mcp_servers);
-    assert_eq!(env[&token_variable(0)], "tok");
+    let config = thread_config(&spec.mcp_servers, spec.allow_shell);
     let params = serde_json::to_value(thread_params(&spec, config)).unwrap();
     assert_eq!(params["approvalPolicy"], "on-request");
     assert_eq!(params["sandbox"], "workspace-write");
     assert_eq!(params["developerInstructions"], "Be brief.");
+    assert_eq!(params["cwd"], "/w", "the workspace goes in the request");
+    // The token goes through the stdio pipe, not the process environment.
     assert_eq!(
-        params["config"]["mcp_servers"]["hub"]["bearer_token_env_var"],
-        "CONSORT_MCP_TOKEN_0"
+        params["config"]["mcp_servers"]["hub"]["http_headers"]["Authorization"],
+        "Bearer tok"
+    );
+    assert!(
+        params["config"]["mcp_servers"]["hub"]
+            .get("bearer_token_env_var")
+            .is_none()
     );
     assert_eq!(
         params["config"]["mcp_servers"]["hub"]["url"],
         "http://127.0.0.1:1/mcp/ses"
     );
-    assert!(
-        !params.to_string().contains("tok\""),
-        "the token is not in the request"
-    );
+    assert!(params["config"].get("features").is_none());
     assert!(params.get("threadId").is_none());
+
+    // A shell-off worker removes the shell tools.
+    spec.allow_shell = false;
+    let config = thread_config(&spec.mcp_servers, spec.allow_shell);
+    let params = serde_json::to_value(thread_params(&spec, config)).unwrap();
+    assert_eq!(params["config"]["features"]["shell_tool"], false);
+    assert_eq!(params["config"]["features"]["unified_exec"], false);
+}
+
+#[test]
+fn app_server_starts_in_the_runtime_folder_without_the_token() {
+    let account = AccountConfig::default_for(HarnessKind::Codex);
+    let spec = app_server_spec(
+        &account,
+        std::path::Path::new("/runtime/ses_1"),
+        BTreeMap::new(),
+        None,
+        &|name| Some(std::path::PathBuf::from(format!("/bin/{name}"))),
+    )
+    .unwrap();
+    assert_eq!(
+        spec.cwd.as_deref(),
+        Some(std::path::Path::new("/runtime/ses_1"))
+    );
+    assert_eq!(spec.args, vec!["app-server"]);
+    assert!(
+        !spec.env.keys().any(|k| k.starts_with("CONSORT_MCP_TOKEN")),
+        "{:?}",
+        spec.env
+    );
 }
 
 #[test]
@@ -439,10 +474,12 @@ mod fake_server {
                 .into_iter()
                 .collect(),
             approval_mode: ApprovalMode::Ask,
+            allow_shell: true,
             system_prompt_append: String::new(),
             mcp_servers: vec![],
             env: BTreeMap::new(),
             resume: None,
+            process_watcher: None,
         };
         let (session, mut events) =
             start_thread(spec, serde_json::Map::new(), client, inbound, None)
@@ -577,5 +614,78 @@ mod fake_server {
                 .any(|m| m["method"] == "turn/steer" && m["params"]["expectedTurnId"] == "t2")
         );
         session.close().await.unwrap();
+    }
+
+    /// An app-server that accepts `turn/interrupt` but never ends the turn.
+    async fn run_stuck_server(stream: tokio::io::DuplexStream) {
+        let (read, mut write) = tokio::io::split(stream);
+        let mut lines = BufReader::new(read).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let msg: Value = serde_json::from_str(&line).unwrap();
+            let id = msg.get("id").cloned();
+            let reply = match msg.get("method").and_then(Value::as_str) {
+                Some("thread/start") => {
+                    json!({"id": id, "result": {"thread": {"id": "th1"}, "model": "m"}})
+                }
+                Some("turn/start") => {
+                    json!({"id": id, "result": {"turn": {"id": "t1", "status": "inProgress", "items": []}}})
+                }
+                Some("turn/interrupt") => json!({"id": id, "result": {}}),
+                _ => continue,
+            };
+            write
+                .write_all(format!("{reply}\n").as_bytes())
+                .await
+                .unwrap();
+            write.flush().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn an_ignored_interrupt_kills_the_harness_and_loses_the_session() {
+        let (client_side, server_side) = tokio::io::duplex(1 << 16);
+        tokio::spawn(run_stuck_server(server_side));
+        let (read, write) = tokio::io::split(client_side);
+        let (client, inbound) = RpcClient::start(write, read);
+        let spec = SessionSpec {
+            session_id: SessionId::new(),
+            workspace: "/w".into(),
+            runtime_dir: "/r".into(),
+            model: String::new(),
+            options: Default::default(),
+            approval_mode: ApprovalMode::Ask,
+            allow_shell: true,
+            system_prompt_append: String::new(),
+            mcp_servers: vec![],
+            env: BTreeMap::new(),
+            resume: None,
+            process_watcher: None,
+        };
+        let (session, mut events) =
+            start_thread(spec, serde_json::Map::new(), client, inbound, None)
+                .await
+                .unwrap();
+        let mut session: Box<dyn HarnessSession> = Box::new(session);
+        session.turn(TurnInput::default()).await.unwrap();
+        session.interrupt().await.unwrap();
+        let ended =
+            next_matching(&mut events, |e| matches!(e, SessionEvent::TurnEnded { .. })).await;
+        assert!(matches!(
+            ended,
+            SessionEvent::TurnEnded {
+                reason: TurnEndReason::Failed,
+                ..
+            }
+        ));
+        assert!(matches!(
+            next_matching(&mut events, |e| matches!(e, SessionEvent::Error { .. })).await,
+            SessionEvent::Error { code, .. } if code == "harness_unresponsive"
+        ));
+        assert!(matches!(
+            next_matching(&mut events, |e| matches!(e, SessionEvent::State { .. })).await,
+            SessionEvent::State {
+                state: SessionState::Lost
+            }
+        ));
     }
 }

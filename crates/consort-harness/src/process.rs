@@ -5,6 +5,12 @@
 //! [`HarnessProcess::kill`] ends the whole process tree. Wrapper launchers
 //! such as `npx` start the real agent as a grandchild, so killing only the
 //! child is not enough.
+//!
+//! On Windows the job object kills the tree when the worker exits, even
+//! when the worker is killed. On Unix a process group outlives a worker
+//! that is killed. So a [`ProcessWatcher`] learns each group that starts and
+//! ends, and the worker kills the groups that it recorded at the next start
+//! (see [`group_start_time`] and [`kill_group`]).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -20,6 +26,33 @@ use crate::HarnessError;
 /// How much of a harness's stderr the adapter keeps for error messages.
 const STDERR_TAIL_BYTES: usize = 8 * 1024;
 
+/// Learns about the process groups of harness processes. The worker
+/// records them, so it can kill a group that outlives it.
+pub trait ProcessWatcher: Send + Sync {
+    /// A process group started. `pgid` is the ID of the group and of its
+    /// leader. `program` is the program that the leader runs.
+    fn started(&self, pgid: u32, program: &str);
+    /// The process group ended, or the adapter killed it.
+    fn ended(&self, pgid: u32);
+}
+
+/// A shared [`ProcessWatcher`]. Two handles are equal when they share one
+/// watcher.
+#[derive(Clone)]
+pub struct WatcherHandle(pub Arc<dyn ProcessWatcher>);
+
+impl std::fmt::Debug for WatcherHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("WatcherHandle")
+    }
+}
+
+impl PartialEq for WatcherHandle {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
 /// How to start a harness process.
 #[derive(Debug, Clone, Default)]
 pub struct ProcessSpec {
@@ -33,6 +66,8 @@ pub struct ProcessSpec {
     pub env_remove: Vec<String>,
     /// The working folder.
     pub cwd: Option<PathBuf>,
+    /// Learns the process group, on Unix.
+    pub watcher: Option<WatcherHandle>,
 }
 
 /// Finds a program on `PATH`, or checks an explicit path. On Windows this
@@ -51,6 +86,8 @@ pub struct HarnessProcess {
     stdin: Option<ChildStdin>,
     stdout: Option<ChildStdout>,
     stderr_tail: Arc<Mutex<String>>,
+    /// The watcher and the process group that it knows about.
+    group: Option<(WatcherHandle, u32)>,
 }
 
 impl std::fmt::Debug for HarnessProcess {
@@ -107,6 +144,21 @@ pub fn spawn(spec: &ProcessSpec) -> Result<HarnessProcess, HarnessError> {
     let stdin = child.stdin().take();
     let stdout = child.stdout().take();
     let stderr = child.stderr().take();
+    // The child leads its own process group on Unix, so the group ID is the
+    // child's process ID.
+    let group = if cfg!(unix) {
+        spec.watcher.clone().zip(child.id())
+    } else {
+        None
+    };
+    if let Some((watcher, pgid)) = &group {
+        let program = spec
+            .program
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        watcher.0.started(*pgid, &program);
+    }
     let stderr_tail = Arc::new(Mutex::new(String::new()));
     if let Some(stderr) = stderr {
         let tail = stderr_tail.clone();
@@ -131,6 +183,7 @@ pub fn spawn(spec: &ProcessSpec) -> Result<HarnessProcess, HarnessError> {
         stdin,
         stdout,
         stderr_tail,
+        group,
     })
 }
 
@@ -178,6 +231,14 @@ impl HarnessProcess {
         if let Err(err) = Box::into_pin(self.child.kill()).await {
             tracing::debug!(error = %err, "harness process kill failed; it may have exited");
         }
+        self.forget_group();
+    }
+
+    /// Tells the watcher that the process group is gone.
+    fn forget_group(&mut self) {
+        if let Some((watcher, pgid)) = self.group.take() {
+            watcher.0.ended(pgid);
+        }
     }
 
     /// Waits up to `grace` for the process to exit, then kills the tree.
@@ -192,6 +253,13 @@ impl HarnessProcess {
             // The child exited. Kill the rest of the group, if any.
             self.kill().await;
         }
+    }
+}
+
+impl Drop for HarnessProcess {
+    fn drop(&mut self) {
+        // `KillOnDrop` kills the process tree when the child drops.
+        self.forget_group();
     }
 }
 
@@ -224,6 +292,7 @@ pub async fn run_capture(
         env: env.clone(),
         env_remove: Vec::new(),
         cwd: None,
+        watcher: None,
     };
     let mut cmd = build_command(&spec);
     cmd.stdin(std::process::Stdio::null());
@@ -240,6 +309,39 @@ pub async fn run_capture(
         )));
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+/// The start time of a process, as `ps -o lstart` shows it, or `None` when
+/// no such process runs. The worker stores it with a process group, so it
+/// never kills a group whose ID the system gave to a new process. This
+/// blocks, so call it from a blocking task.
+#[cfg(unix)]
+pub fn group_start_time(pid: u32) -> Option<String> {
+    let output = std::process::Command::new("ps")
+        .args(["-o", "lstart=", "-p", &pid.to_string()])
+        .env("LC_ALL", "C")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    (output.status.success() && !text.is_empty()).then_some(text)
+}
+
+/// Sends SIGKILL to every process in a process group. Returns whether the
+/// signal went out. This blocks, so call it from a blocking task.
+#[cfg(unix)]
+pub fn kill_group(pgid: u32) -> bool {
+    if pgid <= 1 {
+        return false;
+    }
+    std::process::Command::new("kill")
+        .args(["-s", "KILL", "--", &format!("-{pgid}")])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
 }
 
 /// Pulls a version number such as `0.165.0` out of `--version` output.
@@ -296,5 +398,87 @@ mod tests {
         process.kill().await;
         assert!(process.has_exited());
         assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[cfg(unix)]
+    #[derive(Default)]
+    struct Recorder(Mutex<Vec<(String, u32)>>);
+
+    #[cfg(unix)]
+    impl ProcessWatcher for Recorder {
+        fn started(&self, pgid: u32, program: &str) {
+            self.0
+                .lock()
+                .unwrap()
+                .push((format!("started {program}"), pgid));
+        }
+        fn ended(&self, pgid: u32) {
+            self.0.lock().unwrap().push(("ended".to_owned(), pgid));
+        }
+    }
+
+    #[cfg(unix)]
+    fn group_members(pgid: u32) -> Vec<String> {
+        let out = std::process::Command::new("ps")
+            .args(["-A", "-o", "pid=,pgid=,stat="])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter(|l| {
+                let parts: Vec<&str> = l.split_whitespace().collect();
+                parts.get(1) == Some(&pgid.to_string().as_str())
+                    && !parts.get(2).is_some_and(|s| s.starts_with('Z'))
+            })
+            .map(str::to_owned)
+            .collect()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_watcher_learns_the_group_and_a_stale_group_can_be_killed() {
+        let recorder = Arc::new(Recorder::default());
+        let watcher = WatcherHandle(recorder.clone());
+        let spec = ProcessSpec {
+            program: resolve_program("sh").unwrap(),
+            args: vec!["-c".to_owned(), "sleep 30 & sleep 30".to_owned()],
+            watcher: Some(watcher.clone()),
+            ..ProcessSpec::default()
+        };
+        // A killed process tells the watcher that its group ended.
+        let mut process = spawn(&spec).unwrap();
+        let pgid = process.id().unwrap();
+        process.kill().await;
+        assert_eq!(
+            *recorder.0.lock().unwrap(),
+            vec![("started sh".to_owned(), pgid), ("ended".to_owned(), pgid)]
+        );
+
+        // A process that the worker loses (as when the worker is killed)
+        // keeps its group. The worker kills the group at its next start, but
+        // only when the leader still has the start time that it recorded.
+        let process = spawn(&spec).unwrap();
+        let pgid = process.id().unwrap();
+        std::mem::forget(process);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(group_members(pgid).len() >= 2, "{:?}", group_members(pgid));
+        let started = tokio::task::spawn_blocking(move || group_start_time(pgid))
+            .await
+            .unwrap()
+            .expect("the leader runs");
+        assert!(!started.is_empty());
+        assert!(
+            tokio::task::spawn_blocking(move || kill_group(pgid))
+                .await
+                .unwrap()
+        );
+        for _ in 0..50 {
+            if group_members(pgid).is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(group_members(pgid).is_empty(), "{:?}", group_members(pgid));
+        assert!(!kill_group(1), "the worker never signals init");
     }
 }

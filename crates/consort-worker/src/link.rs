@@ -1,6 +1,11 @@
 //! The worker link: one WebSocket to the hub, with challenge
-//! authentication, `hello`, request and response matching, pings and
-//! reconnects with jittered backoff.
+//! authentication, `hello`, request and response matching, pings, a
+//! liveness check and reconnects with jittered backoff.
+//!
+//! The worker sends a ping every 20 seconds, and the hub answers each one
+//! with a pong. When no frame and no pong arrives for 60 seconds, the worker
+//! closes the link and connects again. A socket that a sleep or a network
+//! change left half open so does not look connected for long.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -11,10 +16,10 @@ use consort_proto::auth::{
 };
 use consort_proto::error::{ErrorBody, ErrorCode};
 use consort_proto::frame::{
-    Frame, FrameId, Message as ProtoMessage, Request, ResponseError, ResponseFrame,
+    Frame, FrameError, FrameId, Message as ProtoMessage, Request, ResponseError, ResponseFrame,
     SUPPORTED_PROTOCOL_VERSIONS,
 };
-use consort_proto::worker_link::PING_INTERVAL_SECS;
+use consort_proto::worker_link::{OFFLINE_AFTER_SECS, PING_INTERVAL_SECS};
 use futures_util::{SinkExt, StreamExt};
 use rand::Rng;
 use serde_json::Value;
@@ -30,6 +35,25 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 /// The shortest and longest wait between reconnects.
 const BACKOFF_MIN: Duration = Duration::from_millis(500);
 const BACKOFF_MAX: Duration = Duration::from_secs(30);
+
+/// How often the worker pings, and how long it waits for any frame or pong
+/// before it closes the link.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinkTiming {
+    /// The time between two pings.
+    pub ping: Duration,
+    /// The longest time with no frame and no pong from the hub.
+    pub liveness: Duration,
+}
+
+impl Default for LinkTiming {
+    fn default() -> Self {
+        Self {
+            ping: Duration::from_secs(PING_INTERVAL_SECS),
+            liveness: Duration::from_secs(OFFLINE_AFTER_SECS),
+        }
+    }
+}
 
 type Pending = HashMap<FrameId, oneshot::Sender<ResponseFrame>>;
 
@@ -89,12 +113,12 @@ impl Link {
         self.inner.connected.subscribe()
     }
 
-    fn attach(&self, out: mpsc::UnboundedSender<String>) {
+    pub(crate) fn attach(&self, out: mpsc::UnboundedSender<String>) {
         *lock(&self.inner.out) = Some(out);
         self.inner.connected.send_replace(true);
     }
 
-    fn detach(&self) {
+    pub(crate) fn detach(&self) {
         *lock(&self.inner.out) = None;
         self.inner.connected.send_replace(false);
         // Dropping the senders fails every request that waits.
@@ -103,9 +127,10 @@ impl Link {
 
     /// Sends a frame.
     pub fn send_frame(&self, frame: &Frame) -> Result<(), WorkerError> {
-        let text = frame
-            .to_text()
-            .map_err(|e| WorkerError::Network(e.to_string()))?;
+        let text = frame.to_text().map_err(|e| match e {
+            FrameError::TooLarge { .. } => WorkerError::TooLarge(e.to_string()),
+            other => WorkerError::Network(other.to_string()),
+        })?;
         let out = lock(&self.inner.out);
         match out.as_ref() {
             Some(tx) => tx.send(text).map_err(|_| WorkerError::Offline),
@@ -153,7 +178,7 @@ impl Link {
         })
     }
 
-    fn resolve(&self, response: ResponseFrame) {
+    pub(crate) fn resolve(&self, response: ResponseFrame) {
         if let Some(tx) = lock(&self.inner.pending).remove(&response.re) {
             let _ = tx.send(response);
         }
@@ -195,7 +220,7 @@ pub async fn maintain<H: LinkHandler>(
         }
         let started = Instant::now();
         let result = tokio::select! {
-            r = connect_once(&link, handler.clone()) => r,
+            r = connect_once(&link, handler.clone(), LinkTiming::default()) => r,
             _ = shutdown.changed() => { link.detach(); break; }
         };
         link.detach();
@@ -228,20 +253,27 @@ type WsStream = futures_util::stream::SplitStream<
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
 >;
 
+/// The text of the error that ends the read loop when the hub closes.
+const HUB_CLOSED: &str = "the hub closed the connection";
+
+/// Reads one WebSocket message. A text frame gives a frame. A ping, a pong
+/// or another control message gives `None`: it shows that the link is
+/// alive, but it holds no frame.
+async fn read_one(stream: &mut WsStream) -> Result<Option<Frame>, WorkerError> {
+    match stream.next().await {
+        Some(Ok(Message::Text(text))) => Frame::parse(text.as_str())
+            .map(Some)
+            .map_err(|e| WorkerError::Network(e.to_string())),
+        Some(Ok(Message::Close(_))) | None => Err(WorkerError::Network(HUB_CLOSED.to_owned())),
+        Some(Ok(_)) => Ok(None),
+        Some(Err(e)) => Err(WorkerError::Network(e.to_string())),
+    }
+}
+
 async fn next_frame(stream: &mut WsStream) -> Result<Frame, WorkerError> {
     loop {
-        match stream.next().await {
-            Some(Ok(Message::Text(text))) => {
-                return Frame::parse(text.as_str())
-                    .map_err(|e| WorkerError::Network(e.to_string()));
-            }
-            Some(Ok(Message::Close(_))) | None => {
-                return Err(WorkerError::Network(
-                    "the hub closed the connection".to_owned(),
-                ));
-            }
-            Some(Ok(_)) => {}
-            Some(Err(e)) => return Err(WorkerError::Network(e.to_string())),
+        if let Some(frame) = read_one(stream).await? {
+            return Ok(frame);
         }
     }
 }
@@ -259,7 +291,11 @@ async fn await_response(stream: &mut WsStream, id: &FrameId) -> Result<Value, Wo
     }
 }
 
-async fn connect_once<H: LinkHandler>(link: &Link, handler: Arc<H>) -> Result<(), WorkerError> {
+async fn connect_once<H: LinkHandler>(
+    link: &Link,
+    handler: Arc<H>,
+    timing: LinkTiming,
+) -> Result<(), WorkerError> {
     let url = crate::http::worker_ws_url(handler.hub_url())?;
     let origin = consort_proto::auth::normalize_origin(handler.hub_url())
         .map_err(|e| WorkerError::Config(e.to_string()))?;
@@ -316,7 +352,7 @@ async fn connect_once<H: LinkHandler>(link: &Link, handler: Arc<H>) -> Result<()
 
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
     let writer = tokio::spawn(async move {
-        let mut ping = tokio::time::interval(Duration::from_secs(PING_INTERVAL_SECS));
+        let mut ping = tokio::time::interval(timing.ping);
         ping.tick().await;
         loop {
             tokio::select! {
@@ -335,13 +371,20 @@ async fn connect_once<H: LinkHandler>(link: &Link, handler: Arc<H>) -> Result<()
     handler.clone().connected(hello);
 
     let result = loop {
-        match next_frame(&mut stream).await {
-            Ok(Frame::Request(request)) => handler.clone().command(request),
-            Ok(Frame::Response(response)) => link.resolve(response),
-            Ok(Frame::Event(event)) => {
+        let Ok(read) = tokio::time::timeout(timing.liveness, read_one(&mut stream)).await else {
+            break Err(WorkerError::Network(format!(
+                "the hub sent no frame and no pong for {} seconds",
+                timing.liveness.as_secs()
+            )));
+        };
+        match read {
+            Ok(None) => {}
+            Ok(Some(Frame::Request(request))) => handler.clone().command(request),
+            Ok(Some(Frame::Response(response))) => link.resolve(response),
+            Ok(Some(Frame::Event(event))) => {
                 tracing::debug!(kind = %event.kind, "ignored an event from the hub")
             }
-            Err(WorkerError::Network(m)) if m == "the hub closed the connection" => break Ok(()),
+            Err(WorkerError::Network(m)) if m == HUB_CLOSED => break Ok(()),
             Err(err) => break Err(err),
         }
     };
@@ -391,6 +434,140 @@ mod tests {
         assert!(task.await.unwrap().unwrap().tools.is_empty());
         link.detach();
         assert!(!link.is_connected());
+    }
+
+    struct TestHandler {
+        url: String,
+        identity: crate::identity::Identity,
+        worker_id: consort_proto::ids::WorkerId,
+    }
+
+    impl LinkHandler for TestHandler {
+        fn worker_id(&self) -> consort_proto::ids::WorkerId {
+            self.worker_id
+        }
+        fn hub_url(&self) -> &str {
+            &self.url
+        }
+        fn sign(&self, payload: &[u8]) -> consort_proto::auth::Signature {
+            self.identity.sign(payload)
+        }
+        fn hello(&self) -> WorkerHello {
+            WorkerHello {
+                worker_id: self.worker_id,
+                version: "test".into(),
+                protocol_versions: SUPPORTED_PROTOCOL_VERSIONS.to_vec(),
+                sessions: vec![],
+            }
+        }
+        fn connected(self: Arc<Self>, _result: WorkerHelloResult) {}
+        fn command(self: Arc<Self>, _request: consort_proto::frame::RequestFrame) {}
+    }
+
+    /// A hub that finishes the handshake. With `silent`, it then stops
+    /// reading, so it answers no ping, as a half-open socket does.
+    async fn handshake_hub(silent: bool) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let (mut sink, mut source) = ws.split();
+            let challenge = Frame::event(&AuthChallenge {
+                nonce: consort_proto::auth::Nonce::from_bytes([7; 32]),
+            })
+            .unwrap()
+            .to_text()
+            .unwrap();
+            sink.send(Message::Text(challenge.into())).await.unwrap();
+            for answer in [
+                serde_json::json!({}),
+                serde_json::json!({
+                    "protocol_version": 1, "hub_version": "test", "sessions": []
+                }),
+            ] {
+                let Some(Ok(Message::Text(text))) = source.next().await else {
+                    return;
+                };
+                let Frame::Request(request) = Frame::parse(text.as_str()).unwrap() else {
+                    panic!("expected a request")
+                };
+                let reply = request.respond_ok(&answer).unwrap().to_text().unwrap();
+                sink.send(Message::Text(reply.into())).await.unwrap();
+            }
+            if silent {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            } else {
+                // Reading answers each ping with a pong.
+                while let Some(Ok(_)) = source.next().await {}
+            }
+            drop(sink);
+        });
+        url
+    }
+
+    fn handler(url: String) -> Arc<TestHandler> {
+        Arc::new(TestHandler {
+            url,
+            identity: crate::identity::Identity::generate(),
+            worker_id: consort_proto::ids::WorkerId::new(),
+        })
+    }
+
+    #[tokio::test]
+    async fn a_silent_hub_closes_the_link() {
+        let url = handshake_hub(true).await;
+        let link = Link::new();
+        let timing = LinkTiming {
+            ping: Duration::from_millis(100),
+            liveness: Duration::from_millis(400),
+        };
+        let started = Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            connect_once(&link, handler(url), timing),
+        )
+        .await
+        .expect("the worker notices the silence");
+        assert!(
+            matches!(&result, Err(WorkerError::Network(m)) if m.contains("no frame and no pong")),
+            "{result:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(!link.is_connected());
+    }
+
+    #[tokio::test]
+    async fn pongs_keep_an_idle_link_open() {
+        let url = handshake_hub(false).await;
+        let link = Link::new();
+        let timing = LinkTiming {
+            ping: Duration::from_millis(100),
+            liveness: Duration::from_millis(400),
+        };
+        let run = connect_once(&link, handler(url), timing);
+        let outcome = tokio::time::timeout(Duration::from_millis(1500), run).await;
+        assert!(outcome.is_err(), "the link stays open: {outcome:?}");
+    }
+
+    #[test]
+    fn too_large_frames_are_a_typed_error() {
+        let link = Link::new();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        link.attach(tx);
+        let small = Frame::error(
+            FrameId::generate(),
+            ErrorBody::new(ErrorCode::Internal, "x"),
+        );
+        assert!(link.send_frame(&small).is_ok());
+        let big = Frame::error(
+            FrameId::generate(),
+            ErrorBody::new(ErrorCode::Internal, "x".repeat(2 * 1024 * 1024)),
+        );
+        assert!(matches!(
+            link.send_frame(&big),
+            Err(WorkerError::TooLarge(_))
+        ));
     }
 
     #[test]

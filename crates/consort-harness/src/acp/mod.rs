@@ -11,7 +11,7 @@
 pub mod mapper;
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use agent_client_protocol::{
@@ -29,7 +29,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::account::prepare_home;
-use crate::approval::{claude_mode, gemini_mode, opencode_permission};
+use crate::approval::{CLAUDE_SHELL_TOOLS, claude_mode, gemini_mode, opencode_permission};
 use crate::process::{self, ProcessSpec, StderrTail, resolve_program};
 use crate::{
     AccountConfig, AccountStatus, Answer, EVENT_CHANNEL_CAPACITY, EventReceiver, Harness,
@@ -46,6 +46,25 @@ pub const CLAUDE_AGENT_ACP: &str = "@agentclientprotocol/claude-agent-acp@0.99.0
 const OPEN_TIMEOUT: Duration = Duration::from_secs(180);
 /// How long a probe may take.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long a steer may wait for the agent's answer. The worker's session
+/// actor waits for the answer, so this stays short.
+const STEER_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_millis(500)
+} else {
+    Duration::from_secs(10)
+};
+/// How long a turn may run after `session/cancel`. After that, the adapter
+/// kills the agent and reports the session as lost.
+const INTERRUPT_GRACE: Duration = if cfg!(test) {
+    Duration::from_millis(300)
+} else {
+    Duration::from_secs(30)
+};
+/// The most bytes of repo instructions that the adapter adds to the system
+/// prompt of a Claude session.
+const PROJECT_INSTRUCTIONS_MAX_BYTES: usize = 64 * 1024;
+/// A CLAUDE.md file larger than this is not read.
+const PROJECT_FILE_MAX_BYTES: u64 = 1024 * 1024;
 
 /// The ACP adapter for one kind of ACP agent.
 #[derive(Debug, Clone, Copy)]
@@ -78,6 +97,7 @@ pub fn launch_recipe(
     kind: HarnessKind,
     account: &AccountConfig,
     mode: ApprovalMode,
+    allow_shell: bool,
     resolve: &dyn Fn(&str) -> Option<PathBuf>,
 ) -> Result<Launch, HarnessError> {
     let explicit = |default: &str| -> Result<PathBuf, HarnessError> {
@@ -103,7 +123,7 @@ pub fn launch_recipe(
         HarnessKind::OpenCode => {
             env.insert(
                 "OPENCODE_CONFIG_CONTENT".to_owned(),
-                opencode_permission(mode).to_string(),
+                opencode_permission(mode, allow_shell).to_string(),
             );
             (explicit("opencode")?, vec!["acp".to_owned()])
         }
@@ -194,6 +214,99 @@ pub fn mcp_servers_json(servers: &[McpServerSpec], http: bool) -> Vec<Value> {
             }
         })
         .collect()
+}
+
+/// The first `max` bytes of `text`, cut at a character boundary.
+fn head_of(text: &str, max: usize) -> &str {
+    if text.len() <= max {
+        return text;
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+/// Reads one CLAUDE.md file of the workspace. The file must be a plain file
+/// inside the workspace, not a link, so a repo cannot make the worker read a
+/// file from somewhere else.
+fn read_project_file(workspace: &Path, rel: &str) -> Option<String> {
+    let path = workspace.join(rel);
+    let meta = path.symlink_metadata().ok()?;
+    if !meta.is_file() || meta.len() > PROJECT_FILE_MAX_BYTES {
+        return None;
+    }
+    let root = std::fs::canonicalize(workspace).ok()?;
+    let real = std::fs::canonicalize(&path).ok()?;
+    if !real.starts_with(&root) {
+        return None;
+    }
+    let text = std::fs::read_to_string(&real).ok()?;
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.to_owned())
+}
+
+/// The repo instructions of a workspace: `CLAUDE.md` and `.claude/CLAUDE.md`
+/// in the workspace folder, at most [`PROJECT_INSTRUCTIONS_MAX_BYTES`].
+///
+/// A Claude session below Full access does not load the repo's Claude
+/// settings, and Claude Code loads CLAUDE.md files only with those settings.
+/// So the adapter reads these two files and adds them to the system prompt.
+pub fn project_instructions(workspace: &Path) -> Option<String> {
+    let mut budget = PROJECT_INSTRUCTIONS_MAX_BYTES;
+    let mut parts = Vec::new();
+    for rel in ["CLAUDE.md", ".claude/CLAUDE.md"] {
+        if budget == 0 {
+            break;
+        }
+        let Some(text) = read_project_file(workspace, rel) else {
+            continue;
+        };
+        let kept = head_of(&text, budget);
+        budget -= kept.len();
+        parts.push(format!(
+            "Instructions from {rel} in the workspace:\n\n{kept}"
+        ));
+    }
+    (!parts.is_empty()).then(|| parts.join("\n\n"))
+}
+
+/// The `_meta` object of `session/new` and `session/load` for Claude Code.
+///
+/// - `systemPrompt.append` holds the text from the hub, and below Full
+///   access the repo instructions (see [`project_instructions`]).
+/// - Below Full access, `settingSources` is `["user"]`. The repo's
+///   `.claude/settings.json` and `.claude/settings.local.json` then cannot
+///   allow tools, set a permission mode, add hooks or start MCP servers. And
+///   `allowDangerouslySkipPermissions` is false, so nothing can turn on
+///   `bypassPermissions`.
+/// - With `allow_shell` off, `disallowedTools` removes the shell tools.
+pub fn claude_meta(spec: &SessionSpec) -> Value {
+    let restricted = spec.approval_mode < ApprovalMode::FullAccess;
+    let mut append = spec.system_prompt_append.clone();
+    if restricted && let Some(text) = project_instructions(&spec.workspace) {
+        if !append.is_empty() {
+            append.push_str("\n\n");
+        }
+        append.push_str(&text);
+    }
+    let mut options = serde_json::Map::new();
+    if restricted {
+        options.insert("settingSources".to_owned(), json!(["user"]));
+        options.insert("allowDangerouslySkipPermissions".to_owned(), json!(false));
+    }
+    if !spec.allow_shell {
+        options.insert("disallowedTools".to_owned(), json!(CLAUDE_SHELL_TOOLS));
+    }
+    let mut meta = serde_json::Map::new();
+    if !append.is_empty() {
+        meta.insert("systemPrompt".to_owned(), json!({ "append": append }));
+    }
+    if !options.is_empty() {
+        meta.insert("claudeCode".to_owned(), json!({ "options": options }));
+    }
+    Value::Object(meta)
 }
 
 /// The choices of a select config option, flat or grouped.
@@ -414,19 +527,26 @@ impl Actor {
 
         let cwd = self.spec.workspace.to_string_lossy().into_owned();
         let servers = mcp_servers_json(&self.spec.mcp_servers, http);
+        // Claude Code gets the same `_meta` on `session/load` as on
+        // `session/new`, so a resumed session keeps its system prompt and its
+        // limits.
+        let meta = (self.kind == HarnessKind::ClaudeCode)
+            .then(|| claude_meta(&self.spec))
+            .filter(|m| m.as_object().is_some_and(|o| !o.is_empty()));
         let (native_ref, response) = if let Some(resume) = &self.spec.resume {
             if !load {
                 return Err(HarnessError::ResumeFailed(
                     "the agent cannot load sessions".to_owned(),
                 ));
             }
-            let response = request(
-                cx,
-                "session/load",
-                json!({"sessionId": resume.as_str(), "cwd": cwd, "mcpServers": servers}),
-            )
-            .await
-            .map_err(|e| HarnessError::ResumeFailed(e.to_string()))?;
+            let mut params =
+                json!({"sessionId": resume.as_str(), "cwd": cwd, "mcpServers": servers});
+            if let Some(meta) = &meta {
+                params["_meta"] = meta.clone();
+            }
+            let response = request(cx, "session/load", params)
+                .await
+                .map_err(|e| HarnessError::ResumeFailed(e.to_string()))?;
             // `session/load` replays the history as updates. The hub has it
             // already, so drop the replay.
             while let Ok(message) = incoming.try_recv() {
@@ -438,9 +558,8 @@ impl Actor {
             (resume.clone(), response)
         } else {
             let mut params = json!({"cwd": cwd, "mcpServers": servers});
-            if self.kind == HarnessKind::ClaudeCode && !self.spec.system_prompt_append.is_empty() {
-                params["_meta"] =
-                    json!({"systemPrompt": {"append": self.spec.system_prompt_append}});
+            if let Some(meta) = &meta {
+                params["_meta"] = meta.clone();
             }
             let response = request(cx, "session/new", params)
                 .await
@@ -457,8 +576,9 @@ impl Actor {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        self.configure(cx, &native_ref, &response, &config_options)
-            .await;
+        let config_options = self
+            .configure(cx, &native_ref, &response, config_options)
+            .await?;
         Ok(Ready {
             native_ref,
             capabilities: self.capabilities.clone(),
@@ -468,94 +588,162 @@ impl Actor {
         })
     }
 
+    /// Sets one select config option. Returns the config options that the
+    /// agent sent back, or `None` when nothing changed.
     async fn set_option(
         &self,
         cx: &ConnectionTo<Agent>,
         session: &NativeRef,
         option: &Value,
         value: &str,
-    ) {
+    ) -> Result<Option<Vec<Value>>, String> {
         let Some(id) = option.get("id").and_then(Value::as_str) else {
-            return;
+            return Err("the option has no ID".to_owned());
         };
         if option.get("currentValue").and_then(Value::as_str) == Some(value) {
-            return;
+            return Ok(None);
         }
         if !option_choices(option).iter().any(|(v, _)| v == value) {
-            self.emit(SessionEvent::Error {
-                code: "option_not_offered".to_owned(),
-                message: format!(
-                    "The harness does not offer `{value}` for `{id}`. It uses its default."
-                ),
-            })
-            .await;
-            return;
+            return Err(format!("the harness does not offer `{value}` for `{id}`"));
         }
-        if let Err(err) = request(
+        let reply = request(
             cx,
             "session/set_config_option",
             json!({"sessionId": session.as_str(), "configId": id, "value": value}),
         )
         .await
-        {
-            self.emit(SessionEvent::Error {
-                code: "option_failed".to_owned(),
-                message: format!("Could not set `{id}` to `{value}`: {err}"),
-            })
-            .await;
+        .map_err(|err| format!("could not set `{id}` to `{value}`: {err}"))?;
+        Ok(reply
+            .get("configOptions")
+            .and_then(Value::as_array)
+            .cloned())
+    }
+
+    /// Sets one option that may fail without harm, such as the model. A
+    /// failure becomes an error event, and the harness uses its default.
+    async fn set_soft_option(
+        &self,
+        cx: &ConnectionTo<Agent>,
+        session: &NativeRef,
+        option: &Value,
+        value: &str,
+    ) -> Option<Vec<Value>> {
+        match self.set_option(cx, session, option, value).await {
+            Ok(updated) => updated,
+            Err(message) => {
+                self.emit(SessionEvent::Error {
+                    code: "option_failed".to_owned(),
+                    message: format!("{message}. It uses its default."),
+                })
+                .await;
+                None
+            }
         }
     }
 
-    /// Sets the approval mode, the model and the options.
+    /// Sets the Claude Code permission mode and reads it back. Any doubt is a
+    /// failure, because a wrong mode can run tools that the worker policy
+    /// does not allow.
+    async fn set_claude_mode(
+        &self,
+        cx: &ConnectionTo<Agent>,
+        session: &NativeRef,
+        response: &Value,
+        options: &mut Vec<Value>,
+    ) -> Result<(), HarnessError> {
+        let mode = claude_mode(self.spec.approval_mode);
+        let refuse = |why: String| {
+            HarnessError::Protocol(format!(
+                "could not set the Claude Code permission mode to `{mode}`: {why}"
+            ))
+        };
+        if let Some(option) = find_option(options, "mode", &["mode"]).cloned() {
+            if let Some(updated) = self
+                .set_option(cx, session, &option, mode)
+                .await
+                .map_err(refuse)?
+            {
+                *options = updated;
+            }
+            let current = find_option(options, "mode", &["mode"])
+                .and_then(|o| o.get("currentValue"))
+                .and_then(Value::as_str);
+            if current != Some(mode) {
+                return Err(refuse(format!(
+                    "the agent reports `{}`",
+                    current.unwrap_or("no mode")
+                )));
+            }
+            return Ok(());
+        }
+        let Some(modes) = response.get("modes") else {
+            return Err(refuse("the agent offers no permission mode".to_owned()));
+        };
+        if modes.get("currentModeId").and_then(Value::as_str) == Some(mode) {
+            return Ok(());
+        }
+        let offered = modes
+            .get("availableModes")
+            .and_then(Value::as_array)
+            .is_some_and(|list| {
+                list.iter()
+                    .any(|m| m.get("id").and_then(Value::as_str) == Some(mode))
+            });
+        if !offered {
+            return Err(refuse("the agent does not offer it".to_owned()));
+        }
+        // A successful `session/set_mode` sets the mode. ACP has no way to
+        // read the mode back in the answer.
+        request(
+            cx,
+            "session/set_mode",
+            json!({"sessionId": session.as_str(), "modeId": mode}),
+        )
+        .await
+        .map_err(|e| refuse(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Sets the approval mode, the model and the options. Returns the config
+    /// options as the agent last reported them. Fails when the approval mode
+    /// cannot be set.
     async fn configure(
         &self,
         cx: &ConnectionTo<Agent>,
         session: &NativeRef,
         response: &Value,
-        options: &[Value],
-    ) {
+        mut options: Vec<Value>,
+    ) -> Result<Vec<Value>, HarnessError> {
         if self.kind == HarnessKind::ClaudeCode {
-            let mode = claude_mode(self.spec.approval_mode);
-            if let Some(option) = find_option(options, "mode", &["mode"]) {
-                self.set_option(cx, session, option, mode).await;
-            } else if response
-                .get("modes")
-                .and_then(|m| m.get("availableModes"))
-                .and_then(Value::as_array)
-                .is_some_and(|modes| {
-                    modes
-                        .iter()
-                        .any(|m| m.get("id").and_then(Value::as_str) == Some(mode))
-                })
-            {
-                let _ = request(
-                    cx,
-                    "session/set_mode",
-                    json!({"sessionId": session.as_str(), "modeId": mode}),
-                )
-                .await;
-            }
+            self.set_claude_mode(cx, session, response, &mut options)
+                .await?;
         }
         if !self.spec.model.is_empty()
-            && let Some(option) = find_option(options, "model", &["model"])
+            && let Some(option) = find_option(&options, "model", &["model"]).cloned()
+            && let Some(updated) = self
+                .set_soft_option(cx, session, &option, &self.spec.model)
+                .await
         {
-            self.set_option(cx, session, option, &self.spec.model).await;
+            options = updated;
         }
         for (key, value) in &self.spec.options {
             let OptionValue::Text(value) = value else {
                 continue;
             };
             let option = if key == "effort" {
-                find_option(options, "thought_level", &["effort", "thought_level"])
+                find_option(&options, "thought_level", &["effort", "thought_level"])
             } else {
                 options
                     .iter()
                     .find(|o| o.get("id").and_then(Value::as_str) == Some(key.as_str()))
             };
-            if let Some(option) = option {
-                self.set_option(cx, session, option, value).await;
+            if let Some(option) = option.cloned()
+                && let Some(updated) = self.set_soft_option(cx, session, &option, value).await
+            {
+                options = updated;
             }
         }
+        Ok(options)
     }
 
     async fn run(
@@ -598,14 +786,22 @@ impl Actor {
             mpsc::unbounded_channel::<(TurnId, Result<Value, agent_client_protocol::Error>)>();
         let closed = cx.incoming_closed();
         tokio::pin!(closed);
-        let mut by_user = false;
+        let mut exit = Exit::Harness;
+        // Set while an interrupted turn has not ended yet.
+        let mut cancel_deadline: Option<tokio::time::Instant> = None;
 
         loop {
+            let deadline = async {
+                match cancel_deadline {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending::<()>().await,
+                }
+            };
             tokio::select! {
                 command = commands.recv() => {
-                    let Some(command) = command else { by_user = true; break };
+                    let Some(command) = command else { exit = Exit::User; break };
                     match command {
-                        Command::Close => { by_user = true; break }
+                        Command::Close => { exit = Exit::User; break }
                         Command::Turn { input, reply } => {
                             if running.is_some() {
                                 let _ = reply.send(Err(HarnessError::Protocol("a turn is already running".to_owned())));
@@ -645,16 +841,26 @@ impl Actor {
                                 let _ = reply.send(Err(HarnessError::Protocol("no turn is running".to_owned())));
                                 continue;
                             }
-                            let result = request(&cx, "_session/steering", json!({
+                            let message = match UntypedMessage::new("_session/steering", json!({
                                 "sessionId": native.as_str(),
                                 "prompt": [{"type": "text", "text": turn_text(&input)}],
                                 "_meta": {"steering": {"idleBehavior": "promptRequired"}}
-                            })).await;
-                            let _ = reply.send(match result {
-                                Ok(v) if v.get("outcome").and_then(Value::as_str) == Some("promptRequired") =>
-                                    Err(HarnessError::Protocol("the turn ended before the steer arrived".to_owned())),
-                                Ok(_) => Ok(()),
-                                Err(e) => Err(protocol_error(&e)),
+                            })) {
+                                Ok(m) => m,
+                                Err(e) => { let _ = reply.send(Err(protocol_error(&e))); continue; }
+                            };
+                            // The answer comes in its own task, so approvals and
+                            // interrupts go on while the agent takes the steer.
+                            let future = cx.send_request(message).block_task();
+                            tokio::spawn(async move {
+                                let result = tokio::time::timeout(STEER_TIMEOUT, future).await;
+                                let _ = reply.send(match result {
+                                    Err(_) => Err(HarnessError::Timeout("the agent did not take the steer".to_owned())),
+                                    Ok(Ok(v)) if v.get("outcome").and_then(Value::as_str) == Some("promptRequired") =>
+                                        Err(HarnessError::Protocol("the turn ended before the steer arrived".to_owned())),
+                                    Ok(Ok(_)) => Ok(()),
+                                    Ok(Err(e)) => Err(protocol_error(&e)),
+                                });
                             });
                         }
                         Command::Interrupt { reply } => {
@@ -667,6 +873,9 @@ impl Actor {
                                 Ok(m) => cx.send_notification(m).map_err(|e| protocol_error(&e)),
                                 Err(e) => Err(protocol_error(&e)),
                             };
+                            if result.is_ok() && running.is_some() && cancel_deadline.is_none() {
+                                cancel_deadline = Some(tokio::time::Instant::now() + INTERRUPT_GRACE);
+                            }
                             let _ = reply.send(result);
                         }
                         Command::Respond { request: request_id, answer, reply } => {
@@ -724,11 +933,15 @@ impl Actor {
                         continue;
                     }
                     running = None;
+                    cancel_deadline = None;
                     for (request_id, _) in pending.drain() {
                         self.emit(SessionEvent::RequestClosed { request_id, outcome: RequestOutcome::Canceled }).await;
                     }
                     let events = match result {
-                        Ok(response) => mapper.end_turn(stop_reason(response.get("stopReason").and_then(Value::as_str)), None),
+                        Ok(response) => {
+                            let (reason, error) = stop_reason(response.get("stopReason").and_then(Value::as_str));
+                            mapper.end_turn(reason, error)
+                        }
                         Err(err) if err.code == ErrorCode::AuthRequired => {
                             // The login is gone or expired. Tell the worker
                             // first, then end the turn with the next step.
@@ -745,38 +958,99 @@ impl Actor {
                     self.emit_all(events).await;
                     self.emit(SessionEvent::State { state: SessionState::Idle }).await;
                 }
+                () = deadline => {
+                    cancel_deadline = None;
+                    if running.is_some() {
+                        exit = Exit::Unresponsive;
+                        break;
+                    }
+                }
                 () = &mut closed => break,
             }
         }
 
-        if !by_user {
-            if running.is_some() {
-                let events =
-                    mapper.end_turn(TurnEndReason::Failed, Some("the harness exited".to_owned()));
-                self.emit_all(events).await;
+        match exit {
+            Exit::User => {
+                self.emit(SessionEvent::State {
+                    state: SessionState::Ended,
+                })
+                .await;
             }
-            let tail = self.stderr.get();
-            self.emit(SessionEvent::Error {
-                code: "harness_exited".to_owned(),
-                message: if tail.is_empty() {
-                    "The harness process exited.".to_owned()
+            Exit::Harness | Exit::Unresponsive => {
+                let (code, message) = if exit == Exit::Unresponsive {
+                    (
+                        "harness_unresponsive",
+                        "The harness did not stop the turn after an interrupt, so the worker stopped the harness."
+                            .to_owned(),
+                    )
                 } else {
-                    format!("The harness process exited. Its last output:\n{tail}")
-                },
-            })
-            .await;
-            self.emit(SessionEvent::State {
-                state: SessionState::Lost,
-            })
-            .await;
-        } else {
-            self.emit(SessionEvent::State {
-                state: SessionState::Ended,
-            })
-            .await;
+                    let tail = self.stderr.get();
+                    (
+                        "harness_exited",
+                        if tail.is_empty() {
+                            "The harness process exited.".to_owned()
+                        } else {
+                            format!("The harness process exited. Its last output:\n{tail}")
+                        },
+                    )
+                };
+                if running.is_some() {
+                    let error = if exit == Exit::Unresponsive {
+                        "the harness did not stop the turn"
+                    } else {
+                        "the harness exited"
+                    };
+                    let events = mapper.end_turn(TurnEndReason::Failed, Some(error.to_owned()));
+                    self.emit_all(events).await;
+                }
+                self.emit(SessionEvent::Error {
+                    code: code.to_owned(),
+                    message,
+                })
+                .await;
+                self.emit(SessionEvent::State {
+                    state: SessionState::Lost,
+                })
+                .await;
+            }
         }
         Ok(())
     }
+}
+
+/// Why the session actor stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Exit {
+    /// `close` asked for it.
+    User,
+    /// The agent closed the connection.
+    Harness,
+    /// The agent did not end an interrupted turn in time. The connection
+    /// task then kills the agent.
+    Unresponsive,
+}
+
+/// The process of the agent for a session. The agent starts in the
+/// session's runtime folder. The workspace goes to the agent as `cwd` in
+/// `session/new`.
+pub fn agent_process_spec(
+    kind: HarnessKind,
+    account: &AccountConfig,
+    spec: &SessionSpec,
+    resolve: &dyn Fn(&str) -> Option<PathBuf>,
+) -> Result<ProcessSpec, HarnessError> {
+    let mut env = prepare_home(account)?;
+    let launch = launch_recipe(kind, account, spec.approval_mode, spec.allow_shell, resolve)?;
+    env.extend(launch.env);
+    env.extend(spec.env.clone());
+    Ok(ProcessSpec {
+        program: launch.program,
+        args: launch.args,
+        env,
+        env_remove: Vec::new(),
+        cwd: Some(spec.runtime_dir.clone()),
+        watcher: spec.process_watcher.clone(),
+    })
 }
 
 async fn start(
@@ -784,17 +1058,7 @@ async fn start(
     account: &AccountConfig,
     spec: SessionSpec,
 ) -> Result<(AcpSession, EventReceiver, Ready), HarnessError> {
-    let mut env = prepare_home(account)?;
-    let launch = launch_recipe(kind, account, spec.approval_mode, &resolve_program)?;
-    env.extend(launch.env);
-    env.extend(spec.env.clone());
-    let mut child = process::spawn(&ProcessSpec {
-        program: launch.program,
-        args: launch.args,
-        env,
-        env_remove: Vec::new(),
-        cwd: Some(spec.workspace.clone()),
-    })?;
+    let mut child = process::spawn(&agent_process_spec(kind, account, &spec, &resolve_program)?)?;
     let stdin = child
         .take_stdin()
         .ok_or_else(|| HarnessError::Spawn("no stdin".to_owned()))?;
@@ -929,7 +1193,13 @@ impl Harness for AcpHarness {
 
     async fn probe(&self, account: &AccountConfig) -> AccountStatus {
         let caps = static_capabilities(self.kind);
-        if let Err(err) = launch_recipe(self.kind, account, ApprovalMode::Ask, &resolve_program) {
+        if let Err(err) = launch_recipe(
+            self.kind,
+            account,
+            ApprovalMode::Ask,
+            true,
+            &resolve_program,
+        ) {
             return AccountStatus::unknown(err.to_string(), caps);
         }
         let dir = std::env::temp_dir().join(format!("consort-probe-{}", uuid::Uuid::now_v7()));
@@ -943,10 +1213,12 @@ impl Harness for AcpHarness {
             model: String::new(),
             options: Default::default(),
             approval_mode: ApprovalMode::Ask,
+            allow_shell: true,
             system_prompt_append: String::new(),
             mcp_servers: Vec::new(),
             env: BTreeMap::new(),
             resume: None,
+            process_watcher: None,
         };
         let result = tokio::time::timeout(PROBE_TIMEOUT, start(self.kind, account, spec)).await;
         let status = match result {

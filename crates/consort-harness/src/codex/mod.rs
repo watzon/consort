@@ -2,8 +2,9 @@
 //!
 //! One `codex app-server` process serves one session. The hub MCP endpoint
 //! goes into the `config` object of `thread/start` as `mcp_servers.<name>`,
-//! with the bearer token in an environment variable of the process, so the
-//! token never appears in a request.
+//! with the bearer token in `http_headers`. The token so goes through the
+//! stdio pipe of the process, and not in its environment, where another
+//! process of the same user could read it.
 
 pub mod mapper;
 pub mod protocol;
@@ -23,7 +24,7 @@ use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::account::prepare_home;
-use crate::approval::codex_policy;
+use crate::approval::{CODEX_SHELL_FEATURES, codex_policy};
 use crate::process::{
     self, HarnessProcess, ProcessSpec, parse_version, resolve_program, run_capture,
 };
@@ -44,6 +45,16 @@ use rpc::{Inbound, RpcClient};
 
 /// How long the adapter waits for Codex to start a thread.
 const OPEN_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long the adapter waits for `initialize`. After that, it kills the
+/// process.
+const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a turn may run after `turn/interrupt`. After that, the adapter
+/// kills the process and reports the session as lost.
+const INTERRUPT_GRACE: Duration = if cfg!(test) {
+    Duration::from_millis(300)
+} else {
+    Duration::from_secs(30)
+};
 /// How long a probe may take.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -70,29 +81,25 @@ pub fn codex_capabilities() -> Capabilities {
     }
 }
 
-/// The environment variable that holds the bearer token of the MCP server
-/// at `index`.
-pub fn token_variable(index: usize) -> String {
-    format!("CONSORT_MCP_TOKEN_{index}")
-}
-
-/// The `mcp_servers` config for `thread/start`, and the environment
-/// variables that hold the tokens.
-pub fn mcp_config(
+/// The `config` object of `thread/start`: the `mcp_servers`, and with
+/// `allow_shell` off, the `features` that remove the shell tools.
+///
+/// The bearer token of a server goes in `http_headers`. Tested with
+/// codex-cli 0.165.0: Codex sends it as the `Authorization` header to the
+/// MCP server, and does not write it to its home folder.
+pub fn thread_config(
     servers: &[McpServerSpec],
-) -> (serde_json::Map<String, Value>, BTreeMap<String, String>) {
+    allow_shell: bool,
+) -> serde_json::Map<String, Value> {
     let mut config = serde_json::Map::new();
-    let mut env = BTreeMap::new();
-    for (index, server) in servers.iter().enumerate() {
+    for server in servers {
         let mut entry = serde_json::Map::new();
         entry.insert("url".to_owned(), Value::String(server.url.clone()));
         if let Some(token) = &server.bearer_token {
-            let variable = token_variable(index);
             entry.insert(
-                "bearer_token_env_var".to_owned(),
-                Value::String(variable.clone()),
+                "http_headers".to_owned(),
+                json!({ "Authorization": format!("Bearer {token}") }),
             );
-            env.insert(variable, token.clone());
         }
         config.insert(server.name.clone(), Value::Object(entry));
     }
@@ -100,7 +107,14 @@ pub fn mcp_config(
     if !config.is_empty() {
         root.insert("mcp_servers".to_owned(), Value::Object(config));
     }
-    (root, env)
+    if !allow_shell {
+        let features: serde_json::Map<String, Value> = CODEX_SHELL_FEATURES
+            .iter()
+            .map(|f| ((*f).to_owned(), Value::Bool(false)))
+            .collect();
+        root.insert("features".to_owned(), Value::Object(features));
+    }
+    root
 }
 
 /// The `thread/start` or `thread/resume` params for a session.
@@ -170,24 +184,45 @@ struct Connection {
     inbound: mpsc::UnboundedReceiver<Inbound>,
 }
 
-async fn connect(
+/// The `codex app-server` process. It starts in `cwd`: the session's
+/// runtime folder, not the workspace. The workspace goes to Codex as `cwd`
+/// in `thread/start`.
+pub fn app_server_spec(
     account: &AccountConfig,
     cwd: &std::path::Path,
     extra_env: BTreeMap<String, String>,
-) -> Result<Connection, HarnessError> {
-    let program = resolve_program(account.binary.as_deref().unwrap_or("codex"))
+    watcher: Option<process::WatcherHandle>,
+    resolve: &dyn Fn(&str) -> Option<std::path::PathBuf>,
+) -> Result<ProcessSpec, HarnessError> {
+    let program = resolve(account.binary.as_deref().unwrap_or("codex"))
         .ok_or_else(|| HarnessError::Spawn("`codex` is not on PATH".to_owned()))?;
     let mut env = prepare_home(account)?;
     env.extend(extra_env);
     let mut args = vec!["app-server".to_owned()];
     args.extend(account.args.iter().cloned());
-    let mut process = process::spawn(&ProcessSpec {
+    Ok(ProcessSpec {
         program,
         args,
         env,
         env_remove: Vec::new(),
         cwd: Some(cwd.to_path_buf()),
-    })?;
+        watcher,
+    })
+}
+
+async fn connect(
+    account: &AccountConfig,
+    cwd: &std::path::Path,
+    extra_env: BTreeMap<String, String>,
+    watcher: Option<process::WatcherHandle>,
+) -> Result<Connection, HarnessError> {
+    let mut process = process::spawn(&app_server_spec(
+        account,
+        cwd,
+        extra_env,
+        watcher,
+        &resolve_program,
+    )?)?;
     let stdin = process
         .take_stdin()
         .ok_or_else(|| HarnessError::Spawn("no stdin".to_owned()))?;
@@ -206,7 +241,17 @@ async fn connect(
             opt_out_notification_methods: Vec::new(),
         },
     };
-    let initialized: Result<Value, HarnessError> = client.request(method::INITIALIZE, &init).await;
+    let initialized: Result<Value, HarnessError> = match tokio::time::timeout(
+        INITIALIZE_TIMEOUT,
+        client.request(method::INITIALIZE, &init),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => Err(HarnessError::Timeout(
+            "codex app-server did not answer `initialize`".to_owned(),
+        )),
+    };
     if let Err(err) = initialized {
         let tail = process.stderr_tail();
         process.kill().await;
@@ -248,7 +293,7 @@ impl Harness for CodexHarness {
             .and_then(|out| parse_version(&out));
         let dir = std::env::temp_dir();
         let probe = async {
-            let mut conn = connect(account, &dir, BTreeMap::new()).await?;
+            let mut conn = connect(account, &dir, BTreeMap::new(), None).await?;
             let account_info: GetAccountResponse = conn
                 .client
                 .request(
@@ -340,10 +385,14 @@ impl Harness for CodexHarness {
         account: &AccountConfig,
         spec: SessionSpec,
     ) -> Result<(Box<dyn HarnessSession>, EventReceiver), HarnessError> {
-        let (config, token_env) = mcp_config(&spec.mcp_servers);
-        let mut env = spec.env.clone();
-        env.extend(token_env);
-        let conn = connect(account, &spec.workspace, env).await?;
+        let config = thread_config(&spec.mcp_servers, spec.allow_shell);
+        let conn = connect(
+            account,
+            &spec.runtime_dir,
+            spec.env.clone(),
+            spec.process_watcher.clone(),
+        )
+        .await?;
         let session =
             start_thread(spec, config, conn.client, conn.inbound, Some(conn.process)).await?;
         Ok((Box::new(session.0), session.1))
@@ -501,44 +550,74 @@ impl Actor {
         })
         .await;
         let mut groups: HashMap<String, QuestionGroup> = HashMap::new();
-        let mut by_user = false;
+        let mut exit = Exit::Harness;
+        // Set while an interrupted turn has not ended yet.
+        let mut cancel_deadline: Option<tokio::time::Instant> = None;
         loop {
+            if self.mapper.current_turn().is_none() {
+                cancel_deadline = None;
+            }
+            let deadline = async {
+                match cancel_deadline {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending::<()>().await,
+                }
+            };
             tokio::select! {
                 command = commands.recv() => {
-                    let Some(command) = command else { by_user = true; break };
+                    let Some(command) = command else { exit = Exit::User; break };
                     match command {
-                        Command::Close => { by_user = true; break }
+                        Command::Close => { exit = Exit::User; break }
                         Command::Turn { input, reply } => {
                             let _ = reply.send(self.start_turn(&input).await);
                         }
+                        // Steer and interrupt answer in their own tasks, so
+                        // approvals go on while Codex takes them.
                         Command::Steer { input, reply } => {
-                            let result = match self.mapper.current_turn().map(str::to_owned) {
-                                None => Err(HarnessError::Protocol("no turn is running".to_owned())),
-                                Some(turn) => self
-                                    .client
-                                    .request::<_, Value>(method::TURN_STEER, &TurnSteerParams {
+                            match self.mapper.current_turn().map(str::to_owned) {
+                                None => {
+                                    let _ = reply.send(Err(HarnessError::Protocol("no turn is running".to_owned())));
+                                }
+                                Some(turn) => {
+                                    let client = self.client.clone();
+                                    let params = TurnSteerParams {
                                         thread_id: self.thread_id.clone(),
                                         input: vec![UserInput::text(turn_text(&input))],
                                         expected_turn_id: turn,
-                                    })
-                                    .await
-                                    .map(|_| ()),
-                            };
-                            let _ = reply.send(result);
+                                    };
+                                    tokio::spawn(async move {
+                                        let result = client
+                                            .request::<_, Value>(method::TURN_STEER, &params)
+                                            .await
+                                            .map(|_| ());
+                                        let _ = reply.send(result);
+                                    });
+                                }
+                            }
                         }
                         Command::Interrupt { reply } => {
-                            let result = match self.mapper.current_turn().map(str::to_owned) {
-                                None => Ok(()),
-                                Some(turn) => self
-                                    .client
-                                    .request::<_, Value>(method::TURN_INTERRUPT, &TurnInterruptParams {
+                            match self.mapper.current_turn().map(str::to_owned) {
+                                None => {
+                                    let _ = reply.send(Ok(()));
+                                }
+                                Some(turn) => {
+                                    if cancel_deadline.is_none() {
+                                        cancel_deadline = Some(tokio::time::Instant::now() + INTERRUPT_GRACE);
+                                    }
+                                    let client = self.client.clone();
+                                    let params = TurnInterruptParams {
                                         thread_id: self.thread_id.clone(),
                                         turn_id: turn,
-                                    })
-                                    .await
-                                    .map(|_| ()),
-                            };
-                            let _ = reply.send(result);
+                                    };
+                                    tokio::spawn(async move {
+                                        let result = client
+                                            .request::<_, Value>(method::TURN_INTERRUPT, &params)
+                                            .await
+                                            .map(|_| ());
+                                        let _ = reply.send(result);
+                                    });
+                                }
+                            }
                         }
                         Command::Respond { request, answer, reply } => {
                             let _ = reply.send(self.respond(request, answer, &mut groups).await);
@@ -563,9 +642,16 @@ impl Actor {
                         }
                     }
                 }
+                () = deadline => {
+                    cancel_deadline = None;
+                    if self.mapper.current_turn().is_some() {
+                        exit = Exit::Unresponsive;
+                        break;
+                    }
+                }
             }
         }
-        if by_user {
+        if exit == Exit::User {
             if let Some(p) = process.as_mut() {
                 p.shutdown(Duration::from_secs(2)).await;
             }
@@ -573,34 +659,48 @@ impl Actor {
                 state: SessionState::Ended,
             })
             .await;
+            return;
+        }
+        let mut tail = String::new();
+        if let Some(p) = process.as_mut() {
+            tail = p.stderr_tail();
+            p.kill().await;
+        }
+        let (code, message, turn_error) = if exit == Exit::Unresponsive {
+            (
+                "harness_unresponsive",
+                "Codex did not stop the turn after an interrupt, so the worker stopped codex app-server."
+                    .to_owned(),
+                "codex did not stop the turn",
+            )
         } else {
-            let mut tail = String::new();
-            if let Some(p) = process.as_mut() {
-                tail = p.stderr_tail();
-                p.kill().await;
-            }
-            if let Some(turn) = self.mapper.current_turn().map(str::to_owned) {
-                self.emit(SessionEvent::TurnEnded {
-                    turn_id: TurnId::new(turn),
-                    reason: TurnEndReason::Failed,
-                    error: Some("codex app-server exited".to_owned()),
-                })
-                .await;
-            }
-            self.emit(SessionEvent::Error {
-                code: "harness_exited".to_owned(),
-                message: if tail.is_empty() {
+            (
+                "harness_exited",
+                if tail.is_empty() {
                     "codex app-server exited.".to_owned()
                 } else {
                     format!("codex app-server exited. Its last output:\n{tail}")
                 },
-            })
-            .await;
-            self.emit(SessionEvent::State {
-                state: SessionState::Lost,
+                "codex app-server exited",
+            )
+        };
+        if let Some(turn) = self.mapper.current_turn().map(str::to_owned) {
+            self.emit(SessionEvent::TurnEnded {
+                turn_id: TurnId::new(turn),
+                reason: TurnEndReason::Failed,
+                error: Some(turn_error.to_owned()),
             })
             .await;
         }
+        self.emit(SessionEvent::Error {
+            code: code.to_owned(),
+            message,
+        })
+        .await;
+        self.emit(SessionEvent::State {
+            state: SessionState::Lost,
+        })
+        .await;
     }
 
     async fn start_turn(&mut self, input: &TurnInput) -> Result<TurnId, HarnessError> {
@@ -868,6 +968,17 @@ impl Actor {
         .await;
         Ok(())
     }
+}
+
+/// Why the session actor stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Exit {
+    /// `close` asked for it.
+    User,
+    /// codex app-server closed its stdout.
+    Harness,
+    /// Codex did not end an interrupted turn in time.
+    Unresponsive,
 }
 
 /// One live Codex session.

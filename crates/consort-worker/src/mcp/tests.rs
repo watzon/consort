@@ -77,7 +77,7 @@ async fn lists_and_forwards_tools_and_uploads_artifacts() {
     let endpoint = start(session, dir.path().to_path_buf(), backend.clone())
         .await
         .unwrap();
-    let client = McpHttpClient::new(&endpoint.url, &endpoint.token);
+    let client = McpHttpClient::new(&endpoint.url, &endpoint.token).unwrap();
     let init = client.post(&initialize()).await.unwrap();
     assert_eq!(init[0]["result"]["serverInfo"]["name"], "consort-hub");
     client

@@ -225,7 +225,7 @@ Anthropic's terms allow a user to sign in to the unmodified Claude Code binary w
 These items can change the design, and the research could not settle them:
 
 1. Can `claude-agent-acp` use the user's installed `claude` and its login, and how does it pass `AskUserQuestion` and steering to an ACP client written in Rust?
-2. Does Codex accept an HTTP MCP server with a bearer token in the `config` of `thread/start`? Answered on 2026-10-29: yes, as `config.mcp_servers.hub` with the token in an environment variable (see harness-adapters.md).
+2. Does Codex accept an HTTP MCP server with a bearer token in the `config` of `thread/start`? Answered on 2026-10-29: yes, as `config.mcp_servers.hub` with the token in `http_headers`, which the worker sends through the stdio pipe and not in an environment variable (see harness-adapters.md).
 3. Which folder and keychain entry hold a Claude Code login, and does `CLAUDE_CONFIG_DIR` isolate two accounts?
 4. Do a system tray and global hotkeys work with GPUI's event loop on Linux?
 5. If the mobile app uses Expo: does `uniffi-bindgen-react-native` work with an Expo dev build on the current Expo SDK?

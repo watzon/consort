@@ -69,7 +69,7 @@ The user configures harness accounts in `worker.toml` (see [data-model.md](data-
 | Codex | `CODEX_HOME` | `auth.json` |
 | Claude Code | `CLAUDE_CONFIG_DIR`. `claude-agent-acp` reads the login of the folder in this variable | `.credentials.json`, or the keychain entry on macOS (to verify) |
 | Pi | Pi's agent folder | `auth.json` |
-| OpenCode | `XDG_DATA_HOME` (OpenCode keeps its data in `$XDG_DATA_HOME/opencode`) | `auth.json` |
+| OpenCode | `XDG_DATA_HOME` (OpenCode keeps its data in `$XDG_DATA_HOME/opencode`) | `opencode/auth.json`. The shadow home has a real `opencode` folder, and each entry of the shared `opencode` folder except `auth.json` is linked into it |
 | ACP agents | Set per registry entry | Set per agent |
 
 The worker never reads the private files. It only reports `auth_state`, which each adapter gets from the harness itself, for example `account/read` in Codex.
@@ -82,8 +82,8 @@ Every session gets the worker's local MCP endpoint (see [Hub tools](protocol.md#
 
 | Path | How the endpoint reaches the harness |
 |---|---|
-| ACP | In `mcpServers` of `session/new`, as an `http` server with an `Authorization` header. The agent must report the `http` MCP capability. If it does not, the worker gives it a `stdio` server that runs `consort mcp-bridge --url <endpoint>` with the token in `CONSORT_MCP_TOKEN`, which forwards stdio to the local HTTP endpoint. Claude Code and OpenCode report `http` |
-| Codex app-server | In the `config` object of `thread/start`, as `mcp_servers.hub` with `url` and `bearer_token_env_var`. The worker puts the token in that variable of the `codex app-server` process. Tested with codex-cli 0.165.0 |
+| ACP | In `mcpServers` of `session/new`, as an `http` server with an `Authorization` header. The agent must report the `http` MCP capability. If it does not, the worker gives it a `stdio` server that runs `consort mcp-bridge --url <endpoint>` with the token in `CONSORT_MCP_TOKEN`, which forwards stdio to the local HTTP endpoint. Other processes of the same OS user can read that variable. The harness starts the bridge, so no safer channel exists for it. Claude Code and OpenCode report `http`, so they do not use the bridge |
+| Codex app-server | In the `config` object of `thread/start`, as `mcp_servers.hub` with `url` and `http_headers` (`Authorization: Bearer <token>`). The token goes through the stdio pipe, not the process environment. Tested with codex-cli 0.165.0: Codex sends the header to the endpoint and does not write the token to its home folder |
 | Pi RPC | The `--mcp-config` flag, with a generated config file in the session's runtime folder |
 
 The worker also adds the local MCP servers that the channel may use, with the same mechanism.
@@ -101,7 +101,22 @@ The effective approval mode of a session is the lower of the requested mode and 
 
 The adapter tests check these values. OpenCode gets its mode in `OPENCODE_CONFIG_CONTENT` as a `permission` setting for `edit`, `bash` and `webfetch` (`ask` or `allow`). Gemini CLI gets `--approval-mode` (`default`, `auto_edit` or `yolo`) and supports Ask, Auto edits and Auto. Other ACP agents report Ask only.
 
-If `allow_shell` is false in the worker policy, the worker caps the mode at Auto edits and denies each command approval itself. That is worker policy, so the adapter rule above still holds.
+If `allow_shell` is false in the worker policy, the worker caps the mode at Auto edits and denies each command approval itself. That is worker policy, so the adapter rule above still holds. A command that does not ask for approval still runs, so the adapters also remove the shell tools (`allow_shell` in `SessionSpec`):
+
+| Harness | How the shell tools go away |
+|---|---|
+| Claude (ACP) | `_meta.claudeCode.options.disallowedTools` is `Bash`, `PowerShell` and `Monitor` (the tools that run commands in Claude Agent SDK 0.3.312) |
+| Codex | `features.shell_tool` and `features.unified_exec` are false in the `thread/start` config. Tested with codex-cli 0.165.0: the model gets no `exec_command` and no `write_stdin` tool |
+| OpenCode | `bash` is `deny` in `OPENCODE_CONFIG_CONTENT` |
+| Gemini CLI | Not done yet. Only the worker's denial of each command approval applies |
+
+### Claude Code and the repo's settings
+
+`claude-agent-acp` loads the user, project and local settings of Claude Code. A repo's `.claude/settings.json` can allow tools, set the permission mode, add hooks and start MCP servers, all without an approval. So below Full access, the adapter sends `settingSources: ["user"]` and `allowDangerouslySkipPermissions: false` in `_meta.claudeCode.options`. Only the user's own settings in the account's home then load, and nothing can turn on `bypassPermissions`.
+
+Claude Code loads CLAUDE.md files only with the project settings. So the adapter reads `CLAUDE.md` and `.claude/CLAUDE.md` in the workspace folder itself (each must be a plain file in the workspace, not a link), and adds them to the system prompt, at most 64 KiB. Other repo files that Claude Code would load do not load: skills, agents, commands, hooks, `.mcp.json`, nested CLAUDE.md files and `@` imports. In Full access, Claude Code loads all of its settings as usual.
+
+After `session/new` or `session/load`, the adapter sets the Claude permission mode and reads it back from the `configOptions` of the answer. If the agent has no mode, does not offer the mode, refuses it or reports another mode, the open fails and the adapter stops the agent.
 
 Pi has no built-in approval prompts, so a Pi session can only run in Auto or Full access. A later Pi extension can add a gate that asks the worker before each tool call, as T3 Code does.
 
@@ -124,11 +139,27 @@ The ACP path also covers Codex through `codex-acp` before step 2 is done, so all
 
 | Path | Resume method |
 |---|---|
-| ACP | `session/load`, which replays history, or `session/resume` on agents that support ACP v2 |
+| ACP | `session/load`, which replays history, or `session/resume` on agents that support ACP v2. Claude Code gets the same `_meta` as in `session/new`, so it keeps the system prompt and the limits |
 | Codex | `thread/resume` with the thread ID |
 | Pi | `--session` with the session file |
 
 If resume fails, the worker reports the session as `lost`. For a coordinator, the hub then starts a new session with a context pack (see [architecture.md](architecture.md#how-a-coordinator-keeps-its-context)). For a task, the hub moves the task to `failed` with the reason, and the user or the coordinator can retry it.
+
+## Processes and time limits
+
+The adapter starts each harness process in the session's runtime folder, not in the workspace. The workspace goes to the harness as `cwd` in `session/new` or `thread/start`. So `npx` does not read the repo's `.npmrc`, and a Windows shell does not find programs in the repo.
+
+| Wait | Limit | What happens then |
+|---|---|---|
+| ACP agent start and `session/new` | 180 s | The open fails |
+| Codex `initialize` | 30 s | The adapter kills the process |
+| Any other Codex request | 90 s | The request fails |
+| ACP steer | 10 s | The steer fails. The actor loop does not wait for it |
+| A turn after an interrupt | 30 s | The adapter kills the harness, ends the turn as failed and reports the session as `lost` (`harness_unresponsive`) |
+
+An ACP turn that stops with `max_tokens`, `max_turn_requests`, another reason or no reason ends as `failed`, with the reason in the error. Only `end_turn` is `completed`, and `cancelled` is `interrupted`.
+
+On Unix each harness process leads its own process group. The worker records each group in `worker.db` with the start time of its leader. A killed worker cannot stop its groups, so at the next start the worker kills each recorded group whose leader still has the recorded start time. On Windows the job object stops the tree when the worker exits.
 
 ## Install harnesses
 

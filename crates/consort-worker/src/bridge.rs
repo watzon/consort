@@ -5,6 +5,12 @@
 //! instead: `consort mcp-bridge --url <endpoint>`, with the token in
 //! `CONSORT_MCP_TOKEN`. The bridge reads JSON-RPC messages from stdin, posts
 //! each one to the endpoint, and writes the answers to stdout.
+//!
+//! The harness starts the bridge from its MCP configuration, so the token
+//! must be in that configuration: in an argument, a variable or a file
+//! name. Each of these is visible to other processes of the same OS user,
+//! so the bridge cannot keep the token from them (see DECISIONS.md). The
+//! adapters use the bridge only for an agent that has no HTTP MCP support.
 
 use std::sync::Arc;
 
@@ -50,15 +56,21 @@ pub struct McpHttpClient {
 }
 
 impl McpHttpClient {
-    /// A client for `url` with a bearer token.
-    pub fn new(url: impl Into<String>, token: impl Into<String>) -> Self {
-        Self {
+    /// A client for `url` with a bearer token. The client ignores the
+    /// proxy variables (`HTTP_PROXY` and the others), because the endpoint
+    /// is on 127.0.0.1 and a proxy would see the token.
+    pub fn new(url: impl Into<String>, token: impl Into<String>) -> Result<Self, WorkerError> {
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .map_err(|e| WorkerError::Network(format!("could not make an HTTP client: {e}")))?;
+        Ok(Self {
             url: url.into(),
             token: token.into(),
-            http: reqwest::Client::new(),
+            http,
             session: Arc::new(Mutex::new(None)),
             protocol: Arc::new(Mutex::new(None)),
-        }
+        })
     }
 
     /// Posts one JSON-RPC message and returns the messages that came back.
@@ -128,7 +140,7 @@ impl McpHttpClient {
 
 /// Runs the stdio bridge until stdin closes.
 pub async fn run_stdio(url: &str, token: &str) -> Result<(), WorkerError> {
-    let client = McpHttpClient::new(url, token);
+    let client = McpHttpClient::new(url, token)?;
     let stdout = Arc::new(Mutex::new(tokio::io::stdout()));
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     let mut first = true;

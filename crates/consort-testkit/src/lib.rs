@@ -107,6 +107,8 @@ pub struct FakeHarness {
     capabilities: Capabilities,
     /// When set, `open` with `resume` fails.
     pub fail_resume: bool,
+    /// When set, every `turn` fails.
+    pub fail_turn: bool,
 }
 
 impl FakeHarness {
@@ -125,6 +127,7 @@ impl FakeHarness {
                 ..Capabilities::default()
             },
             fail_resume: false,
+            fail_turn: false,
         }
     }
 
@@ -216,6 +219,7 @@ impl Harness for FakeHarness {
                 waiters: Arc::new(Mutex::new(HashMap::new())),
                 turn_index: 0,
                 cancel,
+                fail_turn: self.fail_turn,
             }),
             rx,
         ))
@@ -234,6 +238,7 @@ struct FakeSession {
     waiters: Waiters,
     turn_index: usize,
     cancel: watch::Sender<u64>,
+    fail_turn: bool,
 }
 
 async fn play(
@@ -389,6 +394,11 @@ impl HarnessSession for FakeSession {
         if let Ok(mut record) = self.record.lock() {
             record.turns.push(input);
         }
+        if self.fail_turn {
+            return Err(HarnessError::Protocol(
+                "the fake harness refused the turn".to_owned(),
+            ));
+        }
         let steps = self
             .script
             .turns
@@ -468,10 +478,12 @@ mod tests {
             model: "fake-model".into(),
             options: Default::default(),
             approval_mode: ApprovalMode::Ask,
+            allow_shell: true,
             system_prompt_append: String::new(),
             mcp_servers: vec![],
             env: BTreeMap::new(),
             resume: None,
+            process_watcher: None,
         }
     }
 

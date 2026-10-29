@@ -1,6 +1,7 @@
 //! The `consort` program: the hub, the worker, a dev mode that runs both,
 //! and the stdio MCP bridge.
 
+use std::io::BufRead;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -75,9 +76,11 @@ enum WorkerCommand {
     Pair {
         /// The hub URL, for example https://hub.example.com.
         hub_url: String,
-        /// The pairing code from a client, for example ABCD-EFGH.
-        #[arg(long)]
-        code: String,
+        /// The pairing code from a client, for example ABCD-EFGH. Without
+        /// it, the code comes from CONSORT_PAIRING_CODE or from a prompt.
+        /// Other users of this machine can see a code on the command line.
+        #[arg(long, env = "CONSORT_PAIRING_CODE", hide_env_values = true)]
+        code: Option<String>,
         /// The worker name. The default is the host name.
         #[arg(long)]
         name: Option<String>,
@@ -88,7 +91,7 @@ enum WorkerCommand {
         #[arg(long, env = "CONSORT_WORKER_DIR")]
         config_dir: Option<PathBuf>,
     },
-    /// Run the worker until Ctrl-C.
+    /// Run the worker until Ctrl-C, SIGTERM or SIGHUP.
     Run {
         /// The worker folder.
         #[arg(long, env = "CONSORT_WORKER_DIR")]
@@ -131,11 +134,115 @@ fn worker_dir(given: Option<PathBuf>) -> Result<PathBuf> {
     }
 }
 
-async fn wait_for_ctrl_c() {
-    if let Err(err) = tokio::signal::ctrl_c().await {
-        tracing::warn!(error = %err, "could not listen for Ctrl-C");
-        std::future::pending::<()>().await;
+/// The signals that stop the hub and the worker: Ctrl-C, and on Unix also
+/// SIGTERM (from launchd or systemd) and SIGHUP (when the terminal closes).
+/// On Windows, closing the console and a system shutdown stop them too.
+struct StopSignals {
+    #[cfg(unix)]
+    terminate: Option<tokio::signal::unix::Signal>,
+    #[cfg(unix)]
+    hangup: Option<tokio::signal::unix::Signal>,
+    #[cfg(windows)]
+    close: Option<tokio::signal::windows::CtrlClose>,
+    #[cfg(windows)]
+    shutdown: Option<tokio::signal::windows::CtrlShutdown>,
+}
+
+impl StopSignals {
+    /// Starts to listen. From now on, these signals no longer end the
+    /// process at once.
+    fn listen() -> Self {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            let listen = |kind: SignalKind, name: &str| match signal(kind) {
+                Ok(s) => Some(s),
+                Err(err) => {
+                    tracing::warn!(error = %err, "could not listen for {name}");
+                    None
+                }
+            };
+            Self {
+                terminate: listen(SignalKind::terminate(), "SIGTERM"),
+                hangup: listen(SignalKind::hangup(), "SIGHUP"),
+            }
+        }
+        #[cfg(windows)]
+        {
+            Self {
+                close: tokio::signal::windows::ctrl_close().ok(),
+                shutdown: tokio::signal::windows::ctrl_shutdown().ok(),
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Self {}
+        }
     }
+
+    /// Waits for the first stop signal.
+    async fn wait(mut self) {
+        async fn next<F: std::future::Future>(f: Option<F>) {
+            match f {
+                Some(f) => {
+                    f.await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        }
+        let ctrl_c = async {
+            if let Err(err) = tokio::signal::ctrl_c().await {
+                tracing::warn!(error = %err, "could not listen for Ctrl-C");
+                std::future::pending::<()>().await;
+            }
+        };
+        #[cfg(unix)]
+        {
+            tokio::select! {
+                () = ctrl_c => {}
+                () = next(self.terminate.as_mut().map(|s| s.recv())) => {
+                    tracing::info!("SIGTERM: stopping");
+                }
+                () = next(self.hangup.as_mut().map(|s| s.recv())) => {
+                    tracing::info!("SIGHUP: stopping");
+                }
+            }
+        }
+        #[cfg(windows)]
+        {
+            tokio::select! {
+                () = ctrl_c => {}
+                () = next(self.close.as_mut().map(|s| s.recv())) => {}
+                () = next(self.shutdown.as_mut().map(|s| s.recv())) => {}
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            ctrl_c.await;
+        }
+    }
+}
+
+async fn wait_for_stop() {
+    StopSignals::listen().wait().await;
+}
+
+/// The pairing code: from `--code` or CONSORT_PAIRING_CODE (`given`), or
+/// else one line from `input`, after a prompt on stderr.
+fn pairing_code(given: Option<String>, input: &mut dyn BufRead) -> Result<String> {
+    if let Some(code) = given.filter(|c| !c.trim().is_empty()) {
+        return Ok(code.trim().to_owned());
+    }
+    eprint!("Pairing code from a client (for example ABCD-EFGH): ");
+    let mut line = String::new();
+    input
+        .read_line(&mut line)
+        .context("could not read the pairing code")?;
+    let code = line.trim();
+    if code.is_empty() {
+        bail!("no pairing code. Pass --code, set CONSORT_PAIRING_CODE, or type the code");
+    }
+    Ok(code.to_owned())
 }
 
 async fn run_hub(args: HubArgs) -> Result<()> {
@@ -169,7 +276,7 @@ async fn run_hub(args: HubArgs) -> Result<()> {
         println!("No client is paired yet. Client setup code: {code}");
     }
     println!("Press Ctrl-C to stop.");
-    wait_for_ctrl_c().await;
+    wait_for_stop().await;
     hub.shutdown()
         .await
         .context("the hub did not stop cleanly")?;
@@ -183,7 +290,7 @@ async fn run_worker(config_dir: PathBuf) -> Result<()> {
     .await
     .with_context(|| format!("could not start the worker in {}", config_dir.display()))?;
     println!("Worker {} runs. Press Ctrl-C to stop.", worker.worker_id());
-    wait_for_ctrl_c().await;
+    wait_for_stop().await;
     worker.shutdown().await?;
     Ok(())
 }
@@ -247,7 +354,7 @@ async fn run_dev(args: DevArgs) -> Result<()> {
         worker_dir.display()
     );
     println!("Press Ctrl-C to stop.");
-    wait_for_ctrl_c().await;
+    wait_for_stop().await;
     worker.shutdown().await?;
     hub.shutdown()
         .await
@@ -281,6 +388,10 @@ async fn main() -> Result<()> {
                 config_dir,
             } => {
                 let dir = worker_dir(config_dir)?;
+                if let Some(warning) = consort_worker::http::cleartext_warning(&hub_url) {
+                    eprintln!("Warning: {warning}");
+                }
+                let code = pairing_code(code, &mut std::io::stdin().lock())?;
                 let id = consort_worker::pair(&hub_url, &code, &dir, name, labels).await?;
                 println!(
                     "Paired as worker {id}. The configuration is in {}.",
@@ -327,7 +438,15 @@ mod tests {
             panic!("expected worker pair")
         };
         assert_eq!(labels, vec!["a", "b"]);
-        assert_eq!(code, "ABCD-EFGH");
+        assert_eq!(code.as_deref(), Some("ABCD-EFGH"));
+        // The code can come from the environment or a prompt instead.
+        let cli = Cli::try_parse_from(["consort", "worker", "pair", "http://h:7600"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Worker {
+                command: WorkerCommand::Pair { .. }
+            }
+        ));
         let cli =
             Cli::try_parse_from(["consort", "hub", "setup-code", "--data", "/tmp/x"]).unwrap();
         assert!(matches!(
@@ -346,5 +465,38 @@ mod tests {
             Cli::try_parse_from(["consort", "dev"]).is_err(),
             "dev needs --data"
         );
+    }
+
+    #[test]
+    fn the_pairing_code_comes_from_the_flag_or_a_prompt() {
+        let mut empty = std::io::Cursor::new(Vec::new());
+        assert_eq!(
+            pairing_code(Some(" ABCD-EFGH ".into()), &mut empty).unwrap(),
+            "ABCD-EFGH"
+        );
+        let mut typed = std::io::Cursor::new(b"wxyz-1234\n".to_vec());
+        assert_eq!(pairing_code(None, &mut typed).unwrap(), "wxyz-1234");
+        let mut nothing = std::io::Cursor::new(b"\n".to_vec());
+        assert!(pairing_code(None, &mut nothing).is_err());
+    }
+
+    /// SIGHUP and SIGTERM end the wait, so the worker runs its shutdown.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_signals_end_the_wait() {
+        for signal in ["HUP", "TERM"] {
+            let signals = StopSignals::listen();
+            let wait = tokio::spawn(signals.wait());
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let status = std::process::Command::new("kill")
+                .args(["-s", signal, &std::process::id().to_string()])
+                .status()
+                .unwrap();
+            assert!(status.success());
+            tokio::time::timeout(Duration::from_secs(5), wait)
+                .await
+                .unwrap_or_else(|_| panic!("SIG{signal} did not end the wait"))
+                .unwrap();
+        }
     }
 }

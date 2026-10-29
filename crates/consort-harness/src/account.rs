@@ -76,13 +76,15 @@ pub fn home_variable(kind: HarnessKind) -> Option<&'static str> {
     }
 }
 
-/// The login files that a shadow home keeps private. The worker never reads
-/// these files.
+/// The login files that a shadow home keeps private, as paths relative to
+/// the home with `/` between parts. The worker never reads these files.
 pub fn private_files(kind: HarnessKind) -> &'static [&'static str] {
     match kind {
         HarnessKind::Codex | HarnessKind::Pi => &["auth.json"],
         HarnessKind::ClaudeCode => &[".credentials.json"],
-        HarnessKind::OpenCode => &["auth.json"],
+        // The home is `$XDG_DATA_HOME`, and OpenCode keeps its login in the
+        // `opencode` folder inside it.
+        HarnessKind::OpenCode => &["opencode/auth.json"],
         HarnessKind::GeminiCli | HarnessKind::Acp => &[],
     }
 }
@@ -157,8 +159,13 @@ pub fn prepare_home(account: &AccountConfig) -> Result<BTreeMap<String, String>,
 }
 
 /// Creates `shadow` and links each entry of `shared` into it, except the
-/// names in `private`. Existing entries in `shadow` stay as they are, so a
+/// paths in `private`. Existing entries in `shadow` stay as they are, so a
 /// login that the user made in the shadow home is kept.
+///
+/// A private path can be inside a folder, such as `opencode/auth.json`. That
+/// folder is then a real folder in `shadow`, and each of its entries except
+/// the private file is linked. An older link to the whole folder is replaced
+/// by a real folder; only the link is removed, never the shared folder.
 pub fn build_shadow_home(
     shadow: &Path,
     shared: Option<&Path>,
@@ -168,19 +175,47 @@ pub fn build_shadow_home(
     let Some(shared) = shared else {
         return Ok(());
     };
+    let private: Vec<Vec<&str>> = private
+        .iter()
+        .map(|p| p.split('/').filter(|part| !part.is_empty()).collect())
+        .filter(|parts: &Vec<&str>| !parts.is_empty())
+        .collect();
+    shadow_folder(shadow, shared, &private)
+}
+
+/// Links the entries of one folder of the shared home. See
+/// [`build_shadow_home`].
+fn shadow_folder(shadow: &Path, shared: &Path, private: &[Vec<&str>]) -> Result<(), HarnessError> {
     let Ok(entries) = std::fs::read_dir(shared) else {
         return Ok(());
     };
     for entry in entries.flatten() {
         let name = entry.file_name();
-        if private.iter().any(|p| name == std::ffi::OsStr::new(p)) {
+        let here = |part: &str| name == std::ffi::OsStr::new(part);
+        if private.iter().any(|p| p.len() == 1 && here(p[0])) {
             continue;
         }
+        let inner: Vec<Vec<&str>> = private
+            .iter()
+            .filter(|p| p.len() > 1 && here(p[0]))
+            .map(|p| p[1..].to_vec())
+            .collect();
         let target = shadow.join(&name);
+        let source = entry.path();
+        if !inner.is_empty() && source.is_dir() {
+            let is_link = target
+                .symlink_metadata()
+                .is_ok_and(|m| m.file_type().is_symlink());
+            if is_link {
+                remove_link(&target)?;
+            }
+            std::fs::create_dir_all(&target)?;
+            shadow_folder(&target, &source, &inner)?;
+            continue;
+        }
         if target.symlink_metadata().is_ok() {
             continue;
         }
-        let source = entry.path();
         let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
         if let Err(err) = link(&source, &target, is_dir) {
             tracing::warn!(
@@ -191,6 +226,19 @@ pub fn build_shadow_home(
         }
     }
     Ok(())
+}
+
+/// Removes a link, not what it points to.
+#[cfg(windows)]
+fn remove_link(path: &Path) -> std::io::Result<()> {
+    // A folder link on Windows is a folder entry, so remove it as one.
+    std::fs::remove_dir(path).or_else(|_| std::fs::remove_file(path))
+}
+
+/// Removes a link, not what it points to.
+#[cfg(not(windows))]
+fn remove_link(path: &Path) -> std::io::Result<()> {
+    std::fs::remove_file(path)
 }
 
 #[cfg(unix)]
@@ -239,6 +287,41 @@ mod tests {
         assert!(shadow.join("auth.json").symlink_metadata().is_err());
         // A second run keeps what is there.
         build_shadow_home(&shadow, Some(&shared), &["auth.json"]).unwrap();
+    }
+
+    #[test]
+    fn opencode_shadow_home_keeps_the_nested_login_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("share");
+        std::fs::create_dir_all(shared.join("opencode").join("storage")).unwrap();
+        std::fs::create_dir_all(shared.join("other-app")).unwrap();
+        // A stand-in login file. The test only checks that it is not linked.
+        std::fs::write(shared.join("opencode").join("auth.json"), "x").unwrap();
+        std::fs::write(shared.join("opencode").join("log.txt"), "y").unwrap();
+        let shadow = dir.path().join("shadow");
+        // An older build linked the whole `opencode` folder.
+        std::fs::create_dir_all(&shadow).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(shared.join("opencode"), shadow.join("opencode")).unwrap();
+
+        build_shadow_home(&shadow, Some(&shared), private_files(HarnessKind::OpenCode)).unwrap();
+        let opencode = shadow.join("opencode");
+        let meta = opencode.symlink_metadata().unwrap();
+        assert!(meta.is_dir() && !meta.file_type().is_symlink());
+        assert!(opencode.join("storage").exists());
+        assert!(opencode.join("log.txt").exists());
+        assert!(
+            opencode.join("auth.json").symlink_metadata().is_err(),
+            "the OpenCode login is not shared"
+        );
+        assert!(shadow.join("other-app").exists());
+        assert!(
+            shared.join("opencode").join("auth.json").exists(),
+            "the shared login stays"
+        );
+        // A second run keeps the real folder.
+        build_shadow_home(&shadow, Some(&shared), private_files(HarnessKind::OpenCode)).unwrap();
+        assert!(opencode.join("auth.json").symlink_metadata().is_err());
     }
 
     #[test]

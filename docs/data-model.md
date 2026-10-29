@@ -446,3 +446,6 @@ path = "C:/Users/chris/Code/sayso"
 - `spool`: session ID, sequence number, event and an acknowledged flag. The worker keeps events until the hub acknowledges them.
 - `processed_commands`: command ID, result and time, kept for 24 hours so that a repeated command runs once.
 - `sessions`: the local registry of sessions with their native references and workspace paths.
+- `harness_processes`: the process group of each harness that the worker started on Unix, with the start time of its leader. At the next start, the worker stops only the recorded groups whose start time still matches.
+
+On Unix the worker folder, `workspaces/` and `runtime/` have mode 0700, and `worker.db` has mode 0600.

@@ -25,8 +25,9 @@ use consort_proto::worker_link::{
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
-use crate::core::Core;
-use crate::mcp::{self, McpEndpoint, ToolBackend};
+use crate::config::{RUNTIME_DIR, create_private_dir, local_server_name_problem};
+use crate::core::{Core, GroupLog};
+use crate::mcp::{self, McpEndpoint, ToolBackend, ToolCache};
 use crate::store::{SessionRecord, WorkspaceEntry};
 use crate::{WorkerError, workspace};
 
@@ -50,6 +51,8 @@ pub(crate) enum Job {
         request_id: RequestId,
         option_id: String,
     },
+    /// The harness reported the session as lost. Close what is left of it.
+    HarnessLost,
     /// Close the harness but keep the session for resume.
     Shutdown,
 }
@@ -144,15 +147,25 @@ pub(crate) const HUB_SERVER: &str = "hub";
 /// The allow-once option of an approval for a hub tool, if the request is
 /// one. Falls back to an allow-always option when the harness offers no
 /// allow-once option.
-fn hub_tool_allow(opened: &consort_proto::worker_link::RequestOpened) -> Option<String> {
+///
+/// The request is for a hub tool only when the server is `hub` and the tool
+/// is in the session's hub tool list (`hub_tools`, from `tool.list`). The
+/// server name comes from a tool name such as `mcp__hub__post_message`, so a
+/// local server named `hub__x` would give the server `hub`; the list check
+/// stops that. Before the harness lists the tools, nothing is allowed here.
+fn hub_tool_allow(
+    opened: &consort_proto::worker_link::RequestOpened,
+    hub_tools: Option<&[ToolDefinition]>,
+) -> Option<String> {
     let RequestBody::Approval(ApprovalDetails::Tool {
         server: Some(server),
+        tool,
         ..
     }) = &opened.body
     else {
         return None;
     };
-    if server != HUB_SERVER {
+    if server != HUB_SERVER || !hub_tools?.iter().any(|t| &t.name == tool) {
         return None;
     }
     let pick = |kind: RequestOptionKind| {
@@ -181,6 +194,7 @@ async fn pump(
     mut events: EventReceiver,
     jobs: mpsc::UnboundedSender<Job>,
     deny_commands: bool,
+    hub_tools: ToolCache,
 ) {
     let mut coalescer = Coalescer::default();
     let interval = Duration::from_millis(OUTPUT_DELTA_INTERVAL_MS);
@@ -202,12 +216,17 @@ async fn pump(
                 {
                     core.mark_signed_out(account_id, message);
                 }
-                if let SessionEvent::RequestOpened(opened) = &event
-                    && let Some(option_id) = hub_tool_allow(opened)
-                {
-                    let _ = jobs.send(Job::AllowHubTool { request_id: opened.request_id.clone(), option_id });
-                    continue;
+                if let SessionEvent::RequestOpened(opened) = &event {
+                    let allow = {
+                        let tools = hub_tools.lock().await;
+                        hub_tool_allow(opened, tools.as_deref())
+                    };
+                    if let Some(option_id) = allow {
+                        let _ = jobs.send(Job::AllowHubTool { request_id: opened.request_id.clone(), option_id });
+                        continue;
+                    }
                 }
+                let lost = matches!(event, SessionEvent::State { state: SessionState::Lost });
                 let mut policy_deny = None;
                 if deny_commands
                     && let SessionEvent::RequestOpened(opened) = &event
@@ -225,6 +244,9 @@ async fn pump(
                 }
                 if let Some((request_id, option_id)) = policy_deny {
                     let _ = jobs.send(Job::PolicyDeny { request_id, option_id });
+                }
+                if lost {
+                    let _ = jobs.send(Job::HarnessLost);
                 }
             }
             () = sleep => {
@@ -384,9 +406,10 @@ impl Runtime {
             }),
         }];
         for local in &config.local_mcp_servers {
-            if local.name == HUB_SERVER {
+            if let Some(problem) = local_server_name_problem(&local.name) {
                 tracing::warn!(
-                    "a local MCP server is named `hub`, which Consort keeps for the hub tools; rename it to use it"
+                    server = %local.name,
+                    "the worker does not give this local MCP server to sessions: {problem}. Rename it in worker.toml to use it"
                 );
                 continue;
             }
@@ -399,11 +422,21 @@ impl Runtime {
                 });
             }
         }
-        let runtime_dir = core
-            .config_dir
-            .join("runtime")
-            .join(self.session_id.to_string());
-        let _ = std::fs::create_dir_all(&runtime_dir);
+        let runtime_root = core.config_dir.join(RUNTIME_DIR);
+        let runtime_dir = runtime_root.join(self.session_id.to_string());
+        if let Err(err) =
+            create_private_dir(&runtime_root).and_then(|()| std::fs::create_dir_all(&runtime_dir))
+        {
+            endpoint.stop().await;
+            return Err(WorkerError::io(
+                format!("could not create {}", runtime_dir.display()),
+                err,
+            )
+            .to_error_body());
+        }
+        let watcher = consort_harness::process::WatcherHandle(Arc::new(GroupLog {
+            core: Arc::downgrade(&core),
+        }));
         let spec = SessionSpec {
             session_id: self.session_id,
             workspace: workspace_path.to_path_buf(),
@@ -411,10 +444,12 @@ impl Runtime {
             model: start.model.clone(),
             options: start.options.clone(),
             approval_mode: mode,
+            allow_shell: config.policy.allow_shell,
             system_prompt_append: start.system_prompt_append.clone(),
             mcp_servers: servers,
             env: BTreeMap::new(),
             resume,
+            process_watcher: Some(watcher),
         };
         let (session, events) = match adapter.open(&account, spec).await {
             Ok(s) => s,
@@ -428,6 +463,7 @@ impl Runtime {
             let _ = core.store.set_native_ref(self.session_id, &native);
         }
         self.harness = Some(session);
+        let hub_tools = endpoint.tools();
         self.mcp = Some(endpoint);
         self.pump = Some(tokio::spawn(pump(
             core.clone(),
@@ -436,6 +472,7 @@ impl Runtime {
             events,
             self.jobs.clone(),
             !config.policy.allow_shell,
+            hub_tools,
         )));
         core.inventory_changed();
         Ok(())
@@ -527,7 +564,18 @@ impl Runtime {
         }
         let native_ref = self.harness.as_ref().and_then(|h| h.native_ref());
         if let Some(turn) = start.turn {
-            self.harness()?.turn(turn).await.map_err(harness_body)?;
+            let result = match self.harness() {
+                Ok(h) => h.turn(turn).await.map_err(harness_body),
+                Err(e) => Err(e),
+            };
+            if let Err(err) = result {
+                // The session did not start, so nothing of it may keep
+                // running: not the harness and not the MCP endpoint.
+                self.stop_recording();
+                self.close_harness().await;
+                self.lost("start_failed", &err.message);
+                return Err(err);
+            }
         }
         serde_json::to_value(SessionStartResult {
             workspace_path,
@@ -536,10 +584,15 @@ impl Runtime {
         .map_err(|_| ErrorBody::internal())
     }
 
-    async fn restore(&mut self, record: SessionRecord) {
+    /// Opens the harness of a session again after the worker restarted.
+    /// Returns false when the session is lost.
+    async fn restore(&mut self, record: SessionRecord) -> bool {
         let Some(native) = record.native_ref.clone() else {
-            self.lost("the session has no harness reference to resume");
-            return;
+            self.lost(
+                "resume_failed",
+                "the session has no harness reference to resume",
+            );
+            return false;
         };
         // Tell the hub first, so that it closes the old turn before any
         // event from the new harness process.
@@ -547,11 +600,21 @@ impl Runtime {
             .record_event(self.session_id, &SessionEvent::Reopened);
         let path = std::path::PathBuf::from(&record.workspace_path);
         if let Err(err) = self.open(&record.start, &path, Some(native)).await {
-            self.lost(&err.message);
+            self.lost("resume_failed", &err.message);
+            return false;
+        }
+        true
+    }
+
+    /// Stops recording harness events, so the `ended` state that a harness
+    /// reports when it closes does not reach the hub.
+    fn stop_recording(&mut self) {
+        if let Some(pump) = self.pump.take() {
+            pump.abort();
         }
     }
 
-    fn lost(&self, why: &str) {
+    fn lost(&self, code: &str, why: &str) {
         let _ = self
             .core
             .store
@@ -559,7 +622,7 @@ impl Runtime {
         self.core.record_event(
             self.session_id,
             &SessionEvent::Error {
-                code: "resume_failed".to_owned(),
+                code: code.to_owned(),
                 message: why.to_owned(),
             },
         );
@@ -584,10 +647,15 @@ impl Runtime {
     }
 
     /// Runs one command. Returns the result and whether the session ends.
+    /// A session that fails to start ends, so its ID is free again.
     async fn execute(&mut self, command: HubToWorker) -> (Result<Value, ErrorBody>, bool) {
         let empty = || Ok(json!({}));
         match command {
-            HubToWorker::SessionStart(start) => (self.start(start).await, false),
+            HubToWorker::SessionStart(start) => {
+                let result = self.start(start).await;
+                let ended = result.is_err();
+                (result, ended)
+            }
             HubToWorker::SessionTurn(turn) => {
                 let result = match self.harness() {
                     Ok(h) => h.turn(turn.turn).await.map_err(harness_body),
@@ -675,7 +743,11 @@ pub(crate) async fn run_session(
                     break;
                 }
             }
-            Job::Restore(record) => runtime.restore(*record).await,
+            Job::Restore(record) => {
+                if !runtime.restore(*record).await {
+                    break;
+                }
+            }
             Job::PolicyDeny {
                 request_id,
                 option_id,
@@ -709,18 +781,34 @@ pub(crate) async fn run_session(
                         .await;
                 }
             }
+            Job::HarnessLost => {
+                // The harness process is gone, and the pump recorded the
+                // lost state and every event before it. Stop recording, so
+                // no `ended` from the close follows. Stop the MCP endpoint,
+                // so its token works no more.
+                tracing::info!(session = %session_id, "the harness lost the session");
+                runtime.stop_recording();
+                runtime.close_harness().await;
+                break;
+            }
             Job::Shutdown => {
                 // Stop recording first: the harness reports `ended` when it
                 // closes, but the session stays open for the next run.
-                if let Some(pump) = runtime.pump.take() {
-                    pump.abort();
-                }
+                runtime.stop_recording();
                 runtime.close_harness().await;
                 break;
             }
         }
     }
     runtime.close_harness().await;
+    // Commands that wait in the queue will not run. Answer them, so the hub
+    // does not wait for ever.
+    jobs.close();
+    while let Ok(job) = jobs.try_recv() {
+        if let Job::Command { id, .. } = job {
+            core.abandon_command(&id, crate::core::session_gone());
+        }
+    }
     core.session_ended(session_id);
 }
 
@@ -743,6 +831,48 @@ mod tests {
             created_at: Timestamp::EPOCH,
             updated_at: Timestamp::EPOCH,
         })
+    }
+
+    #[test]
+    fn only_listed_hub_tools_are_allowed_on_the_worker() {
+        use consort_proto::model::{RequestOption, RequestOptionKind};
+        use consort_proto::worker_link::RequestOpened;
+        let opened = |server: &str, tool: &str| RequestOpened {
+            request_id: RequestId::new("r"),
+            summary: String::new(),
+            body: RequestBody::Approval(ApprovalDetails::Tool {
+                server: Some(server.into()),
+                tool: tool.into(),
+                arguments: Value::Null,
+            }),
+            options: vec![RequestOption {
+                id: "yes".into(),
+                label: "Allow".into(),
+                kind: RequestOptionKind::AllowOnce,
+                description: None,
+            }],
+        };
+        let listed = vec![consort_proto::tools::HubTool::PostMessage.definition()];
+        let tools = Some(listed.as_slice());
+        assert_eq!(
+            hub_tool_allow(&opened("hub", "post_message"), tools).as_deref(),
+            Some("yes")
+        );
+        // `mcp__hub__x__post_message` from a local server named `hub__x`.
+        assert_eq!(
+            hub_tool_allow(&opened("hub", "x__post_message"), tools),
+            None
+        );
+        assert_eq!(hub_tool_allow(&opened("hub", "rm_rf"), tools), None);
+        assert_eq!(
+            hub_tool_allow(&opened("github", "post_message"), tools),
+            None
+        );
+        assert_eq!(
+            hub_tool_allow(&opened("hub", "post_message"), None),
+            None,
+            "nothing is allowed before the harness lists the tools"
+        );
     }
 
     #[test]

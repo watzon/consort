@@ -4,6 +4,10 @@
 //! The worker writes every event to the spool before it sends it, and
 //! deletes events after the hub acknowledges them. Each command result is
 //! kept for 24 hours, so a repeated command ID returns the same result.
+//!
+//! The database also lists the harness process groups that run, so the
+//! next start can kill the ones that a killed worker left behind. On Unix
+//! the file has mode 0600.
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -21,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::WorkerError;
+use crate::cap::cap_event;
 
 const SCHEMA: &str = "
 PRAGMA journal_mode = WAL;
@@ -53,7 +58,60 @@ CREATE TABLE IF NOT EXISTS workspaces (
     entries TEXT NOT NULL,
     created_at INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS harness_processes (
+    pgid INTEGER PRIMARY KEY,
+    program TEXT NOT NULL,
+    started TEXT NOT NULL,
+    recorded_at INTEGER NOT NULL
+);
 ";
+
+/// One harness process group that runs, or ran when the worker stopped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProcessRecord {
+    /// The process group ID, which is the leader's process ID.
+    pub pgid: u32,
+    /// The program of the leader.
+    pub program: String,
+    /// The leader's start time, as `ps -o lstart` shows it.
+    pub started: String,
+}
+
+/// The event that replaces a spooled event that the worker cannot read.
+fn unreadable_event(seq: i64) -> SessionEvent {
+    SessionEvent::Error {
+        code: "event_unreadable".to_owned(),
+        message: format!(
+            "The worker could not read event {seq} of this session from its spool, so it sent this note instead."
+        ),
+    }
+}
+
+/// Creates the database file with mode 0600 on Unix, or sets that mode on
+/// an existing file. SQLite gives its journal files the mode of the
+/// database file.
+fn make_private(path: &Path) -> Result<(), WorkerError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let context = || format!("could not make {} private", path.display());
+        if path.exists() {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| WorkerError::io(context(), e))?;
+        } else {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .open(path)
+                .map_err(|e| WorkerError::io(context(), e))?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
 
 /// A stored command result.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -180,6 +238,7 @@ pub struct Store {
 impl Store {
     /// Opens or creates the database.
     pub fn open(path: &Path) -> Result<Self, WorkerError> {
+        make_private(path)?;
         let conn = Connection::open(path)?;
         conn.execute_batch(SCHEMA)?;
         Ok(Self {
@@ -283,14 +342,17 @@ impl Store {
     // Spool.
 
     /// Numbers an event and writes it to the spool. Sequence numbers start
-    /// at 1 and have no gaps.
+    /// at 1 and have no gaps. An event larger than
+    /// [`MAX_EVENT_BYTES`](crate::cap::MAX_EVENT_BYTES) is cut first (see
+    /// [`cap_event`]).
     pub fn append_event(
         &self,
         id: SessionId,
         event: &SessionEvent,
     ) -> Result<SequencedEvent, WorkerError> {
         let at = Timestamp::now();
-        let text = serde_json::to_string(event).map_err(|e| WorkerError::Config(e.to_string()))?;
+        let event = cap_event(event.clone());
+        let text = serde_json::to_string(&event).map_err(|e| WorkerError::Config(e.to_string()))?;
         let seq = self.with(|c| {
             let tx = c.transaction()?;
             let last: Option<i64> = tx
@@ -317,7 +379,7 @@ impl Store {
         Ok(SequencedEvent {
             seq: to_u64(seq),
             at,
-            event: event.clone(),
+            event,
         })
     }
 
@@ -339,7 +401,10 @@ impl Store {
 
     /// The next batch of spooled events of a session: at most
     /// [`MAX_EVENTS_PER_BATCH`] events and [`MAX_BATCH_BYTES`] bytes, and at
-    /// least one event when any is spooled.
+    /// least one event when any is spooled. A row that the worker cannot
+    /// read becomes an `event_unreadable` error event with the same number,
+    /// so one bad row never stops the session's events. A row that is too
+    /// large (from an older build) is cut.
     pub fn next_batch(&self, id: SessionId) -> Result<Vec<SequencedEvent>, WorkerError> {
         self.with(|c| {
             let mut stmt = c.prepare(
@@ -363,7 +428,13 @@ impl Store {
                 if !out.is_empty() && bytes > MAX_BATCH_BYTES {
                     break;
                 }
-                let event: SessionEvent = serde_json::from_str(&text).map_err(json_err)?;
+                let event = match serde_json::from_str::<SessionEvent>(&text) {
+                    Ok(event) => cap_event(event),
+                    Err(err) => {
+                        tracing::warn!(session = %id, seq, error = %err, "a spooled event cannot be read; the worker sends a note instead");
+                        unreadable_event(seq)
+                    }
+                };
                 out.push(SequencedEvent {
                     seq: to_u64(seq),
                     at: Timestamp::from_millis(at),
@@ -371,6 +442,34 @@ impl Store {
                 });
             }
             Ok(out)
+        })
+    }
+
+    /// Deletes every spooled event of a session.
+    pub fn drop_spool(&self, id: SessionId) -> Result<usize, WorkerError> {
+        self.with(|c| {
+            c.execute(
+                "DELETE FROM spool WHERE session_id = ?1",
+                params![id.to_string()],
+            )
+        })
+    }
+
+    /// Replaces one spooled event, for example with a note when the event
+    /// cannot be sent.
+    pub fn replace_event(
+        &self,
+        id: SessionId,
+        seq: u64,
+        event: &SessionEvent,
+    ) -> Result<(), WorkerError> {
+        let text = serde_json::to_string(event).map_err(|e| WorkerError::Config(e.to_string()))?;
+        self.with(|c| {
+            c.execute(
+                "UPDATE spool SET event = ?3 WHERE session_id = ?1 AND seq = ?2",
+                params![id.to_string(), to_i64(seq), text],
+            )
+            .map(|_| ())
         })
     }
 
@@ -469,6 +568,60 @@ impl Store {
                 .map(|_| ())
         })
     }
+
+    // Harness processes.
+
+    /// Records a harness process group.
+    pub fn put_process(&self, record: &ProcessRecord) -> Result<(), WorkerError> {
+        self.with(|c| {
+            c.execute(
+                "INSERT OR REPLACE INTO harness_processes (pgid, program, started, recorded_at) VALUES (?1, ?2, ?3, ?4)",
+                params![i64::from(record.pgid), record.program, record.started, Timestamp::now().as_millis()],
+            )
+            .map(|_| ())
+        })
+    }
+
+    /// Forgets a harness process group.
+    pub fn delete_process(&self, pgid: u32) -> Result<(), WorkerError> {
+        self.with(|c| {
+            c.execute(
+                "DELETE FROM harness_processes WHERE pgid = ?1",
+                params![i64::from(pgid)],
+            )
+            .map(|_| ())
+        })
+    }
+
+    /// The recorded harness process groups.
+    pub fn processes(&self) -> Result<Vec<ProcessRecord>, WorkerError> {
+        self.with(|c| {
+            let mut stmt =
+                c.prepare("SELECT pgid, program, started FROM harness_processes ORDER BY pgid")?;
+            let rows = stmt.query_map([], |r| {
+                Ok(ProcessRecord {
+                    pgid: u32::try_from(r.get::<_, i64>(0)?).unwrap_or(0),
+                    program: r.get(1)?,
+                    started: r.get(2)?,
+                })
+            })?;
+            rows.collect()
+        })
+    }
+
+    /// Writes a raw spool row, for tests of rows that the worker cannot
+    /// read.
+    #[cfg(test)]
+    pub(crate) fn put_raw_event(&self, id: SessionId, seq: u64, text: &str) {
+        self.with(|c| {
+            c.execute(
+                "INSERT INTO spool (session_id, seq, at, event) VALUES (?1, ?2, 0, ?3)",
+                params![id.to_string(), to_i64(seq), text],
+            )
+            .map(|_| ())
+        })
+        .unwrap();
+    }
 }
 
 fn read_session(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
@@ -485,7 +638,7 @@ fn read_session(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use consort_proto::error::ErrorCode;
     use consort_proto::ids::{AccountId, ChannelId};
@@ -515,7 +668,7 @@ mod tests {
         }
     }
 
-    fn record(id: SessionId) -> SessionRecord {
+    pub(crate) fn record(id: SessionId) -> SessionRecord {
         SessionRecord {
             start: start(id),
             native_ref: None,
@@ -631,6 +784,89 @@ mod tests {
         let later = Timestamp::now().plus_millis(COMMAND_RESULT_TTL_MS + 1000);
         assert_eq!(store.prune_commands(later).unwrap(), 2);
         assert!(store.command_result("c1").unwrap().is_none());
+    }
+
+    #[test]
+    fn an_unreadable_row_becomes_a_note_and_the_rest_follows() {
+        let store = Store::in_memory().unwrap();
+        let id = SessionId::new();
+        store.put_session(&record(id)).unwrap();
+        store
+            .append_event(id, &state(SessionState::Active))
+            .unwrap();
+        store.put_raw_event(id, 2, "{\"type\": \"no such event\"}");
+        store.put_raw_event(
+            id,
+            3,
+            &serde_json::to_string(&state(SessionState::Idle)).unwrap(),
+        );
+        let batch = store.next_batch(id).unwrap();
+        assert_eq!(
+            batch.iter().map(|e| e.seq).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert!(
+            matches!(&batch[1].event, SessionEvent::Error { code, .. } if code == "event_unreadable")
+        );
+        assert_eq!(batch[2].event, state(SessionState::Idle));
+    }
+
+    #[test]
+    fn oversized_events_are_cut_before_the_spool() {
+        let store = Store::in_memory().unwrap();
+        let id = SessionId::new();
+        store.put_session(&record(id)).unwrap();
+        let big = SessionEvent::Error {
+            code: "x".into(),
+            message: "y".repeat(1_200_000),
+        };
+        let stored = store.append_event(id, &big).unwrap();
+        let batch = store.next_batch(id).unwrap();
+        assert_eq!(batch[0], stored);
+        assert!(serde_json::to_vec(&batch[0].event).unwrap().len() <= crate::cap::MAX_EVENT_BYTES);
+        // An old oversized row is cut when it is read.
+        store.put_raw_event(id, 2, &serde_json::to_string(&big).unwrap());
+        store.ack(id, 1).unwrap();
+        let batch = store.next_batch(id).unwrap();
+        assert_eq!(batch.iter().map(|e| e.seq).collect::<Vec<_>>(), vec![2]);
+        let frame = consort_proto::frame::Frame::request(
+            consort_proto::frame::FrameId::generate(),
+            &consort_proto::worker_link::SessionEvents {
+                session_id: id,
+                events: batch,
+            },
+        )
+        .unwrap();
+        assert!(frame.to_text().is_ok(), "the batch fits in one frame");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_database_file_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("worker.db");
+        Store::open(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        Store::open(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "an existing database becomes private");
+    }
+
+    #[test]
+    fn processes_round_trip() {
+        let store = Store::in_memory().unwrap();
+        let record = ProcessRecord {
+            pgid: 4242,
+            program: "npx".into(),
+            started: "Thu Oct 29 02:59:29 2026".into(),
+        };
+        store.put_process(&record).unwrap();
+        assert_eq!(store.processes().unwrap(), vec![record]);
+        store.delete_process(4242).unwrap();
+        assert!(store.processes().unwrap().is_empty());
     }
 
     #[test]

@@ -286,12 +286,27 @@ pub fn option_kind(kind: &str) -> RequestOptionKind {
     }
 }
 
-/// The ACP stop reason of a `session/prompt` response, as a turn end reason.
-pub fn stop_reason(reason: Option<&str>) -> TurnEndReason {
+/// The ACP stop reason of a `session/prompt` response, as a turn end
+/// reason, with the error text for a turn that did not finish its work.
+pub fn stop_reason(reason: Option<&str>) -> (TurnEndReason, Option<String>) {
+    let failed = |text: &str| (TurnEndReason::Failed, Some(text.to_owned()));
     match reason {
-        Some("cancelled") => TurnEndReason::Interrupted,
-        Some("refusal") => TurnEndReason::Failed,
-        _ => TurnEndReason::Completed,
+        Some("end_turn") => (TurnEndReason::Completed, None),
+        Some("cancelled") => (TurnEndReason::Interrupted, None),
+        Some("refusal") => failed("The model refused to continue."),
+        Some("max_tokens") => {
+            failed("The model reached its output token limit before it finished the turn.")
+        }
+        Some("max_turn_requests") => {
+            failed("The turn reached the agent's limit of model requests before it finished.")
+        }
+        Some(other) => (
+            TurnEndReason::Failed,
+            Some(format!(
+                "The agent ended the turn with the stop reason `{other}`."
+            )),
+        ),
+        None => failed("The agent ended the turn without a stop reason."),
     }
 }
 
