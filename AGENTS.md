@@ -27,7 +27,7 @@ Dependency direction: `proto` and `theme` depend on no other Consort crate. `cli
 
 ## Rust rules
 
-- Edition 2024, Rust 1.94.1 (see `rust-toolchain.toml`). `unsafe_code` is forbidden in every crate.
+- Edition 2024, Rust 1.98.1 (see `rust-toolchain.toml`). `unsafe_code` is forbidden in every crate.
 - `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace` must pass before a change is done. Format with `cargo fmt`.
 - Library crates return typed errors (`thiserror`). Only binaries and tests use `anyhow`.
 - No `unwrap` or `expect` outside tests, except for an invariant that a comment proves.

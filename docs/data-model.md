@@ -19,7 +19,7 @@ The hub is the source of truth for everything except harness logins and raw tran
 
 ## Identifiers
 
-Every ID is a UUIDv7 string with a type prefix, for example `tsk_0192f0c4-...`. UUIDv7 sorts by creation time.
+Every ID is a UUIDv7 string with a type prefix, for example `tsk_0192f0c4-...`. UUIDv7 sorts by creation time. The UUID part is lowercase and hyphenated. Readers check the prefix. They accept any UUID version, so test fixtures can use fixed IDs.
 
 | Prefix | Entity |
 |---|---|
@@ -38,7 +38,9 @@ Every ID is a UUIDv7 string with a type prefix, for example `tsk_0192f0c4-...`. 
 | `acc_` | Harness account (unique per worker) |
 | `cli_` | Client |
 
-All timestamps are UTC, stored as Unix milliseconds.
+All timestamps are UTC, stored as Unix milliseconds. Hub tool arguments also accept RFC 3339 strings, because models write those more reliably.
+
+Turn IDs, harness request IDs and native references are opaque strings that the harness adapter chooses.
 
 ## Conversation entities
 
@@ -66,6 +68,7 @@ All timestamps are UTC, stored as Unix milliseconds.
 | `coordinator_selection` | model selection | Falls back to the Everything channel's value |
 | `task_selection` | model selection | Default for new tasks in this channel |
 | `preferred_workers` | list of worker IDs | Ordered. Placement tries these first |
+| `repo_ids` | list of repo IDs | The `channel_repos` join, in order. Part of the client view |
 | `default_isolation` | `in_place`, `worktree` or `clone` | |
 | `default_approval_mode` | `ask`, `auto_edits`, `auto` or `full_access` | |
 | `memory_enabled` | bool | |
@@ -102,6 +105,7 @@ A repo is global, so two channels can attach the same repo.
 | `in_timeline` | bool | True for a thread reply that also shows in the timeline |
 | `client_message_id` | text, optional | Idempotency key from the client. Unique per client |
 | `reply_count`, `last_reply_at` | integer, timestamp | Set on thread roots only |
+| `reactions` | list | The client view of `reactions`: `author`, `emoji`, `created_at` |
 | `edited_at`, `deleted_at` | timestamp, optional | |
 | `created_at` | timestamp | |
 
@@ -136,6 +140,7 @@ The hub has one user, so a message that is read on one client is read on all of 
 | `approval_mode` | approval mode | |
 | `start_at` | timestamp, optional | Set for Scheduled tasks |
 | `current_session_id` | ID, optional | |
+| `worker_id` | ID, optional | The worker of the current session, so the task card can show when it is offline |
 | `review_summary` | markdown, optional | The text the task gave when it went to Ready for review |
 | `resolved_at`, `archived_at` | timestamp, optional | Archive hides a task in any status |
 | `created_at`, `updated_at` | timestamp | |
@@ -214,19 +219,36 @@ The hub stores a normalized copy of what a session did. An update with the same 
 | `payload` | JSON | Command output keeps only the last 8 KiB. File changes keep paths and line counts. The full data stays on the worker |
 | `created_at`, `updated_at` | timestamp | |
 
+The payload for each kind:
+
+| Kind | Payload |
+|---|---|
+| `assistant_message`, `reasoning` | `text` |
+| `command` | `command`, `cwd`, `output` (the last 8 KiB), `output_truncated`, `exit_code`, `duration_ms` |
+| `file_change` | `changes`, each with `path`, `change` (`add`, `modify`, `delete` or `rename`), `from_path`, `lines_added`, `lines_removed` |
+| `tool_call` | `server`, `tool`, `arguments`, `output`, `is_error` |
+| `plan` | `steps`, each with `text` and `status` (`pending`, `in_progress` or `completed`) |
+| `subagent` | `agent`, `description`, `result` |
+| `web_search` | `query`, `urls` |
+| `error` | `message`, `code` |
+
 ### Approval
 
 | Field | Type | Notes |
 |---|---|---|
 | `id` | ID | |
-| `session_id`, `task_id` | ID | |
+| `channel_id` | ID | |
+| `session_id` | ID | |
+| `task_id` | ID, optional | Empty when a coordinator session asked |
 | `message_id` | ID | The approval card in the task thread |
-| `kind` | `command`, `file_change`, `tool`, `network` or `other` | |
+| `request_id` | text | The harness request. `session.respond` sends it back |
 | `summary` | text | One line for the card and the push notification |
-| `details` | JSON | Command and folder, paths, or tool name and arguments |
-| `options` | list | From the harness, for example allow once, allow for this session, deny |
+| `details` | JSON | Has a `kind`: `command`, `file_change`, `tool`, `network` or `other`. The other fields depend on the kind: command and folder, paths, or tool name and arguments |
+| `options` | list | From the harness, for example allow once, allow for this session, deny. Each has `id`, `label`, `kind` and `description` |
 | `status` | `pending`, `allowed`, `denied`, `expired` or `canceled` | |
+| `answer_option_id` | text, optional | The option that the user chose |
 | `answered_at`, `answered_by_client_id` | timestamp, ID | |
+| `created_at` | timestamp | |
 
 ### Decision
 
@@ -237,14 +259,16 @@ The hub stores a normalized copy of what a session did. An update with the same 
 | `task_id` | ID, optional | |
 | `session_id` | ID | The session that asked |
 | `message_id` | ID | The decision card |
+| `request_id` | text, optional | Set when the decision comes from a harness question. The hub then sends the answer with `session.respond` |
 | `question` | text, at most 1,200 characters | |
 | `context` | markdown, optional | |
-| `options` | 2 to 4 objects | Each has `label` (at most 40 characters) and `consequence` (at most 800 characters) |
+| `options` | 2 to 4 objects | Each has `label` (at most 40 characters) and `consequence` (at most 800 characters). An option from a harness question also has the harness's `id` |
 | `recommended_index` | integer, optional | |
 | `allow_free_text` | bool | |
 | `status` | `pending`, `answered`, `expired` or `canceled` | |
 | `answer` | object, optional | `option_index`, `text` or both |
 | `answered_at` | timestamp, optional | |
+| `created_at` | timestamp | |
 
 ### Routine
 
@@ -253,9 +277,9 @@ The hub stores a normalized copy of what a session did. An update with the same 
 | `id` | ID | |
 | `channel_id` | ID | |
 | `name` | text | |
-| `schedule` | object | One of: `cron` with an expression and a time zone, `interval` in seconds (at least 60), or `once` with a timestamp |
+| `schedule` | object | Has a `kind`. One of: `cron` with `expression` (five fields) and `time_zone`, `interval` with `seconds` (at least 60), or `once` with `at` |
 | `prompt` | markdown | |
-| `action` | object | `coordinator_turn`, or `start_task` with a title, a model selection and a placement request |
+| `action` | object | Has a `kind`: `coordinator_turn`, or `start_task` with `title`, `model_selection` and `placement` |
 | `enabled` | bool | |
 | `next_run_at`, `last_run_at` | timestamp | |
 | `last_run_status` | `ok` or `error` | |
@@ -317,7 +341,8 @@ An artifact is a channel file with a `task_id`. Tasks publish artifacts under `a
 | `arch` | text | |
 | `public_key` | Ed25519 public key | |
 | `version`, `protocol_version` | text, integer | |
-| `labels` | list of text | For example `gpu` or `windows-test` |
+| `labels` | list of text | Labels that the user set in a client, for example `gpu` or `windows-test`. Placement matches a label from this list or from the inventory, which has the labels from `worker.toml` |
+| `paused` | bool | Set by the user. Placement skips a paused worker. Running sessions continue |
 | `state` | `online` or `offline` | |
 | `last_seen_at` | timestamp | |
 | `inventory` | JSON | The newest inventory snapshot. See [protocol.md](protocol.md#inventory) |
@@ -333,7 +358,8 @@ The worker owns the account configuration and the login. The hub stores only wha
 | `harness` | text | |
 | `label` | text | For example "Claude Personal". Two workers with the same label share one login |
 | `harness_version` | text | |
-| `auth_state` | `signed_in`, `signed_out`, `error` or `unknown` | With a detail such as the plan name |
+| `auth_state` | `signed_in`, `signed_out`, `error` or `unknown` | |
+| `auth_detail` | text, optional | A detail such as the plan name, or the command to sign in |
 | `models` | list | Each model has an ID, a name and option descriptors (select or boolean) |
 | `capabilities` | object | `steer`, `resume`, `fork`, `images`, `plan_mode`, `usage`, `mcp_http` and the approval modes it supports |
 | `enabled` | bool | |
@@ -361,7 +387,7 @@ A model selection is a value, not a row: `account_label`, `model` and `options`.
 | `name` | text | |
 | `kind` | `desktop`, `ios` or `android` | |
 | `public_key` | Ed25519 public key | |
-| `push` | object, optional | Provider (`apns`, `fcm` or `expo`) and token |
+| `push` | object, optional | Provider (`apns`, `fcm` or `expo`) and token. The client view has only `push_provider`. The token stays on the hub |
 | `paired_at`, `last_seen_at`, `revoked_at` | timestamp | |
 
 ## Feed
@@ -373,10 +399,10 @@ Every write on the hub adds one feed entry in the same database transaction. Cli
 | `seq` | integer | Increases by one for each entry, across the whole hub |
 | `at` | timestamp | |
 | `channel_id` | ID, optional | Lets a client filter by channel |
-| `entity` | text | `channel`, `group`, `message`, `task`, `session_item`, `approval`, `decision`, `memory_note`, `channel_file`, `routine` or `worker` |
-| `entity_id` | text | |
+| `entity` | text | `channel`, `group`, `repo`, `message`, `read_marker`, `task`, `session_item`, `approval`, `decision`, `memory_note`, `channel_file`, `routine`, `worker` or `client` |
+| `entity_id` | text | The entity's ID. A memory note uses `<scope>:<path>`, a channel file `<channel-id>:<path>`, a read marker `<channel-id>` or `<channel-id>:<thread-root-id>`, and a session item `<session-id>:<item-id>` |
 | `op` | `upsert` or `delete` | |
-| `payload` | JSON | The full client view of the entity after the write |
+| `payload` | JSON | The full client view of the entity after the write. `null` for `delete` |
 
 The hub merges updates to the same session item that arrive within 250 ms into one feed entry. The hub deletes feed entries after 30 days. A client whose last `seq` is older than the oldest kept entry gets a `resync_required` error and reloads its snapshots.
 

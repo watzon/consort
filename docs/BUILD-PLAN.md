@@ -19,10 +19,10 @@ The first build, started 2026-10-29 while the user was away. It builds the deskt
 | Phase | Work | Owner | Status |
 |---|---|---|---|
 | 0 | Repo, docs, `AGENTS.md`, this plan, decisions log | Lead | Done |
-| A | `consort-proto`: the full wire contract | Agent (Opus) | Started |
+| A | `consort-proto`: the full wire contract | Agent (Opus) | Done |
 | A | `consort-theme`, `consort-desktop` UI on mock data, then `consort-client` | Agent (Opus) | Started |
-| B | `consort-hub` | Agent (Sonnet) | After proto |
-| B | `consort-harness`, `consort-worker`, `consort-testkit`, `consort-cli` | Agent (Opus) | After proto |
+| B | `consort-hub` | Agent (Sonnet) | Started |
+| B | `consort-harness`, `consort-worker`, `consort-testkit`, `consort-cli` | Agent (Opus) | Started |
 | C | End-to-end on macOS, then Windows on `bigboi` | Lead | |
 | D | Up to three review cycles with independent reviewer agents | Lead | |
 

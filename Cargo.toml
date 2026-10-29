@@ -6,7 +6,7 @@ members = ["crates/*"]
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-rust-version = "1.94"
+rust-version = "1.98"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
@@ -25,6 +25,22 @@ consort-worker = { path = "crates/consort-worker" }
 consort-hub = { path = "crates/consort-hub" }
 consort-client = { path = "crates/consort-client" }
 consort-testkit = { path = "crates/consort-testkit" }
+
+# Wire contract (added by the proto agent)
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+uuid = { version = "1.29.0", features = ["v7", "serde"] }
+thiserror = "2.0.21"
+schemars = "=1.2.3"
+
+# Desktop app, theme and client (added by the desktop agent)
+gpui-kit = "=0.8.1"
+directories = "6"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
+tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+url = "2"
 
 [profile.dev.package."*"]
 opt-level = 1
