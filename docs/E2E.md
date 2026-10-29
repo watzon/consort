@@ -63,3 +63,24 @@ The lead ran the same setup again at commit `ccebf5e`, on the data from the firs
 - Archived tasks cannot be listed or brought back from the app, because the hub has no request for that yet.
 - A channel's allowed local MCP servers (new in review cycle 3) can be set through `channel.update`, but the app has no field for it yet.
 - In an approval card, the "Folder" label lines up with the second line of a long wrapped path.
+
+## Accounts, sign-in, managed tools and tags, 2026-10-29
+
+The lead ran `scripts/dev.sh` on a new dev folder (hub, worker and app on the Mac) at commit `5cd1f7c`, then fixed what the run found (commit `24b145f`).
+
+Checked in the real app:
+
+- The worker starts with no accounts. It does not pick up the logins that already exist on the Mac.
+- Detected tags: `macos`, `arm64`, `ram-48gb`, `cpu-18`, `gpu-apple`. The user tag `work` saves on the hub.
+- Add account step 1 lists the four providers with logos and the live ACP registry with its icons.
+- Creating "Claude Work" made `profiles/<name>/` in the dev Consort home. The worker then installed Node 24.22.2, Claude Code 2.1.308 (signature and SHA-256 checked) and claude-agent-acp 0.99.0 on its own. The tool rows went from "Installing" to "Up to date".
+- The worker started the real `claude auth login --claudeai` for the profile. The hub stored `needs_code` with the real sign-in URL, and the app showed "Open sign-in page", "Copy link" and the code field. Cancel stopped the login process and the sign-in became `cancelled`.
+- A new channel with the tag `work` showed "1 worker matches" and the tag chip in its header. A message there waited with a clear notice, because no account was signed in.
+
+Not checked live: a completed sign-in (it needs the user's own Claude or ChatGPT login) and a model turn with a signed-in profile account. The Codex device code flow was checked by the worker agent with the real `codex` 0.165.0 up to the code, not through the app.
+
+Found and fixed: the ten issues in DECISIONS rows 306 to 317 (Escape closing Settings, tag suggestions, `aarch64` label, select-all fallback, account row text, wait notice wording, "Default account", "On workers:" suggestions, sign-ins in the snapshot, the coordinator moving off a worker without the channel tag) and the `reopened` race in the hub that made `reopened_keeps_a_coordinator_turn_that_still_waits_in_the_queue` fail on Windows and under load.
+
+Windows: the workspace builds on `bigboi`. Two signature tests failed only because Git checked out the signed fixtures with CRLF line ends. `.gitattributes` now keeps them byte for byte.
+
+Note for computer-use testing: when the driver returns focus to another app after each click, macOS stops drawing the hidden Consort window, so screenshots lag one step. Keep the window in front during such runs.
