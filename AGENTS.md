@@ -25,6 +25,10 @@ If the code and a doc disagree, fix the one that is wrong in the same change, an
 
 Dependency direction: `proto` and `theme` depend on no other Consort crate. `client` never depends on GPUI. `desktop` never talks to the network; it calls `client`. `hub` never runs a model; it asks a worker.
 
+## Run the app
+
+`scripts/dev.sh` builds the debug binaries, starts a dev hub with its worker, and starts the desktop app. Quitting the app stops the hub. The first run prints a setup code to type in the app. The comment at the top of the script lists its settings. `scripts/dev.sh --mock` starts only the app, with the designs' content and no hub.
+
 ## Rust rules
 
 - Edition 2024, Rust 1.98.1 (see `rust-toolchain.toml`). `unsafe_code` is forbidden in every crate.
