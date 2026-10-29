@@ -9,7 +9,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use consort_harness::approval::effective_mode;
 use consort_harness::{
-    EventReceiver, HarnessSession, McpServerSpec, SIGNED_OUT_ERROR_CODE, SessionSpec, StdioCommand,
+    AccountConfig, EventReceiver, HarnessError, HarnessSession, McpServerSpec,
+    SIGNED_OUT_ERROR_CODE, SessionSpec, StdioCommand, sign_in_hint,
 };
 use consort_proto::error::{ErrorBody, ErrorCode};
 use consort_proto::frame::FrameId;
@@ -407,6 +408,52 @@ fn harness_body(err: consort_harness::HarnessError) -> ErrorBody {
     WorkerError::Harness(err).to_error_body()
 }
 
+/// Why [`Runtime::open`] failed.
+struct OpenFailure {
+    /// The error for the hub.
+    body: ErrorBody,
+    /// The harness failed in a way that a stop signal can cause, for
+    /// example because its process exited. A refusal from the worker, or a
+    /// sign-in answer from the harness, is not such a failure.
+    harness_failed: bool,
+}
+
+impl From<ErrorBody> for OpenFailure {
+    fn from(body: ErrorBody) -> Self {
+        Self {
+            body,
+            harness_failed: false,
+        }
+    }
+}
+
+/// Why a `session.start` did not finish.
+enum StartFailure {
+    /// The start failed. The worker stores the error, and the session
+    /// ends.
+    Failed(ErrorBody),
+    /// The worker stops, and the harness stopped with it. The worker stores
+    /// no result, and the session stays `starting` with no harness
+    /// reference. So the next run does not resume it, and the hub sends the
+    /// start again after the restart.
+    Stopped(ErrorBody),
+}
+
+impl From<ErrorBody> for StartFailure {
+    fn from(body: ErrorBody) -> Self {
+        Self::Failed(body)
+    }
+}
+
+/// What the actor does with the result of a command.
+enum Outcome {
+    /// Store the result and send it to the hub.
+    Finish(Result<Value, ErrorBody>),
+    /// Store nothing, so the hub can send the command again (see
+    /// [`Core::abandon_command`]).
+    Abandon(ErrorBody),
+}
+
 impl Runtime {
     fn harness(&mut self) -> Result<&mut Box<dyn HarnessSession>, ErrorBody> {
         self.harness
@@ -420,7 +467,7 @@ impl Runtime {
         start: &SessionStart,
         workspace_path: &std::path::Path,
         resume: Option<consort_proto::ids::NativeRef>,
-    ) -> Result<(), ErrorBody> {
+    ) -> Result<(), OpenFailure> {
         let core = self.core.clone();
         let config = core.config_snapshot();
         let account = config
@@ -441,7 +488,8 @@ impl Runtime {
                     "the account \"{}\" is turned off on this worker",
                     account.label
                 ),
-            ));
+            )
+            .into());
         }
         let adapter = core
             .harnesses
@@ -522,7 +570,8 @@ impl Runtime {
                 format!("could not create {}", runtime_dir.display()),
                 err,
             )
-            .to_error_body());
+            .to_error_body()
+            .into());
         }
         let watcher = consort_harness::process::WatcherHandle(Arc::new(GroupLog {
             core: Arc::downgrade(&core),
@@ -545,7 +594,7 @@ impl Runtime {
             Ok(s) => s,
             Err(err) => {
                 endpoint.stop().await;
-                return Err(harness_body(err));
+                return Err(self.open_failed(&account, err));
             }
         };
         self.capabilities = session.capabilities().clone();
@@ -589,7 +638,33 @@ impl Runtime {
         Ok(())
     }
 
-    async fn start(&mut self, start: SessionStart) -> Result<Value, ErrorBody> {
+    /// What a failed harness open tells the hub. When the harness says
+    /// that the account is signed out, the worker marks the account signed
+    /// out at once, so placement stops choosing it before the next probe.
+    /// The session also gets a `signed_out` error event with the step to
+    /// sign in, as after a failed turn.
+    fn open_failed(&self, account: &AccountConfig, err: HarnessError) -> OpenFailure {
+        match err {
+            HarnessError::SignedOut(reason) => {
+                let hint = sign_in_hint(account.harness, &reason);
+                self.core.mark_signed_out(account.id, &hint);
+                self.core.record_event(
+                    self.session_id,
+                    &SessionEvent::Error {
+                        code: SIGNED_OUT_ERROR_CODE.to_owned(),
+                        message: hint.clone(),
+                    },
+                );
+                harness_body(HarnessError::SignedOut(hint)).into()
+            }
+            other => OpenFailure {
+                body: harness_body(other),
+                harness_failed: true,
+            },
+        }
+    }
+
+    async fn start(&mut self, start: SessionStart) -> Result<Value, StartFailure> {
         let core = self.core.clone();
         let config = core.config_snapshot();
         let key = start
@@ -638,14 +713,15 @@ impl Runtime {
             );
         }
         let workspace_path = prepared.path.to_string_lossy().into_owned();
+        let starting = SessionRecord {
+            start: start.clone(),
+            native_ref: None,
+            workspace_path: workspace_path.clone(),
+            state: SessionState::Starting,
+            last_seq: 0,
+        };
         core.store
-            .put_session(&SessionRecord {
-                start: start.clone(),
-                native_ref: None,
-                workspace_path: workspace_path.clone(),
-                state: SessionState::Starting,
-                last_seq: 0,
-            })
+            .put_session(&starting)
             .map_err(|e| e.to_error_body())?;
         core.record_event(
             self.session_id,
@@ -654,7 +730,14 @@ impl Runtime {
             },
         );
         let resume = start.resume.as_ref().map(|r| r.native_ref.clone());
-        if let Err(err) = self.open(&start, &prepared.path, resume).await {
+        if let Err(failure) = self.open(&start, &prepared.path, resume).await {
+            // The same stop signal can reach the harness a moment before
+            // the worker, so wait for the flag as the pump does.
+            if failure.harness_failed && core.stops_within(EXIT_HOLD).await {
+                tracing::info!(session = %self.session_id, "the harness stopped with the worker during the start; the hub sends the start again after the restart");
+                return Err(StartFailure::Stopped(failure.body));
+            }
+            let err = failure.body;
             let _ = core
                 .store
                 .set_session_state(self.session_id, SessionState::Lost);
@@ -671,7 +754,7 @@ impl Runtime {
                     state: SessionState::Lost,
                 },
             );
-            return Err(err);
+            return Err(err.into());
         }
         let native_ref = self.harness.as_ref().and_then(|h| h.native_ref());
         if let Some(turn) = start.turn {
@@ -682,17 +765,28 @@ impl Runtime {
             if let Err(err) = result {
                 // The session did not start, so nothing of it may keep
                 // running: not the harness and not the MCP endpoint.
-                self.stop_recording();
+                self.stop_recording().await;
                 self.close_harness().await;
+                if core.stops_within(EXIT_HOLD).await {
+                    // The harness has a reference now. Forget it, so the
+                    // next run does not resume a session that the hub never
+                    // got. The start that the hub sends again opens a new
+                    // harness session.
+                    if let Err(store_err) = core.store.put_session(&starting) {
+                        tracing::warn!(session = %self.session_id, error = %store_err, "could not reset a session start that the stop cut short");
+                    }
+                    tracing::info!(session = %self.session_id, "the harness stopped with the worker in the first turn; the hub sends the start again after the restart");
+                    return Err(StartFailure::Stopped(err));
+                }
                 self.lost("start_failed", &err.message);
-                return Err(err);
+                return Err(err.into());
             }
         }
         serde_json::to_value(SessionStartResult {
             workspace_path,
             native_ref,
         })
-        .map_err(|_| ErrorBody::internal())
+        .map_err(|_| ErrorBody::internal().into())
     }
 
     /// Opens the harness of a session again after the worker restarted.
@@ -710,8 +804,8 @@ impl Runtime {
         self.core
             .record_event(self.session_id, &SessionEvent::Reopened);
         let path = std::path::PathBuf::from(&record.workspace_path);
-        if let Err(err) = self.open(&record.start, &path, Some(native)).await {
-            self.lost("resume_failed", &err.message);
+        if let Err(failure) = self.open(&record.start, &path, Some(native)).await {
+            self.lost("resume_failed", &failure.body.message);
             return false;
         }
         true
@@ -719,9 +813,13 @@ impl Runtime {
 
     /// Stops recording harness events, so the `ended` state that a harness
     /// reports when it closes does not reach the hub.
-    fn stop_recording(&mut self) {
+    ///
+    /// It waits until the pump has stopped, so no event that the pump
+    /// still holds changes the session record after this.
+    async fn stop_recording(&mut self) {
         if let Some(pump) = self.pump.take() {
             pump.abort();
+            let _ = pump.await;
         }
     }
 
@@ -762,16 +860,30 @@ impl Runtime {
         }
     }
 
-    /// Runs one command. Returns the result and whether the session ends.
-    /// A session that fails to start ends, so its ID is free again.
-    async fn execute(&mut self, command: HubToWorker) -> (Result<Value, ErrorBody>, bool) {
+    /// Runs one command. Returns what to do with the result, and whether
+    /// the session ends. A session that fails to start ends, so its ID is
+    /// free again.
+    async fn execute(&mut self, command: HubToWorker) -> (Outcome, bool) {
+        match command {
+            HubToWorker::SessionStart(start) => match self.start(start).await {
+                Ok(value) => (Outcome::Finish(Ok(value)), false),
+                Err(StartFailure::Failed(err)) => (Outcome::Finish(Err(err)), true),
+                Err(StartFailure::Stopped(err)) => (Outcome::Abandon(err), true),
+            },
+            other => {
+                let (result, ended) = self.execute_session_command(other).await;
+                (Outcome::Finish(result), ended)
+            }
+        }
+    }
+
+    /// Runs one command for an open session.
+    async fn execute_session_command(
+        &mut self,
+        command: HubToWorker,
+    ) -> (Result<Value, ErrorBody>, bool) {
         let empty = || Ok(json!({}));
         match command {
-            HubToWorker::SessionStart(start) => {
-                let result = self.start(start).await;
-                let ended = result.is_err();
-                (result, ended)
-            }
             HubToWorker::SessionTurn(turn) => {
                 let result = match self.harness() {
                     Ok(h) => h.turn(turn.turn).await.map_err(harness_body),
@@ -811,9 +923,10 @@ impl Runtime {
                     .set_session_state(self.session_id, SessionState::Ended);
                 (empty(), true)
             }
-            // `run_session` starts a steer with `begin_steer`, and `Core`
-            // runs the other commands itself.
-            HubToWorker::SessionSteer(_)
+            // `execute` runs `session.start`, `run_session` starts a steer
+            // with `begin_steer`, and `Core` runs the other commands itself.
+            HubToWorker::SessionStart(_)
+            | HubToWorker::SessionSteer(_)
             | HubToWorker::WorkspaceRelease(_)
             | HubToWorker::ItemDetail(_)
             | HubToWorker::InventoryRefresh(_) => (Err(ErrorBody::internal()), false),
@@ -886,8 +999,11 @@ pub(crate) async fn run_session(
                     runtime.begin_steer(id, steer);
                     continue;
                 }
-                let (result, ended) = runtime.execute(*command).await;
-                core.finish_command(&id, result);
+                let (outcome, ended) = runtime.execute(*command).await;
+                match outcome {
+                    Outcome::Finish(result) => core.finish_command(&id, result),
+                    Outcome::Abandon(error) => core.abandon_command(&id, error),
+                }
                 if ended {
                     break;
                 }
@@ -968,14 +1084,14 @@ pub(crate) async fn run_session(
                 // no `ended` from the close follows. Stop the MCP endpoint,
                 // so its token works no more.
                 tracing::info!(session = %session_id, "the harness lost the session");
-                runtime.stop_recording();
+                runtime.stop_recording().await;
                 runtime.close_harness().await;
                 break;
             }
             Job::Shutdown => {
                 // Stop recording first: the harness reports `ended` when it
                 // closes, but the session stays open for the next run.
-                runtime.stop_recording();
+                runtime.stop_recording().await;
                 runtime.close_harness().await;
                 break;
             }

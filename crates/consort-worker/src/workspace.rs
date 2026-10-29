@@ -62,10 +62,30 @@ async fn git_with(
     env: &[(&str, &str)],
     timeout: Duration,
 ) -> Result<Vec<u8>, WorkerError> {
+    git_with_input(args, cwd, env, timeout, None).await
+}
+
+/// Runs `git` with `input` on its stdin, or with no stdin, and returns its
+/// stdout as bytes. `env` adds variables.
+async fn git_with_input(
+    args: &[&str],
+    cwd: Option<&Path>,
+    env: &[(&str, &str)],
+    timeout: Duration,
+    input: Option<&[u8]>,
+) -> Result<Vec<u8>, WorkerError> {
+    use tokio::io::AsyncWriteExt;
+
     let mut cmd = tokio::process::Command::new("git");
     cmd.args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(std::process::Stdio::null())
+        .stdin(if input.is_some() {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        })
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
     for (key, value) in env {
         cmd.env(key, value);
@@ -73,8 +93,22 @@ async fn git_with(
     if let Some(cwd) = cwd {
         cmd.current_dir(cwd);
     }
-    // On a time-out the output future drops, and `kill_on_drop` kills git.
-    let output = tokio::time::timeout(timeout, cmd.output())
+    let run = async {
+        let mut child = cmd.spawn()?;
+        let stdin = child.stdin.take();
+        // Write the input while git runs, so a full pipe cannot block both
+        // sides. A write error means that git stopped early, and its exit
+        // status says why.
+        let write = async {
+            if let (Some(mut stdin), Some(input)) = (stdin, input) {
+                let _ = stdin.write_all(input).await;
+            }
+        };
+        let ((), output) = tokio::join!(write, child.wait_with_output());
+        output
+    };
+    // On a time-out the future drops, and `kill_on_drop` kills git.
+    let output = tokio::time::timeout(timeout, run)
         .await
         .map_err(|_| {
             WorkerError::Workspace(format!(
@@ -289,25 +323,17 @@ async fn carry_changes(checkout: &Path, dest: &Path, deadline: Instant) -> Resul
     )
     .await?;
     if !diff.iter().all(u8::is_ascii_whitespace) {
-        let patch = dest.join(".consort-carry.patch");
-        tokio::fs::write(&patch, &diff)
-            .await
-            .map_err(|e| WorkerError::io("could not write the carry patch", e))?;
-        let result = git_until(
-            &[
-                "apply",
-                "--binary",
-                "--whitespace=nowarn",
-                ".consort-carry.patch",
-            ],
+        // The patch goes to `git apply` on stdin, not through a file. A
+        // file in the worktree could be a link that the repo commits, and
+        // then the worker would write the patch somewhere else.
+        git_with_input(
+            &["apply", "--binary", "--whitespace=nowarn", "-"],
             Some(dest),
             &[],
-            GIT_TIMEOUT,
-            deadline,
+            step_limit(deadline, GIT_TIMEOUT)?,
+            Some(&diff),
         )
-        .await;
-        let _ = tokio::fs::remove_file(&patch).await;
-        result?;
+        .await?;
     }
     let untracked = git_until(
         &["ls-files", "--others", "--exclude-standard", "-z"],
@@ -1002,6 +1028,44 @@ mod tests {
         assert_eq!(
             std::fs::read(carried.path.join("raw.bin")).unwrap(),
             vec![0xff, 0xfe, 0x00, 0x80]
+        );
+    }
+
+    /// A repo can commit a link with any name. The carry must not write
+    /// through it to a file outside the worktree.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_carry_does_not_write_through_a_link_in_the_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = repo_with_changes(dir.path()).await;
+        let outside = dir.path().join("outside.txt");
+        std::fs::write(&outside, "keep\n").unwrap();
+        for name in [".consort-carry.patch", "carry.patch"] {
+            std::os::unix::fs::symlink(&outside, repo.join(name)).unwrap();
+        }
+        git(&["add", ".consort-carry.patch", "carry.patch"], Some(&repo))
+            .await
+            .unwrap();
+        git(&["commit", "-q", "-m", "links"], Some(&repo))
+            .await
+            .unwrap();
+        let carried = prepare(
+            &dir.path().join("workspaces"),
+            "tsk_s",
+            None,
+            &spec(&repo, Isolation::Worktree, true),
+            &PolicyConfig::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "keep\n");
+        assert_eq!(
+            std::fs::read_to_string(carried.path.join("a.txt")).unwrap(),
+            "one\ntwo\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(carried.path.join("new/b.txt")).unwrap(),
+            "untracked\n"
         );
     }
 

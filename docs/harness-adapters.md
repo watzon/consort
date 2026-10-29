@@ -76,6 +76,8 @@ The user configures harness accounts in `worker.toml` (see [data-model.md](data-
 
 The worker never reads the private files. It only reports `auth_state`, which each adapter gets from the harness itself, for example `account/read` in Codex.
 
+A session can find out that the login is gone before the next probe. When a turn fails for that reason, the adapter sends a `signed_out` error event. When the open of a session fails for that reason (`auth_required` in ACP), the adapter returns `HarnessError::SignedOut`, and the worker sends the same event. In both cases the event has the step to sign in, and the worker marks the account signed out in its inventory at once, so placement stops choosing it.
+
 The user signs in on the worker machine, with the harness's own command. The client shows the sign-in state and the command to run. Anthropic's terms require the sign-in to go through Anthropic's own flow, so the app never asks for a Claude credential.
 
 ## How each path gives a session the hub tools
@@ -94,14 +96,16 @@ The worker also adds the local MCP servers that the channel may use, with the sa
 
 The effective approval mode of a session is the lower of the requested mode and the worker policy's `max_approval_mode`. Each adapter maps the four modes onto its harness:
 
-| Mode | Claude (ACP) | Codex | Pi |
-|---|---|---|---|
-| Ask | `default` permission mode | Approval policy `untrusted`, sandbox `read-only` | Not supported in v1 |
-| Auto edits | `acceptEdits` | `on-request`, sandbox `workspace-write` | Not supported in v1 |
-| Auto | `acceptEdits` (channel allowed tools are not built yet) | `never`, sandbox `workspace-write` | Default behavior |
-| Full access | `bypassPermissions` | `never`, sandbox `danger-full-access` | Default behavior |
+| Mode | Claude (ACP) | Codex | OpenCode | Gemini CLI | Pi |
+|---|---|---|---|---|---|
+| Ask | `default` permission mode | Approval policy `untrusted`, sandbox `read-only` | `edit`, `bash` and `webfetch` are `ask` | `default` | Not supported in v1 |
+| Auto edits | `acceptEdits` | `on-request`, sandbox `workspace-write` | `edit` is `allow`, `bash` and `webfetch` are `ask` | `auto_edit` | Not supported in v1 |
+| Auto | `acceptEdits` (channel allowed tools are not built yet) | `never`, sandbox `workspace-write` | The same as Auto edits | `auto_edit` | Not supported in v1 |
+| Full access | `bypassPermissions` | `never`, sandbox `danger-full-access` | `edit`, `bash` and `webfetch` are `allow` | `yolo` | Default behavior |
 
-The adapter tests check these values. OpenCode gets its mode in `OPENCODE_CONFIG_CONTENT` as a `permission` setting for `edit`, `bash` and `webfetch` (`ask` or `allow`). Gemini CLI gets `--approval-mode` (`default`, `auto_edit` or `yolo`) and supports Ask, Auto edits and Auto. Other ACP agents report Ask only.
+The adapter tests check these values, and `tests/harness_modes.rs` in `consort-harness` checks the next rule for every adapter. OpenCode gets its mode in `OPENCODE_CONFIG_CONTENT` as a `permission` setting. Gemini CLI gets `--approval-mode`. Other ACP agents report Ask only.
+
+Full access is the only mode in which a harness runs commands with no prompt and no sandbox. Codex Auto runs commands with no prompt, but in its `workspace-write` sandbox. OpenCode, Gemini CLI and Pi have no sandbox, so a mode with no prompt is Full access for them. So in Auto, OpenCode and Gemini CLI ask before each command and each fetch, like Claude, and Pi runs only in Full access. A new worker caps sessions at Auto, so a Full access session needs `max_approval_mode = "full_access"` in `worker.toml`.
 
 A repo's own configuration can raise these limits, so below Full access the adapter keeps it out where the harness allows that:
 
@@ -122,6 +126,12 @@ If `allow_shell` is false in the worker policy, the worker caps the mode at Auto
 | OpenCode | `bash` is `deny` in `OPENCODE_CONFIG_CONTENT` |
 | Gemini CLI | Not done yet. Only the worker's denial of each command approval applies |
 
+### What an approval shows
+
+Every command approval names the folder that the command runs in (`cwd` of the `command` details). When the harness names no folder, the adapter gives the session's workspace, where the harness starts its commands. Claude Code's `Bash` names no folder. OpenCode 2.2.0 names it `workdir` and Gemini CLI 0.46.0 names it `dir_path`, and a relative folder is in the workspace.
+
+Codex asks for network access with a command approval that has `networkApprovalContext` (a host and a protocol). The adapter keeps the `command` details, with the command and its folder, and the summary names the host, for example "Run `git fetch` with network access to github.com". So the user sees which command uses the host. The `network` details have only a `target`, so they would hide the command. A web fetch of an ACP agent (tool kind `fetch`) still has `network` details with the URL.
+
 ### Claude Code and the repo's settings
 
 `claude-agent-acp` loads the user, project and local settings of Claude Code. A repo's `.claude/settings.json` can allow tools, set the permission mode, add hooks and start MCP servers, all without an approval. So below Full access, the adapter sends `settingSources: ["user"]` and `allowDangerouslySkipPermissions: false` in `_meta.claudeCode.options`. Only the user's own settings in the account's home then load, and nothing can turn on `bypassPermissions`.
@@ -137,7 +147,7 @@ The session must stay at or below the Claude mode of its approval mode. The mode
 - The adapter removes each permission option that would set a higher mode. These are the options of `claude-agent-acp` 0.99.0 to leave plan mode, such as "Yes, and use auto mode" and "Yes, auto-accept edits" (both `allow_always`, so a client's "Allow for task" would pick them). For a file change, `allow-with-updates` can set `acceptEdits` for the session, so it counts as `acceptEdits`. A request always keeps an allow-once and a deny option.
 - When the agent reports a higher mode in a `current_mode_update` or a `config_option_update`, the adapter sets the mode back at once and sends a `mode_reset` error event. If the agent refuses, does not answer in 30 s, or still reports the higher mode, the adapter stops the agent and reports the session as `lost` with a `mode_reset_failed` error event.
 
-Pi has no built-in approval prompts, so a Pi session can only run in Auto or Full access. A later Pi extension can add a gate that asks the worker before each tool call, as T3 Code does.
+Pi has no built-in approval prompts and no sandbox, so a Pi session can only run in Full access. A later Pi extension can add a gate that asks the worker before each tool call, as T3 Code does. Then Pi can support the lower modes.
 
 ## Adapter order
 
@@ -187,6 +197,8 @@ On Unix each harness process leads its own process group. The worker records eac
 Only one worker can use a worker folder. A running worker holds an exclusive lock on `worker.lock` in the folder (`flock` on Unix, `LockFileEx` on Windows), and a second worker refuses to start before it touches the recorded groups.
 
 When the worker stops, it turns on a stopping flag first, then closes each harness and keeps the sessions for the next run. A harness that exits while the flag is on does not make its session lost: the worker drops its `harness_exited`, `harness_unresponsive` and `lost` events. The first of those events waits up to 1 s for the flag, because the same stop signal can reach the harness a moment before the worker. A session start that the stop cut short (still `starting`, with no harness reference) is not resumed. The hub has no result for that `session.start`, so it sends it again, and the worker runs it then.
+
+The flag also covers a `session.start` whose harness fails in the open or in the first turn. The worker waits up to 1 s for the flag here too. When the flag is on, the worker does not mark the session lost and stores no result. If the harness opened, the worker forgets its harness reference, so the session stays `starting` and the next run does not resume it. While the flag is on, the worker also sends no answer to a command that did not run: the hub would take the error as the result. The link closes, and the hub sends the command again after the restart.
 
 So that a stop signal reaches only the worker:
 

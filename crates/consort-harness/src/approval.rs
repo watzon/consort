@@ -96,11 +96,15 @@ pub const CLAUDE_SHELL_TOOLS: [&str; 3] = ["Bash", "PowerShell", "Monitor"];
 pub const CODEX_SHELL_FEATURES: [&str; 2] = ["shell_tool", "unified_exec"];
 
 /// The Gemini CLI `--approval-mode` value.
+///
+/// Gemini CLI has no sandbox and no mode between `auto_edit` and `yolo`.
+/// `yolo` runs every command and every fetch with no prompt, so only Full
+/// access gets it. Auto asks before commands, like Auto edits.
 pub fn gemini_mode(mode: ApprovalMode) -> &'static str {
     match mode {
         ApprovalMode::Ask => "default",
-        ApprovalMode::AutoEdits => "auto_edit",
-        ApprovalMode::Auto | ApprovalMode::FullAccess => "yolo",
+        ApprovalMode::AutoEdits | ApprovalMode::Auto => "auto_edit",
+        ApprovalMode::FullAccess => "yolo",
     }
 }
 
@@ -116,11 +120,15 @@ pub const OPENCODE_NO_PROJECT_CONFIG: [&str; 2] = [
 
 /// The OpenCode `permission` configuration, passed in
 /// `OPENCODE_CONFIG_CONTENT`. With `allow_shell` off, `bash` is `deny`.
+///
+/// OpenCode has no sandbox, so `bash` and `webfetch` on `allow` let every
+/// command and every fetch run with no prompt. Only Full access gets that.
+/// Auto asks before commands and fetches, like Auto edits.
 pub fn opencode_permission(mode: ApprovalMode, allow_shell: bool) -> Value {
     let (edit, bash, webfetch) = match mode {
         ApprovalMode::Ask => ("ask", "ask", "ask"),
-        ApprovalMode::AutoEdits => ("allow", "ask", "ask"),
-        ApprovalMode::Auto | ApprovalMode::FullAccess => ("allow", "allow", "allow"),
+        ApprovalMode::AutoEdits | ApprovalMode::Auto => ("allow", "ask", "ask"),
+        ApprovalMode::FullAccess => ("allow", "allow", "allow"),
     };
     let bash = if allow_shell { bash } else { "deny" };
     json!({ "permission": { "edit": edit, "bash": bash, "webfetch": webfetch } })
@@ -141,6 +149,16 @@ mod tests {
             ("never", "danger-full-access")
         );
         assert_eq!(gemini_mode(ApprovalMode::AutoEdits), "auto_edit");
+        assert_eq!(gemini_mode(ApprovalMode::Auto), "auto_edit");
+        assert_eq!(gemini_mode(ApprovalMode::FullAccess), "yolo");
+        let auto = opencode_permission(ApprovalMode::Auto, true);
+        assert_eq!(auto["permission"]["edit"], "allow");
+        assert_eq!(auto["permission"]["bash"], "ask");
+        assert_eq!(auto["permission"]["webfetch"], "ask");
+        assert_eq!(
+            opencode_permission(ApprovalMode::FullAccess, true)["permission"]["bash"],
+            "allow"
+        );
         assert_eq!(
             opencode_permission(ApprovalMode::AutoEdits, true)["permission"]["bash"],
             "ask"

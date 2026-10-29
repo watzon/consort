@@ -205,12 +205,10 @@ pub fn static_capabilities(kind: HarnessKind) -> Capabilities {
             approval_modes: ApprovalMode::ALL.to_vec(),
             ..Capabilities::default()
         },
+        // Auto is `auto_edit`, the same as Auto edits, and Full access is
+        // `yolo` (see `gemini_mode`).
         HarnessKind::GeminiCli => Capabilities {
-            approval_modes: vec![
-                ApprovalMode::Ask,
-                ApprovalMode::AutoEdits,
-                ApprovalMode::Auto,
-            ],
+            approval_modes: ApprovalMode::ALL.to_vec(),
             ..Capabilities::default()
         },
         _ => Capabilities {
@@ -1022,7 +1020,7 @@ impl Actor {
         })
         .await;
 
-        let mut mapper = AcpMapper::new(self.spec.session_id);
+        let mut mapper = AcpMapper::new(self.spec.session_id).with_workspace(&self.spec.workspace);
         let mut preamble = (self.kind != HarnessKind::ClaudeCode
             && self.spec.resume.is_none()
             && !self.spec.system_prompt_append.is_empty())

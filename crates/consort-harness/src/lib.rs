@@ -25,7 +25,7 @@ pub mod process;
 pub mod record;
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -313,6 +313,23 @@ pub fn turn_text(input: &TurnInput) -> String {
     format!("{}\n\n(Attached files: {})", input.text, names.join(", "))
 }
 
+/// The folder of a command approval. `given` is the folder that the harness
+/// names, and `workspace` is the session's workspace, where the harness
+/// starts commands. A relative folder is in the workspace. When the harness
+/// names no folder, the command runs in the workspace. So the user always
+/// sees where a command runs before they allow it.
+pub(crate) fn command_cwd(given: Option<&str>, workspace: Option<&Path>) -> Option<String> {
+    let given = given.map(str::trim).filter(|g| !g.is_empty());
+    match (given, workspace) {
+        (Some(given), Some(workspace)) if !Path::new(given).is_absolute() => {
+            Some(workspace.join(given).to_string_lossy().into_owned())
+        }
+        (Some(given), _) => Some(given.to_owned()),
+        (None, Some(workspace)) => Some(workspace.to_string_lossy().into_owned()),
+        (None, None) => None,
+    }
+}
+
 /// The `code` of the [`SessionEvent::Error`] that tells the worker the
 /// harness account is signed out. The `message` of that event is the text for
 /// the user, and it includes what to do next (see [`sign_in_hint`]).
@@ -394,5 +411,19 @@ mod tests {
             }],
         };
         assert_eq!(turn_text(&input), "Look\n\n(Attached files: a.png)");
+    }
+
+    #[test]
+    fn a_command_folder_falls_back_to_the_workspace() {
+        let workspace = std::env::temp_dir().join("ws");
+        let inside = workspace.join("sub").to_string_lossy().into_owned();
+        let ws = Some(workspace.as_path());
+        let ws_text = workspace.to_string_lossy().into_owned();
+        assert_eq!(command_cwd(None, ws), Some(ws_text.clone()));
+        assert_eq!(command_cwd(Some("  "), ws), Some(ws_text));
+        assert_eq!(command_cwd(Some("sub"), ws), Some(inside.clone()));
+        assert_eq!(command_cwd(Some(&inside), ws), Some(inside.clone()));
+        assert_eq!(command_cwd(Some("sub"), None), Some("sub".to_owned()));
+        assert_eq!(command_cwd(None, None), None);
     }
 }

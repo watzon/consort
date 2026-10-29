@@ -7,6 +7,7 @@
 //! current assistant message, and the latest state of each tool call.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use consort_proto::ids::{RequestId, SessionId, TurnId};
 use consort_proto::model::{
@@ -18,7 +19,7 @@ use consort_proto::model::{
 use consort_proto::worker_link::{RequestBody, RequestOpened, SessionEvent, TurnEndReason};
 use serde_json::Value;
 
-use crate::ItemTracker;
+use crate::{ItemTracker, command_cwd};
 
 /// Which kind of text block is open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +37,8 @@ pub struct AcpMapper {
     last_message_id: Option<String>,
     /// The latest kind, title and merged JSON of each tool call.
     tool_meta: HashMap<String, (String, String, Value)>,
+    /// The session's workspace: the `cwd` of `session/new`.
+    workspace: Option<PathBuf>,
 }
 
 fn str_field<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
@@ -195,6 +198,15 @@ fn tool_command(value: &Value, title: &str) -> String {
         .unwrap_or_else(|| title.to_owned())
 }
 
+/// The folder that the `rawInput` of an `execute` tool call names, if any.
+/// OpenCode 2.2.0 calls it `workdir`, and Gemini CLI 0.46.0 calls it
+/// `dir_path`. Claude Code's `Bash` names none.
+fn raw_command_folder(raw: &Value) -> Option<&str> {
+    ["cwd", "workdir", "dir_path"]
+        .into_iter()
+        .find_map(|key| str_field(raw, key))
+}
+
 /// The tool name of a tool call: the Claude tool name in `_meta` when there
 /// is one, else the title.
 fn tool_name(value: &Value, title: &str) -> String {
@@ -319,7 +331,15 @@ impl AcpMapper {
             text_counter: 0,
             last_message_id: None,
             tool_meta: HashMap::new(),
+            workspace: None,
         }
+    }
+
+    /// Sets the session's workspace. A command approval that names no
+    /// folder runs there.
+    pub fn with_workspace(mut self, workspace: impl Into<PathBuf>) -> Self {
+        self.workspace = Some(workspace.into());
+        self
     }
 
     /// Starts a new turn.
@@ -530,10 +550,10 @@ impl AcpMapper {
         let details = match kind.as_str() {
             "execute" => ApprovalDetails::Command {
                 command: tool_command(&merged, &title),
-                cwd: merged
-                    .get("rawInput")
-                    .and_then(|r| str_field(r, "cwd"))
-                    .map(str::to_owned),
+                cwd: command_cwd(
+                    merged.get("rawInput").and_then(raw_command_folder),
+                    self.workspace.as_deref(),
+                ),
             },
             "edit" | "delete" | "move" => {
                 let mut paths: Vec<String> = file_changes(&merged, &kind)

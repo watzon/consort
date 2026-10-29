@@ -1,6 +1,8 @@
 //! Maps `codex app-server` notifications and server requests to Consort
 //! session events.
 
+use std::path::PathBuf;
+
 use consort_proto::ids::{RequestId, SessionId, TurnId};
 use consort_proto::model::{
     ApprovalDetails, AssistantMessagePayload, COMMAND_OUTPUT_TAIL_BYTES, CommandPayload,
@@ -20,7 +22,7 @@ use super::protocol::{
     PermissionsApprovalParams, ThreadItem, TokenUsageNotification, TurnError, TurnNotification,
     TurnPlanNotification, TurnStatus, UserInputQuestion, method,
 };
-use crate::{HarnessKind, ItemTracker, SIGNED_OUT_ERROR_CODE, sign_in_hint};
+use crate::{HarnessKind, ItemTracker, SIGNED_OUT_ERROR_CODE, command_cwd, sign_in_hint};
 
 fn parse<T: DeserializeOwned>(params: &Value) -> Option<T> {
     match serde_json::from_value(params.clone()) {
@@ -207,6 +209,8 @@ pub fn item_payload(item: &ThreadItem) -> Option<(String, ItemPayload, ItemStatu
 pub struct CodexMapper {
     tracker: ItemTracker,
     current_turn: Option<String>,
+    /// The session's workspace: the `cwd` of `thread/start`.
+    workspace: Option<PathBuf>,
 }
 
 impl CodexMapper {
@@ -215,7 +219,15 @@ impl CodexMapper {
         Self {
             tracker: ItemTracker::new(session_id),
             current_turn: None,
+            workspace: None,
         }
+    }
+
+    /// Sets the session's workspace. A command approval that names no
+    /// folder runs there.
+    pub fn with_workspace(mut self, workspace: impl Into<PathBuf>) -> Self {
+        self.workspace = Some(workspace.into());
+        self
     }
 
     /// The Codex turn that runs, if any.
@@ -411,6 +423,12 @@ impl CodexMapper {
     }
 
     /// The `request.opened` of a command approval.
+    ///
+    /// A network approval (`networkApprovalContext`) is for a command that
+    /// needs the network. It keeps the command details, with the command and
+    /// its folder, so the user sees what uses the host. The summary names the
+    /// host. `ApprovalDetails::Network` has only the target, so it would
+    /// hide the command.
     pub fn command_approval(
         &self,
         request_id: RequestId,
@@ -424,23 +442,25 @@ impl CodexMapper {
                     Some(ItemPayload::Command(c)) => c.command.clone(),
                     _ => "a command".to_owned(),
                 });
-        let details = match &params.network_approval_context {
-            Some(context) => ApprovalDetails::Network {
-                target: context
-                    .get("host")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| command.clone()),
-            },
-            None => ApprovalDetails::Command {
-                command: command.clone(),
-                cwd: params.cwd.clone(),
-            },
+        let network = params.network_approval_context.as_ref().map(network_target);
+        let summary = match (&network, &params.reason) {
+            (Some(target), Some(reason)) => {
+                let reason = reason.trim_end();
+                let stop = if reason.ends_with(['.', '!', '?']) {
+                    ""
+                } else {
+                    "."
+                };
+                format!("{reason}{stop} The command connects to {target}.")
+            }
+            (Some(target), None) => format!("Run `{command}` with network access to {target}"),
+            (None, Some(reason)) => reason.clone(),
+            (None, None) => format!("Run `{command}`"),
         };
-        let summary = params
-            .reason
-            .clone()
-            .unwrap_or_else(|| format!("Run `{command}`"));
+        let details = ApprovalDetails::Command {
+            command,
+            cwd: command_cwd(params.cwd.as_deref(), self.workspace.as_deref()),
+        };
         RequestOpened {
             request_id,
             summary,
@@ -536,6 +556,21 @@ impl CodexMapper {
             }),
             options,
         }
+    }
+}
+
+/// The host of a Codex `NetworkApprovalContext`, with the protocol when
+/// Codex gives one: `https://example.com`, or `example.com (socks5Tcp)`.
+fn network_target(context: &Value) -> String {
+    let host = context
+        .get("host")
+        .and_then(Value::as_str)
+        .filter(|h| !h.trim().is_empty())
+        .unwrap_or("a host");
+    match context.get("protocol").and_then(Value::as_str) {
+        Some(protocol @ ("http" | "https")) => format!("{protocol}://{host}"),
+        Some(protocol) if !protocol.trim().is_empty() => format!("{host} ({protocol})"),
+        _ => host.to_owned(),
     }
 }
 

@@ -3,7 +3,8 @@
 //!
 //! The worker writes every event to the spool before it sends it, and
 //! deletes events after the hub acknowledges them. Each command result is
-//! kept for 24 hours, so a repeated command ID returns the same result.
+//! kept for 8 days ([`COMMAND_RESULT_KEEP_MS`]), longer than the hub keeps a
+//! queued command, so a repeated command ID returns the same result.
 //!
 //! The database also lists the harness process groups that run, so the
 //! next start can kill the ones that a killed worker left behind. On Unix
@@ -17,8 +18,8 @@ use consort_proto::ids::{NativeRef, SessionId, TaskId};
 use consort_proto::model::SessionState;
 use consort_proto::time::Timestamp;
 use consort_proto::worker_link::{
-    COMMAND_RESULT_TTL_MS, MAX_BATCH_BYTES, MAX_EVENTS_PER_BATCH, SequencedEvent, SessionEvent,
-    SessionStart,
+    COMMAND_RESULT_TTL_MS, MAX_BATCH_BYTES, MAX_EVENTS_PER_BATCH, QUEUED_COMMAND_TTL_MS,
+    SequencedEvent, SessionEvent, SessionStart,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -26,6 +27,31 @@ use serde_json::Value;
 
 use crate::WorkerError;
 use crate::cap::cap_event;
+
+/// One day, in milliseconds.
+const DAY_MS: i64 = 24 * 60 * 60 * 1_000;
+
+/// How long the worker keeps a command result, in milliseconds: 8 days.
+///
+/// The hub keeps a queued command for [`QUEUED_COMMAND_TTL_MS`] (7 days)
+/// from the time it makes the command, and it can send the command again
+/// until then. The worker stores a result after the hub made the command,
+/// so a command that arrives again always finds its result. The extra day
+/// covers a clock difference between the hub and the worker and the hub's
+/// expiry loop. The worker does not use `COMMAND_RESULT_TTL_MS` (24 hours)
+/// alone, because a `session.turn` that the hub sends again after that would
+/// run twice.
+pub const COMMAND_RESULT_KEEP_MS: i64 = {
+    let keep = QUEUED_COMMAND_TTL_MS + DAY_MS;
+    if keep > COMMAND_RESULT_TTL_MS {
+        keep
+    } else {
+        COMMAND_RESULT_TTL_MS
+    }
+};
+
+// The worker keeps each result for longer than the hub resends a command.
+const _: () = assert!(COMMAND_RESULT_KEEP_MS > QUEUED_COMMAND_TTL_MS);
 
 const SCHEMA: &str = "
 PRAGMA journal_mode = WAL;
@@ -485,9 +511,19 @@ impl Store {
 
     // Commands.
 
-    /// The stored result of a command ID, if it is younger than 24 hours.
+    /// The stored result of a command ID, if it is younger than
+    /// [`COMMAND_RESULT_KEEP_MS`].
     pub fn command_result(&self, command_id: &str) -> Result<Option<StoredResult>, WorkerError> {
-        let cutoff = Timestamp::now().as_millis() - COMMAND_RESULT_TTL_MS;
+        self.command_result_at(command_id, Timestamp::now())
+    }
+
+    /// [`Store::command_result`] at the time `now`.
+    fn command_result_at(
+        &self,
+        command_id: &str,
+        now: Timestamp,
+    ) -> Result<Option<StoredResult>, WorkerError> {
+        let cutoff = now.as_millis() - COMMAND_RESULT_KEEP_MS;
         let text: Option<String> = self.with(|c| {
             c.query_row(
                 "SELECT result FROM processed_commands WHERE command_id = ?1 AND at >= ?2",
@@ -505,19 +541,29 @@ impl Store {
         command_id: &str,
         result: &StoredResult,
     ) -> Result<(), WorkerError> {
+        self.store_command_at(command_id, result, Timestamp::now())
+    }
+
+    /// [`Store::store_command`] at the time `at`.
+    fn store_command_at(
+        &self,
+        command_id: &str,
+        result: &StoredResult,
+        at: Timestamp,
+    ) -> Result<(), WorkerError> {
         let text = serde_json::to_string(result).map_err(|e| WorkerError::Config(e.to_string()))?;
         self.with(|c| {
             c.execute(
                 "INSERT OR REPLACE INTO processed_commands (command_id, result, at) VALUES (?1, ?2, ?3)",
-                params![command_id, text, Timestamp::now().as_millis()],
+                params![command_id, text, at.as_millis()],
             )
             .map(|_| ())
         })
     }
 
-    /// Deletes command results older than 24 hours.
+    /// Deletes command results older than [`COMMAND_RESULT_KEEP_MS`].
     pub fn prune_commands(&self, now: Timestamp) -> Result<usize, WorkerError> {
-        let cutoff = now.as_millis() - COMMAND_RESULT_TTL_MS;
+        let cutoff = now.as_millis() - COMMAND_RESULT_KEEP_MS;
         self.with(|c| {
             c.execute(
                 "DELETE FROM processed_commands WHERE at < ?1",
@@ -763,7 +809,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn command_results_dedup_for_24_hours() {
+    fn command_results_dedup_until_they_expire() {
         let store = Store::in_memory().unwrap();
         assert!(store.command_result("c1").unwrap().is_none());
         let ok = StoredResult::from(&Ok(serde_json::json!({"turn_id": "t1"})));
@@ -781,9 +827,36 @@ pub(crate) mod tests {
                 .code,
             ErrorCode::NotFound
         );
-        let later = Timestamp::now().plus_millis(COMMAND_RESULT_TTL_MS + 1000);
+        let later = Timestamp::now().plus_millis(COMMAND_RESULT_KEEP_MS + 1000);
         assert_eq!(store.prune_commands(later).unwrap(), 2);
         assert!(store.command_result("c1").unwrap().is_none());
+    }
+
+    #[test]
+    fn command_results_outlive_the_hubs_command_queue() {
+        // The hub sends a queued command again for up to 7 days. A result
+        // that the worker forgot earlier would let the command run twice.
+        let store = Store::in_memory().unwrap();
+        let stored_at = Timestamp::now();
+        let ok = StoredResult::from(&Ok(serde_json::json!({"turn_id": "t1"})));
+        store.store_command_at("c1", &ok, stored_at).unwrap();
+        // The last resend of a command that the hub made just before the
+        // worker ran it.
+        let last_resend = stored_at.plus_millis(QUEUED_COMMAND_TTL_MS);
+        assert_eq!(store.prune_commands(last_resend).unwrap(), 0);
+        assert_eq!(
+            store.command_result_at("c1", last_resend).unwrap(),
+            Some(ok.clone())
+        );
+        assert_eq!(
+            store
+                .command_result_at("c1", stored_at.plus_millis(3 * DAY_MS))
+                .unwrap(),
+            Some(ok)
+        );
+        let gone = stored_at.plus_millis(COMMAND_RESULT_KEEP_MS + 1000);
+        assert!(store.command_result_at("c1", gone).unwrap().is_none());
+        assert_eq!(store.prune_commands(gone).unwrap(), 1);
     }
 
     #[test]

@@ -247,6 +247,10 @@ fn approvals_and_questions() {
             ("decline", RequestOptionKind::DenyOnce)
         ]
     );
+    // A network approval keeps the command and its folder, and names the
+    // host in the summary. A command with no folder runs in the workspace.
+    let workspace = std::env::temp_dir().join("codex-ws");
+    let m = CodexMapper::new(SessionId::new()).with_workspace(&workspace);
     let net = m.command_approval(
         RequestId::new("codex-2"),
         &CommandApprovalParams {
@@ -254,12 +258,37 @@ fn approvals_and_questions() {
             item_id: "c".into(),
             command: Some("curl x".into()),
             cwd: None,
-            reason: Some("Needs network".into()),
-            network_approval_context: Some(json!({"host": "example.com"})),
+            reason: Some("Needs network.".into()),
+            network_approval_context: Some(json!({"host": "example.com", "protocol": "https"})),
         },
     );
+    let ws = workspace.to_string_lossy().into_owned();
     assert!(
-        matches!(&net.body, RequestBody::Approval(ApprovalDetails::Network { target }) if target == "example.com")
+        matches!(&net.body, RequestBody::Approval(ApprovalDetails::Command { command, cwd: Some(c) }) if command == "curl x" && c == &ws),
+        "{:?}",
+        net.body
+    );
+    assert_eq!(
+        net.summary,
+        "Needs network. The command connects to https://example.com."
+    );
+    let net = m.command_approval(
+        RequestId::new("codex-4"),
+        &CommandApprovalParams {
+            turn_id: "t".into(),
+            item_id: "c".into(),
+            command: Some("git fetch".into()),
+            cwd: Some("/w".into()),
+            reason: None,
+            network_approval_context: Some(json!({"host": "github.com"})),
+        },
+    );
+    assert_eq!(
+        net.summary,
+        "Run `git fetch` with network access to github.com"
+    );
+    assert!(
+        matches!(&net.body, RequestBody::Approval(ApprovalDetails::Command { cwd: Some(c), .. }) if c == "/w")
     );
     let q: UserInputQuestion = serde_json::from_value(json!({
         "id": "db", "header": "Database", "question": "Which database?", "isOther": true,

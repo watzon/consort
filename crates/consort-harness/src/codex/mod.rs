@@ -456,7 +456,7 @@ pub(crate) async fn start_thread(
         thread_id,
         client,
         events: event_tx,
-        mapper: CodexMapper::new(spec.session_id),
+        mapper: CodexMapper::new(spec.session_id).with_workspace(&spec.workspace),
         pending: HashMap::new(),
         effort,
         counter: 0,

@@ -98,6 +98,17 @@ pub struct FakeRecord {
     pub closed: usize,
 }
 
+/// How [`FakeHarness::open`] fails, after [`FakeHarness::set_open_failure`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FakeOpenFailure {
+    /// The harness says that the account is not signed in, with this
+    /// reason.
+    SignedOut(String),
+    /// The harness process exits before the session opens, as when a stop
+    /// signal reaches it.
+    Exited,
+}
+
 /// A harness that plays a script.
 #[derive(Debug, Clone)]
 pub struct FakeHarness {
@@ -105,6 +116,9 @@ pub struct FakeHarness {
     script: FakeScript,
     record: Arc<Mutex<FakeRecord>>,
     capabilities: Capabilities,
+    /// Shared by the clones, so a test can change it after it gives the
+    /// harness to a worker.
+    open_failure: Arc<Mutex<Option<FakeOpenFailure>>>,
     /// When set, `open` with `resume` fails.
     pub fail_resume: bool,
     /// When set, every `turn` fails.
@@ -123,6 +137,7 @@ impl FakeHarness {
             kind,
             script,
             record: Arc::new(Mutex::new(FakeRecord::default())),
+            open_failure: Arc::new(Mutex::new(None)),
             capabilities: Capabilities {
                 steer: true,
                 resume: true,
@@ -148,6 +163,14 @@ impl FakeHarness {
     /// What the harness saw so far.
     pub fn record(&self) -> Arc<Mutex<FakeRecord>> {
         self.record.clone()
+    }
+
+    /// Makes every `open` of this harness and of its clones fail, or work
+    /// again with `None`.
+    pub fn set_open_failure(&self, failure: Option<FakeOpenFailure>) {
+        if let Ok(mut current) = self.open_failure.lock() {
+            *current = failure;
+        }
     }
 
     /// The model that the fake account offers.
@@ -202,6 +225,14 @@ impl Harness for FakeHarness {
             return Err(HarnessError::ResumeFailed(
                 "the fake harness forgot".to_owned(),
             ));
+        }
+        let failure = self.open_failure.lock().ok().and_then(|f| f.clone());
+        match failure {
+            Some(FakeOpenFailure::SignedOut(reason)) => {
+                return Err(HarnessError::SignedOut(reason));
+            }
+            Some(FakeOpenFailure::Exited) => return Err(HarnessError::Closed),
+            None => {}
         }
         if let Ok(mut record) = self.record.lock() {
             record.opened.push(spec.clone());
@@ -329,7 +360,12 @@ async fn play(
                     } => (
                         request_id,
                         format!("Run `{command}`"),
-                        ApprovalDetails::Command { command, cwd: None },
+                        ApprovalDetails::Command {
+                            command,
+                            // Like the real adapters, the fake names the
+                            // folder of every command approval.
+                            cwd: Some(spec.workspace.to_string_lossy().into_owned()),
+                        },
                     ),
                     _ => unreachable!("the outer pattern allows only approvals"),
                 };

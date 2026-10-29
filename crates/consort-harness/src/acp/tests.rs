@@ -210,6 +210,42 @@ fn permission_requests_map_details_and_options() {
 }
 
 #[test]
+fn command_approvals_always_name_their_folder() {
+    let workspace = std::env::temp_dir().join("acp-ws");
+    let ws = workspace.to_string_lossy().into_owned();
+    let mut m = AcpMapper::new(SessionId::new()).with_workspace(&workspace);
+    m.start_turn(TurnId::new("t1"));
+    let cwd_of = |m: &AcpMapper, raw: Value| {
+        let opened = m.map_permission(
+            RequestId::new("acp-1"),
+            &json!({
+                "toolCall": {"toolCallId": "c", "title": "Run", "kind": "execute", "rawInput": raw},
+                "options": []
+            }),
+        );
+        match opened.body {
+            RequestBody::Approval(ApprovalDetails::Command { cwd, .. }) => cwd,
+            other => panic!("not a command approval: {other:?}"),
+        }
+    };
+    // Claude Code's `Bash` names no folder, so the command runs in the
+    // workspace.
+    assert_eq!(cwd_of(&m, json!({"command": "ls"})), Some(ws.clone()));
+    // OpenCode names it `workdir`, and Gemini CLI `dir_path`. A relative
+    // folder is in the workspace.
+    let sub = workspace.join("sub").to_string_lossy().into_owned();
+    assert_eq!(
+        cwd_of(&m, json!({"command": "ls", "workdir": "sub"})),
+        Some(sub.clone())
+    );
+    assert_eq!(
+        cwd_of(&m, json!({"command": "ls", "dir_path": &sub})),
+        Some(sub.clone())
+    );
+    assert_eq!(cwd_of(&m, json!({"command": "ls", "cwd": &sub})), Some(sub));
+}
+
+#[test]
 fn stop_reasons() {
     assert_eq!(
         stop_reason(Some("end_turn")),
@@ -320,17 +356,39 @@ fn launch_recipes() {
         assert!(!full.env.contains_key(key), "{key}");
     }
 
-    let gemini = AccountConfig::default_for(HarnessKind::GeminiCli);
-    let l = launch_recipe(
-        HarnessKind::GeminiCli,
-        &gemini,
+    // OpenCode Auto asks before commands and fetches. Only Full access
+    // allows them with no prompt.
+    let auto = launch_recipe(
+        HarnessKind::OpenCode,
+        &open,
         ApprovalMode::Auto,
         true,
         &found,
     )
     .unwrap();
+    let config: Value = serde_json::from_str(&auto.env["OPENCODE_CONFIG_CONTENT"]).unwrap();
     assert_eq!(
-        l.args,
+        config["permission"],
+        json!({"edit": "allow", "bash": "ask", "webfetch": "ask"})
+    );
+    let config: Value = serde_json::from_str(&full.env["OPENCODE_CONFIG_CONTENT"]).unwrap();
+    assert_eq!(
+        config["permission"],
+        json!({"edit": "allow", "bash": "allow", "webfetch": "allow"})
+    );
+
+    let gemini = AccountConfig::default_for(HarnessKind::GeminiCli);
+    let gemini_args = |mode| {
+        launch_recipe(HarnessKind::GeminiCli, &gemini, mode, true, &found)
+            .unwrap()
+            .args
+    };
+    assert_eq!(
+        gemini_args(ApprovalMode::Auto),
+        vec!["--experimental-acp", "--approval-mode", "auto_edit"]
+    );
+    assert_eq!(
+        gemini_args(ApprovalMode::FullAccess),
         vec!["--experimental-acp", "--approval-mode", "yolo"]
     );
 

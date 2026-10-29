@@ -319,8 +319,17 @@ impl Core {
     /// Answers a command that did not run, for example because its session
     /// ended first. The answer is not stored, so the hub can send the
     /// command again, for example after the worker restarted.
+    ///
+    /// While the worker stops, it sends no answer. The hub would take the
+    /// error as the result: a `session.start` would fail its task. The link
+    /// closes instead, the hub keeps the command in its queue, and it sends
+    /// the command again after the restart.
     pub fn abandon_command(&self, id: &FrameId, error: ErrorBody) {
         lock(&self.inflight).remove(id.as_str());
+        if self.is_stopping() {
+            tracing::debug!(command = %id.as_str(), %error, "the worker stops, so it does not answer a command that did not run");
+            return;
+        }
         self.respond(id, Err(error));
     }
 
@@ -373,9 +382,10 @@ impl Core {
     }
 
     /// Routes one hub command. Commands for one session run in order in
-    /// that session's actor. A command ID that ran in the last 24 hours gets
-    /// its stored result. A command ID that runs now does not run again: the
-    /// worker answers it when the first run ends.
+    /// that session's actor. A command ID that ran in the last 8 days
+    /// ([`crate::store::COMMAND_RESULT_KEEP_MS`]) gets its stored result. A
+    /// command ID that runs now does not run again: the worker answers it
+    /// when the first run ends.
     pub fn dispatch(self: &Arc<Self>, request: RequestFrame) {
         let id = request.id.clone();
         {
@@ -798,7 +808,7 @@ mod tests {
     use consort_proto::frame::ResponseFrame;
     use consort_proto::model::SessionState;
     use consort_proto::worker_link::{SessionTurn, TurnInput};
-    use consort_testkit::{FakeHarness, FakeScript, FakeStep};
+    use consort_testkit::{FakeHarness, FakeOpenFailure, FakeScript, FakeStep};
 
     fn test_core(dir: &std::path::Path, harnesses: Harnesses, config: WorkerToml) -> Arc<Core> {
         Arc::new(Core {
@@ -1291,6 +1301,152 @@ mod tests {
             SessionState::Lost,
             "the next run resumes the session"
         );
+    }
+
+    #[tokio::test]
+    async fn a_signed_out_open_marks_the_account_signed_out() {
+        let fake = FakeHarness::new(HarnessKind::ClaudeCode, FakeScript::reply("Hi."));
+        fake.set_open_failure(Some(FakeOpenFailure::SignedOut(
+            "Authentication required".into(),
+        )));
+        let (_dir, core, account_id) = fake_worker(&fake);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        core.link.attach(tx);
+        let session_id = SessionId::new();
+        let mut command = start(session_id);
+        command.account_id = account_id;
+        core.dispatch(request(&FrameId::new("c1"), &command.into()));
+        wait_until("the failed start", || {
+            core.store.command_result("c1").unwrap().is_some() && lock(&core.sessions).is_empty()
+        })
+        .await;
+        let hint = "Authentication required. Run `claude` on this machine and sign in with /login.";
+        // Placement stops choosing the account now, not after the next
+        // probe.
+        let account = core
+            .inventory()
+            .accounts
+            .into_iter()
+            .find(|a| a.account_id == account_id)
+            .unwrap();
+        assert_eq!(account.auth_state, AuthState::SignedOut);
+        assert_eq!(
+            lock(&core.statuses)[&account_id].auth_detail.as_deref(),
+            Some(hint)
+        );
+        let events = spooled(&core, session_id);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                SessionEvent::Error { code, message } if code == "signed_out" && message == hint
+            )),
+            "{events:?}"
+        );
+        let answer = core
+            .store
+            .command_result("c1")
+            .unwrap()
+            .unwrap()
+            .into_result()
+            .unwrap_err();
+        assert!(answer.message.contains(hint), "{}", answer.message);
+    }
+
+    /// Whether the worker sent an answer to `id`.
+    fn answered(rx: &mut mpsc::UnboundedReceiver<String>, id: &str) -> bool {
+        responses(rx).iter().any(|r| r.re.as_str() == id)
+    }
+
+    #[tokio::test]
+    async fn a_start_that_the_stop_cuts_short_runs_again_after_the_restart() {
+        let fake = FakeHarness::new(HarnessKind::ClaudeCode, FakeScript::reply("Hi."));
+        let record = fake.record();
+        let (_dir, core, account_id) = fake_worker(&fake);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        core.link.attach(tx);
+        let session_id = SessionId::new();
+        let mut command = start(session_id);
+        command.account_id = account_id;
+        command.turn = Some(TurnInput {
+            text: "Go".into(),
+            attachments: vec![],
+        });
+        let command: HubToWorker = command.into();
+        // The stop signal reaches the harness while it opens.
+        fake.set_open_failure(Some(FakeOpenFailure::Exited));
+        core.stopping.send_replace(true);
+        core.dispatch(request(&FrameId::new("c1"), &command));
+        wait_until("the start to end its actor", || {
+            lock(&core.sessions).is_empty()
+        })
+        .await;
+        assert!(
+            core.store.command_result("c1").unwrap().is_none(),
+            "no stored result, so the hub's resend runs the start"
+        );
+        assert!(!answered(&mut rx, "c1"), "the hub gets no error");
+        assert!(lock(&core.inflight).is_empty());
+        let stored = core.store.session(session_id).unwrap().unwrap();
+        assert_eq!(stored.state, SessionState::Starting);
+        assert!(stored.native_ref.is_none());
+        let events = spooled(&core, session_id);
+        assert!(!has_error(&events, "start_failed"), "{events:?}");
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                SessionEvent::State {
+                    state: SessionState::Lost
+                }
+            )),
+            "{events:?}"
+        );
+        // The next run does not resume it. The hub sends the start again,
+        // and it runs.
+        assert_eq!(restore_sessions(&core).unwrap(), 0);
+        core.stopping.send_replace(false);
+        fake.set_open_failure(None);
+        core.dispatch(request(&FrameId::new("c1"), &command));
+        wait_until("the second start", || {
+            core.store.command_result("c1").unwrap().is_some()
+        })
+        .await;
+        let stored = core.store.command_result("c1").unwrap().unwrap();
+        assert!(stored.into_result().is_ok());
+        assert_eq!(record.lock().unwrap().turns.len(), 1, "one first turn");
+    }
+
+    #[tokio::test]
+    async fn a_first_turn_that_the_stop_cuts_short_leaves_no_session_to_resume() {
+        let mut fake = FakeHarness::new(HarnessKind::ClaudeCode, FakeScript::reply("Hi."));
+        // The harness opens, and then the stop signal reaches it before it
+        // takes the first turn.
+        fake.fail_turn = true;
+        let record = fake.record();
+        let (_dir, core, account_id) = fake_worker(&fake);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        core.link.attach(tx);
+        let session_id = SessionId::new();
+        let mut command = start(session_id);
+        command.account_id = account_id;
+        command.turn = Some(TurnInput::default());
+        core.stopping.send_replace(true);
+        core.dispatch(request(&FrameId::new("c1"), &command.into()));
+        wait_until("the start to end its actor", || {
+            lock(&core.sessions).is_empty()
+        })
+        .await;
+        assert_eq!(record.lock().unwrap().closed, 1, "the harness is closed");
+        assert!(core.store.command_result("c1").unwrap().is_none());
+        assert!(!answered(&mut rx, "c1"));
+        // The harness reference is gone, so the next run does not resume a
+        // session that has no owner on the hub.
+        let stored = core.store.session(session_id).unwrap().unwrap();
+        assert_eq!(stored.state, SessionState::Starting);
+        assert!(stored.native_ref.is_none());
+        assert_eq!(restore_sessions(&core).unwrap(), 0);
+        assert!(lock(&core.sessions).is_empty());
+        let events = spooled(&core, session_id);
+        assert!(!has_error(&events, "start_failed"), "{events:?}");
     }
 
     #[tokio::test]
