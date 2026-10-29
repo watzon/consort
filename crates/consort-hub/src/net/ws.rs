@@ -1,5 +1,8 @@
 //! Shared WebSocket parts: the outbox, frame I/O and the auth handshake.
 
+use std::collections::HashMap;
+use std::net::IpAddr;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::extract::ws::{CloseFrame, Message, WebSocket};
@@ -14,28 +17,72 @@ use tokio_util::sync::CancellationToken;
 use crate::hub::Hub;
 use crate::util::random_bytes;
 
+/// The whole handshake, from the challenge to `hello`, must end in this
+/// time. Pings and pongs do not make it longer.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const OUTBOX_CAPACITY: usize = 4096;
 /// The most connections that can be in the handshake at the same time. A
 /// personal hub has a few peers, so this is far above normal use. It stops a
 /// flood of sockets that never authenticate.
 pub(crate) const MAX_PENDING_HANDSHAKES: usize = 64;
+/// The most connections from one address (an IPv4 address or an IPv6 /64)
+/// that can be in the handshake at the same time. So one host cannot take
+/// every slot. Behind a reverse proxy every connection has the proxy
+/// address, and this limit then applies to all of them together.
+pub(crate) const MAX_PENDING_HANDSHAKES_PER_ADDRESS: usize = 16;
 
 /// The slots for connections that have not finished the handshake.
-pub struct HandshakeSlots(std::sync::Arc<tokio::sync::Semaphore>);
+pub struct HandshakeSlots {
+    all: Arc<tokio::sync::Semaphore>,
+    by_address: Arc<Mutex<HashMap<IpAddr, usize>>>,
+}
 
 impl Default for HandshakeSlots {
     fn default() -> Self {
-        Self(std::sync::Arc::new(tokio::sync::Semaphore::new(
-            MAX_PENDING_HANDSHAKES,
-        )))
+        Self {
+            all: Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_HANDSHAKES)),
+            by_address: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+/// One slot. The slot is free again when this value is dropped.
+pub(crate) struct HandshakeSlot {
+    _all: tokio::sync::OwnedSemaphorePermit,
+    address: IpAddr,
+    by_address: Arc<Mutex<HashMap<IpAddr, usize>>>,
+}
+
+impl Drop for HandshakeSlot {
+    fn drop(&mut self) {
+        if let Ok(mut map) = self.by_address.lock()
+            && let Some(count) = map.get_mut(&self.address)
+        {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                map.remove(&self.address);
+            }
+        }
     }
 }
 
 impl HandshakeSlots {
-    /// A slot, or `None` when all slots are in use.
-    pub(crate) fn try_take(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
-        self.0.clone().try_acquire_owned().ok()
+    /// A slot for a connection from `ip`, or `None` when all slots, or all
+    /// slots of that address, are in use.
+    pub(crate) fn try_take(&self, ip: IpAddr) -> Option<HandshakeSlot> {
+        let address = crate::net::pairing::limit_key(ip);
+        let mut map = self.by_address.lock().ok()?;
+        let count = map.entry(address).or_insert(0);
+        if *count >= MAX_PENDING_HANDSHAKES_PER_ADDRESS {
+            return None;
+        }
+        let permit = self.all.clone().try_acquire_owned().ok()?;
+        *count += 1;
+        Some(HandshakeSlot {
+            _all: permit,
+            address,
+            by_address: self.by_address.clone(),
+        })
     }
 }
 
@@ -108,7 +155,7 @@ pub(crate) fn too_large(size: usize) -> ErrorBody {
     ErrorBody::new(
         ErrorCode::Internal,
         format!(
-            "The answer has {} KiB, and a frame can have at most {} KiB, so the hub cannot send it. Ask for less, for example with a smaller limit.",
+            "The answer has {} KiB, and a frame can have at most {} KiB, so the hub cannot send it. Ask for less at once.",
             size / 1024,
             MAX_FRAME_BYTES / 1024
         ),
@@ -128,13 +175,14 @@ pub(crate) enum RecvError {
     Frame(FrameError),
 }
 
-/// Reads the next text frame. Pings and pongs are skipped.
+/// Reads the next text frame. Pings and pongs are skipped, and they do not
+/// move the deadline.
 pub(crate) async fn recv_frame(
     socket: &mut WebSocket,
-    timeout: Duration,
+    deadline: tokio::time::Instant,
 ) -> Result<Frame, RecvError> {
     loop {
-        let next = tokio::time::timeout(timeout, futures_util::StreamExt::next(socket))
+        let next = tokio::time::timeout_at(deadline, futures_util::StreamExt::next(socket))
             .await
             .map_err(|_| RecvError::Timeout)?;
         match next {
@@ -196,20 +244,22 @@ pub(crate) async fn handshake(
     hub: &Hub,
     socket: &mut WebSocket,
     kind: PeerKind,
+    peer_ip: IpAddr,
 ) -> Option<Authenticated> {
     // The slot is free again when this function returns.
-    let Some(_slot) = hub.handshakes.try_take() else {
-        tracing::warn!("too many connections are in the handshake, so the hub refuses a new one");
+    let Some(_slot) = hub.handshakes.try_take(peer_ip) else {
+        tracing::warn!(%peer_ip, "too many connections are in the handshake, so the hub refuses a new one");
         close_with(socket, 1013, "too many connections, try again later").await;
         return None;
     };
+    let deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
     let nonce = Nonce::from_bytes(random_bytes::<32>());
     let challenge = Frame::event(&AuthChallenge { nonce }).ok()?;
     if !send_frame(socket, &challenge).await {
         return None;
     }
 
-    let request = match recv_request(socket, "auth.response").await {
+    let request = match recv_request(socket, "auth.response", deadline).await {
         Some(request) => request,
         None => return None,
     };
@@ -261,7 +311,7 @@ pub(crate) async fn handshake(
         return None;
     }
 
-    let hello = match recv_request(socket, "hello").await {
+    let hello = match recv_request(socket, "hello", deadline).await {
         Some(hello) => hello,
         None => return None,
     };
@@ -271,8 +321,12 @@ pub(crate) async fn handshake(
     })
 }
 
-async fn recv_request(socket: &mut WebSocket, expected: &str) -> Option<RequestFrame> {
-    match recv_frame(socket, HANDSHAKE_TIMEOUT).await {
+async fn recv_request(
+    socket: &mut WebSocket,
+    expected: &str,
+    deadline: tokio::time::Instant,
+) -> Option<RequestFrame> {
+    match recv_frame(socket, deadline).await {
         Ok(Frame::Request(request)) if request.kind == expected => Some(request),
         Ok(_) => {
             close_with(socket, 1002, "unexpected frame").await;
@@ -359,6 +413,44 @@ mod tests {
     use super::*;
     use consort_proto::frame::FrameId;
     use serde_json::json;
+
+    #[test]
+    fn one_address_gets_at_most_its_share_of_the_handshake_slots() {
+        let slots = HandshakeSlots::default();
+        let one: IpAddr = "192.0.2.1".parse().unwrap();
+        let held: Vec<_> = (0..MAX_PENDING_HANDSHAKES_PER_ADDRESS)
+            .map(|_| slots.try_take(one).unwrap())
+            .collect();
+        assert!(slots.try_take(one).is_none());
+        // Another host in the same IPv6 /64 is the same address.
+        let v6a: IpAddr = "2001:db8::1".parse().unwrap();
+        let v6b: IpAddr = "2001:db8::2".parse().unwrap();
+        let v6: Vec<_> = (0..MAX_PENDING_HANDSHAKES_PER_ADDRESS)
+            .map(|_| slots.try_take(v6a).unwrap())
+            .collect();
+        assert!(slots.try_take(v6b).is_none());
+        // A slot comes free when its connection leaves the handshake.
+        drop(held);
+        assert!(slots.try_take(one).is_some());
+        drop(v6);
+        assert!(slots.try_take(v6b).is_some());
+    }
+
+    #[test]
+    fn all_addresses_together_get_at_most_the_global_slots() {
+        let slots = HandshakeSlots::default();
+        let held: Vec<_> = (0..MAX_PENDING_HANDSHAKES)
+            .map(|i| {
+                let ip = IpAddr::from([198, 51, 100, u8::try_from(i).unwrap()]);
+                slots.try_take(ip).unwrap()
+            })
+            .collect();
+        assert!(slots.try_take("203.0.113.9".parse().unwrap()).is_none());
+        drop(held);
+        assert!(slots.try_take("203.0.113.9".parse().unwrap()).is_some());
+        // Refused tries did not leave counts behind.
+        assert!(slots.by_address.lock().unwrap().len() <= 1);
+    }
 
     #[test]
     fn a_response_that_does_not_fit_goes_out_as_an_error_response() {

@@ -131,10 +131,12 @@ async fn a_worker_revoked_between_its_signature_and_its_hello_stays_offline() {
 }
 
 #[tokio::test]
-async fn the_hub_caps_connections_that_have_not_finished_the_handshake() {
+async fn the_hub_caps_connections_from_one_address_that_have_not_finished_the_handshake() {
     let hub = TestHub::start().await;
-    // MAX_PENDING_HANDSHAKES in net/ws.rs.
-    const SLOTS: usize = 64;
+    // MAX_PENDING_HANDSHAKES_PER_ADDRESS in net/ws.rs. Every test connection
+    // comes from 127.0.0.1. The cap for all addresses together has a unit
+    // test in net/ws.rs.
+    const SLOTS: usize = 16;
     let mut parked = Vec::new();
     for _ in 0..SLOTS {
         let mut peer = Peer::connect(&hub.ws_url(CLIENT_WS_PATH)).await;
@@ -182,5 +184,52 @@ async fn a_blob_upload_without_credentials_is_refused_before_the_body_arrives() 
         .unwrap();
     let text = String::from_utf8_lossy(&answer[..read]).to_string();
     assert!(text.starts_with("HTTP/1.1 401"), "{text}");
+    hub.handle.shutdown().await.unwrap();
+}
+
+/// Review cycle 2, finding 2: each ping restarted the 15 s handshake
+/// timeout, so sockets that only pinged held their slots for ever. The
+/// handshake now has one deadline from the challenge to `hello`.
+#[tokio::test]
+async fn pings_do_not_keep_a_connection_in_the_handshake_past_its_deadline() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+    let hub = TestHub::start().await;
+    let (mut ws, _) = tokio_tungstenite::connect_async(hub.ws_url(WORKER_WS_PATH))
+        .await
+        .unwrap();
+    let first = ws.next().await.unwrap().unwrap();
+    assert!(matches!(first, WsMessage::Text(_)), "{first:?}");
+    let started = tokio::time::Instant::now();
+    let mut ping = tokio::time::interval(Duration::from_secs(2));
+    let close_code = loop {
+        tokio::select! {
+            _ = ping.tick() => {
+                if ws.send(WsMessage::Ping(Vec::new().into())).await.is_err() {
+                    break None;
+                }
+            }
+            next = ws.next() => match next {
+                Some(Ok(WsMessage::Close(frame))) => break frame.map(|f| u16::from(f.code)),
+                Some(Ok(_)) => {}
+                None | Some(Err(_)) => break None,
+            },
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(25),
+            "the hub kept a pinging socket in the handshake"
+        );
+    };
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_secs(14) && elapsed < Duration::from_secs(20),
+        "closed after {elapsed:?}"
+    );
+    assert_eq!(
+        close_code,
+        Some(1008),
+        "the hub closes with handshake timed out"
+    );
     hub.handle.shutdown().await.unwrap();
 }

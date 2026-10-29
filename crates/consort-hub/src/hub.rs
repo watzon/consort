@@ -202,3 +202,98 @@ pub(crate) async fn test_hub() -> (Hub, tempfile::TempDir) {
     hub.coordinators.set_disabled(true);
     (hub, dir)
 }
+
+/// A worker, a task in Working and its Active task session with an open
+/// turn, stored in a test hub. Nothing is queued and no link is registered.
+#[cfg(test)]
+pub(crate) async fn test_task_session(
+    hub: &Hub,
+) -> (consort_proto::model::Task, consort_proto::model::Session) {
+    use consort_proto::ids::{AccountId, SessionId, WorkerId};
+    use consort_proto::model::{
+        ModelOptions, Os, PlacementRequest, Session, SessionRole, SessionState, TaskCreator, Usage,
+        Worker, WorkerState,
+    };
+    use consort_proto::status::TaskStatus;
+
+    let channel = hub
+        .store
+        .read(conversation::everything_channel)
+        .await
+        .unwrap();
+    let task = hub
+        .create_task(crate::ops::hooks::NewTask {
+            channel_id: channel.id,
+            title: "Work".to_owned(),
+            brief: "Do the work.".to_owned(),
+            model_selection: None,
+            placement: PlacementRequest::default(),
+            approval_mode: None,
+            start_at: Some(Timestamp::now().plus_millis(86_400_000)),
+            created_by: TaskCreator::User,
+            routine_id: None,
+        })
+        .await
+        .unwrap();
+    let worker = Worker {
+        id: WorkerId::new(),
+        name: "Laptop".to_owned(),
+        hostname: "laptop".to_owned(),
+        os: Os::Macos,
+        arch: "aarch64".to_owned(),
+        public_key: consort_proto::auth::PublicKey::from_bytes([1; 32]),
+        version: String::new(),
+        protocol_version: 1,
+        labels: Vec::new(),
+        paused: false,
+        state: WorkerState::Online,
+        last_seen_at: None,
+        inventory: None,
+        paired_at: Timestamp::now(),
+        revoked_at: None,
+    };
+    let session = Session {
+        id: SessionId::new(),
+        role: SessionRole::Task,
+        channel_id: channel.id,
+        task_id: Some(task.id),
+        worker_id: worker.id,
+        account_id: AccountId::new(),
+        harness: "fake".to_owned(),
+        model: "fake-1".to_owned(),
+        options: ModelOptions::new(),
+        workspace_path: "/tmp/workspace".to_owned(),
+        native_ref: None,
+        state: SessionState::Active,
+        last_seq: 0,
+        usage: Usage::default(),
+        started_at: Timestamp::now(),
+        ended_at: None,
+        end_reason: None,
+    };
+    let (task_id, stored) = (task.id, session.clone());
+    let task = hub
+        .store
+        .write(move |tx| {
+            tx.save_worker(&worker)?;
+            tx.save_session(&stored)?;
+            tx.save_session_runtime(
+                stored.id,
+                &crate::store::work::SessionRuntime {
+                    turn_open: true,
+                    active_at: Some(tx.now()),
+                    ..Default::default()
+                },
+            )?;
+            let mut task = crate::store::work::task_or_404(tx.db(), task_id)?;
+            task.status = TaskStatus::Working;
+            task.start_at = None;
+            task.current_session_id = Some(stored.id);
+            task.worker_id = Some(stored.worker_id);
+            tx.save_task(&task)?;
+            Ok(task)
+        })
+        .await
+        .unwrap();
+    (task, session)
+}

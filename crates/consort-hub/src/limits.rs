@@ -39,6 +39,14 @@ pub(crate) const SNAPSHOT_MESSAGES_MAX_BYTES: usize = 512 * 1024;
 /// The messages in a tool result. A tool result holds its JSON twice (as
 /// text and as structured content), so it gets less than half a frame.
 pub(crate) const TOOL_MESSAGES_MAX_BYTES: usize = 320 * 1024;
+/// The largest review summary of a task. It comes from a task session, so
+/// the hub cuts it to this size.
+pub(crate) const REVIEW_SUMMARY_MAX_BYTES: usize = 16 * 1024;
+/// The preview of a long task brief or review summary in a snapshot and in
+/// `list_tasks`. The full task comes with `task.get` or `read_task`.
+pub(crate) const TASK_PREVIEW_BYTES: usize = 1024;
+/// The largest snapshot body. The rest of the frame is for the envelope.
+pub(crate) const SNAPSHOT_MAX_BYTES: usize = MAX_FRAME_BYTES - FRAME_ENVELOPE_BYTES;
 /// The largest text of a notice or of a task status reason. These often
 /// hold an error text from a worker, which the hub cuts to this size.
 pub(crate) const NOTICE_TEXT_MAX_BYTES: usize = 4 * 1024;
@@ -92,6 +100,23 @@ pub(crate) fn cut_text(text: &str, max: usize) -> String {
     let mut out = json_prefix(text, max.saturating_sub(json_len(MARK))).to_owned();
     out.push_str(MARK);
     out
+}
+
+/// Cuts the brief and the review summary of a task to a preview. Returns
+/// true when it cut one of them.
+pub(crate) fn preview_task(task: &mut consort_proto::model::Task) -> bool {
+    let mut cut = false;
+    if json_len(&task.brief) > TASK_PREVIEW_BYTES {
+        task.brief = cut_text(&task.brief, TASK_PREVIEW_BYTES);
+        cut = true;
+    }
+    if let Some(summary) = task.review_summary.as_mut()
+        && json_len(summary) > TASK_PREVIEW_BYTES
+    {
+        *summary = cut_text(summary, TASK_PREVIEW_BYTES);
+        cut = true;
+    }
+    cut
 }
 
 /// The room for the turn text of a command whose other text fields take

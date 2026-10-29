@@ -7,9 +7,9 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use consort_proto::error::ErrorCode;
-use consort_proto::ids::ChannelId;
+use consort_proto::ids::{ChannelId, MessageId};
 use consort_proto::model::{
-    Author, BlobRef, ChannelFile, MemoryAuthor, MemoryScope, MessageKind, Sha256Hash,
+    Author, BlobRef, ChannelFile, MemoryAuthor, MemoryScope, Message, MessageKind, Sha256Hash,
     validate_relative_path,
 };
 use consort_proto::status::TaskStatus;
@@ -21,6 +21,7 @@ use serde_json::Value;
 use crate::api::to_value;
 use crate::error::{HubError, Result};
 use crate::hub::{Hub, ToolCtx};
+use crate::limits::{TOOL_MESSAGES_MAX_BYTES, json_len, json_prefix};
 use crate::store::conversation::{self, NewMessage};
 use crate::store::{knowledge, work};
 use crate::util::{hex_encode, random_bytes, sha256};
@@ -28,6 +29,96 @@ use crate::util::{hex_encode, random_bytes, sha256};
 /// `fetch_timeline` page size when the call gives none, and its limit.
 const TIMELINE_PAGE_DEFAULT: u32 = 50;
 const TIMELINE_PAGE_MAX: u32 = 200;
+/// `fetch_thread` page size when the call gives none, and its limit.
+const THREAD_PAGE_DEFAULT: u32 = 50;
+const THREAD_PAGE_MAX: u32 = 200;
+/// The most room that a root takes in `fetch_thread` when the call names
+/// one of its replies. A longer root is cut.
+const THREAD_ROOT_MAX_BYTES: usize = 48 * 1024;
+
+/// The bytes that a message takes in a list as JSON.
+fn message_cost(message: &Message) -> Result<usize> {
+    Ok(serde_json::to_vec(message)?.len() + 1)
+}
+
+/// Cuts the body of a message so that the message takes at most `room`
+/// bytes as JSON. The body ends with a note that names the message ID, so
+/// the coordinator can read all of it alone.
+fn fit_message(mut message: Message, room: usize) -> Result<Message> {
+    let cost = message_cost(&message)?;
+    if cost <= room {
+        return Ok(message);
+    }
+    let note = format!(
+        "\n\n[The hub cut this message here, because the result has no room for all of it. Call fetch_thread with message_id \"{}\" to read all of it.]",
+        message.id
+    );
+    let other = cost.saturating_sub(json_len(&message.body));
+    let keep = room.saturating_sub(other + json_len(&note));
+    message.body = format!("{}{note}", json_prefix(&message.body, keep));
+    Ok(message)
+}
+
+/// See [`Hub::tool_fetch_thread`].
+fn thread_page(
+    conn: &Connection,
+    channel_id: ChannelId,
+    asked: Message,
+    root: Message,
+    before: Option<MessageId>,
+    limit: usize,
+) -> Result<FetchThreadResult> {
+    let budget = TOOL_MESSAGES_MAX_BYTES;
+    // The next page of a thread does not repeat the named reply.
+    let mut message = (asked.id != root.id && before.is_none()).then_some(asked);
+    let mut used = match &message {
+        Some(asked) => message_cost(asked)?,
+        None => 0,
+    };
+    let root_room = if message.is_some() {
+        THREAD_ROOT_MAX_BYTES
+    } else {
+        budget
+    };
+    let root = fit_message(root, root_room.min(budget.saturating_sub(used)))?;
+    used += message_cost(&root)?;
+    let (rows, _) = conversation::messages_page(
+        conn,
+        channel_id,
+        Some(root.id),
+        before,
+        limit + 1,
+        usize::MAX,
+    )?;
+    let mut replies = Vec::new();
+    for reply in rows.iter().take(limit) {
+        if message.as_ref().is_some_and(|m| m.id == reply.id) {
+            // The named reply is in the page. It is counted already.
+            replies.push(reply.clone());
+            message = None;
+            continue;
+        }
+        let cost = message_cost(reply)?;
+        if used + cost <= budget {
+            used += cost;
+            replies.push(reply.clone());
+            continue;
+        }
+        if replies.is_empty() {
+            let cut = fit_message(reply.clone(), budget.saturating_sub(used))?;
+            replies.push(cut);
+        }
+        break;
+    }
+    let has_more = rows.len() > replies.len();
+    replies.reverse();
+    Ok(FetchThreadResult {
+        root,
+        replies,
+        has_more,
+        message,
+    })
+}
 /// The most timeline messages that `read_channel` returns.
 const READ_CHANNEL_MESSAGES: usize = 50;
 /// The most hits that `search` returns.
@@ -285,28 +376,43 @@ impl Hub {
         to_value(&FetchTimelineResult { messages, has_more })
     }
 
+    /// The thread of a message: the root, the message that the call names
+    /// (when it is a reply), and a page of replies, all in
+    /// [`TOOL_MESSAGES_MAX_BYTES`](crate::limits::TOOL_MESSAGES_MAX_BYTES).
+    ///
+    /// The named message comes first and is whole. The root comes next, cut
+    /// when it is not the named message and it is long. Replies fill the
+    /// rest, newest first. When the newest reply alone does not fit, it is
+    /// cut, so a page always shows where to go on. A cut message ends with a
+    /// note that names its ID.
     pub(crate) async fn tool_fetch_thread(
         &self,
         ctx: &ToolCtx,
         args: FetchThreadArgs,
     ) -> Result<Value> {
         let channel_id = ctx.channel.id;
+        let limit = usize::try_from(
+            args.limit
+                .unwrap_or(THREAD_PAGE_DEFAULT)
+                .clamp(1, THREAD_PAGE_MAX),
+        )
+        .unwrap_or(1);
         let result = self
             .store
             .read(move |conn| {
-                let mut root = conversation::message_or_404(conn, args.message_id)?;
-                if root.channel_id != channel_id {
+                let asked = conversation::message_or_404(conn, args.message_id)?;
+                if asked.channel_id != channel_id {
                     return Err(HubError::not_found(format!(
                         "The message {} is not in this channel.",
                         args.message_id
                     )));
                 }
                 // The ID of a reply names its thread too.
-                if let Some(root_id) = root.thread_root_id {
-                    root = conversation::message_or_404(conn, root_id)?;
-                }
-                let replies = conversation::thread_replies(conn, root.id)?;
-                Ok(FetchThreadResult { root, replies })
+                let root = match asked.thread_root_id {
+                    Some(root_id) => conversation::message_or_404(conn, root_id)?,
+                    None => asked.clone(),
+                };
+                thread_page(conn, channel_id, asked, root, args.before, limit)
             })
             .await?;
         to_value(&result)
@@ -1055,6 +1161,8 @@ mod tests {
                 &ctx,
                 FetchThreadArgs {
                     message_id: sent[0].id,
+                    before: None,
+                    limit: None,
                 },
             )
             .await
@@ -1069,6 +1177,8 @@ mod tests {
                 &ctx,
                 FetchThreadArgs {
                     message_id: reply_id,
+                    before: None,
+                    limit: None,
                 },
             )
             .await
@@ -1081,6 +1191,8 @@ mod tests {
                 &ctx,
                 FetchThreadArgs {
                     message_id: elsewhere.id,
+                    before: None,
+                    limit: None,
                 },
             )
             .await;

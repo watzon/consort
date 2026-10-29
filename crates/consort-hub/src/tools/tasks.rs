@@ -15,10 +15,13 @@ use super::super::ops::hooks::NewTask;
 use crate::api::to_value;
 use crate::error::{HubError, Result};
 use crate::hub::{Hub, ToolCtx};
+use crate::limits::{REVIEW_SUMMARY_MAX_BYTES, TOOL_MESSAGES_MAX_BYTES, cut_text, preview_task};
 use crate::store::{conversation, machine, work};
 
-/// The most items `read_task` returns.
-const READ_TASK_ITEMS: usize = 50;
+/// The items that `read_task` returns when the call gives no limit, and the
+/// most that it returns.
+const READ_TASK_ITEMS: u32 = 50;
+const READ_TASK_ITEMS_MAX: u32 = 200;
 
 fn own_task(
     conn: &rusqlite::Connection,
@@ -198,27 +201,80 @@ impl Hub {
             .store
             .read(move |conn| work::tasks_in_channel(conn, channel_id, false))
             .await?;
+        // Long texts are previews here. read_task gives the full task.
         to_value(&ListTasksResult {
             tasks: tasks
                 .into_iter()
                 .filter(|t| args.status.is_none_or(|s| t.status == s))
+                .map(|mut t| {
+                    preview_task(&mut t);
+                    t
+                })
                 .collect(),
         })
     }
 
+    /// The task in full, and a page of its items that fits in
+    /// [`TOOL_MESSAGES_MAX_BYTES`] with the task. The page always has at
+    /// least one item when one exists: the worker cuts every event to 192
+    /// KiB, so one item fits next to the task.
     pub(crate) async fn tool_read_task(&self, ctx: &ToolCtx, args: ReadTaskArgs) -> Result<Value> {
         let ctx = ctx.clone();
+        let limit = usize::try_from(
+            args.limit
+                .unwrap_or(READ_TASK_ITEMS)
+                .clamp(1, READ_TASK_ITEMS_MAX),
+        )
+        .unwrap_or(1);
         let result = self
             .store
             .read(move |conn| {
                 let task = own_task(conn, &ctx, args.task_id)?;
-                let items = match args.since_item_id {
+                let mut used = serde_json::to_vec(&task)?.len();
+                let budget = TOOL_MESSAGES_MAX_BYTES;
+                let mut items = Vec::new();
+                let has_more;
+                match args.since_item_id {
+                    // Items after `since`, oldest first.
                     Some(after) => {
-                        work::task_items(conn, task.id, None, Some(after), READ_TASK_ITEMS)?.0
+                        let (page, more) =
+                            work::task_items(conn, task.id, None, Some(after), limit)?;
+                        let mut stopped = false;
+                        for item in page {
+                            let cost = serde_json::to_vec(&item)?.len() + 1;
+                            if used + cost > budget && !items.is_empty() {
+                                stopped = true;
+                                break;
+                            }
+                            used += cost;
+                            items.push(item);
+                        }
+                        has_more = more || stopped;
                     }
-                    None => work::recent_task_items(conn, task.id, READ_TASK_ITEMS)?,
-                };
-                Ok(ReadTaskResult { task, items })
+                    // The newest items, or the newest ones older than
+                    // `before_item_id`.
+                    None => {
+                        let page =
+                            work::task_items_before(conn, task.id, args.before_item_id, limit + 1)?;
+                        let mut taken = 0;
+                        for item in page.iter().take(limit) {
+                            let cost = serde_json::to_vec(item)?.len() + 1;
+                            if used + cost > budget && taken > 0 {
+                                break;
+                            }
+                            used += cost;
+                            taken += 1;
+                        }
+                        has_more = page.len() > taken;
+                        items.extend(page.into_iter().take(taken));
+                        items.reverse();
+                    }
+                }
+                Ok(ReadTaskResult {
+                    task,
+                    items,
+                    has_more,
+                })
             })
             .await?;
         to_value(&result)
@@ -322,12 +378,14 @@ impl Hub {
     ) -> Result<Value> {
         session_task(ctx)?;
         let session_id = ctx.session.id;
-        let summary = args.summary.trim().to_owned();
+        let summary = args.summary.trim();
         if summary.is_empty() {
             return Err(HubError::invalid(
                 "The summary is empty. Say what you did and what to check.",
             ));
         }
+        // The text comes from the harness, so the hub cuts it and does not refuse it.
+        let summary = cut_text(summary, REVIEW_SUMMARY_MAX_BYTES);
         self.store
             .write(move |tx| {
                 let mut runtime = work::session_runtime(tx.db(), session_id)?;

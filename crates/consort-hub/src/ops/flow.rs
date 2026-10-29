@@ -124,6 +124,29 @@ pub(crate) fn deliver_in_tx(
     text: &str,
     actor: Actor,
 ) -> Result<Delivered> {
+    deliver(hub, tx, task_id, text, actor, true)
+}
+
+/// Like [`deliver_in_tx`], but never steers: while a turn is open, the text
+/// waits in the inbox. The hub uses it when the worker refused a steer.
+pub(crate) fn deliver_without_steer(
+    hub: &Hub,
+    tx: &mut Tx<'_>,
+    task_id: TaskId,
+    text: &str,
+    actor: Actor,
+) -> Result<Delivered> {
+    deliver(hub, tx, task_id, text, actor, false)
+}
+
+fn deliver(
+    hub: &Hub,
+    tx: &mut Tx<'_>,
+    task_id: TaskId,
+    text: &str,
+    actor: Actor,
+    may_steer: bool,
+) -> Result<Delivered> {
     let mut task = work::task_or_404(tx.db(), task_id)?;
     match task.status {
         TaskStatus::Scheduled | TaskStatus::UpNext => {
@@ -176,7 +199,7 @@ pub(crate) fn deliver_in_tx(
     // offline worker too: a queued turn would reach it while the old turn
     // still runs.
     let online = hub.links.is_online(session.worker_id);
-    let delivery = if runtime.turn_open && online && steer {
+    let delivery = if runtime.turn_open && online && steer && may_steer {
         tx.queue_command(
             session.worker_id,
             &HubToWorker::SessionSteer(SessionSteer { session_id, turn }),
@@ -191,6 +214,7 @@ pub(crate) fn deliver_in_tx(
             &HubToWorker::SessionTurn(SessionTurn { session_id, turn }),
         )?;
         runtime.turn_open = true;
+        runtime.active_at = Some(tx.now());
         if online {
             MessageDelivery::Turn
         } else {

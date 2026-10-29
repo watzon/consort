@@ -728,6 +728,8 @@ pub struct World {
     pub client: FakeClient,
     pub worker: FakeWorker,
     pub everything: ChannelId,
+    /// The coordinator session that `start_coordinator` started last.
+    pub coordinator_session: Option<SessionId>,
 }
 
 impl World {
@@ -765,6 +767,7 @@ impl World {
             client,
             worker,
             everything,
+            coordinator_session: None,
         }
     }
 
@@ -803,6 +806,7 @@ impl World {
                 vec![state(SessionState::Active), turn_started("t1")],
             )
             .await;
+        self.coordinator_session = Some(start.session_id);
         start
     }
 }
@@ -825,4 +829,165 @@ pub async fn placeholder_worker(hub: &TestHub) -> FakeWorker {
     assert_eq!(status, 200, "{body}");
     let paired: PairWorkerResponse = serde_json::from_value(body).unwrap();
     FakeWorker::connect(hub, paired.worker_id, key, AccountId::new(), Vec::new()).await
+}
+
+// Tasks -----------------------------------------------------------------------
+
+impl World {
+    /// Starts a coordinator, which starts a task. Returns the task ID and the
+    /// `session.start` of the task session, which the worker accepted.
+    pub async fn start_task(
+        &mut self,
+        brief: &str,
+    ) -> (
+        consort_proto::ids::TaskId,
+        consort_proto::worker_link::SessionStart,
+    ) {
+        let coordinator = self.start_coordinator("Please do this").await;
+        let started = self
+            .worker
+            .tool_json(
+                coordinator.session_id,
+                "start_task",
+                serde_json::json!({"title": "Fix the bug", "brief": brief}),
+            )
+            .await;
+        let task_id = started["task_id"].as_str().unwrap().parse().unwrap();
+        let start = self.worker.accept_session_start().await;
+        (task_id, start)
+    }
+
+    /// The task as the Everything channel snapshot shows it.
+    pub async fn task(&mut self, id: consort_proto::ids::TaskId) -> consort_proto::model::Task {
+        self.client
+            .snapshot(SnapshotScope::Channel(self.everything))
+            .await
+            .tasks
+            .into_iter()
+            .find(|t| t.id == id)
+            .unwrap()
+    }
+
+    /// Waits until the task has this status, and returns it.
+    pub async fn wait_task(
+        &mut self,
+        id: consort_proto::ids::TaskId,
+        status: consort_proto::status::TaskStatus,
+    ) -> consort_proto::model::Task {
+        let deadline = tokio::time::Instant::now() + WAIT;
+        loop {
+            let task = self.task(id).await;
+            if task.status == status {
+                return task;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the task stayed {:?}, wanted {status:?}",
+                task.status
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// Retries a failed task. The worker answers the stop of the old session
+    /// and the start of the new one. Returns the new session ID.
+    pub async fn retry_task(
+        &mut self,
+        id: consort_proto::ids::TaskId,
+        old: SessionId,
+    ) -> SessionId {
+        self.client
+            .request(consort_proto::client_api::TaskRetry { task_id: id })
+            .await
+            .unwrap();
+        let mut stopped = false;
+        let mut new = None;
+        while !stopped || new.is_none() {
+            let (request, command) = self.worker.next_command().await;
+            match command {
+                HubToWorker::SessionStop(stop) => {
+                    assert_eq!(stop.session_id, old);
+                    self.worker
+                        .respond_ok(&request, &serde_json::json!({}))
+                        .await;
+                    stopped = true;
+                }
+                HubToWorker::SessionStart(start) => {
+                    self.worker
+                        .respond_ok(
+                            &request,
+                            &SessionStartResult {
+                                workspace_path: "/tmp/workspace-2".to_owned(),
+                                native_ref: None,
+                            },
+                        )
+                        .await;
+                    new = Some(start.session_id);
+                }
+                other => panic!("unexpected command {}", other.type_name()),
+            }
+        }
+        new.unwrap()
+    }
+
+    /// Waits until the hub shows the worker in this state.
+    pub async fn wait_worker(&mut self, id: WorkerId, state: consort_proto::model::WorkerState) {
+        let deadline = tokio::time::Instant::now() + WAIT;
+        loop {
+            let workers: consort_proto::client_api::WorkerListResult = self
+                .client
+                .request(consort_proto::client_api::WorkerList {})
+                .await
+                .unwrap();
+            if worker_state(&workers.workers, id) == state {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the worker did not become {state:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// Waits for a notice in a thread (or the timeline) whose body holds
+    /// every one of `parts`.
+    pub async fn wait_notice(
+        &mut self,
+        thread: Option<consort_proto::ids::MessageId>,
+        parts: &[&str],
+    ) {
+        let deadline = tokio::time::Instant::now() + WAIT;
+        loop {
+            let notices = self.notices(thread).await;
+            if notices.iter().any(|n| parts.iter().all(|p| n.contains(p))) {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no notice with {parts:?} in {notices:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// The bodies of the notices in a thread, or in the timeline when
+    /// `thread` is `None`.
+    pub async fn notices(&mut self, thread: Option<consort_proto::ids::MessageId>) -> Vec<String> {
+        let page = self
+            .client
+            .request(consort_proto::client_api::MessageList {
+                channel_id: self.everything,
+                thread_root_id: thread,
+                before: None,
+                limit: Some(200),
+            })
+            .await
+            .unwrap();
+        page.messages
+            .into_iter()
+            .filter(|m| m.kind == consort_proto::model::MessageKind::Notice)
+            .map(|m| m.body)
+            .collect()
+    }
 }

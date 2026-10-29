@@ -1,10 +1,11 @@
 //! The worker WebSocket.
 
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket};
-use axum::extract::{State, WebSocketUpgrade};
+use axum::extract::{ConnectInfo, State, WebSocketUpgrade};
 use axum::response::Response;
 use consort_proto::auth::{PeerId, WorkerHello};
 use consort_proto::error::{ErrorBody, ErrorCode};
@@ -24,15 +25,19 @@ use crate::error::{HubError, Result};
 use crate::hub::Hub;
 use crate::link::WorkerLink;
 
-pub(crate) async fn worker_ws(State(hub): State<Hub>, upgrade: WebSocketUpgrade) -> Response {
+pub(crate) async fn worker_ws(
+    State(hub): State<Hub>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    upgrade: WebSocketUpgrade,
+) -> Response {
     upgrade
         .max_message_size(WS_MAX_FRAME)
         .max_frame_size(WS_MAX_FRAME)
-        .on_upgrade(move |socket| run_worker(hub, socket))
+        .on_upgrade(move |socket| run_worker(hub, socket, addr.ip()))
 }
 
-async fn run_worker(hub: Hub, mut socket: WebSocket) {
-    let Some(auth) = handshake(&hub, &mut socket, PeerKind::Worker).await else {
+async fn run_worker(hub: Hub, mut socket: WebSocket, peer_ip: IpAddr) {
+    let Some(auth) = handshake(&hub, &mut socket, PeerKind::Worker, peer_ip).await else {
         return;
     };
     let PeerId::Worker(worker_id) = auth.peer else {

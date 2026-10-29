@@ -334,8 +334,14 @@ pub struct FetchTimelineArgs {
 /// `fetch_thread`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct FetchThreadArgs {
-    /// The thread root.
+    /// The thread root, or any reply in the thread.
     pub message_id: MessageId,
+    /// Only replies older than this reply. Use it to get the next page.
+    #[serde(default)]
+    pub before: Option<MessageId>,
+    /// The most replies to return. The default is 50 and the limit is 200.
+    #[serde(default)]
+    pub limit: Option<u32>,
 }
 
 /// `memory_write`.
@@ -425,6 +431,12 @@ pub struct ReadTaskArgs {
     /// Only session items after this item.
     #[serde(default)]
     pub since_item_id: Option<ItemId>,
+    /// Only session items older than this item. Use it to get the next page.
+    #[serde(default)]
+    pub before_item_id: Option<ItemId>,
+    /// The most items to return. The default is 50 and the limit is 200.
+    #[serde(default)]
+    pub limit: Option<u32>,
 }
 
 /// `interrupt_task` and `retry_task`.
@@ -654,7 +666,7 @@ hub_tools! {
         "Get older messages from the channel timeline, newest first."),
     /// `fetch_thread`.
     FetchThread("fetch_thread", FetchThreadArgs, COORDINATORS,
-        "Get a thread: the root message and its replies."),
+        "Get a thread: the root message and a page of its replies, oldest first. When has_more is true, older replies exist: call again with before set to the ID of the oldest reply that you got."),
     /// `memory_write`.
     MemoryWrite("memory_write", MemoryWriteArgs, COORDINATORS,
         "Write a memory note in your own memory. Give the sha256 that you read, or not_exists for a new note. If the note changed since you read it, the write fails with stale_write: read it again and retry."),
@@ -672,10 +684,10 @@ hub_tools! {
         "Send a message to a task. It starts a new turn, or steers the running turn when the harness can steer."),
     /// `list_tasks`.
     ListTasks("list_tasks", ListTasksArgs, COORDINATORS,
-        "List the tasks in this channel."),
+        "List the tasks in this channel. A long brief or review summary is cut to a preview here. Use read_task for the full task."),
     /// `read_task`.
     ReadTask("read_task", ReadTaskArgs, COORDINATORS,
-        "Read a task: its status, its recent session items and its review summary."),
+        "Read a task: its status, its review summary and a page of its recent session items, oldest first. When has_more is true, older items exist: call again with before_item_id set to the ID of the oldest item that you got."),
     /// `interrupt_task`.
     InterruptTask("interrupt_task", TaskIdArgs, COORDINATORS,
         "Stop the running turn of a task."),
@@ -975,8 +987,15 @@ pub struct FetchTimelineResult {
 pub struct FetchThreadResult {
     /// The root.
     pub root: Message,
-    /// The replies, oldest first.
+    /// A page of replies, oldest first: the newest replies that fit, or the
+    /// newest ones older than `before`.
     pub replies: Vec<Message>,
+    /// True when older replies exist than the oldest one in `replies`.
+    #[serde(default)]
+    pub has_more: bool,
+    /// The reply that `message_id` names, when it is not in `replies`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<Message>,
 }
 
 /// `memory_write` result.
@@ -1045,6 +1064,11 @@ pub struct ReadTaskResult {
     pub task: Task,
     /// Recent session items, oldest first.
     pub items: Vec<SessionItem>,
+    /// True when more items exist: newer ones after the last item when the
+    /// call gave `since_item_id`, and older ones before the first item
+    /// otherwise.
+    #[serde(default)]
+    pub has_more: bool,
 }
 
 /// `interrupt_task` and `retry_task` result.

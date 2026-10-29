@@ -121,6 +121,12 @@ pub struct SyncSnapshot {
 /// For a channel: that channel, its newest [`SNAPSHOT_MESSAGE_LIMIT`]
 /// timeline messages, its tasks that are not archived, its pending approvals
 /// and decisions, its routines and its channel files.
+///
+/// In both scopes, a long `brief` or `review_summary` of a task is cut to a
+/// short preview, and the task ID is in `tasks_cut`. Resolved tasks come
+/// last: the hub leaves out the oldest ones when the snapshot would not fit
+/// in one frame, and then sets `tasks_has_more`. Get one full task with
+/// `task.get`.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Snapshot {
@@ -146,6 +152,15 @@ pub struct Snapshot {
     pub messages_has_more: bool,
     /// Tasks.
     pub tasks: Vec<Task>,
+    /// The tasks in `tasks` whose `brief` or `review_summary` is cut to a
+    /// preview. Send `task.get` for the full task before you show the full
+    /// text. A feed entry for a task always holds the full task.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tasks_cut: Vec<TaskId>,
+    /// True when the snapshot left out older resolved tasks, so that it fits
+    /// in one frame. Send `task.get` for a task that is not in `tasks`.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub tasks_has_more: bool,
     /// Approvals.
     pub approvals: Vec<Approval>,
     /// Decisions.
@@ -913,6 +928,13 @@ pub struct TaskDelete {
     pub task_id: TaskId,
 }
 
+/// `task.get`: one task with its full brief and review summary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskGet {
+    /// The task.
+    pub task_id: TaskId,
+}
+
 /// `task.items`: a page of a task's session items, oldest first.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskItems {
@@ -1353,6 +1375,8 @@ message_family! {
         TaskArchive("task.archive", TaskArchive => TaskResult),
         /// Delete a task.
         TaskDelete("task.delete", TaskDelete => Empty),
+        /// Get one full task.
+        TaskGet("task.get", TaskGet => TaskResult),
         /// Load a task's session items.
         TaskItems("task.items", TaskItems => TaskItemsResult),
         /// Get an item's full data.
@@ -1848,6 +1872,7 @@ mod tests {
             }
             .into(),
             TaskDelete { task_id: tsk }.into(),
+            TaskGet { task_id: tsk }.into(),
             TaskItems {
                 task_id: tsk,
                 session_id: None,
@@ -2030,6 +2055,7 @@ mod tests {
             "task.interrupt",
             "task.archive",
             "task.delete",
+            "task.get",
             "task.items",
             "task.item_detail",
             "approval.answer",

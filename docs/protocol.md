@@ -46,6 +46,7 @@ The hub keeps every frame that it sends under 1 MiB. Limits count the bytes of a
 | A channel purpose | 4 KiB | The hub refuses it with `invalid` |
 | Channel instructions | 16 KiB | The hub refuses it with `invalid` |
 | A notice or a task status reason with text from a worker | 4 KiB | The hub cuts it and says so at the end |
+| A review summary (`submit_for_review`, or the last assistant message) | 16 KiB | The hub cuts it and says so at the end |
 | A message from a worker, for example the fallback post or the card of a request | 256 KiB | The hub cuts it and says so at the end |
 | A command to a worker | 1 MiB | The hub refuses to queue it, and the action fails with `invalid` |
 
@@ -97,7 +98,9 @@ The first client uses the setup code that the hub prints on its first start. To 
 4. The hub checks the signature against the stored public key. It answers `ok` with an empty body, or `unauthorized` and closes the connection.
 5. The peer sends `hello`. The hub answers with the protocol version. If the worker or client was revoked after step 4, the hub answers `unauthorized` and closes the connection.
 
-At most 64 connections can be between steps 1 and 5 at the same time. The hub closes a connection over that limit at once, with the WebSocket close code 1013. The peer tries again later.
+At most 64 connections can be between steps 1 and 5 at the same time, and at most 16 from one address (an IPv4 address, or an IPv6 /64 network). The hub closes a connection over a limit at once, with the WebSocket close code 1013. The peer tries again later. Behind a reverse proxy, every connection has the address of the proxy, so the limit of 16 then applies to all connections together.
+
+Steps 2 to 5 must end in 15 seconds in total. Pings and pongs do not make this time longer. When the time runs out, the hub closes the connection with the close code 1008.
 
 The origin is `scheme://host[:port]` of the hub URL, in lowercase, with `ws` read as `http` and `wss` as `https`, and without a default port, a path or a query. The peer takes it from the hub URL in its own configuration. The hub takes it from its configured public URL. So a peer cannot pass a challenge from one hub to another.
 
@@ -125,11 +128,11 @@ Every hub command is a request. The envelope `id` of a hub command is its comman
 |---|---|---|
 | `session.start` | `session_id`, `role`, `channel_id`, `task_id` (for a task session), `account_id`, `model`, `options`, `approval_mode`, `workspace` (see below), `system_prompt_append`, `allowed_local_mcp_servers`, `channel_files` (a list of `path` and `sha256`), optional `resume` with a `native_ref`, optional first `turn` | `workspace_path` and optional `native_ref` |
 | `session.turn` | `session_id`, `turn` (`text` and `attachments`) | `turn_id` |
-| `session.steer` | `session_id`, `turn` | None. The worker sends `policy_denied` if the harness cannot steer |
+| `session.steer` | `session_id`, `turn` | None. The worker sends `policy_denied` if the harness cannot steer. The worker refuses a steer when no turn runs, for example because the turn ended first. The hub does not lose the text of a refused steer (see [Delivery rules](#delivery-rules)) |
 | `session.interrupt` | `session_id` | None |
-| `session.respond` | `session_id`, `request_id`, `answer` (`option_id` and, for a question, `text`) | None |
+| `session.respond` | `session_id`, `request_id`, `answer` (`option_id` and, for a question, `text`) | None. `not_found` means that the harness has closed the request already: the hub shows the approval or decision as `canceled`, posts a notice, and lets `turn.ended` or the session state decide the task status. Any other refusal fails a task that waits on the answer, with Retry |
 | `session.stop` | `session_id`, `reason` | None |
-| `workspace.release` | `task_id`, `delete` (bool) | None |
+| `workspace.release` | `task_id`, `delete` (bool) | None. The hub sends it with `delete` true when a task is deleted, and when a resolved task is archived, to each worker that ran the task, after the `session.stop` of the task's session. It does not send it when a task is resolved, because Not done needs the workspace |
 | `item.detail` | `session_id`, `item_id` | `sha256`, `size` and `mime` of a blob with the full command output or diff |
 | `inventory.refresh` | Empty | None |
 
@@ -142,6 +145,8 @@ The `workspace` object of `session.start` has these fields:
 | `carry_uncommitted` | Copy uncommitted changes from the checkout into the worktree. Allowed only with `worktree` |
 
 A workspace with no repos is an empty folder in `workspaces/`. Coordinators usually run in one.
+
+The hub waits 60 minutes for the answer to `session.start`, because the worker prepares the workspace first and a clone can take 15 minutes. It waits 10 minutes for any other queued command. When the time runs out, the hub keeps the link open (the read loop closes a link only when the worker sends nothing, not even a ping, for 60 seconds) and sends the same command again. The worker runs a command ID once and answers when the first run ends.
 
 ### Session events
 
@@ -167,7 +172,21 @@ The worker cuts a session event to at most 192 KiB before it spools the event, a
 
 The worker runs a command ID once. When the hub sends a command again while the first run still goes on, the worker answers once, when the first run ends.
 
-New `error` event codes from the worker: `event_unreadable`, `event_too_large`, `harness_unresponsive` (a turn did not end 30 s after an interrupt, so the worker stopped the harness and reports the session lost), `start_failed` (a first turn failed, followed by the state `lost`), and `signed_out` (a turn failed because the harness login is gone).
+The `code` of an `error` event is one of these:
+
+| Code | From | Meaning |
+|---|---|---|
+| `event_unreadable` | Worker | The worker could not read a spool row. The event has the sequence number of that row |
+| `event_too_large` | Worker | An event was still larger than 192 KiB after the cut |
+| `start_failed` | Worker | The session could not start: the harness did not open, or the first turn failed. The state `lost` follows, and `session.start` gets an error |
+| `resume_failed` | Worker | After a worker restart, the worker could not open the session again. The state `lost` follows |
+| `harness_unresponsive` | Adapter | A turn did not end 30 s after an interrupt, or a request did not get an answer in time. The worker stopped the harness and reports the session lost |
+| `signed_out` | Adapter | A turn failed because the harness login is gone. The message says how to sign in again |
+| `option_failed` | ACP adapter | The harness refused a model option, for example the model or the effort. The session goes on with the harness default |
+| `elicitation_declined` | Codex adapter | An MCP server asked for input. The worker declined it, because Consort does not support MCP elicitation yet |
+| `codex_error` | Codex adapter | Codex reported an error that it will not retry |
+
+The hub stores each `error` event as a failed item of the session. After `signed_out`, the hub also marks the account `signed_out` in the stored inventory of the worker, so placement does not choose it until the next inventory from the worker. A coordinator session on that account ends as `lost`: its turn's events go back to the queue, and placement starts a new session on another signed-in account. When no account fits, the channel gets a notice that names the account and the worker to sign in on, and the events wait for the next inventory. A failed coordinator turn on an account that the inventory shows as signed out has the same result.
 
 The `details` of an approval request has a `kind` and the fields for that kind: `command` (`command`, `cwd`), `file_change` (`paths`), `tool` (`server`, `tool`, `arguments`), `network` (`target`) or `other` (`text`). The `details` of a question has `question`, `context` and `allow_free_text`. Each option has `id`, `label`, `kind` (`allow_once`, `allow_always`, `deny_once`, `deny_always` or `choice`) and an optional `description`.
 
@@ -180,7 +199,11 @@ The hub makes an approval for an approval request. It makes a decision with a `r
 - The worker sends batches of at most 256 events or 256 KiB.
 - On reconnect, `hello` lists the open sessions. The hub answers with its stored `last_seq` for each session, and the worker sends every event after that number.
 - The hub keeps commands for an offline worker in a per-session queue and sends them in order on reconnect. A queued command expires after 7 days. Then the hub ends its session as `lost`: a task fails with Retry, and the channel or the task thread gets a notice. An answer whose `session.respond` expired shows as `expired`.
-- When the hub ends a session that the worker can still run, it sends `session.stop`. For example: the hub marks a session `lost`, or the user retries a failed task.
+- When the hub ends a session that the worker can still run, it sends `session.stop`. For example: the hub marks a session `lost`, or the user retries a failed task. The hub deletes the other queued commands of that session first. Only a command that is in flight stays. When the session's `session.start` never went out, the hub deletes it and sends no `session.stop`, because the worker does not know the session.
+- Events of a session that has ended on the hub, or that is not the current session of its task (for example the old session of a retried task), are stored, but they do not change the task: a `turn.ended` does not move it and does not take its inbox, and a `request.opened` makes no approval or decision. A coordinator session that is not the current one of its channel opens no request either.
+- When the worker refuses a `session.steer`, the hub gives the text to the task in another way: while the hub sees the turn as open, the text waits in the task inbox; when the turn is closed, the text starts a new turn and a task in Ready for review goes back to Working. When the task cannot take it (it failed, or its session ended), the task thread gets a `message_not_sent` notice.
+- A task turn that sends no event for 2 hours while its worker is online fails the task with Retry, and the hub marks the session `lost`. A coordinator turn that runs for more than 2 hours makes the hub replace the session.
+- After a coordinator session fails to start, the channel waits before it starts a new one: 10 s after the first failure, then twice as long after each new failure, at most 10 minutes. A session that never became active does not start a new one by itself; the next wake event or a worker that comes online does.
 - While a task session has an open turn, a new message for the task steers the turn (when the worker is online and the harness can steer) or waits for the turn to end. The hub never sends a second `session.turn` while a turn is open, also not to an offline worker.
 - A coordinator turn holds as many queued events as fit in 512 KiB. The other events wait for the next turn. An event that alone does not fit is cut, with a note that names `fetch_thread` and the message ID. Task inbox messages split over turns in the same way.
 - The worker sends a WebSocket ping every 20 seconds. The hub marks the worker offline after 60 seconds with no frames.
@@ -244,14 +267,14 @@ The hub gives each session the tools for its role. Each tool's `input_schema` is
 | `react` | `message_id`, `emoji` | |
 | `no_reply_needed` | None | Ends the turn with no visible reply |
 | `fetch_timeline` | optional `before`, `limit` | Messages, newest first, and `has_more`. The page stops early when its messages would take more than 320 KiB |
-| `fetch_thread` | `message_id` | The root and its replies |
+| `fetch_thread` | `message_id` (the root or any reply), optional `before` and `limit` | `root`, a page of `replies` (oldest first), `has_more`, and `message`: the reply that `message_id` names, when it is not in `replies`. All of it takes at most 320 KiB. The named reply is always whole. A long root is cut when the call names a reply, and the newest reply is cut when it alone does not fit. A cut message ends with a note that names its ID. With `before`, the page has the replies older than that reply, and no `message`. The default `limit` is 50, and the limit is 200 |
 | `memory_write` | `path`, `content`, `expected_sha256` or `"not_exists"` | New `sha256`, or `stale_write` |
 | `memory_delete` | `path`, `expected_sha256` | |
 | `files_write` | `path`, `content` | Text files only |
 | `start_task` | `title`, `brief`, optional `model_selection`, `worker_id`, `require`, `repos`, `isolation`, `approval_mode` and `start_at` (RFC 3339) | `task_id`, `status` and optional `status_reason` |
 | `message_task` | `task_id`, `body` | Starts a turn, or steers the running turn when the harness can steer. `delivery` is `turn`, `steer` or `queued` |
-| `list_tasks` | optional `status` | Tasks in this channel |
-| `read_task` | `task_id`, optional `since_item_id` | The task, its recent session items and its review summary |
+| `list_tasks` | optional `status` | Tasks in this channel. A brief or review summary longer than 1 KiB is cut to a preview |
+| `read_task` | `task_id`, optional `since_item_id`, `before_item_id` and `limit` | The full task, a page of its session items (oldest first) and `has_more`. The task and the items take at most 320 KiB. Without `since_item_id`, the page has the newest items, or the newest ones older than `before_item_id`, and `has_more` says that older items exist. With `since_item_id`, the page has the oldest items after it, and `has_more` says that newer items exist. The default `limit` is 50, and the limit is 200 |
 | `interrupt_task`, `retry_task` | `task_id` | |
 | `routine_list`, `routine_create`, `routine_update`, `routine_delete` | Routine fields | |
 | `suggest_memory` | `note`, `reason` | Channel coordinators only. Sends the note to the Everything coordinator as a global memory suggestion |
@@ -304,12 +327,24 @@ The client API uses the same frames, errors and authentication as the worker lin
 
 | Type | Body | Result |
 |---|---|---|
-| `sync.snapshot` | `scope`: `all` or a channel ID | The entities in that scope and the current feed `seq`. For `all`: every group, channel, repo, worker and read marker, every task that is not archived, the pending approvals and decisions, and every routine. For a channel: the channel, its newest 50 timeline messages (oldest first), its tasks that are not archived, its pending approvals and decisions, its routines and its channel files. Large messages can make the page shorter than 50. `messages_has_more` is true when older timeline messages exist |
+| `sync.snapshot` | `scope`: `all` or a channel ID | The entities in that scope and the current feed `seq`. For `all`: every group, channel, repo, worker and read marker, the tasks that are not archived, the pending approvals and decisions, and every routine. For a channel: the channel, its newest 50 timeline messages (oldest first), its tasks that are not archived, its pending approvals and decisions, its routines and its channel files. Large messages can make the page shorter than 50. `messages_has_more` is true when older timeline messages exist. See [Tasks in a snapshot](#tasks-in-a-snapshot) |
 | `sync.subscribe` | `after_seq`, optional `channel_ids` | `ok`. The hub then sends `feed` messages |
 | `feed` (from the hub) | `seq`, `at`, `channel_id`, `entity`, `entity_id`, `op` and `payload` | None. `payload` is `null` for `delete` |
 | `feed.skipped` (from the hub) | `seq`, `channel_id`, `entity` and `entity_id` | None. The hub could not send the entry `seq`, because it does not fit in one frame. The feed goes on after it. Get the entity again, for example with `message.list` or a new snapshot. A client that does not know this event ignores it |
 
 When a channel is deleted, the feed has a `delete` for each entity of the channel that a client can hold (messages, read markers, tasks, session items, approvals, decisions, routines, channel files and memory notes), and then one for the channel.
+
+#### Tasks in a snapshot
+
+A snapshot cuts the `brief` and the `review_summary` of a task to a preview of 1 KiB when they are longer, and puts the task ID in `tasks_cut`. Every task that is not resolved is in the snapshot. Resolved tasks follow, newest first, while the snapshot fits in one frame. When some resolved tasks do not fit, `tasks_has_more` is true. The two fields are left out when they are empty or false.
+
+A client does this:
+
+1. For a task in `tasks_cut`, mark its `brief` and `review_summary` as previews. Show the preview in lists and on task cards.
+2. Before you show the full brief or review summary of a task with previews, for example in the task thread header or the review bar, send `task.get`. Its result has the full task. A feed entry for a task also has the full task, so it ends the preview state.
+3. When `tasks_has_more` is true, a task card in the timeline can name a task that is not in the snapshot. Send `task.get` for it.
+
+A client that does not know these fields shows the preview, which ends with a note that says that the hub cut it.
 
 ### Requests
 
@@ -317,7 +352,7 @@ When a channel is deleted, the feed has a `delete` for each entity of the channe
 |---|---|
 | Channels and groups | `channel.create`, `channel.update`, `channel.archive` (with `archived`, default true), `channel.delete`, `channel.move`, `group.create`, `group.update`, `group.delete`, `group.reorder`, `repo.create` |
 | Messages | `message.send` (with `client_message_id`), `message.list` (a page of a timeline or a thread, newest first; the page stops early when its messages would take more than 768 KiB, and `has_more` is then true), `message.edit`, `message.delete`, `message.react`, `message.search`, `read.mark` |
-| Tasks | `task.create`, `task.update`, `task.resolve`, `task.reopen`, `task.retry`, `task.interrupt`, `task.archive` (with `archived`, default true), `task.delete`, `task.items`, `task.item_detail` (with `session_id` and `item_id`) |
+| Tasks | `task.create`, `task.update`, `task.get` (with `task_id`: the full task), `task.resolve`, `task.reopen`, `task.retry`, `task.interrupt`, `task.archive` (with `archived`, default true; archiving a resolved task stops its session and deletes its workspace), `task.delete`, `task.items`, `task.item_detail` (with `session_id` and `item_id`) |
 | Waiting on the user | `approval.answer`, `decision.answer` |
 | Memory | `memory.list`, `memory.read`, `memory.write`, `memory.delete`, `memory.history` |
 | Channel files | `files.list`, `files.put` (after a blob upload), `files.move`, `files.delete` |

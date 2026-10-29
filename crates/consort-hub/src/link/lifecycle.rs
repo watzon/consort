@@ -8,14 +8,14 @@ use consort_proto::model::{
     ApprovalStatus, DecisionStatus, Inventory, SessionRole, SessionState, WorkerState,
 };
 use consort_proto::status::{Actor, TaskStatus};
-use consort_proto::worker_link::SessionStartResult;
+use consort_proto::worker_link::{SessionRespond, SessionStartResult, SessionSteer};
 
-use super::events::{Ctx, Effects, finish_session};
+use super::events::{Ctx, Effects, finish_session, mark_lost_in_tx};
 use crate::error::{HubError, Result};
 use crate::hub::{HUB_VERSION, Hub};
-use crate::ops::flow::transition;
+use crate::ops::flow::{deliver_without_steer, transition};
 use crate::store::coordinator as coord_store;
-use crate::store::{machine, work};
+use crate::store::{Tx, machine, work};
 
 impl Hub {
     /// Records a worker's hello. Returns the answer, and the sessions that the
@@ -205,204 +205,10 @@ impl Hub {
     }
 
     // Results of commands ------------------------------------------------
-
-    pub(crate) async fn on_session_started(
-        &self,
-        session_id: SessionId,
-        started: SessionStartResult,
-    ) -> Result<()> {
-        self.store
-            .write(move |tx| {
-                let Some(mut session) = work::session(tx.db(), session_id)? else {
-                    return Ok(());
-                };
-                session.workspace_path = started.workspace_path;
-                if let Some(native) = started.native_ref {
-                    session.native_ref = Some(native);
-                }
-                if session.state == SessionState::Starting {
-                    session.state = SessionState::Active;
-                }
-                tx.save_session(&session)
-            })
-            .await
-    }
-
-    /// The worker could not start a session.
-    pub(crate) async fn on_session_start_failed(
-        &self,
-        session_id: SessionId,
-        error: ErrorBody,
-    ) -> Result<()> {
-        let hub = self.clone();
-        let fx = self
-            .store
-            .write(move |tx| {
-                let Some(session) = work::session(tx.db(), session_id)? else {
-                    return Ok(Effects::default());
-                };
-                let mut ctx = Ctx::load(&hub, tx, session_id)?;
-                ctx.session.end_reason = Some(error.message.clone());
-                let was_final = ctx.session.state.is_final();
-                if !was_final {
-                    finish_session(tx, &mut ctx, SessionState::Lost)?;
-                }
-                if session.role == SessionRole::Coordinator {
-                    // Do not kick: a start that fails would fail again at once.
-                    ctx.fx.kick.clear();
-                    tx.post_notice(
-                        session.channel_id,
-                        None,
-                        None,
-                        "assistant_unavailable",
-                        &format!("The assistant could not start: {}", error.message),
-                    )?;
-                } else {
-                    // The task failed in finish_session. Give the reason in
-                    // the worker's words. `persist` saves it.
-                    ctx.set_failed_reason(format!(
-                        "The session could not start: {}",
-                        error.message
-                    ));
-                }
-                ctx.persist(tx)?;
-                Ok(ctx.fx)
-            })
-            .await?;
-        self.run_effects(fx);
-        Ok(())
-    }
-
-    /// The worker refused a `session.turn`.
-    pub(crate) async fn on_turn_command_failed(
-        &self,
-        session_id: SessionId,
-        error: ErrorBody,
-    ) -> Result<()> {
-        let session_gone = error.code == ErrorCode::NotFound;
-        if session_gone {
-            return self.mark_session_lost(session_id, &error.message).await;
-        }
-        let hub = self.clone();
-        let fx = self
-            .store
-            .write(move |tx| {
-                let Some(session) = work::session(tx.db(), session_id)? else {
-                    return Ok(Effects::default());
-                };
-                let mut fx = Effects::default();
-                match session.role {
-                    SessionRole::Coordinator => {
-                        let mut row = coord_store::coordinator(tx.db(), session.channel_id)?;
-                        if row.session_id == Some(session_id) && row.turn_open {
-                            if !row.turn_events.is_empty() {
-                                tx.requeue_wakes_first(session.channel_id, &row.turn_events)?;
-                            }
-                            row.turn_open = false;
-                            row.turn_events.clear();
-                            tx.save_coordinator(&row)?;
-                            tx.post_notice(
-                                session.channel_id,
-                                None,
-                                None,
-                                "assistant_unavailable",
-                                &format!(
-                                    "The assistant did not take your message: {}",
-                                    error.message
-                                ),
-                            )?;
-                        }
-                        let mut runtime = work::session_runtime(tx.db(), session_id)?;
-                        runtime.turn_open = false;
-                        tx.save_session_runtime(session_id, &runtime)?;
-                    }
-                    SessionRole::Task => {
-                        if let Some(task) = session
-                            .task_id
-                            .map(|t| work::task(tx.db(), t))
-                            .transpose()?
-                            .flatten()
-                        {
-                            tx.post_notice(
-                                task.channel_id,
-                                Some(task.card_message_id),
-                                Some(task.id),
-                                "message_not_sent",
-                                &format!("The task did not take the message: {}", error.message),
-                            )?;
-                        }
-                        let mut runtime = work::session_runtime(tx.db(), session_id)?;
-                        runtime.turn_open = false;
-                        tx.save_session_runtime(session_id, &runtime)?;
-                    }
-                }
-                let _ = &hub;
-                fx.pump.clear();
-                Ok(fx)
-            })
-            .await?;
-        self.run_effects(fx);
-        Ok(())
-    }
-
-    /// The worker refused a `session.respond`. The harness will not go on
-    /// with that request, so a task that waits on it fails, and the user can
-    /// retry it. Without this, the task would stay in Working for ever.
-    pub(crate) async fn on_answer_command_failed(
-        &self,
-        session_id: SessionId,
-        error: ErrorBody,
-    ) -> Result<()> {
-        let kick = self
-            .store
-            .write(move |tx| {
-                let Some(session) = work::session(tx.db(), session_id)? else {
-                    return Ok(None);
-                };
-                let task = session
-                    .task_id
-                    .map(|t| work::task(tx.db(), t))
-                    .transpose()?
-                    .flatten();
-                let (root, task_id) = task
-                    .as_ref()
-                    .map_or((None, None), |t| (Some(t.card_message_id), Some(t.id)));
-                let text = format!("The session did not take your answer: {}", error.message);
-                tx.post_notice(
-                    session.channel_id,
-                    root,
-                    task_id,
-                    "answer_not_delivered",
-                    &text,
-                )?;
-                let Some(mut task) = task else {
-                    return Ok(None);
-                };
-                let waits = task.current_session_id == Some(session_id)
-                    && matches!(task.status, TaskStatus::Working | TaskStatus::NeedsInput);
-                if !waits {
-                    return Ok(None);
-                }
-                let reason = format!("{text} Retry the task.");
-                if transition(
-                    tx,
-                    &mut task,
-                    TaskStatus::Failed,
-                    Actor::System,
-                    Some(reason),
-                    None,
-                )? {
-                    tx.save_task(&task)?;
-                    return Ok(Some(task.channel_id));
-                }
-                Ok(None)
-            })
-            .await?;
-        if let Some(channel_id) = kick {
-            self.kick_coordinator(channel_id);
-        }
-        Ok(())
-    }
+    //
+    // These run inside the transaction that takes the command from the
+    // queue (see `link::commands`), so a result that arrives twice changes
+    // the hub once.
 
     /// Ends the session of a queued command that expired. The worker was
     /// away for 7 days, so the hub stops waiting: the session is lost, its
@@ -489,6 +295,267 @@ impl Hub {
     pub(crate) fn recover(&self) {
         self.retry_waiting_work();
     }
+}
+
+/// The worker started a session.
+pub(crate) fn session_started_tx(
+    tx: &mut Tx<'_>,
+    session_id: SessionId,
+    started: SessionStartResult,
+) -> Result<Effects> {
+    let mut fx = Effects::default();
+    let Some(mut session) = work::session(tx.db(), session_id)? else {
+        return Ok(fx);
+    };
+    session.workspace_path = started.workspace_path;
+    if let Some(native) = started.native_ref {
+        session.native_ref = Some(native);
+    }
+    if session.state == SessionState::Starting {
+        session.state = SessionState::Active;
+    }
+    tx.save_session(&session)?;
+    if session.role == SessionRole::Coordinator {
+        fx.start_ok.push(session.channel_id);
+    }
+    Ok(fx)
+}
+
+/// The worker could not start a session.
+pub(crate) fn session_start_failed_tx(
+    hub: &Hub,
+    tx: &mut Tx<'_>,
+    session_id: SessionId,
+    error: ErrorBody,
+) -> Result<Effects> {
+    let Some(session) = work::session(tx.db(), session_id)? else {
+        return Ok(Effects::default());
+    };
+    let mut ctx = Ctx::load(hub, tx, session_id)?;
+    ctx.session.end_reason = Some(error.message.clone());
+    if !ctx.session.state.is_final() {
+        finish_session(tx, &mut ctx, SessionState::Lost)?;
+    }
+    if session.role == SessionRole::Coordinator {
+        // Do not kick: a start that fails would fail again at once. The
+        // channel waits longer before each new try.
+        ctx.fx.kick.clear();
+        ctx.fx.start_failed.push(session.channel_id);
+        tx.post_notice(
+            session.channel_id,
+            None,
+            None,
+            "assistant_unavailable",
+            &format!("The assistant could not start: {}", error.message),
+        )?;
+    } else {
+        // The task failed in finish_session. Give the reason in the
+        // worker's words. `persist` saves it.
+        ctx.set_failed_reason(format!("The session could not start: {}", error.message));
+    }
+    ctx.persist(tx)?;
+    Ok(ctx.fx)
+}
+
+/// The worker refused a `session.turn`.
+pub(crate) fn turn_command_failed_tx(
+    hub: &Hub,
+    tx: &mut Tx<'_>,
+    session_id: SessionId,
+    error: ErrorBody,
+) -> Result<Effects> {
+    let Some(session) = work::session(tx.db(), session_id)? else {
+        return Ok(Effects::default());
+    };
+    if error.code == ErrorCode::NotFound {
+        // The worker does not have the session.
+        let mut ctx = Ctx::load(hub, tx, session_id)?;
+        mark_lost_in_tx(hub, tx, &mut ctx, &error.message)?;
+        return Ok(ctx.fx);
+    }
+    match session.role {
+        SessionRole::Coordinator => {
+            let mut row = coord_store::coordinator(tx.db(), session.channel_id)?;
+            if row.session_id == Some(session_id) && row.turn_open {
+                if !row.turn_events.is_empty() {
+                    tx.requeue_wakes_first(session.channel_id, &row.turn_events)?;
+                }
+                row.turn_open = false;
+                row.turn_events.clear();
+                tx.save_coordinator(&row)?;
+                tx.post_notice(
+                    session.channel_id,
+                    None,
+                    None,
+                    "assistant_unavailable",
+                    &format!("The assistant did not take your message: {}", error.message),
+                )?;
+            }
+        }
+        SessionRole::Task => {
+            if let Some(task) = session
+                .task_id
+                .map(|t| work::task(tx.db(), t))
+                .transpose()?
+                .flatten()
+            {
+                tx.post_notice(
+                    task.channel_id,
+                    Some(task.card_message_id),
+                    Some(task.id),
+                    "message_not_sent",
+                    &format!("The task did not take the message: {}", error.message),
+                )?;
+            }
+        }
+    }
+    let mut runtime = work::session_runtime(tx.db(), session_id)?;
+    runtime.turn_open = false;
+    tx.save_session_runtime(session_id, &runtime)?;
+    Ok(Effects::default())
+}
+
+/// The worker refused a `session.steer`, for example because the turn
+/// ended on the worker before the steer arrived. The text must still reach
+/// the task: it waits in the inbox while the hub sees the turn open, or it
+/// starts a new turn. When the task cannot take it, the thread gets a
+/// `message_not_sent` notice.
+pub(crate) fn steer_command_failed_tx(
+    hub: &Hub,
+    tx: &mut Tx<'_>,
+    steer: &SessionSteer,
+    error: &ErrorBody,
+) -> Result<Effects> {
+    let mut fx = Effects::default();
+    let Some(session) = work::session(tx.db(), steer.session_id)? else {
+        return Ok(fx);
+    };
+    let Some(task) = session
+        .task_id
+        .map(|t| work::task(tx.db(), t))
+        .transpose()?
+        .flatten()
+    else {
+        tracing::warn!(session_id = %session.id, %error, "a worker refused a steer for a session with no task");
+        return Ok(fx);
+    };
+    let result = if task.current_session_id == Some(session.id) {
+        deliver_without_steer(hub, tx, task.id, &steer.turn.text, Actor::User)
+    } else {
+        Err(HubError::conflict("The session of this task has ended."))
+    };
+    match result {
+        Ok(delivered) => {
+            fx.pump.push(delivered.worker_id);
+            if delivered.status_changed {
+                fx.kick.push(task.channel_id);
+            }
+        }
+        Err(HubError::Api(refusal)) => {
+            tx.post_notice(
+                task.channel_id,
+                Some(task.card_message_id),
+                Some(task.id),
+                "message_not_sent",
+                &format!(
+                    "The task did not take your message: {} {}",
+                    error.message, refusal.message
+                ),
+            )?;
+        }
+        Err(other) => return Err(other),
+    }
+    Ok(fx)
+}
+
+/// The worker refused a `session.respond`.
+///
+/// With `not_found`, the harness has closed the request already, for
+/// example because the turn ended or the request timed out on its side. The
+/// approval or decision shows Canceled, and the thread gets a notice. The
+/// task status does not change here: `turn.ended` or the session state
+/// decides it.
+///
+/// With any other error, the harness will not go on with that request, so a
+/// task that waits on it fails, and the user can retry it. Without this, the
+/// task would stay in Working for ever.
+pub(crate) fn answer_command_failed_tx(
+    tx: &mut Tx<'_>,
+    respond: &SessionRespond,
+    error: &ErrorBody,
+) -> Result<Effects> {
+    let mut fx = Effects::default();
+    let session_id = respond.session_id;
+    let Some(session) = work::session(tx.db(), session_id)? else {
+        return Ok(fx);
+    };
+    let task = session
+        .task_id
+        .map(|t| work::task(tx.db(), t))
+        .transpose()?
+        .flatten();
+    let (root, task_id) = task
+        .as_ref()
+        .map_or((None, None), |t| (Some(t.card_message_id), Some(t.id)));
+    if error.code == ErrorCode::NotFound {
+        if let Some(mut approval) =
+            work::approval_by_request(tx.db(), session_id, &respond.request_id)?
+            && matches!(
+                approval.status,
+                ApprovalStatus::Allowed | ApprovalStatus::Denied
+            )
+        {
+            approval.status = ApprovalStatus::Canceled;
+            tx.save_approval(&approval)?;
+        }
+        if let Some(mut decision) =
+            work::decision_by_request(tx.db(), session_id, &respond.request_id)?
+            && decision.status == DecisionStatus::Answered
+        {
+            decision.status = DecisionStatus::Canceled;
+            tx.save_decision(&decision)?;
+        }
+        tx.post_notice(
+            session.channel_id,
+            root,
+            task_id,
+            "answer_not_delivered",
+            &format!(
+                "The session did not take your answer, because the request was already closed: {}",
+                error.message
+            ),
+        )?;
+        return Ok(fx);
+    }
+    let text = format!("The session did not take your answer: {}", error.message);
+    tx.post_notice(
+        session.channel_id,
+        root,
+        task_id,
+        "answer_not_delivered",
+        &text,
+    )?;
+    let Some(mut task) = task else {
+        return Ok(fx);
+    };
+    let waits = task.current_session_id == Some(session_id)
+        && matches!(task.status, TaskStatus::Working | TaskStatus::NeedsInput);
+    if !waits {
+        return Ok(fx);
+    }
+    let reason = format!("{text} Retry the task.");
+    if transition(
+        tx,
+        &mut task,
+        TaskStatus::Failed,
+        Actor::System,
+        Some(reason),
+        None,
+    )? {
+        tx.save_task(&task)?;
+        fx.kick.push(task.channel_id);
+    }
+    Ok(fx)
 }
 
 #[cfg(test)]

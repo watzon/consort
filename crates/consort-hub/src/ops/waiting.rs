@@ -26,7 +26,7 @@ impl Hub {
                     .ok_or_else(|| HubError::not_found("The approval does not exist."))?;
                 if approval.status != ApprovalStatus::Pending {
                     return Err(HubError::conflict(
-                        "This approval was already answered or closed. Reload to see its state.",
+                        "This approval is already answered or closed, so it takes no more answers.",
                     ));
                 }
                 let option = approval
@@ -80,7 +80,7 @@ impl Hub {
                     .ok_or_else(|| HubError::not_found("The decision does not exist."))?;
                 if decision.status != DecisionStatus::Pending {
                     return Err(HubError::conflict(
-                        "This decision was already answered or closed. Reload to see its state.",
+                        "This decision is already answered or closed, so it takes no more answers.",
                     ));
                 }
                 decision.check_answer(&request.answer)?;

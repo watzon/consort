@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use consort_proto::ids::{ChannelId, SessionId};
 use consort_proto::model::{
@@ -16,12 +17,13 @@ use consort_proto::model::{
 };
 use consort_proto::turn_input::{WakeEvent, render_events};
 use consort_proto::worker_link::{
-    HubToWorker, SessionStart, SessionStop, SessionTurn, TurnInput, WorkspaceSpec,
+    HubToWorker, SessionStart, SessionTurn, TurnInput, WorkspaceSpec,
 };
 
 use crate::error::Result;
 use crate::hub::Hub;
 use crate::limits::{TURN_TEXT_MAX_BYTES, TURN_TEXT_MIN_BYTES, json_len, turn_room};
+use crate::link::events::{Effects, queue_stop};
 use crate::placement::{PlacementInput, Subject, place};
 use crate::prompts;
 use crate::store::coordinator::{self as coord_store, CoordinatorRow};
@@ -29,6 +31,31 @@ use crate::store::work::{self, SessionRuntime};
 use crate::store::{conversation, knowledge, machine};
 
 const CONTEXT_MESSAGES: usize = 50;
+/// The wait after the first failed start of a coordinator session.
+const START_BACKOFF_FIRST: Duration = Duration::from_secs(10);
+/// The longest wait between two starts of a coordinator session.
+const START_BACKOFF_MAX: Duration = Duration::from_secs(10 * 60);
+
+/// The wait before the next start after `failures` failed starts in a row:
+/// 10 s, then twice as long after each new failure, at most 10 minutes.
+pub(crate) fn start_backoff(failures: u32) -> Duration {
+    if failures == 0 {
+        return Duration::ZERO;
+    }
+    let factor = 2_u32.saturating_pow(failures - 1);
+    START_BACKOFF_FIRST
+        .saturating_mul(factor)
+        .min(START_BACKOFF_MAX)
+}
+
+/// The failed starts of one channel's coordinator.
+#[derive(Debug, Clone, Copy)]
+struct StartFailures {
+    count: u32,
+    last: Instant,
+    /// A run is scheduled for the end of the wait.
+    retry_scheduled: bool,
+}
 
 #[derive(Default)]
 pub struct Coordinators {
@@ -38,6 +65,9 @@ pub struct Coordinators {
     locks: Mutex<HashMap<ChannelId, Arc<tokio::sync::Mutex<()>>>>,
     /// The last notice per channel, so the hub does not post the same one twice.
     notices: Mutex<HashMap<ChannelId, String>>,
+    /// Failed starts per channel, for the backoff. They live in memory, so
+    /// a hub restart tries again at once.
+    start_failures: Mutex<HashMap<ChannelId, StartFailures>>,
 }
 
 impl Coordinators {
@@ -82,6 +112,49 @@ impl Coordinators {
     fn clear_notice(&self, channel_id: ChannelId) {
         if let Ok(mut notices) = self.notices.lock() {
             notices.remove(&channel_id);
+        }
+    }
+
+    /// Records a failed start of a coordinator session in a channel.
+    pub(crate) fn start_failed(&self, channel_id: ChannelId) {
+        if let Ok(mut failures) = self.start_failures.lock() {
+            let entry = failures.entry(channel_id).or_insert(StartFailures {
+                count: 0,
+                last: Instant::now(),
+                retry_scheduled: false,
+            });
+            entry.count = entry.count.saturating_add(1);
+            entry.last = Instant::now();
+        }
+    }
+
+    /// Records that a coordinator session in a channel started.
+    pub(crate) fn start_worked(&self, channel_id: ChannelId) {
+        if let Ok(mut failures) = self.start_failures.lock() {
+            failures.remove(&channel_id);
+        }
+    }
+
+    /// How long the channel must still wait before it starts a new session.
+    /// `None` when it may start now. When it must wait and no run is
+    /// scheduled yet, the second value is true: the caller schedules one.
+    fn start_wait(&self, channel_id: ChannelId, now: Instant) -> Option<(Duration, bool)> {
+        let mut failures = self.start_failures.lock().ok()?;
+        let entry = failures.get_mut(&channel_id)?;
+        let until = entry.last + start_backoff(entry.count);
+        if now >= until {
+            return None;
+        }
+        let schedule = !entry.retry_scheduled;
+        entry.retry_scheduled = true;
+        Some((until - now, schedule))
+    }
+
+    fn retry_ran(&self, channel_id: ChannelId) {
+        if let Ok(mut failures) = self.start_failures.lock()
+            && let Some(entry) = failures.get_mut(&channel_id)
+        {
+            entry.retry_scheduled = false;
         }
     }
 }
@@ -298,7 +371,21 @@ impl Hub {
             return Ok(());
         }
 
-        // No healthy session: place a new one.
+        // No healthy session: place a new one. After failed starts, the
+        // channel waits first. A run at the end of the wait takes the events
+        // that came in the meantime.
+        if let Some((wait, schedule)) = self.coordinators.start_wait(channel_id, Instant::now()) {
+            if schedule {
+                tracing::info!(channel_id = %channel_id, wait_ms = wait.as_millis(), "the coordinator failed to start before, so the hub waits before it tries again");
+                let hub = self.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(wait).await;
+                    hub.coordinators.retry_ran(channel_id);
+                    hub.kick_coordinator(channel_id);
+                });
+            }
+            return Ok(());
+        }
         let selection = inputs
             .channel
             .effective_coordinator_selection(&inputs.everything)
@@ -451,38 +538,32 @@ impl Hub {
         channel_id: ChannelId,
         session_id: SessionId,
     ) -> Result<()> {
-        let worker = self
+        let hub = self.clone();
+        let fx = self
             .store
             .write(move |tx| {
+                let mut fx = Effects::default();
                 let Some(mut session) = work::session(tx.db(), session_id)? else {
-                    return Ok(None);
+                    return Ok(fx);
                 };
                 let mut row = coord_store::coordinator(tx.db(), channel_id)?;
                 if row.turn_open || row.session_id != Some(session_id) {
-                    return Ok(None);
+                    return Ok(fx);
                 }
                 row.session_id = None;
                 tx.save_coordinator(&row)?;
                 if !session.state.is_final() {
+                    let reason = "The channel settings changed.";
                     session.state = SessionState::Ended;
                     session.ended_at = Some(tx.now());
-                    session.end_reason = Some("The channel settings changed.".to_owned());
+                    session.end_reason = Some(reason.to_owned());
                     tx.save_session(&session)?;
-                    tx.queue_command(
-                        session.worker_id,
-                        &HubToWorker::SessionStop(SessionStop {
-                            session_id,
-                            reason: "The channel settings changed.".to_owned(),
-                        }),
-                    )?;
-                    return Ok(Some(session.worker_id));
+                    queue_stop(&hub, tx, &mut fx, &session, reason)?;
                 }
-                Ok(None)
+                Ok(fx)
             })
             .await?;
-        if let Some(worker_id) = worker {
-            self.pump_worker(worker_id);
-        }
+        self.run_effects(fx);
         Ok(())
     }
 
@@ -628,6 +709,38 @@ mod tests {
             at: Timestamp::now(),
             text: text.to_owned(),
         }
+    }
+
+    #[test]
+    fn the_start_backoff_doubles_up_to_ten_minutes() {
+        assert_eq!(start_backoff(0), Duration::ZERO);
+        assert_eq!(start_backoff(1), Duration::from_secs(10));
+        assert_eq!(start_backoff(2), Duration::from_secs(20));
+        assert_eq!(start_backoff(3), Duration::from_secs(40));
+        assert_eq!(start_backoff(7), Duration::from_secs(600));
+        assert_eq!(start_backoff(u32::MAX), Duration::from_secs(600));
+    }
+
+    #[test]
+    fn a_channel_waits_after_a_failed_start_and_schedules_one_run() {
+        let coordinators = Coordinators::default();
+        let channel = ChannelId::new();
+        let now = Instant::now();
+        assert!(coordinators.start_wait(channel, now).is_none());
+        coordinators.start_failed(channel);
+        let (wait, schedule) = coordinators.start_wait(channel, Instant::now()).unwrap();
+        assert!(wait <= Duration::from_secs(10) && schedule);
+        // A second trigger in the wait schedules nothing more.
+        let (_, schedule) = coordinators.start_wait(channel, Instant::now()).unwrap();
+        assert!(!schedule);
+        // After the wait, the channel may start.
+        assert!(
+            coordinators
+                .start_wait(channel, Instant::now() + Duration::from_secs(11))
+                .is_none()
+        );
+        coordinators.start_worked(channel);
+        assert!(coordinators.start_wait(channel, Instant::now()).is_none());
     }
 
     #[test]

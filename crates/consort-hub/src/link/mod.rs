@@ -43,6 +43,8 @@ pub(crate) struct WorkerLink {
     pub outbox: Outbox,
     /// Places for running tool calls. See [`MAX_TOOL_CALLS_PER_LINK`].
     pub tool_calls: Arc<tokio::sync::Semaphore>,
+    /// When the connection finished its hello.
+    pub connected_at: Instant,
     pending: Mutex<Pending>,
     inflight: Mutex<HashSet<Option<SessionId>>>,
 }
@@ -54,6 +56,7 @@ impl WorkerLink {
             worker_id,
             outbox,
             tool_calls: Arc::new(tokio::sync::Semaphore::new(MAX_TOOL_CALLS_PER_LINK)),
+            connected_at: Instant::now(),
             pending: Mutex::new(HashMap::new()),
             inflight: Mutex::new(HashSet::new()),
         }
@@ -118,6 +121,11 @@ impl WorkerLink {
         self.inflight.lock().is_ok_and(|mut set| set.insert(key))
     }
 
+    /// True when a command of this queue key is in flight.
+    pub(crate) fn is_inflight(&self, key: Option<SessionId>) -> bool {
+        self.inflight.lock().is_ok_and(|set| set.contains(&key))
+    }
+
     pub(crate) fn clear_inflight(&self, key: Option<SessionId>) {
         if let Ok(mut set) = self.inflight.lock() {
             set.remove(&key);
@@ -155,6 +163,9 @@ pub struct Links {
     workers: Mutex<HashMap<WorkerId, std::sync::Arc<WorkerLink>>>,
     next_conn: AtomicU64,
     item_emit: Mutex<HashMap<(SessionId, ItemId), ItemEmit>>,
+    /// A shorter command timeout for unit tests.
+    #[cfg(test)]
+    pub(crate) command_timeout: Mutex<Option<Duration>>,
 }
 
 pub(crate) const ITEM_MERGE_WINDOW: Duration = Duration::from_millis(250);

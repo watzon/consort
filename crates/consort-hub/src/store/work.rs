@@ -222,6 +222,24 @@ pub fn open_session_counts(conn: &Connection) -> Result<HashMap<WorkerId, u32>> 
     Ok(out)
 }
 
+/// Task sessions that are not ended or lost and have an open turn, with
+/// their runtime.
+pub fn task_sessions_with_open_turn(conn: &Connection) -> Result<Vec<(Session, SessionRuntime)>> {
+    let sessions: Vec<Session> = list_docs(
+        conn,
+        "SELECT s.data FROM sessions s JOIN session_runtime r ON r.session_id = s.id
+         WHERE s.role = 'task' AND s.state NOT IN ('ended', 'lost') AND r.turn_open = 1
+         ORDER BY s.rowid",
+        [],
+    )?;
+    let mut out = Vec::with_capacity(sessions.len());
+    for session in sessions {
+        let runtime = session_runtime(conn, session.id)?;
+        out.push((session, runtime));
+    }
+    Ok(out)
+}
+
 /// Sessions of a task, oldest first.
 pub fn sessions_of_task(conn: &Connection, task_id: TaskId) -> Result<Vec<Session>> {
     list_docs(
@@ -246,12 +264,15 @@ pub struct SessionRuntime {
     /// A hash of the channel settings that the system prompt of this session
     /// was built from. A coordinator session is replaced when it changes.
     pub prompt_fingerprint: Option<String>,
+    /// The last sign of life of the session: an event batch, or a turn that
+    /// the hub opened. The stuck-turn check of task sessions reads it.
+    pub active_at: Option<Timestamp>,
 }
 
 pub fn session_runtime(conn: &Connection, id: SessionId) -> Result<SessionRuntime> {
     let row = conn
         .query_row(
-            "SELECT turn_id, turn_open, last_assistant_text, tools_called, review_summary, prompt_fingerprint
+            "SELECT turn_id, turn_open, last_assistant_text, tools_called, review_summary, prompt_fingerprint, active_at
              FROM session_runtime WHERE session_id = ?1",
             [id.to_string()],
             |row| {
@@ -262,6 +283,7 @@ pub fn session_runtime(conn: &Connection, id: SessionId) -> Result<SessionRuntim
                     row.get::<_, String>(3)?,
                     row.get::<_, Option<String>>(4)?,
                     row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
                 ))
             },
         )
@@ -273,6 +295,7 @@ pub fn session_runtime(conn: &Connection, id: SessionId) -> Result<SessionRuntim
         tools_called,
         review_summary,
         prompt_fingerprint,
+        active_at,
     )) = row
     else {
         return Ok(SessionRuntime::default());
@@ -284,6 +307,7 @@ pub fn session_runtime(conn: &Connection, id: SessionId) -> Result<SessionRuntim
         tools_called: serde_json::from_str(&tools_called)?,
         review_summary,
         prompt_fingerprint,
+        active_at: active_at.map(Timestamp::from_millis),
     })
 }
 
@@ -315,12 +339,12 @@ impl Tx<'_> {
 
     pub fn save_session_runtime(&mut self, id: SessionId, runtime: &SessionRuntime) -> Result<()> {
         self.db().execute(
-            "INSERT INTO session_runtime (session_id, turn_id, turn_open, last_assistant_text, tools_called, review_summary, prompt_fingerprint)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "INSERT INTO session_runtime (session_id, turn_id, turn_open, last_assistant_text, tools_called, review_summary, prompt_fingerprint, active_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(session_id) DO UPDATE SET turn_id = excluded.turn_id,
                 turn_open = excluded.turn_open, last_assistant_text = excluded.last_assistant_text,
                 tools_called = excluded.tools_called, review_summary = excluded.review_summary,
-                prompt_fingerprint = excluded.prompt_fingerprint",
+                prompt_fingerprint = excluded.prompt_fingerprint, active_at = excluded.active_at",
             params![
                 id.to_string(),
                 runtime.turn_id.as_ref().map(|t| t.as_str().to_owned()),
@@ -328,7 +352,8 @@ impl Tx<'_> {
                 runtime.last_assistant_text,
                 serde_json::to_string(&runtime.tools_called)?,
                 runtime.review_summary,
-                runtime.prompt_fingerprint
+                runtime.prompt_fingerprint,
+                runtime.active_at.map(|t| t.as_millis())
             ],
         )?;
         Ok(())
@@ -392,23 +417,36 @@ pub fn task_items(
     Ok((items, has_more))
 }
 
-/// The newest `limit` items of a task, oldest first.
-pub fn recent_task_items(
+/// Items of a task that are older than `before` (or the newest items when
+/// `before` is `None`), newest first, at most `limit`.
+pub fn task_items_before(
     conn: &Connection,
     task_id: TaskId,
+    before: Option<ItemId>,
     limit: usize,
 ) -> Result<Vec<SessionItem>> {
-    let mut items: Vec<SessionItem> = list_docs(
+    let before_rowid: i64 = match before {
+        Some(item) => conn
+            .query_row(
+                "SELECT si.rowid FROM session_items si JOIN sessions s ON s.id = si.session_id
+                 WHERE s.task_id = ?1 AND si.item_id = ?2",
+                params![task_id.to_string(), item.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| HubError::not_found(format!("The task has no item {item}.")))?,
+        None => i64::MAX,
+    };
+    list_docs(
         conn,
         "SELECT si.data FROM session_items si JOIN sessions s ON s.id = si.session_id
-         WHERE s.task_id = ?1 ORDER BY si.rowid DESC LIMIT ?2",
+         WHERE s.task_id = ?1 AND si.rowid < ?2 ORDER BY si.rowid DESC LIMIT ?3",
         params![
             task_id.to_string(),
+            before_rowid,
             i64::try_from(limit).unwrap_or(i64::MAX)
         ],
-    )?;
-    items.reverse();
-    Ok(items)
+    )
 }
 
 impl Tx<'_> {

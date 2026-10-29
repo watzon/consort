@@ -7,7 +7,7 @@ use rusqlite::Connection;
 
 use crate::error::{HubError, Result};
 
-pub const MIGRATIONS: &[&str] = &[include_str!("schema_v1.sql")];
+pub const MIGRATIONS: &[&str] = &[include_str!("schema_v1.sql"), include_str!("schema_v2.sql")];
 
 pub fn current_version() -> i64 {
     // The list is a constant with a handful of entries.

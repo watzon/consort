@@ -1,5 +1,5 @@
-//! Periodic work: due tasks, the feed retention, stuck turns and expired
-//! commands.
+//! Periodic work: due tasks, the feed retention, stuck coordinator turns,
+//! quiet task turns and expired commands.
 
 use std::time::Duration;
 
@@ -27,6 +27,9 @@ pub(crate) fn spawn(hub: &Hub) -> JoinHandle<()> {
             if ticks.is_multiple_of(60) {
                 if let Err(err) = hub.expire_stuck_turns(STUCK_TURN_MS).await {
                     tracing::warn!(error = %err, "could not check coordinator turns");
+                }
+                if let Err(err) = hub.expire_quiet_task_turns(STUCK_TURN_MS).await {
+                    tracing::warn!(error = %err, "could not check task turns");
                 }
                 if let Err(err) = hub.expire_queued_commands().await {
                     tracing::warn!(error = %err, "could not expire queued commands");

@@ -1,10 +1,11 @@
 //! The client WebSocket: handshake, requests, snapshots and the feed.
 
 use std::collections::HashSet;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket};
-use axum::extract::{State, WebSocketUpgrade};
+use axum::extract::{ConnectInfo, State, WebSocketUpgrade};
 use axum::response::Response;
 use consort_proto::auth::{ClientHello, ClientHelloResult, PeerId};
 use consort_proto::client_api::{
@@ -30,15 +31,19 @@ use crate::store::feed;
 const CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const BACKLOG_BATCH: usize = 500;
 
-pub(crate) async fn client_ws(State(hub): State<Hub>, upgrade: WebSocketUpgrade) -> Response {
+pub(crate) async fn client_ws(
+    State(hub): State<Hub>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    upgrade: WebSocketUpgrade,
+) -> Response {
     upgrade
         .max_message_size(WS_MAX_FRAME)
         .max_frame_size(WS_MAX_FRAME)
-        .on_upgrade(move |socket| run_client(hub, socket))
+        .on_upgrade(move |socket| run_client(hub, socket, addr.ip()))
 }
 
-async fn run_client(hub: Hub, mut socket: WebSocket) {
-    let Some(auth) = handshake(&hub, &mut socket, PeerKind::Client).await else {
+async fn run_client(hub: Hub, mut socket: WebSocket, peer_ip: IpAddr) {
+    let Some(auth) = handshake(&hub, &mut socket, PeerKind::Client, peer_ip).await else {
         return;
     };
     let PeerId::Client(client_id) = auth.peer else {

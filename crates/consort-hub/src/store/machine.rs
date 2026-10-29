@@ -279,6 +279,26 @@ pub fn commands_for_worker(conn: &Connection, worker_id: WorkerId) -> Result<Vec
     Ok(out)
 }
 
+/// The queued commands of one session in the order they were queued, each
+/// with whether the hub has sent it at least once.
+pub fn commands_for_session(
+    conn: &Connection,
+    session_id: SessionId,
+) -> Result<Vec<(QueuedCommand, bool)>> {
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {COMMAND_COLUMNS}, sent_at IS NOT NULL FROM commands WHERE session_id = ?1 ORDER BY rowid"
+    ))?;
+    let rows = stmt.query_map([session_id.to_string()], |row| {
+        Ok((command_from_row(row)?, row.get::<_, bool>(7)?))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (parts, sent) = row?;
+        out.push((command_from_parts(parts)?, sent));
+    }
+    Ok(out)
+}
+
 pub fn command(conn: &Connection, id: &FrameId) -> Result<Option<QueuedCommand>> {
     let row = conn
         .query_row(
@@ -313,6 +333,28 @@ impl Tx<'_> {
         self.db()
             .execute("DELETE FROM commands WHERE id = ?1", [id.as_str()])?;
         Ok(())
+    }
+
+    /// Deletes a command and returns whether it was still queued. The hub
+    /// handles a result only when this returns true, so a result that
+    /// arrives twice is handled once.
+    pub fn take_command(&mut self, id: &FrameId) -> Result<bool> {
+        let deleted = self
+            .db()
+            .execute("DELETE FROM commands WHERE id = ?1", [id.as_str()])?;
+        Ok(deleted > 0)
+    }
+
+    /// Records that the hub sends a command now. Returns false when the
+    /// command is no longer queued, for example because the worker answered
+    /// it or the hub ended its session in the meantime.
+    pub fn mark_command_sent(&mut self, id: &FrameId) -> Result<bool> {
+        let now = self.now().as_millis();
+        let updated = self.db().execute(
+            "UPDATE commands SET sent_at = ?1 WHERE id = ?2",
+            params![now, id.as_str()],
+        )?;
+        Ok(updated > 0)
     }
 
     /// Deletes commands that waited longer than their time to live. Returns

@@ -51,7 +51,7 @@ struct LimiterState {
 
 /// The key of an address: IPv4 as it is (also when mapped into IPv6), and
 /// the /64 network of an IPv6 address.
-fn limit_key(ip: IpAddr) -> IpAddr {
+pub(crate) fn limit_key(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
             Some(v4) => IpAddr::V4(v4),

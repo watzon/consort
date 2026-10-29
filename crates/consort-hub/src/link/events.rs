@@ -6,9 +6,9 @@ use std::time::Instant;
 
 use consort_proto::ids::{ApprovalId, ChannelId, DecisionId, ItemId, SessionId, WorkerId};
 use consort_proto::model::{
-    Approval, ApprovalStatus, Author, COMMAND_OUTPUT_TAIL_BYTES, Channel, Decision, DecisionOption,
-    DecisionStatus, ErrorPayload, ItemPayload, ItemStatus, MessageKind, Session, SessionItem,
-    SessionRole, SessionState, Task, tail_of,
+    Approval, ApprovalStatus, AuthState, Author, COMMAND_OUTPUT_TAIL_BYTES, Channel, Decision,
+    DecisionOption, DecisionStatus, ErrorPayload, ItemPayload, ItemStatus, MessageKind, Session,
+    SessionItem, SessionRole, SessionState, Task, tail_of,
 };
 use consort_proto::status::{Actor, TaskStatus};
 use consort_proto::tools::HubTool;
@@ -22,7 +22,10 @@ use consort_proto::worker_link::{
 use super::EmitNow;
 use crate::error::{HubError, Result};
 use crate::hub::Hub;
-use crate::limits::{MESSAGE_BODY_MAX_BYTES, TURN_TEXT_MAX_BYTES, cut_text, json_len};
+use crate::limits::{
+    MESSAGE_BODY_MAX_BYTES, NOTICE_TEXT_MAX_BYTES, REVIEW_SUMMARY_MAX_BYTES, TURN_TEXT_MAX_BYTES,
+    cut_text, json_len,
+};
 use crate::ops::flow::transition;
 use crate::ops::waiting::resume_if_nothing_waits;
 use crate::store::Tx;
@@ -31,6 +34,11 @@ use crate::store::coordinator as coord_store;
 use crate::store::work::{self, SessionRuntime};
 use crate::util::truncate_chars;
 
+/// The `code` of the error event that says that the harness account of a
+/// session is signed out. The worker sends it (`consort-harness` has the
+/// same constant).
+pub(crate) const SIGNED_OUT_CODE: &str = "signed_out";
+
 /// Work to do after the transaction commits.
 #[derive(Default)]
 pub(crate) struct Effects {
@@ -38,6 +46,11 @@ pub(crate) struct Effects {
     pub pump: Vec<WorkerId>,
     pub flush_items: Vec<(SessionId, ItemId, ChannelId, std::time::Duration)>,
     pub items_done: Vec<(SessionId, ItemId)>,
+    /// Channels whose coordinator session could not start. They wait
+    /// longer before the next start.
+    pub start_failed: Vec<ChannelId>,
+    /// Channels whose coordinator session started.
+    pub start_ok: Vec<ChannelId>,
 }
 
 impl Effects {
@@ -62,6 +75,8 @@ impl Effects {
         }
         self.flush_items.extend(other.flush_items);
         self.items_done.extend(other.items_done);
+        self.start_failed.extend(other.start_failed);
+        self.start_ok.extend(other.start_ok);
     }
 }
 
@@ -119,6 +134,34 @@ impl<'h> Ctx<'h> {
         }
     }
 
+    /// True when this session runs the task now: the task names it as its
+    /// current session, and the session has not ended. Events of an older
+    /// session (for example one that a retry replaced) must not change the
+    /// task.
+    fn drives_task(&self) -> bool {
+        !self.session.state.is_final()
+            && self
+                .task
+                .as_ref()
+                .is_some_and(|t| t.current_session_id == Some(self.session.id))
+    }
+
+    /// True when this session may open approvals and decisions and end
+    /// turns that change the hub: a task session that drives its task, or
+    /// the current coordinator session of the channel.
+    fn is_current(&self, tx: &Tx<'_>) -> Result<bool> {
+        if self.session.state.is_final() {
+            return Ok(false);
+        }
+        Ok(match self.session.role {
+            SessionRole::Task => self.drives_task(),
+            SessionRole::Coordinator => {
+                coord_store::coordinator(tx.db(), self.channel.id)?.session_id
+                    == Some(self.session.id)
+            }
+        })
+    }
+
     /// Moves the task of this session, if it has one.
     fn move_task(
         &mut self,
@@ -170,6 +213,12 @@ impl Hub {
     pub(crate) fn run_effects(&self, fx: Effects) {
         for (session, item) in fx.items_done {
             self.links.item_done(session, item);
+        }
+        for channel in fx.start_ok {
+            self.coordinators.start_worked(channel);
+        }
+        for channel in fx.start_failed {
+            self.coordinators.start_failed(channel);
         }
         for channel in fx.kick {
             self.kick_coordinator(channel);
@@ -241,6 +290,7 @@ fn apply_batch(
     events.dedup_by_key(|e| e.seq);
 
     let mut ctx = Ctx::load(hub, tx, batch.session_id)?;
+    ctx.runtime.active_at = Some(tx.now());
     // Only the newest copy of an item in a batch matters.
     let last_item_index: std::collections::HashMap<ItemId, usize> = events
         .iter()
@@ -298,6 +348,9 @@ fn apply_event(tx: &mut Tx<'_>, ctx: &mut Ctx<'_>, event: &SessionEvent) -> Resu
         }
         SessionEvent::Reopened => on_reopened(tx, ctx),
         SessionEvent::Error { code, message } => {
+            if code == SIGNED_OUT_CODE {
+                on_signed_out(tx, ctx, message)?;
+            }
             let item = SessionItem {
                 id: ItemId::new(),
                 session_id: ctx.session.id,
@@ -319,10 +372,11 @@ fn on_state(tx: &mut Tx<'_>, ctx: &mut Ctx<'_>, state: SessionState) -> Result<(
     if ctx.session.state.is_final() {
         return Ok(());
     }
-    ctx.session.state = state;
     if state.is_final() {
-        finish_session(tx, ctx, state)?;
+        // `finish_session` reads the state before this one.
+        return finish_session(tx, ctx, state);
     }
+    ctx.session.state = state;
     Ok(())
 }
 
@@ -367,6 +421,8 @@ pub(crate) fn finish_session(
     state: SessionState,
 ) -> Result<()> {
     let lost = state == SessionState::Lost;
+    // A session that never left Starting did not start.
+    let started = ctx.session.state != SessionState::Starting;
     ctx.session.state = state;
     ctx.session.ended_at.get_or_insert_with(|| tx.now());
     if ctx.session.end_reason.is_none() {
@@ -378,7 +434,7 @@ pub(crate) fn finish_session(
     cancel_pending_requests(tx, ctx.session.id)?;
 
     match ctx.session.role {
-        SessionRole::Coordinator => release_coordinator(tx, ctx)?,
+        SessionRole::Coordinator => release_coordinator(tx, ctx, started)?,
         SessionRole::Task => {
             let current = ctx
                 .task
@@ -402,8 +458,11 @@ pub(crate) fn finish_session(
 }
 
 /// The coordinator row stops pointing at a session that is gone. Events of an
-/// open turn go back to the front of the queue.
-fn release_coordinator(tx: &mut Tx<'_>, ctx: &mut Ctx<'_>) -> Result<()> {
+/// open turn go back to the front of the queue. The channel gets a new
+/// session at once only when this one had started: a start that failed
+/// would fail again at once. The next wake event, or a worker that comes
+/// online, starts it then, after the backoff in `Coordinators`.
+fn release_coordinator(tx: &mut Tx<'_>, ctx: &mut Ctx<'_>, started: bool) -> Result<()> {
     let mut row = coord_store::coordinator(tx.db(), ctx.channel.id)?;
     if row.session_id != Some(ctx.session.id) {
         return Ok(());
@@ -416,8 +475,129 @@ fn release_coordinator(tx: &mut Tx<'_>, ctx: &mut Ctx<'_>) -> Result<()> {
     row.turn_started_at = None;
     row.turn_events.clear();
     tx.save_coordinator(&row)?;
-    ctx.fx.kick(ctx.channel.id);
+    if started {
+        ctx.fx.kick(ctx.channel.id);
+    }
     Ok(())
+}
+
+/// The harness account of a session is signed out. The hub marks the
+/// account as signed out in the worker's inventory, so placement does not
+/// choose it again until the worker reports it signed in. A coordinator
+/// session on that account cannot answer, so the hub replaces it.
+fn on_signed_out(tx: &mut Tx<'_>, ctx: &mut Ctx<'_>, detail: &str) -> Result<()> {
+    mark_account_signed_out(tx, &ctx.session, detail)?;
+    if ctx.session.role == SessionRole::Coordinator && ctx.is_current(tx)? {
+        replace_signed_out_coordinator(tx, ctx)?;
+    }
+    Ok(())
+}
+
+/// The label of the session's harness account and the name of its worker,
+/// for notices.
+fn account_and_worker(tx: &Tx<'_>, session: &Session) -> Result<(String, String)> {
+    let worker = crate::store::machine::worker(tx.db(), session.worker_id)?;
+    let label = worker
+        .as_ref()
+        .and_then(|w| w.inventory.as_ref())
+        .and_then(|inv| inv.account(session.account_id))
+        .map_or_else(|| session.harness.clone(), |a| a.label.clone());
+    let name = worker.map_or_else(|| "its worker".to_owned(), |w| w.name);
+    Ok((label, name))
+}
+
+fn mark_account_signed_out(tx: &mut Tx<'_>, session: &Session, detail: &str) -> Result<()> {
+    let Some(mut worker) = crate::store::machine::worker(tx.db(), session.worker_id)? else {
+        return Ok(());
+    };
+    let Some(inventory) = worker.inventory.take() else {
+        return Ok(());
+    };
+    let mut inventory = inventory;
+    let mut changed = false;
+    if let Some(account) = inventory
+        .accounts
+        .iter_mut()
+        .find(|a| a.account_id == session.account_id)
+        && account.auth_state != AuthState::SignedOut
+    {
+        account.auth_state = AuthState::SignedOut;
+        account.auth_detail = Some(cut_text(detail, NOTICE_TEXT_MAX_BYTES));
+        changed = true;
+    }
+    // A new hash, so the next inventory from the worker replaces this one
+    // even when the worker did not see the change.
+    worker.inventory = Some(if changed {
+        inventory.with_hash()
+    } else {
+        inventory
+    });
+    if changed {
+        tx.save_worker(&worker)?;
+    }
+    Ok(())
+}
+
+/// True when the stored inventory says that the session's account is signed
+/// out.
+fn account_signed_out(tx: &Tx<'_>, session: &Session) -> Result<bool> {
+    Ok(crate::store::machine::worker(tx.db(), session.worker_id)?
+        .and_then(|w| w.inventory)
+        .and_then(|inv| inv.account(session.account_id).map(|a| a.auth_state))
+        == Some(AuthState::SignedOut))
+}
+
+/// Ends a coordinator session whose account is signed out. The events of
+/// its turn go back to the queue, and placement chooses a new session on an
+/// account that is signed in. When no account fits, the events wait, and the
+/// notice says where to sign in. A sign-in sends a new inventory, and that
+/// starts the coordinator again.
+fn replace_signed_out_coordinator(tx: &mut Tx<'_>, ctx: &mut Ctx<'_>) -> Result<()> {
+    let reason = "The harness account of the session is signed out.";
+    ctx.session.end_reason = Some(reason.to_owned());
+    finish_session(tx, ctx, SessionState::Lost)?;
+    queue_stop(ctx.hub, tx, &mut ctx.fx, &ctx.session, reason)?;
+    let (label, worker) = account_and_worker(tx, &ctx.session)?;
+    let text = if coordinator_can_start(tx, &ctx.channel)? {
+        // Also when the session never became active: the cause is known,
+        // and another account can take the events now.
+        ctx.fx.kick(ctx.channel.id);
+        format!(
+            "{label} on {worker} is signed out, so the assistant moves to another account. Sign in to {label} on {worker} to use it again."
+        )
+    } else {
+        // Nothing can start now. The events wait for a sign-in.
+        ctx.fx.kick.retain(|c| *c != ctx.channel.id);
+        format!(
+            "The assistant cannot answer, because {label} on {worker} is signed out. Sign in to {label} on {worker}. The assistant then answers your waiting messages."
+        )
+    };
+    tx.post_notice(ctx.channel.id, None, None, "assistant_signed_out", &text)?;
+    Ok(())
+}
+
+/// True when placement finds a worker and an account for a new coordinator
+/// session of the channel now.
+fn coordinator_can_start(tx: &Tx<'_>, channel: &Channel) -> Result<bool> {
+    let everything = conversation::everything_channel(tx.db())?;
+    let workers = crate::store::machine::workers(tx.db())?;
+    let open = work::open_session_counts(tx.db())?;
+    let selection = channel
+        .effective_coordinator_selection(&everything)
+        .cloned();
+    let request = consort_proto::model::PlacementRequest::default();
+    Ok(crate::placement::place(&crate::placement::PlacementInput {
+        subject: crate::placement::Subject::Coordinator,
+        workers: &workers,
+        open_sessions: &open,
+        selection: selection.as_ref(),
+        request: &request,
+        approval_mode: channel.default_approval_mode,
+        preferred_workers: &channel.preferred_workers,
+        repos: &[],
+        isolation: consort_proto::model::Isolation::Worktree,
+    })
+    .is_ok())
 }
 
 fn on_item(tx: &mut Tx<'_>, ctx: &mut Ctx<'_>, mut item: SessionItem) -> Result<()> {
@@ -479,6 +659,12 @@ fn emit_item(tx: &mut Tx<'_>, ctx: &mut Ctx<'_>, item: &SessionItem) -> Result<(
 
 fn open_request(tx: &mut Tx<'_>, ctx: &mut Ctx<'_>, opened: &RequestOpened) -> Result<()> {
     let session_id = ctx.session.id;
+    // Nobody can answer a request of a session that the hub ended or
+    // replaced, and it must not move the task of a newer session.
+    if !ctx.is_current(tx)? {
+        tracing::info!(session_id = %session_id, request_id = %opened.request_id, "a session that is not current opened a request, so the hub ignores it");
+        return Ok(());
+    }
     if work::approval_by_request(tx.db(), session_id, &opened.request_id)?
         .is_some_and(|a| a.status == ApprovalStatus::Pending)
         || work::decision_by_request(tx.db(), session_id, &opened.request_id)?
@@ -589,6 +775,9 @@ fn close_request(
         };
         tx.save_decision(&decision)?;
     }
+    if !ctx.drives_task() {
+        return Ok(());
+    }
     if let Some(task) = ctx.task.as_mut() {
         // Reload: the status may have changed in this batch.
         if let Some(fresh) = work::task(tx.db(), task.id)? {
@@ -624,6 +813,14 @@ fn coordinator_turn_ended(
     let mut row = coord_store::coordinator(tx.db(), ctx.channel.id)?;
     if row.session_id != Some(ctx.session.id) || !row.turn_open {
         return Ok(());
+    }
+    // A failed turn on an account that the worker reports as signed out
+    // will fail again. A new session goes on another account.
+    if reason == TurnEndReason::Failed
+        && !ctx.session.state.is_final()
+        && account_signed_out(tx, &ctx.session)?
+    {
+        return replace_signed_out_coordinator(tx, ctx);
     }
     // Which thread did the turn answer? One user message in a thread means a
     // reply in that thread.
@@ -687,6 +884,12 @@ fn task_turn_ended(
     if let Some(fresh) = work::task(tx.db(), task_id)? {
         ctx.task = Some(fresh);
     }
+    // The turn of an older session, for example one that a retry replaced,
+    // must not move the task or take its inbox.
+    if !ctx.drives_task() {
+        ctx.runtime.review_summary = None;
+        return Ok(());
+    }
     let status = ctx.task.as_ref().map_or(TaskStatus::Resolved, |t| t.status);
     if !matches!(status, TaskStatus::Working | TaskStatus::NeedsInput) {
         ctx.runtime.review_summary = None;
@@ -718,6 +921,7 @@ fn task_turn_ended(
             }),
         )?;
         ctx.runtime.turn_open = true;
+        ctx.runtime.active_at = Some(tx.now());
         ctx.fx.pump(ctx.session.worker_id);
         return Ok(());
     }
@@ -744,6 +948,8 @@ fn task_turn_ended(
                 None,
             ),
         };
+        // The summary comes from the session, so the hub cuts it.
+        let summary = cut_text(&summary, REVIEW_SUMMARY_MAX_BYTES);
         if let Some(task) = ctx.task.as_mut() {
             task.review_summary = Some(summary.clone());
         }
@@ -758,7 +964,14 @@ fn task_turn_ended(
 /// Queues `session.stop` for a session that the hub ended, so the harness
 /// on the worker stops too. A removed worker gets nothing: its commands are
 /// gone, and it cannot connect again.
+///
+/// The other queued commands of the session have no use now, so they go.
+/// Only the command that is in flight stays: the pump sends the oldest
+/// command of a session, and it waits for its answer. When the
+/// `session.start` of the session never went out, the worker does not know
+/// the session, so the start goes and no stop is queued.
 pub(crate) fn queue_stop(
+    hub: &Hub,
     tx: &mut Tx<'_>,
     fx: &mut Effects,
     session: &Session,
@@ -767,6 +980,24 @@ pub(crate) fn queue_stop(
     let removed = crate::store::machine::worker(tx.db(), session.worker_id)?
         .is_none_or(|w| w.revoked_at.is_some());
     if removed {
+        return Ok(());
+    }
+    let queued = crate::store::machine::commands_for_session(tx.db(), session.id)?;
+    let inflight = hub
+        .links
+        .get(session.worker_id)
+        .is_some_and(|link| link.is_inflight(Some(session.id)));
+    let mut worker_knows = true;
+    for (index, (command, sent)) in queued.iter().enumerate() {
+        if inflight && index == 0 {
+            continue;
+        }
+        if command.kind == "session.start" && !sent {
+            worker_knows = false;
+        }
+        tx.delete_command(&command.id)?;
+    }
+    if !worker_knows {
         return Ok(());
     }
     tx.queue_command(
@@ -796,7 +1027,7 @@ pub(crate) fn end_session_by_hub(
     }
     ctx.session.end_reason = Some(reason.to_owned());
     finish_session(tx, &mut ctx, SessionState::Ended)?;
-    queue_stop(tx, &mut ctx.fx, &ctx.session, reason)?;
+    queue_stop(hub, tx, &mut ctx.fx, &ctx.session, reason)?;
     ctx.persist(tx)?;
     Ok(ctx.fx)
 }
@@ -827,6 +1058,23 @@ fn inbox_batch(inbox: &[(i64, String)], room: usize) -> (Vec<i64>, String) {
     (taken, text)
 }
 
+/// Marks a loaded session as lost because the hub decided so, and saves it.
+/// The worker may still run the harness, so it gets `session.stop`.
+pub(crate) fn mark_lost_in_tx(
+    hub: &Hub,
+    tx: &mut Tx<'_>,
+    ctx: &mut Ctx<'_>,
+    reason: &str,
+) -> Result<()> {
+    if ctx.session.state.is_final() {
+        return Ok(());
+    }
+    ctx.session.end_reason = Some(reason.to_owned());
+    finish_session(tx, ctx, SessionState::Lost)?;
+    queue_stop(hub, tx, &mut ctx.fx, &ctx.session, reason)?;
+    ctx.persist(tx)
+}
+
 /// Marks a session as lost from outside an event batch, for example when a
 /// worker no longer has it.
 impl Hub {
@@ -844,12 +1092,7 @@ impl Hub {
                 if ctx.session.state.is_final() {
                     return Ok(Effects::default());
                 }
-                ctx.session.end_reason = Some(reason.clone());
-                finish_session(tx, &mut ctx, SessionState::Lost)?;
-                // The hub decided this, so the worker may still run the
-                // harness. Tell it to stop.
-                queue_stop(tx, &mut ctx.fx, &ctx.session, &reason)?;
-                ctx.persist(tx)?;
+                mark_lost_in_tx(&hub, tx, &mut ctx, &reason)?;
                 Ok(ctx.fx)
             })
             .await?;
@@ -862,5 +1105,137 @@ impl Hub {
         self.store
             .read(move |conn| work::open_sessions_of_worker(conn, worker_id))
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use consort_proto::worker_link::{SessionStart, WorkspaceSpec};
+    use tokio_util::sync::CancellationToken;
+
+    use super::*;
+    use crate::link::WorkerLink;
+    use crate::net::ws::Outbox;
+    use crate::store::machine;
+
+    fn start(session: &Session) -> HubToWorker {
+        HubToWorker::SessionStart(SessionStart {
+            session_id: session.id,
+            role: SessionRole::Task,
+            channel_id: session.channel_id,
+            task_id: session.task_id,
+            account_id: session.account_id,
+            model: session.model.clone(),
+            options: session.options.clone(),
+            approval_mode: consort_proto::model::ApprovalMode::Ask,
+            workspace: WorkspaceSpec {
+                repos: Vec::new(),
+                isolation: consort_proto::model::Isolation::Worktree,
+                carry_uncommitted: false,
+            },
+            system_prompt_append: String::new(),
+            allowed_local_mcp_servers: Vec::new(),
+            channel_files: Vec::new(),
+            resume: None,
+            turn: None,
+        })
+    }
+
+    fn turn(session: &Session) -> HubToWorker {
+        HubToWorker::SessionTurn(SessionTurn {
+            session_id: session.id,
+            turn: TurnInput {
+                text: "More work".to_owned(),
+                attachments: Vec::new(),
+            },
+        })
+    }
+
+    async fn queued_kinds(hub: &Hub, session: &Session) -> Vec<String> {
+        let id = session.id;
+        hub.store
+            .read(move |conn| machine::commands_for_session(conn, id))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(c, _)| c.kind)
+            .collect()
+    }
+
+    /// Finding 9: queued commands of a session that the hub ended still
+    /// went out before `session.stop`.
+    #[tokio::test]
+    async fn ending_a_session_whose_start_never_went_out_drops_the_start_and_sends_no_stop() {
+        let (hub, _dir) = crate::hub::test_hub().await;
+        let (_, session) = crate::hub::test_task_session(&hub).await;
+        let queued = session.clone();
+        hub.store
+            .write(move |tx| {
+                tx.queue_command(queued.worker_id, &start(&queued))?;
+                tx.queue_command(queued.worker_id, &turn(&queued))?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        hub.mark_session_lost(session.id, "The test ends it.")
+            .await
+            .unwrap();
+        assert!(queued_kinds(&hub, &session).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ending_a_session_keeps_the_command_in_flight_and_drops_the_rest() {
+        let (hub, _dir) = crate::hub::test_hub().await;
+        let (_, session) = crate::hub::test_task_session(&hub).await;
+        let (outbox, _rx) = Outbox::new(CancellationToken::new());
+        let link = Arc::new(WorkerLink::new(
+            hub.links.next_conn_id(),
+            session.worker_id,
+            outbox,
+        ));
+        hub.links.register(link.clone());
+        let queued = session.clone();
+        hub.store
+            .write(move |tx| {
+                let id = tx.queue_command(queued.worker_id, &start(&queued))?;
+                tx.mark_command_sent(&id)?;
+                tx.queue_command(queued.worker_id, &turn(&queued))?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        // The pump sends the oldest command of the session and waits.
+        assert!(link.mark_inflight(Some(session.id)));
+        hub.mark_session_lost(session.id, "The test ends it.")
+            .await
+            .unwrap();
+        assert_eq!(
+            queued_kinds(&hub, &session).await,
+            ["session.start", "session.stop"]
+        );
+    }
+
+    #[tokio::test]
+    async fn ending_a_session_whose_start_went_out_drops_the_rest_and_sends_a_stop() {
+        let (hub, _dir) = crate::hub::test_hub().await;
+        let (_, session) = crate::hub::test_task_session(&hub).await;
+        let queued = session.clone();
+        hub.store
+            .write(move |tx| {
+                // The start went out on an old link that closed before the
+                // answer, so the worker may run the session.
+                let id = tx.queue_command(queued.worker_id, &start(&queued))?;
+                tx.mark_command_sent(&id)?;
+                tx.queue_command(queued.worker_id, &turn(&queued))?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        hub.mark_session_lost(session.id, "The test ends it.")
+            .await
+            .unwrap();
+        assert_eq!(queued_kinds(&hub, &session).await, ["session.stop"]);
     }
 }

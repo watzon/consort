@@ -12,7 +12,7 @@ use consort_proto::model::{
 use consort_proto::status::{Actor, TaskStatus};
 use consort_proto::worker_link::{
     HubToWorker, InventoryRefresh, ItemDetail, ItemDetailResult, SessionInterrupt, SessionStart,
-    SessionStop, TurnInput, WorkspaceRepo, WorkspaceSpec,
+    TurnInput, WorkspaceRelease, WorkspaceRepo, WorkspaceSpec,
 };
 
 use super::flow::transition;
@@ -20,7 +20,7 @@ use super::hooks::NewTask;
 use crate::error::{HubError, Result};
 use crate::hub::{Caller, Hub};
 use crate::limits::{BRIEF_MAX_BYTES, check_text};
-use crate::link::events::{Effects, end_session_by_hub};
+use crate::link::events::{Ctx, Effects, end_session_by_hub, mark_lost_in_tx, queue_stop};
 use crate::placement::{Placement, PlacementError, PlacementInput, Subject, place};
 use crate::prompts;
 use crate::store::conversation::{self, NewMessage};
@@ -281,6 +281,7 @@ impl Hub {
                     session.id,
                     &work::SessionRuntime {
                         turn_open: true,
+                        active_at: Some(now),
                         ..work::SessionRuntime::default()
                     },
                 )?;
@@ -605,66 +606,45 @@ impl Hub {
         request: TaskArchive,
     ) -> Result<TaskResult> {
         let id = request.task_id;
-        let task = self
+        let hub = self.clone();
+        let (task, fx) = self
             .store
             .write(move |tx| {
                 let mut task = work::task_or_404(tx.db(), id)?;
                 let archived_at = request.archived.then(|| tx.now());
+                let mut fx = Effects::default();
                 if task.archived_at.is_some() != archived_at.is_some() {
                     task.archived_at = archived_at;
                     task.updated_at = tx.now();
                     tx.save_task(&task)?;
+                    // A resolved task is done, so its session stops and its
+                    // workspace goes (DECISION 61). Resolve alone keeps
+                    // both, because Not done needs them.
+                    if task.archived_at.is_some() && task.status == TaskStatus::Resolved {
+                        fx = release_task(&hub, tx, &task, "The task was archived.")?;
+                    }
                 }
-                Ok(task)
+                Ok((task, fx))
             })
             .await?;
+        self.run_effects(fx);
         Ok(TaskResult { task })
     }
 
     pub(crate) async fn task_delete(&self, _caller: &Caller, request: TaskDelete) -> Result<Empty> {
         let id = request.task_id;
-        self.stop_task_session(id).await?;
-        self.store
-            .write(move |tx| {
-                let task = work::task_or_404(tx.db(), id)?;
-                tx.purge_task(&task)
-            })
-            .await?;
-        Ok(Empty {})
-    }
-
-    /// Stops the session of a task and tells the worker to release the
-    /// workspace. The commands wait in the queue when the worker is offline.
-    pub(crate) async fn stop_task_session(&self, id: TaskId) -> Result<()> {
-        let worker = self
+        let hub = self.clone();
+        let fx = self
             .store
             .write(move |tx| {
-                let Some(task) = work::task(tx.db(), id)? else {
-                    return Ok(None);
-                };
-                let Some(session_id) = task.current_session_id else {
-                    return Ok(None);
-                };
-                let Some(session) = work::session(tx.db(), session_id)? else {
-                    return Ok(None);
-                };
-                if session.state.is_final() {
-                    return Ok(None);
-                }
-                tx.queue_command(
-                    session.worker_id,
-                    &HubToWorker::SessionStop(SessionStop {
-                        session_id,
-                        reason: "The task was removed.".to_owned(),
-                    }),
-                )?;
-                Ok(Some(session.worker_id))
+                let task = work::task_or_404(tx.db(), id)?;
+                let fx = release_task(&hub, tx, &task, "The task was removed.")?;
+                tx.purge_task(&task)?;
+                Ok(fx)
             })
             .await?;
-        if let Some(worker_id) = worker {
-            self.pump_worker(worker_id);
-        }
-        Ok(())
+        self.run_effects(fx);
+        Ok(Empty {})
     }
 
     pub(crate) async fn task_items(
@@ -709,6 +689,87 @@ impl Hub {
         Ok(serde_json::from_value(value)?)
     }
 
+    /// Fails the task of a session whose turn is open but sent nothing for
+    /// `max_quiet_ms` while its worker was online. A lost `turn.ended` (for
+    /// example an `event_unreadable` in its place) would keep such a task
+    /// in Working for ever. The maintenance loop calls it.
+    pub(crate) async fn expire_quiet_task_turns(&self, max_quiet_ms: i64) -> Result<()> {
+        let candidates = self
+            .store
+            .read(move |conn| {
+                let now = consort_proto::time::Timestamp::now().as_millis();
+                let mut out = Vec::new();
+                for (session, runtime) in work::task_sessions_with_open_turn(conn)? {
+                    let quiet_since = runtime.active_at.unwrap_or(session.started_at);
+                    if now - quiet_since.as_millis() <= max_quiet_ms {
+                        continue;
+                    }
+                    let Some(task) = session
+                        .task_id
+                        .map(|t| work::task(conn, t))
+                        .transpose()?
+                        .flatten()
+                    else {
+                        continue;
+                    };
+                    // Needs input waits for the user, not for the session.
+                    if task.status != TaskStatus::Working
+                        || task.current_session_id != Some(session.id)
+                        || work::pending_count_for_task(conn, task.id)? > 0
+                    {
+                        continue;
+                    }
+                    out.push(session);
+                }
+                Ok(out)
+            })
+            .await?;
+        let quiet = std::time::Duration::from_millis(u64::try_from(max_quiet_ms).unwrap_or(0));
+        for session in candidates {
+            // Events of an offline worker wait in its spool. Count only the
+            // time that the worker was online.
+            let online_long_enough = self
+                .links
+                .get(session.worker_id)
+                .is_some_and(|l| !l.outbox.is_closed() && l.connected_at.elapsed() > quiet);
+            if !online_long_enough {
+                continue;
+            }
+            tracing::warn!(session_id = %session.id, "a task turn sent nothing for too long, so the hub fails the task");
+            if let Err(err) = self.fail_quiet_task_turn(session.id, max_quiet_ms).await {
+                tracing::warn!(error = %err, session_id = %session.id, "could not fail a task with a quiet turn");
+            }
+        }
+        Ok(())
+    }
+
+    async fn fail_quiet_task_turn(&self, session_id: SessionId, max_quiet_ms: i64) -> Result<()> {
+        let hub = self.clone();
+        let fx = self
+            .store
+            .write(move |tx| {
+                let mut ctx = Ctx::load(&hub, tx, session_id)?;
+                // Check again on the writer: an event may have come in.
+                let quiet_since = ctx.runtime.active_at.unwrap_or(ctx.session.started_at);
+                if ctx.session.state.is_final()
+                    || !ctx.runtime.turn_open
+                    || tx.now().as_millis() - quiet_since.as_millis() <= max_quiet_ms
+                {
+                    return Ok(Effects::default());
+                }
+                mark_lost_in_tx(&hub, tx, &mut ctx, "The turn sent nothing for too long.")?;
+                ctx.set_failed_reason(format!(
+                    "The session sent nothing for {} while its turn was open, so the hub stopped waiting. Retry the task.",
+                    quiet_text(max_quiet_ms)
+                ));
+                ctx.persist(tx)?;
+                Ok(ctx.fx)
+            })
+            .await?;
+        self.run_effects(fx);
+        Ok(())
+    }
+
     /// Asks a worker to send its inventory again.
     pub(crate) async fn request_inventory_refresh(
         &self,
@@ -720,5 +781,169 @@ impl Hub {
         )
         .await?;
         Ok(())
+    }
+}
+
+/// A time span for a status reason: whole hours, or minutes.
+fn quiet_text(ms: i64) -> String {
+    let minutes = (ms.max(1) + 59_999) / 60_000;
+    if minutes % 60 == 0 {
+        let hours = minutes / 60;
+        if hours == 1 {
+            "1 hour".to_owned()
+        } else {
+            format!("{hours} hours")
+        }
+    } else if minutes == 1 {
+        "1 minute".to_owned()
+    } else {
+        format!("{minutes} minutes")
+    }
+}
+
+/// Stops the open session of a task and asks each worker that ran the task
+/// to delete its workspace. A task workspace is keyed by the task ID (see
+/// DECISION 91), so one `workspace.release` per worker is enough. The
+/// release goes in the queue of the newest session of the task on that
+/// worker, after its `session.stop`, so the worker does not delete the
+/// folder under a running harness. Returns the work to do after the commit.
+pub(crate) fn release_task(
+    hub: &Hub,
+    tx: &mut crate::store::Tx<'_>,
+    task: &Task,
+    reason: &str,
+) -> Result<Effects> {
+    let mut fx = Effects::default();
+    let sessions = work::sessions_of_task(tx.db(), task.id)?;
+    for session in &sessions {
+        if !session.state.is_final() {
+            // The task leaves, so its status does not change here.
+            let mut ended = session.clone();
+            ended.state = SessionState::Ended;
+            ended.ended_at = Some(tx.now());
+            ended.end_reason = Some(reason.to_owned());
+            tx.save_session(&ended)?;
+            let (approvals, decisions) = work::pending_for_session(tx.db(), session.id)?;
+            for mut approval in approvals {
+                approval.status = consort_proto::model::ApprovalStatus::Canceled;
+                tx.save_approval(&approval)?;
+            }
+            for mut decision in decisions {
+                decision.status = consort_proto::model::DecisionStatus::Canceled;
+                tx.save_decision(&decision)?;
+            }
+            queue_stop(hub, tx, &mut fx, &ended, reason)?;
+        }
+    }
+    // The newest session on each worker, newest first.
+    let mut newest: Vec<&Session> = Vec::new();
+    for session in sessions.iter().rev() {
+        if !newest.iter().any(|s| s.worker_id == session.worker_id) {
+            newest.push(session);
+        }
+    }
+    for session in newest {
+        let removed =
+            machine::worker(tx.db(), session.worker_id)?.is_none_or(|w| w.revoked_at.is_some());
+        if removed {
+            continue;
+        }
+        tx.queue_command_keyed(
+            session.worker_id,
+            Some(session.id),
+            &HubToWorker::WorkspaceRelease(WorkspaceRelease {
+                task_id: task.id,
+                delete: true,
+            }),
+        )?;
+        fx.pump.push(session.worker_id);
+    }
+    Ok(fx)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use consort_proto::time::Timestamp;
+    use tokio_util::sync::CancellationToken;
+
+    use super::*;
+    use crate::link::WorkerLink;
+    use crate::net::ws::Outbox;
+
+    /// Registers a link for the worker that connected `online_for` ago, and
+    /// makes the session quiet for 10 s. Keep the receiver, so the link
+    /// stays open.
+    async fn quiet_session(
+        hub: &Hub,
+        session: &Session,
+        online_for: Duration,
+    ) -> tokio::sync::mpsc::Receiver<String> {
+        let (outbox, rx) = Outbox::new(CancellationToken::new());
+        let mut link = WorkerLink::new(hub.links.next_conn_id(), session.worker_id, outbox);
+        link.connected_at = Instant::now().checked_sub(online_for).unwrap();
+        hub.links.register(Arc::new(link));
+        let id = session.id;
+        hub.store
+            .write(move |tx| {
+                let mut runtime = work::session_runtime(tx.db(), id)?;
+                runtime.active_at = Some(Timestamp::now().plus_millis(-10_000));
+                tx.save_session_runtime(id, &runtime)
+            })
+            .await
+            .unwrap();
+        rx
+    }
+
+    /// Finding 11: a lost `turn.ended` (an `event_unreadable` in its place)
+    /// kept a task in Working for ever.
+    #[tokio::test]
+    async fn a_task_turn_that_sends_nothing_for_too_long_fails_the_task() {
+        let (hub, _dir) = crate::hub::test_hub().await;
+        let (task, session) = crate::hub::test_task_session(&hub).await;
+        let _rx = quiet_session(&hub, &session, Duration::from_secs(60)).await;
+        hub.expire_quiet_task_turns(1_000).await.unwrap();
+        let (task, session) = hub
+            .store
+            .read(move |conn| {
+                Ok((
+                    work::task_or_404(conn, task.id)?,
+                    work::session_or_404(conn, session.id)?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(task.status, TaskStatus::Failed);
+        let reason = task.status_reason.unwrap();
+        assert!(
+            reason.contains("sent nothing") && reason.contains("Retry"),
+            "{reason}"
+        );
+        assert_eq!(session.state, SessionState::Lost);
+    }
+
+    #[tokio::test]
+    async fn a_quiet_turn_of_a_worker_that_just_came_back_waits() {
+        let (hub, _dir) = crate::hub::test_hub().await;
+        let (task, session) = crate::hub::test_task_session(&hub).await;
+        // The worker was offline. Its events may still wait in its spool.
+        let _rx = quiet_session(&hub, &session, Duration::ZERO).await;
+        hub.expire_quiet_task_turns(1_000).await.unwrap();
+        let task = hub
+            .store
+            .read(move |conn| work::task_or_404(conn, task.id))
+            .await
+            .unwrap();
+        assert_eq!(task.status, TaskStatus::Working);
+    }
+
+    #[test]
+    fn a_quiet_time_reads_in_hours_or_minutes() {
+        assert_eq!(quiet_text(2 * 60 * 60 * 1000), "2 hours");
+        assert_eq!(quiet_text(60 * 60 * 1000), "1 hour");
+        assert_eq!(quiet_text(90 * 60 * 1000), "90 minutes");
+        assert_eq!(quiet_text(1_000), "1 minute");
     }
 }
