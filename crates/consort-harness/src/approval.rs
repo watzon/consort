@@ -31,6 +31,44 @@ pub fn claude_mode(mode: ApprovalMode) -> &'static str {
     }
 }
 
+/// How much a Claude Code permission mode lets run without a prompt. A
+/// higher rank allows more. `plan` and `dontAsk` never allow more than
+/// `default`. An unknown mode ranks highest, so the adapter treats it as
+/// above every limit.
+pub fn claude_mode_rank(mode: &str) -> u8 {
+    match mode {
+        "plan" | "dontAsk" | "default" => 0,
+        "acceptEdits" => 1,
+        "auto" => 2,
+        _ => 3,
+    }
+}
+
+/// Whether a Claude Code permission mode stays at or below the mode of
+/// `limit`.
+pub fn claude_mode_allowed(mode: &str, limit: ApprovalMode) -> bool {
+    claude_mode_rank(mode) <= claude_mode_rank(claude_mode(limit))
+}
+
+/// The permission mode that a `claude-agent-acp` permission option sets,
+/// when the option sets one. Checked against `claude-agent-acp` 0.99.0
+/// (`PERMISSION_OPTION_ID` and `applyExitPlanModeSelection`).
+///
+/// `allow-with-updates` applies the changes that Claude Code suggests. For
+/// a file change these can set `acceptEdits` for the session, and the
+/// option does not say which changes it holds. So for a file change the
+/// adapter treats the option as `acceptEdits`.
+pub fn claude_option_mode(option_id: &str, file_change: bool) -> Option<&'static str> {
+    match option_id {
+        "exit-plan-bypass" | "exit-plan-clear-bypass" => Some("bypassPermissions"),
+        "exit-plan-auto" | "exit-plan-clear-auto" => Some("auto"),
+        "exit-plan-accept-edits" | "exit-plan-clear-accept-edits" => Some("acceptEdits"),
+        "exit-plan-default" => Some("default"),
+        "allow-with-updates" if file_change => Some("acceptEdits"),
+        _ => None,
+    }
+}
+
 /// The Codex `approvalPolicy` and `sandbox` values.
 pub fn codex_policy(mode: ApprovalMode) -> (&'static str, &'static str) {
     match mode {
@@ -66,6 +104,16 @@ pub fn gemini_mode(mode: ApprovalMode) -> &'static str {
     }
 }
 
+/// The environment variables that stop OpenCode from loading the
+/// project's configuration: `opencode.json`, and the `.opencode`,
+/// `.claude` and `.agents` folders of the workspace and of the folders
+/// above it. OpenCode 2.2.0 reads the first name, and the second one when
+/// the first is not set. Both go to the agent below Full access.
+pub const OPENCODE_NO_PROJECT_CONFIG: [&str; 2] = [
+    "OPENCODE_CONFIG_PROJECT_DISABLE",
+    "OPENCODE_DISABLE_PROJECT_CONFIG",
+];
+
 /// The OpenCode `permission` configuration, passed in
 /// `OPENCODE_CONFIG_CONTENT`. With `allow_shell` off, `bash` is `deny`.
 pub fn opencode_permission(mode: ApprovalMode, allow_shell: bool) -> Value {
@@ -100,6 +148,32 @@ mod tests {
         let off = opencode_permission(ApprovalMode::AutoEdits, false);
         assert_eq!(off["permission"]["bash"], "deny");
         assert_eq!(off["permission"]["edit"], "allow");
+    }
+
+    #[test]
+    fn claude_modes_have_a_rank() {
+        assert!(claude_mode_allowed("default", ApprovalMode::Ask));
+        assert!(claude_mode_allowed("plan", ApprovalMode::Ask));
+        assert!(!claude_mode_allowed("acceptEdits", ApprovalMode::Ask));
+        assert!(!claude_mode_allowed("auto", ApprovalMode::AutoEdits));
+        assert!(!claude_mode_allowed("auto", ApprovalMode::Auto));
+        assert!(claude_mode_allowed("acceptEdits", ApprovalMode::Auto));
+        assert!(!claude_mode_allowed(
+            "bypassPermissions",
+            ApprovalMode::Auto
+        ));
+        assert!(!claude_mode_allowed("somethingNew", ApprovalMode::Auto));
+        assert!(claude_mode_allowed(
+            "bypassPermissions",
+            ApprovalMode::FullAccess
+        ));
+        assert_eq!(claude_option_mode("exit-plan-auto", false), Some("auto"));
+        assert_eq!(
+            claude_option_mode("allow-with-updates", true),
+            Some("acceptEdits")
+        );
+        assert_eq!(claude_option_mode("allow-with-updates", false), None);
+        assert_eq!(claude_option_mode("allow-once", true), None);
     }
 
     #[test]

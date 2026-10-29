@@ -28,8 +28,10 @@ pub trait HarnessSession: Send {
 	fn native_ref(&self) -> Option<NativeRef>;
 
 	async fn turn(&mut self, input: TurnInput) -> Result<TurnId, HarnessError>;
-	/// Returns `HarnessError::Unsupported` when `capabilities().steer` is false.
-	async fn steer(&mut self, input: TurnInput) -> Result<(), HarnessError>;
+	/// Takes the input at once, in order with the other calls. The future
+	/// gives the answer and does not borrow the session. It fails with
+	/// `HarnessError::Unsupported` when `capabilities().steer` is false.
+	fn steer(&mut self, input: TurnInput) -> SteerFuture;
 	async fn interrupt(&mut self) -> Result<(), HarnessError>;
 	async fn respond(&mut self, request: RequestId, answer: Answer) -> Result<(), HarnessError>;
 	async fn close(self: Box<Self>) -> Result<(), HarnessError>;
@@ -45,7 +47,7 @@ Four rules keep the adapters honest:
 - An adapter reports a feature in `Capabilities` only if it has a test for that feature. The hub and the clients read `Capabilities` and hide what a session cannot do.
 - Two sessions of the same account share no state inside the adapter. Two accounts of one harness never share a login.
 - `turn` returns when the harness accepts the input, not when the turn ends. The end of a turn comes as a `turn.ended` event.
-- If a harness asks for permission, the adapter emits `request.opened` and waits for `respond`. It never answers on its own, even in Full access. In Full access, the adapter configures the harness so that it does not ask.
+- If a harness asks for permission, the adapter emits `request.opened` and waits for `respond`. It never answers on its own, even in Full access. In Full access, the adapter configures the harness so that it does not ask. Two exceptions keep a session inside its limits: after an interrupt, the adapter cancels each new request at once, and it removes the options that would raise the session's mode (see [Claude Code and the repo's settings](#claude-code-and-the-repos-settings)).
 
 ## Capabilities
 
@@ -101,6 +103,16 @@ The effective approval mode of a session is the lower of the requested mode and 
 
 The adapter tests check these values. OpenCode gets its mode in `OPENCODE_CONFIG_CONTENT` as a `permission` setting for `edit`, `bash` and `webfetch` (`ask` or `allow`). Gemini CLI gets `--approval-mode` (`default`, `auto_edit` or `yolo`) and supports Ask, Auto edits and Auto. Other ACP agents report Ask only.
 
+A repo's own configuration can raise these limits, so below Full access the adapter keeps it out where the harness allows that:
+
+| Harness | Repo configuration | Below Full access |
+|---|---|---|
+| Claude (ACP) | `.claude/settings.json`, `.claude/settings.local.json`, `.mcp.json` | Not loaded (see the next section) |
+| OpenCode | `opencode.json`, and the `.opencode`, `.claude` and `.agents` folders of the workspace and the folders above it. They can start local MCP servers with any command, load plugins and allow tools per agent | Not loaded. The agent gets `OPENCODE_CONFIG_PROJECT_DISABLE=1` and `OPENCODE_DISABLE_PROJECT_CONFIG=1`. Tested with OpenCode 2.2.0: a repo's local MCP server ran without them and did not run with them |
+| Gemini CLI | `.gemini/settings.json` | Still loaded when the user trusts the folder or turns folder trust off. Gemini CLI 0.46.0 has no switch to skip it in a trusted folder, and an untrusted folder forces Gemini's `default` mode. So a Gemini session is weaker here |
+
+The worker's limits also apply to an approval that it would have to cut to send. If the details of an approval do not fit in an event (192 KiB), the worker denies it and does not send it, because the user would allow a command or a change that they cannot see in full. The session gets an `approval_too_long` error event that says what to do. When the harness can steer, the model gets the same text as a steer, because the harness tells the model only that the request was denied.
+
 If `allow_shell` is false in the worker policy, the worker caps the mode at Auto edits and denies each command approval itself. That is worker policy, so the adapter rule above still holds. A command that does not ask for approval still runs, so the adapters also remove the shell tools (`allow_shell` in `SessionSpec`):
 
 | Harness | How the shell tools go away |
@@ -114,9 +126,16 @@ If `allow_shell` is false in the worker policy, the worker caps the mode at Auto
 
 `claude-agent-acp` loads the user, project and local settings of Claude Code. A repo's `.claude/settings.json` can allow tools, set the permission mode, add hooks and start MCP servers, all without an approval. So below Full access, the adapter sends `settingSources: ["user"]` and `allowDangerouslySkipPermissions: false` in `_meta.claudeCode.options`. Only the user's own settings in the account's home then load, and nothing can turn on `bypassPermissions`.
 
-Claude Code loads CLAUDE.md files only with the project settings. So the adapter reads `CLAUDE.md` and `.claude/CLAUDE.md` in the workspace folder itself (each must be a plain file in the workspace, not a link), and adds them to the system prompt, at most 64 KiB. Other repo files that Claude Code would load do not load: skills, agents, commands, hooks, `.mcp.json`, nested CLAUDE.md files and `@` imports. In Full access, Claude Code loads all of its settings as usual.
+Claude Code loads CLAUDE.md files only with the project settings. So the adapter reads `CLAUDE.md` and `.claude/CLAUDE.md` in the workspace folder itself, and adds them to the system prompt, at most 64 KiB in all. It follows `@path` imports as Claude Code does, up to 5 deep, outside code blocks and code spans. Each file must be a plain file (not a link) whose real path is in the workspace, so an import cannot read a file from somewhere else, and `@~/` imports are not followed. A file loads once, also in a cycle. A workspace with more than one repo is a folder that is not a git repo, with one repo in each subfolder. Then the adapter also reads the CLAUDE.md files of each repo folder. Other repo files that Claude Code would load do not load: skills, agents, commands, hooks, `.mcp.json` and nested CLAUDE.md files. In Full access, Claude Code loads all of its settings as usual.
 
 After `session/new` or `session/load`, the adapter sets the Claude permission mode and reads it back from the `configOptions` of the answer. If the agent has no mode, does not offer the mode, refuses it or reports another mode, the open fails and the adapter stops the agent.
+
+`claude-agent-acp` turns `bypassPermissions` off for root without `IS_SANDBOX`, and when the Claude settings set `disableBypassPermissionsMode`. A probe sends no `allowDangerouslySkipPermissions`, so its mode list shows whether the agent offers `bypassPermissions`. When it does not, the account's capabilities have no Full access, and the worker lowers a Full access request to Auto. When the setting changes after the probe, the open of a Full access session fails with that reason. The adapter then stops that agent, starts a new one in Auto with the limits of Auto, and the session's capabilities have no Full access. The worker then sends an `approval_mode_lowered` error event and removes Full access from the account in the inventory.
+
+The session must stay at or below the Claude mode of its approval mode. The modes rank `plan`, `dontAsk` and `default` lowest, then `acceptEdits`, `auto` and `bypassPermissions`. An unknown mode ranks highest. Two rules hold the session there:
+
+- The adapter removes each permission option that would set a higher mode. These are the options of `claude-agent-acp` 0.99.0 to leave plan mode, such as "Yes, and use auto mode" and "Yes, auto-accept edits" (both `allow_always`, so a client's "Allow for task" would pick them). For a file change, `allow-with-updates` can set `acceptEdits` for the session, so it counts as `acceptEdits`. A request always keeps an allow-once and a deny option.
+- When the agent reports a higher mode in a `current_mode_update` or a `config_option_update`, the adapter sets the mode back at once and sends a `mode_reset` error event. If the agent refuses, does not answer in 30 s, or still reports the higher mode, the adapter stops the agent and reports the session as `lost` with a `mode_reset_failed` error event.
 
 Pi has no built-in approval prompts, so a Pi session can only run in Auto or Full access. A later Pi extension can add a gate that asks the worker before each tool call, as T3 Code does.
 
@@ -151,15 +170,28 @@ The adapter starts each harness process in the session's runtime folder, not in 
 
 | Wait | Limit | What happens then |
 |---|---|---|
-| ACP agent start and `session/new` | 180 s | The open fails |
+| The workspace of `session.start`, for all repos together | 40 min | The start fails and the worker removes what it made. A clone has its own 15 min limit inside this. The hub waits 60 min for `session.start`, and the harness open and the first turn take at most about 8 min more |
+| ACP agent start and `session/new` | 180 s | The open fails, and the adapter stops the agent |
+| ACP `initialize` | 120 s | The open fails, and the adapter stops the agent |
+| ACP probe | 150 s | The probe reports that it timed out, and the adapter stops the agent |
 | Codex `initialize` | 30 s | The adapter kills the process |
 | Any other Codex request | 90 s | The request fails |
-| ACP steer | 10 s | The steer fails. The actor loop does not wait for it |
+| ACP and Codex steer | 10 s | The steer fails. The worker waits for the answer in its own task, so interrupts, policy denials and hub tool answers do not wait for it |
+| A Claude mode reset | 30 s | The adapter stops the agent and reports the session as `lost` (`mode_reset_failed`) |
 | A turn after an interrupt | 30 s | The adapter kills the harness, ends the turn as failed and reports the session as `lost` (`harness_unresponsive`) |
 
 An ACP turn that stops with `max_tokens`, `max_turn_requests`, another reason or no reason ends as `failed`, with the reason in the error. Only `end_turn` is `completed`, and `cancelled` is `interrupted`.
 
-On Unix each harness process leads its own process group. The worker records each group in `worker.db` with the start time of its leader. A killed worker cannot stop its groups, so at the next start the worker kills each recorded group whose leader still has the recorded start time. On Windows the job object stops the tree when the worker exits.
+On Unix each harness process leads its own process group. The worker records each group in `worker.db` with the start time of its leader. A killed worker cannot stop its groups, so at the next start the worker kills each recorded group whose leader still has the recorded start time. When the leader is gone, the processes that it started keep the group, so the worker kills each process of the group that started at or after the recorded time (it reads `/proc` on Linux and `ps` on macOS). When another process has the leader's ID, the worker leaves the group alone. On Windows the job object stops the tree when the worker exits.
+
+Only one worker can use a worker folder. A running worker holds an exclusive lock on `worker.lock` in the folder (`flock` on Unix, `LockFileEx` on Windows), and a second worker refuses to start before it touches the recorded groups.
+
+When the worker stops, it turns on a stopping flag first, then closes each harness and keeps the sessions for the next run. A harness that exits while the flag is on does not make its session lost: the worker drops its `harness_exited`, `harness_unresponsive` and `lost` events. The first of those events waits up to 1 s for the flag, because the same stop signal can reach the harness a moment before the worker. A session start that the stop cut short (still `starting`, with no harness reference) is not resumed. The hub has no result for that `session.start`, so it sends it again, and the worker runs it then.
+
+So that a stop signal reaches only the worker:
+
+- On Windows each harness starts with `CREATE_NEW_PROCESS_GROUP` and `CREATE_NO_WINDOW`. It does not share the worker's console, so Ctrl-C and a console close do not reach it.
+- On Unix each harness leads its own process group, so Ctrl-C in a terminal does not reach it. In a systemd unit, set `KillMode=mixed`. Then SIGTERM goes to the worker only, and the worker stops the harnesses in order. With the default `KillMode=control-group`, SIGTERM reaches every harness at the same time, and a harness can stop in the middle of its work.
 
 ## Install harnesses
 

@@ -25,6 +25,9 @@ pub const DB_FILE: &str = "worker.db";
 pub const WORKSPACES_DIR: &str = "workspaces";
 /// The name of the folder with one runtime folder per session.
 pub const RUNTIME_DIR: &str = "runtime";
+/// The name of the lock file. A running worker holds an exclusive lock on
+/// it, so a second worker cannot use the same folder.
+pub const LOCK_FILE: &str = "worker.lock";
 
 /// Creates a folder and its parents. On Unix the folder gets mode 0700,
 /// also when it exists already, so only the user can read what the worker

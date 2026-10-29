@@ -6,13 +6,14 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Duration;
 
-use consort_harness::{AccountStatus, Harness, HarnessKind};
+use consort_harness::{AccountConfig, AccountStatus, Harness, HarnessKind};
 use consort_proto::auth::{OpenSession, Signature, WorkerHello, WorkerHelloResult};
 use consort_proto::error::{ErrorBody, ErrorCode};
 use consort_proto::frame::{Frame, FrameId, RequestFrame, SUPPORTED_PROTOCOL_VERSIONS};
 use consort_proto::ids::{AccountId, SessionId, WorkerId};
 use consort_proto::model::{
-    AuthState, HarnessAccount, Inventory, LocalMcpServerInfo, Os, WorkerLoad,
+    AuthState, Capabilities, HarnessAccount, Inventory, LocalMcpServerInfo, Os, SessionState,
+    WorkerLoad,
 };
 use consort_proto::time::Timestamp;
 use consort_proto::worker_link::{HubToWorker, SessionEvent, SessionEvents};
@@ -67,6 +68,12 @@ pub(crate) struct Core {
     /// The command IDs that run now. A command that arrives again while it
     /// runs gets the result of the first run, when that run ends.
     pub inflight: Mutex<HashSet<String>>,
+    /// Turns true when the worker starts to stop. From then on, a harness
+    /// that exits does not make its session lost: the next run resumes it.
+    pub stopping: watch::Sender<bool>,
+    /// The lock on the config folder, held while the worker runs. `None` in
+    /// tests. `WorkerHandle::shutdown` releases it at its end.
+    pub lock: Mutex<Option<std::fs::File>>,
 }
 
 /// The answer to a command for a session whose actor has ended.
@@ -127,11 +134,19 @@ impl consort_harness::process::ProcessWatcher for GroupLog {
 
 /// Kills the harness process groups that the last run of the worker
 /// recorded and did not end, for example because the worker was killed.
-/// A group is killed only when its leader still has the recorded start
-/// time, so a process that got the same ID later is never touched. This
-/// blocks, so call it from a blocking task.
+///
+/// - When the leader still has the recorded start time, the whole group is
+///   killed.
+/// - When the leader is gone, the processes that it left in the group keep
+///   running. The worker kills each process of the group that started at or
+///   after the recorded time.
+/// - When another process has the leader's ID now, the group is not ours,
+///   and nothing is killed.
+///
+/// This blocks, so call it from a blocking task.
 #[cfg(unix)]
 pub(crate) fn kill_stale_groups(store: &Store) {
+    use consort_harness::process::{group_start_time, kill_group, kill_pid, members_started_since};
     let records = match store.processes() {
         Ok(r) => r,
         Err(err) => {
@@ -140,26 +155,124 @@ pub(crate) fn kill_stale_groups(store: &Store) {
         }
     };
     for record in records {
-        let now = consort_harness::process::group_start_time(record.pgid);
-        if now.as_deref() == Some(record.started.as_str()) {
-            if consort_harness::process::kill_group(record.pgid) {
-                tracing::warn!(
+        match group_start_time(record.pgid) {
+            Some(now) if now == record.started => {
+                if kill_group(record.pgid) {
+                    tracing::warn!(
+                        pgid = record.pgid,
+                        program = %record.program,
+                        "killed a harness process group that the last run of the worker left behind"
+                    );
+                }
+            }
+            Some(_) => {
+                tracing::debug!(
                     pgid = record.pgid,
-                    program = %record.program,
-                    "killed a harness process group that the last run of the worker left behind"
+                    "another process has the ID of a recorded harness group; the worker leaves it"
                 );
             }
-        } else {
-            tracing::debug!(
-                pgid = record.pgid,
-                "a recorded harness process group is gone"
-            );
+            None => {
+                let members = members_started_since(record.pgid, &record.started);
+                let killed = members.into_iter().filter(|pid| kill_pid(*pid)).count();
+                if killed > 0 {
+                    tracing::warn!(
+                        pgid = record.pgid,
+                        program = %record.program,
+                        killed,
+                        "killed the processes that a harness left behind in its group"
+                    );
+                } else {
+                    tracing::debug!(
+                        pgid = record.pgid,
+                        "a recorded harness process group is gone"
+                    );
+                }
+            }
         }
         let _ = store.delete_process(record.pgid);
     }
 }
 
+/// Starts an actor for each session that was open when the worker
+/// stopped, and asks it to resume the session. Returns how many it
+/// resumes.
+///
+/// A session that is still `starting` and has no harness reference stopped
+/// in the middle of `session.start`. That command has no stored result, so
+/// the hub sends it again. The worker does not resume such a session: it
+/// leaves it for that start.
+pub(crate) fn restore_sessions(core: &Arc<Core>) -> Result<usize, WorkerError> {
+    let mut count = 0;
+    for record in core.store.open_sessions()? {
+        if record.state == SessionState::Starting && record.native_ref.is_none() {
+            tracing::info!(
+                session = %record.start.session_id,
+                "a session start did not finish before the worker stopped; the worker waits for the hub to send the start again"
+            );
+            continue;
+        }
+        let jobs = core.spawn_session(record.start.session_id);
+        let _ = jobs.send(Job::Restore(Box::new(record)));
+        count += 1;
+    }
+    Ok(count)
+}
+
 impl Core {
+    /// Whether the worker has started to stop.
+    pub fn is_stopping(&self) -> bool {
+        *self.stopping.borrow()
+    }
+
+    /// Waits up to `hold` for the worker to start to stop. Returns whether
+    /// it stops. A harness can exit just before the worker learns that it
+    /// must stop, for example when systemd sends SIGTERM to every process
+    /// of the unit. The hold covers that gap.
+    pub async fn stops_within(&self, hold: Duration) -> bool {
+        let mut rx = self.stopping.subscribe();
+        if *rx.borrow_and_update() {
+            return true;
+        }
+        tokio::time::timeout(hold, rx.wait_for(|stopping| *stopping))
+            .await
+            .is_ok_and(|r| r.is_ok())
+    }
+
+    /// The capabilities of an account: what the last probe found, or what
+    /// the adapter knows without a probe.
+    pub fn account_capabilities(
+        &self,
+        account: &AccountConfig,
+        adapter: &dyn Harness,
+    ) -> Capabilities {
+        lock(&self.statuses)
+            .get(&account.id)
+            .map(|s| s.capabilities.clone())
+            .filter(|c| !c.approval_modes.is_empty())
+            .unwrap_or_else(|| adapter.capabilities(account))
+    }
+
+    /// Removes the approval modes that a session of the account could not
+    /// use from the account's capabilities, and sends the inventory, so the
+    /// hub does not offer them again.
+    pub fn narrow_approval_modes(&self, account: &AccountConfig, session: &Capabilities) {
+        let changed = {
+            let mut statuses = lock(&self.statuses);
+            let Some(status) = statuses.get_mut(&account.id) else {
+                return;
+            };
+            let before = status.capabilities.approval_modes.len();
+            status
+                .capabilities
+                .approval_modes
+                .retain(|m| session.approval_modes.contains(m));
+            status.capabilities.approval_modes.len() != before
+        };
+        if changed {
+            self.send_inventory(false);
+        }
+    }
+
     pub fn config_snapshot(&self) -> WorkerToml {
         match self.config.read() {
             Ok(c) => c.clone(),
@@ -521,7 +634,7 @@ impl Core {
                 let capabilities = self
                     .harnesses
                     .get(&account.harness)
-                    .map(|h| h.capabilities(account))
+                    .map(|h| self.account_capabilities(account, h.as_ref()))
                     .unwrap_or_default();
                 let status = statuses.get(&account.id);
                 let enabled = account.enabled && self.harnesses.contains_key(&account.harness);
@@ -540,10 +653,7 @@ impl Core {
                         })
                     }),
                     models: status.map(|s| s.models.clone()).unwrap_or_default(),
-                    capabilities: status
-                        .map(|s| s.capabilities.clone())
-                        .filter(|c| !c.approval_modes.is_empty())
-                        .unwrap_or(capabilities),
+                    capabilities,
                     enabled,
                 }
             })
@@ -707,6 +817,8 @@ mod tests {
             last_inventory_hash: Mutex::new(None),
             bridge_program: None,
             inflight: Mutex::new(HashSet::new()),
+            stopping: watch::channel(false).0,
+            lock: Mutex::new(None),
         })
     }
 
@@ -1090,6 +1202,321 @@ mod tests {
         assert!(lock(&core.inflight).is_empty());
     }
 
+    /// The events in the spool of a session.
+    fn spooled(core: &Core, session_id: SessionId) -> Vec<SessionEvent> {
+        core.store
+            .next_batch(session_id)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.event)
+            .collect()
+    }
+
+    fn has_error(events: &[SessionEvent], wanted: &str) -> bool {
+        events
+            .iter()
+            .any(|e| matches!(e, SessionEvent::Error { code, .. } if code == wanted))
+    }
+
+    /// Starts a session with a first turn on the fake worker and waits for
+    /// the start result.
+    async fn start_with_turn(
+        core: &Arc<Core>,
+        account_id: AccountId,
+        mode: consort_proto::model::ApprovalMode,
+    ) -> SessionId {
+        let session_id = SessionId::new();
+        let mut command = start(session_id);
+        command.account_id = account_id;
+        command.approval_mode = mode;
+        command.turn = Some(TurnInput {
+            text: "Go".into(),
+            attachments: vec![],
+        });
+        let id = format!("start-{session_id}");
+        core.dispatch(request(&FrameId::new(&id), &command.into()));
+        wait_until("the start result", || {
+            core.store.command_result(&id).unwrap().is_some()
+        })
+        .await;
+        session_id
+    }
+
+    #[tokio::test]
+    async fn a_harness_that_exits_while_the_worker_stops_keeps_its_session() {
+        // The harness exits as it does when the stop signal reaches it too.
+        let script = FakeScript {
+            turns: vec![vec![
+                FakeStep::Event(SessionEvent::Error {
+                    code: "marker".into(),
+                    message: "about to exit".into(),
+                }),
+                FakeStep::Event(SessionEvent::Error {
+                    code: "harness_exited".into(),
+                    message: "The harness process exited.".into(),
+                }),
+                FakeStep::Event(SessionEvent::State {
+                    state: SessionState::Lost,
+                }),
+            ]],
+        };
+        let fake = FakeHarness::new(HarnessKind::ClaudeCode, script);
+        let (_dir, core, account_id) = fake_worker(&fake);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        core.link.attach(tx);
+        let session_id =
+            start_with_turn(&core, account_id, consort_proto::model::ApprovalMode::Ask).await;
+        wait_until("the marker", || {
+            has_error(&spooled(&core, session_id), "marker")
+        })
+        .await;
+        // The exit event reached the pump before the worker set its flag.
+        // The pump holds it, and drops it once the flag is set.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        core.stopping.send_replace(true);
+        tokio::time::sleep(crate::sessions::EXIT_HOLD * 2).await;
+        let events = spooled(&core, session_id);
+        assert!(!has_error(&events, "harness_exited"), "{events:?}");
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                SessionEvent::State {
+                    state: SessionState::Lost
+                }
+            )),
+            "{events:?}"
+        );
+        assert_ne!(
+            core.store.session(session_id).unwrap().unwrap().state,
+            SessionState::Lost,
+            "the next run resumes the session"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_approval_too_long_to_show_is_denied_with_a_reason() {
+        let script = FakeScript {
+            turns: vec![vec![
+                FakeStep::Approval {
+                    request_id: "r1".into(),
+                    command: format!("echo {}", "x".repeat(300 * 1024)),
+                },
+                FakeStep::Text("After.".into()),
+            ]],
+        };
+        let fake = FakeHarness::new(HarnessKind::ClaudeCode, script);
+        let record = fake.record();
+        let (_dir, core, account_id) = fake_worker(&fake);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        core.link.attach(tx);
+        let session_id =
+            start_with_turn(&core, account_id, consort_proto::model::ApprovalMode::Ask).await;
+        wait_until("the denial", || !record.lock().unwrap().answers.is_empty()).await;
+        let (request_id, answer) = record.lock().unwrap().answers[0].clone();
+        assert_eq!(request_id.as_str(), "r1");
+        assert_eq!(answer.option_id.as_deref(), Some("deny"));
+        wait_until("the steer", || !record.lock().unwrap().steers.is_empty()).await;
+        let steer = record.lock().unwrap().steers[0].text.clone();
+        assert!(steer.contains("too long to show"), "{steer}");
+        let events = spooled(&core, session_id);
+        assert!(has_error(&events, "approval_too_long"), "{events:?}");
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, SessionEvent::RequestOpened(_))),
+            "the user never sees a cut approval"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_slow_steer_does_not_hold_an_interrupt() {
+        let script = FakeScript {
+            turns: vec![vec![FakeStep::Sleep(Duration::from_secs(10))]],
+        };
+        let mut fake = FakeHarness::new(HarnessKind::ClaudeCode, script);
+        fake.steer_delay = Duration::from_secs(2);
+        let record = fake.record();
+        let (_dir, core, account_id) = fake_worker(&fake);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        core.link.attach(tx);
+        let session_id =
+            start_with_turn(&core, account_id, consort_proto::model::ApprovalMode::Ask).await;
+        let steer: HubToWorker = consort_proto::worker_link::SessionSteer {
+            session_id,
+            turn: TurnInput {
+                text: "Also this".into(),
+                attachments: vec![],
+            },
+        }
+        .into();
+        let interrupt: HubToWorker =
+            consort_proto::worker_link::SessionInterrupt { session_id }.into();
+        core.dispatch(request(&FrameId::new("steer"), &steer));
+        core.dispatch(request(&FrameId::new("interrupt"), &interrupt));
+        wait_until("the interrupt result", || {
+            core.store.command_result("interrupt").unwrap().is_some()
+        })
+        .await;
+        assert!(
+            core.store.command_result("steer").unwrap().is_none(),
+            "the interrupt did not wait for the steer"
+        );
+        assert_eq!(record.lock().unwrap().interrupts, 1);
+        for _ in 0..200 {
+            if core.store.command_result("steer").unwrap().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let stored = core.store.command_result("steer").unwrap().unwrap();
+        assert!(stored.into_result().is_ok());
+    }
+
+    /// A fake worker whose policy allows Full access.
+    fn full_access_worker(fake: &FakeHarness) -> (tempfile::TempDir, Arc<Core>, AccountId) {
+        let (dir, core, account_id) = fake_worker(fake);
+        if let Ok(mut config) = core.config.write() {
+            config.policy.max_approval_mode = consort_proto::model::ApprovalMode::FullAccess;
+        }
+        (dir, core, account_id)
+    }
+
+    fn all_but_full_access() -> consort_proto::model::Capabilities {
+        use consort_proto::model::ApprovalMode;
+        consort_proto::model::Capabilities {
+            steer: true,
+            resume: true,
+            mcp_http: true,
+            approval_modes: vec![
+                ApprovalMode::Ask,
+                ApprovalMode::AutoEdits,
+                ApprovalMode::Auto,
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn the_effective_mode_follows_the_probed_capabilities() {
+        use consort_proto::model::ApprovalMode;
+        let fake = FakeHarness::new(HarnessKind::ClaudeCode, FakeScript::reply("Hi."));
+        let record = fake.record();
+        let (_dir, core, account_id) = full_access_worker(&fake);
+        // The probe found that Full access does not work here.
+        lock(&core.statuses).insert(
+            account_id,
+            AccountStatus {
+                harness_version: None,
+                auth_state: AuthState::SignedIn,
+                auth_detail: None,
+                models: vec![],
+                capabilities: all_but_full_access(),
+            },
+        );
+        let (tx, _rx) = mpsc::unbounded_channel();
+        core.link.attach(tx);
+        start_with_turn(&core, account_id, ApprovalMode::FullAccess).await;
+        assert_eq!(
+            record.lock().unwrap().opened[0].approval_mode,
+            ApprovalMode::Auto
+        );
+        let account = core
+            .inventory()
+            .accounts
+            .into_iter()
+            .find(|a| a.account_id == account_id)
+            .unwrap();
+        assert!(
+            !account
+                .capabilities
+                .approval_modes
+                .contains(&ApprovalMode::FullAccess)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_in_a_lower_mode_is_reported_and_narrows_the_account() {
+        use consort_proto::model::ApprovalMode;
+        let mut fake = FakeHarness::new(HarnessKind::ClaudeCode, FakeScript::reply("Hi."));
+        // The adapter had to open the session without Full access.
+        fake.session_capabilities = Some(all_but_full_access());
+        let (_dir, core, account_id) = full_access_worker(&fake);
+        let probed = fake
+            .probe(&AccountConfig::default_for(HarnessKind::ClaudeCode))
+            .await;
+        lock(&core.statuses).insert(account_id, probed);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        core.link.attach(tx);
+        let session_id = start_with_turn(&core, account_id, ApprovalMode::FullAccess).await;
+        let events = spooled(&core, session_id);
+        let lowered = events.iter().find_map(|e| match e {
+            SessionEvent::Error { code, message } if code == "approval_mode_lowered" => {
+                Some(message.clone())
+            }
+            _ => None,
+        });
+        let lowered = lowered.expect("an approval_mode_lowered error");
+        assert!(
+            lowered.contains("Full access") && lowered.contains("runs in Auto"),
+            "{lowered}"
+        );
+        assert!(
+            !lock(&core.statuses)[&account_id]
+                .capabilities
+                .approval_modes
+                .contains(&ApprovalMode::FullAccess)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unfinished_start_is_left_for_the_start_that_the_hub_sends_again() {
+        let fake = FakeHarness::new(HarnessKind::ClaudeCode, FakeScript::reply("Hi."));
+        let record = fake.record();
+        let (_dir, core, account_id) = fake_worker(&fake);
+        // The worker stopped in the middle of a start: the record is
+        // `starting` and has no harness reference.
+        let unfinished = SessionId::new();
+        let mut stored = crate::store::tests::record(unfinished);
+        stored.start.account_id = account_id;
+        core.store.put_session(&stored).unwrap();
+        // A session whose open finished is resumed.
+        let opened = SessionId::new();
+        let mut resumable = crate::store::tests::record(opened);
+        resumable.start.account_id = account_id;
+        resumable.native_ref = Some(consort_proto::ids::NativeRef::new("fake-old"));
+        core.store.put_session(&resumable).unwrap();
+
+        assert_eq!(restore_sessions(&core).unwrap(), 1);
+        assert!(lock(&core.sessions).contains_key(&opened));
+        assert!(!lock(&core.sessions).contains_key(&unfinished));
+        assert_eq!(
+            core.store.session(unfinished).unwrap().unwrap().state,
+            SessionState::Starting,
+            "not lost"
+        );
+        // The hub sends the start again, and it runs.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        core.link.attach(tx);
+        let mut again = start(unfinished);
+        again.account_id = account_id;
+        core.dispatch(request(&FrameId::new("again"), &again.into()));
+        wait_until("the start that the hub sent again", || {
+            core.store.command_result("again").unwrap().is_some()
+        })
+        .await;
+        let answers = responses(&mut rx);
+        let answer = answers.iter().find(|r| r.re.as_str() == "again").unwrap();
+        assert!(answer.result.is_ok(), "{:?}", answer.result);
+        assert!(
+            record
+                .lock()
+                .unwrap()
+                .opened
+                .iter()
+                .any(|spec| spec.session_id == unfinished && spec.resume.is_none())
+        );
+    }
+
     /// The members of a process group that still run.
     #[cfg(unix)]
     fn live_members(pgid: u32) -> usize {
@@ -1152,5 +1579,38 @@ mod tests {
         assert!(live_members(other_pgid) >= 1, "the other group still runs");
         assert!(core.store.processes().unwrap().is_empty());
         drop(other);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_next_start_kills_what_a_dead_leader_left_in_its_group() {
+        use consort_harness::process::{ProcessSpec, WatcherHandle, resolve_program, spawn};
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(dir.path(), HashMap::new(), WorkerToml::default());
+        let watcher = WatcherHandle(Arc::new(GroupLog {
+            core: Arc::downgrade(&core),
+        }));
+        // The leader (as `npx` is) starts a child in its group and exits.
+        let mut leader = spawn(&ProcessSpec {
+            program: resolve_program("sh").unwrap(),
+            args: vec!["-c".to_owned(), "sleep 30 & exit 0".to_owned()],
+            watcher: Some(watcher),
+            ..ProcessSpec::default()
+        })
+        .unwrap();
+        let pgid = leader.id().unwrap();
+        leader.wait().await;
+        // The worker is killed, so it forgets the process without the
+        // kill that a drop does.
+        std::mem::forget(leader);
+        assert_eq!(core.store.processes().unwrap().len(), 1);
+        wait_until("the child in the group", || live_members(pgid) == 1).await;
+
+        let core2 = core.clone();
+        tokio::task::spawn_blocking(move || kill_stale_groups(&core2.store))
+            .await
+            .unwrap();
+        wait_until("the child to die", || live_members(pgid) == 0).await;
+        assert!(core.store.processes().unwrap().is_empty());
     }
 }

@@ -30,7 +30,8 @@ use crate::process::{
 };
 use crate::{
     AccountConfig, AccountStatus, Answer, EVENT_CHANNEL_CAPACITY, EventReceiver, Harness,
-    HarnessError, HarnessKind, HarnessSession, McpServerSpec, SessionSpec, sign_in_hint, turn_text,
+    HarnessError, HarnessKind, HarnessSession, McpServerSpec, SessionSpec, SteerFuture,
+    sign_in_hint, steer_ready, turn_text,
 };
 use mapper::CodexMapper;
 use protocol::{
@@ -57,6 +58,13 @@ const INTERRUPT_GRACE: Duration = if cfg!(test) {
 };
 /// How long a probe may take.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a steer may wait for Codex's answer. A steer that waits longer
+/// fails, so the worker does not hold it for the 90 s request limit.
+const STEER_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_millis(500)
+} else {
+    Duration::from_secs(10)
+};
 
 /// The Codex adapter.
 #[derive(Debug, Default, Clone, Copy)]
@@ -579,7 +587,7 @@ impl Actor {
                                     let _ = reply.send(Err(HarnessError::Protocol("no turn is running".to_owned())));
                                 }
                                 Some(turn) => {
-                                    let client = self.client.clone();
+                                    let client = self.client.clone().with_timeout(STEER_TIMEOUT);
                                     let params = TurnSteerParams {
                                         thread_id: self.thread_id.clone(),
                                         input: vec![UserInput::text(turn_text(&input))],
@@ -1017,8 +1025,19 @@ impl HarnessSession for CodexSession {
         self.call(|reply| Command::Turn { input, reply }).await
     }
 
-    async fn steer(&mut self, input: TurnInput) -> Result<(), HarnessError> {
-        self.call(|reply| Command::Steer { input, reply }).await
+    fn steer(&mut self, input: TurnInput) -> SteerFuture {
+        // The command goes in the queue now, so it keeps its place before
+        // a later interrupt. Only the answer is waited for later.
+        let (reply, answer) = oneshot::channel();
+        if let Err(err) = self.commands.try_send(Command::Steer { input, reply }) {
+            return steer_ready(Err(match err {
+                mpsc::error::TrySendError::Closed(_) => HarnessError::Closed,
+                mpsc::error::TrySendError::Full(_) => {
+                    HarnessError::Protocol("the session has too many commands waiting".to_owned())
+                }
+            }));
+        }
+        Box::pin(async move { answer.await.map_err(|_| HarnessError::Closed)? })
     }
 
     async fn interrupt(&mut self) -> Result<(), HarnessError> {

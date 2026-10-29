@@ -17,6 +17,11 @@ pub enum WorkerError {
     /// `worker.toml` is not valid.
     #[error("worker.toml is not valid: {0}")]
     Config(String),
+    /// Another worker runs with the same config folder.
+    #[error(
+        "another worker runs with the folder {0}. Stop that worker first, or give this worker its own folder with --config-dir"
+    )]
+    AlreadyRunning(String),
     /// The worker is not paired yet.
     #[error("this worker is not paired. Run `consort worker pair <hub-url> --code <code>` first")]
     NotPaired,

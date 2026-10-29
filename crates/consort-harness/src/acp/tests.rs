@@ -304,6 +304,22 @@ fn launch_recipes() {
     let config: Value = serde_json::from_str(&l.env["OPENCODE_CONFIG_CONTENT"]).unwrap();
     assert_eq!(config["permission"]["bash"], "deny");
 
+    // Below Full access, OpenCode does not load the repo's configuration.
+    for key in crate::approval::OPENCODE_NO_PROJECT_CONFIG {
+        assert_eq!(l.env.get(key).map(String::as_str), Some("1"), "{key}");
+    }
+    let full = launch_recipe(
+        HarnessKind::OpenCode,
+        &open,
+        ApprovalMode::FullAccess,
+        true,
+        &found,
+    )
+    .unwrap();
+    for key in crate::approval::OPENCODE_NO_PROJECT_CONFIG {
+        assert!(!full.env.contains_key(key), "{key}");
+    }
+
     let gemini = AccountConfig::default_for(HarnessKind::GeminiCli);
     let l = launch_recipe(
         HarnessKind::GeminiCli,
@@ -464,6 +480,19 @@ mod fake_agent {
         ignore_steer: bool,
         /// `session/cancel` does not end the turn.
         ignore_cancel: bool,
+        /// The mode option offers `bypassPermissions`.
+        bypass: bool,
+        /// The first permission request is the one to leave plan mode.
+        plan_exit: bool,
+        /// After the first permission answer, the agent reports this mode.
+        escalate: Option<&'static str>,
+        /// A `session/set_config_option` for `mode` after the open fails.
+        refuse_reset: bool,
+        /// On `session/cancel`, the agent asks for a permission before the
+        /// turn ends.
+        ask_after_cancel: bool,
+        /// The agent never answers.
+        silent: bool,
     }
 
     /// The config options of the fake session.
@@ -475,8 +504,17 @@ mod fake_agent {
              "options": [{"value": "medium", "name": "Medium"}, {"value": "high", "name": "High"}]}),
         ];
         if !behavior.no_mode {
+            let mut choices = vec![
+                json!({"value": "default", "name": "Default"}),
+                json!({"value": "acceptEdits", "name": "Accept edits"}),
+                json!({"value": "plan", "name": "Plan"}),
+                json!({"value": "auto", "name": "Auto"}),
+            ];
+            if behavior.bypass {
+                choices.push(json!({"value": "bypassPermissions", "name": "Bypass permissions"}));
+            }
             options.insert(0, json!({"id": "mode", "name": "Mode", "category": "mode", "type": "select", "currentValue": mode,
-             "options": [{"value": "default", "name": "Default"}, {"value": "acceptEdits", "name": "Accept edits"}]}));
+             "options": choices}));
         }
         options
     }
@@ -492,10 +530,19 @@ mod fake_agent {
         behavior: Behavior,
     ) {
         let mut mode = "acceptEdits".to_owned();
+        let mut mode_sets = 0;
         let (read, mut write) = tokio::io::split(stream);
         let mut lines = BufReader::new(read).lines();
         let mut prompts = 0;
         let mut open_prompt: Option<Value> = None;
+        if behavior.silent {
+            while let Ok(Some(line)) = lines.next_line().await {
+                log.lock()
+                    .unwrap()
+                    .push(serde_json::from_str(&line).unwrap());
+            }
+            return;
+        }
         let send = async |w: &mut tokio::io::WriteHalf<tokio::io::DuplexStream>, v: Value| {
             w.write_all(format!("{v}\n").as_bytes()).await.unwrap();
             w.flush().await.unwrap();
@@ -528,6 +575,13 @@ mod fake_agent {
                     .await;
                 }
                 Some("session/set_config_option") => {
+                    if msg["params"]["configId"] == "mode" {
+                        mode_sets += 1;
+                        if behavior.refuse_reset && mode_sets > 1 {
+                            send(&mut write, json!({"jsonrpc": "2.0", "id": id.clone(), "error": {"code": -32603, "message": "Internal error"}})).await;
+                            continue;
+                        }
+                    }
                     if msg["params"]["configId"] == "mode" && !behavior.ignore_mode {
                         mode = msg["params"]["value"]
                             .as_str()
@@ -555,7 +609,22 @@ mod fake_agent {
                     }
                     prompts += 1;
                     open_prompt = id.clone();
-                    if prompts == 1 {
+                    if prompts == 1 && behavior.plan_exit {
+                        // The options of `claude-agent-acp` 0.99.0 to leave
+                        // plan mode.
+                        send(&mut write, json!({"jsonrpc": "2.0", "id": "perm-1", "method": "session/request_permission", "params": {
+                            "sessionId": "s1",
+                            "toolCall": {"toolCallId": "tc1", "title": "Ready to code?", "kind": "switch_mode", "rawInput": {"plan": "Do it."}},
+                            "options": [
+                                {"optionId": "exit-plan-clear-auto", "name": "Yes, clear context and use auto mode", "kind": "allow_always"},
+                                {"optionId": "exit-plan-auto", "name": "Yes, and use auto mode", "kind": "allow_always"},
+                                {"optionId": "exit-plan-bypass", "name": "Yes, and bypass permissions", "kind": "allow_always"},
+                                {"optionId": "exit-plan-accept-edits", "name": "Yes, auto-accept edits", "kind": "allow_always"},
+                                {"optionId": "exit-plan-default", "name": "Yes, manually approve edits", "kind": "allow_once"},
+                                {"optionId": "reject", "name": "No, keep planning", "kind": "reject_once"}
+                            ]
+                        }})).await;
+                    } else if prompts == 1 {
                         send(&mut write, update("Checking. ")).await;
                         send(&mut write, json!({"jsonrpc": "2.0", "id": "perm-1", "method": "session/request_permission", "params": {
                             "sessionId": "s1",
@@ -576,6 +645,21 @@ mod fake_agent {
                     }
                 }
                 Some("session/cancel") if behavior.ignore_cancel => {}
+                Some("session/cancel") if behavior.ask_after_cancel => {
+                    send(&mut write, json!({"jsonrpc": "2.0", "id": "perm-2", "method": "session/request_permission", "params": {
+                        "sessionId": "s1",
+                        "toolCall": {"toolCallId": "tc2", "title": "`rm -rf /`", "kind": "execute", "rawInput": {"command": "rm -rf /"}},
+                        "options": [
+                            {"optionId": "yes", "name": "Allow", "kind": "allow_once"},
+                            {"optionId": "no", "name": "Reject", "kind": "reject_once"}
+                        ]
+                    }})).await;
+                }
+                None if msg.get("id") == Some(&json!("perm-2")) => {
+                    if let Some(pid) = open_prompt.take() {
+                        send(&mut write, json!({"jsonrpc": "2.0", "id": pid, "result": {"stopReason": "cancelled"}})).await;
+                    }
+                }
                 Some("session/cancel") => {
                     if let Some(pid) = open_prompt.take() {
                         send(&mut write, json!({"jsonrpc": "2.0", "id": pid, "result": {"stopReason": "cancelled"}})).await;
@@ -586,6 +670,13 @@ mod fake_agent {
                         .as_str()
                         .unwrap_or("none")
                         .to_owned();
+                    if let Some(higher) = behavior.escalate {
+                        mode = higher.to_owned();
+                        send(&mut write, json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "s1",
+                            "update": {"sessionUpdate": "current_mode_update", "currentModeId": higher}}})).await;
+                        send(&mut write, json!({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "s1",
+                            "update": {"sessionUpdate": "config_option_update", "configOptions": fake_options(&mode, behavior)}}})).await;
+                    }
                     send(&mut write, update(&format!("Chose {chosen}."))).await;
                     if let Some(pid) = open_prompt.take() {
                         send(&mut write, json!({"jsonrpc": "2.0", "id": pid, "result": {"stopReason": "end_turn"}})).await;
@@ -1124,6 +1215,388 @@ mod fake_agent {
         assert_eq!(process.cwd.as_deref(), Some(Path::new("/runtime/ses_1")));
         assert_ne!(process.cwd.as_deref(), Some(s.workspace.as_path()));
     }
+
+    /// The first turn of the fake agent with `plan_exit` asks to leave plan
+    /// mode. Returns the request.
+    async fn plan_exit_request(
+        mode: ApprovalMode,
+    ) -> (
+        Box<dyn HarnessSession>,
+        EventReceiver,
+        consort_proto::worker_link::RequestOpened,
+    ) {
+        let mut s = spec();
+        s.approval_mode = mode;
+        let behavior = Behavior {
+            plan_exit: true,
+            bypass: true,
+            ..Behavior::default()
+        };
+        let (result, _log) = connect_with(HarnessKind::ClaudeCode, s, behavior).await;
+        let (session, mut events, _ready) = result.unwrap();
+        let mut session: Box<dyn HarnessSession> = Box::new(session);
+        session
+            .turn(TurnInput {
+                text: "Plan it".into(),
+                attachments: vec![],
+            })
+            .await
+            .unwrap();
+        let SessionEvent::RequestOpened(opened) =
+            next_matching(&mut events, |e| matches!(e, SessionEvent::RequestOpened(_))).await
+        else {
+            unreachable!()
+        };
+        (session, events, opened)
+    }
+
+    #[tokio::test]
+    async fn options_that_raise_the_mode_are_not_offered() {
+        let ids = |opened: &consort_proto::worker_link::RequestOpened| -> Vec<String> {
+            opened.options.iter().map(|o| o.id.clone()).collect()
+        };
+        // Ask: only "manually approve edits" and "keep planning" stay. The
+        // client's "Allow for task" picks the first allow-always option, so
+        // it can no longer move the session to auto mode.
+        let (mut session, mut events, opened) = plan_exit_request(ApprovalMode::Ask).await;
+        assert_eq!(ids(&opened), vec!["exit-plan-default", "reject"]);
+        assert!(matches!(
+            session
+                .respond(
+                    opened.request_id.clone(),
+                    Answer {
+                        option_id: Some("exit-plan-auto".into()),
+                        text: None
+                    }
+                )
+                .await,
+            Err(HarnessError::InvalidAnswer(_))
+        ));
+        session
+            .respond(
+                opened.request_id,
+                Answer {
+                    option_id: Some("exit-plan-default".into()),
+                    text: None,
+                },
+            )
+            .await
+            .unwrap();
+        next_matching(&mut events, |e| matches!(e, SessionEvent::TurnEnded { .. })).await;
+        session.close().await.unwrap();
+
+        // Auto edits and Auto map to `acceptEdits`, so auto mode and bypass
+        // go, and "auto-accept edits" stays.
+        let (session, _events, opened) = plan_exit_request(ApprovalMode::Auto).await;
+        assert_eq!(
+            ids(&opened),
+            vec!["exit-plan-accept-edits", "exit-plan-default", "reject"]
+        );
+        session.close().await.unwrap();
+
+        // Full access keeps every option.
+        let (session, _events, opened) = plan_exit_request(ApprovalMode::FullAccess).await;
+        assert_eq!(opened.options.len(), 6);
+        session.close().await.unwrap();
+    }
+
+    /// Plays the first turn of the fake agent, which asks for a permission,
+    /// and allows it.
+    async fn allow_first_request(
+        session: &mut Box<dyn HarnessSession>,
+        events: &mut EventReceiver,
+    ) {
+        session
+            .turn(TurnInput {
+                text: "Push it".into(),
+                attachments: vec![],
+            })
+            .await
+            .unwrap();
+        let SessionEvent::RequestOpened(opened) =
+            next_matching(events, |e| matches!(e, SessionEvent::RequestOpened(_))).await
+        else {
+            unreachable!()
+        };
+        session
+            .respond(
+                opened.request_id,
+                Answer {
+                    option_id: Some("yes".into()),
+                    text: None,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_mode_above_the_limit_is_set_back_at_once() {
+        let behavior = Behavior {
+            escalate: Some("auto"),
+            ..Behavior::default()
+        };
+        let (result, log) = connect_with(HarnessKind::ClaudeCode, spec(), behavior).await;
+        let (session, mut events, _ready) = result.unwrap();
+        let mut session: Box<dyn HarnessSession> = Box::new(session);
+        allow_first_request(&mut session, &mut events).await;
+        let reset = next_matching(&mut events, |e| matches!(e, SessionEvent::Error { .. })).await;
+        assert!(
+            matches!(&reset, SessionEvent::Error { code, message } if code == "mode_reset" && message.contains("`auto`") && message.contains("`default`")),
+            "{reset:?}"
+        );
+        let sets: Vec<String> = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|m| {
+                m["method"] == "session/set_config_option" && m["params"]["configId"] == "mode"
+            })
+            .map(|m| m["params"]["value"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(sets, vec!["default", "default"], "the open, then the reset");
+        // The session goes on.
+        assert!(
+            session
+                .turn(TurnInput {
+                    text: "Next".into(),
+                    attachments: vec![],
+                })
+                .await
+                .is_ok()
+        );
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_mode_that_cannot_be_set_back_loses_the_session() {
+        let behavior = Behavior {
+            escalate: Some("bypassPermissions"),
+            refuse_reset: true,
+            bypass: true,
+            ..Behavior::default()
+        };
+        let (result, _log) = connect_with(HarnessKind::ClaudeCode, spec(), behavior).await;
+        let (session, mut events, _ready) = result.unwrap();
+        let mut session: Box<dyn HarnessSession> = Box::new(session);
+        allow_first_request(&mut session, &mut events).await;
+        let error = next_matching(&mut events, |e| matches!(e, SessionEvent::Error { .. })).await;
+        assert!(
+            matches!(&error, SessionEvent::Error { code, .. } if code == "mode_reset_failed"),
+            "{error:?}"
+        );
+        assert!(matches!(
+            next_matching(&mut events, |e| matches!(e, SessionEvent::State { .. })).await,
+            SessionEvent::State {
+                state: SessionState::Lost
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_permission_request_after_a_cancel_is_cancelled_at_once() {
+        let behavior = Behavior {
+            ask_after_cancel: true,
+            ..Behavior::default()
+        };
+        let (result, log) = connect_with(HarnessKind::ClaudeCode, spec(), behavior).await;
+        let (session, mut events, _ready) = result.unwrap();
+        let mut session: Box<dyn HarnessSession> = Box::new(session);
+        allow_first_request(&mut session, &mut events).await;
+        next_matching(&mut events, |e| matches!(e, SessionEvent::TurnEnded { .. })).await;
+        session
+            .turn(TurnInput {
+                text: "Wait".into(),
+                attachments: vec![],
+            })
+            .await
+            .unwrap();
+        session.interrupt().await.unwrap();
+        // The agent asks once more before it ends the turn. The user never
+        // sees that request.
+        loop {
+            match next_matching(&mut events, |_| true).await {
+                SessionEvent::RequestOpened(opened) => {
+                    panic!("a request after the cancel reached the user: {opened:?}")
+                }
+                SessionEvent::TurnEnded { reason, .. } => {
+                    assert_eq!(reason, TurnEndReason::Interrupted);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let answer = log
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|m| m.get("id") == Some(&json!("perm-2")) && m.get("method").is_none())
+            .cloned()
+            .expect("the request was answered");
+        assert_eq!(answer["result"]["outcome"]["outcome"], "cancelled");
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn full_access_without_bypass_is_unavailable() {
+        let mut s = spec();
+        s.approval_mode = ApprovalMode::FullAccess;
+        let (result, _log) =
+            connect_with(HarnessKind::ClaudeCode, s.clone(), Behavior::default()).await;
+        assert!(
+            matches!(&result, Err(HarnessError::ModeUnavailable(_))),
+            "{:?}",
+            result.as_ref().err()
+        );
+        let behavior = Behavior {
+            bypass: true,
+            ..Behavior::default()
+        };
+        let (result, _log) = connect_with(HarnessKind::ClaudeCode, s, behavior).await;
+        let (session, _events, ready) = result.unwrap();
+        assert_eq!(ready.bypass, Some(true));
+        Box::new(session).close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn full_access_without_bypass_opens_in_auto_with_its_limits() {
+        let mut s = spec();
+        s.approval_mode = ApprovalMode::FullAccess;
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let seen = logs.clone();
+        let (session, _events) = open_with_fallback(HarnessKind::ClaudeCode, s, |spec| {
+            let seen = seen.clone();
+            async move {
+                let (result, log) =
+                    connect_with(HarnessKind::ClaudeCode, spec, Behavior::default()).await;
+                seen.lock().unwrap().push(log);
+                result
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            !session
+                .capabilities()
+                .approval_modes
+                .contains(&ApprovalMode::FullAccess)
+        );
+        let logs = logs.lock().unwrap().clone();
+        assert_eq!(logs.len(), 2, "a second agent opens the session");
+        let second = logs[1].lock().unwrap().clone();
+        let new = second
+            .iter()
+            .find(|m| m["method"] == "session/new")
+            .unwrap();
+        assert_eq!(
+            new["params"]["_meta"]["claudeCode"]["options"]["settingSources"],
+            json!(["user"]),
+            "the lower mode does not load the repo's settings"
+        );
+        assert_eq!(
+            new["params"]["_meta"]["claudeCode"]["options"]["allowDangerouslySkipPermissions"],
+            false
+        );
+        Box::new(session).close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_probe_sees_whether_bypass_is_offered() {
+        let (client_side, agent_side) = tokio::io::duplex(1 << 16);
+        let log = Arc::new(Mutex::new(Vec::new()));
+        tokio::spawn(run_agent_with(agent_side, log.clone(), Behavior::default()));
+        let (read, write) = tokio::io::split(client_side);
+        let (session, _events, ready) = connect_for(
+            HarnessKind::ClaudeCode,
+            spec(),
+            write,
+            read,
+            None,
+            StderrTail::empty(),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(ready.bypass, Some(false));
+        let new = log
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|m| m["method"] == "session/new")
+            .cloned()
+            .unwrap();
+        let options = &new["params"]["_meta"]["claudeCode"]["options"];
+        assert_eq!(options["settingSources"], json!(["user"]));
+        assert!(
+            options.get("allowDangerouslySkipPermissions").is_none(),
+            "a probe lets Claude Code show its bypass mode: {options}"
+        );
+        Box::new(session).close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn initialize_has_its_own_limit() {
+        let behavior = Behavior {
+            silent: true,
+            ..Behavior::default()
+        };
+        let started = std::time::Instant::now();
+        let (result, _log) = connect_with(HarnessKind::ClaudeCode, spec(), behavior).await;
+        let Err(HarnessError::Timeout(why)) = result else {
+            panic!("the open must time out")
+        };
+        assert!(why.contains("initialize"), "{why}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// Whether a process runs. A zombie does not count.
+    #[cfg(unix)]
+    fn runs(pid: u32) -> bool {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        let stat = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+        !stat.is_empty() && !stat.starts_with('Z')
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_dropped_start_stops_the_agent() {
+        // An agent that never answers, as a hung probe has.
+        let mut child = crate::process::spawn(&crate::process::ProcessSpec {
+            program: crate::process::resolve_program("sh").unwrap(),
+            args: vec!["-c".into(), "sleep 30".into()],
+            ..Default::default()
+        })
+        .unwrap();
+        let pid = child.id().unwrap();
+        let stdin = child.take_stdin().unwrap();
+        let stdout = child.take_stdout().unwrap();
+        let stderr = child.stderr_handle();
+        // The probe limit runs out before the agent answers.
+        let dropped = tokio::time::timeout(
+            Duration::from_millis(100),
+            connect_for(
+                HarnessKind::ClaudeCode,
+                spec(),
+                stdin,
+                stdout,
+                Some(child),
+                stderr,
+                true,
+            ),
+        )
+        .await;
+        assert!(dropped.is_err());
+        for _ in 0..50 {
+            if !runs(pid) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(!runs(pid), "the agent still runs");
+    }
 }
 
 #[test]
@@ -1173,4 +1646,112 @@ fn claude_meta_keeps_repo_settings_and_the_shell_out() {
     let meta = claude_meta(&spec);
     assert_eq!(meta["systemPrompt"]["append"], "You are a task.");
     assert!(meta.get("claudeCode").is_none(), "{meta}");
+}
+
+/// A workspace folder that is one git repo.
+fn repo_workspace() -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let workspace = dir.path().join("repo");
+    std::fs::create_dir_all(workspace.join(".git")).unwrap();
+    (dir, workspace)
+}
+
+#[test]
+fn claude_md_imports_are_followed_inside_the_workspace() {
+    let (dir, ws) = repo_workspace();
+    std::fs::write(ws.join("CLAUDE.md"), "@AGENTS.md\n").unwrap();
+    std::fs::create_dir_all(ws.join("docs")).unwrap();
+    std::fs::write(
+        ws.join("AGENTS.md"),
+        "Use tabs. See @docs/style.md, @../outside.md and @link.md.\n```\n@secret.md\n```\nNot `@secret.md` either.\n",
+    )
+    .unwrap();
+    // A cycle back to AGENTS.md.
+    std::fs::write(ws.join("docs/style.md"), "Short lines.\n@../AGENTS.md\n").unwrap();
+    std::fs::write(ws.join("secret.md"), "do not read: fenced").unwrap();
+    std::fs::write(dir.path().join("outside.md"), "do not read: outside").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(dir.path().join("outside.md"), ws.join("link.md")).unwrap();
+    let text = project_instructions(&ws).unwrap();
+    assert!(
+        text.contains("Instructions from CLAUDE.md in the workspace:\n\n@AGENTS.md"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Instructions from AGENTS.md in the workspace, imported by CLAUDE.md:"),
+        "{text}"
+    );
+    assert!(text.contains("Use tabs."), "{text}");
+    assert!(
+        text.contains("imported by AGENTS.md:\n\nShort lines."),
+        "{text}"
+    );
+    assert!(!text.contains("do not read"), "{text}");
+    assert_eq!(
+        text.matches("Use tabs.").count(),
+        1,
+        "a cycle reads a file once"
+    );
+}
+
+#[test]
+fn imports_stop_at_the_depth_limit() {
+    let (_dir, ws) = repo_workspace();
+    std::fs::write(ws.join("CLAUDE.md"), "@f1.md").unwrap();
+    let words = ["one", "two", "three", "four", "five", "six"];
+    for (i, word) in words.iter().enumerate() {
+        let n = i + 1;
+        std::fs::write(
+            ws.join(format!("f{n}.md")),
+            format!("Step {word}. @f{}.md", n + 1),
+        )
+        .unwrap();
+    }
+    let text = project_instructions(&ws).unwrap();
+    assert!(text.contains("Step five."), "{text}");
+    assert!(!text.contains("Step six."), "{text}");
+}
+
+#[test]
+fn a_multi_repo_workspace_reads_each_repo() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("ws");
+    for name in ["a", "b", "notes"] {
+        std::fs::create_dir_all(root.join(name).join(".claude")).unwrap();
+    }
+    std::fs::create_dir_all(root.join("a/.git")).unwrap();
+    // A worktree has a `.git` file.
+    std::fs::write(root.join("b/.git"), "gitdir: /x").unwrap();
+    std::fs::write(root.join("a/CLAUDE.md"), "From a. @../b/shared.md").unwrap();
+    std::fs::write(root.join("b/shared.md"), "Shared by b.").unwrap();
+    std::fs::write(root.join("b/.claude/CLAUDE.md"), "From b.").unwrap();
+    std::fs::write(root.join("notes/CLAUDE.md"), "do not read: not a repo").unwrap();
+    let text = project_instructions(&root).unwrap();
+    assert!(text.contains("Instructions from a/CLAUDE.md"), "{text}");
+    assert!(text.contains("From a."), "{text}");
+    assert!(text.contains("Shared by b."), "{text}");
+    assert!(
+        text.contains("Instructions from b/.claude/CLAUDE.md"),
+        "{text}"
+    );
+    assert!(!text.contains("do not read"), "{text}");
+    // In a single repo, a subfolder with `.git` (a submodule) is not read.
+    let (_dir, ws) = repo_workspace();
+    std::fs::create_dir_all(ws.join("sub/.git")).unwrap();
+    std::fs::write(ws.join("sub/CLAUDE.md"), "Submodule.").unwrap();
+    assert_eq!(project_instructions(&ws), None);
+}
+
+#[test]
+fn instructions_stay_in_the_budget() {
+    let (_dir, ws) = repo_workspace();
+    std::fs::write(
+        ws.join("CLAUDE.md"),
+        format!("@big.md\n{}", "a".repeat(40 * 1024)),
+    )
+    .unwrap();
+    std::fs::write(ws.join("big.md"), "b".repeat(40 * 1024)).unwrap();
+    let text = project_instructions(&ws).unwrap();
+    assert!(text.len() <= 64 * 1024, "{}", text.len());
+    assert!(text.contains("bbbb"));
 }

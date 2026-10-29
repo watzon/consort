@@ -10,7 +10,12 @@
 //! when the worker is killed. On Unix a process group outlives a worker
 //! that is killed. So a [`ProcessWatcher`] learns each group that starts and
 //! ends, and the worker kills the groups that it recorded at the next start
-//! (see [`group_start_time`] and [`kill_group`]).
+//! (see [`group_start_time`], [`kill_group`] and [`members_started_since`]).
+//!
+//! A harness never shares the worker's console on Windows: it starts with
+//! `CREATE_NEW_PROCESS_GROUP` and `CREATE_NO_WINDOW`. So Ctrl-C and a
+//! console close reach only the worker, which then stops its sessions in
+//! order and keeps them for the next run.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -135,6 +140,10 @@ pub fn spawn(spec: &ProcessSpec) -> Result<HarnessProcess, HarnessError> {
     }
     #[cfg(windows)]
     {
+        use windows::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW};
+        wrap.wrap(process_wrap::tokio::CreationFlags(
+            CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
+        ));
         wrap.wrap(process_wrap::tokio::JobObject);
     }
     wrap.wrap(KillOnDrop);
@@ -344,6 +353,110 @@ pub fn kill_group(pgid: u32) -> bool {
         .is_ok_and(|s| s.success())
 }
 
+/// Sends SIGKILL to one process. Returns whether the signal went out. This
+/// blocks, so call it from a blocking task.
+#[cfg(unix)]
+pub fn kill_pid(pid: u32) -> bool {
+    if pid <= 1 {
+        return false;
+    }
+    std::process::Command::new("kill")
+        .args(["-s", "KILL", "--", &pid.to_string()])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// A start time from `ps -o lstart` (with `LC_ALL=C`), such as
+/// `Mon Jan  1 00:00:00 2001`, as a value that sorts in time order:
+/// year, month, day, hour, minute, second. The time is local time, as
+/// `ps` shows it.
+pub fn parse_lstart(text: &str) -> Option<(u32, u32, u32, u32, u32, u32)> {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let parts: Vec<&str> = text.split_whitespace().collect();
+    let [_, month, day, clock, year] = parts.as_slice() else {
+        return None;
+    };
+    let month = u32::try_from(MONTHS.iter().position(|m| m == month)? + 1).ok()?;
+    let mut clock = clock.split(':').map(str::parse::<u32>);
+    let (Some(Ok(h)), Some(Ok(m)), Some(Ok(s)), None) =
+        (clock.next(), clock.next(), clock.next(), clock.next())
+    else {
+        return None;
+    };
+    Some((year.parse().ok()?, month, day.parse().ok()?, h, m, s))
+}
+
+/// The processes of a group: on Linux from `/proc`, elsewhere from `ps`.
+#[cfg(target_os = "linux")]
+fn group_pids(pgid: u32) -> Vec<u32> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| {
+            // The fields after the program name, which ends with `)`:
+            // state, parent, then the process group.
+            std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+                stat.rsplit_once(')').is_some_and(|(_, rest)| {
+                    rest.split_whitespace().nth(2) == Some(pgid.to_string().as_str())
+                })
+            })
+        })
+        .collect()
+}
+
+/// The processes of a group: on Linux from `/proc`, elsewhere from `ps`.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn group_pids(pgid: u32) -> Vec<u32> {
+    let Ok(output) = std::process::Command::new("ps")
+        .args(["-A", "-o", "pid=,pgid="])
+        .env("LC_ALL", "C")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+    else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut words = line.split_whitespace();
+            let pid = words.next()?.parse::<u32>().ok()?;
+            (words.next()? == pgid.to_string()).then_some(pid)
+        })
+        .collect()
+}
+
+/// The processes of a process group whose leader is gone, that started at
+/// or after `started` (the leader's start time as [`group_start_time`]
+/// gave it). The worker kills them at its next start: when a harness
+/// leader exits, the processes that it started keep the group. A process
+/// that started before the leader cannot belong to the leader's group.
+/// This blocks, so call it from a blocking task.
+#[cfg(unix)]
+pub fn members_started_since(pgid: u32, started: &str) -> Vec<u32> {
+    let Some(since) = parse_lstart(started) else {
+        return Vec::new();
+    };
+    group_pids(pgid)
+        .into_iter()
+        .filter(|pid| *pid > 1)
+        .filter(|pid| {
+            group_start_time(*pid)
+                .as_deref()
+                .and_then(parse_lstart)
+                .is_some_and(|at| at >= since)
+        })
+        .collect()
+}
+
 /// Pulls a version number such as `0.165.0` out of `--version` output.
 pub fn parse_version(output: &str) -> Option<String> {
     output
@@ -374,6 +487,16 @@ mod tests {
         assert_eq!(parse_version("opencode v2.2.0").as_deref(), Some("2.2.0"));
         assert_eq!(parse_version("0.46.0").as_deref(), Some("0.46.0"));
         assert_eq!(parse_version("no version"), None);
+    }
+
+    #[test]
+    fn lstart_sorts_in_time_order() {
+        let a = parse_lstart("Mon Jan  1 00:00:00 2001").unwrap();
+        let b = parse_lstart("Tue Oct 29 13:05:09 2026").unwrap();
+        assert_eq!(b, (2026, 10, 29, 13, 5, 9));
+        assert!(a < b);
+        assert!(parse_lstart("Tue Oct 29 13:05 2026").is_none());
+        assert!(parse_lstart("").is_none());
     }
 
     #[tokio::test]
@@ -480,5 +603,42 @@ mod tests {
         }
         assert!(group_members(pgid).is_empty(), "{:?}", group_members(pgid));
         assert!(!kill_group(1), "the worker never signals init");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn members_of_a_group_whose_leader_is_gone_are_found() {
+        // The leader starts a child in its group and exits.
+        let mut process = spawn(&ProcessSpec {
+            program: resolve_program("sh").unwrap(),
+            args: vec!["-c".to_owned(), "sleep 30 & exit 0".to_owned()],
+            ..ProcessSpec::default()
+        })
+        .unwrap();
+        let pgid = process.id().unwrap();
+        let started = tokio::task::spawn_blocking(move || group_start_time(pgid))
+            .await
+            .unwrap()
+            .unwrap();
+        process.wait().await;
+        // Dropping the process would kill its group, as the worker does.
+        // A killed worker does not, so forget it.
+        std::mem::forget(process);
+        let s = started.clone();
+        let members = tokio::task::spawn_blocking(move || members_started_since(pgid, &s))
+            .await
+            .unwrap();
+        assert_eq!(members.len(), 1, "{members:?}");
+        assert!(!members.contains(&pgid));
+        // A time after the members started finds none.
+        let none = tokio::task::spawn_blocking(move || {
+            members_started_since(pgid, "Fri Dec 31 23:59:59 2100")
+        })
+        .await
+        .unwrap();
+        assert!(none.is_empty());
+        for pid in members {
+            assert!(kill_pid(pid));
+        }
     }
 }

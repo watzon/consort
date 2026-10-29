@@ -408,6 +408,8 @@ mod fake_server {
                             "questions": [{"id": "db", "header": "Database", "question": "Which one?", "options": [{"label": "Postgres", "description": ""}, {"label": "SQLite", "description": ""}]}]}})).await;
                     }
                 }
+                // A steer with this text gets no answer.
+                Some("turn/steer") if msg["params"]["input"][0]["text"] == "Ignore me" => {}
                 Some("turn/steer") => {
                     send(
                         &mut write,
@@ -591,7 +593,16 @@ mod fake_server {
             })
             .await
             .unwrap();
+        // A steer that Codex does not answer fails after the short steer
+        // limit, and the interrupt does not wait for it.
+        let ignored = session.steer(TurnInput {
+            text: "Ignore me".into(),
+            attachments: vec![],
+        });
+        let started = std::time::Instant::now();
         session.interrupt().await.unwrap();
+        assert!(started.elapsed() < STEER_TIMEOUT, "the interrupt waited");
+        assert!(matches!(ignored.await, Err(HarnessError::Timeout(_))));
         assert!(matches!(
             next_matching(&mut events, |e| matches!(
                 e,

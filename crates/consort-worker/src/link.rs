@@ -3,12 +3,16 @@
 //! liveness check and reconnects with jittered backoff.
 //!
 //! The worker sends a ping every 20 seconds, and the hub answers each one
-//! with a pong. When no frame and no pong arrives for 60 seconds, the worker
-//! closes the link and connects again. A socket that a sleep or a network
-//! change left half open so does not look connected for long.
+//! with a pong. When no byte arrives for 60 seconds, the worker closes the
+//! link and connects again. A socket that a sleep or a network change left
+//! half open so does not look connected for long. The check counts bytes,
+//! not whole frames, so a large frame on a slow link that is still
+//! arriving keeps the link open.
 
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use consort_proto::auth::{
@@ -23,8 +27,11 @@ use consort_proto::worker_link::{OFFLINE_AFTER_SECS, PING_INTERVAL_SECS};
 use futures_util::{SinkExt, StreamExt};
 use rand::Rng;
 use serde_json::Value;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 use crate::WorkerError;
 
@@ -249,9 +256,108 @@ pub async fn maintain<H: LinkHandler>(
     }
 }
 
+/// The time of the last read from the hub that returned bytes.
+#[derive(Clone)]
+struct LastRead(Arc<Mutex<Instant>>);
+
+impl LastRead {
+    fn new() -> Self {
+        Self(Arc::new(Mutex::new(Instant::now())))
+    }
+
+    fn mark(&self) {
+        *lock(&self.0) = Instant::now();
+    }
+
+    fn elapsed(&self) -> Duration {
+        lock(&self.0).elapsed()
+    }
+}
+
+/// A TCP stream that marks the time of each read that returns bytes, below
+/// TLS and the WebSocket framing.
+struct Progress {
+    inner: TcpStream,
+    last: LastRead,
+}
+
+impl AsyncRead for Progress {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let result = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if matches!(result, Poll::Ready(Ok(()))) && buf.filled().len() > before {
+            self.last.mark();
+        }
+        result
+    }
+}
+
+impl AsyncWrite for Progress {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
 type WsStream = futures_util::stream::SplitStream<
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<Progress>>,
 >;
+
+/// Opens the WebSocket to the hub over a [`Progress`] stream. Returns the
+/// socket and the time of its last read.
+async fn open_socket(
+    url: &str,
+) -> Result<
+    (
+        tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<Progress>>,
+        LastRead,
+    ),
+    WorkerError,
+> {
+    let request = url
+        .into_client_request()
+        .map_err(|e| WorkerError::Network(format!("{url}: {e}")))?;
+    let uri = request.uri();
+    let host = uri
+        .host()
+        .map(|h| h.trim_start_matches('[').trim_end_matches(']').to_owned())
+        .ok_or_else(|| WorkerError::Network(format!("{url} has no host")))?;
+    let port = uri
+        .port_u16()
+        .or(match uri.scheme_str() {
+            Some("wss") => Some(443),
+            Some("ws") => Some(80),
+            _ => None,
+        })
+        .ok_or_else(|| WorkerError::Network(format!("{url} has no port")))?;
+    let tcp = TcpStream::connect((host.as_str(), port))
+        .await
+        .map_err(|e| WorkerError::Network(format!("{url}: {e}")))?;
+    let last = LastRead::new();
+    let stream = Progress {
+        inner: tcp,
+        last: last.clone(),
+    };
+    let (ws, _) = tokio_tungstenite::client_async_tls(request, stream)
+        .await
+        .map_err(|e| WorkerError::Network(format!("{url}: {e}")))?;
+    Ok((ws, last))
+}
 
 /// The text of the error that ends the read loop when the hub closes.
 const HUB_CLOSED: &str = "the hub closed the connection";
@@ -299,10 +405,9 @@ async fn connect_once<H: LinkHandler>(
     let url = crate::http::worker_ws_url(handler.hub_url())?;
     let origin = consort_proto::auth::normalize_origin(handler.hub_url())
         .map_err(|e| WorkerError::Config(e.to_string()))?;
-    let (ws, _) = tokio::time::timeout(HANDSHAKE_TIMEOUT, tokio_tungstenite::connect_async(&url))
+    let (ws, last_read) = tokio::time::timeout(HANDSHAKE_TIMEOUT, open_socket(&url))
         .await
-        .map_err(|_| WorkerError::Network(format!("{url} did not answer")))?
-        .map_err(|e| WorkerError::Network(format!("{url}: {e}")))?;
+        .map_err(|_| WorkerError::Network(format!("{url} did not answer")))??;
     let (mut sink, mut stream) = ws.split();
 
     let handshake = async {
@@ -371,11 +476,19 @@ async fn connect_once<H: LinkHandler>(
     handler.clone().connected(hello);
 
     let result = loop {
-        let Ok(read) = tokio::time::timeout(timing.liveness, read_one(&mut stream)).await else {
-            break Err(WorkerError::Network(format!(
-                "the hub sent no frame and no pong for {} seconds",
-                timing.liveness.as_secs()
-            )));
+        // Wait until the liveness time after the last byte. When it runs
+        // out, a byte that came in the meantime starts the wait again. A
+        // read that a time-out drops keeps its bytes in the WebSocket's
+        // buffer.
+        let left = timing.liveness.saturating_sub(last_read.elapsed());
+        let Ok(read) = tokio::time::timeout(left, read_one(&mut stream)).await else {
+            if last_read.elapsed() >= timing.liveness {
+                break Err(WorkerError::Network(format!(
+                    "the hub sent no data for {} seconds",
+                    timing.liveness.as_secs()
+                )));
+            }
+            continue;
         };
         match read {
             Ok(None) => {}
@@ -440,6 +553,8 @@ mod tests {
         url: String,
         identity: crate::identity::Identity,
         worker_id: consort_proto::ids::WorkerId,
+        /// Gets the ID of each hub command.
+        commands: Option<mpsc::UnboundedSender<String>>,
     }
 
     impl LinkHandler for TestHandler {
@@ -461,7 +576,11 @@ mod tests {
             }
         }
         fn connected(self: Arc<Self>, _result: WorkerHelloResult) {}
-        fn command(self: Arc<Self>, _request: consort_proto::frame::RequestFrame) {}
+        fn command(self: Arc<Self>, request: consort_proto::frame::RequestFrame) {
+            if let Some(tx) = &self.commands {
+                let _ = tx.send(request.id.as_str().to_owned());
+            }
+        }
     }
 
     /// A hub that finishes the handshake. With `silent`, it then stops
@@ -511,7 +630,137 @@ mod tests {
             url,
             identity: crate::identity::Identity::generate(),
             worker_id: consort_proto::ids::WorkerId::new(),
+            commands: None,
         })
+    }
+
+    /// A server stream that, once `slow` is on, writes at most `chunk`
+    /// bytes at a time and waits `pause` after each write, as a slow uplink
+    /// does.
+    struct Throttled {
+        inner: TcpStream,
+        slow: Arc<std::sync::atomic::AtomicBool>,
+        sleep: Option<Pin<Box<tokio::time::Sleep>>>,
+        chunk: usize,
+        pause: Duration,
+    }
+
+    impl AsyncRead for Throttled {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for Throttled {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            if !self.slow.load(std::sync::atomic::Ordering::SeqCst) {
+                return Pin::new(&mut self.inner).poll_write(cx, buf);
+            }
+            if let Some(sleep) = self.sleep.as_mut() {
+                std::task::ready!(sleep.as_mut().poll(cx));
+                self.sleep = None;
+            }
+            let n = buf.len().min(self.chunk);
+            let written = std::task::ready!(Pin::new(&mut self.inner).poll_write(cx, &buf[..n]));
+            let pause = self.pause;
+            self.sleep = Some(Box::pin(tokio::time::sleep(pause)));
+            Poll::Ready(written)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_large_frame_on_a_slow_link_keeps_the_link_open() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let slow = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let stream = Throttled {
+                inner: stream,
+                slow: slow.clone(),
+                sleep: None,
+                chunk: 8 * 1024,
+                pause: Duration::from_millis(60),
+            };
+            let ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let (mut sink, mut source) = ws.split();
+            let challenge = Frame::event(&AuthChallenge {
+                nonce: consort_proto::auth::Nonce::from_bytes([7; 32]),
+            })
+            .unwrap()
+            .to_text()
+            .unwrap();
+            sink.send(Message::Text(challenge.into())).await.unwrap();
+            for answer in [
+                serde_json::json!({}),
+                serde_json::json!({
+                    "protocol_version": 1, "hub_version": "test", "sessions": []
+                }),
+            ] {
+                let Some(Ok(Message::Text(text))) = source.next().await else {
+                    return;
+                };
+                let Frame::Request(request) = Frame::parse(text.as_str()).unwrap() else {
+                    panic!("expected a request")
+                };
+                let reply = request.respond_ok(&answer).unwrap().to_text().unwrap();
+                sink.send(Message::Text(reply.into())).await.unwrap();
+            }
+            // About 100 KiB at 8 KiB every 60 ms takes about 750 ms, longer
+            // than the liveness time. The hub reads nothing meanwhile, so it
+            // answers no ping.
+            slow.store(true, std::sync::atomic::Ordering::SeqCst);
+            let big = serde_json::json!({
+                "v": 1, "id": "big", "type": "inventory.refresh",
+                "body": {"pad": "x".repeat(100 * 1024)}
+            })
+            .to_string();
+            sink.send(Message::Text(big.into())).await.unwrap();
+            slow.store(false, std::sync::atomic::Ordering::SeqCst);
+            while let Some(Ok(_)) = source.next().await {}
+        });
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let handler = Arc::new(TestHandler {
+            url,
+            identity: crate::identity::Identity::generate(),
+            worker_id: consort_proto::ids::WorkerId::new(),
+            commands: Some(tx),
+        });
+        let link = Link::new();
+        let timing = LinkTiming {
+            ping: Duration::from_millis(100),
+            liveness: Duration::from_millis(400),
+        };
+        let run = tokio::spawn({
+            let link = link.clone();
+            async move { connect_once(&link, handler, timing).await }
+        });
+        let got = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("the large frame arrives");
+        assert_eq!(got.as_deref(), Some("big"));
+        assert!(!run.is_finished(), "the link stays open: {:?}", run.await);
+        assert!(link.is_connected());
+        run.abort();
     }
 
     #[tokio::test]
@@ -530,7 +779,7 @@ mod tests {
         .await
         .expect("the worker notices the silence");
         assert!(
-            matches!(&result, Err(WorkerError::Network(m)) if m.contains("no frame and no pong")),
+            matches!(&result, Err(WorkerError::Network(m)) if m.contains("no data")),
             "{result:?}"
         );
         assert!(started.elapsed() < Duration::from_secs(5));

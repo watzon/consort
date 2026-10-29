@@ -10,7 +10,7 @@
 
 pub mod mapper;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -20,21 +20,26 @@ use agent_client_protocol::{
 use async_trait::async_trait;
 use consort_proto::ids::{NativeRef, RequestId, TurnId};
 use consort_proto::model::{
-    ApprovalMode, AuthState, Capabilities, ModelInfo, OptionChoice, OptionDescriptor, OptionValue,
-    RequestOption, SessionState,
+    ApprovalDetails, ApprovalMode, AuthState, Capabilities, ModelInfo, OptionChoice,
+    OptionDescriptor, OptionValue, RequestOption, SessionState,
 };
-use consort_proto::worker_link::{RequestOutcome, SessionEvent, TurnEndReason, TurnInput};
+use consort_proto::worker_link::{
+    RequestBody, RequestOutcome, SessionEvent, TurnEndReason, TurnInput,
+};
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::account::prepare_home;
-use crate::approval::{CLAUDE_SHELL_TOOLS, claude_mode, gemini_mode, opencode_permission};
+use crate::approval::{
+    CLAUDE_SHELL_TOOLS, OPENCODE_NO_PROJECT_CONFIG, claude_mode, claude_mode_allowed,
+    claude_option_mode, gemini_mode, opencode_permission,
+};
 use crate::process::{self, ProcessSpec, StderrTail, resolve_program};
 use crate::{
     AccountConfig, AccountStatus, Answer, EVENT_CHANNEL_CAPACITY, EventReceiver, Harness,
     HarnessError, HarnessKind, HarnessSession, McpServerSpec, SIGNED_OUT_ERROR_CODE, SessionSpec,
-    sign_in_hint, turn_text,
+    SteerFuture, sign_in_hint, steer_ready, turn_text,
 };
 use mapper::{AcpMapper, stop_reason};
 
@@ -44,8 +49,23 @@ pub const CLAUDE_AGENT_ACP: &str = "@agentclientprotocol/claude-agent-acp@0.99.0
 /// How long the adapter waits for the agent to start and open a session.
 /// The first `npx` run downloads the package, so this is long.
 const OPEN_TIMEOUT: Duration = Duration::from_secs(180);
-/// How long a probe may take.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long the agent may take to answer `initialize`. The agent answers
+/// after `npx` has downloaded the package, so this is long too.
+const INITIALIZE_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_millis(300)
+} else {
+    Duration::from_secs(120)
+};
+/// How long a probe may take. When it runs out, the adapter stops the
+/// agent.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(150);
+/// How long the agent may take to set the permission mode back after it
+/// went above the limit of the session.
+const MODE_RESET_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_millis(500)
+} else {
+    Duration::from_secs(30)
+};
 /// How long a steer may wait for the agent's answer. The worker's session
 /// actor waits for the answer, so this stays short.
 const STEER_TIMEOUT: Duration = if cfg!(test) {
@@ -65,6 +85,9 @@ const INTERRUPT_GRACE: Duration = if cfg!(test) {
 const PROJECT_INSTRUCTIONS_MAX_BYTES: usize = 64 * 1024;
 /// A CLAUDE.md file larger than this is not read.
 const PROJECT_FILE_MAX_BYTES: u64 = 1024 * 1024;
+/// How many `@` imports deep the adapter follows from a CLAUDE.md file, as
+/// Claude Code does.
+const IMPORT_MAX_DEPTH: usize = 5;
 
 /// The ACP adapter for one kind of ACP agent.
 #[derive(Debug, Clone, Copy)]
@@ -125,8 +148,21 @@ pub fn launch_recipe(
                 "OPENCODE_CONFIG_CONTENT".to_owned(),
                 opencode_permission(mode, allow_shell).to_string(),
             );
+            // The repo's `opencode.json` and `.opencode/` can start local
+            // MCP servers, load plugins and allow tools per agent. Below
+            // Full access, they do not load.
+            if mode < ApprovalMode::FullAccess {
+                for key in OPENCODE_NO_PROJECT_CONFIG {
+                    env.insert(key.to_owned(), "1".to_owned());
+                }
+            }
             (explicit("opencode")?, vec!["acp".to_owned()])
         }
+        // Gemini CLI 0.46.0 loads the `.gemini/settings.json` of the session
+        // folder only when the user trusts that folder (or turns folder trust
+        // off). It has no switch to skip the file in a trusted folder, so the
+        // adapter cannot stop it. An untrusted folder also forces Gemini's
+        // `default` mode. See docs/harness-adapters.md.
         HarnessKind::GeminiCli => (
             explicit("gemini")?,
             vec![
@@ -228,48 +264,154 @@ fn head_of(text: &str, max: usize) -> &str {
     &text[..end]
 }
 
-/// Reads one CLAUDE.md file of the workspace. The file must be a plain file
-/// inside the workspace, not a link, so a repo cannot make the worker read a
-/// file from somewhere else.
-fn read_project_file(workspace: &Path, rel: &str) -> Option<String> {
-    let path = workspace.join(rel);
-    let meta = path.symlink_metadata().ok()?;
-    if !meta.is_file() || meta.len() > PROJECT_FILE_MAX_BYTES {
-        return None;
+/// The `@` imports of a CLAUDE.md text: each word that starts with `@`,
+/// outside code blocks and code spans, as a relative path. Paths from the
+/// home folder (`@~/...`) and absolute paths are not followed, because the
+/// adapter reads only files in the workspace.
+fn import_targets(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut fence: Option<&str> = None;
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if let Some(open) = fence {
+            if trimmed.starts_with(open) {
+                fence = None;
+            }
+            continue;
+        }
+        if let Some(open) = ["```", "~~~"].into_iter().find(|f| trimmed.starts_with(f)) {
+            fence = Some(open);
+            continue;
+        }
+        for word in line.split_whitespace() {
+            let Some(path) = word.strip_prefix('@') else {
+                continue;
+            };
+            if word.contains('`') {
+                continue;
+            }
+            let path = path.trim_end_matches(['.', ',', ';', ':', ')', '!', '?', '"', '\'']);
+            if path.is_empty() || path.starts_with('~') || Path::new(path).is_absolute() {
+                continue;
+            }
+            out.push(path.to_owned());
+        }
     }
-    let root = std::fs::canonicalize(workspace).ok()?;
-    let real = std::fs::canonicalize(&path).ok()?;
-    if !real.starts_with(&root) {
-        return None;
-    }
-    let text = std::fs::read_to_string(&real).ok()?;
-    let text = text.trim();
-    (!text.is_empty()).then(|| text.to_owned())
+    out
 }
 
-/// The repo instructions of a workspace: `CLAUDE.md` and `.claude/CLAUDE.md`
-/// in the workspace folder, at most [`PROJECT_INSTRUCTIONS_MAX_BYTES`].
+/// Reads the CLAUDE.md files of a workspace and the files that they
+/// import, inside a byte budget.
+struct InstructionReader {
+    /// The workspace, with links resolved.
+    root: PathBuf,
+    budget: usize,
+    seen: HashSet<PathBuf>,
+    parts: Vec<String>,
+}
+
+impl InstructionReader {
+    /// Reads one file. The file must be a plain file (not a link) whose
+    /// real path is inside the workspace, so a repo cannot make the worker
+    /// read a file from somewhere else.
+    fn read(&self, path: &Path) -> Option<(PathBuf, String)> {
+        let meta = path.symlink_metadata().ok()?;
+        if !meta.is_file() || meta.len() > PROJECT_FILE_MAX_BYTES {
+            return None;
+        }
+        let real = std::fs::canonicalize(path).ok()?;
+        if !real.starts_with(&self.root) {
+            return None;
+        }
+        let text = std::fs::read_to_string(&real).ok()?;
+        Some((real, text))
+    }
+
+    /// The path of a file relative to the workspace, with `/`.
+    fn name(&self, real: &Path) -> String {
+        let rel = real.strip_prefix(&self.root).unwrap_or(real);
+        rel.components()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+
+    /// Adds a file and, depth first, the files that it imports.
+    fn add(&mut self, path: &Path, depth: usize, imported_by: Option<&str>) {
+        if self.budget == 0 || depth > IMPORT_MAX_DEPTH {
+            return;
+        }
+        let Some((real, text)) = self.read(path) else {
+            return;
+        };
+        if !self.seen.insert(real.clone()) {
+            return;
+        }
+        let name = self.name(&real);
+        let text = text.trim();
+        if !text.is_empty() {
+            let header = match imported_by {
+                None => format!("Instructions from {name} in the workspace:"),
+                Some(by) => format!("Instructions from {name} in the workspace, imported by {by}:"),
+            };
+            // The header, its line breaks and the break before this part
+            // count too.
+            let separator = if self.parts.is_empty() { 0 } else { 2 };
+            let Some(room) = self.budget.checked_sub(header.len() + 2 + separator) else {
+                self.budget = 0;
+                return;
+            };
+            let kept = head_of(text, room);
+            self.budget = room - kept.len();
+            self.parts.push(format!("{header}\n\n{kept}"));
+        }
+        let Some(folder) = real.parent().map(Path::to_path_buf) else {
+            return;
+        };
+        for target in import_targets(text) {
+            self.add(&folder.join(target), depth + 1, Some(&name));
+        }
+    }
+}
+
+/// The repo instructions of a workspace, at most
+/// [`PROJECT_INSTRUCTIONS_MAX_BYTES`]: `CLAUDE.md` and `.claude/CLAUDE.md`
+/// in the workspace folder, and the files that they import with `@path`,
+/// up to [`IMPORT_MAX_DEPTH`] deep. A workspace with more than one repo is
+/// a folder that is not a git repo, with one repo in each subfolder. Then
+/// the adapter also reads these files in each repo folder.
 ///
 /// A Claude session below Full access does not load the repo's Claude
 /// settings, and Claude Code loads CLAUDE.md files only with those settings.
-/// So the adapter reads these two files and adds them to the system prompt.
+/// So the adapter reads these files and adds them to the system prompt.
 pub fn project_instructions(workspace: &Path) -> Option<String> {
-    let mut budget = PROJECT_INSTRUCTIONS_MAX_BYTES;
-    let mut parts = Vec::new();
-    for rel in ["CLAUDE.md", ".claude/CLAUDE.md"] {
-        if budget == 0 {
-            break;
-        }
-        let Some(text) = read_project_file(workspace, rel) else {
-            continue;
-        };
-        let kept = head_of(&text, budget);
-        budget -= kept.len();
-        parts.push(format!(
-            "Instructions from {rel} in the workspace:\n\n{kept}"
-        ));
+    let root = std::fs::canonicalize(workspace).ok()?;
+    let mut folders = vec![root.clone()];
+    if root.join(".git").symlink_metadata().is_err() {
+        let mut repos: Vec<PathBuf> = std::fs::read_dir(&root)
+            .ok()?
+            .filter_map(Result::ok)
+            // `file_type` does not follow links, so a linked folder is not
+            // read.
+            .filter(|entry| entry.file_type().is_ok_and(|t| t.is_dir()))
+            .map(|entry| entry.path())
+            .filter(|path| path.join(".git").symlink_metadata().is_ok())
+            .collect();
+        repos.sort();
+        folders.extend(repos);
     }
-    (!parts.is_empty()).then(|| parts.join("\n\n"))
+    let mut reader = InstructionReader {
+        root,
+        budget: PROJECT_INSTRUCTIONS_MAX_BYTES,
+        seen: HashSet::new(),
+        parts: Vec::new(),
+    };
+    for folder in folders {
+        for rel in ["CLAUDE.md", ".claude/CLAUDE.md"] {
+            reader.add(&folder.join(rel), 0, None);
+        }
+    }
+    (!reader.parts.is_empty()).then(|| reader.parts.join("\n\n"))
 }
 
 /// The `_meta` object of `session/new` and `session/load` for Claude Code.
@@ -283,6 +425,14 @@ pub fn project_instructions(workspace: &Path) -> Option<String> {
 ///   `bypassPermissions`.
 /// - With `allow_shell` off, `disallowedTools` removes the shell tools.
 pub fn claude_meta(spec: &SessionSpec) -> Value {
+    claude_meta_for(spec, false)
+}
+
+/// [`claude_meta`], or for a probe the same without
+/// `allowDangerouslySkipPermissions`. A probe session then shows whether
+/// Claude Code offers `bypassPermissions` on this machine. The probe sets
+/// the `default` mode and runs no turn.
+fn claude_meta_for(spec: &SessionSpec, probe: bool) -> Value {
     let restricted = spec.approval_mode < ApprovalMode::FullAccess;
     let mut append = spec.system_prompt_append.clone();
     if restricted && let Some(text) = project_instructions(&spec.workspace) {
@@ -294,7 +444,9 @@ pub fn claude_meta(spec: &SessionSpec) -> Value {
     let mut options = serde_json::Map::new();
     if restricted {
         options.insert("settingSources".to_owned(), json!(["user"]));
-        options.insert("allowDangerouslySkipPermissions".to_owned(), json!(false));
+        if !probe {
+            options.insert("allowDangerouslySkipPermissions".to_owned(), json!(false));
+        }
     }
     if !spec.allow_shell {
         options.insert("disallowedTools".to_owned(), json!(CLAUDE_SHELL_TOOLS));
@@ -375,6 +527,17 @@ pub fn models_from_config(options: &[Value]) -> Vec<ModelInfo> {
         .collect()
 }
 
+/// How the adapter sets the permission mode of a Claude session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ModeSetter {
+    /// `session/set_config_option` with this config ID.
+    ConfigOption(String),
+    /// `session/set_mode`.
+    SetMode,
+    /// The agent has no mode, or the session is not a Claude session.
+    None,
+}
+
 /// What the actor learned while it opened the session.
 #[derive(Debug, Clone)]
 struct Ready {
@@ -383,6 +546,28 @@ struct Ready {
     agent_version: Option<String>,
     config_options: Vec<Value>,
     auth_label: Option<String>,
+    /// For Claude Code: whether the agent offers `bypassPermissions`.
+    bypass: Option<bool>,
+    mode_setter: ModeSetter,
+}
+
+/// The permission mode in a `current_mode_update` or a
+/// `config_option_update` session update.
+fn reported_mode(update: &Value) -> Option<String> {
+    match update.get("sessionUpdate").and_then(Value::as_str)? {
+        "current_mode_update" => update
+            .get("currentModeId")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        "config_option_update" => {
+            let options = update.get("configOptions").and_then(Value::as_array)?;
+            find_option(options, "mode", &["mode"])?
+                .get("currentValue")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        }
+        _ => None,
+    }
 }
 
 /// The account label from `claude-agent-acp`'s `_auth/status_update`
@@ -433,12 +618,30 @@ struct PendingPermission {
     options: Vec<RequestOption>,
 }
 
+/// Aborts a task when it drops, unless the task was taken out first. The
+/// connection task owns the agent process, so an abort stops the agent.
+struct AbortOnDrop(Option<tokio::task::JoinHandle<()>>);
+
+impl AbortOnDrop {
+    fn take(&mut self) -> Option<tokio::task::JoinHandle<()>> {
+        self.0.take()
+    }
+}
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+        }
+    }
+}
+
 /// One live ACP session.
 pub struct AcpSession {
     capabilities: Capabilities,
     native_ref: NativeRef,
     commands: mpsc::Sender<Command>,
-    task: tokio::task::JoinHandle<()>,
+    task: AbortOnDrop,
 }
 
 fn protocol_error(err: &agent_client_protocol::Error) -> HarnessError {
@@ -464,6 +667,8 @@ struct Actor {
     capabilities: Capabilities,
     events: mpsc::Sender<SessionEvent>,
     stderr: StderrTail,
+    /// The session is a probe, not a session for the hub.
+    probe: bool,
 }
 
 impl Actor {
@@ -483,19 +688,28 @@ impl Actor {
         cx: &ConnectionTo<Agent>,
         incoming: &mut mpsc::UnboundedReceiver<Incoming>,
     ) -> Result<Ready, HarnessError> {
-        let init = request(
-            cx,
-            "initialize",
-            json!({
-                "protocolVersion": 1,
-                "clientCapabilities": {
-                    "fs": {"readTextFile": false, "writeTextFile": false},
-                    "terminal": false
-                },
-                "clientInfo": {"name": "consort", "title": "Consort", "version": env!("CARGO_PKG_VERSION")}
-            }),
+        let init = tokio::time::timeout(
+            INITIALIZE_TIMEOUT,
+            request(
+                cx,
+                "initialize",
+                json!({
+                    "protocolVersion": 1,
+                    "clientCapabilities": {
+                        "fs": {"readTextFile": false, "writeTextFile": false},
+                        "terminal": false
+                    },
+                    "clientInfo": {"name": "consort", "title": "Consort", "version": env!("CARGO_PKG_VERSION")}
+                }),
+            ),
         )
         .await
+        .map_err(|_| {
+            HarnessError::Timeout(format!(
+                "the agent did not answer `initialize` in {} seconds",
+                INITIALIZE_TIMEOUT.as_secs()
+            ))
+        })?
         .map_err(|e| protocol_error(&e))?;
         let agent_caps = init
             .get("agentCapabilities")
@@ -531,7 +745,7 @@ impl Actor {
         // `session/new`, so a resumed session keeps its system prompt and its
         // limits.
         let meta = (self.kind == HarnessKind::ClaudeCode)
-            .then(|| claude_meta(&self.spec))
+            .then(|| claude_meta_for(&self.spec, self.probe))
             .filter(|m| m.as_object().is_some_and(|o| !o.is_empty()));
         let (native_ref, response) = if let Some(resume) = &self.spec.resume {
             if !load {
@@ -576,7 +790,7 @@ impl Actor {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        let config_options = self
+        let (config_options, mode) = self
             .configure(cx, &native_ref, &response, config_options)
             .await?;
         Ok(Ready {
@@ -585,6 +799,8 @@ impl Actor {
             agent_version,
             config_options,
             auth_label: None,
+            bypass: mode.as_ref().map(|(bypass, _)| *bypass),
+            mode_setter: mode.map(|(_, setter)| setter).unwrap_or(ModeSetter::None),
         })
     }
 
@@ -643,21 +859,42 @@ impl Actor {
 
     /// Sets the Claude Code permission mode and reads it back. Any doubt is a
     /// failure, because a wrong mode can run tools that the worker policy
-    /// does not allow.
+    /// does not allow. Returns whether the agent offers
+    /// `bypassPermissions`, and how to set the mode later.
+    ///
+    /// Claude Code turns `bypassPermissions` off for root without
+    /// `IS_SANDBOX`, and when its settings set
+    /// `disableBypassPermissionsMode`. Full access then fails with
+    /// [`HarnessError::ModeUnavailable`].
     async fn set_claude_mode(
         &self,
         cx: &ConnectionTo<Agent>,
         session: &NativeRef,
         response: &Value,
         options: &mut Vec<Value>,
-    ) -> Result<(), HarnessError> {
+    ) -> Result<(bool, ModeSetter), HarnessError> {
         let mode = claude_mode(self.spec.approval_mode);
         let refuse = |why: String| {
             HarnessError::Protocol(format!(
                 "could not set the Claude Code permission mode to `{mode}`: {why}"
             ))
         };
+        let no_bypass = || {
+            HarnessError::ModeUnavailable(
+                "Claude Code does not offer `bypassPermissions` on this machine. It turns it off for root without IS_SANDBOX, and when its settings set `disableBypassPermissionsMode`"
+                    .to_owned(),
+            )
+        };
         if let Some(option) = find_option(options, "mode", &["mode"]).cloned() {
+            let bypass = option_choices(&option)
+                .iter()
+                .any(|(v, _)| v == "bypassPermissions");
+            if mode == "bypassPermissions" && !bypass {
+                return Err(no_bypass());
+            }
+            let Some(id) = option.get("id").and_then(Value::as_str).map(str::to_owned) else {
+                return Err(refuse("the mode option has no ID".to_owned()));
+            };
             if let Some(updated) = self
                 .set_option(cx, session, &option, mode)
                 .await
@@ -674,22 +911,28 @@ impl Actor {
                     current.unwrap_or("no mode")
                 )));
             }
-            return Ok(());
+            return Ok((bypass, ModeSetter::ConfigOption(id)));
         }
         let Some(modes) = response.get("modes") else {
             return Err(refuse("the agent offers no permission mode".to_owned()));
         };
-        if modes.get("currentModeId").and_then(Value::as_str) == Some(mode) {
-            return Ok(());
+        let offered = |id: &str| {
+            modes
+                .get("availableModes")
+                .and_then(Value::as_array)
+                .is_some_and(|list| {
+                    list.iter()
+                        .any(|m| m.get("id").and_then(Value::as_str) == Some(id))
+                })
+        };
+        let bypass = offered("bypassPermissions");
+        if mode == "bypassPermissions" && !bypass {
+            return Err(no_bypass());
         }
-        let offered = modes
-            .get("availableModes")
-            .and_then(Value::as_array)
-            .is_some_and(|list| {
-                list.iter()
-                    .any(|m| m.get("id").and_then(Value::as_str) == Some(mode))
-            });
-        if !offered {
+        if modes.get("currentModeId").and_then(Value::as_str) == Some(mode) {
+            return Ok((bypass, ModeSetter::SetMode));
+        }
+        if !offered(mode) {
             return Err(refuse("the agent does not offer it".to_owned()));
         }
         // A successful `session/set_mode` sets the mode. ACP has no way to
@@ -701,22 +944,26 @@ impl Actor {
         )
         .await
         .map_err(|e| refuse(e.to_string()))?;
-        Ok(())
+        Ok((bypass, ModeSetter::SetMode))
     }
 
     /// Sets the approval mode, the model and the options. Returns the config
-    /// options as the agent last reported them. Fails when the approval mode
-    /// cannot be set.
+    /// options as the agent last reported them, and for Claude Code what
+    /// [`Self::set_claude_mode`] learned. Fails when the approval mode cannot
+    /// be set.
     async fn configure(
         &self,
         cx: &ConnectionTo<Agent>,
         session: &NativeRef,
         response: &Value,
         mut options: Vec<Value>,
-    ) -> Result<Vec<Value>, HarnessError> {
+    ) -> Result<(Vec<Value>, Option<(bool, ModeSetter)>), HarnessError> {
+        let mut mode = None;
         if self.kind == HarnessKind::ClaudeCode {
-            self.set_claude_mode(cx, session, response, &mut options)
-                .await?;
+            mode = Some(
+                self.set_claude_mode(cx, session, response, &mut options)
+                    .await?,
+            );
         }
         if !self.spec.model.is_empty()
             && let Some(option) = find_option(&options, "model", &["model"]).cloned()
@@ -743,7 +990,7 @@ impl Actor {
                 options = updated;
             }
         }
-        Ok(options)
+        Ok((options, mode))
     }
 
     async fn run(
@@ -754,11 +1001,12 @@ impl Actor {
         ready: oneshot::Sender<Result<Ready, HarnessError>>,
     ) -> Result<(), agent_client_protocol::Error> {
         let opened = self.open(&cx, &mut incoming).await;
-        let native = match opened {
+        let (native, mode_setter) = match opened {
             Ok(r) => {
                 let native = r.native_ref.clone();
+                let setter = r.mode_setter.clone();
                 let _ = ready.send(Ok(r));
-                native
+                (native, setter)
             }
             Err(err) => {
                 let _ = ready.send(Err(err));
@@ -789,6 +1037,15 @@ impl Actor {
         let mut exit = Exit::Harness;
         // Set while an interrupted turn has not ended yet.
         let mut cancel_deadline: Option<tokio::time::Instant> = None;
+        // A Claude session may not go above the mode of its approval mode.
+        // When the agent reports a higher mode, the actor sets the mode back
+        // at once. `resetting` holds the mode that went too high while the
+        // reset runs.
+        let limit = self.spec.approval_mode;
+        let watch_mode = self.kind == HarnessKind::ClaudeCode;
+        let mut resetting: Option<String> = None;
+        let mut lost_reason = String::new();
+        let (reset_tx, mut reset_rx) = mpsc::unbounded_channel::<Result<Value, String>>();
 
         loop {
             let deadline = async {
@@ -909,15 +1166,60 @@ impl Actor {
                     match message {
                         Incoming::Update(params) => {
                             if let Some(update) = params.get("update") {
+                                if watch_mode
+                                    && resetting.is_none()
+                                    && let Some(mode) = reported_mode(update)
+                                    && !claude_mode_allowed(&mode, limit)
+                                {
+                                    let target = claude_mode(limit);
+                                    tracing::warn!(session = %self.spec.session_id, %mode, %target, "the Claude session went above its permission mode; the adapter sets it back");
+                                    match mode_reset_message(&native, &mode_setter, target) {
+                                        Some(message) => {
+                                            let future = cx.send_request(message).block_task();
+                                            let tx = reset_tx.clone();
+                                            tokio::spawn(async move {
+                                                let result = match tokio::time::timeout(MODE_RESET_TIMEOUT, future).await {
+                                                    Err(_) => Err("the agent did not answer in time".to_owned()),
+                                                    Ok(Err(err)) => Err(err.to_string()),
+                                                    Ok(Ok(reply)) => Ok(reply),
+                                                };
+                                                let _ = tx.send(result);
+                                            });
+                                            resetting = Some(mode);
+                                        }
+                                        None => {
+                                            lost_reason = mode_lost_text(&mode, target, "the agent offers no way to set the mode");
+                                            exit = Exit::ModeLost;
+                                            break;
+                                        }
+                                    }
+                                }
                                 let events = mapper.map_update(update);
                                 self.emit_all(events).await;
                             }
                         }
                         Incoming::Request { method, params, responder } => {
-                            if method == "session/request_permission" {
+                            if method == "session/request_permission" && cancel_deadline.is_some() {
+                                // The turn was interrupted. A request that
+                                // comes after the cancel gets the same answer
+                                // as the requests before it, and the user
+                                // never sees it.
+                                tracing::debug!(session = %self.spec.session_id, "a permission request came after the cancel; the adapter cancels it");
+                                let _ = responder.respond(json!({"outcome": {"outcome": "cancelled"}}));
+                            } else if method == "session/request_permission" {
                                 request_counter += 1;
                                 let request_id = RequestId::new(format!("acp-{request_counter}"));
-                                let opened = mapper.map_permission(request_id.clone(), &params);
+                                let mut opened = mapper.map_permission(request_id.clone(), &params);
+                                if watch_mode {
+                                    // An option that moves the session to a
+                                    // higher mode, such as "Yes, and use auto
+                                    // mode" when it leaves plan mode, is not
+                                    // offered.
+                                    let file_change = matches!(opened.body, RequestBody::Approval(ApprovalDetails::FileChange { .. }));
+                                    opened.options.retain(|o| {
+                                        claude_option_mode(&o.id, file_change).is_none_or(|m| claude_mode_allowed(m, limit))
+                                    });
+                                }
                                 pending.insert(request_id, PendingPermission { responder: *responder, options: opened.options.clone() });
                                 self.emit(SessionEvent::RequestOpened(opened)).await;
                             } else {
@@ -958,6 +1260,43 @@ impl Actor {
                     self.emit_all(events).await;
                     self.emit(SessionEvent::State { state: SessionState::Idle }).await;
                 }
+                reset = reset_rx.recv() => {
+                    let Some(result) = reset else { continue };
+                    let Some(mode) = resetting.take() else { continue };
+                    let target = claude_mode(limit);
+                    // `session/set_config_option` answers with the options,
+                    // so the actor reads the mode back. `session/set_mode`
+                    // has no answer to read.
+                    let failure = match result {
+                        Err(err) => Some(err),
+                        Ok(reply) => reply
+                            .get("configOptions")
+                            .and_then(Value::as_array)
+                            .and_then(|options| {
+                                let now = find_option(options, "mode", &["mode"])
+                                    .and_then(|o| o.get("currentValue"))
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("no mode");
+                                (!claude_mode_allowed(now, limit)).then(|| format!("the agent still reports `{now}`"))
+                            }),
+                    };
+                    match failure {
+                        None => {
+                            self.emit(SessionEvent::Error {
+                                code: "mode_reset".to_owned(),
+                                message: format!(
+                                    "The harness changed its permission mode to `{mode}`, which is above the limit of this session. The worker set it back to `{target}`."
+                                ),
+                            })
+                            .await;
+                        }
+                        Some(why) => {
+                            lost_reason = mode_lost_text(&mode, target, &why);
+                            exit = Exit::ModeLost;
+                            break;
+                        }
+                    }
+                }
                 () = deadline => {
                     cancel_deadline = None;
                     if running.is_some() {
@@ -976,29 +1315,31 @@ impl Actor {
                 })
                 .await;
             }
-            Exit::Harness | Exit::Unresponsive => {
-                let (code, message) = if exit == Exit::Unresponsive {
-                    (
+            Exit::Harness | Exit::Unresponsive | Exit::ModeLost => {
+                let (code, message) = match exit {
+                    Exit::Unresponsive => (
                         "harness_unresponsive",
                         "The harness did not stop the turn after an interrupt, so the worker stopped the harness."
                             .to_owned(),
-                    )
-                } else {
-                    let tail = self.stderr.get();
-                    (
-                        "harness_exited",
-                        if tail.is_empty() {
-                            "The harness process exited.".to_owned()
-                        } else {
-                            format!("The harness process exited. Its last output:\n{tail}")
-                        },
-                    )
+                    ),
+                    Exit::ModeLost => ("mode_reset_failed", lost_reason),
+                    _ => {
+                        let tail = self.stderr.get();
+                        (
+                            "harness_exited",
+                            if tail.is_empty() {
+                                "The harness process exited.".to_owned()
+                            } else {
+                                format!("The harness process exited. Its last output:\n{tail}")
+                            },
+                        )
+                    }
                 };
                 if running.is_some() {
-                    let error = if exit == Exit::Unresponsive {
-                        "the harness did not stop the turn"
-                    } else {
-                        "the harness exited"
+                    let error = match exit {
+                        Exit::Unresponsive => "the harness did not stop the turn",
+                        Exit::ModeLost => "the harness went above its permission mode",
+                        _ => "the harness exited",
                     };
                     let events = mapper.end_turn(TurnEndReason::Failed, Some(error.to_owned()));
                     self.emit_all(events).await;
@@ -1028,6 +1369,38 @@ enum Exit {
     /// The agent did not end an interrupted turn in time. The connection
     /// task then kills the agent.
     Unresponsive,
+    /// A Claude session went above its permission mode, and the adapter
+    /// could not set the mode back. The connection task then kills the
+    /// agent.
+    ModeLost,
+}
+
+/// The request that sets a Claude session's permission mode back to
+/// `target`, or `None` when the agent has no way to set it.
+fn mode_reset_message(
+    native: &NativeRef,
+    setter: &ModeSetter,
+    target: &str,
+) -> Option<UntypedMessage> {
+    let (method, params) = match setter {
+        ModeSetter::ConfigOption(id) => (
+            "session/set_config_option",
+            json!({"sessionId": native.as_str(), "configId": id, "value": target}),
+        ),
+        ModeSetter::SetMode => (
+            "session/set_mode",
+            json!({"sessionId": native.as_str(), "modeId": target}),
+        ),
+        ModeSetter::None => return None,
+    };
+    UntypedMessage::new(method, params).ok()
+}
+
+/// The text of the `mode_reset_failed` error.
+fn mode_lost_text(mode: &str, target: &str, why: &str) -> String {
+    format!(
+        "The harness changed its permission mode to `{mode}`, which is above the limit of this session. The worker could not set it back to `{target}` ({why}), so it stopped the harness."
+    )
 }
 
 /// The process of the agent for a session. The agent starts in the
@@ -1053,10 +1426,13 @@ pub fn agent_process_spec(
     })
 }
 
+/// Starts the agent and opens a session. With `probe`, the session is a
+/// probe (see [`claude_meta_for`]).
 async fn start(
     kind: HarnessKind,
     account: &AccountConfig,
     spec: SessionSpec,
+    probe: bool,
 ) -> Result<(AcpSession, EventReceiver, Ready), HarnessError> {
     let mut child = process::spawn(&agent_process_spec(kind, account, &spec, &resolve_program)?)?;
     let stdin = child
@@ -1066,11 +1442,12 @@ async fn start(
         .take_stdout()
         .ok_or_else(|| HarnessError::Spawn("no stdout".to_owned()))?;
     let stderr = child.stderr_handle();
-    connect(kind, spec, stdin, stdout, Some(child), stderr).await
+    connect_for(kind, spec, stdin, stdout, Some(child), stderr, probe).await
 }
 
 /// Runs the ACP client over any byte streams. `start` passes the stdio of
 /// the agent process; tests pass in-memory pipes.
+#[cfg(test)]
 async fn connect<W, R>(
     kind: HarnessKind,
     spec: SessionSpec,
@@ -1078,6 +1455,27 @@ async fn connect<W, R>(
     stdout: R,
     child: Option<process::HarnessProcess>,
     stderr: StderrTail,
+) -> Result<(AcpSession, EventReceiver, Ready), HarnessError>
+where
+    W: tokio::io::AsyncWrite + Send + Unpin + 'static,
+    R: tokio::io::AsyncRead + Send + Unpin + 'static,
+{
+    connect_for(kind, spec, stdin, stdout, child, stderr, false).await
+}
+
+/// [`connect`] for a session or a probe.
+///
+/// The connection task owns the agent process. Until the session is open,
+/// a guard aborts the task when this future drops, for example when the
+/// probe limit runs out, so the agent does not keep running.
+async fn connect_for<W, R>(
+    kind: HarnessKind,
+    spec: SessionSpec,
+    stdin: W,
+    stdout: R,
+    child: Option<process::HarnessProcess>,
+    stderr: StderrTail,
+    probe: bool,
 ) -> Result<(AcpSession, EventReceiver, Ready), HarnessError>
 where
     W: tokio::io::AsyncWrite + Send + Unpin + 'static,
@@ -1094,12 +1492,13 @@ where
         spec,
         events: event_tx,
         stderr: stderr.clone(),
+        probe,
     };
     let notify_tx = incoming_tx.clone();
     let request_tx = incoming_tx;
     let label = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
     let label_writer = label.clone();
-    let task = tokio::spawn(async move {
+    let task = AbortOnDrop(Some(tokio::spawn(async move {
         let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
         let result = Client
             .builder()
@@ -1147,16 +1546,13 @@ where
         if let Some(mut child) = child {
             child.shutdown(Duration::from_secs(2)).await;
         }
-    });
+    })));
 
+    // On each error, `task` drops and aborts the connection task.
     let mut ready = match tokio::time::timeout(OPEN_TIMEOUT, ready_rx).await {
         Ok(Ok(Ok(ready))) => ready,
-        Ok(Ok(Err(err))) => {
-            task.abort();
-            return Err(err);
-        }
+        Ok(Ok(Err(err))) => return Err(err),
         Ok(Err(_)) => {
-            task.abort();
             let tail = stderr.get();
             return Err(HarnessError::Spawn(if tail.is_empty() {
                 "the agent exited before it opened a session".to_owned()
@@ -1165,7 +1561,6 @@ where
             }));
         }
         Err(_) => {
-            task.abort();
             return Err(HarnessError::Timeout(
                 "the agent did not open a session".to_owned(),
             ));
@@ -1220,7 +1615,10 @@ impl Harness for AcpHarness {
             resume: None,
             process_watcher: None,
         };
-        let result = tokio::time::timeout(PROBE_TIMEOUT, start(self.kind, account, spec)).await;
+        // When the limit runs out, the start future drops, and its guard
+        // stops the agent.
+        let result =
+            tokio::time::timeout(PROBE_TIMEOUT, start(self.kind, account, spec, true)).await;
         let status = match result {
             Ok(Ok((session, _events, ready))) => {
                 let _ = Box::new(session).close().await;
@@ -1228,6 +1626,14 @@ impl Harness for AcpHarness {
                 capabilities.resume = ready.capabilities.resume;
                 capabilities.steer = ready.capabilities.steer;
                 capabilities.mcp_http = ready.capabilities.mcp_http;
+                if ready.bypass == Some(false) {
+                    // Claude Code turned `bypassPermissions` off, so Full
+                    // access would fail. The worker lowers a Full access
+                    // request to Auto.
+                    capabilities
+                        .approval_modes
+                        .retain(|m| *m != ApprovalMode::FullAccess);
+                }
                 AccountStatus {
                     harness_version: ready.agent_version,
                     auth_state: AuthState::SignedIn,
@@ -1265,9 +1671,54 @@ impl Harness for AcpHarness {
         account: &AccountConfig,
         spec: SessionSpec,
     ) -> Result<(Box<dyn HarnessSession>, EventReceiver), HarnessError> {
-        let (session, events, _ready) = start(self.kind, account, spec).await?;
+        let (session, events) = open_with_fallback(self.kind, spec, |spec| {
+            start(self.kind, account, spec, false)
+        })
+        .await?;
         Ok((Box::new(session), events))
     }
+}
+
+/// Opens a session with `start`. When Full access fails because Claude
+/// Code turned `bypassPermissions` off after the last probe, opens it again
+/// in the next lower mode. The first agent loaded the repo's settings for
+/// Full access, so the new agent starts fresh, with the limits of the
+/// lower mode. The session's capabilities lose Full access, so the worker
+/// sees the lower mode.
+async fn open_with_fallback<F, Fut>(
+    kind: HarnessKind,
+    spec: SessionSpec,
+    start: F,
+) -> Result<(AcpSession, EventReceiver), HarnessError>
+where
+    F: Fn(SessionSpec) -> Fut,
+    Fut: std::future::Future<Output = Result<(AcpSession, EventReceiver, Ready), HarnessError>>,
+{
+    let full = spec.approval_mode == ApprovalMode::FullAccess;
+    let fallback = full.then(|| spec.clone());
+    let why = match start(spec).await {
+        Ok((session, events, _ready)) => return Ok((session, events)),
+        Err(HarnessError::ModeUnavailable(why)) => why,
+        Err(err) => return Err(err),
+    };
+    let mut capabilities = static_capabilities(kind);
+    capabilities
+        .approval_modes
+        .retain(|m| *m != ApprovalMode::FullAccess);
+    let (Some(mut spec), Some(lower)) = (
+        fallback,
+        capabilities.best_mode_up_to(ApprovalMode::FullAccess),
+    ) else {
+        return Err(HarnessError::ModeUnavailable(why));
+    };
+    tracing::warn!(session = %spec.session_id, %why, ?lower, "Full access is not available; the session starts in a lower approval mode");
+    spec.approval_mode = lower;
+    let (mut session, events, _ready) = start(spec).await?;
+    session
+        .capabilities
+        .approval_modes
+        .retain(|m| *m != ApprovalMode::FullAccess);
+    Ok((session, events))
 }
 
 impl AcpSession {
@@ -1298,11 +1749,22 @@ impl HarnessSession for AcpSession {
         self.call(|reply| Command::Turn { input, reply }).await
     }
 
-    async fn steer(&mut self, input: TurnInput) -> Result<(), HarnessError> {
+    fn steer(&mut self, input: TurnInput) -> SteerFuture {
         if !self.capabilities.steer {
-            return Err(HarnessError::Unsupported("steer"));
+            return steer_ready(Err(HarnessError::Unsupported("steer")));
         }
-        self.call(|reply| Command::Steer { input, reply }).await
+        // The command goes in the queue now, so it keeps its place before a
+        // later interrupt. Only the answer is waited for later.
+        let (reply, answer) = oneshot::channel();
+        if let Err(err) = self.commands.try_send(Command::Steer { input, reply }) {
+            return steer_ready(Err(match err {
+                mpsc::error::TrySendError::Closed(_) => HarnessError::Closed,
+                mpsc::error::TrySendError::Full(_) => {
+                    HarnessError::Protocol("the session has too many commands waiting".to_owned())
+                }
+            }));
+        }
+        Box::pin(async move { answer.await.map_err(|_| HarnessError::Closed)? })
     }
 
     async fn interrupt(&mut self) -> Result<(), HarnessError> {
@@ -1320,10 +1782,11 @@ impl HarnessSession for AcpSession {
 
     async fn close(self: Box<Self>) -> Result<(), HarnessError> {
         let _ = self.commands.send(Command::Close).await;
-        let mut task = self.task;
-        if tokio::time::timeout(Duration::from_secs(5), &mut task)
-            .await
-            .is_err()
+        let mut guard = self.task;
+        if let Some(mut task) = guard.take()
+            && tokio::time::timeout(Duration::from_secs(5), &mut task)
+                .await
+                .is_err()
         {
             task.abort();
         }

@@ -36,12 +36,37 @@ pub use crate::core::{Harnesses, default_harnesses};
 pub use crate::error::WorkerError;
 pub use crate::sessions::Coalescer;
 
-use crate::config::{DB_FILE, KEY_FILE, WorkerToml, create_private_dir, harness_installed};
+use crate::config::{
+    DB_FILE, KEY_FILE, LOCK_FILE, WorkerToml, create_private_dir, harness_installed,
+};
 use crate::core::Core;
 use crate::identity::Identity;
 use crate::link::Link;
 use crate::sessions::Job;
 use crate::store::Store;
+
+/// Takes the exclusive lock on the worker lock file of a config folder.
+/// The lock lasts as long as the returned file is open. Another process
+/// that holds it makes this fail with [`WorkerError::AlreadyRunning`].
+pub fn lock_config_dir(dir: &Path) -> Result<std::fs::File, WorkerError> {
+    let path = dir.join(LOCK_FILE);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .map_err(|e| WorkerError::io(format!("could not open {}", path.display()), e))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => {
+            Err(WorkerError::AlreadyRunning(dir.display().to_string()))
+        }
+        Err(std::fs::TryLockError::Error(e)) => Err(WorkerError::io(
+            format!("could not lock {}", path.display()),
+            e,
+        )),
+    }
+}
 
 /// Where the worker keeps its files.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,7 +167,12 @@ impl WorkerHandle {
 
     /// Stops the worker. Open sessions stay in `worker.db`, so the next run
     /// resumes them.
+    ///
+    /// The stopping flag turns on first. A harness that exits from now on,
+    /// for example because the same signal reached it, does not make its
+    /// session lost.
     pub async fn shutdown(self) -> Result<(), WorkerError> {
+        self.core.stopping.send_replace(true);
         let _ = self.shutdown.send(true);
         let handles: Vec<_> = {
             let mut sessions = match self.core.sessions.lock() {
@@ -172,6 +202,12 @@ impl WorkerHandle {
                 task.abort();
             }
         }
+        // Everything has stopped, so the next worker may use the folder.
+        let lock = match self.core.lock.lock() {
+            Ok(mut l) => l.take(),
+            Err(p) => p.into_inner().take(),
+        };
+        drop(lock);
         Ok(())
     }
 }
@@ -199,6 +235,9 @@ pub async fn run_with(
     // made it with the default mode.
     create_private_dir(&dir)
         .map_err(|e| WorkerError::io(format!("could not create {}", dir.display()), e))?;
+    // One worker per folder. A second worker would kill the first one's
+    // harness groups below, and both would write the same spool.
+    let lock = lock_config_dir(&dir)?;
     if toml.discover_accounts(&harness_installed) {
         toml.save(&dir)?;
     }
@@ -245,13 +284,12 @@ pub async fn run_with(
         last_inventory_hash: Mutex::new(None),
         bridge_program,
         inflight: Mutex::new(Default::default()),
+        stopping: watch::channel(false).0,
+        lock: Mutex::new(Some(lock)),
     });
 
     // Resume the sessions that were open when the worker stopped.
-    for record in core.store.open_sessions()? {
-        let jobs = core.spawn_session(record.start.session_id);
-        let _ = jobs.send(Job::Restore(Box::new(record)));
-    }
+    crate::core::restore_sessions(&core)?;
 
     let (shutdown, shutdown_rx) = watch::channel(false);
     let tasks = vec![
@@ -269,4 +307,32 @@ pub async fn run_with(
         shutdown,
         tasks,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn one_worker_per_config_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = lock_config_dir(dir.path()).unwrap();
+        let second = lock_config_dir(dir.path());
+        assert!(
+            matches!(&second, Err(WorkerError::AlreadyRunning(_))),
+            "{second:?}"
+        );
+        assert!(second.unwrap_err().to_string().contains("--config-dir"));
+        // The lock ends with the worker. A process that another test forks
+        // holds the open file until its `exec` closes it (the file is
+        // close-on-exec), so try a few times.
+        drop(first);
+        let again = (0..50).find_map(|_| {
+            lock_config_dir(dir.path()).ok().or_else(|| {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                None
+            })
+        });
+        assert!(again.is_some());
+    }
 }

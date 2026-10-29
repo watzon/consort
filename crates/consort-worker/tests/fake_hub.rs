@@ -367,6 +367,12 @@ async fn sessions_resume_after_a_worker_restart() {
         .await
         .unwrap();
     hub.wait_connected().await;
+    // A second worker on the same folder refuses to start.
+    let second = consort_worker::run_with(config.clone(), harnesses()).await;
+    assert!(
+        matches!(second, Err(consort_worker::WorkerError::AlreadyRunning(_))),
+        "{second:?}"
+    );
     let session_id = SessionId::new();
     let mut start = session_start(session_id, account_id);
     start.turn = None;

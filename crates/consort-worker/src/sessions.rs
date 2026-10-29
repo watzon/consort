@@ -20,7 +20,7 @@ use consort_proto::model::{
 use consort_proto::tools::{ToolCallResult, ToolDefinition};
 use consort_proto::worker_link::{
     HubToWorker, OUTPUT_DELTA_INTERVAL_MS, RequestAnswer, RequestBody, SessionEvent, SessionStart,
-    SessionStartResult, SessionTurnResult, ToolCall, ToolList,
+    SessionStartResult, SessionSteer, SessionTurnResult, ToolCall, ToolList, TurnInput,
 };
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -50,6 +50,13 @@ pub(crate) enum Job {
     AllowHubTool {
         request_id: RequestId,
         option_id: String,
+    },
+    /// Deny an approval that is too long to show in full. `reason` goes to
+    /// the model as a steer when the harness can steer.
+    DenyTooLong {
+        request_id: RequestId,
+        option_id: Option<String>,
+        reason: String,
     },
     /// The harness reported the session as lost. Close what is left of it.
     HarnessLost,
@@ -186,6 +193,58 @@ fn deny_option(options: &[consort_proto::model::RequestOption]) -> Option<String
         .map(|o| o.id.clone())
 }
 
+/// How long the pump holds the first event that says the harness exited,
+/// to see whether the worker stops. A harness that gets the same stop
+/// signal as the worker can exit a moment before the worker sets its
+/// stopping flag.
+pub(crate) const EXIT_HOLD: Duration = if cfg!(test) {
+    Duration::from_millis(300)
+} else {
+    Duration::from_secs(1)
+};
+
+/// How long the worker waits for the answer to a steer. The adapters have
+/// their own shorter limits, so this only catches an adapter that never
+/// answers.
+const STEER_LIMIT: Duration = Duration::from_secs(15);
+
+/// Whether an event says that the harness process is gone. While the worker
+/// stops, these events do not reach the spool, so the session stays open
+/// for the next run.
+fn is_exit_event(event: &SessionEvent) -> bool {
+    match event {
+        SessionEvent::State { state } => *state == SessionState::Lost,
+        SessionEvent::Error { code, .. } => {
+            code == "harness_exited" || code == "harness_unresponsive"
+        }
+        _ => false,
+    }
+}
+
+/// What the worker tells the user and the model when it denies an
+/// approval that is too long to show.
+fn too_long_reason(body: &RequestBody) -> String {
+    match body {
+        RequestBody::Approval(ApprovalDetails::Command { .. }) => {
+            "The command is too long to show for approval, so the worker denied it. Split it into smaller steps."
+        }
+        _ => {
+            "The request is too long to show for approval, so the worker denied it. Split the work into smaller steps."
+        }
+    }
+    .to_owned()
+}
+
+/// A name for an approval mode in a message.
+fn mode_name(mode: ApprovalMode) -> &'static str {
+    match mode {
+        ApprovalMode::Ask => "Ask",
+        ApprovalMode::AutoEdits => "Auto edits",
+        ApprovalMode::Auto => "Auto",
+        ApprovalMode::FullAccess => "Full access",
+    }
+}
+
 /// Reads harness events until the harness closes the channel.
 async fn pump(
     core: Arc<Core>,
@@ -199,6 +258,7 @@ async fn pump(
     let mut coalescer = Coalescer::default();
     let interval = Duration::from_millis(OUTPUT_DELTA_INTERVAL_MS);
     let mut deadline: Option<tokio::time::Instant> = None;
+    let mut exit_held = false;
     loop {
         let sleep = async {
             match deadline {
@@ -209,6 +269,14 @@ async fn pump(
         tokio::select! {
             event = events.recv() => {
                 let Some(event) = event else { break };
+                if is_exit_event(&event) {
+                    let hold = if exit_held { Duration::ZERO } else { EXIT_HOLD };
+                    exit_held = true;
+                    if core.stops_within(hold).await {
+                        tracing::info!(session = %session_id, "the harness exited while the worker stops; the worker keeps the session for the next run");
+                        continue;
+                    }
+                }
                 // The harness says that the login is gone or expired. Update
                 // the inventory now, so the hub stops placing work here.
                 if let SessionEvent::Error { code, message } = &event
@@ -223,6 +291,26 @@ async fn pump(
                     };
                     if let Some(option_id) = allow {
                         let _ = jobs.send(Job::AllowHubTool { request_id: opened.request_id.clone(), option_id });
+                        continue;
+                    }
+                    // The worker would have to cut this approval to send it,
+                    // so the user would allow a command or a change that
+                    // they cannot see in full. The worker denies it and
+                    // says why.
+                    if matches!(opened.body, RequestBody::Approval(_))
+                        && crate::cap::request_must_be_cut(opened)
+                    {
+                        let reason = too_long_reason(&opened.body);
+                        let note = SessionEvent::Error { code: "approval_too_long".to_owned(), message: reason.clone() };
+                        for ready in coalescer.push(note) {
+                            core.record_event(session_id, &ready);
+                        }
+                        deadline = None;
+                        let _ = jobs.send(Job::DenyTooLong {
+                            request_id: opened.request_id.clone(),
+                            option_id: deny_option(&opened.options),
+                            reason,
+                        });
                         continue;
                     }
                 }
@@ -368,7 +456,9 @@ impl Runtime {
                     ),
                 )
             })?;
-        let capabilities = adapter.capabilities(&account);
+        // The probed capabilities, when the worker has them: a probe can
+        // find that Full access does not work on this machine.
+        let capabilities = core.account_capabilities(&account, adapter.as_ref());
         let mut max = config.policy.max_approval_mode;
         if !config.policy.allow_shell {
             max = max.min(ApprovalMode::AutoEdits);
@@ -459,6 +549,27 @@ impl Runtime {
             }
         };
         self.capabilities = session.capabilities().clone();
+        if !self.capabilities.approval_modes.contains(&mode) {
+            // The adapter had to start the session in a lower mode, for
+            // example because Claude Code turned `bypassPermissions` off
+            // after the last probe. Say so, and stop offering the mode.
+            let used = self
+                .capabilities
+                .best_mode_up_to(mode)
+                .map_or("a lower mode", mode_name);
+            core.record_event(
+                self.session_id,
+                &SessionEvent::Error {
+                    code: "approval_mode_lowered".to_owned(),
+                    message: format!(
+                        "{} cannot run in {} on this worker now, so the session runs in {used}.",
+                        account.label,
+                        mode_name(mode)
+                    ),
+                },
+            );
+            core.narrow_approval_modes(&account, &self.capabilities);
+        }
         if let Some(native) = session.native_ref() {
             let _ = core.store.set_native_ref(self.session_id, &native);
         }
@@ -615,6 +726,11 @@ impl Runtime {
     }
 
     fn lost(&self, code: &str, why: &str) {
+        if self.core.is_stopping() {
+            // The next run of the worker tries again.
+            tracing::info!(session = %self.session_id, %code, "the worker stops, so it does not mark the session lost");
+            return;
+        }
         let _ = self
             .core
             .store
@@ -669,22 +785,6 @@ impl Runtime {
                     false,
                 )
             }
-            HubToWorker::SessionSteer(steer) => {
-                if !self.capabilities.steer {
-                    return (
-                        Err(ErrorBody::new(
-                            ErrorCode::PolicyDenied,
-                            "this harness cannot steer a running turn",
-                        )),
-                        false,
-                    );
-                }
-                let result = match self.harness() {
-                    Ok(h) => h.steer(steer.turn).await.map_err(harness_body),
-                    Err(e) => Err(e),
-                };
-                (result.and_then(|()| empty()), false)
-            }
             HubToWorker::SessionInterrupt(_) => {
                 let result = match self.harness() {
                     Ok(h) => h.interrupt().await.map_err(harness_body),
@@ -711,10 +811,55 @@ impl Runtime {
                     .set_session_state(self.session_id, SessionState::Ended);
                 (empty(), true)
             }
-            HubToWorker::WorkspaceRelease(_)
+            // `run_session` starts a steer with `begin_steer`, and `Core`
+            // runs the other commands itself.
+            HubToWorker::SessionSteer(_)
+            | HubToWorker::WorkspaceRelease(_)
             | HubToWorker::ItemDetail(_)
             | HubToWorker::InventoryRefresh(_) => (Err(ErrorBody::internal()), false),
         }
+    }
+
+    /// Gives a steer to the harness and answers the command from its own
+    /// task, so interrupts, policy denials and hub tool answers do not wait
+    /// for the harness to take the steer.
+    fn begin_steer(&mut self, id: FrameId, steer: SessionSteer) {
+        if !self.capabilities.steer {
+            self.core.finish_command(
+                &id,
+                Err(ErrorBody::new(
+                    ErrorCode::PolicyDenied,
+                    "this harness cannot steer a running turn",
+                )),
+            );
+            return;
+        }
+        let answer = match self.harness() {
+            Ok(h) => h.steer(steer.turn),
+            Err(e) => {
+                self.core.finish_command(&id, Err(e));
+                return;
+            }
+        };
+        let core = self.core.clone();
+        tokio::spawn(async move {
+            match tokio::time::timeout(STEER_LIMIT, answer).await {
+                Ok(Ok(())) => core.finish_command(&id, Ok(json!({}))),
+                // The session closed first, for example because the worker
+                // stops. The answer is not stored, so the hub can send the
+                // steer again.
+                Ok(Err(consort_harness::HarnessError::Closed)) => {
+                    core.abandon_command(&id, crate::core::session_gone());
+                }
+                Ok(Err(err)) => core.finish_command(&id, Err(harness_body(err))),
+                Err(_) => core.finish_command(
+                    &id,
+                    Err(harness_body(consort_harness::HarnessError::Timeout(
+                        "the harness did not take the steer".to_owned(),
+                    ))),
+                ),
+            }
+        });
     }
 }
 
@@ -737,6 +882,10 @@ pub(crate) async fn run_session(
     while let Some(job) = jobs.recv().await {
         match job {
             Job::Command { id, command } => {
+                if let HubToWorker::SessionSteer(steer) = *command {
+                    runtime.begin_steer(id, steer);
+                    continue;
+                }
                 let (result, ended) = runtime.execute(*command).await;
                 core.finish_command(&id, result);
                 if ended {
@@ -779,6 +928,38 @@ pub(crate) async fn run_session(
                             },
                         )
                         .await;
+                }
+            }
+            Job::DenyTooLong {
+                request_id,
+                option_id,
+                reason,
+            } => {
+                let can_steer = runtime.capabilities.steer;
+                if let Ok(h) = runtime.harness() {
+                    tracing::info!(session = %session_id, "the worker denies an approval that is too long to show");
+                    let _ = h
+                        .respond(
+                            request_id,
+                            RequestAnswer {
+                                option_id,
+                                text: None,
+                            },
+                        )
+                        .await;
+                    // The harness gives the model only "denied". A steer
+                    // tells it why, so it can split the work.
+                    if can_steer {
+                        let steer = h.steer(TurnInput {
+                            text: reason,
+                            attachments: vec![],
+                        });
+                        tokio::spawn(async move {
+                            if let Err(err) = steer.await {
+                                tracing::debug!(error = %err, "could not tell the model why the worker denied an approval");
+                            }
+                        });
+                    }
                 }
             }
             Job::HarnessLost => {

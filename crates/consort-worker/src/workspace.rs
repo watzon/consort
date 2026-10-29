@@ -15,11 +15,14 @@
 //! - A clone of a local path is allowed only inside the allowed roots of
 //!   the worker policy.
 //!
-//! Each `git` command has a time limit. When `prepare` fails, it removes
-//! what it made, so the hub can try again.
+//! Each `git` command has a time limit, and the whole `prepare` has
+//! [`PREPARE_LIMIT`]. When `prepare` fails, it removes what it made, so the
+//! hub can try again.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+use tokio::time::Instant;
 
 use consort_proto::ids::TaskId;
 use consort_proto::model::Isolation;
@@ -31,6 +34,13 @@ use crate::store::{WorkspaceEntry, WorkspaceRecord};
 
 /// How long a clone may take.
 const CLONE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// How long the whole `prepare` may take, for all repos together. The hub
+/// waits 60 minutes for `session.start` (`SESSION_START_TIMEOUT` in
+/// `consort-hub`). The harness open and the first turn come after the
+/// workspace. They take at most about 8 minutes (two ACP opens of 3 minutes
+/// when Full access falls back to Auto), so this leaves a margin of at
+/// least 10 minutes.
+pub const PREPARE_LIMIT: Duration = Duration::from_secs(40 * 60);
 /// How long any other `git` command may take.
 const GIT_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 /// The protocols that a clone of a remote repo may use.
@@ -87,6 +97,30 @@ async fn git_with(
 /// Runs `git` with the default time limit and returns its stdout as bytes.
 async fn git(args: &[&str], cwd: Option<&Path>) -> Result<Vec<u8>, WorkerError> {
     git_with(args, cwd, &[], GIT_TIMEOUT).await
+}
+
+/// The time limit of one step of `prepare`: `limit`, or less when the
+/// whole `prepare` has less time left.
+fn step_limit(deadline: Instant, limit: Duration) -> Result<Duration, WorkerError> {
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err(WorkerError::Workspace(format!(
+            "the workspace took longer than {} minutes to prepare. Use fewer or smaller repos, or a checkout on this worker",
+            PREPARE_LIMIT.as_secs() / 60
+        )));
+    }
+    Ok(limit.min(left))
+}
+
+/// Runs `git` within the time that `prepare` has left.
+async fn git_until(
+    args: &[&str],
+    cwd: Option<&Path>,
+    env: &[(&str, &str)],
+    limit: Duration,
+    deadline: Instant,
+) -> Result<Vec<u8>, WorkerError> {
+    git_with(args, cwd, env, step_limit(deadline, limit)?).await
 }
 
 /// A folder name for a repo, from the last part of its URL.
@@ -165,7 +199,17 @@ pub fn clone_source(url: &str) -> Result<CloneSource, WorkerError> {
     check_git_value("repo URL", url)?;
     let lower = url.to_ascii_lowercase();
     if lower.starts_with("file://") {
-        return Ok(CloneSource::Local(PathBuf::from(&url["file://".len()..])));
+        // `Url` turns `file:///C:/repo` into `C:\repo` on Windows, and
+        // decodes `%20` and the like.
+        let path = url::Url::parse(url)
+            .ok()
+            .and_then(|u| u.to_file_path().ok())
+            .ok_or_else(|| {
+                WorkerError::Workspace(format!(
+                    "the repo URL `{url}` is not a file URL of this machine"
+                ))
+            })?;
+        return Ok(CloneSource::Local(path));
     }
     if ["https://", "ssh://", "git://", "git+ssh://", "ssh+git://"]
         .iter()
@@ -233,16 +277,23 @@ async fn copy_untracked(from: &Path, to: &Path) -> Result<(), WorkerError> {
     Ok(())
 }
 
-async fn carry_changes(checkout: &Path, dest: &Path) -> Result<(), WorkerError> {
+async fn carry_changes(checkout: &Path, dest: &Path, deadline: Instant) -> Result<(), WorkerError> {
     // The patch stays bytes from end to end, so files that are not UTF-8
     // keep their content.
-    let diff = git(&["diff", "--binary", "HEAD"], Some(checkout)).await?;
+    let diff = git_until(
+        &["diff", "--binary", "HEAD"],
+        Some(checkout),
+        &[],
+        GIT_TIMEOUT,
+        deadline,
+    )
+    .await?;
     if !diff.iter().all(u8::is_ascii_whitespace) {
         let patch = dest.join(".consort-carry.patch");
         tokio::fs::write(&patch, &diff)
             .await
             .map_err(|e| WorkerError::io("could not write the carry patch", e))?;
-        let result = git(
+        let result = git_until(
             &[
                 "apply",
                 "--binary",
@@ -250,14 +301,20 @@ async fn carry_changes(checkout: &Path, dest: &Path) -> Result<(), WorkerError> 
                 ".consort-carry.patch",
             ],
             Some(dest),
+            &[],
+            GIT_TIMEOUT,
+            deadline,
         )
         .await;
         let _ = tokio::fs::remove_file(&patch).await;
         result?;
     }
-    let untracked = git(
+    let untracked = git_until(
         &["ls-files", "--others", "--exclude-standard", "-z"],
         Some(checkout),
+        &[],
+        GIT_TIMEOUT,
+        deadline,
     )
     .await?;
     for rel in untracked.split(|b| *b == 0).filter(|s| !s.is_empty()) {
@@ -340,6 +397,7 @@ async fn prepare_repo(
     spec: &WorkspaceSpec,
     policy: &PolicyConfig,
     entries: &mut Vec<WorkspaceEntry>,
+    deadline: Instant,
 ) -> Result<PathBuf, WorkerError> {
     if let Some(branch) = &repo.branch {
         check_git_value("branch", branch)?;
@@ -364,7 +422,7 @@ async fn prepare_repo(
             let dest = root.join(repo_folder_name(repo));
             let dest_text = dest.to_string_lossy().into_owned();
             let target = repo.branch.as_deref().unwrap_or("HEAD");
-            git(
+            git_until(
                 &[
                     "worktree",
                     "add",
@@ -374,6 +432,9 @@ async fn prepare_repo(
                     target,
                 ],
                 Some(&checkout),
+                &[],
+                GIT_TIMEOUT,
+                deadline,
             )
             .await?;
             entries.push(WorkspaceEntry::Worktree {
@@ -381,7 +442,7 @@ async fn prepare_repo(
                 path: dest_text,
             });
             if spec.carry_uncommitted {
-                carry_changes(&checkout, &dest).await?;
+                carry_changes(&checkout, &dest, deadline).await?;
             }
             Ok(dest)
         }
@@ -414,11 +475,12 @@ async fn prepare_repo(
             entries.push(WorkspaceEntry::Clone {
                 path: dest_text.clone(),
             });
-            git_with(
+            git_until(
                 &args,
                 None,
                 &[("GIT_ALLOW_PROTOCOL", protocols)],
                 CLONE_TIMEOUT,
+                deadline,
             )
             .await?;
             Ok(dest)
@@ -426,8 +488,8 @@ async fn prepare_repo(
     }
 }
 
-/// Makes the workspace of a session under `workspaces_dir/<key>`. On an
-/// error, it removes what it made.
+/// Makes the workspace of a session under `workspaces_dir/<key>`, in at
+/// most [`PREPARE_LIMIT`]. On an error, it removes what it made.
 pub async fn prepare(
     workspaces_dir: &Path,
     key: &str,
@@ -435,6 +497,19 @@ pub async fn prepare(
     spec: &WorkspaceSpec,
     policy: &PolicyConfig,
 ) -> Result<Prepared, WorkerError> {
+    prepare_within(workspaces_dir, key, task_id, spec, policy, PREPARE_LIMIT).await
+}
+
+/// [`prepare`] with another time limit, for tests.
+async fn prepare_within(
+    workspaces_dir: &Path,
+    key: &str,
+    task_id: Option<TaskId>,
+    spec: &WorkspaceSpec,
+    policy: &PolicyConfig,
+    limit: Duration,
+) -> Result<Prepared, WorkerError> {
+    let deadline = Instant::now() + limit;
     spec.validate()
         .map_err(|e| WorkerError::Workspace(e.to_string()))?;
     let root = workspaces_dir.join(key);
@@ -457,7 +532,7 @@ pub async fn prepare(
     let mut entries = Vec::new();
     let mut paths = Vec::new();
     for repo in &spec.repos {
-        match prepare_repo(&root, repo, spec, policy, &mut entries).await {
+        match prepare_repo(&root, repo, spec, policy, &mut entries, deadline).await {
             Ok(path) => paths.push(path),
             Err(err) => {
                 for entry in entries.iter().rev() {
@@ -720,9 +795,23 @@ mod tests {
         for url in remote {
             assert_eq!(clone_source(url).unwrap(), CloneSource::Remote, "{url}");
         }
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                clone_source("file:///srv/repo").unwrap(),
+                CloneSource::Local(PathBuf::from("/srv/repo"))
+            );
+            assert_eq!(
+                clone_source("file:///srv/my%20repo").unwrap(),
+                CloneSource::Local(PathBuf::from("/srv/my repo"))
+            );
+            // A file URL of another host is not a path on this machine.
+            assert!(clone_source("file://server/share/repo").is_err());
+        }
+        #[cfg(windows)]
         assert_eq!(
-            clone_source("file:///srv/repo").unwrap(),
-            CloneSource::Local(PathBuf::from("/srv/repo"))
+            clone_source("file:///C:/repo").unwrap(),
+            CloneSource::Local(PathBuf::from(r"C:\repo"))
         );
         #[cfg(unix)]
         assert_eq!(
@@ -936,6 +1025,25 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(std::fs::read(carried.path.join(name)).unwrap(), b"x");
+    }
+
+    #[tokio::test]
+    async fn prepare_has_a_time_limit_for_all_repos() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = repo_with_changes(dir.path()).await;
+        let workspaces = dir.path().join("workspaces");
+        let err = prepare_within(
+            &workspaces,
+            "tsk_t",
+            None,
+            &spec(&repo, Isolation::Clone, false),
+            &PolicyConfig::default(),
+            Duration::ZERO,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("longer than 40 minutes"), "{err}");
+        assert!(!workspaces.join("tsk_t").exists(), "nothing is left");
     }
 
     #[tokio::test]

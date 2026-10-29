@@ -230,6 +230,10 @@ pub enum HarnessError {
     /// The harness did not answer in time.
     #[error("the harness did not answer in time: {0}")]
     Timeout(String),
+    /// The harness cannot run in the approval mode that the session asks
+    /// for, for example because Claude Code turned `bypassPermissions` off.
+    #[error("the harness cannot run in this approval mode: {0}")]
+    ModeUnavailable(String),
     /// A file system error.
     #[error("file system error: {0}")]
     Io(#[from] std::io::Error),
@@ -237,6 +241,16 @@ pub enum HarnessError {
 
 /// The receiver of a session's events.
 pub type EventReceiver = mpsc::Receiver<SessionEvent>;
+
+/// The answer to a steer. It does not borrow the session, so the worker can
+/// wait for it in another task and go on with interrupts and answers.
+pub type SteerFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), HarnessError>> + Send>>;
+
+/// A [`SteerFuture`] that is ready with `result`.
+pub fn steer_ready(result: Result<(), HarnessError>) -> SteerFuture {
+    Box::pin(std::future::ready(result))
+}
 
 /// One kind of harness.
 #[async_trait]
@@ -273,9 +287,11 @@ pub trait HarnessSession: Send {
     /// the turn comes as a `turn.ended` event.
     async fn turn(&mut self, input: TurnInput) -> Result<TurnId, HarnessError>;
 
-    /// Adds input to the running turn. Returns
+    /// Adds input to the running turn. The session takes the input at once,
+    /// in order with the other calls, and the returned future gives the
+    /// harness's answer. The future fails with
     /// [`HarnessError::Unsupported`] when `capabilities().steer` is false.
-    async fn steer(&mut self, input: TurnInput) -> Result<(), HarnessError>;
+    fn steer(&mut self, input: TurnInput) -> SteerFuture;
 
     /// Stops the running turn.
     async fn interrupt(&mut self) -> Result<(), HarnessError>;

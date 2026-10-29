@@ -92,6 +92,15 @@ enum WorkerCommand {
         config_dir: Option<PathBuf>,
     },
     /// Run the worker until Ctrl-C, SIGTERM or SIGHUP.
+    ///
+    /// When the worker stops, it closes each harness and keeps the open
+    /// sessions, so the next run resumes them. Only one worker can use a
+    /// worker folder at a time.
+    ///
+    /// In a systemd unit, set `KillMode=mixed`. Then SIGTERM goes to the
+    /// worker only, and the worker stops the harnesses itself. With the
+    /// default `KillMode=control-group`, SIGTERM reaches every harness at
+    /// the same time, and a harness can stop in the middle of its work.
     Run {
         /// The worker folder.
         #[arg(long, env = "CONSORT_WORKER_DIR")]

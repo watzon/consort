@@ -14,7 +14,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use consort_harness::{
     AccountConfig, AccountStatus, Answer, Capabilities, EventReceiver, Harness, HarnessError,
-    HarnessKind, HarnessSession, SessionSpec,
+    HarnessKind, HarnessSession, SessionSpec, SteerFuture,
 };
 use consort_proto::ids::{ItemId, NativeRef, RequestId, TurnId};
 use consort_proto::model::{
@@ -109,6 +109,11 @@ pub struct FakeHarness {
     pub fail_resume: bool,
     /// When set, every `turn` fails.
     pub fail_turn: bool,
+    /// How long the answer to a steer takes.
+    pub steer_delay: Duration,
+    /// The capabilities of a session, when they differ from the adapter's,
+    /// as when an adapter has to start a session in a lower mode.
+    pub session_capabilities: Option<Capabilities>,
 }
 
 impl FakeHarness {
@@ -128,7 +133,16 @@ impl FakeHarness {
             },
             fail_resume: false,
             fail_turn: false,
+            steer_delay: Duration::ZERO,
+            session_capabilities: None,
         }
+    }
+
+    /// The same fake with other capabilities, for example without Full
+    /// access.
+    pub fn with_capabilities(mut self, capabilities: Capabilities) -> Self {
+        self.capabilities = capabilities;
+        self
     }
 
     /// What the harness saw so far.
@@ -212,7 +226,10 @@ impl Harness for FakeHarness {
             Box::new(FakeSession {
                 spec,
                 script: self.script.clone(),
-                capabilities: self.capabilities.clone(),
+                capabilities: self
+                    .session_capabilities
+                    .clone()
+                    .unwrap_or_else(|| self.capabilities.clone()),
                 native,
                 events,
                 record: self.record.clone(),
@@ -220,6 +237,7 @@ impl Harness for FakeHarness {
                 turn_index: 0,
                 cancel,
                 fail_turn: self.fail_turn,
+                steer_delay: self.steer_delay,
             }),
             rx,
         ))
@@ -239,6 +257,7 @@ struct FakeSession {
     turn_index: usize,
     cancel: watch::Sender<u64>,
     fail_turn: bool,
+    steer_delay: Duration,
 }
 
 async fn play(
@@ -419,11 +438,15 @@ impl HarnessSession for FakeSession {
         Ok(turn)
     }
 
-    async fn steer(&mut self, input: TurnInput) -> Result<(), HarnessError> {
+    fn steer(&mut self, input: TurnInput) -> SteerFuture {
         if let Ok(mut record) = self.record.lock() {
             record.steers.push(input);
         }
-        Ok(())
+        let delay = self.steer_delay;
+        Box::pin(async move {
+            tokio::time::sleep(delay).await;
+            Ok(())
+        })
     }
 
     async fn interrupt(&mut self) -> Result<(), HarnessError> {

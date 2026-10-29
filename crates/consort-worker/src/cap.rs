@@ -17,7 +17,7 @@
 //! the hub what the worker dropped.
 
 use consort_proto::model::{ApprovalDetails, ItemPayload};
-use consort_proto::worker_link::{RequestBody, SessionEvent};
+use consort_proto::worker_link::{RequestBody, RequestOpened, SessionEvent};
 use serde_json::{Value, json};
 
 /// The largest event, as JSON bytes. A batch is then at most
@@ -98,6 +98,13 @@ fn dropped(size: usize) -> SessionEvent {
     }
 }
 
+/// Whether [`cap_event`] would cut this request. For an approval, the
+/// worker then denies the request instead, because the user would allow
+/// something that they cannot see in full.
+pub fn request_must_be_cut(opened: &RequestOpened) -> bool {
+    json_size(&SessionEvent::RequestOpened(opened.clone())) > MAX_EVENT_BYTES
+}
+
 /// Cuts an event to at most [`MAX_EVENT_BYTES`] of JSON. An event that fits
 /// comes back as it is.
 pub fn cap_event(event: SessionEvent) -> SessionEvent {
@@ -146,7 +153,6 @@ mod tests {
     use consort_proto::ids::{ItemId, RequestId, SessionId, TurnId};
     use consort_proto::model::{ItemStatus, SessionItem, ToolCallPayload};
     use consort_proto::time::Timestamp;
-    use consort_proto::worker_link::RequestOpened;
 
     fn tool_item(arguments: Value) -> SessionEvent {
         SessionEvent::Item(SessionItem {
