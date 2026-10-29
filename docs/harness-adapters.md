@@ -67,9 +67,9 @@ The user configures harness accounts in `worker.toml` (see [data-model.md](data-
 | Harness | Home setting | Private files |
 |---|---|---|
 | Codex | `CODEX_HOME` | `auth.json` |
-| Claude Code | `CLAUDE_CONFIG_DIR` (to verify) | Credentials file, or the keychain entry on macOS (to verify) |
+| Claude Code | `CLAUDE_CONFIG_DIR`. `claude-agent-acp` reads the login of the folder in this variable | `.credentials.json`, or the keychain entry on macOS (to verify) |
 | Pi | Pi's agent folder | `auth.json` |
-| OpenCode | Its data folder (to verify) | Its auth file (to verify) |
+| OpenCode | `XDG_DATA_HOME` (OpenCode keeps its data in `$XDG_DATA_HOME/opencode`) | `auth.json` |
 | ACP agents | Set per registry entry | Set per agent |
 
 The worker never reads the private files. It only reports `auth_state`, which each adapter gets from the harness itself, for example `account/read` in Codex.
@@ -82,8 +82,8 @@ Every session gets the worker's local MCP endpoint (see [Hub tools](protocol.md#
 
 | Path | How the endpoint reaches the harness |
 |---|---|
-| ACP | In `mcpServers` of `session/new`, as an `http` server with an `Authorization` header. The agent must report the `http` MCP capability. If it does not, the worker gives it a `stdio` server that runs `app mcp-bridge`, which forwards stdio to the local HTTP endpoint |
-| Codex app-server | In the `config` object of `thread/start`, as `mcp_servers.hub` (to verify). The fallback is the `-c mcp_servers.hub.url=...` launch argument |
+| ACP | In `mcpServers` of `session/new`, as an `http` server with an `Authorization` header. The agent must report the `http` MCP capability. If it does not, the worker gives it a `stdio` server that runs `consort mcp-bridge --url <endpoint>` with the token in `CONSORT_MCP_TOKEN`, which forwards stdio to the local HTTP endpoint. Claude Code and OpenCode report `http` |
+| Codex app-server | In the `config` object of `thread/start`, as `mcp_servers.hub` with `url` and `bearer_token_env_var`. The worker puts the token in that variable of the `codex app-server` process. Tested with codex-cli 0.165.0 |
 | Pi RPC | The `--mcp-config` flag, with a generated config file in the session's runtime folder |
 
 The worker also adds the local MCP servers that the channel may use, with the same mechanism.
@@ -94,12 +94,14 @@ The effective approval mode of a session is the lower of the requested mode and 
 
 | Mode | Claude (ACP) | Codex | Pi |
 |---|---|---|---|
-| Ask | `default` permission mode | Approval policy `on-request`, sandbox `workspace-write` | Not supported in v1 |
-| Auto edits | `acceptEdits` | `on-request`, edits allowed | Not supported in v1 |
-| Auto | `acceptEdits` plus the allowed tools in channel settings | `never` inside the sandbox | Default behavior |
+| Ask | `default` permission mode | Approval policy `untrusted`, sandbox `read-only` | Not supported in v1 |
+| Auto edits | `acceptEdits` | `on-request`, sandbox `workspace-write` | Not supported in v1 |
+| Auto | `acceptEdits` (channel allowed tools are not built yet) | `never`, sandbox `workspace-write` | Default behavior |
 | Full access | `bypassPermissions` | `never`, sandbox `danger-full-access` | Default behavior |
 
-The exact Codex and Claude values must be checked against each harness version in the adapter tests.
+The adapter tests check these values. OpenCode gets its mode in `OPENCODE_CONFIG_CONTENT` as a `permission` setting for `edit`, `bash` and `webfetch` (`ask` or `allow`). Gemini CLI gets `--approval-mode` (`default`, `auto_edit` or `yolo`) and supports Ask, Auto edits and Auto. Other ACP agents report Ask only.
+
+If `allow_shell` is false in the worker policy, the worker caps the mode at Auto edits and denies each command approval itself. That is worker policy, so the adapter rule above still holds.
 
 Pi has no built-in approval prompts, so a Pi session can only run in Auto or Full access. A later Pi extension can add a gate that asks the worker before each tool call, as T3 Code does.
 

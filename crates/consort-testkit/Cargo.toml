@@ -4,8 +4,15 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
+description = "A fake harness and helpers for Consort integration tests."
 
 [lints]
 workspace = true
 
 [dependencies]
+consort-proto = { workspace = true }
+consort-harness = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }

@@ -1,0 +1,2 @@
+{"method": "session/update", "params": {"sessionId": "sess-1", "update": {"sessionUpdate": "agent_message_chunk", "messageId": "msg_1869dff42001g8JyJi2Up7yVeq", "content": {"type": "text", "text": "OK"}}}}
+{"method": "session/update", "params": {"sessionId": "sess-1", "update": {"sessionUpdate": "usage_update", "used": 20303, "size": 1048576, "cost": {"amount": 0.0031166999999999996, "currency": "USD"}}}}

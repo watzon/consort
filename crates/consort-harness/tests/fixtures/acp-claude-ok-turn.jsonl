@@ -1,0 +1,5 @@
+{"method": "session/update", "params": {"sessionId": "sess-1", "update": {"sessionUpdate": "current_mode_update", "currentModeId": "default"}}}
+{"method": "session/update", "params": {"sessionId": "sess-1", "update": {"sessionUpdate": "session_info_update", "title": "Single word OK reply", "updatedAt": "2026-10-29T07:20:13.437Z"}}}
+{"method": "session/update", "params": {"sessionId": "sess-1", "update": {"sessionUpdate": "usage_update", "used": 54996, "size": 1000000, "_meta": {"_claude/model": "claude-opus-5-5"}}}}
+{"method": "session/update", "params": {"sessionId": "sess-1", "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "OK"}, "messageId": "msg_011CgW86nmyTR2DrVn2UaFBk"}}}
+{"method": "session/update", "params": {"sessionId": "sess-1", "update": {"sessionUpdate": "usage_update", "used": 54996, "size": 1000000, "cost": {"amount": 0.3495129, "currency": "USD"}, "_meta": {"_claude/origin": {"kind": "human"}, "_claude/model": "claude-opus-5-5"}}}}

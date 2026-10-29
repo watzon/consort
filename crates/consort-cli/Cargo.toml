@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
+description = "The consort binary: hub, worker, dev and mcp-bridge."
 
 [lints]
 workspace = true
@@ -13,3 +14,18 @@ name = "consort"
 path = "src/main.rs"
 
 [dependencies]
+consort-proto = { workspace = true }
+consort-worker = { workspace = true }
+consort-hub = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
+directories = { workspace = true }
+
+[dev-dependencies]
+async-trait = { workspace = true }
+tempfile = { workspace = true }

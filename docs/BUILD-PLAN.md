@@ -20,7 +20,7 @@ The first build, started 2026-10-29 while the user was away. It builds the deskt
 |---|---|---|---|
 | 0 | Repo, docs, `AGENTS.md`, this plan, decisions log | Lead | Done |
 | A | `consort-proto`: the full wire contract | Agent (Opus) | Done |
-| A | `consort-theme`, `consort-desktop` UI on mock data, then `consort-client` | Agent (Opus) | Started |
+| A | `consort-theme`, `consort-desktop` UI on mock data, then `consort-client` | Agent (Opus) | Done (Windows controls and polish in follow-up) |
 | B | `consort-hub` | Agent (Sonnet) | Started |
 | B | `consort-harness`, `consort-worker`, `consort-testkit`, `consort-cli` | Agent (Opus) | Started |
 | C | End-to-end on macOS, then Windows on `bigboi` | Lead | |
@@ -30,4 +30,4 @@ Agents use their own build folder to avoid lock waits: `CARGO_TARGET_DIR=target/
 
 ## Out of scope for this build
 
-Mobile apps, push notifications, the native Codex and Pi adapters (Codex runs through `codex-acp` for now), the hosted relay, and the Memory and Routines settings pages beyond a basic list.
+Mobile apps, push notifications, the native Pi adapter, the hosted relay, and the Memory and Routines settings pages beyond a basic list.
