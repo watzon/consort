@@ -2,7 +2,11 @@
 //! reconnect loop around them. Every wait has a limit, so a hub that stops
 //! answering ends the link and the client reconnects.
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
 
 use consort_proto::{
     auth::{
@@ -45,6 +49,40 @@ type Ws =
 pub(super) const THREAD_PAGE: u32 = 200;
 /// The most pages of one thread. A thread this long is not a real thread.
 const MAX_THREAD_PAGES: usize = 100;
+
+/// How far the wall clock may run ahead of the timer clock between two ticks
+/// before the client takes it for a sleep of the computer. The timer clock of
+/// Tokio does not count the time that a Mac sleeps, so after a wake the link
+/// can look fresh while its connection died long ago. Scheduling jitter is
+/// far below this.
+const SLEEP_SLACK: Duration = Duration::from_secs(5);
+
+/// True when the wall clock moved on by much more than the timer clock did
+/// between two ticks: the computer slept. A wall clock that was set back
+/// reads as no jump.
+fn slept(timer: Duration, wall: Duration) -> bool {
+    wall > timer.saturating_add(SLEEP_SLACK)
+}
+
+/// Waits for `delay` on the wall clock too. A timer that stops while the
+/// computer sleeps would leave an offline client waiting for the rest of its
+/// delay after a wake. A wall clock that was set back does not stretch the
+/// wait: the timer clock ends it as well.
+async fn sleep_counting_sleep(delay: Duration) {
+    let start_wall = SystemTime::now();
+    let start = Instant::now();
+    loop {
+        let waited = start.elapsed();
+        let wall = SystemTime::now()
+            .duration_since(start_wall)
+            .unwrap_or_default();
+        if waited >= delay || wall >= delay {
+            return;
+        }
+        let left = delay - waited.max(wall);
+        tokio::time::sleep(left.min(Duration::from_secs(1))).await;
+    }
+}
 
 fn lost(reason: impl Into<String>) -> SessionEnd {
     SessionEnd::Lost(reason.into())
@@ -332,6 +370,7 @@ async fn session(
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_seen = Instant::now();
     let mut last_ping = last_seen;
+    let mut last_tick = (Instant::now(), SystemTime::now());
     let result = loop {
         tokio::select! {
             incoming = ws.next() => {
@@ -384,6 +423,15 @@ async fn session(
             }
             _ = tick.tick() => {
                 let now = Instant::now();
+                let wall = SystemTime::now();
+                let timer_passed = now.duration_since(last_tick.0);
+                let wall_passed = wall.duration_since(last_tick.1).unwrap_or_default();
+                last_tick = (now, wall);
+                if slept(timer_passed, wall_passed) {
+                    // The connection is not worth checking: it has been
+                    // silent for the whole sleep. Start again at once.
+                    break Err(lost("The computer was asleep, so Consort connects to the hub again."));
+                }
                 if shared.restart.swap(false, std::sync::atomic::Ordering::AcqRel) {
                     break Err(lost("Consort could not load all the changes from the hub. It connects again to load the data"));
                 }
@@ -575,13 +623,22 @@ fn on_feed(shared: &Arc<Shared>, event: &EventFrame) -> Option<SessionEnd> {
                 &entry.change,
                 FeedChange::Upsert(consort_proto::client_api::EntityPayload::Channel(_))
             );
-            let changed = shared
+            let (changed, outbox_shrank) = shared
                 .cache
                 .lock()
-                .map(|mut c| c.apply(entry))
-                .unwrap_or(false);
+                .map(|mut c| {
+                    let before = c.pending.len();
+                    let changed = c.apply(entry);
+                    (changed, c.pending.len() < before)
+                })
+                .unwrap_or((false, false));
             if changed {
                 shared.publish();
+            }
+            if outbox_shrank {
+                // A deleted channel took its waiting messages out of the
+                // outbox. The callers that wait for them can stop.
+                shared.settle_waiters();
             }
             if channel_changed {
                 // A new channel, or one that was unarchived, may have no
@@ -825,7 +882,7 @@ pub(crate) async fn run_link(shared: Arc<Shared>) {
             reason,
         });
         tokio::select! {
-            _ = tokio::time::sleep(delay) => {}
+            _ = sleep_counting_sleep(delay) => {}
             _ = shared.wake.notified() => { reconnect.reset(); }
         }
     }
@@ -843,6 +900,36 @@ mod tests {
         }
         assert!(backoff(0) < Duration::from_millis(700));
         assert!(backoff(10) >= Duration::from_millis(22_500));
+    }
+
+    /// Review cycle 3, finding 10: the idle check used a clock that does not
+    /// count sleep on macOS, so a link read Online for up to a minute after
+    /// a wake.
+    #[test]
+    fn a_wall_clock_that_ran_ahead_of_the_timer_means_the_computer_slept() {
+        let tick = Duration::from_secs(1);
+        // Normal ticks, with some jitter.
+        assert!(!slept(tick, tick));
+        assert!(!slept(tick, tick + Duration::from_secs(2)));
+        // The computer slept for ten minutes: the timer saw one tick.
+        assert!(slept(tick, Duration::from_secs(600)));
+        assert!(slept(
+            Duration::ZERO,
+            SLEEP_SLACK + Duration::from_millis(1)
+        ));
+        // A wall clock that was set back is not a sleep.
+        assert!(!slept(tick, Duration::ZERO));
+    }
+
+    #[tokio::test]
+    async fn the_offline_wait_ends_at_its_delay() {
+        let started = std::time::Instant::now();
+        sleep_counting_sleep(Duration::from_millis(60)).await;
+        let took = started.elapsed();
+        assert!(took >= Duration::from_millis(60), "{took:?}");
+        assert!(took < Duration::from_secs(2), "{took:?}");
+        // No wait at all is fine.
+        sleep_counting_sleep(Duration::ZERO).await;
     }
 
     #[test]

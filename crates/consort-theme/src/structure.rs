@@ -203,6 +203,9 @@ pub struct Components {
     pub brand_mark: f32,
     /// The gap between the mark and the word in the logo.
     pub brand_gap: f32,
+    /// The width of the focus ring that a control shows when the keyboard
+    /// focuses it. The ring is `accent.text`.
+    pub focus_ring: f32,
     pub theme_preview: ThemePreview,
 }
 
@@ -326,6 +329,7 @@ mod tests {
         assert_eq!(c.state_dot, 6.0);
         assert_eq!(c.worker_row_pad_y * 2.0 + 20.0, 26.0);
         assert_eq!(c.switch_inset, 3.0);
+        assert_eq!(c.focus_ring, 2.0);
         let p = c.theme_preview;
         assert_eq!(
             (p.bar, p.bar_gap, p.sidebar, p.sidebar_item),

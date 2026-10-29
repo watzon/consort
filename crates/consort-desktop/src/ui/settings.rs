@@ -14,8 +14,11 @@ use crate::{
     ui::window_controls::DragArea as _,
     ui::{
         links::file_url,
-        menu::{MenuAction, MenuItem, OpenMenu},
-        parts::{ButtonKind, button, detail, glyph, icon, icon_button, line, text, worker_dot},
+        menu::{MenuAction, MenuItem, OpenMenu, worker_menu},
+        parts::{
+            ButtonKind, button, detail, focusable, glyph, icon, icon_button, line, selectable,
+            text, worker_dot,
+        },
         sidebar::{row, title_bar_height},
     },
 };
@@ -70,8 +73,7 @@ pub fn segmented<T: Copy + PartialEq + 'static>(
         let value = *value;
         let pick = on_pick.clone();
         bar = bar.child(
-            div()
-                .id(SharedString::from(format!("{id}-{i}")))
+            focusable(div().id(SharedString::from(format!("{id}-{i}"))), t)
                 .flex()
                 .flex_1()
                 .items_center()
@@ -125,8 +127,7 @@ pub fn switch(id: &str, on: bool, t: &Tokens) -> gpui_kit::Stateful<Div> {
     } else {
         c.text_secondary
     };
-    div()
-        .id(SharedString::from(id.to_owned()))
+    focusable(div().id(SharedString::from(id.to_owned())), t)
         .flex()
         .items_center()
         .w(t.space.xxl)
@@ -527,50 +528,64 @@ impl ConsortApp {
         for worker in &state.workers {
             let is_selected = selected.as_deref() == Some(worker.id.as_str());
             let id = worker.id.clone();
+            let menu_id = worker.id.clone();
+            let paused = worker.paused;
             rows = rows.child(
-                div()
-                    .id(SharedString::from(format!("settings-worker-{}", worker.id)))
-                    .flex()
-                    .items_start()
-                    .gap(t.space.sm + t.space.xxs)
-                    .py(t.space.sm + t.space.xxs)
-                    .px(t.space.sm)
-                    .rounded(t.radius.md)
-                    .cursor_pointer()
-                    .when(is_selected, |d| d.bg(c.surface_selected))
-                    .when(!is_selected, |d| d.hover(|s| s.bg(c.hover_canvas)))
-                    .child(
-                        div()
-                            .h(t.text.ui.line)
-                            .flex()
-                            .items_center()
-                            .child(worker_dot(
-                                worker.online,
-                                t.component.worker_dot,
-                                t.icon.size,
-                                t,
-                            )),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .min_w_0()
-                            .child(line(worker.name.clone(), t.text.ui, c.text_primary))
-                            .child(line(
-                                worker.list_detail.clone(),
-                                detail(t),
-                                if is_selected {
-                                    c.text_secondary
-                                } else {
-                                    c.text_tertiary
-                                },
-                            )),
-                    )
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.settings_worker = Some(id.clone());
-                        cx.notify();
-                    })),
+                focusable(
+                    div().id(SharedString::from(format!("settings-worker-{}", worker.id))),
+                    t,
+                )
+                .flex()
+                .items_start()
+                .gap(t.space.sm + t.space.xxs)
+                .py(t.space.sm + t.space.xxs)
+                .px(t.space.sm)
+                .rounded(t.radius.md)
+                .cursor_pointer()
+                .when(is_selected, |d| d.bg(c.surface_selected))
+                .when(!is_selected, |d| d.hover(|s| s.bg(c.hover_canvas)))
+                .child(
+                    div()
+                        .h(t.text.ui.line)
+                        .flex()
+                        .items_center()
+                        .child(worker_dot(
+                            worker.online,
+                            t.component.worker_dot,
+                            t.icon.size,
+                            t,
+                        )),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .min_w_0()
+                        .child(line(worker.name.clone(), t.text.ui, c.text_primary))
+                        .child(line(
+                            worker.list_detail.clone(),
+                            detail(t),
+                            if is_selected {
+                                c.text_secondary
+                            } else {
+                                c.text_tertiary
+                            },
+                        )),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.settings_worker = Some(id.clone());
+                    cx.notify();
+                }))
+                // The same menu as the sidebar row: Rename, Edit labels,
+                // Pause and Remove.
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                        let items = worker_menu(&menu_id, paused);
+                        this.open_menu(OpenMenu::at(event.position, items), cx);
+                        cx.stop_propagation();
+                    }),
+                ),
             );
         }
         let list = div()
@@ -854,7 +869,7 @@ impl ConsortApp {
                             .child(if roots.is_empty() {
                                 text(roots_line, detail(t), c.text_tertiary).into_any_element()
                             } else {
-                                folders_line(&roots, t).into_any_element()
+                                folders_line(&w.id, &roots, t).into_any_element()
                             }),
                     )
                     .child(
@@ -883,6 +898,7 @@ impl ConsortApp {
                 t,
             ));
         let more_id = w.id.clone();
+        let more_paused = w.paused;
         let more_trigger = self.triggers.clone();
         div()
             .id("worker-detail")
@@ -952,25 +968,8 @@ impl ConsortApp {
                                                     if let Some(bounds) =
                                                         this.triggers.get("worker-more")
                                                     {
-                                                        let id = more_id.clone();
-                                                        let items = vec![
-                                                            MenuItem::new(
-                                                                "Rename",
-                                                                MenuAction::RenameWorker(
-                                                                    id.clone(),
-                                                                ),
-                                                            ),
-                                                            MenuItem::new(
-                                                                "Edit labels",
-                                                                MenuAction::EditLabels(id.clone()),
-                                                            ),
-                                                            MenuItem::new(
-                                                                "Remove",
-                                                                MenuAction::RemoveWorker(id),
-                                                            )
-                                                            .danger()
-                                                            .separated(),
-                                                        ];
+                                                        let items =
+                                                            worker_menu(&more_id, more_paused);
                                                         this.open_menu(
                                                             OpenMenu::under(bounds, items, false),
                                                             cx,
@@ -1042,7 +1041,7 @@ impl ConsortApp {
         &mut self,
         select: &'static str,
         option: &str,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         match resolve_pick(&self.state, &self.new_channel.workers, select, option) {
@@ -1050,7 +1049,21 @@ impl ConsortApp {
                 format!("The approval mode is set on the worker. Set max_approval_mode to {} in worker.toml.", mode_key(mode)),
                 cx,
             ),
-            Some(Pick::Group(id)) => self.new_channel.group_id = Some(id),
+            Some(Pick::Group(id)) => {
+                self.new_channel.group_id = Some(id);
+                self.new_channel.new_group = false;
+            }
+            Some(Pick::NoGroup) => {
+                self.new_channel.group_id = None;
+                self.new_channel.new_group = false;
+            }
+            Some(Pick::NewGroup) => {
+                self.new_channel.group_id = None;
+                self.new_channel.new_group = true;
+                self.inputs
+                    .group_name
+                    .update(cx, |input, cx| input.focus(window, cx));
+            }
             Some(Pick::Selection(selection)) => self.new_channel.selection = Some(selection),
             Some(Pick::Worker(id)) => self.new_channel.workers.push(id),
             None => self.show_notice(
@@ -1067,6 +1080,10 @@ impl ConsortApp {
 pub enum Pick {
     ApprovalMode(ApprovalMode),
     Group(String),
+    /// The new channel goes in no group.
+    NoGroup,
+    /// The new channel goes in a group that the dialog makes.
+    NewGroup,
     Selection(String),
     Worker(String),
 }
@@ -1084,6 +1101,8 @@ pub fn resolve_pick(
             .iter()
             .find(|mode| mode_key(**mode) == option)
             .map(|mode| Pick::ApprovalMode(*mode)),
+        "new-channel-group" if option == crate::ui::dialogs::NO_GROUP => Some(Pick::NoGroup),
+        "new-channel-group" if option == crate::ui::dialogs::NEW_GROUP => Some(Pick::NewGroup),
         "new-channel-group" => state
             .groups
             .iter()
@@ -1285,7 +1304,10 @@ fn code_ranges(detail_text: &str, code: &[String]) -> Vec<std::ops::Range<usize>
     out
 }
 
-fn folders_line(roots: &[String], t: &Tokens) -> Div {
+/// The allowed folders of a worker. The paths are text that the user may
+/// copy, so they are selectable. `worker_id` keeps the selection of one
+/// worker apart from another's.
+fn folders_line(worker_id: &str, roots: &[String], t: &Tokens) -> Div {
     let c = &t.colors;
     let mut out = div()
         .flex()
@@ -1296,7 +1318,15 @@ fn folders_line(roots: &[String], t: &Tokens) -> Div {
         if i > 0 {
             out = out.child(if i + 1 == roots.len() { " and " } else { ", " });
         }
-        out = out.child(div().font_family(t.font_mono.clone()).child(root.clone()));
+        out = out.child(
+            selectable(
+                SharedString::from(format!("allowed-folder-{worker_id}-{i}")),
+                root.clone(),
+                detail(t),
+                c.text_tertiary,
+            )
+            .font_family(t.font_mono.clone()),
+        );
     }
     out.child(". Tasks cannot open anything outside them.")
 }

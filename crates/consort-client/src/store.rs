@@ -194,6 +194,106 @@ impl Store {
     }
 }
 
+/// The text that the user wrote in a message box and did not send. One draft
+/// for each channel and one for each task thread, so a switch to another
+/// channel keeps what was typed. The file is `drafts.json` in the client's
+/// folder.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Drafts {
+    /// By channel ID.
+    #[serde(default)]
+    pub channels: std::collections::BTreeMap<String, String>,
+    /// By task ID.
+    #[serde(default)]
+    pub threads: std::collections::BTreeMap<String, String>,
+}
+
+impl Drafts {
+    /// The draft of a channel, or an empty text.
+    pub fn channel(&self, channel_id: &str) -> &str {
+        self.channels.get(channel_id).map_or("", String::as_str)
+    }
+
+    /// The draft of a task thread, or an empty text.
+    pub fn thread(&self, task_id: &str) -> &str {
+        self.threads.get(task_id).map_or("", String::as_str)
+    }
+
+    /// Keeps the draft of a channel. A text that holds only white space is
+    /// no draft, and removes the old one. An empty ID keeps nothing.
+    pub fn set_channel(&mut self, channel_id: &str, text: &str) {
+        set(&mut self.channels, channel_id, text);
+    }
+
+    /// Keeps the draft of a task thread. See [`Drafts::set_channel`].
+    pub fn set_thread(&mut self, task_id: &str, text: &str) {
+        set(&mut self.threads, task_id, text);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.channels.is_empty() && self.threads.is_empty()
+    }
+
+    /// Drops the drafts of channels and tasks that are not in the lists, so
+    /// the file does not keep the drafts of a channel that was deleted.
+    pub fn keep_only<'a>(
+        &mut self,
+        channel_ids: impl IntoIterator<Item = &'a str>,
+        task_ids: impl IntoIterator<Item = &'a str>,
+    ) {
+        let channels: std::collections::BTreeSet<&str> = channel_ids.into_iter().collect();
+        let tasks: std::collections::BTreeSet<&str> = task_ids.into_iter().collect();
+        self.channels.retain(|id, _| channels.contains(id.as_str()));
+        self.threads.retain(|id, _| tasks.contains(id.as_str()));
+    }
+}
+
+fn set(map: &mut std::collections::BTreeMap<String, String>, id: &str, text: &str) {
+    if id.is_empty() {
+        return;
+    }
+    if text.trim().is_empty() {
+        map.remove(id);
+    } else {
+        map.insert(id.to_owned(), text.to_owned());
+    }
+}
+
+impl Store {
+    fn drafts_path(&self) -> PathBuf {
+        self.dir.join("drafts.json")
+    }
+
+    /// The drafts that were saved. A missing or damaged file reads as no
+    /// drafts: it holds a convenience copy, so it never stops the app.
+    pub fn load_drafts(&self) -> Drafts {
+        let path = self.drafts_path();
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return Drafts::default();
+        };
+        serde_json::from_str(&text).unwrap_or_else(|err| {
+            tracing::warn!(path = %path.display(), error = %err, "the drafts file is damaged, so the client starts with no drafts");
+            Drafts::default()
+        })
+    }
+
+    /// Saves the drafts through a temporary file and a rename, so a crash
+    /// never leaves half a file. No drafts removes the file.
+    pub fn save_drafts(&self, drafts: &Drafts) -> Result<(), ClientError> {
+        let path = self.drafts_path();
+        if drafts.is_empty() {
+            return match std::fs::remove_file(&path) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(storage_error(&path, e)),
+            };
+        }
+        std::fs::create_dir_all(&self.dir).map_err(|e| storage_error(&self.dir, e))?;
+        let text = serde_json::to_string(drafts).map_err(|e| storage_error(&path, e))?;
+        write_private(&path, &text).map_err(|e| storage_error(&path, e))
+    }
+}
+
 /// Writes a file that only this user can read, through a temporary file in
 /// the same folder and a rename, so a reader sees the old file or the new
 /// one and never half of it.
@@ -354,6 +454,74 @@ mod tests {
             body: body.into(),
             created_at: 5,
         }
+    }
+
+    #[test]
+    fn drafts_are_kept_per_channel_and_per_thread_and_survive_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+        assert_eq!(store.load_drafts(), Drafts::default());
+        let mut drafts = Drafts::default();
+        drafts.set_channel("chn_a", "A draft in A");
+        drafts.set_channel("chn_b", "A draft in B\nwith two lines");
+        drafts.set_thread("tsk_1", "A reply");
+        // White space is no draft, and an empty ID keeps nothing.
+        drafts.set_channel("chn_c", "  \n");
+        drafts.set_channel("", "Lost");
+        assert_eq!(drafts.channel("chn_a"), "A draft in A");
+        assert_eq!(drafts.channel("chn_c"), "");
+        assert_eq!(drafts.thread("tsk_1"), "A reply");
+        store.save_drafts(&drafts).unwrap();
+        // A new store on the same folder, as after a restart.
+        let again = Store::new(dir.path()).load_drafts();
+        assert_eq!(again, drafts);
+        assert_eq!(again.channel("chn_b"), "A draft in B\nwith two lines");
+        // The write leaves no temporary file.
+        let mut names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["drafts.json"]);
+    }
+
+    #[test]
+    fn a_cleared_draft_leaves_the_file_and_no_drafts_remove_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+        let mut drafts = Drafts::default();
+        drafts.set_channel("chn_a", "One");
+        drafts.set_channel("chn_b", "Two");
+        store.save_drafts(&drafts).unwrap();
+        drafts.set_channel("chn_a", "");
+        store.save_drafts(&drafts).unwrap();
+        assert_eq!(store.load_drafts().channel("chn_b"), "Two");
+        assert_eq!(store.load_drafts().channel("chn_a"), "");
+        drafts.set_channel("chn_b", "");
+        store.save_drafts(&drafts).unwrap();
+        assert!(!dir.path().join("drafts.json").exists());
+        // Removing a file that is not there is fine.
+        store.save_drafts(&drafts).unwrap();
+    }
+
+    #[test]
+    fn a_damaged_drafts_file_reads_as_no_drafts() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("drafts.json"), "{broken").unwrap();
+        assert_eq!(Store::new(dir.path()).load_drafts(), Drafts::default());
+    }
+
+    #[test]
+    fn drafts_of_gone_channels_and_tasks_are_dropped() {
+        let mut drafts = Drafts::default();
+        drafts.set_channel("chn_a", "Keep");
+        drafts.set_channel("chn_gone", "Drop");
+        drafts.set_thread("tsk_1", "Keep");
+        drafts.set_thread("tsk_gone", "Drop");
+        drafts.keep_only(["chn_a"], ["tsk_1"]);
+        assert_eq!(drafts.channel("chn_a"), "Keep");
+        assert_eq!(drafts.channel("chn_gone"), "");
+        assert_eq!(drafts.thread("tsk_gone"), "");
     }
 
     #[test]

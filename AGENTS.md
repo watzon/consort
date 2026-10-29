@@ -44,7 +44,7 @@ These come from the user's experience with GPUI. Follow them in every view.
    - Selected text: Copy, Quote in reply, Ask Consort about this.
    - A message: Copy text, Copy as Markdown, Reply in thread, Quote in reply. Your own message also has Edit and Delete.
    - A code or command block: Copy code.
-   - A task card or task row: Open thread, Resolve or Not done, Retry (failed only), Stop (working only), Copy task ID.
+   - A task card or task row: Open thread, Resolve (Ready for review only) or Not done (resolved only), Retry (failed only), Stop (working only), Archive (failed or resolved only), Copy task ID.
    - A channel row: Rename, Instructions, Change icon, Move to group, Archive, Delete.
    - A worker row: Rename, Edit labels, Pause, Remove.
    - The composer: Cut, Copy, Paste, Select all.

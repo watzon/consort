@@ -1,6 +1,10 @@
 //! Labels made from times, in the user's time zone.
 
 use chrono::{DateTime, Datelike, Local, TimeZone};
+use markdown::{
+    ParseOptions,
+    mdast::{self, Node},
+};
 
 fn local(ms: i64) -> Option<DateTime<Local>> {
     Local.timestamp_millis_opt(ms).single()
@@ -49,6 +53,164 @@ pub fn age_label(ms: i64, now_ms: i64) -> String {
     }
 }
 
+/// Parses Markdown the way the text view does (`markdown` with the GFM
+/// options), or returns `None` when the parser fails. Math is off: a text
+/// such as "$5 and $10" is a price list, not a formula, and the text view
+/// shows it as prose too.
+fn parse(markdown: &str) -> Option<Node> {
+    let mut options = ParseOptions::gfm();
+    options.constructs.math_text = false;
+    options.constructs.math_flow = false;
+    markdown::to_mdast(markdown, &options).ok()
+}
+
+/// The text of inline nodes, as the reader sees it. Emphasis marks and link
+/// targets are gone. A code span keeps every character it holds, and so do
+/// the characters that the parser reads as plain text: a lone `*`, the
+/// brackets of `arr[0]`, and a name such as `my_script.sh`.
+fn inline_text(nodes: &[Node], out: &mut String) {
+    for node in nodes {
+        match node {
+            Node::Text(n) => out.push_str(&n.value),
+            Node::InlineCode(n) => out.push_str(&n.value),
+            Node::InlineMath(n) => out.push_str(&n.value),
+            Node::Html(n) => out.push_str(&n.value),
+            Node::Break(_) => out.push('\n'),
+            Node::Image(n) => out.push_str(&n.alt),
+            Node::ImageReference(n) => out.push_str(&n.alt),
+            Node::FootnoteReference(n) => {
+                out.push_str("[^");
+                out.push_str(n.label.as_deref().unwrap_or(&n.identifier));
+                out.push(']');
+            }
+            other => {
+                if let Some(children) = other.children() {
+                    inline_text(children, out);
+                }
+            }
+        }
+    }
+}
+
+fn inline_of(node: &Node) -> String {
+    let mut out = String::new();
+    if let Some(children) = node.children() {
+        inline_text(children, &mut out);
+    }
+    out
+}
+
+/// The lines of a list, with a mark for each item and two spaces for each
+/// level of nesting.
+fn list_lines(list: &mdast::List, depth: usize, out: &mut Vec<String>) {
+    let indent = "  ".repeat(depth);
+    for (i, item) in list.children.iter().enumerate() {
+        let Node::ListItem(item) = item else {
+            continue;
+        };
+        let mark = if list.ordered {
+            format!("{}. ", list.start.unwrap_or(1) as usize + i)
+        } else {
+            "- ".to_owned()
+        };
+        let check = match item.checked {
+            Some(true) => "[x] ",
+            Some(false) => "[ ] ",
+            None => "",
+        };
+        let mut first = true;
+        for child in &item.children {
+            match child {
+                Node::List(nested) => list_lines(nested, depth + 1, out),
+                other => {
+                    let mut blocks = Vec::new();
+                    block_texts(other, &mut blocks);
+                    for text in blocks {
+                        for (n, line) in text.lines().enumerate() {
+                            if first && n == 0 {
+                                out.push(format!("{indent}{mark}{check}{line}"));
+                            } else {
+                                out.push(format!("{indent}  {line}"));
+                            }
+                        }
+                        first = false;
+                    }
+                }
+            }
+        }
+        if first {
+            out.push(format!("{indent}{mark}{check}").trim_end().to_owned());
+        }
+    }
+}
+
+/// The blocks of Markdown as plain text, one string for each block. A list
+/// is one block, with a line for each item.
+fn block_texts(node: &Node, out: &mut Vec<String>) {
+    match node {
+        Node::Root(_) | Node::Blockquote(_) | Node::FootnoteDefinition(_) | Node::ListItem(_) => {
+            for child in node.children().into_iter().flatten() {
+                block_texts(child, out);
+            }
+        }
+        Node::Paragraph(_) | Node::Heading(_) => {
+            let text = inline_of(node);
+            if !text.trim().is_empty() {
+                out.push(text);
+            }
+        }
+        // Code is text as it is: no mark comes off.
+        Node::Code(n) => out.push(n.value.clone()),
+        Node::Math(n) => out.push(n.value.clone()),
+        Node::Html(n) => out.push(n.value.clone()),
+        Node::List(list) => {
+            let mut lines = Vec::new();
+            list_lines(list, 0, &mut lines);
+            out.push(lines.join("\n"));
+        }
+        Node::Table(table) => {
+            let rows: Vec<String> = table
+                .children
+                .iter()
+                .map(|row| {
+                    row.children()
+                        .into_iter()
+                        .flatten()
+                        .map(inline_of)
+                        .collect::<Vec<_>>()
+                        .join(" | ")
+                })
+                .collect();
+            out.push(rows.join("\n"));
+        }
+        // Nothing of these shows in the text.
+        Node::Definition(_) | Node::ThematicBreak(_) | Node::Yaml(_) | Node::Toml(_) => {}
+        inline => {
+            let mut text = String::new();
+            inline_text(std::slice::from_ref(inline), &mut text);
+            if !text.trim().is_empty() {
+                out.push(text);
+            }
+        }
+    }
+}
+
+/// Markdown as plain text, for "Copy text". It is the text that the reader
+/// sees: emphasis and heading marks are gone, a link keeps its words, and
+/// blocks are separated by a blank line. Code spans and code blocks keep
+/// every character, so `rm -rf build/*` and `__init__.py` copy as they were
+/// written. The text comes from the parsed Markdown, so a lone `*` or the
+/// brackets of `arr[0]` stay too. If the parser fails, the source is
+/// returned as it is.
+pub fn plain_text(markdown: &str) -> String {
+    let Some(root) = parse(markdown) else {
+        return markdown.to_owned();
+    };
+    let mut blocks = Vec::new();
+    block_texts(&root, &mut blocks);
+    blocks.join("\n\n")
+}
+
 /// Markdown as plain text for a short summary on a card, one block to a
 /// line. Headings and list marks go, emphasis and code marks go, and a link
 /// keeps its words. A paragraph is one line, even when the source wraps it.
@@ -56,120 +218,52 @@ pub fn age_label(ms: i64, now_ms: i64) -> String {
 /// indented) is a line of its own, so the lines of a code block never run
 /// together with the text around them. The card clamps the lines.
 pub fn card_summary(markdown: &str) -> String {
-    let mut lines: Vec<String> = Vec::new();
-    let mut paragraph = String::new();
-    let mut in_fence = false;
-    let mut in_indented_code = false;
-    let mut after_blank = true;
-    fn flush(paragraph: &mut String, lines: &mut Vec<String>) {
-        let text = paragraph.split_whitespace().collect::<Vec<_>>().join(" ");
-        if !text.is_empty() {
-            lines.push(text);
-        }
-        paragraph.clear();
-    }
-    for raw in markdown.lines() {
-        let trimmed = raw.trim();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            flush(&mut paragraph, &mut lines);
-            in_fence = !in_fence;
-            continue;
-        }
-        if in_fence {
-            // Code is text as it is: no marks come off.
-            if !trimmed.is_empty() {
-                lines.push(trimmed.to_owned());
-            }
-            continue;
-        }
-        if trimmed.is_empty() {
-            flush(&mut paragraph, &mut lines);
-            in_indented_code = false;
-            after_blank = true;
-            continue;
-        }
-        let indented = raw.starts_with("    ") || raw.starts_with('\t');
-        if indented && (after_blank || in_indented_code) {
-            flush(&mut paragraph, &mut lines);
-            in_indented_code = true;
-            after_blank = false;
-            lines.push(trimmed.to_owned());
-            continue;
-        }
-        in_indented_code = false;
-        after_blank = false;
-        let mut text = trimmed;
-        let mut new_block = false;
-        if text.starts_with('#') {
-            text = text.trim_start_matches('#').trim_start();
-            new_block = true;
-        }
-        for mark in ["- ", "* ", "+ ", "> "] {
-            if let Some(rest) = text.strip_prefix(mark) {
-                text = rest;
-                new_block = true;
-            }
-        }
-        if let Some((number, rest)) = text.split_once(". ")
-            && !number.is_empty()
-            && number.chars().all(|c| c.is_ascii_digit())
-        {
-            text = rest;
-            new_block = true;
-        }
-        if new_block {
-            flush(&mut paragraph, &mut lines);
-        }
-        if !paragraph.is_empty() {
-            paragraph.push(' ');
-        }
-        paragraph.push_str(&strip_marks(text));
-        if new_block {
-            // A heading or a list item is a line by itself.
-            flush(&mut paragraph, &mut lines);
-        }
-    }
-    flush(&mut paragraph, &mut lines);
+    let Some(root) = parse(markdown) else {
+        return markdown.split_whitespace().collect::<Vec<_>>().join(" ");
+    };
+    let mut lines = Vec::new();
+    summary_lines(&root, &mut lines);
     lines.join("\n")
 }
 
-/// Inline Markdown without its marks: emphasis and code marks go, and a
-/// link keeps only its words. An underscore inside a word (`new_members`)
-/// is part of the word, so it stays.
-pub fn strip_marks(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut prev: Option<char> = None;
-    let mut chars = text.chars().peekable();
-    while let Some(ch) = chars.next() {
-        match ch {
-            '_' if prev.is_some_and(char::is_alphanumeric)
-                && chars.peek().is_some_and(|c| c.is_alphanumeric()) =>
-            {
-                out.push(ch);
+fn summary_lines(node: &Node, out: &mut Vec<String>) {
+    match node {
+        Node::Root(_)
+        | Node::Blockquote(_)
+        | Node::List(_)
+        | Node::ListItem(_)
+        | Node::FootnoteDefinition(_) => {
+            for child in node.children().into_iter().flatten() {
+                summary_lines(child, out);
             }
-            '*' | '_' | '`' => {}
-            '[' => {
-                let mut label = String::new();
-                for c in chars.by_ref() {
-                    if c == ']' {
-                        break;
-                    }
-                    label.push(c);
-                }
-                if chars.peek() == Some(&'(') {
-                    for c in chars.by_ref() {
-                        if c == ')' {
-                            break;
-                        }
-                    }
-                }
-                out.push_str(&label);
-            }
-            _ => out.push(ch),
         }
-        prev = Some(ch);
+        Node::Paragraph(_) | Node::Heading(_) => {
+            let text = inline_of(node).replace('\n', " ");
+            let text = text.trim();
+            if !text.is_empty() {
+                out.push(text.to_owned());
+            }
+        }
+        Node::Code(n) => out.extend(
+            n.value
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(str::to_owned),
+        ),
+        other => {
+            let mut blocks = Vec::new();
+            block_texts(other, &mut blocks);
+            for text in blocks {
+                out.extend(
+                    text.lines()
+                        .map(str::trim)
+                        .filter(|line| !line.is_empty())
+                        .map(str::to_owned),
+                );
+            }
+        }
     }
-    out
 }
 
 /// The time now, in Unix milliseconds.
@@ -233,6 +327,115 @@ mod tests {
         );
         // An indented line inside a paragraph is not code.
         assert_eq!(card_summary("Text\n    still text"), "Text still text");
+    }
+
+    /// Review cycle 3, finding 5: "Copy text" ran every message through a
+    /// filter that dropped each `*` and `_`, also inside backticks. So
+    /// `rm -rf build/*` copied as `rm -rf build/`.
+    #[test]
+    fn code_spans_copy_exactly_as_written() {
+        assert_eq!(
+            plain_text("Clean up with `rm -rf build/*` and `ls *.log`"),
+            "Clean up with rm -rf build/* and ls *.log"
+        );
+        assert_eq!(
+            plain_text("Edit `__init__.py` and `my_script.sh`, then run `cargo test -p x`."),
+            "Edit __init__.py and my_script.sh, then run cargo test -p x."
+        );
+        assert_eq!(
+            plain_text("Pass `*args` and `**kwargs`, and `a_b_c`."),
+            "Pass *args and **kwargs, and a_b_c."
+        );
+    }
+
+    #[test]
+    fn code_blocks_copy_exactly_as_written() {
+        let md =
+            "Run this:\n\n```sh\nrm -rf build/*\nprintf '__init__'\n  indented [x] *\n```\n\nDone.";
+        assert_eq!(
+            plain_text(md),
+            "Run this:\n\nrm -rf build/*\nprintf '__init__'\n  indented [x] *\n\nDone."
+        );
+        // An indented block too.
+        assert_eq!(
+            plain_text("Text.\n\n    ls *.log\n    cat __init__.py\n"),
+            "Text.\n\nls *.log\ncat __init__.py"
+        );
+    }
+
+    #[test]
+    fn marks_that_the_parser_reads_as_text_stay() {
+        assert_eq!(plain_text("Run ls *.log"), "Run ls *.log");
+        assert_eq!(
+            plain_text("Set arr[0] to the value of b[i]"),
+            "Set arr[0] to the value of b[i]"
+        );
+        assert_eq!(
+            plain_text("Call it with *args and **kwargs"),
+            "Call it with *args and **kwargs"
+        );
+        assert_eq!(
+            plain_text("The total is 2 * 3 = 6"),
+            "The total is 2 * 3 = 6"
+        );
+        assert_eq!(
+            plain_text("A file my_script.sh and new_members"),
+            "A file my_script.sh and new_members"
+        );
+        assert_eq!(plain_text("It costs $5 and $10."), "It costs $5 and $10.");
+        // An escape shows as the mark.
+        assert_eq!(plain_text(r"Five \* six"), "Five * six");
+    }
+
+    #[test]
+    fn emphasis_and_links_lose_their_marks_and_keep_their_words() {
+        assert_eq!(
+            plain_text(
+                "This is **bold**, _italic_ and ~~gone~~ text. See [the docs](https://x.y)."
+            ),
+            "This is bold, italic and gone text. See the docs."
+        );
+        assert_eq!(plain_text("## Title\n\nBody"), "Title\n\nBody");
+        assert_eq!(
+            plain_text("See https://example.com/a_b."),
+            "See https://example.com/a_b."
+        );
+    }
+
+    #[test]
+    fn lists_keep_their_marks_and_tasks_keep_their_boxes() {
+        assert_eq!(
+            plain_text("- one\n- two\n  - nested"),
+            "- one\n- two\n  - nested"
+        );
+        assert_eq!(plain_text("1. one\n2. two"), "1. one\n2. two");
+        assert_eq!(
+            plain_text("- [x] done\n- [ ] open"),
+            "- [x] done\n- [ ] open"
+        );
+    }
+
+    #[test]
+    fn a_line_break_in_a_paragraph_stays_a_line_break() {
+        assert_eq!(plain_text("line one\nline two"), "line one\nline two");
+        assert_eq!(plain_text(""), "");
+    }
+
+    /// The text view shows `__init__.py` outside code as bold "init" and
+    /// ".py", because CommonMark reads the underscores as strong marks. The
+    /// copy matches the screen. The exact text is in "Copy as Markdown", and
+    /// in a code span.
+    #[test]
+    fn the_copy_matches_what_the_reader_sees() {
+        assert_eq!(plain_text("Edit __init__.py now"), "Edit init.py now");
+    }
+
+    #[test]
+    fn a_card_summary_keeps_code_exactly_too() {
+        assert_eq!(
+            card_summary("Run `rm -rf build/*` now.\n\n- Use `__init__.py`."),
+            "Run rm -rf build/* now.\nUse __init__.py."
+        );
     }
 
     #[test]

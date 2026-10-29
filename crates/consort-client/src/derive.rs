@@ -189,7 +189,8 @@ pub fn tasks_panel(state: &ViewState) -> TasksPanelView {
     }
 }
 
-/// Copies each task's title and status onto its cards in every timeline.
+/// Copies each task's title, status and approval mode onto its cards in every
+/// timeline, and onto its thread.
 fn sync_cards(state: &mut ViewState) {
     let tasks = state.tasks.clone();
     for timeline in &mut state.timelines {
@@ -199,6 +200,7 @@ fn sync_cards(state: &mut ViewState) {
             {
                 card.title = task.title.clone();
                 card.status = task.status;
+                card.approval_mode = task.approval_mode;
             }
         }
     }
@@ -206,6 +208,7 @@ fn sync_cards(state: &mut ViewState) {
         if let Some(task) = tasks.iter().find(|t| t.id == thread.task_id) {
             thread.title = task.title.clone();
             thread.status = task.status;
+            thread.approval_mode = task.approval_mode;
         }
     }
 }

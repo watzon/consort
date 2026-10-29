@@ -14,6 +14,9 @@ path = "src/main.rs"
 consort-client.workspace = true
 consort-theme.workspace = true
 gpui-kit.workspace = true
+# The same Markdown parser that the GPUI text view uses (gpui-base 0.8.1). The
+# link policy reads the reference definitions from it.
+markdown.workspace = true
 
 [lints]
 workspace = true

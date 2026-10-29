@@ -14,6 +14,9 @@ pub struct ViewState {
     /// Every channel, Everything first.
     pub channels: Vec<ChannelView>,
     pub groups: Vec<GroupView>,
+    /// The channels that the user archived, by name. They have no timeline
+    /// in this state. The sidebar lists them with a way to bring them back.
+    pub archived_channels: Vec<ArchivedChannelView>,
     pub timelines: Vec<TimelineView>,
     pub tasks: Vec<TaskView>,
     pub threads: Vec<TaskThreadView>,
@@ -219,6 +222,14 @@ pub struct GroupView {
     pub name: String,
 }
 
+/// A channel that the user archived.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ArchivedChannelView {
+    pub id: String,
+    pub name: String,
+    pub icon: IconName,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Isolation {
     InPlace,
@@ -414,6 +425,8 @@ pub struct TaskCardView {
     pub reply_count: u32,
     /// The newest update, for a working or failed card.
     pub latest: Option<String>,
+    /// How much the task may do without asking.
+    pub approval_mode: ApprovalMode,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -462,16 +475,33 @@ pub struct ApprovalView {
     pub state: RequestState,
     /// The answer, once given.
     pub answer: Option<ApprovalChoice>,
+    /// The harness's own words for its "allow always" option, such as "Yes,
+    /// and don't ask again for python3 commands". The scope of that option
+    /// is the harness's, and it can be wider than this task, so the button
+    /// shows these words and not our own.
+    pub allow_always_label: Option<String>,
 }
 
 impl ApprovalView {
-    /// The words on a choice's button. "Allow for this task" reads wrong
-    /// when the coordinator asks, so it is "Always allow" there.
-    pub fn choice_label(&self, choice: ApprovalChoice) -> &'static str {
-        match (choice, &self.task_id) {
-            (ApprovalChoice::AllowForTask, None) => "Always allow",
-            _ => choice.label(),
+    /// The words on a choice's button. "Allow once" and "Deny" are ours.
+    /// The wide choice shows what the harness says it does. When the
+    /// harness gave no words, it is "Allow for this task", or "Always allow"
+    /// when the coordinator asks, because the first reads wrong there.
+    pub fn choice_label(&self, choice: ApprovalChoice) -> String {
+        if choice == ApprovalChoice::AllowForTask {
+            if let Some(label) = self
+                .allow_always_label
+                .as_deref()
+                .map(str::trim)
+                .filter(|label| !label.is_empty())
+            {
+                return label.to_owned();
+            }
+            if self.task_id.is_none() {
+                return "Always allow".to_owned();
+            }
         }
+        choice.label().to_owned()
     }
 }
 
@@ -515,6 +545,8 @@ pub struct TaskView {
     pub age_label: String,
     pub updated_at: i64,
     pub card_message_id: String,
+    /// The approval mode that the task asked for. The worker may cap it.
+    pub approval_mode: ApprovalMode,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -612,6 +644,16 @@ pub struct TaskThreadView {
     pub reason: Option<String>,
     pub placement: Option<PlacementView>,
     pub posts: Vec<ThreadPost>,
+    /// The brief that started the task, in full, as Markdown.
+    pub brief: String,
+    /// What the task said when it went to Ready for review, in full, as
+    /// Markdown.
+    pub review_summary: Option<String>,
+    /// The client holds only the start of the brief and the summary, and it
+    /// is loading the rest. The thread loads the full task when it opens.
+    pub text_is_preview: bool,
+    /// The approval mode that the task asked for. The worker may cap it.
+    pub approval_mode: ApprovalMode,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -694,6 +736,16 @@ impl ApprovalMode {
             ApprovalMode::AutoEdits => "Auto edits",
             ApprovalMode::Auto => "Auto",
             ApprovalMode::FullAccess => "Full access",
+        }
+    }
+
+    /// The mode as a short tag on a task, such as "Ask mode".
+    pub fn tag(self) -> &'static str {
+        match self {
+            ApprovalMode::Ask => "Ask mode",
+            ApprovalMode::AutoEdits => "Auto edits mode",
+            ApprovalMode::Auto => "Auto mode",
+            ApprovalMode::FullAccess => "Full access mode",
         }
     }
 }

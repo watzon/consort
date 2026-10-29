@@ -54,10 +54,12 @@ impl MockBackend {
             .lock()
             .map_err(|_| ClientError::Other("The mock state is poisoned".into()))?;
         let mut reply_to = None;
+        let archiving = matches!(command, Command::ArchiveChannel { .. });
         match command {
             Command::SendMessage {
                 channel_id, body, ..
             } => {
+                crate::command::check_channel_id(&channel_id)?;
                 let timeline = timeline_mut(&mut state, &channel_id)?;
                 timeline.items.push(TimelineItem::Message(MessageView {
                     id: message_id,
@@ -114,13 +116,38 @@ impl MockBackend {
                         message: "Enter a name for the channel.".into(),
                     });
                 }
+                let group_id = match new.new_group.as_deref().map(str::trim) {
+                    Some("") => {
+                        return Err(ClientError::Hub {
+                            code: "invalid".into(),
+                            message: "Enter a name for the group.".into(),
+                        });
+                    }
+                    Some(group_name) => {
+                        let id = state
+                            .groups
+                            .iter()
+                            .find(|g| g.name.eq_ignore_ascii_case(group_name))
+                            .map(|g| g.id.clone())
+                            .unwrap_or_else(|| {
+                                let id = format!("grp_{}", channel_id_new);
+                                state.groups.push(GroupView {
+                                    id: id.clone(),
+                                    name: group_name.to_owned(),
+                                });
+                                id
+                            });
+                        Some(id)
+                    }
+                    None => new.group_id,
+                };
                 state.channels.push(ChannelView {
                     id: channel_id_new.clone(),
                     kind: ChannelKind::Standard,
                     name,
                     purpose: new.purpose,
                     icon: "hash".into(),
-                    group_id: new.group_id,
+                    group_id,
                     coordinator_worker: Some("hub".into()),
                     coordinator_account: Some("Claude Personal".into()),
                     preferred_workers: new.preferred_workers,
@@ -178,9 +205,94 @@ impl MockBackend {
                         message: "Everything cannot be archived or deleted.".into(),
                     });
                 }
+                if archiving
+                    && let Some(channel) = state.channels.iter().find(|c| c.id == channel_id)
+                {
+                    let archived = ArchivedChannelView {
+                        id: channel.id.clone(),
+                        name: channel.name.clone(),
+                        icon: channel.icon.clone(),
+                    };
+                    state.archived_channels.push(archived);
+                }
                 state.channels.retain(|c| c.id != channel_id);
                 state.tasks.retain(|t| t.channel_id != channel_id);
             }
+            Command::UnarchiveChannel { channel_id } => {
+                let Some(at) = state
+                    .archived_channels
+                    .iter()
+                    .position(|c| c.id == channel_id)
+                else {
+                    return Err(not_found());
+                };
+                let archived = state.archived_channels.remove(at);
+                state.channels.push(ChannelView {
+                    id: archived.id.clone(),
+                    kind: ChannelKind::Standard,
+                    name: archived.name,
+                    icon: archived.icon,
+                    ..ChannelView::default()
+                });
+                state.timelines.push(TimelineView {
+                    channel_id: archived.id,
+                    items: Vec::new(),
+                    has_older: false,
+                    loaded: true,
+                });
+            }
+            Command::MoveChannel {
+                channel_id,
+                group_id,
+            } => {
+                if let Some(group) = &group_id
+                    && !state.groups.iter().any(|g| &g.id == group)
+                {
+                    return Err(not_found());
+                }
+                let channel = state
+                    .channels
+                    .iter_mut()
+                    .find(|c| c.id == channel_id)
+                    .ok_or_else(not_found)?;
+                channel.group_id = group_id;
+            }
+            Command::CreateGroup { name, channel_id } => {
+                let name = name.trim().to_owned();
+                if name.is_empty() {
+                    return Err(ClientError::Hub {
+                        code: "invalid".into(),
+                        message: "Enter a name for the group.".into(),
+                    });
+                }
+                let id = format!("grp_{channel_id_new}");
+                state.groups.push(GroupView {
+                    id: id.clone(),
+                    name,
+                });
+                if let Some(channel_id) = channel_id {
+                    state
+                        .channels
+                        .iter_mut()
+                        .find(|c| c.id == channel_id)
+                        .ok_or_else(not_found)?
+                        .group_id = Some(id);
+                }
+            }
+            Command::ArchiveTask { task_id } => {
+                if !state.tasks.iter().any(|t| t.id == task_id) {
+                    return Err(not_found());
+                }
+                state.tasks.retain(|t| t.id != task_id);
+                state.threads.retain(|t| t.task_id != task_id);
+                for timeline in &mut state.timelines {
+                    timeline.items.retain(
+                        |item| !matches!(item, TimelineItem::TaskCard(c) if c.task_id == task_id),
+                    );
+                }
+            }
+            // The mock never goes offline.
+            Command::Reconnect => {}
             Command::SetGroupCollapsed {
                 group_id,
                 collapsed,
@@ -527,6 +639,111 @@ mod tests {
         let err =
             block_on(client.archive_channel(mock::everything_id().into())).expect_err("refused");
         assert!(matches!(err, ClientError::Hub { .. }));
+    }
+
+    #[test]
+    fn an_archived_channel_moves_to_the_archived_list_and_comes_back() {
+        let client = Client::mock().expect("mock");
+        let state = client.state();
+        let lights = state
+            .channels
+            .iter()
+            .find(|c| c.name == "house-lights")
+            .map(|c| c.id.clone())
+            .expect("channel");
+        block_on(async {
+            client
+                .archive_channel(lights.clone())
+                .await
+                .expect("archived");
+            let state = client.state();
+            assert!(state.channel(&lights).is_none());
+            assert!(state.archived_channels.iter().any(|c| c.id == lights));
+            client
+                .unarchive_channel(lights.clone())
+                .await
+                .expect("back");
+            let state = client.state();
+            assert!(state.channel(&lights).is_some());
+            assert!(state.archived_channels.iter().all(|c| c.id != lights));
+        });
+    }
+
+    #[test]
+    fn a_group_can_be_made_and_a_channel_can_leave_it() {
+        let client = Client::mock().expect("mock");
+        let sayso = client
+            .state()
+            .channels
+            .iter()
+            .find(|c| c.name == "sayso")
+            .map(|c| c.id.clone())
+            .expect("channel");
+        block_on(async {
+            client
+                .create_group(" Work ".into(), Some(sayso.clone()))
+                .await
+                .expect("group");
+            let state = client.state();
+            let group = state
+                .groups
+                .iter()
+                .find(|g| g.name == "Work")
+                .expect("group");
+            assert_eq!(
+                state
+                    .channel(&sayso)
+                    .and_then(|c| c.group_id.clone())
+                    .as_deref(),
+                Some(group.id.as_str())
+            );
+            assert!(state.sidebar.groups.iter().any(|g| g.name == "Work"));
+            client
+                .move_channel(sayso.clone(), None)
+                .await
+                .expect("moved");
+            let state = client.state();
+            assert_eq!(state.channel(&sayso).and_then(|c| c.group_id.clone()), None);
+            assert!(state.sidebar.ungrouped.iter().any(|c| c.id == sayso));
+            let err = client
+                .create_group("  ".into(), None)
+                .await
+                .expect_err("refused");
+            assert!(err.to_string().contains("Enter a name for the group"));
+        });
+    }
+
+    #[test]
+    fn an_archived_task_leaves_the_lists() {
+        let client = Client::mock().expect("mock");
+        let failed = client
+            .state()
+            .tasks
+            .iter()
+            .find(|t| t.status == TaskStatus::Failed)
+            .map(|t| t.id.clone())
+            .expect("a failed task");
+        block_on(async {
+            client.archive_task(failed.clone()).await.expect("archived");
+            let state = client.state();
+            assert!(state.task(&failed).is_none());
+            assert!(state.thread(&failed).is_none());
+            assert!(
+                state
+                    .tasks_panel
+                    .active
+                    .iter()
+                    .all(|s| !s.task_ids.contains(&failed))
+            );
+        });
+    }
+
+    #[test]
+    fn a_message_for_no_channel_is_refused() {
+        let client = Client::mock().expect("mock");
+        let err =
+            block_on(client.send_message(String::new(), "Hello".into())).expect_err("refused");
+        assert_eq!(err, ClientError::NoChannel);
     }
 }
 

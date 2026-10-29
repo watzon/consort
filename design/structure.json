@@ -63,6 +63,7 @@
     "notes_min_height": 192,
     "brand_mark": 26,
     "brand_gap": 8,
+    "focus_ring": 2,
     "theme_preview": { "bar": 4, "bar_gap": 5, "sidebar": 32, "sidebar_item": 20, "text_line": 76, "title": 48, "chip": 6, "card": 28, "button": 22, "button_radius": 2 }
   },
   "derive": { "hover_delta_l": 0.035, "active_delta_l": 0.07, "selection_alpha": 0.28, "status_tint_alpha": 0.16, "scrim_alpha": { "dark": 0.55, "light": 0.3 } }

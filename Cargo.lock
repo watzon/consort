@@ -1183,6 +1183,7 @@ dependencies = [
  "ed25519-dalek",
  "futures-util",
  "gethostname",
+ "markdown",
  "rand 0.8.8",
  "reqwest",
  "serde",
@@ -1203,6 +1204,7 @@ dependencies = [
  "consort-client",
  "consort-theme",
  "gpui-kit",
+ "markdown",
 ]
 
 [[package]]

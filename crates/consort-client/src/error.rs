@@ -4,6 +4,10 @@
 pub enum ClientError {
     #[error("Consort is not connected to the hub. Wait until it reconnects, then try again")]
     NotConnected,
+    #[error(
+        "Consort has not loaded a channel yet. Wait until it connects to the hub, then try again"
+    )]
+    NoChannel,
     #[error("The hub URL is not valid: {0}. Enter a URL such as https://hub.example.com")]
     InvalidUrl(String),
     #[error("Cannot reach the hub at {url}. Check the URL and that the hub runs, then try again")]

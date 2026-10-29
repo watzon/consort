@@ -26,6 +26,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 pub use command::{ChannelChanges, Command, NewChannel};
 pub use error::ClientError;
+pub use store::Drafts;
 pub use view::*;
 
 struct Request {
@@ -40,6 +41,8 @@ struct Request {
 pub struct Client {
     requests: mpsc::UnboundedSender<Request>,
     state: watch::Receiver<Arc<ViewState>>,
+    /// Where the drafts live. `None` for the mock and for tests.
+    drafts: Option<store::Store>,
     _runtime: Arc<RuntimeThread>,
 }
 
@@ -151,6 +154,7 @@ impl Client {
         Ok(Client {
             requests,
             state,
+            drafts: None,
             _runtime: Arc::new(runtime),
         })
     }
@@ -171,6 +175,7 @@ impl Client {
         options: hub::ClientOptions,
     ) -> Result<Client, ClientError> {
         let (publish, state) = watch::channel(Arc::new(ViewState::default()));
+        let drafts = store.clone();
         let shared = hub::Shared::new(store, options, publish.clone())?;
         let (requests, rx) = mpsc::unbounded_channel();
         let runtime = spawn_runtime("consort-client", move |stop| async move {
@@ -184,6 +189,7 @@ impl Client {
         Ok(Client {
             requests,
             state,
+            drafts,
             _runtime: Arc::new(runtime),
         })
     }
@@ -223,6 +229,7 @@ impl Client {
     /// Sends a message. The client makes the `client_message_id`, so a retry
     /// never makes a second message.
     pub async fn send_message(&self, channel_id: String, body: String) -> Result<(), ClientError> {
+        command::check_channel_id(&channel_id)?;
         self.run(Command::SendMessage {
             channel_id,
             body,
@@ -299,6 +306,61 @@ impl Client {
 
     pub async fn delete_channel(&self, channel_id: String) -> Result<(), ClientError> {
         self.run(Command::DeleteChannel { channel_id }).await
+    }
+
+    /// Brings an archived channel back.
+    pub async fn unarchive_channel(&self, channel_id: String) -> Result<(), ClientError> {
+        self.run(Command::UnarchiveChannel { channel_id }).await
+    }
+
+    /// Puts a channel in a group, or takes it out of its group with `None`.
+    pub async fn move_channel(
+        &self,
+        channel_id: String,
+        group_id: Option<String>,
+    ) -> Result<(), ClientError> {
+        self.run(Command::MoveChannel {
+            channel_id,
+            group_id,
+        })
+        .await
+    }
+
+    /// Makes a group. With a channel, the channel moves into the new group.
+    pub async fn create_group(
+        &self,
+        name: String,
+        channel_id: Option<String>,
+    ) -> Result<(), ClientError> {
+        self.run(Command::CreateGroup { name, channel_id }).await
+    }
+
+    /// Hides a task in any status.
+    pub async fn archive_task(&self, task_id: String) -> Result<(), ClientError> {
+        self.run(Command::ArchiveTask { task_id }).await
+    }
+
+    /// Connects to the hub now, without waiting for the retry timer.
+    pub async fn reconnect(&self) -> Result<(), ClientError> {
+        self.run(Command::Reconnect).await
+    }
+
+    /// The drafts that were saved when the app last ran. A missing or damaged
+    /// file reads as no drafts.
+    pub fn load_drafts(&self) -> Drafts {
+        self.drafts
+            .as_ref()
+            .map(|store| store.load_drafts())
+            .unwrap_or_default()
+    }
+
+    /// Saves the drafts in the client's folder, through a temporary file
+    /// and a rename. Does nothing when the client has no folder.
+    pub fn save_drafts(&self, drafts: &Drafts) -> Result<(), ClientError> {
+        match &self.drafts {
+            Some(store) => store.save_drafts(drafts),
+            None => Ok(()),
+        }
     }
 
     /// Loads the replies of a task's thread when they are not loaded yet.

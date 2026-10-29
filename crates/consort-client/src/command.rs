@@ -13,6 +13,10 @@ pub struct NewChannel {
     pub preferred_workers: Vec<String>,
     pub task_selection: Option<String>,
     pub isolation: Isolation,
+    /// The name of a group to make for this channel. When it is set, the
+    /// client makes the group first and puts the channel in it, and
+    /// `group_id` is not used.
+    pub new_group: Option<String>,
 }
 
 /// Changes to a channel. A `None` field stays as it is.
@@ -57,6 +61,20 @@ pub enum Command {
     ArchiveChannel {
         channel_id: String,
     },
+    /// Brings an archived channel back.
+    UnarchiveChannel {
+        channel_id: String,
+    },
+    /// Puts a channel in a group, or takes it out of its group with `None`.
+    MoveChannel {
+        channel_id: String,
+        group_id: Option<String>,
+    },
+    /// Makes a group. With a channel, puts that channel in the new group.
+    CreateGroup {
+        name: String,
+        channel_id: Option<String>,
+    },
     DeleteChannel {
         channel_id: String,
     },
@@ -87,6 +105,13 @@ pub enum Command {
     StopTask {
         task_id: String,
     },
+    /// Hides a task in any status. It leaves the lists and the Tasks panel.
+    ArchiveTask {
+        task_id: String,
+    },
+    /// Connects to the hub now, without waiting for the retry timer. It
+    /// does nothing while the link is up.
+    Reconnect,
     AnswerApproval {
         approval_id: String,
         choice: ApprovalChoice,
@@ -117,4 +142,26 @@ pub enum Command {
     RemoveWorker {
         worker_id: String,
     },
+}
+
+/// Refuses a channel ID that cannot name a channel. The ID is empty until the
+/// first snapshot arrives, and a message for "no channel" would wait in the
+/// outbox and fail later, so the composer must not take it.
+pub fn check_channel_id(channel_id: &str) -> Result<(), crate::ClientError> {
+    if channel_id.trim().is_empty() {
+        return Err(crate::ClientError::NoChannel);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_empty_channel_id_is_refused() {
+        assert_eq!(check_channel_id(""), Err(crate::ClientError::NoChannel));
+        assert_eq!(check_channel_id("  "), Err(crate::ClientError::NoChannel));
+        assert_eq!(check_channel_id("chn_1"), Ok(()));
+    }
 }

@@ -3,11 +3,12 @@
 
 use consort_client::TaskStatus;
 use consort_theme::{Tokens, Type, TypeExt as _};
+use std::{cell::Cell, time::Duration};
+
 use gpui_kit::{
-    Animation, AnimationExt as _, AnyElement, App, Div, ElementId, Hsla, InteractiveElement,
-    IntoElement, ParentElement, Pixels, SharedString, Stateful, StatefulInteractiveElement as _,
-    Styled, Svg, Transformation, base::SelectableText, div, percentage,
-    prelude::FluentBuilder as _, svg,
+    AnyElement, App, Div, ElementId, Global, Hsla, InteractiveElement, IntoElement, ParentElement,
+    Pixels, SharedString, Stateful, StatefulInteractiveElement as _, Styled, Svg, Transformation,
+    base::SelectableText, div, percentage, prelude::FluentBuilder as _, svg,
 };
 
 /// A Lucide icon from `assets/icons`.
@@ -41,8 +42,67 @@ pub fn status_color(status: TaskStatus, t: &Tokens) -> Hsla {
     }
 }
 
+/// How many times a second the Working glyph moves. The arc turns in steps,
+/// so one timer redraws the window about 15 times a second while a Working
+/// glyph shows. An animation element would ask for a new frame at every
+/// display refresh, and GPUI draws the whole window for each one.
+pub const SPIN_STEPS_PER_SECOND: u32 = 15;
+
+/// The turn of every Working glyph, shared. All glyphs show the same turn,
+/// so one timer moves them all. The app sets it as a global.
+#[derive(Default)]
+pub struct Spin {
+    /// The turn, from 0.0 to 1.0.
+    turn: Cell<f32>,
+    /// A Working glyph was drawn since the last `begin_frame`.
+    used: Cell<bool>,
+}
+
+impl Global for Spin {}
+
+impl Spin {
+    /// Starts a frame: no Working glyph has been drawn yet.
+    pub fn begin_frame(&self) {
+        self.used.set(false);
+    }
+
+    /// True when the frame drew a Working glyph, so the timer must run.
+    pub fn used(&self) -> bool {
+        self.used.get()
+    }
+
+    /// Moves the turn on by one step. `period` is the time of one full turn.
+    pub fn advance(&self, period: Duration) {
+        let steps = steps_per_turn(period) as f32;
+        self.turn.set((self.turn.get() + 1.0 / steps).fract());
+    }
+
+    pub fn turn(&self) -> f32 {
+        self.turn.get()
+    }
+}
+
+/// The steps in one full turn of the glyph.
+pub fn steps_per_turn(period: Duration) -> u32 {
+    ((period.as_secs_f32() * SPIN_STEPS_PER_SECOND as f32).round() as u32).max(4)
+}
+
+/// The time between two steps.
+pub fn step_interval(period: Duration) -> Duration {
+    period / steps_per_turn(period)
+}
+
+/// True when the spin timer must run: a Working glyph is on screen, the
+/// window has the focus, and the system does not ask for less motion. A
+/// window that sits behind others, or a screen with no Working glyph, draws
+/// nothing on a timer.
+pub fn spin_runs(glyph_shown: bool, window_active: bool, reduce_motion: bool) -> bool {
+    glyph_shown && window_active && !reduce_motion
+}
+
 /// The glyph of a task status. The Working glyph is two layers: a still
-/// ring and an arc that turns once every `motion.spin`, unless the system asks
+/// ring and an arc that turns once every `motion.spin`, in steps that one
+/// shared timer makes (see [`Spin`]). It stands still when the system asks
 /// for less motion.
 pub fn status_glyph(
     id: impl Into<ElementId>,
@@ -60,17 +120,20 @@ pub fn status_glyph(
         TaskStatus::Failed => "status-failed",
         TaskStatus::Resolved => "status-resolved",
         TaskStatus::Working => {
+            let _ = id;
             let arc = glyph("status-working-arc", size, color)
                 .absolute()
                 .top_0()
                 .left_0();
-            let arc: AnyElement = if cx.reduce_motion() {
-                arc.into_any_element()
-            } else {
-                arc.with_animation(id, Animation::new(t.motion.spin).repeat(), |arc, delta| {
-                    arc.with_transformation(Transformation::rotate(percentage(delta)))
-                })
-                .into_any_element()
+            let spin = cx.try_global::<Spin>();
+            if let Some(spin) = spin {
+                spin.used.set(true);
+            }
+            let arc: AnyElement = match spin {
+                Some(spin) if !cx.reduce_motion() => arc
+                    .with_transformation(Transformation::rotate(percentage(spin.turn())))
+                    .into_any_element(),
+                _ => arc.into_any_element(),
             };
             return div()
                 .relative()
@@ -161,7 +224,20 @@ pub enum ButtonKind {
     Danger,
 }
 
-/// A text button: UI strong text, `md` corners, 30 px high.
+/// Makes a control reachable by the keyboard. It joins the Tab order, Enter
+/// and Space click it, and it shows the focus ring (`accent.text`, drawn
+/// outside the control) while the keyboard has the focus. A click with the
+/// mouse shows no ring.
+pub fn focusable(control: Stateful<Div>, t: &Tokens) -> Stateful<Div> {
+    let ring = t.focus_ring();
+    control
+        .focusable()
+        .tab_stop(true)
+        .focus_visible(move |style| style.shadow(ring))
+}
+
+/// A text button: UI strong text, `md` corners, 30 px high. The keyboard can
+/// focus it.
 pub fn button(
     id: impl Into<ElementId>,
     label: impl Into<SharedString>,
@@ -169,8 +245,7 @@ pub fn button(
     t: &Tokens,
 ) -> Stateful<Div> {
     let c = &t.colors;
-    let base = div()
-        .id(id)
+    let base = focusable(div().id(id), t)
         .flex()
         .flex_none()
         .items_center()
@@ -212,7 +287,7 @@ pub fn button(
 }
 
 /// A square icon button with `md` corners. `hover` is the hover fill for the
-/// surface it sits on.
+/// surface it sits on. The keyboard can focus it.
 pub fn icon_button(
     id: impl Into<ElementId>,
     name: &str,
@@ -223,8 +298,7 @@ pub fn icon_button(
     t: &Tokens,
 ) -> Stateful<Div> {
     let primary = t.colors.text_primary;
-    div()
-        .id(id)
+    focusable(div().id(id), t)
         .size(box_size)
         .flex_none()
         .flex()
@@ -311,5 +385,55 @@ pub fn editor_style(t: &Tokens) -> gpui_kit::base::input::InputEditorStyle {
         border: c.border_strong,
         background: c.canvas_clear,
         ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Review cycle 3, finding 9: the Working glyph asked for a new frame at
+    /// every display refresh, also while the window sat behind other windows.
+    #[test]
+    fn the_spin_timer_runs_only_for_a_shown_glyph_in_an_active_window() {
+        assert!(spin_runs(true, true, false));
+        assert!(!spin_runs(false, true, false), "no Working glyph on screen");
+        assert!(!spin_runs(true, false, false), "the window is not active");
+        assert!(
+            !spin_runs(true, true, true),
+            "the system asks for less motion"
+        );
+    }
+
+    #[test]
+    fn the_glyph_turns_in_steps_that_one_timer_makes() {
+        let period = Duration::from_millis(1200);
+        assert_eq!(steps_per_turn(period), 18);
+        // 15 steps a second, not a frame at every display refresh.
+        let interval = step_interval(period);
+        assert!(interval > Duration::from_millis(60) && interval < Duration::from_millis(70));
+        let spin = Spin::default();
+        for _ in 0..18 {
+            spin.advance(period);
+        }
+        assert!(
+            spin.turn() < 1e-3 || (1.0 - spin.turn()) < 1e-3,
+            "{}",
+            spin.turn()
+        );
+        spin.advance(period);
+        assert!((spin.turn() - 1.0 / 18.0).abs() < 1e-3);
+        // A very short period still takes a few steps.
+        assert_eq!(steps_per_turn(Duration::from_millis(10)), 4);
+    }
+
+    #[test]
+    fn a_frame_notes_whether_it_drew_a_working_glyph() {
+        let spin = Spin::default();
+        assert!(!spin.used());
+        spin.used.set(true);
+        assert!(spin.used());
+        spin.begin_frame();
+        assert!(!spin.used());
     }
 }

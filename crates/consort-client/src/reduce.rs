@@ -115,6 +115,7 @@ fn closed_approval(m: &model::Message) -> ApprovalView {
         choices: Vec::new(),
         state: RequestState::Closed,
         answer: None,
+        allow_always_label: None,
     }
 }
 
@@ -263,6 +264,13 @@ fn approval_view(a: &model::Approval) -> ApprovalView {
         .as_deref()
         .and_then(|id| a.option(id))
         .and_then(|o| approval_choice(o.kind));
+    // The harness's words for the wide choice. This is the option that
+    // `option_for` sends, so the button says what it does.
+    let allow_always_label = a
+        .options
+        .iter()
+        .find(|o| o.kind == RequestOptionKind::AllowAlways)
+        .map(|o| o.label.clone());
     ApprovalView {
         id: a.id.to_string(),
         task_id: a.task_id.map(|t| t.to_string()),
@@ -276,6 +284,7 @@ fn approval_view(a: &model::Approval) -> ApprovalView {
             ApprovalStatus::Expired | ApprovalStatus::Canceled => RequestState::Expired,
         },
         answer,
+        allow_always_label,
     }
 }
 
@@ -407,6 +416,20 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
             }
         })
         .collect();
+    let mut archived: Vec<&model::Channel> = cache
+        .channels
+        .values()
+        .filter(|c| c.archived_at.is_some() && c.kind != PK::Everything)
+        .collect();
+    archived.sort_by_key(|c| (c.name.to_lowercase(), c.id.to_string()));
+    let archived_channels: Vec<ArchivedChannelView> = archived
+        .iter()
+        .map(|c| ArchivedChannelView {
+            id: c.id.to_string(),
+            name: c.name.clone(),
+            icon: c.icon.clone().unwrap_or_else(|| "hash".to_owned()),
+        })
+        .collect();
     let channel_name = |id: &consort_proto::ids::ChannelId| {
         cache
             .channels
@@ -448,6 +471,7 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                 age_label: format::age_label(t.updated_at.as_millis(), now),
                 updated_at: t.updated_at.as_millis(),
                 card_message_id: t.card_message_id.to_string(),
+                approval_mode: approval_mode(t.approval_mode),
             }
         })
         .collect();
@@ -578,6 +602,7 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                         TaskStatus::Failed | TaskStatus::UpNext => task.status_reason.clone(),
                         _ => None,
                     },
+                    approval_mode: approval_mode(task.approval_mode),
                 }));
             } else if m.kind == MessageKind::Approval {
                 // Snapshots hold only pending approvals, so an answered one
@@ -792,6 +817,13 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                 repo: task_repo(cache, task),
             }),
             posts,
+            brief: task.brief.clone(),
+            review_summary: task
+                .review_summary
+                .clone()
+                .filter(|summary| !summary.trim().is_empty()),
+            text_is_preview: cache.task_previews.contains(&task.id.to_string()),
+            approval_mode: approval_mode(task.approval_mode),
         });
     }
 
@@ -927,6 +959,7 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                 name: g.name.clone(),
             })
             .collect(),
+        archived_channels,
         timelines,
         tasks,
         threads,
@@ -948,7 +981,7 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                     .channels
                     .get(&f.channel_id)
                     .map(|c| c.name.clone())
-                    .unwrap_or_default(),
+                    .unwrap_or_else(|| f.channel_name.clone()),
                 body: f.body.clone(),
                 message: format!(
                     "{} Put your text back in the message box, then send it again.",
@@ -1118,6 +1151,8 @@ mod tests {
 
     use super::*;
     use crate::cache::PendingSend;
+    use crate::view::ApprovalMode as VMode;
+    use consort_proto::client_api::{EntityKind, FeedChange};
 
     const NOW: i64 = 1_793_300_000_000;
 
@@ -1138,6 +1173,7 @@ mod tests {
             repo_ids: vec![],
             default_isolation: Isolation::Worktree,
             default_approval_mode: ApprovalMode::AutoEdits,
+            allowed_local_mcp_servers: vec![],
             memory_enabled: true,
             archived_at: None,
             created_at: Timestamp::from_millis(NOW - 100_000),
@@ -1572,9 +1608,11 @@ mod tests {
                 ApprovalChoice::Deny
             ]
         );
+        // The harness's own words stand on the wide button, so the user sees
+        // the scope it has (review cycle 3, S4).
         assert_eq!(
             approval.choice_label(ApprovalChoice::AllowForTask),
-            "Always allow"
+            "Yes, and don't ask again"
         );
         assert_eq!(
             approval.choice_label(ApprovalChoice::AllowOnce),
@@ -2308,6 +2346,7 @@ mod tests {
             channel_id: w.sayso.to_string(),
             thread_root_id: Some(w.card.to_string()),
             body: "Please retry".into(),
+            channel_name: String::new(),
             message: "That task does not exist".into(),
         });
         let state = view(&w.cache);
@@ -2320,5 +2359,269 @@ mod tests {
         assert_eq!(failure.body, "Please retry");
         assert!(failure.message.starts_with("That task does not exist."));
         assert!(failure.message.contains("Put your text back"));
+    }
+
+    /// Review cycle 3, finding 1: the thread had no brief and no review
+    /// summary, so the user could not read either one in full.
+    #[test]
+    fn the_thread_holds_the_full_brief_and_the_full_review_summary() {
+        let mut w = world();
+        let brief = "Fix the flaky signing step.\n\n- Check the CI logs.\n- Do not touch the release branch.\n\nThis line sits far beyond a short preview. ".repeat(40);
+        let summary = (1..=8)
+            .map(|n| format!("Paragraph {n} of the review summary says what changed."))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let task = w.cache.tasks.get_mut(&w.task.to_string()).expect("task");
+        task.status = PS::Review;
+        task.brief = brief.clone();
+        task.review_summary = Some(summary.clone());
+        let state = view(&w.cache);
+        let thread = state.thread(&w.task.to_string()).expect("thread");
+        assert_eq!(thread.brief, brief);
+        assert_eq!(thread.review_summary.as_deref(), Some(summary.as_str()));
+        assert!(!thread.text_is_preview);
+        assert_eq!(thread.status, TaskStatus::Review);
+        // The card keeps the whole summary too, and the card clamps it.
+        assert!(format!("{state:?}").contains("Paragraph 8"));
+    }
+
+    #[test]
+    fn a_thread_says_when_it_holds_only_a_preview() {
+        let mut w = world();
+        w.cache.task_previews.insert(w.task.to_string());
+        let state = view(&w.cache);
+        assert!(
+            state
+                .thread(&w.task.to_string())
+                .expect("thread")
+                .text_is_preview
+        );
+        // An empty summary is no summary.
+        let task = w.cache.tasks.get_mut(&w.task.to_string()).expect("task");
+        task.review_summary = Some("  \n".into());
+        let state = view(&w.cache);
+        assert_eq!(
+            state
+                .thread(&w.task.to_string())
+                .expect("thread")
+                .review_summary,
+            None
+        );
+    }
+
+    /// Review cycle 3, S2: the card and the thread show the approval mode
+    /// that the task asked for.
+    #[test]
+    fn the_card_and_the_thread_carry_the_approval_mode_of_the_task() {
+        let mut w = world();
+        let state = view(&w.cache);
+        let id = w.task.to_string();
+        assert_eq!(state.task(&id).expect("task").approval_mode, VMode::Ask);
+        assert_eq!(state.thread(&id).expect("thread").approval_mode, VMode::Ask);
+        let card = state
+            .timeline(&w.sayso.to_string())
+            .expect("timeline")
+            .items
+            .iter()
+            .find_map(|i| match i {
+                TimelineItem::TaskCard(c) => Some(c.clone()),
+                _ => None,
+            })
+            .expect("card");
+        assert_eq!(card.approval_mode, VMode::Ask);
+        let task = w.cache.tasks.get_mut(&id).expect("task");
+        task.approval_mode = model::ApprovalMode::FullAccess;
+        let state = view(&w.cache);
+        assert_eq!(
+            state.thread(&id).expect("thread").approval_mode,
+            VMode::FullAccess
+        );
+        assert_eq!(VMode::FullAccess.tag(), "Full access mode");
+        assert_eq!(VMode::Ask.tag(), "Ask mode");
+    }
+
+    fn claude_approval(w: &mut World) -> ApprovalId {
+        let id = *w
+            .cache
+            .approvals
+            .keys()
+            .next()
+            .map(|k| k.parse::<ApprovalId>())
+            .transpose()
+            .expect("id")
+            .as_ref()
+            .expect("an approval");
+        let approval = w
+            .cache
+            .approvals
+            .get_mut(&id.to_string())
+            .expect("approval");
+        approval.details = ApprovalDetails::Command {
+            command: "python3 build.py".into(),
+            cwd: Some("/work/app".into()),
+        };
+        approval.options = vec![
+            RequestOption {
+                id: "allow".into(),
+                label: "Yes".into(),
+                kind: RequestOptionKind::AllowOnce,
+                description: None,
+            },
+            RequestOption {
+                id: "allow-always".into(),
+                label: "Yes, and don't ask again for python3 commands".into(),
+                kind: RequestOptionKind::AllowAlways,
+                description: None,
+            },
+            RequestOption {
+                id: "deny".into(),
+                label: "No".into(),
+                kind: RequestOptionKind::DenyOnce,
+                description: None,
+            },
+        ];
+        id
+    }
+
+    /// Review cycle 3, S4: "Allow for this task" sent claude-agent-acp's
+    /// option that adds a permanent Claude rule, and the harness label that
+    /// says so was thrown away.
+    #[test]
+    fn the_wide_choice_shows_the_harness_label_so_the_user_sees_the_scope() {
+        let mut w = world();
+        let id = claude_approval(&mut w);
+        let state = view(&w.cache);
+        let thread = state.thread(&w.task.to_string()).expect("thread");
+        let approval = thread
+            .posts
+            .iter()
+            .flat_map(|p| p.bodies.iter())
+            .find_map(|b| match b {
+                PostBody::Approval(a) if a.id == id.to_string() => Some(a.clone()),
+                _ => None,
+            })
+            .expect("approval");
+        assert_eq!(
+            approval.choice_label(ApprovalChoice::AllowForTask),
+            "Yes, and don't ask again for python3 commands"
+        );
+        // Allow once and Deny keep our words.
+        assert_eq!(
+            approval.choice_label(ApprovalChoice::AllowOnce),
+            "Allow once"
+        );
+        assert_eq!(approval.choice_label(ApprovalChoice::Deny), "Deny");
+        // The button still sends the option that carries that label.
+        let option = crate::hub::option_for(
+            w.cache.approvals.get(&id.to_string()).expect("approval"),
+            ApprovalChoice::AllowForTask,
+        );
+        assert_eq!(option.as_deref(), Some("allow-always"));
+    }
+
+    #[test]
+    fn without_a_harness_label_the_wide_choice_keeps_our_words() {
+        let mut approval = ApprovalView {
+            task_id: Some("tsk_1".into()),
+            ..ApprovalView::default()
+        };
+        assert_eq!(
+            approval.choice_label(ApprovalChoice::AllowForTask),
+            "Allow for this task"
+        );
+        approval.task_id = None;
+        assert_eq!(
+            approval.choice_label(ApprovalChoice::AllowForTask),
+            "Always allow"
+        );
+        // A label of white space is no label.
+        approval.allow_always_label = Some("  ".into());
+        assert_eq!(
+            approval.choice_label(ApprovalChoice::AllowForTask),
+            "Always allow"
+        );
+        approval.allow_always_label = Some(" Yes, for the session ".into());
+        assert_eq!(
+            approval.choice_label(ApprovalChoice::AllowForTask),
+            "Yes, for the session"
+        );
+    }
+
+    /// Review cycle 3, finding 7: nothing listed the channels that the user
+    /// archived, so there was no way back.
+    #[test]
+    fn archived_channels_are_listed_by_name_and_leave_the_channel_list() {
+        let mut w = world();
+        let mut old = channel(ChannelId::new(), ChannelKind::Standard, "zebra", None);
+        old.archived_at = Some(Timestamp::from_millis(NOW - 5_000));
+        let mut older = channel(ChannelId::new(), ChannelKind::Standard, "Apple", None);
+        older.archived_at = Some(Timestamp::from_millis(NOW - 9_000));
+        older.icon = Some("mic".into());
+        let (old_id, older_id) = (old.id.to_string(), older.id.to_string());
+        w.cache.channels.insert(old_id.clone(), old);
+        w.cache.channels.insert(older_id.clone(), older);
+        let state = view(&w.cache);
+        assert!(state.channel(&old_id).is_none());
+        assert!(state.timeline(&old_id).is_none());
+        let names: Vec<&str> = state
+            .archived_channels
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
+        assert_eq!(names, ["Apple", "zebra"]);
+        assert_eq!(state.archived_channels[0].id, older_id);
+        assert_eq!(state.archived_channels[0].icon, "mic");
+        assert_eq!(state.archived_channels[1].icon, "hash");
+        // Open channels are not in the list.
+        assert!(
+            state
+                .archived_channels
+                .iter()
+                .all(|c| c.id != w.sayso.to_string())
+        );
+    }
+
+    /// Review cycle 3, finding 12: the messages that waited for a channel
+    /// that someone deleted were dropped with no trace.
+    #[test]
+    fn a_message_that_waited_for_a_deleted_channel_becomes_a_failed_send() {
+        let mut w = world();
+        w.cache.pending.push(PendingSend {
+            client_message_id: "cm-1".into(),
+            channel_id: w.sayso.to_string(),
+            thread_root_id: None,
+            body: "A long message that the user wrote offline".into(),
+            created_at: NOW,
+        });
+        w.cache.pending.push(PendingSend {
+            client_message_id: "cm-2".into(),
+            channel_id: w.everything.to_string(),
+            thread_root_id: None,
+            body: "Stays".into(),
+            created_at: NOW,
+        });
+        w.cache.seq = 5;
+        let changed = w.cache.apply(FeedEntry {
+            seq: 6,
+            at: Timestamp::from_millis(NOW),
+            channel_id: Some(w.sayso),
+            entity_id: w.sayso.to_string(),
+            change: FeedChange::Delete(EntityKind::Channel),
+        });
+        assert!(changed);
+        assert_eq!(w.cache.pending.len(), 1);
+        assert_eq!(w.cache.pending[0].client_message_id, "cm-2");
+        assert_eq!(w.cache.send_failures.len(), 1);
+        let failure = &w.cache.send_failures[0];
+        assert_eq!(failure.id, "cm-1");
+        assert_eq!(failure.body, "A long message that the user wrote offline");
+        assert_eq!(failure.message, "The channel was deleted.");
+        // The view names the channel, although it is gone.
+        let state = view(&w.cache);
+        let shown = &state.send_failures[0];
+        assert_eq!(shown.channel_name, "sayso");
+        assert!(shown.message.starts_with("The channel was deleted."));
+        assert!(shown.message.contains("Put your text back"));
+        assert_eq!(shown.body, "A long message that the user wrote offline");
     }
 }

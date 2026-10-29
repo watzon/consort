@@ -110,6 +110,9 @@ struct Hub {
     /// and sends the feed entry, and then answers with the task as it was.
     /// The answer is older than the feed entry that the client got first.
     task_get_race: Option<Task>,
+    /// The request type and the body of every group, move and archive
+    /// request, in order.
+    recorded: Vec<(String, serde_json::Value)>,
 }
 
 /// What the real hub writes at the end of a cut text.
@@ -166,6 +169,7 @@ fn seed(hub: &mut Hub) {
         repo_ids: vec![],
         default_isolation: Isolation::Worktree,
         default_approval_mode: ApprovalMode::AutoEdits,
+        allowed_local_mcp_servers: vec![],
         memory_enabled: true,
         archived_at: None,
         created_at: ts(now - 10_000),
@@ -592,6 +596,35 @@ async fn session(hub: Shared, mut socket: WebSocket) {
                         req.respond_ok(&TaskResult { task }).unwrap()
                     }
                 }
+            }
+            "group.create" => {
+                let body: consort_proto::client_api::GroupCreate = req.decode_as().unwrap();
+                hub.lock()
+                    .unwrap()
+                    .recorded
+                    .push((req.kind.clone(), req.body.clone()));
+                req.respond_ok(&consort_proto::client_api::GroupResult {
+                    group: consort_proto::model::Group {
+                        id: consort_proto::ids::GroupId::new(),
+                        name: body.name,
+                        position: 0,
+                        collapsed: false,
+                    },
+                })
+                .unwrap()
+            }
+            "channel.move" | "channel.archive" => {
+                let mut h = hub.lock().unwrap();
+                h.recorded.push((req.kind.clone(), req.body.clone()));
+                let channel = h.channel.clone().unwrap();
+                req.respond_ok(&consort_proto::client_api::ChannelResult { channel })
+                    .unwrap()
+            }
+            "task.archive" => {
+                let mut h = hub.lock().unwrap();
+                h.recorded.push((req.kind.clone(), req.body.clone()));
+                let task = h.task.clone().unwrap();
+                req.respond_ok(&TaskResult { task }).unwrap()
             }
             "read.mark" => {
                 let mark: consort_proto::client_api::ReadMark = req.decode_as().unwrap();
@@ -2375,4 +2408,313 @@ async fn opening_a_thread_of_a_task_outside_the_snapshot_loads_the_task_and_its_
         PostBody::Text(t) if t == "A reply on an old task"
     ));
     assert_eq!(hub.lock().unwrap().task_gets, vec![outside]);
+}
+
+// ---------------------------------------------------------------------------
+// Review cycle 3: briefs, groups, archive, reconnect, empty channel.
+
+/// Finding 1: the thread holds the whole brief and the whole review
+/// summary. Before the client has the full task, it says that the text is a
+/// preview.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_thread_of_a_previewed_task_shows_the_full_brief_and_summary_after_it_loads() {
+    let (url, hub) = start_hub().await;
+    let (task_id, brief, summary) = previewed_task(&hub);
+    let dir = tempfile::tempdir().unwrap();
+    let client = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
+    let id = task_id.to_string();
+
+    let state = wait_for(&client, "the thread", |s| s.thread(&id).is_some()).await;
+    let thread = state.thread(&id).unwrap();
+    assert!(thread.text_is_preview, "the snapshot cut the text");
+    assert!(thread.brief.ends_with(CUT_MARK));
+    assert!(thread.brief.len() < brief.len());
+
+    client.load_thread(id.clone()).await.unwrap();
+    let state = wait_for(&client, "the full text", |s| {
+        s.thread(&id).is_some_and(|t| !t.text_is_preview)
+    })
+    .await;
+    let thread = state.thread(&id).unwrap();
+    assert_eq!(thread.brief, brief);
+    assert_eq!(thread.review_summary.as_deref(), Some(summary.as_str()));
+    assert_eq!(thread.approval_mode, consort_client::ApprovalMode::Ask);
+}
+
+/// Finding 8: a group can be made, a channel can go into it, and a channel
+/// can leave its group.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_group_can_be_made_and_a_channel_can_leave_its_group() {
+    let (url, hub) = start_hub().await;
+    let dir = tempfile::tempdir().unwrap();
+    let client = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
+    let channel = everything_id(&client);
+
+    client
+        .create_group("  Home projects ".into(), Some(channel.clone()))
+        .await
+        .unwrap();
+    client.move_channel(channel.clone(), None).await.unwrap();
+    let err = client.create_group("  ".into(), None).await.unwrap_err();
+    assert!(
+        err.to_string().contains("Enter a name for the group"),
+        "{err}"
+    );
+
+    let recorded = hub.lock().unwrap().recorded.clone();
+    let kinds: Vec<&str> = recorded.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(kinds, ["group.create", "channel.move", "channel.move"]);
+    assert_eq!(recorded[0].1["name"], "Home projects");
+    // The channel goes into the group that the hub just made.
+    assert_eq!(recorded[1].1["channel_id"], channel.as_str());
+    assert!(recorded[1].1["group_id"].is_string());
+    // "No group" is a move with no group.
+    assert_eq!(recorded[2].1["channel_id"], channel.as_str());
+    assert!(recorded[2].1["group_id"].is_null());
+}
+
+/// Finding 8: a new channel can name a new group. The client makes the group
+/// first, and a second try with the same name uses it again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_channel_made_with_a_new_group_makes_the_group_first() {
+    let (url, hub) = start_hub().await;
+    let dir = tempfile::tempdir().unwrap();
+    let client = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
+    // The fake hub has no channel.create. The group request goes out first,
+    // then the channel request fails with the fake's own answer.
+    let new = consort_client::NewChannel {
+        name: "garden".into(),
+        new_group: Some("Home".into()),
+        ..consort_client::NewChannel::default()
+    };
+    let result = client.create_channel(new).await;
+    assert!(result.is_err());
+    let recorded = hub.lock().unwrap().recorded.clone();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].0, "group.create");
+    assert_eq!(recorded[0].1["name"], "Home");
+}
+
+/// Finding 7: archive a task, and bring an archived channel back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_task_can_be_archived_and_a_channel_can_be_unarchived() {
+    let (url, hub) = start_hub().await;
+    let dir = tempfile::tempdir().unwrap();
+    let client = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
+    let channel = everything_id(&client);
+    let task_id = hub.lock().unwrap().task.as_ref().unwrap().id;
+
+    client.archive_task(task_id.to_string()).await.unwrap();
+    client.unarchive_channel(channel.clone()).await.unwrap();
+    let recorded = hub.lock().unwrap().recorded.clone();
+    assert_eq!(recorded[0].0, "task.archive");
+    assert_eq!(recorded[0].1["task_id"], task_id.to_string());
+    assert_eq!(recorded[0].1["archived"], true);
+    assert_eq!(recorded[1].0, "channel.archive");
+    assert_eq!(recorded[1].1["channel_id"], channel.as_str());
+    assert_eq!(recorded[1].1["archived"], false);
+}
+
+/// Finding 7: a channel that someone archived leaves the channel list and
+/// shows in the archived list, and comes back when someone unarchives it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_archived_channel_shows_in_the_archived_list_and_comes_back() {
+    let (url, hub) = start_hub().await;
+    let archived_id = {
+        let mut h = hub.lock().unwrap();
+        let mut channel = h.channel.clone().unwrap();
+        channel.id = ChannelId::new();
+        channel.kind = ChannelKind::Standard;
+        channel.name = "Garden".into();
+        channel.archived_at = Some(ts(5));
+        let id = channel.id;
+        h.extra.push(channel);
+        id
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let client = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
+    let id = archived_id.to_string();
+    let state = wait_for(&client, "the archived list", |s| {
+        s.archived_channels.iter().any(|c| c.id == id)
+    })
+    .await;
+    assert!(state.channel(&id).is_none());
+    assert_eq!(state.archived_channels[0].name, "Garden");
+
+    let upsert = {
+        let mut h = hub.lock().unwrap();
+        h.extra[0].archived_at = None;
+        let open = h.extra[0].clone();
+        feed(&mut h, EntityPayload::Channel(open))
+    };
+    push(&hub, vec![upsert]);
+    let state = wait_for(&client, "the channel back in the list", |s| {
+        s.channel(&id).is_some()
+    })
+    .await;
+    assert!(state.archived_channels.is_empty());
+}
+
+/// Finding 6: a channel ID that is empty names no channel. The client
+/// refuses it, and queues nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_message_for_no_channel_is_refused_and_not_queued() {
+    // A paired client whose hub is not there: a cold start while the hub is
+    // down, as the user sees it.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("client.json"),
+        r#"{"hub_url":"http://127.0.0.1:1","client_id":"cli_00000000-0000-0000-0000-000000000001","name":"Test"}"#,
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("client.key"), "11".repeat(32)).unwrap();
+    let client =
+        Client::start_with(Some(Store::new(dir.path())), ClientOptions::desktop()).unwrap();
+    wait_for(&client, "offline", |s| {
+        matches!(s.connection, Connection::Offline { .. })
+    })
+    .await;
+    assert!(client.state().channels.is_empty());
+
+    let err = client
+        .send_message(String::new(), "my careful message".into())
+        .await
+        .unwrap_err();
+    assert_eq!(err, ClientError::NoChannel);
+    assert!(err.to_string().contains("try again"));
+    // The same through the command.
+    let err = client
+        .run(Command::SendMessage {
+            channel_id: " ".into(),
+            body: "again".into(),
+            client_message_id: "cm-1".into(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err, ClientError::NoChannel);
+    assert!(
+        !dir.path().join("outbox.json").exists(),
+        "nothing waits in the outbox"
+    );
+}
+
+/// Finding 10: "Try again" connects at once. A hub that drops every link
+/// makes the retry delay grow, and the command ends the wait.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn try_again_connects_without_waiting_for_the_retry_timer() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let accepted = Arc::new(AtomicUsize::new(0));
+    {
+        let accepted = accepted.clone();
+        tokio::spawn(async move {
+            // Take each connection and drop it, so the handshake fails.
+            while let Ok((socket, _)) = listener.accept().await {
+                accepted.fetch_add(1, Ordering::SeqCst);
+                drop(socket);
+            }
+        });
+    }
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("client.json"),
+        format!(
+            r#"{{"hub_url":"http://127.0.0.1:{port}","client_id":"cli_00000000-0000-0000-0000-000000000001","name":"Test"}}"#
+        ),
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("client.key"), "11".repeat(32)).unwrap();
+    let client =
+        Client::start_with(Some(Store::new(dir.path())), ClientOptions::desktop()).unwrap();
+    // Wait until the delay is long enough to tell the difference.
+    let state = wait_for(
+        &client,
+        "a long retry delay",
+        |s| matches!(s.connection, Connection::Offline { retry_in_ms, .. } if retry_in_ms >= 1_400),
+    )
+    .await;
+    assert!(matches!(state.connection, Connection::Offline { .. }));
+    let before = accepted.load(Ordering::SeqCst);
+    client.reconnect().await.unwrap();
+    until("a new attempt before the timer ends", || {
+        accepted.load(Ordering::SeqCst) > before
+    })
+    .await;
+    // The command was not a wait for the timer: it came well before the
+    // delay that the state announced.
+    assert!(matches!(
+        client.state().connection,
+        Connection::Offline { .. } | Connection::Connecting
+    ));
+}
+
+/// Finding 12: a channel that someone deletes takes its waiting messages
+/// out of the outbox, and the user keeps the text as a failed send. The
+/// caller that waited for the send does not hang.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deleting_a_channel_keeps_the_text_of_its_waiting_messages() {
+    let (url, hub) = start_hub().await;
+    let doomed = {
+        let mut h = hub.lock().unwrap();
+        let mut channel = h.channel.clone().unwrap();
+        channel.id = ChannelId::new();
+        channel.kind = ChannelKind::Standard;
+        channel.name = "scratch".into();
+        let id = channel.id;
+        h.extra.push(channel);
+        id
+    };
+    let dir = tempfile::tempdir().unwrap();
+    // Long limits: the call must not end by its own timeout. Only the
+    // delete may end the wait.
+    let patient = Timeouts {
+        call: Duration::from_secs(60),
+        idle: Duration::from_secs(120),
+        ..quick()
+    };
+    let client = paired_client(&url, dir.path(), options(patient)).await;
+    let id = doomed.to_string();
+    wait_for(&client, "the scratch channel", |s| s.channel(&id).is_some()).await;
+    // The hub takes the message and never answers, so it stays in the outbox.
+    hub.lock().unwrap().silent_sends = true;
+    let sender = {
+        let client = client.clone();
+        let id = id.clone();
+        tokio::spawn(async move { client.send_message(id, "A long message".into()).await })
+    };
+    wait_for(&client, "the message waits", |s| {
+        bodies_of(s, &id)
+            .iter()
+            .any(|(b, pending)| b == "A long message" && *pending)
+    })
+    .await;
+    let delete = {
+        let mut h = hub.lock().unwrap();
+        h.seq += 1;
+        Frame::event(&FeedEntry::delete(
+            h.seq,
+            Timestamp::now(),
+            consort_proto::client_api::EntityKind::Channel,
+            id.clone(),
+            Some(doomed),
+        ))
+        .unwrap()
+    };
+    push(&hub, vec![delete]);
+    let state = wait_for(&client, "the failed send", |s| !s.send_failures.is_empty()).await;
+    let failure = &state.send_failures[0];
+    assert_eq!(failure.body, "A long message");
+    assert_eq!(failure.channel_name, "scratch");
+    assert!(
+        failure.message.starts_with("The channel was deleted."),
+        "{}",
+        failure.message
+    );
+    // The caller that waited for the send is not stuck.
+    let done = tokio::time::timeout(Duration::from_secs(5), sender).await;
+    assert!(
+        done.is_ok(),
+        "the send call hangs after the channel was deleted"
+    );
 }

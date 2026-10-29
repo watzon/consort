@@ -2,12 +2,15 @@
 //! the window.
 
 use std::{
+    cell::RefCell,
+    rc::Rc,
     sync::Arc,
     time::{Duration, Instant},
 };
 
 use consort_client::{
-    ApprovalChoice, ChannelChanges, Client, ClientError, Connection, Isolation, Os, ViewState,
+    ApprovalChoice, ChannelChanges, Client, ClientError, Connection, Drafts, Isolation, Os,
+    ViewState,
 };
 use consort_theme::{ActiveTokens as _, Tokens, TypeExt as _};
 use gpui_kit::{
@@ -28,7 +31,9 @@ use crate::{
         links::LinkAction,
         markdown::TextCache,
         menu::{EditOp, MenuAction, MenuItem, OpenMenu, TextTarget, TriggerBounds, render_menu},
+        parts::Spin,
     },
+    waiting::{Waiting, waiting_for_channel},
 };
 
 /// The key that guards the open dialog against a second submit.
@@ -39,6 +44,13 @@ const MARK_KEY: &str = "mark-read";
 
 /// How often the offline countdown redraws.
 const COUNTDOWN_TICK: Duration = Duration::from_secs(1);
+
+/// How long a change to a draft waits before it goes to the disk. A burst of
+/// typing makes one write.
+const DRAFT_SAVE_DELAY: Duration = Duration::from_millis(1_500);
+
+/// The text that the New task buttons put in a message box.
+pub const START_TASK_TEXT: &str = "Start a task to ";
 
 /// Which page fills the window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,6 +96,9 @@ pub enum Dialog {
     Instructions(String),
     RenameWorker(String),
     EditLabels(String),
+    /// A small dialog that names a new group. With a channel ID, the channel
+    /// moves into the group once it exists.
+    NewGroup(Option<String>),
     ConfirmDeleteChannel(String),
     ConfirmRemoveWorker(String),
     /// A link whose words do not match its address: the address to show.
@@ -94,6 +109,9 @@ pub enum Dialog {
 #[derive(Clone, Debug, Default)]
 pub struct NewChannelForm {
     pub group_id: Option<String>,
+    /// The channel goes in a new group. The group's name is in the
+    /// `group_name` input.
+    pub new_group: bool,
     pub workers: Vec<String>,
     pub selection: Option<String>,
     pub isolation: Isolation,
@@ -118,7 +136,12 @@ pub struct Inputs {
     pub hub_url: Entity<InputState>,
     pub search: Entity<InputState>,
     pub setup_code: Entity<InputState>,
+    /// The name of a new group in the New channel dialog.
+    pub group_name: Entity<InputState>,
 }
+
+/// What the Enter key does in the open dialog, as the last render set it.
+pub(crate) type DialogConfirm = Rc<dyn Fn(&mut ConsortApp, &mut Window, &mut Context<ConsortApp>)>;
 
 pub struct ConsortApp {
     pub client: Client,
@@ -188,6 +211,28 @@ pub struct ConsortApp {
     pub switcher: Option<usize>,
     pub onboarding: Onboarding,
     pub triggers: TriggerBounds,
+    /// The drafts of the channels and the task threads. The message boxes
+    /// hold the draft of the open channel and the open thread; this map
+    /// holds the others.
+    pub drafts: Drafts,
+    /// The channel whose draft the composer holds. The composer switches to
+    /// the draft of `channel_id` when this differs from it.
+    composer_for: String,
+    /// The task whose reply draft the reply box holds.
+    reply_for: Option<String>,
+    /// A write of the drafts waits on its timer.
+    drafts_saving: bool,
+    /// The task threads whose brief is open.
+    pub brief_open: Vec<String>,
+    /// The task threads whose review summary the user closed.
+    pub summary_closed: Vec<String>,
+    /// The Archived list in the sidebar is open.
+    pub archived_open: bool,
+    /// The timer that turns the Working glyphs runs.
+    spin_ticker: bool,
+    /// What Enter does in the open dialog: the confirm button, unless Enter
+    /// must not confirm (a destructive dialog, or a box with many lines).
+    pub(crate) dialog_confirm: RefCell<Option<DialogConfirm>>,
     pub focus: FocusHandle,
     styled_for: Option<(gpui_kit::SharedString, consort_theme::Mode)>,
     _subscriptions: Vec<Subscription>,
@@ -196,6 +241,7 @@ pub struct ConsortApp {
 impl ConsortApp {
     pub fn new(client: Client, demo: bool, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let state = client.state();
+        let drafts = client.load_drafts();
         let overdraw = Self::tokens(cx).layout.list_overdraw;
         let channel_id = state.everything().map(|c| c.id.clone()).unwrap_or_default();
         let textarea = |placeholder: &str,
@@ -229,6 +275,7 @@ impl ConsortApp {
             hub_url: field("https://hub.example.com", window, cx),
             search: field("Go to a channel or a task", window, cx),
             setup_code: field("ABCD-EFGH", window, cx),
+            group_name: field("Name of the new group", window, cx),
         };
         let mut subscriptions = Vec::new();
         subscriptions.push(cx.subscribe_in(
@@ -249,6 +296,37 @@ impl ConsortApp {
                 }
             },
         ));
+        // A change to a draft goes to the disk soon, so a quit loses little.
+        for area in [&inputs.composer, &inputs.reply] {
+            subscriptions.push(cx.subscribe_in(
+                area,
+                window,
+                |this, _, event: &InputEvent, _, cx| {
+                    if let InputEvent::Change = event {
+                        this.save_drafts_soon(cx);
+                    }
+                },
+            ));
+        }
+        // Enter in a field of the open dialog, or of the onboarding form,
+        // submits it.
+        for field in [
+            &inputs.name,
+            &inputs.purpose,
+            &inputs.group_name,
+            &inputs.hub_url,
+            &inputs.setup_code,
+        ] {
+            subscriptions.push(cx.subscribe_in(
+                field,
+                window,
+                |this, _, event: &InputEvent, window, cx| {
+                    if let InputEvent::PressEnter { .. } = event {
+                        this.submit_on_enter(window, cx);
+                    }
+                },
+            ));
+        }
         subscriptions.push(cx.subscribe_in(
             &inputs.edit,
             window,
@@ -280,7 +358,17 @@ impl ConsortApp {
             if this.window_active {
                 this.mark_read(cx);
             }
+            // The Working glyphs stop turning in a window that is not active,
+            // and turn again when it is. A draw restarts the timer.
+            cx.notify();
         }));
+        // A quit writes the drafts, so the text in the message boxes comes
+        // back at the next start.
+        subscriptions.push(cx.on_app_quit(|this, cx| {
+            this.save_drafts_now(cx);
+            async {}
+        }));
+        cx.set_global(Spin::default());
         let mut sub = client.subscribe();
         cx.spawn(async move |this, cx| {
             while let Some(state) = sub.next().await {
@@ -350,12 +438,22 @@ impl ConsortApp {
             switcher: None,
             onboarding: Onboarding::default(),
             triggers: TriggerBounds::default(),
+            drafts,
+            composer_for: String::new(),
+            reply_for: None,
+            drafts_saving: false,
+            brief_open: Vec::new(),
+            summary_closed: Vec::new(),
+            archived_open: false,
+            spin_ticker: false,
+            dialog_confirm: RefCell::new(None),
             focus: cx.focus_handle(),
             styled_for: None,
             _subscriptions: subscriptions,
         };
         this.sync_lists();
         this.update_placeholder(window, cx);
+        this.sync_draft_inputs(window, cx);
         this.follow_connection(cx);
         this.mark_read(cx);
         // Reaching the top of the timeline loads older messages. Reaching the
@@ -406,6 +504,7 @@ impl ConsortApp {
             &self.inputs.hub_url,
             &self.inputs.setup_code,
             &self.inputs.search,
+            &self.inputs.group_name,
         ] {
             let style = style.clone();
             field.update(cx, |s, cx| {
@@ -556,7 +655,7 @@ impl ConsortApp {
             if self.state.channel(&failure.channel_id).is_some() {
                 self.open_channel(failure.channel_id.clone(), window, cx);
             }
-            self.open_thread(task, cx);
+            self.open_thread(task, window, cx);
             self.inputs.reply.clone()
         } else {
             if self.state.channel(&failure.channel_id).is_some() {
@@ -775,7 +874,10 @@ impl ConsortApp {
                     .map(|t| t.id.clone());
                 if let (Some(channel), Some(task)) = (channel, task) {
                     self.open_channel(channel, window, cx);
-                    self.open_thread(task, cx);
+                    // The brief opens under the header. The summary is open
+                    // above the Resolve bar already.
+                    self.brief_open.push(task.clone());
+                    self.open_thread(task, window, cx);
                 }
             }
             // A task with no repo: the thread says it runs in a new folder.
@@ -789,7 +891,7 @@ impl ConsortApp {
                     .map(|t| (t.channel_id.clone(), t.id.clone()));
                 if let Some((channel, task)) = task {
                     self.open_channel(channel, window, cx);
-                    self.open_thread(task, cx);
+                    self.open_thread(task, window, cx);
                 }
             }
             // A long error and a second one that waits behind it.
@@ -817,7 +919,7 @@ impl ConsortApp {
                     .map(|t| t.id.clone());
                 if let (Some(channel), Some(task)) = (channel, task) {
                     self.open_channel(channel, window, cx);
-                    self.open_thread(task, cx);
+                    self.open_thread(task, window, cx);
                 }
             }
             "channel-requests" => {
@@ -847,7 +949,7 @@ impl ConsortApp {
                     self.open_channel(id, window, cx);
                 }
                 if let Some(task) = first_task {
-                    self.open_thread(task, cx);
+                    self.open_thread(task, window, cx);
                 }
             }
             "settings" => self.open_settings(SettingsSection::Appearance, cx),
@@ -954,6 +1056,8 @@ impl ConsortApp {
     pub fn open_channel(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
         self.channel_id = id;
         self.page = Page::Main;
+        // The composer holds the draft of this channel from now on.
+        self.sync_draft_inputs(window, cx);
         self.sync_lists();
         self.update_placeholder(window, cx);
         self.track_unloaded(cx);
@@ -970,14 +1074,218 @@ impl ConsortApp {
         cx.notify();
     }
 
-    pub fn open_thread(&mut self, task_id: String, cx: &mut Context<Self>) {
+    pub fn open_thread(&mut self, task_id: String, window: &mut Window, cx: &mut Context<Self>) {
         self.panel = Panel::Thread(task_id.clone());
         self.decision_writing = None;
+        // The reply box holds the draft of this thread from now on.
+        self.sync_draft_inputs(window, cx);
         self.sync_lists();
         cx.notify();
         // Replies come from the hub the first time a thread opens.
         let client = self.client.clone();
         self.spawn_command(cx, async move { client.load_thread(task_id).await });
+    }
+
+    /// Gives each message box the draft of the channel or the thread that is
+    /// open. When the open channel or thread is not the one the box held, the
+    /// text in the box goes to the drafts first, and the box takes the draft
+    /// of the new one. A draft written in channel A never goes to channel B.
+    pub fn sync_draft_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.composer_for != self.channel_id {
+            let text = self.inputs.composer.read(cx).value().to_string();
+            let next = drafts::switch_channel(
+                &mut self.drafts,
+                &self.composer_for,
+                &text,
+                &self.channel_id,
+            );
+            self.inputs
+                .composer
+                .update(cx, |input, cx| input.set_value(next, window, cx));
+            self.composer_for = self.channel_id.clone();
+        }
+        let wanted = match &self.panel {
+            Panel::Thread(task_id) => Some(task_id.clone()),
+            _ => None,
+        };
+        if self.reply_for != wanted {
+            let text = self.inputs.reply.read(cx).value().to_string();
+            let next = drafts::switch_thread(
+                &mut self.drafts,
+                self.reply_for.as_deref(),
+                &text,
+                wanted.as_deref(),
+            );
+            self.inputs
+                .reply
+                .update(cx, |input, cx| input.set_value(next, window, cx));
+            self.reply_for = wanted;
+        }
+    }
+
+    /// Puts the text of the two message boxes in the drafts, and drops the
+    /// drafts of channels and tasks that are gone.
+    fn collect_drafts(&mut self, cx: &mut Context<Self>) {
+        let composer = self.inputs.composer.read(cx).value().to_string();
+        self.drafts.set_channel(&self.composer_for, &composer);
+        if let Some(task_id) = self.reply_for.clone() {
+            let reply = self.inputs.reply.read(cx).value().to_string();
+            self.drafts.set_thread(&task_id, &reply);
+        }
+        // Until the first snapshot, the app knows no channel, so it cannot
+        // tell a gone channel from one that has not loaded.
+        if !self.state.channels.is_empty() {
+            let channels = self
+                .state
+                .channels
+                .iter()
+                .map(|c| c.id.as_str())
+                .chain(self.state.archived_channels.iter().map(|c| c.id.as_str()));
+            let tasks = self.state.tasks.iter().map(|t| t.id.as_str());
+            self.drafts.keep_only(channels, tasks);
+        }
+    }
+
+    /// Writes the drafts to the client's folder now. A failure is only
+    /// printed: a draft is a convenience, and the text is still in its box.
+    pub fn save_drafts_now(&mut self, cx: &mut Context<Self>) {
+        if self.demo {
+            return;
+        }
+        self.collect_drafts(cx);
+        if let Err(err) = self.client.save_drafts(&self.drafts) {
+            eprintln!("consort: cannot save the drafts: {err}");
+        }
+    }
+
+    /// Writes the drafts after a short wait. One write covers a burst of
+    /// typing.
+    fn save_drafts_soon(&mut self, cx: &mut Context<Self>) {
+        if self.drafts_saving || self.demo {
+            return;
+        }
+        self.drafts_saving = true;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(DRAFT_SAVE_DELAY).await;
+            let _ = this.update(cx, |this, cx| {
+                this.drafts_saving = false;
+                this.save_drafts_now(cx);
+            });
+        })
+        .detach();
+    }
+
+    /// Forgets the draft of a channel or a thread whose text went out while
+    /// another one was open. The text is in the hub now.
+    fn forget_sent_draft(&mut self, channel: Option<&str>, thread: Option<&str>, sent: &str) {
+        if let Some(channel) = channel
+            && self.drafts.channel(channel).trim() == sent.trim()
+        {
+            self.drafts.set_channel(channel, "");
+        }
+        if let Some(thread) = thread
+            && self.drafts.thread(thread).trim() == sent.trim()
+        {
+            self.drafts.set_thread(thread, "");
+        }
+    }
+
+    /// Puts "Start a task to " in the composer after the draft. A draft is
+    /// never replaced.
+    pub fn start_task_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.waiting().is_some() {
+            return;
+        }
+        self.inputs.composer.update(cx, |input, cx| {
+            let draft = input.value().to_string();
+            input.set_value(drafts::start_task_text(&draft), window, cx);
+            input.focus(window, cx);
+        });
+    }
+
+    /// Connects to the hub now, without waiting for the retry timer.
+    pub fn try_again(&mut self, cx: &mut Context<Self>) {
+        let client = self.client.clone();
+        self.spawn_command(cx, async move { client.reconnect().await });
+    }
+
+    /// Why the app has no channel to show, if it has none yet.
+    pub fn waiting(&self) -> Option<Waiting> {
+        waiting_for_channel(&self.state, &self.channel_id)
+    }
+
+    /// Enter in a field submits the open dialog or the onboarding form. A
+    /// dialog that destroys something, or that asks for many lines, does not
+    /// take Enter: its button does.
+    fn submit_on_enter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.dialog.is_some() {
+            let confirm = self.dialog_confirm.borrow().clone();
+            if let Some(confirm) = confirm {
+                confirm(self, window, cx);
+            }
+        } else if self.page == Page::Onboarding && !self.onboarding.busy {
+            self.connect(window, cx);
+        }
+    }
+
+    /// True when a Working glyph can be on screen: a task works, the link
+    /// connects, or the Add worker dialog waits for a worker. The glyphs that
+    /// really drew are counted by [`Spin`] after each draw.
+    fn glyphs_may_show(&self) -> bool {
+        self.state
+            .tasks
+            .iter()
+            .any(|t| t.status == consort_client::TaskStatus::Working)
+            || matches!(
+                self.state.connection,
+                Connection::Connecting | Connection::Offline { .. }
+            )
+            || self.dialog == Some(Dialog::AddWorker)
+    }
+
+    /// Starts the timer that turns the Working glyphs. The glyphs turn in
+    /// steps, about 15 times a second, only while a draw showed one and the
+    /// window is active. The timer stops itself at the first tick that finds
+    /// no glyph, no active window, or a system that asks for less motion.
+    /// See [`crate::ui::parts::Spin`].
+    fn follow_spinner(&mut self, cx: &mut Context<Self>) {
+        if self.spin_ticker
+            || !crate::ui::parts::spin_runs(
+                self.glyphs_may_show(),
+                self.window_active,
+                cx.reduce_motion(),
+            )
+        {
+            return;
+        }
+        self.spin_ticker = true;
+        let period = Self::tokens(cx).motion.spin;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(crate::ui::parts::step_interval(period))
+                    .await;
+                let keep = this.update(cx, |this, cx| {
+                    // The last draw says if a Working glyph showed.
+                    let runs = crate::ui::parts::spin_runs(
+                        cx.global::<Spin>().used(),
+                        this.window_active,
+                        cx.reduce_motion(),
+                    );
+                    if !runs {
+                        this.spin_ticker = false;
+                        return false;
+                    }
+                    cx.global::<Spin>().advance(period);
+                    cx.notify();
+                    true
+                });
+                if !matches!(keep, Ok(true)) {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     /// Loads the next page of older messages when the reader reaches the
@@ -1034,12 +1342,18 @@ impl ConsortApp {
             Dialog::NewChannel => {
                 self.new_channel = NewChannelForm {
                     group_id: self.state.groups.first().map(|g| g.id.clone()),
+                    new_group: false,
                     workers: Vec::new(),
                     selection: self.state.selections.first().cloned(),
                     isolation: Isolation::Worktree,
                 };
                 self.set_field(Field::Name, "", window, cx);
                 self.set_field(Field::Purpose, "", window, cx);
+                self.set_field(Field::GroupName, "", window, cx);
+                focus_input(&self.inputs.name, window, cx);
+            }
+            Dialog::NewGroup(_) => {
+                self.set_field(Field::Name, "", window, cx);
                 focus_input(&self.inputs.name, window, cx);
             }
             Dialog::RenameChannel(id) => {
@@ -1181,6 +1495,7 @@ impl ConsortApp {
         let input = match field {
             Field::Name => &self.inputs.name,
             Field::Purpose => &self.inputs.purpose,
+            Field::GroupName => &self.inputs.group_name,
             Field::HubUrl => &self.inputs.hub_url,
             Field::SetupCode => &self.inputs.setup_code,
         };
@@ -1192,6 +1507,7 @@ impl ConsortApp {
         let input = match field {
             Field::Name => &self.inputs.name,
             Field::Purpose => &self.inputs.purpose,
+            Field::GroupName => &self.inputs.group_name,
             Field::HubUrl => &self.inputs.hub_url,
             Field::SetupCode => &self.inputs.setup_code,
         };
@@ -1290,12 +1606,17 @@ impl ConsortApp {
     }
 
     pub fn send_message(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // No channel has loaded: there is nowhere to send to.
+        if self.waiting().is_some() {
+            return;
+        }
         let body = self.inputs.composer.read(cx).value().trim().to_owned();
         if body.is_empty() {
             return;
         }
         let client = self.client.clone();
         let channel_id = self.channel_id.clone();
+        let sent_to = channel_id.clone();
         let input = self.inputs.composer.clone();
         let sent = body.clone();
         // The text stays in the box until the client takes the message.
@@ -1303,7 +1624,16 @@ impl ConsortApp {
             "composer".into(),
             async move { client.send_message(channel_id, body).await },
             Kept::Draft("Your message is still in the box."),
-            move |_, window, cx| Self::clear_draft_if_sent(&input, &sent, window, cx),
+            move |this, window, cx| {
+                if this.composer_for == sent_to {
+                    Self::clear_draft_if_sent(&input, &sent, window, cx);
+                } else {
+                    // The user went to another channel meanwhile. The draft
+                    // of the channel they left is in the drafts.
+                    this.forget_sent_draft(Some(&sent_to), None, &sent);
+                    this.save_drafts_soon(cx);
+                }
+            },
             window,
             cx,
         );
@@ -1320,11 +1650,19 @@ impl ConsortApp {
         let client = self.client.clone();
         let input = self.inputs.reply.clone();
         let sent = body.clone();
+        let sent_to = task_id.clone();
         self.run_guarded(
             "reply".into(),
             async move { client.reply_to_task(task_id, body).await },
             Kept::Draft("Your reply is still in the box."),
-            move |_, window, cx| Self::clear_draft_if_sent(&input, &sent, window, cx),
+            move |this, window, cx| {
+                if this.reply_for.as_deref() == Some(sent_to.as_str()) {
+                    Self::clear_draft_if_sent(&input, &sent, window, cx);
+                } else {
+                    this.forget_sent_draft(None, Some(&sent_to), &sent);
+                    this.save_drafts_soon(cx);
+                }
+            },
             window,
             cx,
         );
@@ -1479,7 +1817,7 @@ impl ConsortApp {
             }
             MenuAction::QuoteInReply(text) => self.quote_in_reply(&text, window, cx),
             MenuAction::AskConsort(text) => self.ask_consort(&text, window, cx),
-            MenuAction::OpenThread(task_id) => self.open_thread(task_id, cx),
+            MenuAction::OpenThread(task_id) => self.open_thread(task_id, window, cx),
             MenuAction::ReplyInThread(text) => {
                 self.quote_in_reply(&text, window, cx);
                 self.show_notice(
@@ -1514,6 +1852,9 @@ impl ConsortApp {
             }
             MenuAction::StopTask(id) => {
                 self.spawn_command(cx, async move { client.stop_task(id).await })
+            }
+            MenuAction::ArchiveTask(id) => {
+                self.spawn_command(cx, async move { client.archive_task(id).await })
             }
             MenuAction::RenameChannel(id) => {
                 self.open_dialog(Dialog::RenameChannel(id), window, cx)
@@ -1556,32 +1897,25 @@ impl ConsortApp {
             MenuAction::MoveToGroup(id) => {
                 if let Some(anchor) = self.last_menu_anchor() {
                     let current = self.state.channel(&id).and_then(|c| c.group_id.clone());
-                    let items = self
-                        .state
-                        .groups
-                        .iter()
-                        .map(|g| {
-                            MenuItem::new(
-                                g.name.clone(),
-                                MenuAction::SetGroup(id.clone(), g.id.clone()),
-                            )
-                            .checked(current.as_deref() == Some(g.id.as_str()))
-                        })
-                        .collect();
+                    let items = group_menu(&self.state, &id, current.as_deref());
                     self.open_menu(OpenMenu { items, ..anchor }, cx);
                 }
             }
-            MenuAction::SetGroup(id, group) => self.spawn_command(cx, async move {
-                client
-                    .update_channel(
-                        id,
-                        ChannelChanges {
-                            group_id: Some(group),
-                            ..ChannelChanges::default()
-                        },
-                    )
-                    .await
-            }),
+            MenuAction::SetGroup(id, group) => {
+                self.spawn_command(
+                    cx,
+                    async move { client.move_channel(id, Some(group)).await },
+                )
+            }
+            MenuAction::NoGroup(id) => {
+                self.spawn_command(cx, async move { client.move_channel(id, None).await })
+            }
+            MenuAction::NewGroup(channel) => {
+                self.open_dialog(Dialog::NewGroup(channel), window, cx)
+            }
+            MenuAction::UnarchiveChannel(id) => {
+                self.spawn_command(cx, async move { client.unarchive_channel(id).await })
+            }
             MenuAction::ArchiveChannel(id) => {
                 self.spawn_command(cx, async move { client.archive_channel(id).await })
             }
@@ -1689,6 +2023,7 @@ impl ConsortApp {
 pub enum Field {
     Name,
     Purpose,
+    GroupName,
     HubUrl,
     SetupCode,
 }
@@ -1709,6 +2044,34 @@ pub const CHANNEL_ICONS: [(&str, &str); 9] = [
     ("cloud", "Cloud"),
     ("terminal", "Terminal"),
 ];
+
+/// The menu of "Move to group": every group, then No group and New group.
+/// A hub with no group still gets a menu with two items.
+pub fn group_menu(state: &ViewState, channel_id: &str, current: Option<&str>) -> Vec<MenuItem> {
+    let mut items: Vec<MenuItem> = state
+        .groups
+        .iter()
+        .map(|g| {
+            MenuItem::new(
+                g.name.clone(),
+                MenuAction::SetGroup(channel_id.to_owned(), g.id.clone()),
+            )
+            .checked(current == Some(g.id.as_str()))
+        })
+        .collect();
+    let in_known_group = current.is_some_and(|c| state.groups.iter().any(|g| g.id == c));
+    let mut no_group = MenuItem::new("No group", MenuAction::NoGroup(channel_id.to_owned()))
+        .checked(!in_known_group);
+    if !items.is_empty() {
+        no_group = no_group.separated();
+    }
+    items.push(no_group);
+    items.push(MenuItem::new(
+        "New group",
+        MenuAction::NewGroup(Some(channel_id.to_owned())),
+    ));
+    items
+}
 
 /// Keeps a virtual list in step with its rows. Only the rows between the
 /// common start and the common end are spliced, so new messages at the end
@@ -1755,6 +2118,16 @@ impl Render for ConsortApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = Self::tokens(cx);
         self.style_inputs(&t, cx);
+        cx.global::<Spin>().begin_frame();
+        self.dialog_confirm.replace(None);
+        // A change of channel that came with a state (a deleted channel, a
+        // channel that the hub just made) gives the composer its draft too.
+        self.sync_draft_inputs(window, cx);
+        // No channel yet: the composer takes no text.
+        let waiting = self.waiting().is_some();
+        self.inputs
+            .composer
+            .update(cx, |input, cx| input.set_disabled(waiting, cx));
         if self.placeholder_stale {
             self.placeholder_stale = false;
             self.update_placeholder(window, cx);
@@ -1765,6 +2138,7 @@ impl Render for ConsortApp {
             Page::Main => self.render_main(&t, window, cx),
         };
         let menu = self.menu.clone();
+        self.follow_spinner(cx);
         div()
             .id("consort")
             .key_context("Consort")

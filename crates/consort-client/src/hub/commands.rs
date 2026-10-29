@@ -5,11 +5,11 @@ use std::sync::Arc;
 use consort_proto::{
     client_api::{
         ChannelArchive, ChannelCreate, ChannelDelete, ChannelMove, ChannelUpdate,
-        DecisionAnswerRequest, GroupUpdate, MessageDelete, MessageEdit, MessageList, ReadMark,
-        TaskInterrupt, TaskReopen, TaskResolve, TaskRetry, WorkerPairingCode, WorkerRename,
-        WorkerRevoke, WorkerSetLabels, WorkerSetPaused,
+        DecisionAnswerRequest, GroupCreate, GroupUpdate, MessageDelete, MessageEdit, MessageList,
+        ReadMark, TaskArchive, TaskInterrupt, TaskReopen, TaskResolve, TaskRetry,
+        WorkerPairingCode, WorkerRename, WorkerRevoke, WorkerSetLabels, WorkerSetPaused,
     },
-    ids::ChannelId,
+    ids::{ChannelId, GroupId},
     model::{DecisionAnswer, ModelSelection, RequestOptionKind},
 };
 use tokio::sync::{oneshot, watch};
@@ -45,7 +45,7 @@ impl Backend for HubBackend {
 fn parse<T: std::str::FromStr>(id: &str, what: &str) -> Result<T, ClientError> {
     id.parse().map_err(|_| {
         ClientError::Other(format!(
-            "Consort cannot use this {what}, because its ID is not valid. Reload the app, then try again"
+            "Consort cannot use this {what}, because its ID is not valid. Restart Consort, then try again"
         ))
     })
 }
@@ -93,6 +93,9 @@ async fn run(shared: Arc<Shared>, command: Command) -> Result<(), ClientError> {
             body,
             client_message_id,
         } => {
+            // No channel has loaded yet, or the ID is not a channel. The
+            // message would wait in the outbox and fail later.
+            crate::command::check_channel_id(&channel_id)?;
             let pending = PendingSend {
                 client_message_id,
                 channel_id,
@@ -145,6 +148,14 @@ async fn run(shared: Arc<Shared>, command: Command) -> Result<(), ClientError> {
                 .await?;
         }
         Command::CreateChannel(new) => {
+            // A new group comes first. A group of that name that exists
+            // already is used again, so a second try after a failure makes
+            // no second group.
+            let group_id: Option<GroupId> = match (&new.new_group, &new.group_id) {
+                (Some(name), _) => Some(group_named(&shared, name).await?),
+                (None, Some(g)) => Some(parse(g, "group")?),
+                (None, None) => None,
+            };
             let created = shared
                 .call(ChannelCreate {
                     name: new.name.trim().to_owned(),
@@ -152,10 +163,7 @@ async fn run(shared: Arc<Shared>, command: Command) -> Result<(), ClientError> {
                     instructions: String::new(),
                     icon: None,
                     color: None,
-                    group_id: match &new.group_id {
-                        Some(g) => Some(parse(g, "group")?),
-                        None => None,
-                    },
+                    group_id,
                     coordinator_selection: None,
                     task_selection: selection(&new.task_selection),
                     repo_ids: Vec::new(),
@@ -224,6 +232,43 @@ async fn run(shared: Arc<Shared>, command: Command) -> Result<(), ClientError> {
                     archived: true,
                 })
                 .await?;
+        }
+        Command::UnarchiveChannel { channel_id } => {
+            shared
+                .call(ChannelArchive {
+                    channel_id: parse(&channel_id, "channel")?,
+                    archived: false,
+                })
+                .await?;
+            // The channel has no snapshot in the cache yet.
+            shared.loader_wake.notify_one();
+        }
+        Command::MoveChannel {
+            channel_id,
+            group_id,
+        } => {
+            shared
+                .call(ChannelMove {
+                    channel_id: parse(&channel_id, "channel")?,
+                    group_id: match &group_id {
+                        Some(g) => Some(parse(g, "group")?),
+                        None => None,
+                    },
+                    position: 0,
+                })
+                .await?;
+        }
+        Command::CreateGroup { name, channel_id } => {
+            let group = group_for_new(&shared, &name).await?;
+            if let Some(channel_id) = channel_id {
+                shared
+                    .call(ChannelMove {
+                        channel_id: parse(&channel_id, "channel")?,
+                        group_id: Some(group),
+                        position: 0,
+                    })
+                    .await?;
+            }
         }
         Command::DeleteChannel { channel_id } => {
             shared
@@ -361,6 +406,25 @@ async fn run(shared: Arc<Shared>, command: Command) -> Result<(), ClientError> {
                 })
                 .await?;
         }
+        Command::ArchiveTask { task_id } => {
+            shared
+                .call(TaskArchive {
+                    task_id: parse(&task_id, "task")?,
+                    archived: true,
+                })
+                .await?;
+        }
+        Command::Reconnect => {
+            // Only an offline link waits on a timer. A permit left over from
+            // a call while the link is up would skip the next wait.
+            let offline = shared
+                .connection
+                .lock()
+                .is_ok_and(|c| matches!(*c, Connection::Offline { .. }));
+            if offline {
+                shared.wake.notify_one();
+            }
+        }
         Command::AnswerApproval {
             approval_id,
             choice,
@@ -468,6 +532,36 @@ async fn run(shared: Arc<Shared>, command: Command) -> Result<(), ClientError> {
         }
     }
     Ok(())
+}
+
+/// The name of a group as the hub stores it: trimmed.
+fn group_name(name: &str) -> Result<String, ClientError> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(invalid("Enter a name for the group."));
+    }
+    Ok(name.to_owned())
+}
+
+/// Makes a group and returns its ID.
+async fn group_for_new(shared: &Shared, name: &str) -> Result<GroupId, ClientError> {
+    let name = group_name(name)?;
+    Ok(shared.call(GroupCreate { name }).await?.group.id)
+}
+
+/// The group with this name, or a new one when no group has it.
+async fn group_named(shared: &Shared, name: &str) -> Result<GroupId, ClientError> {
+    let name = group_name(name)?;
+    let existing = shared.cache.lock().ok().and_then(|c| {
+        c.groups
+            .values()
+            .find(|g| g.name.trim().eq_ignore_ascii_case(&name))
+            .map(|g| g.id)
+    });
+    match existing {
+        Some(id) => Ok(id),
+        None => group_for_new(shared, &name).await,
+    }
 }
 
 /// Opens the thread of a task: the full task, then the replies. The thread

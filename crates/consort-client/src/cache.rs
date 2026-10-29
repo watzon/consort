@@ -37,6 +37,9 @@ pub struct SendFailure {
     /// or `None` for a message in the timeline.
     pub thread_root_id: Option<String>,
     pub body: String,
+    /// The name of the channel, kept for a channel that is gone from the
+    /// cache. Empty when the cache still holds the channel.
+    pub channel_name: String,
     /// What the hub said, with a next step.
     pub message: String,
 }
@@ -113,6 +116,10 @@ pub struct Cache {
     pub touched: HashMap<(EntityKind, String), u64>,
 }
 
+/// Why a message that waited for a channel did not go out when the channel
+/// was deleted.
+pub const CHANNEL_DELETED: &str = "The channel was deleted.";
+
 /// A feed entry older than this many `seq` steps is forgotten by `touched`.
 /// A snapshot read that long ago is not in flight any more.
 const TOUCHED_WINDOW: u64 = 20_000;
@@ -151,11 +158,17 @@ impl Cache {
     /// they were written for, such as after pairing with another hub.
     pub fn fail_pending(&mut self, reason: &str) {
         for p in std::mem::take(&mut self.pending) {
+            let channel_name = self
+                .channels
+                .get(&p.channel_id)
+                .map(|c| c.name.clone())
+                .unwrap_or_default();
             self.send_failures.push(SendFailure {
                 id: p.client_message_id,
                 channel_id: p.channel_id,
                 thread_root_id: p.thread_root_id,
                 body: p.body,
+                channel_name,
                 message: reason.to_owned(),
             });
         }
@@ -192,8 +205,14 @@ impl Cache {
     }
 
     /// Removes a channel and everything that belongs to it.
+    ///
+    /// A message that waited in the outbox for the channel is not dropped.
+    /// It moves to the failed sends with the reason, so the user keeps the
+    /// text.
     fn remove_channel(&mut self, id: &str) -> bool {
-        let mut removed = self.channels.remove(id).is_some();
+        let channel = self.channels.remove(id);
+        let channel_name = channel.as_ref().map(|c| c.name.clone()).unwrap_or_default();
+        let mut removed = channel.is_some();
         let mut sessions: BTreeSet<String> = BTreeSet::new();
         let mut cards: BTreeSet<String> = BTreeSet::new();
         let in_channel = |c: &ChannelId| c.to_string() == id;
@@ -241,7 +260,22 @@ impl Cache {
         for session in &sessions {
             removed |= self.session_items.remove(session).is_some();
         }
-        self.pending.retain(|p| p.channel_id != id);
+        let (waiting, other): (Vec<PendingSend>, Vec<PendingSend>) =
+            std::mem::take(&mut self.pending)
+                .into_iter()
+                .partition(|p| p.channel_id == id);
+        self.pending = other;
+        for p in waiting {
+            removed = true;
+            self.send_failures.push(SendFailure {
+                id: p.client_message_id,
+                channel_id: p.channel_id,
+                thread_root_id: p.thread_root_id,
+                body: p.body,
+                channel_name: channel_name.clone(),
+                message: CHANNEL_DELETED.to_owned(),
+            });
+        }
         self.has_older.remove(id);
         self.channels_loaded.remove(id);
         for card in cards {

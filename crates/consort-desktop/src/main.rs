@@ -12,6 +12,7 @@ mod fonts;
 mod notice;
 mod read_marker;
 mod ui;
+mod waiting;
 
 use consort_client::Client;
 use gpui_kit::{

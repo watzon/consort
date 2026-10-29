@@ -4,7 +4,7 @@
 
 use std::collections::HashSet;
 
-use consort_client::ClientError;
+use consort_client::{ClientError, Drafts};
 
 /// The commands that run now, by key. A key that runs blocks a second
 /// submit, so a double click or a double Enter sends once.
@@ -83,6 +83,44 @@ pub fn append_text(draft: &str, text: &str) -> String {
         text.to_owned()
     } else {
         format!("{}\n\n{text}", draft.trim_end())
+    }
+}
+
+/// Moves a message box from one channel to another. `text` is what the box
+/// holds now: it becomes the draft of `from`. The result is the draft of `to`,
+/// which the box shows from now on. A draft written in one channel never
+/// shows in another.
+pub fn switch_channel(drafts: &mut Drafts, from: &str, text: &str, to: &str) -> String {
+    drafts.set_channel(from, text);
+    drafts.channel(to).to_owned()
+}
+
+/// The same for the reply box and the task threads. `None` is no thread open,
+/// and keeps nothing.
+pub fn switch_thread(
+    drafts: &mut Drafts,
+    from: Option<&str>,
+    text: &str,
+    to: Option<&str>,
+) -> String {
+    if let Some(from) = from {
+        drafts.set_thread(from, text);
+    }
+    to.map(|to| drafts.thread(to).to_owned())
+        .unwrap_or_default()
+}
+
+/// The draft after the New task button: the draft stays, and "Start a task
+/// to " follows it. A box that holds nothing gets just that text. A second
+/// press adds nothing, so the text does not pile up.
+pub fn start_task_text(draft: &str) -> String {
+    let start = crate::app::START_TASK_TEXT;
+    if draft.trim().is_empty() {
+        start.to_owned()
+    } else if draft.trim_end().ends_with(start.trim_end()) {
+        draft.to_owned()
+    } else {
+        append_text(draft, start)
     }
 }
 
@@ -180,6 +218,75 @@ mod tests {
             kept.failure(&hub("not_found", "That channel does not exist.")),
             "That channel does not exist. Your message is still in the box."
         );
+    }
+
+    /// Review cycle 3, finding 4: the New task buttons replaced the draft.
+    #[test]
+    fn new_task_adds_to_the_draft_and_never_replaces_it() {
+        assert_eq!(start_task_text(""), "Start a task to ");
+        assert_eq!(start_task_text("  \n"), "Start a task to ");
+        assert_eq!(
+            start_task_text("Why does the build fail on Windows?"),
+            "Why does the build fail on Windows?\n\nStart a task to "
+        );
+        // A second press adds nothing.
+        let once = start_task_text("A draft");
+        assert_eq!(start_task_text(&once), once);
+        assert_eq!(start_task_text("Start a task to "), "Start a task to ");
+    }
+
+    /// Review cycle 3, finding 4: a draft written in channel A went to
+    /// channel B after a click in the sidebar.
+    #[test]
+    fn a_draft_stays_in_its_channel_and_comes_back() {
+        let mut drafts = Drafts::default();
+        // Write in A, go to B: the box is empty there.
+        assert_eq!(
+            switch_channel(&mut drafts, "chn_a", "Draft for A", "chn_b"),
+            ""
+        );
+        // Write in B, go back to A.
+        assert_eq!(
+            switch_channel(&mut drafts, "chn_b", "Draft for B", "chn_a"),
+            "Draft for A"
+        );
+        assert_eq!(
+            switch_channel(&mut drafts, "chn_a", "Draft for A", "chn_b"),
+            "Draft for B"
+        );
+        // A box that was emptied leaves no draft.
+        assert_eq!(
+            switch_channel(&mut drafts, "chn_b", "", "chn_a"),
+            "Draft for A"
+        );
+        assert_eq!(drafts.channel("chn_b"), "");
+        // Before the first channel loads, the box has no channel and keeps nothing.
+        assert_eq!(
+            switch_channel(&mut drafts, "", "text", "chn_a"),
+            "Draft for A"
+        );
+        assert!(drafts.channels.keys().all(|k| !k.is_empty()));
+    }
+
+    #[test]
+    fn a_reply_draft_stays_in_its_thread() {
+        let mut drafts = Drafts::default();
+        assert_eq!(switch_thread(&mut drafts, None, "", Some("tsk_1")), "");
+        assert_eq!(
+            switch_thread(&mut drafts, Some("tsk_1"), "Reply to 1", Some("tsk_2")),
+            ""
+        );
+        assert_eq!(
+            switch_thread(&mut drafts, Some("tsk_2"), "Reply to 2", Some("tsk_1")),
+            "Reply to 1"
+        );
+        // Closing the thread keeps its draft, and shows none.
+        assert_eq!(
+            switch_thread(&mut drafts, Some("tsk_1"), "Reply to 1", None),
+            ""
+        );
+        assert_eq!(drafts.thread("tsk_1"), "Reply to 1");
+        assert_eq!(drafts.thread("tsk_2"), "Reply to 2");
     }
 
     #[test]

@@ -79,6 +79,37 @@ impl Shared {
         }
     }
 
+    /// Tells the callers whose message left the outbox without the outbox
+    /// sending it, such as a message for a channel that was deleted. The
+    /// message is in the failed sends, so the caller can stop waiting.
+    pub(super) fn settle_waiters(&self) {
+        let waiting: std::collections::HashSet<String> = self
+            .cache
+            .lock()
+            .map(|c| {
+                c.pending
+                    .iter()
+                    .map(|p| p.client_message_id.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let gone: Vec<_> = self
+            .waiters
+            .lock()
+            .map(|mut w| {
+                let ids: Vec<String> = w
+                    .keys()
+                    .filter(|id| !waiting.contains(*id))
+                    .cloned()
+                    .collect();
+                ids.into_iter().filter_map(|id| w.remove(&id)).collect()
+            })
+            .unwrap_or_default();
+        for tx in gone {
+            let _ = tx.send(SendOutcome::Deferred);
+        }
+    }
+
     /// The oldest message in the outbox, when the link is up.
     fn next_to_send(&self) -> Option<PendingSend> {
         if !self.is_online() {
@@ -107,13 +138,26 @@ impl Shared {
                         sentence(&message)
                     );
                 }
-                cache.send_failures.push(SendFailure {
-                    id: pending.client_message_id.clone(),
-                    channel_id: pending.channel_id.clone(),
-                    thread_root_id: pending.thread_root_id.clone(),
-                    body: pending.body.clone(),
-                    message,
-                });
+                // A deleted channel may have moved the message here already.
+                if !cache
+                    .send_failures
+                    .iter()
+                    .any(|f| f.id == pending.client_message_id)
+                {
+                    let channel_name = cache
+                        .channels
+                        .get(&pending.channel_id)
+                        .map(|c| c.name.clone())
+                        .unwrap_or_default();
+                    cache.send_failures.push(SendFailure {
+                        id: pending.client_message_id.clone(),
+                        channel_id: pending.channel_id.clone(),
+                        thread_root_id: pending.thread_root_id.clone(),
+                        body: pending.body.clone(),
+                        channel_name,
+                        message,
+                    });
+                }
             }
         }
         self.publish();
@@ -201,14 +245,14 @@ async fn send_pending(shared: &Arc<Shared>, p: &PendingSend) -> Result<(), Clien
     crate::limits::check_message_body(&p.body)?;
     let body = MessageSend {
         channel_id: p.channel_id.parse().map_err(|_| {
-            invalid("Consort cannot use this channel. Reload the app, then try again")
+            invalid("Consort cannot use this channel. Restart Consort, then try again")
         })?,
         client_message_id: p.client_message_id.clone(),
         body: p.body.clone(),
         attachments: Vec::new(),
         thread_root_id: match &p.thread_root_id {
             Some(id) => Some(id.parse().map_err(|_| {
-                invalid("Consort cannot use this thread. Reload the app, then try again")
+                invalid("Consort cannot use this thread. Restart Consort, then try again")
             })?),
             None => None,
         },

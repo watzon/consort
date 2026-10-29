@@ -29,13 +29,21 @@ pub enum MenuAction {
     ReopenTask(String),
     RetryTask(String),
     StopTask(String),
+    /// Hide a failed or resolved task.
+    ArchiveTask(String),
     RenameChannel(String),
     ChannelInstructions(String),
     ChangeIcon(String),
     SetIcon(String, String),
     MoveToGroup(String),
     SetGroup(String, String),
+    /// Take a channel out of its group.
+    NoGroup(String),
+    /// Open the dialog that makes a group. With a channel ID, the channel
+    /// moves into the new group.
+    NewGroup(Option<String>),
     ArchiveChannel(String),
+    UnarchiveChannel(String),
     DeleteChannel(String),
     RenameWorker(String),
     EditLabels(String),
@@ -64,6 +72,49 @@ pub enum EditOp {
     Copy,
     Paste,
     SelectAll,
+}
+
+/// The menu of a worker row, in the sidebar and in Settings: Rename, Edit
+/// labels, Pause (Resume when it is paused) and Remove. Every surface that
+/// shows a worker builds its menu here, so they never differ.
+pub fn worker_menu(worker_id: &str, paused: bool) -> Vec<MenuItem> {
+    let id = worker_id.to_owned();
+    vec![
+        MenuItem::new("Rename", MenuAction::RenameWorker(id.clone())),
+        MenuItem::new("Edit labels", MenuAction::EditLabels(id.clone())),
+        MenuItem::new(
+            if paused { "Resume" } else { "Pause" },
+            MenuAction::PauseWorker(id.clone(), !paused),
+        ),
+        MenuItem::new("Remove", MenuAction::RemoveWorker(id))
+            .danger()
+            .separated(),
+    ]
+}
+
+/// The menu of a channel row: Rename, Instructions, Change icon, Move to
+/// group, Archive and Delete.
+pub fn channel_menu(channel_id: &str) -> Vec<MenuItem> {
+    let id = channel_id.to_owned();
+    vec![
+        MenuItem::new("Rename", MenuAction::RenameChannel(id.clone())),
+        MenuItem::new("Instructions", MenuAction::ChannelInstructions(id.clone())),
+        MenuItem::new("Change icon", MenuAction::ChangeIcon(id.clone())),
+        MenuItem::new("Move to group", MenuAction::MoveToGroup(id.clone())),
+        MenuItem::new("Archive", MenuAction::ArchiveChannel(id.clone())).separated(),
+        MenuItem::new("Delete", MenuAction::DeleteChannel(id)).danger(),
+    ]
+}
+
+/// The menu of an archived channel: Unarchive and Delete.
+pub fn archived_channel_menu(channel_id: &str) -> Vec<MenuItem> {
+    let id = channel_id.to_owned();
+    vec![
+        MenuItem::new("Unarchive", MenuAction::UnarchiveChannel(id.clone())),
+        MenuItem::new("Delete", MenuAction::DeleteChannel(id))
+            .danger()
+            .separated(),
+    ]
 }
 
 /// The menu of a message box: Cut, Copy, Paste, Select all.
@@ -344,6 +395,58 @@ mod tests {
             );
             assert!(items[3].separator_before);
         }
+    }
+
+    fn labels(items: &[MenuItem]) -> Vec<&str> {
+        items.iter().map(|i| i.label.as_ref()).collect()
+    }
+
+    /// AGENTS.md: a worker row has Rename, Edit labels, Pause and Remove.
+    /// The Settings list rows and the "more" menu lacked some of them.
+    #[test]
+    fn every_worker_menu_has_the_same_items_in_the_same_order() {
+        let running = worker_menu("wrk_1", false);
+        assert_eq!(
+            labels(&running),
+            ["Rename", "Edit labels", "Pause", "Remove"]
+        );
+        let paused = worker_menu("wrk_1", true);
+        assert_eq!(
+            labels(&paused),
+            ["Rename", "Edit labels", "Resume", "Remove"]
+        );
+        // Pause pauses a running worker, and Resume resumes a paused one.
+        assert_eq!(
+            running[2].action,
+            MenuAction::PauseWorker("wrk_1".into(), true)
+        );
+        assert_eq!(
+            paused[2].action,
+            MenuAction::PauseWorker("wrk_1".into(), false)
+        );
+        assert!(running[3].danger && running[3].separator_before);
+        assert!(running.iter().all(|i| !matches!(&i.action,
+            MenuAction::RenameWorker(id) | MenuAction::EditLabels(id) | MenuAction::RemoveWorker(id)
+            | MenuAction::PauseWorker(id, _) if id != "wrk_1")));
+    }
+
+    #[test]
+    fn the_channel_menu_keeps_the_names_and_the_order() {
+        assert_eq!(
+            labels(&channel_menu("chn_1")),
+            [
+                "Rename",
+                "Instructions",
+                "Change icon",
+                "Move to group",
+                "Archive",
+                "Delete"
+            ]
+        );
+        assert_eq!(
+            labels(&archived_channel_menu("chn_1")),
+            ["Unarchive", "Delete"]
+        );
     }
 
     #[test]

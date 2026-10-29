@@ -155,7 +155,7 @@ impl ConsortApp {
             Hit::Channel { id, .. } => self.open_channel(id, window, cx),
             Hit::Task { id, channel_id, .. } => {
                 self.open_channel(channel_id, window, cx);
-                self.open_thread(id, cx);
+                self.open_thread(id, window, cx);
             }
         }
     }

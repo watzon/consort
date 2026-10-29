@@ -286,6 +286,8 @@ pub struct Components {
     pub notes_min_height: Pixels,
     pub brand_mark: Pixels,
     pub brand_gap: Pixels,
+    /// The width of the focus ring.
+    pub focus_ring: Pixels,
     pub theme_preview: ThemePreview,
 }
 
@@ -328,6 +330,7 @@ impl Components {
             notes_min_height: px(c.notes_min_height),
             brand_mark: px(c.brand_mark),
             brand_gap: px(c.brand_gap),
+            focus_ring: px(c.focus_ring),
             theme_preview: ThemePreview {
                 bar: px(p.bar),
                 bar_gap: px(p.bar_gap),
@@ -483,6 +486,19 @@ impl Tokens {
         self.mode.is_dark()
     }
 
+    /// The focus ring of a control that the keyboard focuses: a ring of
+    /// `accent.text` just outside the control. It takes no room in the
+    /// layout, so a control does not move when it gets the focus.
+    pub fn focus_ring(&self) -> Vec<BoxShadow> {
+        vec![BoxShadow {
+            color: self.colors.accent_text,
+            offset: point(px(0.0), px(0.0)),
+            blur_radius: px(0.0),
+            spread_radius: self.component.focus_ring,
+            inset: false,
+        }]
+    }
+
     /// `shadow.float`: menus, popovers, dialogs and toasts.
     pub fn shadow_float(&self) -> Vec<BoxShadow> {
         let (x, y, blur, spread) = self.shadow_float;
@@ -560,6 +576,26 @@ mod tests {
         assert_eq!(t.motion.spin, Duration::from_millis(1200));
     }
 
+    /// Review cycle 3, finding 3: a control that the keyboard focuses shows a
+    /// ring. It is the accent text color, drawn outside the control.
+    #[test]
+    fn the_focus_ring_is_the_accent_text_color_outside_the_control() {
+        let t = tokens();
+        let ring = t.focus_ring();
+        assert_eq!(ring.len(), 1);
+        assert_eq!(ring[0].color, t.colors.accent_text);
+        assert_eq!(ring[0].spread_radius, px(2.0));
+        assert_eq!(ring[0].blur_radius, px(0.0));
+        assert_eq!(ring[0].offset, point(px(0.0), px(0.0)));
+        assert!(!ring[0].inset);
+        // Both modes give the ring a color that reads on the surface.
+        for mode in [Mode::Dark, Mode::Light] {
+            let theme = builtin_themes().into_iter().next().expect("a theme");
+            let t = Tokens::new(&theme, mode, TextSize::Default);
+            assert_ne!(t.focus_ring()[0].color, t.colors.surface_canvas);
+        }
+    }
+
     #[test]
     fn opacity_and_component_tokens_reach_the_views() {
         let t = tokens();
@@ -572,6 +608,7 @@ mod tests {
         assert_eq!(t.component.notes_min_height, px(192.0));
         assert_eq!(t.component.brand_mark, px(26.0));
         assert_eq!(t.component.brand_gap, px(8.0));
+        assert_eq!(t.component.focus_ring, px(2.0));
         assert_eq!(t.component.theme_preview.sidebar_item, px(20.0));
         assert_eq!(t.component.theme_preview.button_radius, px(2.0));
     }

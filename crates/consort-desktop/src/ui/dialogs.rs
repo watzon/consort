@@ -15,7 +15,9 @@ use crate::{
     notice::{Notice, NoticeKind},
     ui::{
         menu::{MenuAction, MenuItem, OpenMenu},
-        parts::{ButtonKind, button, detail, error_box, icon, icon_button, selectable, text},
+        parts::{
+            ButtonKind, button, detail, error_box, focusable, icon, icon_button, selectable, text,
+        },
         settings::segmented,
     },
 };
@@ -61,8 +63,7 @@ fn select_box(
     t: &Tokens,
 ) -> gpui_kit::Stateful<Div> {
     let c = &t.colors;
-    div()
-        .id(id)
+    focusable(div().id(id), t)
         .relative()
         .flex()
         .items_center()
@@ -80,6 +81,49 @@ fn select_box(
         .child(text(value, t.text.ui, c.text_primary))
         .child(icon("chevrons-up-down", t.icon.dense, c.text_secondary))
 }
+
+/// The items of the Group select in the New channel dialog: every group, then
+/// No group and New group. A hub with no group still gets two items.
+pub fn group_pick_items(
+    groups: &[consort_client::GroupView],
+    current: Option<&str>,
+    new_group: bool,
+) -> Vec<MenuItem> {
+    let mut items: Vec<MenuItem> = groups
+        .iter()
+        .map(|g| {
+            MenuItem::new(
+                g.name.clone(),
+                MenuAction::Select("new-channel-group", g.id.clone()),
+            )
+            .checked(!new_group && current == Some(g.id.as_str()))
+        })
+        .collect();
+    let in_known_group = current.is_some_and(|c| groups.iter().any(|g| g.id == c));
+    let mut none = MenuItem::new(
+        "No group",
+        MenuAction::Select("new-channel-group", NO_GROUP.to_owned()),
+    )
+    .checked(!new_group && !in_known_group);
+    if !items.is_empty() {
+        none = none.separated();
+    }
+    items.push(none);
+    items.push(
+        MenuItem::new(
+            "New group",
+            MenuAction::Select("new-channel-group", NEW_GROUP.to_owned()),
+        )
+        .checked(new_group),
+    );
+    items
+}
+
+/// The select option that puts the new channel in no group. It is not a
+/// group ID, so it cannot be a group.
+pub const NO_GROUP: &str = "no-group";
+/// The select option that makes a group for the new channel.
+pub const NEW_GROUP: &str = "new-group";
 
 impl ConsortApp {
     /// The toast at the bottom. Its text is selectable. An error has a mark
@@ -371,6 +415,36 @@ impl ConsortApp {
                     }),
                 )
             }
+            Dialog::NewGroup(channel) => {
+                let channel = channel.clone();
+                let focused = self
+                    .inputs
+                    .name
+                    .read(cx)
+                    .focus_handle(cx)
+                    .is_focused(window);
+                (
+                    "New group".to_owned(),
+                    "A group is a named folder of channels in the sidebar.".to_owned(),
+                    t.layout.dialog_width,
+                    field_block("Name", input_box(&self.inputs.name, focused, t), None, t),
+                    self.dialog_actions("Create group", t, cx, move |this, window, cx| {
+                        let name = this.field(Field::Name, cx);
+                        if name.is_empty() {
+                            this.dialog_error = Some("Enter a name for the group.".into());
+                            cx.notify();
+                            return;
+                        }
+                        let client = this.client.clone();
+                        let channel = channel.clone();
+                        this.submit_dialog(
+                            async move { client.create_group(name, channel).await },
+                            window,
+                            cx,
+                        );
+                    }),
+                )
+            }
             Dialog::ConfirmDeleteChannel(id) => {
                 let id = id.clone();
                 let name = self
@@ -380,7 +454,7 @@ impl ConsortApp {
                     .unwrap_or_default();
                 (
                     format!("Delete {name}?"),
-                    "Consort deletes its messages, tasks, memory and files. You cannot undo this. To keep them, archive the channel instead.".to_owned(),
+                    "Consort deletes its messages, tasks, memory and files. You cannot undo this. To keep them, archive the channel instead. An archived channel waits in the Archived list in the sidebar, and you can bring it back.".to_owned(),
                     t.layout.dialog_width,
                     div(),
                     self.dialog_actions_kind("Delete channel", ButtonKind::Danger, t, cx, move |this, window, cx| {
@@ -541,6 +615,13 @@ impl ConsortApp {
         let c = &t.colors;
         let busy = self.dialog_busy();
         let danger_hover = t.opacity.danger_hover;
+        // Enter in a field of the dialog does what the confirm button does.
+        // A button that destroys something takes a click, not a key press
+        // from a field.
+        let on_confirm: crate::app::DialogConfirm = std::rc::Rc::new(on_confirm);
+        if kind != ButtonKind::Danger {
+            self.dialog_confirm.replace(Some(on_confirm.clone()));
+        }
         let confirm = button("dialog-confirm", label.to_owned(), kind, t)
             .when(kind == ButtonKind::Danger, |b| {
                 b.bg(c.status_failed)
@@ -586,31 +667,32 @@ impl ConsortApp {
             .read(cx)
             .focus_handle(cx)
             .is_focused(window);
-        let group_name = form
-            .group_id
-            .as_ref()
-            .and_then(|g| state.groups.iter().find(|x| &x.id == g))
-            .map(|g| g.name.clone())
-            .unwrap_or_else(|| "No group".to_owned());
+        let group_name = if form.new_group {
+            "New group".to_owned()
+        } else {
+            form.group_id
+                .as_ref()
+                .and_then(|g| state.groups.iter().find(|x| &x.id == g))
+                .map(|g| g.name.clone())
+                .unwrap_or_else(|| "No group".to_owned())
+        };
         let groups = state.groups.clone();
         let current_group = form.group_id.clone();
+        let new_group = form.new_group;
         let group_select = select_box("new-channel-group", group_name, self, t).on_click(
             cx.listener(move |this, _, _, cx| {
                 if let Some(bounds) = this.triggers.get("new-channel-group") {
-                    let items = groups
-                        .iter()
-                        .map(|g| {
-                            MenuItem::new(
-                                g.name.clone(),
-                                MenuAction::Select("new-channel-group", g.id.clone()),
-                            )
-                            .checked(current_group.as_deref() == Some(g.id.as_str()))
-                        })
-                        .collect();
+                    let items = group_pick_items(&groups, current_group.as_deref(), new_group);
                     this.open_menu(OpenMenu::under(bounds, items, true), cx);
                 }
             }),
         );
+        let group_name_focused = self
+            .inputs
+            .group_name
+            .read(cx)
+            .focus_handle(cx)
+            .is_focused(window);
         let mut chips = div().flex().flex_wrap().gap(t.space.xs + t.space.xxs);
         for (i, worker_id) in form.workers.iter().enumerate() {
             let name = state
@@ -776,6 +858,14 @@ impl ConsortApp {
                 Some("One line. Consort reads it before every turn in this channel."),
                 t,
             ))
+            .when(form.new_group, |d| {
+                d.child(field_block(
+                    "Group name",
+                    input_box(&self.inputs.group_name, group_name_focused, t),
+                    Some("The channel goes in this new group."),
+                    t,
+                ))
+            })
             .child(field_block("Repos", repos, None, t))
             .child(field_block(
                 "Run tasks on",
@@ -800,10 +890,22 @@ impl ConsortApp {
                 return;
             }
             let form = this.new_channel.clone();
+            let new_group = if form.new_group {
+                let group = this.field(Field::GroupName, cx);
+                if group.is_empty() {
+                    this.dialog_error = Some("Enter a name for the group.".into());
+                    cx.notify();
+                    return;
+                }
+                Some(group)
+            } else {
+                None
+            };
             let channel = NewChannel {
                 name,
                 purpose: this.field(Field::Purpose, cx),
-                group_id: form.group_id,
+                group_id: if form.new_group { None } else { form.group_id },
+                new_group,
                 repos: Vec::new(),
                 preferred_workers: form.workers,
                 task_selection: form.selection,

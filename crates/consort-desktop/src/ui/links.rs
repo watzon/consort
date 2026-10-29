@@ -169,31 +169,22 @@ fn shows_only_its_own_address(markdown: &str, target: &str) -> bool {
     let mut risky = false;
 
     // Reference definitions (`[r]: address "title"`). A reference link takes
-    // its address from one, and its words are somewhere else. The address
-    // may sit on the next line.
-    let mut offset = 0;
-    let mut definition_open = false;
-    for line in markdown.split_inclusive('\n') {
-        let body = line.trim_end_matches(['\n', '\r']);
-        let trimmed = body.trim_start();
-        let starts = trimmed.starts_with('[') && trimmed.contains("]:");
-        let after_colon = trimmed.split_once("]:").map(|(_, rest)| rest);
-        let continues = definition_open && !body.trim().is_empty();
-        if starts || continues {
-            let rest = if starts {
-                after_colon.unwrap_or("")
-            } else {
-                body
-            };
-            if rest.contains(target) {
-                risky = true;
-            }
-            definition_open = starts && rest.trim().is_empty();
-            blank(&mut text, offset, offset + body.len());
-        } else if !body.trim().is_empty() {
-            definition_open = false;
+    // its address from one, and its words are somewhere else. The parser
+    // finds them, also inside a block quote or a list item, and also when
+    // the address sits on the next line. A source that the parser refuses
+    // is not understood, so the app asks.
+    let Some(definitions) = definition_ranges(markdown) else {
+        return false;
+    };
+    for range in definitions {
+        let range = range.start.min(markdown.len())..range.end.min(markdown.len());
+        if markdown
+            .get(range.clone())
+            .is_some_and(|source| source.contains(target))
+        {
+            risky = true;
         }
-        offset += line.len();
+        blank(&mut text, range.start, range.end);
     }
 
     // Angle brackets: an autolink `<address>`, or raw HTML. Any mention of
@@ -295,6 +286,38 @@ fn shows_only_its_own_address(markdown: &str, target: &str) -> bool {
         }
     }
     !risky && shown > 0
+}
+
+/// The byte ranges of the reference definitions in `markdown`, found in the
+/// tree that the text view builds (the `markdown` crate with the GFM options,
+/// as `gpui-base` 0.8.1 uses them). A line scan misses a definition inside a
+/// block quote or a list item, and the text view still resolves a link to
+/// it. The text view also reads `$...$` as math in some cases, so the source
+/// is read with the math constructs off and on, and the definitions of both
+/// readings count. `None` when the parser refuses the source.
+fn definition_ranges(markdown: &str) -> Option<Vec<std::ops::Range<usize>>> {
+    use markdown::{ParseOptions, mdast::Node};
+
+    fn walk(node: &Node, out: &mut Vec<std::ops::Range<usize>>) {
+        if let Node::Definition(definition) = node
+            && let Some(position) = &definition.position
+        {
+            out.push(position.start.offset..position.end.offset);
+        }
+        for child in node.children().into_iter().flatten() {
+            walk(child, out);
+        }
+    }
+
+    let mut ranges = Vec::new();
+    for math in [false, true] {
+        let mut options = ParseOptions::gfm();
+        options.constructs.math_text = math;
+        options.constructs.math_flow = math;
+        let root = markdown::to_mdast(markdown, &options).ok()?;
+        walk(&root, &mut ranges);
+    }
+    Some(ranges)
 }
 
 /// The byte index of the `[` that opens the label that ends at `close`.
@@ -641,6 +664,61 @@ mod tests {
         let wrapped =
             "[Docs][r]\n\nCopy https://evil.example/login\n\n[r]:\n    https://evil.example/login";
         assert_eq!(click_action(wrapped, EVIL), confirm(EVIL));
+    }
+
+    // Review cycle 3, S7: the scan for reference definitions found only lines
+    // that start with `[`. A definition inside a block quote or a list item
+    // was missed, the text view still resolved the link to it, and the click
+    // opened the address with no question.
+    #[test]
+    fn a_definition_in_a_block_quote_asks_first() {
+        let md = format!("The setup guide is here: [Open the setup guide][1]\n\n> [1]: {EVIL}\n");
+        assert_eq!(click_action(&md, EVIL), confirm(EVIL));
+    }
+
+    #[test]
+    fn a_definition_in_a_list_item_asks_first() {
+        let md = format!("See [the release notes][r].\n\n- [r]: {EVIL}\n");
+        assert_eq!(click_action(&md, EVIL), confirm(EVIL));
+        let numbered = format!("See [the release notes][r].\n\n1. [r]: {EVIL}\n");
+        assert_eq!(click_action(&numbered, EVIL), confirm(EVIL));
+    }
+
+    #[test]
+    fn a_definition_in_a_nested_container_or_with_a_title_asks_first() {
+        let nested = format!("See [it][r].\n\n> - > [r]: {EVIL}\n");
+        assert_eq!(click_action(&nested, EVIL), confirm(EVIL));
+        let titled = format!("See [it][r].\n\n  > [r]: {EVIL} \"A title\"\n");
+        assert_eq!(click_action(&titled, EVIL), confirm(EVIL));
+        let wrapped = format!("See [it][r].\n\n> [r]:\n>     {EVIL}\n");
+        assert_eq!(click_action(&wrapped, EVIL), confirm(EVIL));
+        // A decoy mention beside a quoted definition does not help either.
+        let decoy = format!("[https://github.com/x][r]\n\nCopy {EVIL}\n\n> [r]: {EVIL}");
+        assert_eq!(click_action(&decoy, EVIL), confirm(EVIL));
+    }
+
+    #[test]
+    fn the_definition_scan_follows_the_parser_and_not_the_lines() {
+        // A quoted definition is a definition for the parser.
+        let quoted = format!("> [1]: {EVIL}");
+        let ranges = definition_ranges(&quoted).expect("parses");
+        assert_eq!(ranges.len(), 2, "once for each reading of the math marks");
+        assert!(quoted[ranges[0].clone()].starts_with("[1]:"));
+        // A line that looks like a definition inside a code block is code.
+        let code = format!("```\n[1]: {EVIL}\n```");
+        assert!(definition_ranges(&code).expect("parses").is_empty());
+        // No definition at all.
+        assert!(definition_ranges("Just text.").expect("parses").is_empty());
+    }
+
+    #[test]
+    fn a_quoted_definition_of_another_address_does_not_stop_a_plain_link() {
+        // The definition names another address, so this click is not about it.
+        let md = format!("[https://example.com/a](https://example.com/a)\n\n> [r]: {EVIL}");
+        assert_eq!(
+            click_action(&md, "https://example.com/a"),
+            open("https://example.com/a")
+        );
     }
 
     #[test]

@@ -16,8 +16,8 @@ use crate::{
     ui::{
         menu::{MenuAction, OpenMenu, TextTarget, text_edit_menu},
         parts::{
-            ButtonKind, button, detail, icon, icon_button, line, selectable, status_color,
-            status_glyph, text,
+            ButtonKind, button, detail, focusable, icon, icon_button, line, selectable,
+            status_color, status_glyph, text,
         },
         timeline::{open_context_menu, task_menu, time_text},
     },
@@ -58,6 +58,46 @@ fn header(t: &Tokens) -> Div {
         .drag_area()
 }
 
+/// What an approval card says after the user answered. The wide choice
+/// repeats the harness's own words, so the card keeps the scope that the user
+/// saw on the button.
+pub fn answered_text(approval: &consort_client::ApprovalView, in_task: bool) -> String {
+    use consort_client::ApprovalChoice;
+    match approval.answer {
+        Some(ApprovalChoice::AllowOnce) => "You allowed it once.".to_owned(),
+        Some(ApprovalChoice::AllowForTask) => match approval.allow_always_label.as_deref() {
+            Some(label) if !label.trim().is_empty() => format!("You chose: {}", label.trim()),
+            _ if in_task => "You allowed it for this task.".to_owned(),
+            _ => "You allowed it from now on.".to_owned(),
+        },
+        Some(ApprovalChoice::Deny) => "You denied it.".to_owned(),
+        None => "Answered.".to_owned(),
+    }
+}
+
+/// How a section of the thread panel looks: its label, its toggle and where
+/// it sits.
+struct TextSection {
+    /// The key of its Markdown text.
+    key: String,
+    toggle_id: &'static str,
+    label: &'static str,
+    open: bool,
+    /// The section sits below the posts, so its border is above it.
+    above: bool,
+    /// The client holds only the start of the text and is loading the rest.
+    loading: bool,
+}
+
+/// Adds `id` to `list`, or takes it out when it is there.
+pub fn toggle_id(list: &mut Vec<String>, id: &str) {
+    if let Some(at) = list.iter().position(|x| x == id) {
+        list.remove(at);
+    } else {
+        list.push(id.to_owned());
+    }
+}
+
 impl ConsortApp {
     pub fn render_tasks_panel(
         &mut self,
@@ -88,8 +128,7 @@ impl ConsortApp {
         for (tab, label, count) in tabs {
             let active = self.tasks_tab == tab;
             segmented = segmented.child(
-                div()
-                    .id(SharedString::from(format!("tab-{label}")))
+                focusable(div().id(SharedString::from(format!("tab-{label}"))), t)
                     .flex()
                     .flex_1()
                     .justify_center()
@@ -213,12 +252,9 @@ impl ConsortApp {
                             c.hover_sidebar,
                             t,
                         )
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.inputs.composer.update(cx, |input, cx| {
-                                input.set_value("Start a task to ", window, cx);
-                                input.focus(window, cx);
-                            });
-                        })),
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.start_task_draft(window, cx)),
+                        ),
                     )
                     .child(
                         icon_button(
@@ -265,58 +301,60 @@ impl ConsortApp {
         } else {
             c.text_tertiary
         };
-        div()
-            .id(SharedString::from(format!("task-row-{}", task.id)))
-            .flex()
-            .items_start()
-            .gap(t.space.sm + t.space.xxs)
-            .p(t.space.sm)
-            .rounded(t.radius.md)
-            .cursor_pointer()
-            .when(selected, |d| d.bg(c.surface_selected))
-            .when(!selected, |d| d.hover(|s| s.bg(c.hover_sidebar)))
-            .child(
-                div()
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .h(t.text.ui.line)
-                    .w(t.icon.size)
-                    .child(status_glyph(
-                        SharedString::from(format!("row-glyph-{}", task.id)),
-                        task.status,
-                        t.icon.size,
-                        t,
-                        cx,
-                    )),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_w_0()
-                    .child(line(task.title.clone(), t.text.ui_strong, c.text_primary))
-                    .child(line(task.meta.clone(), detail(t), quiet)),
-            )
-            .child(
-                div()
-                    .flex_none()
-                    .w(t.space.page)
-                    .text_right()
-                    .type_style(detail(t))
-                    .line_height(t.text.ui.line)
-                    .text_color(quiet)
-                    .child(task.age_label.clone()),
-            )
-            .on_click(cx.listener(move |this, _, _, cx| this.open_thread(id.clone(), cx)))
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                    open_context_menu(this, event, task_menu(&menu_id, status, true), window, cx)
-                }),
-            )
-            .into_any_element()
+        focusable(
+            div().id(SharedString::from(format!("task-row-{}", task.id))),
+            t,
+        )
+        .flex()
+        .items_start()
+        .gap(t.space.sm + t.space.xxs)
+        .p(t.space.sm)
+        .rounded(t.radius.md)
+        .cursor_pointer()
+        .when(selected, |d| d.bg(c.surface_selected))
+        .when(!selected, |d| d.hover(|s| s.bg(c.hover_sidebar)))
+        .child(
+            div()
+                .flex()
+                .flex_none()
+                .items_center()
+                .h(t.text.ui.line)
+                .w(t.icon.size)
+                .child(status_glyph(
+                    SharedString::from(format!("row-glyph-{}", task.id)),
+                    task.status,
+                    t.icon.size,
+                    t,
+                    cx,
+                )),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_w_0()
+                .child(line(task.title.clone(), t.text.ui_strong, c.text_primary))
+                .child(line(task.meta.clone(), detail(t), quiet)),
+        )
+        .child(
+            div()
+                .flex_none()
+                .w(t.space.page)
+                .text_right()
+                .type_style(detail(t))
+                .line_height(t.text.ui.line)
+                .text_color(quiet)
+                .child(task.age_label.clone()),
+        )
+        .on_click(cx.listener(move |this, _, window, cx| this.open_thread(id.clone(), window, cx)))
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                open_context_menu(this, event, task_menu(&menu_id, status, true), window, cx)
+            }),
+        )
+        .into_any_element()
     }
 
     pub fn render_thread_panel(
@@ -336,6 +374,7 @@ impl ConsortApp {
             .as_ref()
             .map(|t| t.status_detail.clone())
             .unwrap_or_default();
+        let mode_tag = thread.as_ref().map(|t| t.approval_mode.tag());
         let menu_task = task_id.to_owned();
         let more_trigger = self.triggers.clone();
 
@@ -378,6 +417,15 @@ impl ConsortApp {
                             .child(text(status.label(), detail(t), status_color(status, t)))
                             .when(!status_detail.is_empty(), |d| {
                                 d.child(line(status_detail, detail(t), c.text_tertiary))
+                            })
+                            // How much the task may do without asking. The
+                            // worker can cap it.
+                            .when_some(mode_tag, |d, tag| {
+                                d.child(
+                                    text(tag, detail(t), c.text_tertiary)
+                                        .flex_none()
+                                        .whitespace_nowrap(),
+                                )
                             }),
                     ),
             )
@@ -453,6 +501,63 @@ impl ConsortApp {
                     })
             });
 
+        // The brief that started the task, in full. It sits under the header
+        // as a section that opens. The text is selectable Markdown, and it
+        // scrolls when it is long.
+        let loading = thread.as_ref().is_some_and(|th| th.text_is_preview);
+        let brief = thread
+            .as_ref()
+            .filter(|th| !th.brief.trim().is_empty())
+            .map(|th| th.brief.clone())
+            .map(|brief| {
+                let open = self.brief_open.iter().any(|id| id == task_id);
+                self.render_text_section(
+                    TextSection {
+                        key: format!("thread-brief-{task_id}"),
+                        toggle_id: "thread-brief-toggle",
+                        label: "Brief",
+                        open,
+                        above: false,
+                        loading,
+                    },
+                    &brief,
+                    t,
+                    cx,
+                    {
+                        let task = task_id.to_owned();
+                        move |this: &mut ConsortApp| toggle_id(&mut this.brief_open, &task)
+                    },
+                )
+            });
+
+        // What the task said when it went to Ready for review, in full. It
+        // sits above the Resolve bar, open by default, so the user reads it
+        // before they resolve the task.
+        let summary = thread
+            .as_ref()
+            .filter(|_| matches!(status, TaskStatus::Review | TaskStatus::Resolved))
+            .and_then(|th| th.review_summary.clone())
+            .map(|summary| {
+                let open = !self.summary_closed.iter().any(|id| id == task_id);
+                self.render_text_section(
+                    TextSection {
+                        key: format!("thread-summary-{task_id}"),
+                        toggle_id: "thread-summary-toggle",
+                        label: "Summary from the task",
+                        open,
+                        above: true,
+                        loading,
+                    },
+                    &summary,
+                    t,
+                    cx,
+                    {
+                        let task = task_id.to_owned();
+                        move |this: &mut ConsortApp| toggle_id(&mut this.summary_closed, &task)
+                    },
+                )
+            });
+
         let placement = thread
             .as_ref()
             .and_then(|th| th.placement.clone())
@@ -481,15 +586,26 @@ impl ConsortApp {
                     consort_client::Isolation::InPlace => "In ".to_owned(),
                     other => format!("{} of ", other.label()),
                 };
+                // The path, the branch and the repo are text that the user may
+                // copy, so they are selectable.
+                let mono = |what: &str, value: String| {
+                    selectable(
+                        SharedString::from(format!("workspace-{what}-{task_id}")),
+                        value,
+                        detail(t),
+                        c.text_secondary,
+                    )
+                    .font_family(t.font_mono.clone())
+                };
                 let workspace = if !p.path.is_empty() {
                     workspace
                         .child(lead)
-                        .child(div().font_family(t.font_mono.clone()).child(p.path.clone()))
-                        .when_some(p.branch.clone(), |d, b| d.child(format!(" at {b}")))
+                        .child(mono("path", p.path.clone()))
+                        .when_some(p.branch.clone(), |d, b| {
+                            d.child(" at ").child(mono("branch", b))
+                        })
                 } else if let Some(repo) = p.repo.clone() {
-                    workspace
-                        .child(lead)
-                        .child(div().font_family(t.font_mono.clone()).child(repo))
+                    workspace.child(lead).child(mono("repo", repo))
                 } else {
                     workspace.child("A new empty folder")
                 };
@@ -593,8 +709,7 @@ impl ConsortApp {
                     })),
                 )
                 .child(
-                    div()
-                        .id("reply-send")
+                    focusable(div().id("reply-send"), t)
                         .size(t.space.xl + t.space.xs)
                         .flex_none()
                         .flex()
@@ -698,6 +813,7 @@ impl ConsortApp {
 
         frame(t)
             .child(head)
+            .children(brief)
             .children(reason)
             .children(placement)
             .child(
@@ -709,8 +825,92 @@ impl ConsortApp {
                     .child(fade(true))
                     .child(fade(false)),
             )
+            .children(summary)
             .children(review)
             .child(reply)
+            .into_any_element()
+    }
+
+    /// A section of the thread panel with a header that opens and closes it,
+    /// and Markdown text under it. The text is selectable and scrolls when it
+    /// is long.
+    fn render_text_section(
+        &mut self,
+        section: TextSection,
+        markdown: &str,
+        t: &Tokens,
+        cx: &mut Context<Self>,
+        toggle: impl Fn(&mut ConsortApp) + 'static,
+    ) -> AnyElement {
+        let c = &t.colors;
+        let first_line = consort_client::format::card_summary(markdown)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_owned();
+        let header = focusable(div().id(section.toggle_id), t)
+            .flex()
+            .items_center()
+            .gap(t.space.sm)
+            .py(t.space.sm)
+            .px(t.space.lg)
+            .cursor_pointer()
+            .hover(|s| s.bg(c.hover_sidebar))
+            .child(icon(
+                if section.open {
+                    "chevron-down"
+                } else {
+                    "chevron-right"
+                },
+                t.icon.dense,
+                c.text_tertiary,
+            ))
+            .child(text(section.label, t.text.label, c.text_secondary).flex_none())
+            // A closed section shows the first line, so the reader knows
+            // what is in it.
+            .when(!section.open, |d| {
+                d.child(line(first_line, detail(t), c.text_tertiary).flex_1())
+            })
+            .on_click(cx.listener(move |this, _, _, cx| {
+                toggle(this);
+                cx.notify();
+            }));
+        let body = section.open.then(|| {
+            let md = self
+                .render_markdown(
+                    &section.key,
+                    markdown,
+                    crate::ui::timeline::post_menu(markdown),
+                    c.surface_raised,
+                    t,
+                    cx,
+                )
+                .type_style(t.text.ui)
+                .text_color(c.text_primary);
+            div()
+                .id(SharedString::from(format!("{}-body", section.key)))
+                .max_h(t.layout.error_text_max_height)
+                .overflow_y_scroll()
+                .px(t.space.lg)
+                .pb(t.space.md)
+                .child(md)
+                .when(section.loading, |d| {
+                    d.child(div().pt(t.space.sm).child(text(
+                        "Loading the full text",
+                        detail(t),
+                        c.text_tertiary,
+                    )))
+                })
+        });
+        div()
+            .flex()
+            .flex_col()
+            .flex_none()
+            .when(section.above, |d| d.border_t(t.border_width))
+            .when(!section.above, |d| d.border_b(t.border_width))
+            .border_color(c.border_subtle)
+            .child(header)
+            .children(body)
             .into_any_element()
     }
 
@@ -794,8 +994,7 @@ impl ConsortApp {
                         .border_color(c.border_subtle)
                         .rounded(t.radius.md)
                         .child(
-                            div()
-                                .id(SharedString::from(format!("{key}-activity")))
+                            focusable(div().id(SharedString::from(format!("{key}-activity"))), t)
                                 .flex()
                                 .items_center()
                                 .gap(t.space.sm)
@@ -917,18 +1116,9 @@ impl ConsortApp {
             .child(self.render_approval_detail(approval, false, t, cx));
         let task = approval.task_id.is_some();
         let card = if answered {
-            card.child(text(
-                match approval.answer {
-                    Some(consort_client::ApprovalChoice::AllowOnce) => "You allowed it once.",
-                    Some(consort_client::ApprovalChoice::AllowForTask) if task => {
-                        "You allowed it for this task."
-                    }
-                    Some(consort_client::ApprovalChoice::AllowForTask) => {
-                        "You allowed it from now on."
-                    }
-                    Some(consort_client::ApprovalChoice::Deny) => "You denied it.",
-                    None => "Answered.",
-                },
+            card.child(selectable(
+                SharedString::from(format!("{key}-answer")),
+                answered_text(approval, task),
                 t.text.ui,
                 c.text_secondary,
             ))
@@ -970,10 +1160,15 @@ impl ConsortApp {
                 c.border_strong
             };
             let id = decision.id.clone();
+            // The answer is irreversible. Only the Choose button sends it. The
+            // row itself is not a control: GPUI fires a click on mouse-up
+            // with no drag threshold, so a click on the row would answer
+            // when the user only selected or double-clicked its text.
             options = options.child(
                 div()
                     .id(SharedString::from(format!("{key}-option-{i}")))
                     .flex()
+                    .items_start()
                     .gap(t.space.sm + t.space.xxs)
                     .py(t.space.sm + t.space.xxs)
                     .px(t.space.md)
@@ -986,9 +1181,6 @@ impl ConsortApp {
                     })
                     .when(recommended || chosen, |d| d.bg(c.surface_raised))
                     .when(dim, |d| d.opacity(t.opacity.answered_dim))
-                    .when(!answered, |d| {
-                        d.cursor_pointer().hover(|s| s.bg(c.hover_card))
-                    })
                     .child(
                         div()
                             .flex()
@@ -1044,9 +1236,24 @@ impl ConsortApp {
                             )),
                     )
                     .when(!answered, |d| {
-                        d.on_click(cx.listener(move |this, _, window, cx| {
-                            this.answer_decision(id.clone(), Some(i), None, window, cx)
-                        }))
+                        d.child(
+                            button(
+                                SharedString::from(format!("{key}-choose-{i}")),
+                                "Choose",
+                                if recommended {
+                                    ButtonKind::Primary
+                                } else {
+                                    ButtonKind::Secondary
+                                },
+                                t,
+                            )
+                            .flex_none()
+                            .on_click(cx.listener(
+                                move |this, _, window, cx| {
+                                    this.answer_decision(id.clone(), Some(i), None, window, cx)
+                                },
+                            )),
+                        )
                     }),
             );
         }
@@ -1133,13 +1340,15 @@ impl ConsortApp {
         } else {
             let id = decision.id.clone();
             let link = |id_suffix: &str, label: &'static str| {
-                div()
-                    .id(SharedString::from(format!("{key}-{id_suffix}")))
-                    .type_style(t.text.ui_strong)
-                    .text_color(c.text_secondary)
-                    .cursor_pointer()
-                    .hover(|s| s.text_color(c.text_primary))
-                    .child(label)
+                focusable(
+                    div().id(SharedString::from(format!("{key}-{id_suffix}"))),
+                    t,
+                )
+                .type_style(t.text.ui_strong)
+                .text_color(c.text_secondary)
+                .cursor_pointer()
+                .hover(|s| s.text_color(c.text_primary))
+                .child(label)
             };
             div()
                 .flex()

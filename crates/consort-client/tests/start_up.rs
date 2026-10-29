@@ -87,3 +87,27 @@ fn a_saved_url_with_a_path_and_a_password_is_cut_to_its_origin() {
         client.state().connection
     );
 }
+
+/// Review cycle 3, finding 4: drafts did not survive a quit. A draft goes to
+/// `drafts.json` in the client's folder, and the next client reads it.
+#[test]
+fn drafts_survive_a_restart_of_the_client() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = Client::start_with(Some(Store::new(dir.path())), ClientOptions::desktop()).unwrap();
+    assert!(first.load_drafts().is_empty());
+    let mut drafts = consort_client::Drafts::default();
+    drafts.set_channel("chn_a", "A draft that I did not send");
+    drafts.set_thread("tsk_1", "A reply");
+    first.save_drafts(&drafts).unwrap();
+    drop(first);
+
+    let second =
+        Client::start_with(Some(Store::new(dir.path())), ClientOptions::desktop()).unwrap();
+    let loaded = second.load_drafts();
+    assert_eq!(loaded.channel("chn_a"), "A draft that I did not send");
+    assert_eq!(loaded.thread("tsk_1"), "A reply");
+    // The mock keeps no file, and says nothing about it.
+    let mock = Client::mock().unwrap();
+    assert!(mock.load_drafts().is_empty());
+    mock.save_drafts(&drafts).unwrap();
+}

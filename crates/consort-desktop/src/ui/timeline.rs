@@ -23,8 +23,8 @@ use crate::{
         markdown::{Segment, exact_selection, segments},
         menu::{MenuAction, MenuItem, OpenMenu, TextTarget, text_edit_menu},
         parts::{
-            ButtonKind, button, detail, icon, icon_button, line, selectable, status_glyph, text,
-            worker_pill,
+            ButtonKind, button, detail, focusable, icon, icon_button, line, selectable,
+            status_glyph, text, worker_pill,
         },
     },
 };
@@ -88,8 +88,10 @@ pub fn selection_menu(selected: String) -> Vec<MenuItem> {
 }
 
 /// What a right click on a task card or a task row offers. Resolve is for a
-/// task that is Ready for review, and Not done is for a resolved task. The
-/// thread panel leaves out Open thread, because the thread is open.
+/// task that is Ready for review, and Not done is for a resolved task. Retry
+/// is for a failed task, Stop for a working one, and Archive for a failed or
+/// a resolved one. The thread panel leaves out Open thread, because the
+/// thread is open.
 pub fn task_menu(task_id: &str, status: TaskStatus, with_open_thread: bool) -> Vec<MenuItem> {
     let id = task_id.to_owned();
     let mut items = Vec::new();
@@ -116,13 +118,22 @@ pub fn task_menu(task_id: &str, status: TaskStatus, with_open_thread: bool) -> V
     if status == TaskStatus::Working {
         items.push(MenuItem::new("Stop", MenuAction::StopTask(id.clone())));
     }
+    // A failed task would stay in Active for ever, and a resolved task stays
+    // in the lists. Archive hides either one.
+    if matches!(status, TaskStatus::Failed | TaskStatus::Resolved) {
+        items.push(MenuItem::new(
+            "Archive",
+            MenuAction::ArchiveTask(id.clone()),
+        ));
+    }
     items.push(MenuItem::new("Copy task ID", MenuAction::Copy(id)).separated());
     items
 }
 
-/// Markdown with its marks taken out, for "Copy text".
+/// Markdown as the reader sees it, for "Copy text". Code keeps every
+/// character.
 fn plain_text(markdown: &str) -> String {
-    consort_client::format::strip_marks(markdown)
+    consort_client::format::plain_text(markdown)
 }
 
 /// Opens the selection menu when text is selected, else the given menu.
@@ -198,8 +209,7 @@ impl ConsortApp {
         let purpose = channel.map(|c| c.purpose.clone()).unwrap_or_default();
         let panel = &state.tasks_panel;
         let pressed = self.panel == Panel::Tasks;
-        let tasks_button = div()
-            .id("tasks-button")
+        let tasks_button = focusable(div().id("tasks-button"), t)
             .flex()
             .flex_none()
             .items_center()
@@ -267,12 +277,7 @@ impl ConsortApp {
             c.hover_canvas,
             t,
         )
-        .on_click(cx.listener(|this, _, window, cx| {
-            this.inputs.composer.update(cx, |input, cx| {
-                input.set_value("Start a task to ", window, cx);
-                input.focus(window, cx);
-            });
-        }));
+        .on_click(cx.listener(|this, _, window, cx| this.start_task_draft(window, cx)));
         div()
             .flex()
             .flex_none()
@@ -315,7 +320,10 @@ impl ConsortApp {
         let at_end = empty || self.timeline.is_scrolled_to_end().unwrap_or(true);
         let fade_bottom = t.space.xxl;
         let unloaded = self.channel_unloaded();
-        let body = if empty && unloaded {
+        let body = if let Some(waiting) = self.waiting() {
+            // No channel has loaded. It is not a channel with no messages.
+            self.render_waiting_timeline(&waiting, t, cx)
+        } else if empty && unloaded {
             self.render_unloaded_timeline(t).into_any_element()
         } else if empty {
             self.render_empty_timeline(t).into_any_element()
@@ -420,6 +428,59 @@ impl ConsortApp {
                 t.text.body,
                 c.text_secondary,
             ))
+    }
+
+    /// The column while no channel has loaded: "Connecting to the hub", or
+    /// why the hub is not there, with a button that tries again at once.
+    fn render_waiting_timeline(
+        &self,
+        waiting: &crate::waiting::Waiting,
+        t: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let c = &t.colors;
+        let connecting = !waiting.can_retry;
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap(t.space.sm)
+            .px(t.space.xl)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(t.space.sm)
+                    .when(connecting, |d| {
+                        d.child(status_glyph(
+                            "waiting-for-hub",
+                            TaskStatus::Working,
+                            t.icon.size,
+                            t,
+                            cx,
+                        ))
+                    })
+                    .child(text(waiting.title, t.text.title, c.text_primary)),
+            )
+            .child(text(waiting.next, t.text.body, c.text_secondary))
+            .when_some(waiting.reason.clone(), |d, reason| {
+                // The reason is an error detail: the user can copy it.
+                d.child(div().max_w(t.layout.timeline_max_width).child(selectable(
+                    SharedString::from(format!("waiting-reason-{reason}")),
+                    reason,
+                    detail(t),
+                    c.text_tertiary,
+                )))
+            })
+            .when(waiting.can_retry, |d| {
+                d.child(
+                    button("waiting-try-again", "Try again", ButtonKind::Secondary, t)
+                        .on_click(cx.listener(|this, _, _, cx| this.try_again(cx))),
+                )
+            })
+            .into_any_element()
     }
 
     fn render_empty_timeline(&self, t: &Tokens) -> Div {
@@ -820,9 +881,9 @@ impl ConsortApp {
                                     .flex_none()
                                     .text_right(),
                             )
-                            .on_click(cx.listener(move |this, _, _, cx| {
+                            .on_click(cx.listener(move |this, _, window, cx| {
                                 if let Some(id) = task_id.clone() {
-                                    this.open_thread(id, cx);
+                                    this.open_thread(id, window, cx);
                                 }
                             })),
                     );
@@ -939,7 +1000,7 @@ impl ConsortApp {
                 }),
             );
         if collapsed {
-            return base
+            return focusable(base, t)
                 .items_center()
                 .gap(t.space.sm)
                 .py(t.space.sm + t.space.xxs)
@@ -949,7 +1010,9 @@ impl ConsortApp {
                 .child(glyph)
                 .child(line(card.title.clone(), t.text.ui_strong, c.text_secondary).flex_1())
                 .child(text(card.summary.clone(), detail(t), c.text_tertiary).whitespace_nowrap())
-                .on_click(cx.listener(move |this, _, _, cx| this.open_thread(task_id.clone(), cx)))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.open_thread(task_id.clone(), window, cx)
+                }))
                 .into_any_element();
         }
         let inset = t.icon.size + t.space.sm;
@@ -962,6 +1025,8 @@ impl ConsortApp {
             .when_some(card.channel_name.clone(), |d, name| {
                 d.child(text(name, detail(t), c.text_tertiary).whitespace_nowrap())
             })
+            // How much the task may do without asking. A worker can cap it.
+            .child(text(card.approval_mode.tag(), detail(t), c.text_tertiary).whitespace_nowrap())
             .when_some(card.worker.clone(), |d, w| {
                 d.child(worker_pill(&w.name, &w.account, w.online, t))
             });
@@ -1000,7 +1065,7 @@ impl ConsortApp {
             let summary = match &card.approval {
                 Some(a) => a
                     .answer
-                    .map(|choice| answered_label(choice).to_owned())
+                    .map(|choice| answered_label(a, choice))
                     .unwrap_or_default(),
                 None => card
                     .latest
@@ -1068,101 +1133,109 @@ impl ConsortApp {
     ) -> AnyElement {
         let c = &t.colors;
         let task_id = task_id.to_owned();
-        div()
-            .id(SharedString::from(format!("open-thread-{task_id}")))
-            .flex_none()
-            .type_style(detail(t))
-            .text_color(if open {
-                c.accent_text
+        focusable(
+            div().id(SharedString::from(format!("open-thread-{task_id}"))),
+            t,
+        )
+        .flex_none()
+        .type_style(detail(t))
+        .text_color(if open {
+            c.accent_text
+        } else {
+            c.text_secondary
+        })
+        .cursor_pointer()
+        .when(!open, |d| d.hover(|s| s.text_color(c.text_primary)))
+        .child(if open { "Thread open" } else { "Open thread" })
+        .on_click(cx.listener(move |this, _, window, cx| {
+            if open {
+                this.close_panel(cx);
             } else {
-                c.text_secondary
-            })
-            .cursor_pointer()
-            .when(!open, |d| d.hover(|s| s.text_color(c.text_primary)))
-            .child(if open { "Thread open" } else { "Open thread" })
-            .on_click(cx.listener(move |this, _, _, cx| {
-                if open {
-                    this.close_panel(cx);
-                } else {
-                    this.open_thread(task_id.clone(), cx);
-                }
-            }))
-            .into_any_element()
+                this.open_thread(task_id.clone(), window, cx);
+            }
+        }))
+        .into_any_element()
     }
 
-    /// "Codex wants to run a command in C:\Code\sayso", then the command.
+    /// What an approval asks for: the summary line (when `with_summary`),
+    /// the folder it runs in, and the command, the files or the tool call in
+    /// a block. The folder always shows, in full, because the agent writes
+    /// the summary and can choose the folder (Codex lets the model do it).
     pub fn render_approval_detail(
         &mut self,
         approval: &ApprovalView,
-        with_folder: bool,
+        with_summary: bool,
         t: &Tokens,
         cx: &mut Context<Self>,
     ) -> Div {
         let c = &t.colors;
         let mut detail_box = div().flex().flex_col().gap(t.space.sm).min_w_0();
-        if with_folder {
-            let mut summary = div()
-                .flex()
-                .flex_wrap()
-                .min_w_0()
-                .overflow_hidden()
-                .type_style(t.text.ui)
-                .text_color(c.text_secondary)
-                .child(div().max_w_full().child(SelectableText::new(
-                    SharedString::from(format!("{}.summary", approval.id)),
-                    approval.summary.clone(),
-                )));
-            if let Some(folder) = &approval.folder {
-                summary = summary
-                    .child(div().whitespace_nowrap().child(" in "))
-                    .child(
-                        div()
-                            .max_w_full()
-                            .truncate()
-                            .font_family(t.font_mono.clone())
-                            .text_color(c.text_primary)
-                            .child(SelectableText::new(
-                                SharedString::from(format!("{}.folder", approval.id)),
-                                folder.clone(),
-                            )),
-                    );
-            }
-            detail_box = detail_box.child(summary);
-        }
-        if let Some(command) = approval.detail.clone() {
-            detail_box = detail_box.child(
-                div()
-                    .id(SharedString::from(format!("{}-command", approval.id)))
-                    .min_w_0()
-                    .bg(c.surface_raised)
-                    .border(t.border_width)
-                    .border_color(c.border_subtle)
-                    .rounded(t.radius.md)
-                    .py(t.space.sm)
-                    .px(t.space.md)
-                    .font_family(t.font_mono.clone())
-                    .type_style(t.text.mono)
-                    .text_color(c.text_primary)
-                    .child(SelectableText::new(
-                        SharedString::from(format!("{}.command", approval.id)),
-                        command.clone(),
-                    ))
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                            open_context_menu(
-                                this,
-                                event,
-                                vec![MenuItem::new(
-                                    "Copy code",
-                                    MenuAction::Copy(command.clone()),
-                                )],
-                                window,
-                                cx,
-                            )
-                        }),
-                    ),
-            );
+        for part in detail_parts(approval, with_summary) {
+            detail_box = match part {
+                DetailPart::Summary(summary) => detail_box.child(
+                    div()
+                        .flex()
+                        .min_w_0()
+                        .type_style(t.text.ui)
+                        .text_color(c.text_secondary)
+                        .child(div().max_w_full().child(SelectableText::new(
+                            SharedString::from(format!("{}.summary", approval.id)),
+                            summary,
+                        ))),
+                ),
+                DetailPart::Folder(folder) => detail_box.child(
+                    div()
+                        .flex()
+                        .items_baseline()
+                        .gap(t.space.sm)
+                        .min_w_0()
+                        .child(text("Folder", detail(t), c.text_tertiary).flex_none())
+                        .child(
+                            div()
+                                .min_w_0()
+                                .font_family(t.font_mono.clone())
+                                .type_style(t.text.mono)
+                                .text_color(c.text_primary)
+                                .child(SelectableText::new(
+                                    SharedString::from(format!("{}.folder", approval.id)),
+                                    folder,
+                                )),
+                        ),
+                ),
+                DetailPart::Command(command) => detail_box.child(
+                    div()
+                        .id(SharedString::from(format!("{}-command", approval.id)))
+                        .min_w_0()
+                        .bg(c.surface_raised)
+                        .border(t.border_width)
+                        .border_color(c.border_subtle)
+                        .rounded(t.radius.md)
+                        .py(t.space.sm)
+                        .px(t.space.md)
+                        .font_family(t.font_mono.clone())
+                        .type_style(t.text.mono)
+                        .text_color(c.text_primary)
+                        .child(SelectableText::new(
+                            SharedString::from(format!("{}.command", approval.id)),
+                            command.clone(),
+                        ))
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                                open_context_menu(
+                                    this,
+                                    event,
+                                    vec![MenuItem::new(
+                                        "Copy code",
+                                        MenuAction::Copy(command.clone()),
+                                    )],
+                                    window,
+                                    cx,
+                                )
+                            }),
+                        ),
+                ),
+            };
         }
         detail_box
     }
@@ -1182,6 +1255,9 @@ impl ConsortApp {
             };
             let id = approval.id.clone();
             let choice = *choice;
+            // The wide choice shows the harness's own words, which can be
+            // long. They wrap, so the user reads the whole scope.
+            let wide = choice == ApprovalChoice::AllowForTask;
             row = row.child(
                 button(
                     SharedString::from(format!("{}-{i}", approval.id)),
@@ -1189,6 +1265,7 @@ impl ConsortApp {
                     kind,
                     t,
                 )
+                .when(wide, |b| b.whitespace_normal().max_w_full().text_left())
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.answer_approval(id.clone(), choice, window, cx)
                 })),
@@ -1213,8 +1290,7 @@ impl ConsortApp {
         let is_everything = channel.is_some_and(|ch| ch.kind == ChannelKind::Everything);
         let _ = is_everything;
         let input = crate::ui::parts::textarea(&self.inputs.composer, t.text.body);
-        let send = div()
-            .id("send")
+        let send = focusable(div().id("send"), t)
             .size(t.space.xl + t.space.xs)
             .flex_none()
             .flex()
@@ -1227,7 +1303,14 @@ impl ConsortApp {
             .cursor_pointer()
             .hover(|s| s.bg(c.hover_raised))
             .child(icon("corner-down-left", t.icon.dense, c.text_primary))
-            .on_click(cx.listener(|this, _, window, cx| this.send_message(window, cx)));
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.send_message(window, cx);
+                // The button takes the focus. The composer gets it back, so
+                // the user can go on typing.
+                this.inputs
+                    .composer
+                    .update(cx, |input, cx| input.focus(window, cx));
+            }));
         let tool = |id: &'static str, name: &str| {
             icon_button(
                 id,
@@ -1241,7 +1324,7 @@ impl ConsortApp {
         };
         // The line under the composer: the state of the link, and for an
         // offline link the reason and a countdown that ticks once a second.
-        let link: Option<(String, Option<String>)> = match &state.connection {
+        let link: Option<(String, Option<String>, bool)> = match &state.connection {
             consort_client::Connection::Offline {
                 retry_in_ms,
                 reason,
@@ -1251,10 +1334,10 @@ impl ConsortApp {
                     |o| o.seconds_left(Instant::now()),
                 );
                 let reason = Some(reason.trim().to_owned()).filter(|r| !r.is_empty());
-                Some((countdown::offline_line(left), reason))
+                Some((countdown::offline_line(left), reason, true))
             }
             consort_client::Connection::Connecting => {
-                Some(("Connecting to the hub".to_owned(), None))
+                Some(("Connecting to the hub".to_owned(), None, false))
             }
             _ => None,
         };
@@ -1267,7 +1350,7 @@ impl ConsortApp {
             .px(t.space.xl)
             .pt(t.space.lg)
             .pb(t.space.xl)
-            .when_some(link, |d, (line_text, reason)| {
+            .when_some(link, |d, (line_text, reason, offline)| {
                 d.child(
                     div()
                         .flex()
@@ -1305,7 +1388,14 @@ impl ConsortApp {
                                         c.text_tertiary,
                                     ))
                                 }),
-                        ),
+                        )
+                        // Do not wait for the countdown.
+                        .when(offline, |row| {
+                            row.child(
+                                button("link-try-again", "Try again", ButtonKind::Quiet, t)
+                                    .on_click(cx.listener(|this, _, _, cx| this.try_again(cx))),
+                            )
+                        }),
                 )
             })
             .child(
@@ -1315,6 +1405,8 @@ impl ConsortApp {
                     .flex_col()
                     .w_full()
                     .max_w(t.layout.timeline_max_width)
+                    // No channel has loaded: the box takes no text.
+                    .when(self.waiting().is_some(), |d| d.opacity(t.opacity.busy))
                     .gap(t.space.sm + t.space.xxs)
                     .pt(t.space.md)
                     .pb(t.space.sm + t.space.xxs)
@@ -1364,6 +1456,34 @@ impl ConsortApp {
     }
 }
 
+/// One part of the detail block of an approval.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DetailPart {
+    /// The line that says what asks.
+    Summary(String),
+    /// The folder the command runs in.
+    Folder(String),
+    /// The command, the files or the tool call.
+    Command(String),
+}
+
+/// The parts of an approval's detail block, in the order they show. The
+/// summary is the agent's own words, so the folder and the command must
+/// always be there to check it against: a card never leaves out the folder.
+pub fn detail_parts(approval: &ApprovalView, with_summary: bool) -> Vec<DetailPart> {
+    let mut parts = Vec::new();
+    if with_summary {
+        parts.push(DetailPart::Summary(approval.summary.clone()));
+    }
+    if let Some(folder) = approval.folder.clone().filter(|f| !f.trim().is_empty()) {
+        parts.push(DetailPart::Folder(folder));
+    }
+    if let Some(command) = approval.detail.clone() {
+        parts.push(DetailPart::Command(command));
+    }
+    parts
+}
+
 /// The time under a speaker. A message or a post that is still on its way to
 /// the hub says "Sending" where its time goes.
 pub fn time_text(label: &str, pending: bool) -> &str {
@@ -1382,11 +1502,17 @@ pub(crate) fn is_open_click(event: &gpui_kit::ClickEvent) -> bool {
     }
 }
 
-fn answered_label(choice: ApprovalChoice) -> &'static str {
+/// What a card says after the user answered an approval. The wide choice
+/// repeats the harness's own words, so the card keeps the scope that the
+/// user saw on the button.
+fn answered_label(approval: &ApprovalView, choice: ApprovalChoice) -> String {
     match choice {
-        ApprovalChoice::AllowOnce => "Allowed once.",
-        ApprovalChoice::AllowForTask => "Allowed for this task.",
-        ApprovalChoice::Deny => "Denied.",
+        ApprovalChoice::AllowOnce => "Allowed once.".to_owned(),
+        ApprovalChoice::AllowForTask => match approval.allow_always_label.as_deref() {
+            Some(label) if !label.trim().is_empty() => format!("Allowed: {}", label.trim()),
+            _ => "Allowed for this task.".to_owned(),
+        },
+        ApprovalChoice::Deny => "Denied.".to_owned(),
     }
 }
 
@@ -1414,6 +1540,50 @@ mod tests {
 
     fn labels(items: &[MenuItem]) -> Vec<&str> {
         items.iter().map(|i| i.label.as_ref()).collect()
+    }
+
+    fn approval_in(folder: Option<&str>) -> ApprovalView {
+        ApprovalView {
+            id: "apr_1".into(),
+            task_id: Some("tsk_1".into()),
+            summary: "Codex wants to run a command".into(),
+            folder: folder.map(str::to_owned),
+            detail: Some("rm -rf build".into()),
+            ..ApprovalView::default()
+        }
+    }
+
+    /// Review cycle 3, S6: task-thread and coordinator approval cards never
+    /// showed the folder, and Codex lets the model pick it.
+    #[test]
+    fn the_folder_shows_with_or_without_the_summary_line() {
+        let approval = approval_in(Some("/etc"));
+        for with_summary in [true, false] {
+            let parts = detail_parts(&approval, with_summary);
+            assert!(
+                parts.contains(&DetailPart::Folder("/etc".into())),
+                "with_summary {with_summary}: {parts:?}"
+            );
+            assert!(parts.contains(&DetailPart::Command("rm -rf build".into())));
+            assert_eq!(
+                parts.contains(&DetailPart::Summary("Codex wants to run a command".into())),
+                with_summary
+            );
+        }
+        // The folder comes before the command.
+        let parts = detail_parts(&approval, false);
+        assert_eq!(
+            parts,
+            [
+                DetailPart::Folder("/etc".into()),
+                DetailPart::Command("rm -rf build".into())
+            ]
+        );
+        // No folder, no row.
+        assert_eq!(
+            detail_parts(&approval_in(None), false),
+            [DetailPart::Command("rm -rf build".into())]
+        );
     }
 
     #[test]
@@ -1487,16 +1657,45 @@ mod tests {
         let resolved = task_menu("t1", TaskStatus::Resolved, true);
         assert_eq!(
             labels(&resolved),
-            ["Open thread", "Not done", "Copy task ID"]
+            ["Open thread", "Not done", "Archive", "Copy task ID"]
         );
     }
 
     #[test]
     fn retry_and_stop_match_the_status() {
         let failed = task_menu("t1", TaskStatus::Failed, true);
-        assert_eq!(labels(&failed), ["Open thread", "Retry", "Copy task ID"]);
+        assert_eq!(
+            labels(&failed),
+            ["Open thread", "Retry", "Archive", "Copy task ID"]
+        );
         let working = task_menu("t1", TaskStatus::Working, true);
         assert_eq!(labels(&working), ["Open thread", "Stop", "Copy task ID"]);
+    }
+
+    /// Review cycle 3, finding 7: a failed task stayed in Active for ever.
+    #[test]
+    fn archive_is_for_a_failed_or_a_resolved_task_only() {
+        for status in [
+            TaskStatus::Scheduled,
+            TaskStatus::UpNext,
+            TaskStatus::Working,
+            TaskStatus::NeedsInput,
+            TaskStatus::Review,
+        ] {
+            let items = task_menu("t1", status, true);
+            assert!(
+                !labels(&items).contains(&"Archive"),
+                "{status:?} offers Archive"
+            );
+        }
+        for status in [TaskStatus::Failed, TaskStatus::Resolved] {
+            let items = task_menu("t1", status, false);
+            let archive = items
+                .iter()
+                .find(|i| i.label == "Archive")
+                .expect("Archive");
+            assert_eq!(archive.action, MenuAction::ArchiveTask("t1".into()));
+        }
     }
 
     #[test]

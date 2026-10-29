@@ -24,6 +24,13 @@ const T_CERT: &str = "tsk_0192f0c4-tls-cert";
 const T_TOKEN: &str = "tsk_0192f0c4-bot-token";
 const T_REPO: &str = "tsk_0192f0c4-sayso-repo";
 
+/// What the spam-rules task said when it went to Ready for review. The card
+/// shows its first lines, and the thread shows it whole.
+const SPAM_SUMMARY: &str = "The new rules are in `rules/new_members.toml`.\n\n```toml\n[new_members]\nhold_first_link = true\nwindow_minutes = 1440\n```\n\nTests pass, and a dry run on last week's messages flags 41 of 43 spam posts and no real ones. Members who joined more than a day ago keep the current rules, so nothing changes for them.\n\n## What to check\n\n- Read the dry run in `reports/dry-run-2026-10-22.md`.\n- Look at the two posts that the rules missed. Both are in `reports/missed.md`.\n- Decide if `window_minutes = 1440` is the right window. A shorter window holds fewer first messages, and lets more spam through.";
+
+/// The brief of the spam-rules task.
+const SPAM_BRIEF: &str = "New accounts keep posting crypto links in the first minute. Tune the spam rules for new members.\n\n- Hold a first message with a link for review.\n- Keep the current rules for members who joined more than a day ago.\n- Run the new rules on last week's messages before you finish, and report how many spam posts they catch and how many real posts they flag.\n\nDo not change the rules for admins.";
+
 /// A fixed "now" for the mock, so ages and times match the designs.
 pub const MOCK_NOW: i64 = 1_793_300_000_000;
 
@@ -78,6 +85,11 @@ fn task(
         age_label: age.into(),
         updated_at: MOCK_NOW - minutes_ago * 60_000,
         card_message_id: format!("msg_card_{id}"),
+        approval_mode: match id {
+            T_SAYSO | T_EXT4 => ApprovalMode::Ask,
+            T_ROOF => ApprovalMode::Auto,
+            _ => ApprovalMode::AutoEdits,
+        },
     }
 }
 
@@ -115,6 +127,7 @@ fn sayso_approval() -> ApprovalView {
         ],
         state: RequestState::Pending,
         answer: None,
+        allow_always_label: Some(text("Yes, and don't ask again for cargo build commands")),
     }
 }
 
@@ -181,6 +194,7 @@ fn card(
         summary: summary.into(),
         reply_count: 0,
         latest: latest.map(Into::into),
+        approval_mode: ApprovalMode::default(),
     })
 }
 
@@ -628,9 +642,7 @@ fn timelines() -> Vec<TimelineView> {
                     Some(("hub", true, "Claude Personal")),
                     None,
                     "Ready for review, 4 replies",
-                    Some(
-                        "The new rules are in `rules/new_members.toml`.\n\n```toml\n[new_members]\nhold_first_link = true\nwindow_minutes = 1440\n```\n\nTests pass, and a dry run on last week's messages flags 41 of 43 spam posts and no real ones. Members who joined more than a day ago keep the current rules, so nothing changes for them.",
-                    ),
+                    Some(SPAM_SUMMARY),
                 ),
             ],
         },
@@ -755,6 +767,12 @@ fn threads() -> Vec<TaskThreadView> {
                 r"C:\Code\sayso",
                 Some("fix/37"),
             ),
+            brief: text(
+                "Go through the open Sayso issues and fix the ones that block 0.9.3.\n\nStart with #37: Sayso crashes on a CPU without AVX2. Ship a build that picks the right engine for the CPU. Open one pull request for all the fixes.",
+            ),
+            review_summary: None,
+            text_is_preview: false,
+            approval_mode: ApprovalMode::Ask,
             posts: vec![
                 post(
                     "pst_sayso_1",
@@ -792,6 +810,9 @@ fn threads() -> Vec<TaskThreadView> {
                 "/srv/consort/miss-lucy",
                 Some("spam-rules"),
             ),
+            brief: text(SPAM_BRIEF),
+            review_summary: Some(text(SPAM_SUMMARY)),
+            approval_mode: ApprovalMode::AutoEdits,
             posts: vec![post(
                 "pst_spam_1",
                 Speaker::Task,
@@ -967,6 +988,11 @@ pub fn view_state() -> ViewState {
                 name: text("Home"),
             },
         ],
+        archived_channels: vec![ArchivedChannelView {
+            id: text("chn_0192f0c4-old-garden"),
+            name: text("garden-sensors"),
+            icon: text("hash"),
+        }],
         timelines: timelines(),
         tasks: tasks(),
         threads: threads(),
@@ -1008,6 +1034,9 @@ pub fn view_state_with_requests() -> ViewState {
                     ],
                     state: RequestState::Pending,
                     answer: None,
+                    allow_always_label: Some(text(
+                        "Yes, and don't ask again for roofline-quotes.md",
+                    )),
                 });
             }
         }
@@ -1030,6 +1059,7 @@ pub fn view_state_with_requests() -> ViewState {
                 ],
                 state: RequestState::Pending,
                 answer: None,
+                allow_always_label: None,
             },
         }));
         timeline.items.push(TimelineItem::Decision(DecisionCardView {
