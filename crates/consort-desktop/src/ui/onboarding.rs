@@ -3,12 +3,12 @@
 use consort_theme::{Tokens, TypeExt as _};
 use gpui_kit::{
     AnyElement, Context, Focusable as _, InteractiveElement, IntoElement, ParentElement,
-    StatefulInteractiveElement as _, Styled, Window, WindowControlArea, div,
-    prelude::FluentBuilder as _,
+    StatefulInteractiveElement as _, Styled, Window, div, prelude::FluentBuilder as _,
 };
 
 use crate::{
     app::{ConsortApp, Field},
+    ui::window_controls::DragArea as _,
     ui::{
         dialogs::input_box,
         parts::{ButtonKind, button, detail, glyph, icon, text},
@@ -162,7 +162,7 @@ impl ConsortApp {
                     .h(t.space.xxl + t.space.md)
                     .w_full()
                     .flex_none()
-                    .window_control_area(WindowControlArea::Drag),
+                    .drag_area(),
             )
             .child(
                 div()

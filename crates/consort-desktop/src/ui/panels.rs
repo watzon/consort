@@ -6,12 +6,13 @@ use consort_client::{
 use consort_theme::{Tokens, TypeExt as _};
 use gpui_kit::{
     AnyElement, Context, Div, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
-    ParentElement, SharedString, StatefulInteractiveElement as _, Styled, Window,
-    WindowControlArea, div, list, prelude::FluentBuilder as _,
+    ParentElement, SharedString, StatefulInteractiveElement as _, Styled, Window, div, list,
+    prelude::FluentBuilder as _,
 };
 
 use crate::{
     app::{ConsortApp, Panel, TasksTab},
+    ui::window_controls::DragArea as _,
     ui::{
         menu::OpenMenu,
         parts::{
@@ -43,7 +44,7 @@ fn header(t: &Tokens) -> Div {
         .h(t.space.page + t.space.xs)
         .border_b(t.border_width)
         .border_color(t.colors.border_subtle)
-        .window_control_area(WindowControlArea::Drag)
+        .drag_area()
 }
 
 impl ConsortApp {
@@ -329,7 +330,8 @@ impl ConsortApp {
 
         let head = header(t)
             .gap(t.space.sm)
-            .px(t.space.sm)
+            .pl(t.space.sm)
+            .pr(t.space.sm)
             .child(
                 icon_button(
                     "thread-back",
@@ -610,8 +612,14 @@ impl ConsortApp {
             let key = format!("{}.{i}", post.id);
             let element = match body {
                 PostBody::Text(markdown) => {
-                    let md =
-                        self.render_markdown(&key, markdown, Vec::new(), c.surface_card, t, cx);
+                    let md = self.render_markdown(
+                        &key,
+                        markdown,
+                        crate::ui::timeline::post_menu(markdown),
+                        c.surface_card,
+                        t,
+                        cx,
+                    );
                     if you {
                         div()
                             .flex()

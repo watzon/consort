@@ -7,4 +7,6 @@ pub mod parts;
 pub mod settings;
 pub mod sidebar;
 pub mod sizes;
+pub mod switcher;
 pub mod timeline;
+pub mod window_controls;

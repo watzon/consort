@@ -8,13 +8,14 @@ use consort_theme::{Tokens, TypeExt as _};
 use gpui_kit::{
     AnyElement, App, Context, Div, Hsla, InteractiveElement, IntoElement, MouseButton,
     MouseDownEvent, ParentElement, SharedString, StatefulInteractiveElement as _, Styled, Window,
-    WindowControlArea, base::SelectableText, component::text::TextView, div, linear_color_stop,
-    linear_gradient, list, prelude::FluentBuilder as _,
+    base::SelectableText, component::text::TextView, div, linear_color_stop, linear_gradient, list,
+    prelude::FluentBuilder as _,
 };
 
 use crate::{
     app::{ConsortApp, Panel},
     ui::sizes,
+    ui::window_controls::DragArea as _,
     ui::{
         markdown::{Segment, segments},
         menu::{MenuAction, MenuItem, OpenMenu},
@@ -42,11 +43,28 @@ pub fn message_menu(message: &MessageView) -> Vec<MenuItem> {
         ),
     ];
     if message.speaker == Speaker::You {
-        items
-            .push(MenuItem::new("Edit", MenuAction::EditMessage(message.body.clone())).separated());
+        items.push(
+            MenuItem::new(
+                "Edit",
+                MenuAction::EditMessage(message.id.clone(), message.body.clone()),
+            )
+            .separated(),
+        );
         items.push(MenuItem::new("Delete", MenuAction::DeleteMessage(message.id.clone())).danger());
     }
     items
+}
+
+/// What a right click on a post in a task thread offers.
+pub fn post_menu(body: &str) -> Vec<MenuItem> {
+    vec![
+        MenuItem::new("Copy text", MenuAction::Copy(plain_text(body))),
+        MenuItem::new(
+            "Copy as Markdown",
+            MenuAction::CopyMarkdown(body.to_owned()),
+        ),
+        MenuItem::new("Quote in reply", MenuAction::QuoteInReply(body.to_owned())),
+    ]
 }
 
 /// What a right click on selected text offers.
@@ -141,6 +159,21 @@ impl ConsortApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let panel_width = if self.panel == Panel::None {
+            gpui_kit::Pixels::ZERO
+        } else {
+            t.layout.panel_width
+        };
+        let column = (window.viewport_size().width
+            - t.layout.sidebar_width
+            - panel_width
+            - t.space.xl * 2.0)
+            .min(t.layout.timeline_max_width);
+        let narrow = column < sizes::WIDE_TIMELINE;
+        if narrow != self.narrow {
+            self.narrow = narrow;
+            self.timeline.remeasure();
+        }
         let sidebar = self.render_sidebar(t, window, cx);
         let column = div()
             .flex()
@@ -167,6 +200,7 @@ impl ConsortApp {
 
     fn render_header(&mut self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
         let c = &t.colors;
+
         let state = self.state.clone();
         let channel = state.channel(&self.channel_id);
         let name = channel.map(|c| c.name.clone()).unwrap_or_default();
@@ -258,7 +292,7 @@ impl ConsortApp {
             .pr(t.space.lg)
             .border_b(t.border_width)
             .border_color(c.border_subtle)
-            .window_control_area(WindowControlArea::Drag)
+            .drag_area()
             .child(
                 div()
                     .type_style(t.text.title)
@@ -407,7 +441,7 @@ impl ConsortApp {
         };
         match item {
             TimelineItem::Day(day) => div()
-                .pl(t.layout.speaker_gutter + t.space.lg)
+                .when(!self.narrow, |d| d.pl(t.layout.speaker_gutter + t.space.lg))
                 .child(text(day.label, t.text.label, t.colors.text_tertiary))
                 .into_any_element(),
             TimelineItem::Message(message) => self.render_message(&message, t, window, cx),
@@ -415,7 +449,59 @@ impl ConsortApp {
         }
     }
 
-    fn gutter(&self, speaker: Speaker, time: &str, top: gpui_kit::Pixels, t: &Tokens) -> Div {
+    /// One timeline row: the speaker in the gutter at 600 px and wider, or on
+    /// one line above the content when the column is narrower.
+    fn speaker_row(
+        &self,
+        speaker: Speaker,
+        time: &str,
+        edited: bool,
+        top: gpui_kit::Pixels,
+        content: impl IntoElement,
+        t: &Tokens,
+    ) -> AnyElement {
+        let c = &t.colors;
+        if !self.narrow {
+            return div()
+                .flex()
+                .gap(t.space.lg)
+                .child(self.gutter_with(speaker, time, edited, top, t))
+                .child(content)
+                .into_any_element();
+        }
+        let color = if speaker == Speaker::You {
+            c.accent_text
+        } else {
+            c.text_secondary
+        };
+        let mut label = time.to_owned();
+        if edited {
+            label.push_str(", edited");
+        }
+        div()
+            .flex()
+            .flex_col()
+            .gap(t.space.xs + t.space.xxs)
+            .child(
+                div()
+                    .flex()
+                    .items_baseline()
+                    .gap(t.space.sm)
+                    .child(text(speaker.label(), t.text.label, color))
+                    .child(text(label, t.text.caption, c.text_tertiary)),
+            )
+            .child(content)
+            .into_any_element()
+    }
+
+    fn gutter_with(
+        &self,
+        speaker: Speaker,
+        time: &str,
+        edited: bool,
+        top: gpui_kit::Pixels,
+        t: &Tokens,
+    ) -> Div {
         let c = &t.colors;
         let color = if speaker == Speaker::You {
             c.accent_text
@@ -441,6 +527,9 @@ impl ConsortApp {
                     .child(speaker.label()),
             )
             .child(text(time.to_owned(), t.text.caption, c.text_tertiary))
+            .when(edited, |d| {
+                d.child(text("Edited", t.text.caption, c.text_tertiary))
+            })
     }
 
     /// Message text, split into prose and code blocks.
@@ -530,8 +619,15 @@ impl ConsortApp {
             t.space.xxs
         };
         let menu = message_menu(message);
-        let body = self.render_markdown(&message.id, &message.body, menu, c.surface_card, t, cx);
-        let content = if you {
+        let editing = you && self.editing.as_deref() == Some(message.id.as_str());
+        let body = if editing {
+            self.render_edit_box(t, cx)
+        } else {
+            self.render_markdown(&message.id, &message.body, menu, c.surface_card, t, cx)
+        };
+        let content = if editing {
+            div().flex().flex_col().flex_1().min_w_0().child(body)
+        } else if you {
             div()
                 .flex()
                 .flex_col()
@@ -617,12 +713,64 @@ impl ConsortApp {
             }
             content
         };
+        self.speaker_row(
+            message.speaker,
+            &message.time_label,
+            message.edited,
+            top,
+            content,
+            t,
+        )
+    }
+
+    /// The text box that edits one of the user's messages in place. Enter
+    /// saves and Escape cancels.
+    fn render_edit_box(&mut self, t: &Tokens, cx: &mut Context<Self>) -> Div {
+        let c = &t.colors;
         div()
             .flex()
-            .gap(t.space.lg)
-            .child(self.gutter(message.speaker, &message.time_label, top, t))
-            .child(content)
-            .into_any_element()
+            .flex_col()
+            .gap(t.space.sm)
+            .child(
+                div()
+                    .id("edit-message")
+                    .w_full()
+                    .py(t.space.xs + t.space.xxs)
+                    .px(t.space.md)
+                    .bg(c.accent_surface)
+                    .border(t.border_width)
+                    .border_color(c.accent_text)
+                    .rounded(t.radius.lg)
+                    .text_color(c.text_primary)
+                    .child(crate::ui::parts::textarea(&self.inputs.edit, t.text.body))
+                    .capture_key_down(cx.listener(
+                        |this, event: &gpui_kit::KeyDownEvent, window, cx| {
+                            if event.keystroke.key == "escape" {
+                                this.cancel_edit(window, cx);
+                                cx.stop_propagation();
+                            }
+                        },
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(t.space.sm)
+                    .child(
+                        text("Enter saves. Escape cancels.", detail(t), c.text_tertiary).flex_1(),
+                    )
+                    .child(
+                        button("edit-cancel", "Cancel", ButtonKind::Quiet, t).on_click(
+                            cx.listener(|this, _, window, cx| this.cancel_edit(window, cx)),
+                        ),
+                    )
+                    .child(
+                        button("edit-save", "Save", ButtonKind::Primary, t).on_click(
+                            cx.listener(|this, _, window, cx| this.save_edit(window, cx)),
+                        ),
+                    ),
+            )
     }
 
     fn render_card_row(
@@ -641,12 +789,8 @@ impl ConsortApp {
         } else {
             t.space.md
         };
-        div()
-            .flex()
-            .gap(t.space.lg)
-            .child(self.gutter(Speaker::Task, &card.time_label, top, t))
-            .child(self.render_task_card(card, collapsed, t, cx))
-            .into_any_element()
+        let card_element = self.render_task_card(card, collapsed, t, cx);
+        self.speaker_row(Speaker::Task, &card.time_label, false, top, card_element, t)
     }
 
     pub fn render_task_card(
@@ -743,7 +887,7 @@ impl ConsortApp {
                     .answer
                     .map(|choice| answered_label(choice).to_owned())
                     .unwrap_or_default(),
-                None => card.latest.clone().unwrap_or_default(),
+                None => card.latest.as_deref().map(plain_text).unwrap_or_default(),
             };
             body = body.child(
                 div()
@@ -874,7 +1018,7 @@ impl ConsortApp {
         t: &Tokens,
         cx: &mut Context<Self>,
     ) -> Div {
-        let mut row = div().flex().items_center().gap(t.space.sm);
+        let mut row = div().flex().flex_wrap().items_center().gap(t.space.sm);
         for (i, choice) in approval.choices.iter().enumerate() {
             let kind = match choice {
                 ApprovalChoice::AllowOnce => ButtonKind::Primary,

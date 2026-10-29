@@ -5,13 +5,14 @@ use consort_client::{SidebarChannel, WorkerView};
 use consort_theme::{Tokens, TypeExt as _};
 use gpui_kit::{
     AnyElement, Context, Div, InteractiveElement, IntoElement, MouseButton, ParentElement,
-    SharedString, StatefulInteractiveElement as _, Styled, Window, WindowControlArea, div,
+    SharedString, StatefulInteractiveElement as _, Styled, Window, div,
     prelude::FluentBuilder as _,
 };
 
 use crate::{
     app::{ConsortApp, Dialog, Page, SettingsSection},
     ui::sizes,
+    ui::window_controls::DragArea as _,
     ui::{
         menu::{MenuAction, MenuItem, OpenMenu},
         parts::{icon, line, status_glyph, text, worker_dot},
@@ -52,10 +53,16 @@ impl ConsortApp {
             .hover(|s| s.bg(c.hover_sidebar))
             .child(icon("search", t.icon.size, c.text_secondary))
             .child(text("Search", t.text.ui, c.text_secondary).flex_1())
-            .child(text("⌘K", t.text.caption, c.text_tertiary))
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.show_notice("Search comes in a later build.".into(), cx)
-            }));
+            .child(text(
+                if cfg!(target_os = "macos") {
+                    "⌘K"
+                } else {
+                    "Ctrl+K"
+                },
+                t.text.caption,
+                c.text_tertiary,
+            ))
+            .on_click(cx.listener(|this, _, window, cx| this.open_switcher(window, cx)));
 
         let everything = self.channel_row(&sidebar.everything, true, &selected, t, cx);
 
@@ -202,13 +209,18 @@ impl ConsortApp {
             .bg(c.surface_sidebar)
             .border_r(t.border_width)
             .border_color(c.border_subtle)
-            .child(
-                div()
-                    .h(title_bar_height(t))
-                    .flex_none()
-                    .w_full()
-                    .window_control_area(WindowControlArea::Drag),
-            )
+            // macOS draws the traffic lights in this strip. Elsewhere the
+            // title bar above the window has the controls.
+            .when(cfg!(target_os = "macos"), |d| {
+                d.child(
+                    div()
+                        .h(title_bar_height(t))
+                        .flex_none()
+                        .w_full()
+                        .drag_area(),
+                )
+            })
+            .when(!cfg!(target_os = "macos"), |d| d.pt(t.space.sm))
             .child(
                 div()
                     .flex()

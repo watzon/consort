@@ -4,6 +4,10 @@
 
 use gpui_kit::{Pixels, px};
 
+/// Below this column width, the timeline puts the speaker and the time on one
+/// line above each message instead of in the 64 px gutter.
+pub const WIDE_TIMELINE: Pixels = px(600.0);
+
 /// The label column of a settings row ("a label column of 160 px").
 pub const SETTINGS_LABEL: Pixels = px(160.0);
 /// A segmented control in Settings: Mode and Text size.

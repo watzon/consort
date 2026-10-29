@@ -23,6 +23,9 @@ pub struct PendingSend {
 pub struct Cache {
     /// The newest feed `seq` that this cache holds.
     pub seq: u64,
+    /// True once a snapshot of scope `all` is loaded, so a reconnect can
+    /// catch up from `seq` instead of loading everything again.
+    pub loaded: bool,
     pub groups: BTreeMap<String, Group>,
     pub channels: BTreeMap<String, Channel>,
     pub workers: BTreeMap<String, Worker>,
@@ -48,6 +51,7 @@ impl Cache {
         let pending = std::mem::take(&mut self.pending);
         *self = Cache::default();
         self.pending = pending;
+        self.loaded = true;
         self.merge_snapshot(snapshot);
     }
 

@@ -92,10 +92,12 @@ pub struct Inputs {
     pub composer: Entity<TextareaState>,
     pub reply: Entity<TextareaState>,
     pub decision_answer: Entity<TextareaState>,
+    pub edit: Entity<TextareaState>,
     pub name: Entity<InputState>,
     pub purpose: Entity<InputState>,
     pub notes: Entity<TextareaState>,
     pub hub_url: Entity<InputState>,
+    pub search: Entity<InputState>,
     pub setup_code: Entity<InputState>,
 }
 
@@ -125,6 +127,12 @@ pub struct ConsortApp {
     pub decision_writing: Option<String>,
     pub activity_open: Vec<String>,
     pub last_thread: Option<String>,
+    /// The message that the user edits in place.
+    pub editing: Option<String>,
+    /// The timeline column is narrower than 600 px.
+    pub narrow: bool,
+    /// The open switcher and its selected row.
+    pub switcher: Option<usize>,
     pub onboarding: Onboarding,
     pub triggers: TriggerBounds,
     pub focus: FocusHandle,
@@ -158,6 +166,7 @@ impl ConsortApp {
             composer: textarea("Message Consort", (1, 10), window, cx),
             reply: textarea("Reply to the task", (1, 6), window, cx),
             decision_answer: textarea("Write your answer", (2, 6), window, cx),
+            edit: textarea("Message", (1, 10), window, cx),
             name: field("Name", window, cx),
             purpose: field("What is this channel for?", window, cx),
             notes: cx.new(|cx| {
@@ -166,6 +175,7 @@ impl ConsortApp {
                     .placeholder("Write standing guidance for Consort in this channel")
             }),
             hub_url: field("https://hub.example.com", window, cx),
+            search: field("Go to a channel or a task", window, cx),
             setup_code: field("ABCD-EFGH", window, cx),
         };
         let mut subscriptions = Vec::new();
@@ -184,6 +194,27 @@ impl ConsortApp {
             |this, _, event: &InputEvent, window, cx| {
                 if let InputEvent::PressEnter { shift: false, .. } = event {
                     this.send_reply(window, cx);
+                }
+            },
+        ));
+        subscriptions.push(cx.subscribe_in(
+            &inputs.edit,
+            window,
+            |this, _, event: &InputEvent, window, cx| {
+                if let InputEvent::PressEnter { shift: false, .. } = event {
+                    this.save_edit(window, cx);
+                }
+            },
+        ));
+        subscriptions.push(cx.subscribe_in(
+            &inputs.search,
+            window,
+            |this, _, event: &InputEvent, _, cx| {
+                if let InputEvent::Change = event {
+                    if this.switcher.is_some() {
+                        this.switcher = Some(0);
+                    }
+                    cx.notify();
                 }
             },
         ));
@@ -234,6 +265,9 @@ impl ConsortApp {
             decision_writing: None,
             activity_open: Vec::new(),
             last_thread: None,
+            editing: None,
+            narrow: false,
+            switcher: None,
             onboarding: Onboarding::default(),
             triggers: TriggerBounds::default(),
             focus: cx.focus_handle(),
@@ -259,6 +293,7 @@ impl ConsortApp {
             &self.inputs.reply,
             &self.inputs.decision_answer,
             &self.inputs.notes,
+            &self.inputs.edit,
         ] {
             let style = style.clone();
             area.update(cx, |s, cx| {
@@ -271,6 +306,7 @@ impl ConsortApp {
             &self.inputs.purpose,
             &self.inputs.hub_url,
             &self.inputs.setup_code,
+            &self.inputs.search,
         ] {
             let style = style.clone();
             field.update(cx, |s, cx| {
@@ -416,6 +452,27 @@ impl ConsortApp {
                     .collect();
             }
             "onboarding" => self.page = Page::Onboarding,
+            "edit" => {
+                let mine = self.state.timeline(&self.channel_id).and_then(|t| {
+                    t.items.iter().rev().find_map(|i| match i {
+                        consort_client::TimelineItem::Message(m)
+                            if m.speaker == consort_client::Speaker::You =>
+                        {
+                            Some((m.id.clone(), m.body.clone()))
+                        }
+                        _ => None,
+                    })
+                });
+                if let Some((id, body)) = mine {
+                    self.run_menu(MenuAction::EditMessage(id, body), window, cx);
+                }
+            }
+            "switcher" => {
+                self.open_switcher(window, cx);
+                self.inputs
+                    .search
+                    .update(cx, |input, cx| input.set_value("s", window, cx));
+            }
             // A right click near the bottom of the window: the menu opens
             // upward, because there is no room below.
             "menu" => {
@@ -675,6 +732,34 @@ impl ConsortApp {
         self.spawn_command(cx, async move { client.reply_to_task(task_id, body).await });
     }
 
+    pub fn save_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(message_id) = self.editing.take() else {
+            return;
+        };
+        let body = self.inputs.edit.read(cx).value().trim().to_owned();
+        self.timeline.remeasure();
+        self.focus.focus(window, cx);
+        cx.notify();
+        let unchanged = self.state.timelines.iter().flat_map(|t| t.items.iter()).any(|i| {
+            matches!(i, consort_client::TimelineItem::Message(m) if m.id == message_id && m.body.trim() == body)
+        });
+        if body.is_empty() || unchanged {
+            return;
+        }
+        let client = self.client.clone();
+        self.spawn_command(
+            cx,
+            async move { client.edit_message(message_id, body).await },
+        );
+    }
+
+    pub fn cancel_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.editing = None;
+        self.timeline.remeasure();
+        self.focus.focus(window, cx);
+        cx.notify();
+    }
+
     pub fn answer_approval(&mut self, id: String, choice: ApprovalChoice, cx: &mut Context<Self>) {
         let client = self.client.clone();
         self.spawn_command(cx, async move { client.answer_approval(id, choice).await });
@@ -749,11 +834,16 @@ impl ConsortApp {
                     cx,
                 );
             }
-            MenuAction::EditMessage(text) => {
-                self.inputs.composer.update(cx, |input, cx| {
+            MenuAction::EditMessage(message_id, text) => {
+                self.editing = Some(message_id);
+                let end = text.len();
+                self.inputs.edit.update(cx, |input, cx| {
                     input.set_value(text, window, cx);
+                    input.set_selected_range(end..end, cx);
                     input.focus(window, cx);
                 });
+                // The row grows, so measure it again.
+                self.timeline.remeasure();
             }
             MenuAction::DeleteMessage(message_id) => self.spawn_command(cx, async move {
                 client
@@ -912,17 +1002,28 @@ impl ConsortApp {
             if self.dialog.is_some() {
                 self.close_dialog(window, cx);
                 cx.stop_propagation();
-            } else if self.panel != Panel::None {
-                self.close_panel(cx);
-                cx.stop_propagation();
             } else if self.page == Page::Settings {
                 self.page = Page::Main;
                 cx.notify();
                 cx.stop_propagation();
+            } else if self.panel != Panel::None {
+                self.close_panel(cx);
+                cx.stop_propagation();
             }
         }
-        if key == "k" && event.keystroke.modifiers.platform {
-            self.show_notice("Search comes in a later build.".into(), cx);
+        let modifiers = event.keystroke.modifiers;
+        let command = if cfg!(target_os = "macos") {
+            modifiers.platform
+        } else {
+            modifiers.control
+        };
+        if key == "k" && command {
+            if self.switcher.is_some() {
+                self.close_switcher(window, cx);
+            } else {
+                self.open_switcher(window, cx);
+            }
+            cx.stop_propagation();
         }
     }
 }
@@ -991,17 +1092,34 @@ impl Render for ConsortApp {
             .on_key_down(cx.listener(Self::on_key_down))
             .relative()
             .size_full()
+            .flex()
+            .flex_col()
             .bg(t.colors.surface_canvas)
             .text_color(t.colors.text_primary)
             .font_family(t.font_sans.clone())
             .type_style(t.text.ui)
-            .child(body)
-            .when_some(self.dialog.clone(), |root, dialog| {
-                root.child(self.render_dialog(&dialog, &t, window, cx))
-            })
-            .when_some(self.notice.clone(), |root, notice| {
-                root.child(self.render_notice(notice, &t, cx))
-            })
+            // Windows and Linux: a title bar with the window controls. On
+            // macOS the traffic lights sit in the sidebar instead.
+            .children(crate::ui::window_controls::title_bar(&t, window))
+            .child(
+                // Dialogs and the switcher cover the app but not the title
+                // bar, so the window can always move and close.
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .w_full()
+                    .child(body)
+                    .when_some(self.dialog.clone(), |layer, dialog| {
+                        layer.child(self.render_dialog(&dialog, &t, window, cx))
+                    })
+                    .when_some(self.notice.clone(), |layer, notice| {
+                        layer.child(self.render_notice(notice, &t, cx))
+                    })
+                    .when(self.switcher.is_some(), |layer| {
+                        layer.child(self.render_switcher(&t, cx))
+                    }),
+            )
             .when_some(menu, |root, menu| {
                 root.child(render_menu(
                     &menu,

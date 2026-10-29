@@ -61,6 +61,10 @@ struct Hub {
     task: Option<Task>,
     approval: Option<Approval>,
     messages: Vec<Message>,
+    /// On a reconnect, answer `sync.subscribe` with `resync_required` once.
+    resync_on_reconnect: bool,
+    resync_sent: bool,
+    kick: Arc<tokio::sync::Notify>,
 }
 
 type Shared = Arc<Mutex<Hub>>;
@@ -223,7 +227,16 @@ async fn session(hub: Shared, mut socket: WebSocket) {
         h.sessions.len() - 1
     };
     send(&mut socket, Frame::event(&AuthChallenge { nonce }).unwrap()).await;
-    while let Some(req) = next_request(&mut socket).await {
+    let kick = hub.lock().unwrap().kick.clone();
+    loop {
+        let req = tokio::select! {
+            req = next_request(&mut socket) => req,
+            _ = kick.notified() => {
+                let _ = socket.send(WsMessage::Close(None)).await;
+                return;
+            }
+        };
+        let Some(req) = req else { return };
         hub.lock().unwrap().sessions[index].push(req.kind.clone());
         let reply = match req.kind.as_str() {
             "auth.response" => {
@@ -259,7 +272,16 @@ async fn session(hub: Shared, mut socket: WebSocket) {
             }
             "sync.subscribe" => {
                 let _: SyncSubscribe = req.decode_as().unwrap();
-                req.respond_ok(&Empty {}).unwrap()
+                let mut h = hub.lock().unwrap();
+                if index > 0 && h.resync_on_reconnect && !h.resync_sent {
+                    h.resync_sent = true;
+                    req.respond_error(ErrorBody::new(
+                        ErrorCode::ResyncRequired,
+                        "The feed position is older than the oldest kept entry.",
+                    ))
+                } else {
+                    req.respond_ok(&Empty {}).unwrap()
+                }
             }
             "message.send" => {
                 let send_body: MessageSend = req.decode_as().unwrap();
@@ -461,5 +483,49 @@ async fn pairs_syncs_sends_answers_and_reconnects() {
     assert_eq!(
         hub.lock().unwrap().sessions[0][..4],
         ["auth.response", "hello", "sync.snapshot", "sync.subscribe"]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resync_required_reloads_the_snapshot() {
+    let (url, hub) = start_hub().await;
+    hub.lock().unwrap().resync_on_reconnect = true;
+    let dir = tempfile::tempdir().unwrap();
+    let client =
+        Client::start_with(Some(Store::new(dir.path())), ClientOptions::desktop()).unwrap();
+    client.pair(url, CODE.into()).await.unwrap();
+    wait_for(&client, "the first snapshot", |s| {
+        s.connection == Connection::Online && s.everything().is_some_and(|c| c.name == "Everything")
+    })
+    .await;
+
+    // While the client is away, the hub changes and forgets old feed
+    // entries. The client must load a new snapshot instead of catching up.
+    let kick = {
+        let mut h = hub.lock().unwrap();
+        if let Some(channel) = h.channel.as_mut() {
+            channel.purpose = "Renamed while the client was away".into();
+        }
+        h.seq = 40;
+        h.kick.clone()
+    };
+    kick.notify_one();
+    let state = wait_for(&client, "the new snapshot", |s| {
+        s.connection == Connection::Online
+            && s.everything()
+                .is_some_and(|c| c.purpose == "Renamed while the client was away")
+    })
+    .await;
+    assert!(state.everything().is_some());
+    let sessions = hub.lock().unwrap().sessions.clone();
+    assert_eq!(
+        sessions[1],
+        vec![
+            "auth.response",
+            "hello",
+            "sync.subscribe",
+            "sync.snapshot",
+            "sync.subscribe"
+        ]
     );
 }

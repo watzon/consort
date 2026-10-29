@@ -5,13 +5,14 @@ use consort_client::{ApprovalMode, AuthState, WorkerView};
 use consort_theme::{Appearance, Mode, TextSize, ThemeLibrary, Tokens, TypeExt as _};
 use gpui_kit::{
     AnyElement, Context, Div, Hsla, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
-    ParentElement, SharedString, StatefulInteractiveElement as _, Styled, Window,
-    WindowControlArea, div, prelude::FluentBuilder as _, px,
+    ParentElement, SharedString, StatefulInteractiveElement as _, Styled, Window, div,
+    prelude::FluentBuilder as _, px,
 };
 
 use crate::{
     app::{ConsortApp, Dialog, Page, SettingsSection},
     ui::sizes,
+    ui::window_controls::DragArea as _,
     ui::{
         menu::{MenuAction, MenuItem, OpenMenu},
         parts::{ButtonKind, button, detail, glyph, icon, icon_button, line, text, worker_dot},
@@ -211,12 +212,7 @@ impl ConsortApp {
             .bg(c.surface_sidebar)
             .border_r(t.border_width)
             .border_color(c.border_subtle)
-            .child(
-                div()
-                    .h(title_bar_height(t))
-                    .w_full()
-                    .window_control_area(WindowControlArea::Drag),
-            )
+            .child(div().h(title_bar_height(t)).w_full().drag_area())
             .child(
                 row(t)
                     .id("settings-back")
@@ -400,7 +396,8 @@ impl ConsortApp {
             .flex()
             .items_center()
             .gap(t.space.md)
-            .w(sizes::THEME_ROW)
+            .w_full()
+            .max_w(sizes::THEME_ROW)
             .py(t.space.md + t.space.xxs)
             .px(t.space.lg)
             .rounded(t.radius.lg)
@@ -439,7 +436,12 @@ impl ConsortApp {
                     },
                 )),
             );
-        let mut rejected = div().flex().flex_col().gap(t.space.sm).w(sizes::THEME_ROW);
+        let mut rejected = div()
+            .flex()
+            .flex_col()
+            .gap(t.space.sm)
+            .w_full()
+            .max_w(sizes::THEME_ROW);
         for bad in &library.rejected {
             rejected = rejected.child(
                 div()
@@ -584,7 +586,7 @@ impl ConsortApp {
                     .pr(t.space.sm)
                     .border_b(t.border_width)
                     .border_color(c.border_subtle)
-                    .window_control_area(WindowControlArea::Drag)
+                    .drag_area()
                     .child(div().flex_1().type_style(t.text.title).child("Workers"))
                     .child(
                         button("add-worker", "Add worker", ButtonKind::Secondary, t)

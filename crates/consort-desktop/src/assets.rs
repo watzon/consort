@@ -6,7 +6,19 @@ use std::borrow::Cow;
 
 use gpui_kit::{AssetSource, SharedString};
 
-const FILES: [(&str, &[u8]); 44] = [
+const FILES: [(&str, &[u8]); 47] = [
+    (
+        "icons/minus.svg",
+        include_bytes!("../assets/icons/minus.svg"),
+    ),
+    (
+        "icons/square.svg",
+        include_bytes!("../assets/icons/square.svg"),
+    ),
+    (
+        "icons/restore.svg",
+        include_bytes!("../assets/icons/restore.svg"),
+    ),
     (
         "icons/arrow-left.svg",
         include_bytes!("../assets/icons/arrow-left.svg"),

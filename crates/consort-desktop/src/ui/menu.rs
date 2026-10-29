@@ -21,7 +21,8 @@ pub enum MenuAction {
     AskConsort(String),
     CopyMarkdown(String),
     ReplyInThread(String),
-    EditMessage(String),
+    /// Edit a message in place: its ID and its text.
+    EditMessage(String, String),
     DeleteMessage(String),
     OpenThread(String),
     ResolveTask(String),

@@ -226,6 +226,11 @@ impl Client {
         self.run(Command::Pair { hub_url, code }).await
     }
 
+    /// Changes the text of one of the user's own messages.
+    pub async fn edit_message(&self, message_id: String, body: String) -> Result<(), ClientError> {
+        self.run(Command::EditMessage { message_id, body }).await
+    }
+
     pub async fn reply_to_task(&self, task_id: String, body: String) -> Result<(), ClientError> {
         self.run(Command::ReplyToTask {
             task_id,

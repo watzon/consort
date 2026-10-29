@@ -402,9 +402,13 @@ async fn session(shared: &Arc<Shared>, identity: &Identity) -> Result<(), Sessio
         .map_err(refused_or_lost)?;
 
     // Catch up from the feed position, or load a snapshot.
-    let seq = shared.cache.lock().map(|c| c.seq).unwrap_or(0);
+    let (loaded, seq) = shared
+        .cache
+        .lock()
+        .map(|c| (c.loaded, c.seq))
+        .unwrap_or((false, 0));
     let mut subscribed = false;
-    if seq > 0 {
+    if loaded {
         match handshake_call(
             &mut ws,
             &SyncSubscribe {

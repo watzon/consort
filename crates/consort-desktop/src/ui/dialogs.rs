@@ -308,9 +308,12 @@ impl ConsortApp {
                 )
             }
         };
+        let max_height = window.viewport_size().height - t.space.xxl * 2.0;
         let card = div()
             .id("dialog")
             .occlude()
+            .max_h(max_height)
+            .overflow_y_scroll()
             .flex()
             .flex_col()
             .gap(t.space.lg + t.space.xxs)
