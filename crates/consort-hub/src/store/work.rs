@@ -460,6 +460,15 @@ impl Tx<'_> {
         Ok(())
     }
 
+    /// Deletes the inbox rows that went into a turn.
+    pub fn delete_task_inbox(&mut self, ids: &[i64]) -> Result<()> {
+        for id in ids {
+            self.db()
+                .execute("DELETE FROM task_inbox WHERE id = ?1", [id])?;
+        }
+        Ok(())
+    }
+
     pub fn clear_task_inbox(&mut self, task_id: TaskId) -> Result<()> {
         self.db().execute(
             "DELETE FROM task_inbox WHERE task_id = ?1",

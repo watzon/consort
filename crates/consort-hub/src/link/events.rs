@@ -15,12 +15,14 @@ use consort_proto::tools::HubTool;
 use consort_proto::turn_input::WakeEvent;
 use consort_proto::worker_link::{
     HubToWorker, RequestBody, RequestOpened, RequestOutcome, SequencedEvent, SessionEvent,
-    SessionEvents, SessionEventsAck, SessionTurn, TurnEndReason, TurnInput, contiguous_seq,
+    SessionEvents, SessionEventsAck, SessionStop, SessionTurn, TurnEndReason, TurnInput,
+    contiguous_seq,
 };
 
 use super::EmitNow;
 use crate::error::{HubError, Result};
 use crate::hub::Hub;
+use crate::limits::{MESSAGE_BODY_MAX_BYTES, TURN_TEXT_MAX_BYTES, cut_text, json_len};
 use crate::ops::flow::transition;
 use crate::ops::waiting::resume_if_nothing_waits;
 use crate::store::Tx;
@@ -104,6 +106,17 @@ impl<'h> Ctx<'h> {
         }
         self.task_dirty = false;
         Ok(())
+    }
+
+    /// Sets the status reason of a failed task of this session. `persist`
+    /// saves it. Saving the task in another way would be overwritten there.
+    pub(crate) fn set_failed_reason(&mut self, reason: String) {
+        if let Some(task) = self.task.as_mut()
+            && task.status == TaskStatus::Failed
+        {
+            task.status_reason = Some(cut_text(&reason, crate::limits::NOTICE_TEXT_MAX_BYTES));
+            self.task_dirty = true;
+        }
     }
 
     /// Moves the task of this session, if it has one.
@@ -477,6 +490,8 @@ fn open_request(tx: &mut Tx<'_>, ctx: &mut Ctx<'_>, opened: &RequestOpened) -> R
         RequestBody::Approval(_) => (MessageKind::Approval, opened.summary.clone()),
         RequestBody::Question(q) => (MessageKind::Decision, q.question.clone()),
     };
+    // The text comes from the harness, so the hub cuts it and does not refuse it.
+    let body = cut_text(&body, MESSAGE_BODY_MAX_BYTES);
     let card = match &ctx.task {
         Some(task) => {
             tx.post_in_task_thread(task, Some(&ctx.session), Author::Assistant, kind, &body)?
@@ -639,6 +654,7 @@ fn coordinator_turn_ended(
             .map(str::trim)
             .filter(|t| !t.is_empty());
         if let Some(text) = text {
+            let text = cut_text(text, MESSAGE_BODY_MAX_BYTES);
             let mut new =
                 NewMessage::new(ctx.channel.id, Author::Assistant, MessageKind::Text, text);
             new.author_session_id = Some(ctx.session.id);
@@ -684,15 +700,13 @@ fn task_turn_ended(
         return ctx.move_task(tx, TaskStatus::Failed, Some(text), None);
     }
 
-    // Messages that waited for the turn to end start the next turn.
+    // Messages that waited for the turn to end start the next turn. They go
+    // in order while the text fits in one turn. The rest wait for the turn
+    // after it.
     let inbox = work::task_inbox(tx.db(), task_id)?;
     if !inbox.is_empty() && !ctx.session.state.is_final() {
-        let text = inbox
-            .iter()
-            .map(|(_, t)| t.as_str())
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        tx.clear_task_inbox(task_id)?;
+        let (taken, text) = inbox_batch(&inbox, TURN_TEXT_MAX_BYTES);
+        tx.delete_task_inbox(&taken)?;
         tx.queue_command(
             ctx.session.worker_id,
             &HubToWorker::SessionTurn(SessionTurn {
@@ -741,6 +755,78 @@ fn task_turn_ended(
     Ok(())
 }
 
+/// Queues `session.stop` for a session that the hub ended, so the harness
+/// on the worker stops too. A removed worker gets nothing: its commands are
+/// gone, and it cannot connect again.
+pub(crate) fn queue_stop(
+    tx: &mut Tx<'_>,
+    fx: &mut Effects,
+    session: &Session,
+    reason: &str,
+) -> Result<()> {
+    let removed = crate::store::machine::worker(tx.db(), session.worker_id)?
+        .is_none_or(|w| w.revoked_at.is_some());
+    if removed {
+        return Ok(());
+    }
+    tx.queue_command(
+        session.worker_id,
+        &HubToWorker::SessionStop(SessionStop {
+            session_id: session.id,
+            reason: reason.to_owned(),
+        }),
+    )?;
+    fx.pump(session.worker_id);
+    Ok(())
+}
+
+/// Ends a session that is still open because the hub no longer needs it,
+/// for example the old session of a task that is retried. Its pending
+/// requests are canceled and the worker gets `session.stop`. Returns the
+/// work to do after the commit.
+pub(crate) fn end_session_by_hub(
+    hub: &Hub,
+    tx: &mut Tx<'_>,
+    session_id: SessionId,
+    reason: &str,
+) -> Result<Effects> {
+    let mut ctx = Ctx::load(hub, tx, session_id)?;
+    if ctx.session.state.is_final() {
+        return Ok(Effects::default());
+    }
+    ctx.session.end_reason = Some(reason.to_owned());
+    finish_session(tx, &mut ctx, SessionState::Ended)?;
+    queue_stop(tx, &mut ctx.fx, &ctx.session, reason)?;
+    ctx.persist(tx)?;
+    Ok(ctx.fx)
+}
+
+/// The inbox messages that go into one turn: their row IDs and the joined
+/// text. A first message that alone does not fit is cut.
+fn inbox_batch(inbox: &[(i64, String)], room: usize) -> (Vec<i64>, String) {
+    const GAP: &str = "\n\n";
+    let mut taken = Vec::new();
+    let mut text = String::new();
+    let mut used = 0;
+    for (id, message) in inbox {
+        let cost = json_len(message) + if taken.is_empty() { 0 } else { json_len(GAP) };
+        if used + cost > room {
+            if taken.is_empty() {
+                taken.push(*id);
+                text = cut_text(message, room);
+            }
+            break;
+        }
+        if !taken.is_empty() {
+            text.push_str(GAP);
+        }
+        text.push_str(message);
+        used += cost;
+        taken.push(*id);
+    }
+    (taken, text)
+}
+
 /// Marks a session as lost from outside an event batch, for example when a
 /// worker no longer has it.
 impl Hub {
@@ -758,8 +844,11 @@ impl Hub {
                 if ctx.session.state.is_final() {
                     return Ok(Effects::default());
                 }
-                ctx.session.end_reason = Some(reason);
+                ctx.session.end_reason = Some(reason.clone());
                 finish_session(tx, &mut ctx, SessionState::Lost)?;
+                // The hub decided this, so the worker may still run the
+                // harness. Tell it to stop.
+                queue_stop(tx, &mut ctx.fx, &ctx.session, &reason)?;
                 ctx.persist(tx)?;
                 Ok(ctx.fx)
             })

@@ -13,7 +13,7 @@ use consort_proto::frame::{
 };
 use consort_proto::ids::WorkerId;
 use consort_proto::worker_link::{
-    HubToWorker, OFFLINE_AFTER_SECS, SessionStop, ToolList, ToolListResult, WorkerToHub,
+    HubToWorker, OFFLINE_AFTER_SECS, SessionStop, ToolCall, ToolList, ToolListResult, WorkerToHub,
 };
 use futures_util::StreamExt;
 
@@ -63,17 +63,15 @@ async fn run_worker(hub: Hub, mut socket: WebSocket) {
         fail_protocol(&mut socket, &auth.hello).await;
         return;
     };
-    let (result, unknown) = match hub.worker_hello(worker_id, hello, version).await {
+    let (result, stops) = match hub.worker_hello(worker_id, hello, version).await {
         Ok(pair) => pair,
         Err(err) => {
-            fail(
-                &mut socket,
-                &auth.hello,
-                err.to_error_body(),
-                1011,
-                "internal",
-            )
-            .await;
+            let (code, reason) = if err.code() == ErrorCode::Unauthorized {
+                (1008, "unauthorized")
+            } else {
+                (1011, "internal")
+            };
+            fail(&mut socket, &auth.hello, err.to_error_body(), code, reason).await;
             return;
         }
     };
@@ -99,17 +97,38 @@ async fn run_worker(hub: Hub, mut socket: WebSocket) {
         old.outbox.close();
         old.fail_pending();
     }
+    // A revoke closes only registered links, so read the revoke time again
+    // now that this link is registered. This also sets the worker online
+    // again if the old connection marked it offline during this hello.
+    match hub.worker_link_registered(worker_id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::info!(worker_id = %worker_id, "a removed worker finished its hello, so the hub closes the link");
+            cancel.cancel();
+            link.fail_pending();
+            hub.links.remove(worker_id, link.conn_id);
+            let _ = writer.await;
+            return;
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, worker_id = %worker_id, "could not check a new worker link, so the hub closes it");
+            cancel.cancel();
+            link.fail_pending();
+            if hub.links.remove(worker_id, link.conn_id) {
+                let _ = hub.worker_went_offline(worker_id).await;
+            }
+            let _ = writer.await;
+            return;
+        }
+    }
     tracing::info!(worker_id = %worker_id, "a worker connected");
 
-    // The worker reported sessions that the hub does not know.
-    for session_id in unknown {
-        let hub = hub.clone();
+    // The worker reported sessions that the hub does not know, or that have
+    // ended on the hub. The worker stops them.
+    for (session_id, reason) in stops {
         let link = link.clone();
         tokio::spawn(async move {
-            let command = HubToWorker::SessionStop(SessionStop {
-                session_id,
-                reason: "The hub does not know this session.".to_owned(),
-            });
+            let command = HubToWorker::SessionStop(SessionStop { session_id, reason });
             if let Ok(Frame::Request(request)) =
                 Frame::family_request(FrameId::generate(), &command)
             {
@@ -122,7 +141,6 @@ async fn run_worker(hub: Hub, mut socket: WebSocket) {
                     )
                     .await;
             }
-            let _ = hub;
         });
     }
     hub.worker_came_online(worker_id);
@@ -222,17 +240,37 @@ async fn handle_request(
             // A tool call can take long, so it must not block other frames.
             let hub = hub.clone();
             let link = link.clone();
-            tokio::spawn(async move {
-                let result = match check_session_owner(&hub, worker_id, call.session_id).await {
-                    Ok(()) => Ok(hub
-                        .call_tool(call.session_id, &call.name, call.arguments)
-                        .await),
-                    Err(err) => Err(err),
-                };
-                reply(&link, &request, result);
-            });
+            tokio::spawn(run_tool_call(hub, worker_id, link, request, call));
         }
     }
+}
+
+/// Runs one `tool.call` and sends the answer. It waits while the link has
+/// [`MAX_TOOL_CALLS_PER_LINK`](crate::link::MAX_TOOL_CALLS_PER_LINK) calls
+/// running.
+async fn run_tool_call(
+    hub: Hub,
+    worker_id: WorkerId,
+    link: Arc<WorkerLink>,
+    request: RequestFrame,
+    call: ToolCall,
+) {
+    let Ok(_permit) = link.tool_calls.clone().acquire_owned().await else {
+        // The semaphore is never closed. A closed one means the link is gone.
+        reply::<Empty>(
+            &link,
+            &request,
+            Err(HubError::internal("the tool call limit closed")),
+        );
+        return;
+    };
+    let result = match check_session_owner(&hub, worker_id, call.session_id).await {
+        Ok(()) => Ok(hub
+            .call_tool(call.session_id, &call.name, call.arguments)
+            .await),
+        Err(err) => Err(err),
+    };
+    reply(&link, &request, result);
 }
 
 async fn check_session_owner(
@@ -260,5 +298,49 @@ fn reply<T: serde::Serialize>(link: &WorkerLink, request: &RequestFrame, result:
             .unwrap_or_else(|err| request.respond_error(err.to_error_body())),
         Err(err) => request.respond_error(err.to_error_body()),
     };
-    link.outbox.send_frame(&frame);
+    link.outbox.send_response(request, &frame);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::link::MAX_TOOL_CALLS_PER_LINK;
+    use crate::net::ws::Outbox;
+    use consort_proto::ids::SessionId;
+    use serde_json::json;
+    use tokio_util::sync::CancellationToken;
+
+    #[tokio::test]
+    async fn a_tool_call_waits_while_the_link_runs_its_most_calls() {
+        let (hub, _dir) = crate::hub::test_hub().await;
+        let (outbox, mut rx) = Outbox::new(CancellationToken::new());
+        let link = Arc::new(WorkerLink::new(1, WorkerId::new(), outbox));
+        let held: Vec<_> = (0..MAX_TOOL_CALLS_PER_LINK)
+            .map(|_| link.tool_calls.clone().try_acquire_owned().unwrap())
+            .collect();
+        let call = ToolCall {
+            session_id: SessionId::new(),
+            call_id: "c1".to_owned(),
+            name: "memory_list".to_owned(),
+            arguments: json!({}),
+        };
+        let request = RequestFrame {
+            id: FrameId::generate(),
+            kind: "tool.call".to_owned(),
+            body: json!({}),
+        };
+        let running = tokio::spawn(run_tool_call(
+            hub.clone(),
+            link.worker_id,
+            link.clone(),
+            request,
+            call,
+        ));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(rx.try_recv().is_err(), "the call ran past the limit");
+        drop(held);
+        running.await.unwrap();
+        // The session does not exist, so the answer is an error. It came.
+        assert!(rx.try_recv().is_ok());
+    }
 }

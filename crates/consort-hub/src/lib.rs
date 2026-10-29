@@ -17,6 +17,7 @@ mod api;
 mod coordinator;
 mod error;
 mod hub;
+mod limits;
 mod link;
 mod maintenance;
 mod net;

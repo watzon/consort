@@ -12,6 +12,7 @@ use consort_proto::client_api::{
     TaskReopen, TaskResolve, TaskRetry,
 };
 use consort_proto::error::ErrorCode;
+use consort_proto::frame::MessageFamily;
 use consort_proto::ids::TaskId;
 use consort_proto::model::{
     ApprovalStatus, DecisionAnswer, DecisionStatus, ItemStatus, MessageKind, SessionRole,
@@ -508,7 +509,36 @@ async fn a_failed_turn_fails_the_task_and_retry_starts_a_new_session() {
         retried.status,
         TaskStatus::UpNext | TaskStatus::Working
     ));
-    let second = world.worker.accept_session_start().await;
+    // A failed turn does not end the session, so the retry stops the old
+    // session and starts a new one. The two commands have their own queues,
+    // so they can come in either order.
+    let mut stopped = false;
+    let mut second = None;
+    while !stopped || second.is_none() {
+        let (request, command) = world.worker.next_command().await;
+        match command {
+            HubToWorker::SessionStop(stop) => {
+                assert_eq!(stop.session_id, sid);
+                world.worker.respond_ok(&request, &json!({})).await;
+                stopped = true;
+            }
+            HubToWorker::SessionStart(start) => {
+                world
+                    .worker
+                    .respond_ok(
+                        &request,
+                        &consort_proto::worker_link::SessionStartResult {
+                            workspace_path: "/tmp/workspace".to_owned(),
+                            native_ref: None,
+                        },
+                    )
+                    .await;
+                second = Some(start);
+            }
+            other => panic!("unexpected command {}", other.type_name()),
+        }
+    }
+    let second = second.unwrap();
     assert_eq!(second.task_id, Some(task_id));
     assert_ne!(second.session_id, sid);
     world.hub.handle.shutdown().await.unwrap();

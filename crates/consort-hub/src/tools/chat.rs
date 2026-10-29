@@ -222,6 +222,11 @@ impl Hub {
                     ));
                 }
                 if message.body != args.body {
+                    crate::limits::check_text(
+                        "message",
+                        &args.body,
+                        crate::limits::MESSAGE_BODY_MAX_BYTES,
+                    )?;
                     message.body = args.body;
                     message.edited_at = Some(tx.now());
                     tx.save_message(&message)?;
@@ -267,7 +272,14 @@ impl Hub {
         let (messages, has_more) = self
             .store
             .read(move |conn| {
-                conversation::messages_page(conn, channel_id, None, args.before, limit)
+                conversation::messages_page(
+                    conn,
+                    channel_id,
+                    None,
+                    args.before,
+                    limit,
+                    crate::limits::TOOL_MESSAGES_MAX_BYTES,
+                )
             })
             .await?;
         to_value(&FetchTimelineResult { messages, has_more })
@@ -506,6 +518,7 @@ impl Hub {
                     None,
                     None,
                     READ_CHANNEL_MESSAGES,
+                    crate::limits::TOOL_MESSAGES_MAX_BYTES,
                 )?;
                 if let Some(since) = args.since {
                     messages.retain(|m| m.created_at > since);

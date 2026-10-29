@@ -35,6 +35,22 @@ A frame must be a JSON object. A missing `body` reads as `{}`. Readers ignore fi
 
 `v` is the frame format version. The protocol version is agreed in the `hello` exchange. A frame larger than 1 MiB is a protocol error. Large data goes through the blob endpoints.
 
+### Size limits
+
+The hub keeps every frame that it sends under 1 MiB. Limits count the bytes of a text as a JSON string: a quote or a backslash counts 2 bytes, and a control character counts 2 or 6 bytes.
+
+| What | Limit | When it is larger |
+|---|---|---|
+| A message body | 256 KiB | The hub refuses it with `invalid` |
+| A task brief, a routine prompt | 32 KiB | The hub refuses it with `invalid` |
+| A channel purpose | 4 KiB | The hub refuses it with `invalid` |
+| Channel instructions | 16 KiB | The hub refuses it with `invalid` |
+| A notice or a task status reason with text from a worker | 4 KiB | The hub cuts it and says so at the end |
+| A message from a worker, for example the fallback post or the card of a request | 256 KiB | The hub cuts it and says so at the end |
+| A command to a worker | 1 MiB | The hub refuses to queue it, and the action fails with `invalid` |
+
+A response that does not fit in one frame becomes an error response with the code `internal` and a message that names the size. A feed entry that does not fit becomes a `feed.skipped` event (see [Sync](#sync)).
+
 ### Versions
 
 Each side sends the protocol versions that it supports in `hello`. The hub picks the highest common version. If no common version exists, the hub closes the connection with `protocol_mismatch`.
@@ -66,7 +82,7 @@ Workers and clients pair the same way, and both prove their identity with an Ed2
 2. On the new machine, the user runs `app worker pair https://hub.example.com --code ABCD-EFGH`.
 3. The worker makes an Ed25519 key pair. The private key stays in the OS keychain, or in a file with mode 0600 when no keychain is available.
 4. The worker sends `POST /v1/pair/worker` with `code`, `public_key`, `hostname`, `os`, `arch` and an optional `name`. Public keys, signatures and nonces are lowercase hex on the wire.
-5. The hub checks the code, stores the worker, and returns the `worker_id`. An HTTP error has the body `{"error": {"code", "message"}}`. The hub allows 10 pairing requests per minute from one IP address. After that, it answers HTTP 429 with the code `policy_denied`.
+5. The hub checks the code, stores the worker, and returns the `worker_id`. An HTTP error has the body `{"error": {"code", "message"}}`. The hub allows 10 pairing requests per minute from one IPv4 address or one IPv6 /64 network, and 60 per minute from all addresses together. After that, it answers HTTP 429 with the code `policy_denied`.
 6. The worker writes `hub_url` and its ID to `worker.toml`.
 
 ### Pair a client
@@ -79,7 +95,9 @@ The first client uses the setup code that the hub prints on its first start. To 
 2. The hub sends the event `auth.challenge` with a 32-byte random `nonce`.
 3. The peer sends the request `auth.response` with `peer_id` (its worker ID or client ID) and `signature`, an Ed25519 signature over the UTF-8 bytes `consort-auth-v1\n<origin>\n<nonce in hex>`.
 4. The hub checks the signature against the stored public key. It answers `ok` with an empty body, or `unauthorized` and closes the connection.
-5. The peer sends `hello`. The hub answers with the protocol version.
+5. The peer sends `hello`. The hub answers with the protocol version. If the worker or client was revoked after step 4, the hub answers `unauthorized` and closes the connection.
+
+At most 64 connections can be between steps 1 and 5 at the same time. The hub closes a connection over that limit at once, with the WebSocket close code 1013. The peer tries again later.
 
 The origin is `scheme://host[:port]` of the hub URL, in lowercase, with `ws` read as `http` and `wss` as `https`, and without a default port, a path or a query. The peer takes it from the hub URL in its own configuration. The hub takes it from its configured public URL. So a peer cannot pass a challenge from one hub to another.
 
@@ -93,11 +111,11 @@ A client that needs the blob endpoints sends `auth.http_token` and gets a bearer
 
 | Type | Body | Response |
 |---|---|---|
-| `hello` | `worker_id`, `version`, `protocol_versions`, `sessions` (each with `session_id`, `last_seq` and `state`) | `protocol_version`, `hub_version`, and `sessions` with the hub's stored `last_seq` for each session that it knows. The hub sends `session.stop` for a session that it does not know |
+| `hello` | `worker_id`, `version`, `protocol_versions`, `sessions` (each with `session_id`, `last_seq` and `state`) | `protocol_version`, `hub_version`, and `sessions` with the hub's stored `last_seq` for each open session that it knows. The hub sends `session.stop` for a session that it does not know, and for a session that has ended or is lost on the hub |
 | `inventory` | See [Inventory](#inventory) | None |
 | `session.events` | `session_id` and `events` (each with `seq`, `at` and `event`) | The ack: `session_id` and `last_seq`, the highest contiguous `seq` that the hub stored |
-| `tool.list` | `session_id` | `tools`: the hub tools for that session's role, each with `name`, `description` and `input_schema` |
-| `tool.call` | `session_id`, `call_id`, `name`, `arguments` | `content` (MCP text blocks, `{"type": "text", "text": ...}`), `is_error`, and optional `structured_content` |
+| `tool.list` | `session_id` | `tools`: the hub tools for that session's role, each with `name`, `description` and `input_schema`. A session that has ended or is lost gets `conflict` |
+| `tool.call` | `session_id`, `call_id`, `name`, `arguments` | `content` (MCP text blocks, `{"type": "text", "text": ...}`), `is_error`, and optional `structured_content`. A session that has ended or is lost gets an error result with `conflict`. The hub runs at most 16 tool calls of one worker at the same time; more calls wait |
 
 ### Hub to worker
 
@@ -155,7 +173,10 @@ The hub makes an approval for an approval request. It makes a decision with a `r
 - The worker writes every event to its spool before it sends the event. The worker deletes an event from the spool after the hub acknowledges it.
 - The worker sends batches of at most 256 events or 256 KiB.
 - On reconnect, `hello` lists the open sessions. The hub answers with its stored `last_seq` for each session, and the worker sends every event after that number.
-- The hub keeps commands for an offline worker in a per-session queue and sends them in order on reconnect. A queued command expires after 7 days.
+- The hub keeps commands for an offline worker in a per-session queue and sends them in order on reconnect. A queued command expires after 7 days. Then the hub ends its session as `lost`: a task fails with Retry, and the channel or the task thread gets a notice. An answer whose `session.respond` expired shows as `expired`.
+- When the hub ends a session that the worker can still run, it sends `session.stop`. For example: the hub marks a session `lost`, or the user retries a failed task.
+- While a task session has an open turn, a new message for the task steers the turn (when the worker is online and the harness can steer) or waits for the turn to end. The hub never sends a second `session.turn` while a turn is open, also not to an offline worker.
+- A coordinator turn holds as many queued events as fit in 512 KiB. The other events wait for the next turn. An event that alone does not fit is cut, with a note that names `fetch_thread` and the message ID. Task inbox messages split over turns in the same way.
 - The worker sends a WebSocket ping every 20 seconds. The hub marks the worker offline after 60 seconds with no frames.
 
 ### Inventory
@@ -174,7 +195,7 @@ The worker sends a full inventory after `hello` and again when any part changes.
 
 ### Blobs
 
-`PUT /v1/blobs/{sha256}` uploads a blob. `GET /v1/blobs/{sha256}` downloads it. Clients authenticate with `Authorization: Bearer <token>`, with the token from `auth.http_token`. The hub rejects an upload whose content does not match the hash.
+`PUT /v1/blobs/{sha256}` uploads a blob. `GET /v1/blobs/{sha256}` downloads it. Clients authenticate with `Authorization: Bearer <token>`, with the token from `auth.http_token`. The hub checks the headers before it reads the body, so a request without valid credentials gets `401` at once. It rejects an upload whose content does not match the hash, and an upload larger than 256 MiB.
 
 Workers authenticate with three headers:
 
@@ -216,7 +237,7 @@ The hub gives each session the tools for its role. Each tool's `input_schema` is
 | `update_message` | `message_id`, `body` | Only for the session's own messages |
 | `react` | `message_id`, `emoji` | |
 | `no_reply_needed` | None | Ends the turn with no visible reply |
-| `fetch_timeline` | optional `before`, `limit` | Messages |
+| `fetch_timeline` | optional `before`, `limit` | Messages, newest first, and `has_more`. The page stops early when its messages would take more than 320 KiB |
 | `fetch_thread` | `message_id` | The root and its replies |
 | `memory_write` | `path`, `content`, `expected_sha256` or `"not_exists"` | New `sha256`, or `stale_write` |
 | `memory_delete` | `path`, `expected_sha256` | |
@@ -277,16 +298,19 @@ The client API uses the same frames, errors and authentication as the worker lin
 
 | Type | Body | Result |
 |---|---|---|
-| `sync.snapshot` | `scope`: `all` or a channel ID | The entities in that scope and the current feed `seq`. For `all`: every group, channel, repo, worker and read marker, every task that is not archived, the pending approvals and decisions, and every routine. For a channel: the channel, its newest 50 timeline messages (oldest first), its tasks that are not archived, its pending approvals and decisions, its routines and its channel files |
+| `sync.snapshot` | `scope`: `all` or a channel ID | The entities in that scope and the current feed `seq`. For `all`: every group, channel, repo, worker and read marker, every task that is not archived, the pending approvals and decisions, and every routine. For a channel: the channel, its newest 50 timeline messages (oldest first), its tasks that are not archived, its pending approvals and decisions, its routines and its channel files. Large messages can make the page shorter than 50. `messages_has_more` is true when older timeline messages exist |
 | `sync.subscribe` | `after_seq`, optional `channel_ids` | `ok`. The hub then sends `feed` messages |
 | `feed` (from the hub) | `seq`, `at`, `channel_id`, `entity`, `entity_id`, `op` and `payload` | None. `payload` is `null` for `delete` |
+| `feed.skipped` (from the hub) | `seq`, `channel_id`, `entity` and `entity_id` | None. The hub could not send the entry `seq`, because it does not fit in one frame. The feed goes on after it. Get the entity again, for example with `message.list` or a new snapshot. A client that does not know this event ignores it |
+
+When a channel is deleted, the feed has a `delete` for each entity of the channel that a client can hold (messages, read markers, tasks, session items, approvals, decisions, routines, channel files and memory notes), and then one for the channel.
 
 ### Requests
 
 | Area | Types |
 |---|---|
 | Channels and groups | `channel.create`, `channel.update`, `channel.archive` (with `archived`, default true), `channel.delete`, `channel.move`, `group.create`, `group.update`, `group.delete`, `group.reorder`, `repo.create` |
-| Messages | `message.send` (with `client_message_id`), `message.list` (a page of a timeline or a thread, newest first), `message.edit`, `message.delete`, `message.react`, `message.search`, `read.mark` |
+| Messages | `message.send` (with `client_message_id`), `message.list` (a page of a timeline or a thread, newest first; the page stops early when its messages would take more than 768 KiB, and `has_more` is then true), `message.edit`, `message.delete`, `message.react`, `message.search`, `read.mark` |
 | Tasks | `task.create`, `task.update`, `task.resolve`, `task.reopen`, `task.retry`, `task.interrupt`, `task.archive` (with `archived`, default true), `task.delete`, `task.items`, `task.item_detail` (with `session_id` and `item_id`) |
 | Waiting on the user | `approval.answer`, `decision.answer` |
 | Memory | `memory.list`, `memory.read`, `memory.write`, `memory.delete`, `memory.history` |

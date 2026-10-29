@@ -13,7 +13,8 @@ impl Hub {
     /// Builds a snapshot in one read transaction, so `seq` matches the entities.
     ///
     /// The `all` scope has no messages and no channel files. A channel scope
-    /// has its newest 50 timeline messages, oldest first.
+    /// has its newest 50 timeline messages, oldest first, or fewer when they
+    /// are large. `messages_has_more` says whether older ones exist.
     pub(crate) async fn snapshot(&self, scope: SnapshotScope) -> Result<Snapshot> {
         self.store
             .read(move |conn| {
@@ -35,12 +36,13 @@ impl Hub {
                     },
                     SnapshotScope::Channel(channel_id) => {
                         let channel = conversation::channel_or_404(&tx, channel_id)?;
-                        let (mut messages, _) = conversation::messages_page(
+                        let (mut messages, messages_has_more) = conversation::messages_page(
                             &tx,
                             channel_id,
                             None,
                             None,
                             consort_proto::client_api::SNAPSHOT_MESSAGE_LIMIT,
+                            crate::limits::SNAPSHOT_MESSAGES_MAX_BYTES,
                         )?;
                         messages.reverse();
                         let read_markers = conversation::read_markers(&tx)?
@@ -51,6 +53,7 @@ impl Hub {
                             seq,
                             channels: vec![channel],
                             messages: messages.into_iter().collect::<Vec<Message>>(),
+                            messages_has_more,
                             read_markers,
                             tasks: work::tasks_in_channel(&tx, channel_id, false)?,
                             approvals: work::pending_approvals(&tx, Some(channel_id))?,

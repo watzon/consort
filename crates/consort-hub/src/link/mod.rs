@@ -1,8 +1,8 @@
 //! The worker link: connections, the command queue and session events.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use consort_proto::error::{ErrorBody, ErrorCode};
@@ -19,13 +19,21 @@ pub(crate) mod lifecycle;
 
 type Pending = HashMap<FrameId, oneshot::Sender<Result<Value, ErrorBody>>>;
 
+/// The most hub tool calls that one worker link runs at the same time.
+/// More calls wait for a free place. A personal hub runs a few sessions per
+/// worker, so this is far above normal use.
+pub(crate) const MAX_TOOL_CALLS_PER_LINK: usize = 16;
+
 /// Why a call to a worker did not get an answer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CallError {
     /// The connection is closed or closed while we waited.
     Gone,
     /// The worker did not answer in time.
     Timeout,
+    /// The request does not encode as a frame, for example because it is
+    /// larger than the frame limit. Sending it again cannot help.
+    Encode(String),
 }
 
 /// One live worker connection.
@@ -33,6 +41,8 @@ pub(crate) struct WorkerLink {
     pub conn_id: u64,
     pub worker_id: WorkerId,
     pub outbox: Outbox,
+    /// Places for running tool calls. See [`MAX_TOOL_CALLS_PER_LINK`].
+    pub tool_calls: Arc<tokio::sync::Semaphore>,
     pending: Mutex<Pending>,
     inflight: Mutex<HashSet<Option<SessionId>>>,
 }
@@ -43,6 +53,7 @@ impl WorkerLink {
             conn_id,
             worker_id,
             outbox,
+            tool_calls: Arc::new(tokio::sync::Semaphore::new(MAX_TOOL_CALLS_PER_LINK)),
             pending: Mutex::new(HashMap::new()),
             inflight: Mutex::new(HashSet::new()),
         }
@@ -66,7 +77,14 @@ impl WorkerLink {
             kind,
             body,
         });
-        if !self.outbox.send_frame(&frame) {
+        let text = match frame.to_text() {
+            Ok(text) => text,
+            Err(err) => {
+                self.forget(&id);
+                return Err(CallError::Encode(err.to_string()));
+            }
+        };
+        if !self.outbox.send_text(text) {
             self.forget(&id);
             return Err(CallError::Gone);
         }

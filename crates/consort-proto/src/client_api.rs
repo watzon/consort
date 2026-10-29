@@ -139,6 +139,11 @@ pub struct Snapshot {
     pub read_markers: Vec<ReadMarker>,
     /// Messages, oldest first.
     pub messages: Vec<Message>,
+    /// For a channel scope: true when the channel has older timeline
+    /// messages than the ones in `messages`. A page can stop before
+    /// [`SNAPSHOT_MESSAGE_LIMIT`] messages when they are large, so a short
+    /// page does not mean that no older messages exist.
+    pub messages_has_more: bool,
     /// Tasks.
     pub tasks: Vec<Task>,
     /// Approvals.
@@ -1411,11 +1416,30 @@ message_family! {
     }
 }
 
+/// `feed.skipped`: the hub could not send the feed entry `seq`, because the
+/// entry does not fit in one frame. The feed goes on after it. The client
+/// gets the entity again another way, for example with `message.list` or a
+/// new snapshot. A client that does not know this event can ignore it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FeedSkipped {
+    /// The `seq` of the entry that the hub did not send.
+    pub seq: u64,
+    /// The channel of the entry, as in the feed entry.
+    #[serde(default)]
+    pub channel_id: Option<ChannelId>,
+    /// The kind of entity.
+    pub entity: EntityKind,
+    /// The feed ID of the entity.
+    pub entity_id: String,
+}
+
 message_family! {
     /// Events from the hub to a client after authentication.
     pub enum HubToClient {
         /// One feed entry.
         Feed("feed", FeedEntry),
+        /// A feed entry that the hub could not send.
+        FeedSkipped("feed.skipped", FeedSkipped),
     }
 }
 

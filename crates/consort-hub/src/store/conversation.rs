@@ -5,12 +5,14 @@ use consort_proto::ids::{
     ChannelId, ClientId, GroupId, MessageId, RepoId, RoutineId, SessionId, TaskId,
 };
 use consort_proto::model::{
-    Author, BlobRef, Channel, ChannelKind, Group, Message, MessageKind, ReadMarker, Repo,
+    Author, BlobRef, Channel, ChannelKind, Group, MemoryScope, Message, MessageKind, ReadMarker,
+    Repo,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 
 use super::{Tx, get_doc, list_docs, to_doc};
 use crate::error::{HubError, Result};
+use crate::limits::{MESSAGE_BODY_MAX_BYTES, check_text};
 
 // Groups -----------------------------------------------------------------
 
@@ -164,12 +166,17 @@ pub fn message_by_client_id(
 /// root messages and thread replies that were also posted in the timeline.
 /// Returns the page and whether older messages exist. Deleted messages are
 /// left out.
+///
+/// The page stops early when its messages would take more than `max_bytes`
+/// as JSON, so a page always fits in a frame. It always has at least one
+/// message when one exists.
 pub fn messages_page(
     conn: &Connection,
     channel_id: ChannelId,
     thread_root_id: Option<MessageId>,
     before: Option<MessageId>,
     limit: usize,
+    max_bytes: usize,
 ) -> Result<(Vec<Message>, bool)> {
     let limit = limit.clamp(1, 500);
     let before_rowid: i64 = match before {
@@ -209,8 +216,17 @@ pub fn messages_page(
             ],
         )?,
     };
-    let has_more = messages.len() > limit;
-    messages.truncate(limit);
+    let mut keep = messages.len().min(limit);
+    let mut used = 0_usize;
+    for (index, message) in messages.iter().take(keep).enumerate() {
+        used = used.saturating_add(serde_json::to_string(message)?.len() + 1);
+        if used > max_bytes && index > 0 {
+            keep = index;
+            break;
+        }
+    }
+    let has_more = messages.len() > keep;
+    messages.truncate(keep);
     Ok((messages, has_more))
 }
 
@@ -262,11 +278,60 @@ impl Tx<'_> {
         self.emit(EntityPayload::Channel(channel.clone()))
     }
 
-    /// Deletes a channel and everything that belongs to it. The feed gets one
-    /// delete for the channel. A client drops every entity of that channel
-    /// when it sees the delete.
+    /// Deletes a channel and everything that belongs to it. The feed gets a
+    /// delete for each entity that a client can hold (messages, read markers,
+    /// tasks, session items, approvals, decisions, routines, channel files
+    /// and memory notes), as `purge_task` does, and then one for the channel.
+    /// So a client does not need to know which rows belong to the channel.
     pub fn purge_channel(&mut self, id: ChannelId) -> Result<()> {
         let key = id.to_string();
+        let mut deletes: Vec<(EntityKind, String)> = Vec::new();
+        for (kind, sql) in [
+            (
+                EntityKind::SessionItem,
+                "SELECT session_id || ':' || item_id FROM session_items
+                 WHERE session_id IN (SELECT id FROM sessions WHERE channel_id = ?1)",
+            ),
+            (
+                EntityKind::Approval,
+                "SELECT id FROM approvals WHERE channel_id = ?1",
+            ),
+            (
+                EntityKind::Decision,
+                "SELECT id FROM decisions WHERE channel_id = ?1",
+            ),
+            (
+                EntityKind::Task,
+                "SELECT id FROM tasks WHERE channel_id = ?1",
+            ),
+            (
+                EntityKind::Message,
+                "SELECT id FROM messages WHERE channel_id = ?1 ORDER BY rowid",
+            ),
+            (
+                EntityKind::ReadMarker,
+                "SELECT CASE WHEN thread_root_id = '' THEN channel_id
+                             ELSE channel_id || ':' || thread_root_id END
+                 FROM read_markers WHERE channel_id = ?1",
+            ),
+            (
+                EntityKind::Routine,
+                "SELECT id FROM routines WHERE channel_id = ?1",
+            ),
+        ] {
+            let mut stmt = self.db().prepare(sql)?;
+            let rows = stmt.query_map([&key], |row| row.get::<_, String>(0))?;
+            for row in rows {
+                deletes.push((kind, row?));
+            }
+        }
+        for file in super::knowledge::channel_files(self.db(), id, None)? {
+            deletes.push((EntityKind::ChannelFile, file.entity_id()));
+        }
+        for note in super::knowledge::memory_notes(self.db(), MemoryScope::Channel(id))? {
+            deletes.push((EntityKind::MemoryNote, note.entity_id()));
+        }
+
         let db = self.db();
         for sql in [
             "DELETE FROM search_idx WHERE channel_id = ?1",
@@ -289,6 +354,9 @@ impl Tx<'_> {
         ] {
             db.execute(sql, [&key])?;
         }
+        for (kind, entity_id) in deletes {
+            self.emit_delete(kind, entity_id, Some(id))?;
+        }
         self.emit_delete(EntityKind::Channel, key, Some(id))
     }
 
@@ -303,7 +371,12 @@ impl Tx<'_> {
 
     /// Adds a message. For a thread reply it also updates the root's reply
     /// count and last reply time. Indexes text messages for search.
+    ///
+    /// A body larger than [`MESSAGE_BODY_MAX_BYTES`] is refused, so every
+    /// message fits in a feed entry. Cut text from a worker with
+    /// [`crate::limits::cut_text`] first.
     pub fn insert_message(&mut self, new: NewMessage) -> Result<Message> {
+        check_text("message", &new.body, MESSAGE_BODY_MAX_BYTES)?;
         let now = self.now();
         let mut thread_root_id = new.thread_root_id;
         if let Some(root_id) = thread_root_id {

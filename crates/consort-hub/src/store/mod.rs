@@ -7,8 +7,9 @@
 //! change. After the commit, the writer broadcasts the new feed entries.
 //!
 //! Readers are plain read-only connections from a small pool. [`Store::read`]
-//! runs a closure on one of them in a blocking task. WAL mode lets readers
-//! and the writer run at the same time.
+//! runs a closure on one of them in a blocking task. At most
+//! `READER_POOL_SIZE` reads run at the same time; more reads wait for a free
+//! connection. WAL mode lets readers and the writer run at the same time.
 //!
 //! Naming convention in the entity modules:
 //!
@@ -55,6 +56,8 @@ pub struct Store {
 struct Inner {
     jobs: mpsc::Sender<Job>,
     readers: Mutex<Vec<Connection>>,
+    /// One permit for each reader connection, so the pool never grows.
+    read_slots: Arc<tokio::sync::Semaphore>,
     db_path: PathBuf,
     blobs_dir: PathBuf,
     feed_tx: broadcast::Sender<Arc<FeedEntry>>,
@@ -102,6 +105,7 @@ impl Store {
             inner: Arc::new(Inner {
                 jobs,
                 readers: Mutex::new(Vec::new()),
+                read_slots: Arc::new(tokio::sync::Semaphore::new(READER_POOL_SIZE)),
                 db_path: data_dir.join("hub.db"),
                 blobs_dir,
                 feed_tx,
@@ -136,14 +140,20 @@ impl Store {
             .map_err(|_| HubError::internal("the database writer stopped"))?
     }
 
-    /// Runs `f` on a read-only connection in a blocking task.
+    /// Runs `f` on a read-only connection in a blocking task. It waits while
+    /// every reader connection is in use.
     pub async fn read<T, F>(&self, f: F) -> Result<T>
     where
         F: FnOnce(&Connection) -> Result<T> + Send + 'static,
         T: Send + 'static,
     {
+        let slot = Arc::clone(&self.inner.read_slots)
+            .acquire_owned()
+            .await
+            .map_err(|_| HubError::internal("the reader pool closed"))?;
         let inner = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || {
+            let _slot = slot;
             let conn = inner.take_reader()?;
             let result = f(&conn);
             inner.put_reader(conn);
@@ -365,6 +375,35 @@ mod tests {
         assert_eq!(entry.entity_id, id.to_string());
         let head = store.read(feed::head_seq).await.unwrap();
         assert_eq!(head, entry.seq);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn at_most_the_pool_size_of_reads_run_at_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (store, _dir) = temp_store();
+        let running = Arc::new(AtomicUsize::new(0));
+        let most = Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+        for _ in 0..READER_POOL_SIZE * 4 {
+            let (store, running, most) = (store.clone(), running.clone(), most.clone());
+            tasks.push(tokio::spawn(async move {
+                store
+                    .read(move |_| {
+                        let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                        most.fetch_max(now, Ordering::SeqCst);
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                        running.fetch_sub(1, Ordering::SeqCst);
+                        Ok(())
+                    })
+                    .await
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap().unwrap();
+        }
+        let most = most.load(Ordering::SeqCst);
+        assert!(most <= READER_POOL_SIZE, "{most} reads ran at once");
+        assert!(store.inner.readers.lock().unwrap().len() <= READER_POOL_SIZE);
     }
 
     #[tokio::test]

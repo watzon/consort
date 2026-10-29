@@ -19,6 +19,8 @@ use super::flow::transition;
 use super::hooks::NewTask;
 use crate::error::{HubError, Result};
 use crate::hub::{Caller, Hub};
+use crate::limits::{BRIEF_MAX_BYTES, check_text};
+use crate::link::events::{Effects, end_session_by_hub};
 use crate::placement::{Placement, PlacementError, PlacementInput, Subject, place};
 use crate::prompts;
 use crate::store::conversation::{self, NewMessage};
@@ -42,6 +44,7 @@ impl Hub {
         if new.brief.trim().is_empty() {
             return Err(HubError::invalid("The task needs a brief."));
         }
+        check_text("brief", &new.brief, BRIEF_MAX_BYTES)?;
         let task = self
             .store
             .write(move |tx| {
@@ -424,6 +427,7 @@ impl Hub {
                     if brief.trim().is_empty() {
                         return Err(HubError::invalid("The task needs a brief."));
                     }
+                    check_text("brief", &brief, BRIEF_MAX_BYTES)?;
                     task.brief = brief;
                 }
                 if let Some(selection) = request.model_selection {
@@ -519,10 +523,27 @@ impl Hub {
         Ok(TaskResult { task })
     }
 
-    /// Sends a failed task back to Up next and places it again.
+    /// Sends a failed task back to Up next and places it again. The old
+    /// session may still run on its worker (a failed turn does not end it),
+    /// so the hub ends it and the worker gets `session.stop`.
     pub(crate) async fn retry_task(&self, id: TaskId, actor: Actor) -> Result<Task> {
-        self.store
+        let hub = self.clone();
+        let fx = self
+            .store
             .write(move |tx| {
+                let task = work::task_or_404(tx.db(), id)?;
+                // Refuse a retry that the rules do not allow before anything
+                // changes. Ending the session of a running task would fail
+                // the task. A task that is in Up next already stays as it is.
+                if task.status != TaskStatus::UpNext {
+                    task.status.check_transition(TaskStatus::UpNext, actor)?;
+                }
+                // The old session ends first, while the task is still
+                // Failed, so ending it does not change the task.
+                let fx = match task.current_session_id {
+                    Some(old) => end_session_by_hub(&hub, tx, old, "The task was retried.")?,
+                    None => Effects::default(),
+                };
                 let mut task = work::task_or_404(tx.db(), id)?;
                 if transition(tx, &mut task, TaskStatus::UpNext, actor, None, None)? {
                     task.current_session_id = None;
@@ -530,9 +551,10 @@ impl Hub {
                     task.review_summary = None;
                     tx.save_task(&task)?;
                 }
-                Ok(())
+                Ok(fx)
             })
             .await?;
+        self.run_effects(fx);
         self.dispatch_task(id).await?;
         self.store
             .read(move |conn| work::task_or_404(conn, id))

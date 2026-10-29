@@ -3,81 +3,103 @@
 
 use consort_proto::auth::{SessionSeq, WorkerHello, WorkerHelloResult};
 use consort_proto::error::{ErrorBody, ErrorCode};
-use consort_proto::ids::{SessionId, WorkerId};
-use consort_proto::model::{Inventory, SessionRole, SessionState, WorkerState};
-use consort_proto::status::TaskStatus;
+use consort_proto::ids::{RequestId, SessionId, WorkerId};
+use consort_proto::model::{
+    ApprovalStatus, DecisionStatus, Inventory, SessionRole, SessionState, WorkerState,
+};
+use consort_proto::status::{Actor, TaskStatus};
 use consort_proto::worker_link::SessionStartResult;
 
 use super::events::{Ctx, Effects, finish_session};
-use crate::error::Result;
+use crate::error::{HubError, Result};
 use crate::hub::{HUB_VERSION, Hub};
+use crate::ops::flow::transition;
 use crate::store::coordinator as coord_store;
 use crate::store::{machine, work};
 
 impl Hub {
     /// Records a worker's hello. Returns the answer, and the sessions that the
-    /// worker reported but the hub does not know, which the hub must stop.
+    /// worker reported but must stop, each with the reason: sessions that the
+    /// hub does not know, and sessions that have ended on the hub.
     pub(crate) async fn worker_hello(
         &self,
         worker_id: WorkerId,
         hello: WorkerHello,
         protocol_version: u32,
-    ) -> Result<(WorkerHelloResult, Vec<SessionId>)> {
+    ) -> Result<(WorkerHelloResult, Vec<(SessionId, String)>)> {
         let hub = self.clone();
-        let (result, unknown, fx) = self
-            .store
-            .write(move |tx| {
-                let mut worker = machine::worker_or_404(tx.db(), worker_id)?;
-                worker.version = hello.version.clone();
-                worker.protocol_version = protocol_version;
-                worker.state = WorkerState::Online;
-                worker.last_seen_at = Some(tx.now());
-                tx.save_worker(&worker)?;
-
-                let mut known = Vec::new();
-                let mut unknown = Vec::new();
-                for reported in &hello.sessions {
-                    match work::session(tx.db(), reported.session_id)? {
-                        Some(session) if session.worker_id == worker_id => known.push(SessionSeq {
-                            session_id: session.id,
-                            last_seq: session.last_seq,
-                        }),
-                        _ => unknown.push(reported.session_id),
+        let (result, stops, fx) =
+            self.store
+                .write(move |tx| {
+                    let mut worker = machine::worker_or_404(tx.db(), worker_id)?;
+                    // The signature check refuses a revoked worker, but a revoke
+                    // can come between that check and this hello.
+                    if worker.revoked_at.is_some() {
+                        return Err(HubError::unauthorized(
+                            "This worker was removed. Pair this machine again.",
+                        ));
                     }
-                }
+                    worker.version = hello.version.clone();
+                    worker.protocol_version = protocol_version;
+                    worker.state = WorkerState::Online;
+                    worker.last_seen_at = Some(tx.now());
+                    tx.save_worker(&worker)?;
 
-                // A session that the hub holds open but the worker no longer
-                // has is lost, unless its start command still waits.
-                let queued = machine::commands_for_worker(tx.db(), worker_id)?;
-                let mut fx = Effects::default();
-                for session in work::open_sessions_of_worker(tx.db(), worker_id)? {
-                    let reported = hello.sessions.iter().any(|s| s.session_id == session.id);
-                    let start_waits = queued
-                        .iter()
-                        .any(|c| c.kind == "session.start" && c.session_id == Some(session.id));
-                    if reported || start_waits {
-                        continue;
+                    let mut known = Vec::new();
+                    let mut stops = Vec::new();
+                    for reported in &hello.sessions {
+                        match work::session(tx.db(), reported.session_id)? {
+                            Some(session)
+                                if session.worker_id == worker_id && !session.state.is_final() =>
+                            {
+                                known.push(SessionSeq {
+                                    session_id: session.id,
+                                    last_seq: session.last_seq,
+                                });
+                            }
+                            // The hub ended or lost this session, so it has no
+                            // more turns. The harness must not keep running.
+                            Some(session) if session.worker_id == worker_id => stops
+                                .push((session.id, "The session has ended on the hub.".to_owned())),
+                            _ => stops.push((
+                                reported.session_id,
+                                "The hub does not know this session.".to_owned(),
+                            )),
+                        }
                     }
-                    let mut ctx = Ctx::load(&hub, tx, session.id)?;
-                    ctx.session.end_reason =
-                        Some("The worker no longer has this session.".to_owned());
-                    finish_session(tx, &mut ctx, SessionState::Lost)?;
-                    ctx.persist(tx)?;
-                    fx.merge(ctx.fx);
-                }
-                Ok((
-                    WorkerHelloResult {
-                        protocol_version,
-                        hub_version: HUB_VERSION.to_owned(),
-                        sessions: known,
-                    },
-                    unknown,
-                    fx,
-                ))
-            })
-            .await?;
+
+                    // A session that the hub holds open but the worker no longer
+                    // has is lost, unless its start command still waits.
+                    let queued = machine::commands_for_worker(tx.db(), worker_id)?;
+                    let mut fx = Effects::default();
+                    for session in work::open_sessions_of_worker(tx.db(), worker_id)? {
+                        let reported = hello.sessions.iter().any(|s| s.session_id == session.id);
+                        let start_waits = queued
+                            .iter()
+                            .any(|c| c.kind == "session.start" && c.session_id == Some(session.id));
+                        if reported || start_waits {
+                            continue;
+                        }
+                        let mut ctx = Ctx::load(&hub, tx, session.id)?;
+                        ctx.session.end_reason =
+                            Some("The worker no longer has this session.".to_owned());
+                        finish_session(tx, &mut ctx, SessionState::Lost)?;
+                        ctx.persist(tx)?;
+                        fx.merge(ctx.fx);
+                    }
+                    Ok((
+                        WorkerHelloResult {
+                            protocol_version,
+                            hub_version: HUB_VERSION.to_owned(),
+                            sessions: known,
+                        },
+                        stops,
+                        fx,
+                    ))
+                })
+                .await?;
         self.run_effects(fx);
-        Ok((result, unknown))
+        Ok((result, stops))
     }
 
     /// Runs after a worker has said hello and the hub answered.
@@ -107,10 +129,41 @@ impl Hub {
         });
     }
 
-    /// Marks a worker offline when its connection ends.
-    pub(crate) async fn worker_went_offline(&self, worker_id: WorkerId) -> Result<()> {
+    /// Runs after the link of a new connection is registered. A revoke closes
+    /// only registered links, so the hub reads the revoke time again now.
+    /// Returns false when the worker was revoked: the caller closes the link.
+    ///
+    /// An old connection that ended during the hello of this one can have
+    /// marked the worker offline. The worker is online again here.
+    pub(crate) async fn worker_link_registered(&self, worker_id: WorkerId) -> Result<bool> {
         self.store
             .write(move |tx| {
+                let Some(mut worker) = machine::worker(tx.db(), worker_id)? else {
+                    return Ok(false);
+                };
+                if worker.revoked_at.is_some() {
+                    return Ok(false);
+                }
+                if worker.state != WorkerState::Online {
+                    worker.state = WorkerState::Online;
+                    worker.last_seen_at = Some(tx.now());
+                    tx.save_worker(&worker)?;
+                }
+                Ok(true)
+            })
+            .await
+    }
+
+    /// Marks a worker offline when its connection ends. A worker that has a
+    /// newer registered link stays online. The check runs on the writer
+    /// thread, so it is ordered with [`Hub::worker_link_registered`].
+    pub(crate) async fn worker_went_offline(&self, worker_id: WorkerId) -> Result<()> {
+        let hub = self.clone();
+        self.store
+            .write(move |tx| {
+                if hub.links.get(worker_id).is_some() {
+                    return Ok(());
+                }
                 if let Some(mut worker) = machine::worker(tx.db(), worker_id)?
                     && worker.state != WorkerState::Offline
                 {
@@ -204,14 +257,13 @@ impl Hub {
                         "assistant_unavailable",
                         &format!("The assistant could not start: {}", error.message),
                     )?;
-                } else if let Some(task) = ctx.task.as_ref()
-                    && task.status == TaskStatus::Failed
-                {
-                    // The task failed in finish_session; give the reason the worker's words.
-                    let mut task = task.clone();
-                    task.status_reason =
-                        Some(format!("The session could not start: {}", error.message));
-                    tx.save_task(&task)?;
+                } else {
+                    // The task failed in finish_session. Give the reason in
+                    // the worker's words. `persist` saves it.
+                    ctx.set_failed_reason(format!(
+                        "The session could not start: {}",
+                        error.message
+                    ));
                 }
                 ctx.persist(tx)?;
                 Ok(ctx.fx)
@@ -293,31 +345,141 @@ impl Hub {
         Ok(())
     }
 
-    /// The worker refused a `session.respond`.
+    /// The worker refused a `session.respond`. The harness will not go on
+    /// with that request, so a task that waits on it fails, and the user can
+    /// retry it. Without this, the task would stay in Working for ever.
     pub(crate) async fn on_answer_command_failed(
         &self,
         session_id: SessionId,
         error: ErrorBody,
     ) -> Result<()> {
-        self.store
+        let kick = self
+            .store
             .write(move |tx| {
                 let Some(session) = work::session(tx.db(), session_id)? else {
-                    return Ok(());
+                    return Ok(None);
                 };
                 let task = session
                     .task_id
                     .map(|t| work::task(tx.db(), t))
                     .transpose()?
                     .flatten();
-                let (root, task_id) =
-                    task.map_or((None, None), |t| (Some(t.card_message_id), Some(t.id)));
+                let (root, task_id) = task
+                    .as_ref()
+                    .map_or((None, None), |t| (Some(t.card_message_id), Some(t.id)));
+                let text = format!("The session did not take your answer: {}", error.message);
                 tx.post_notice(
                     session.channel_id,
                     root,
                     task_id,
                     "answer_not_delivered",
-                    &format!("The session did not take your answer: {}", error.message),
+                    &text,
                 )?;
+                let Some(mut task) = task else {
+                    return Ok(None);
+                };
+                let waits = task.current_session_id == Some(session_id)
+                    && matches!(task.status, TaskStatus::Working | TaskStatus::NeedsInput);
+                if !waits {
+                    return Ok(None);
+                }
+                let reason = format!("{text} Retry the task.");
+                if transition(
+                    tx,
+                    &mut task,
+                    TaskStatus::Failed,
+                    Actor::System,
+                    Some(reason),
+                    None,
+                )? {
+                    tx.save_task(&task)?;
+                    return Ok(Some(task.channel_id));
+                }
+                Ok(None)
+            })
+            .await?;
+        if let Some(channel_id) = kick {
+            self.kick_coordinator(channel_id);
+        }
+        Ok(())
+    }
+
+    /// Ends the session of a queued command that expired. The worker was
+    /// away for 7 days, so the hub stops waiting: the session is lost, its
+    /// task fails, and the channel or the task thread gets a notice. A
+    /// session that has already ended does not change.
+    pub(crate) async fn session_command_expired(&self, session_id: SessionId) -> Result<()> {
+        let hub = self.clone();
+        let fx = self
+            .store
+            .write(move |tx| {
+                let Some(session) = work::session(tx.db(), session_id)? else {
+                    return Ok(Effects::default());
+                };
+                if session.state.is_final() {
+                    return Ok(Effects::default());
+                }
+                let mut ctx = Ctx::load(&hub, tx, session_id)?;
+                ctx.session.end_reason =
+                    Some("The worker was offline for 7 days, so the hub stopped waiting.".to_owned());
+                finish_session(tx, &mut ctx, SessionState::Lost)?;
+                match ctx.task.as_ref() {
+                    Some(task) => {
+                        let text = "The worker was offline for 7 days, so the hub stopped waiting for this task. Retry it to run it on another worker.";
+                        tx.post_notice(
+                            task.channel_id,
+                            Some(task.card_message_id),
+                            Some(task.id),
+                            "worker_away",
+                            text,
+                        )?;
+                        ctx.set_failed_reason(text.to_owned());
+                    }
+                    None => {
+                        tx.post_notice(
+                            session.channel_id,
+                            None,
+                            None,
+                            "worker_away",
+                            "The worker of the assistant was offline for 7 days, so the hub ended its session there. The assistant starts a new session.",
+                        )?;
+                    }
+                }
+                ctx.persist(tx)?;
+                Ok(ctx.fx)
+            })
+            .await?;
+        self.run_effects(fx);
+        Ok(())
+    }
+
+    /// The `session.respond` for an answer expired before the worker got it.
+    /// The approval or decision then shows Expired, not the answer that the
+    /// session never saw.
+    pub(crate) async fn answer_expired(
+        &self,
+        session_id: SessionId,
+        request_id: RequestId,
+    ) -> Result<()> {
+        self.store
+            .write(move |tx| {
+                if let Some(mut approval) =
+                    work::approval_by_request(tx.db(), session_id, &request_id)?
+                    && matches!(
+                        approval.status,
+                        ApprovalStatus::Allowed | ApprovalStatus::Denied
+                    )
+                {
+                    approval.status = ApprovalStatus::Expired;
+                    tx.save_approval(&approval)?;
+                }
+                if let Some(mut decision) =
+                    work::decision_by_request(tx.db(), session_id, &request_id)?
+                    && decision.status == DecisionStatus::Answered
+                {
+                    decision.status = DecisionStatus::Expired;
+                    tx.save_decision(&decision)?;
+                }
                 Ok(())
             })
             .await
@@ -326,5 +488,99 @@ impl Hub {
     /// Runs once at start: the hub kicks coordinators with queued events.
     pub(crate) fn recover(&self) {
         self.retry_waiting_work();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use consort_proto::model::{Os, Worker};
+    use consort_proto::time::Timestamp;
+    use tokio_util::sync::CancellationToken;
+
+    use super::*;
+    use crate::link::WorkerLink;
+    use crate::net::ws::Outbox;
+
+    async fn online_worker(hub: &Hub) -> WorkerId {
+        let worker = Worker {
+            id: WorkerId::new(),
+            name: "Laptop".to_owned(),
+            hostname: "laptop".to_owned(),
+            os: Os::Macos,
+            arch: "aarch64".to_owned(),
+            public_key: consort_proto::auth::PublicKey::from_bytes([1; 32]),
+            version: String::new(),
+            protocol_version: 1,
+            labels: Vec::new(),
+            paused: false,
+            state: WorkerState::Online,
+            last_seen_at: None,
+            inventory: None,
+            paired_at: Timestamp::now(),
+            revoked_at: None,
+        };
+        let id = worker.id;
+        hub.store
+            .write(move |tx| tx.save_worker(&worker))
+            .await
+            .unwrap();
+        id
+    }
+
+    async fn state_of(hub: &Hub, id: WorkerId) -> WorkerState {
+        hub.store
+            .read(move |conn| machine::worker_or_404(conn, id))
+            .await
+            .unwrap()
+            .state
+    }
+
+    #[tokio::test]
+    async fn an_old_connection_that_ends_late_does_not_take_a_new_one_offline() {
+        let (hub, _dir) = crate::hub::test_hub().await;
+        let id = online_worker(&hub).await;
+        // The new connection has registered its link.
+        let (outbox, _rx) = Outbox::new(CancellationToken::new());
+        let link = Arc::new(WorkerLink::new(hub.links.next_conn_id(), id, outbox));
+        hub.links.register(link.clone());
+        // The old connection ends after that.
+        hub.worker_went_offline(id).await.unwrap();
+        assert_eq!(state_of(&hub, id).await, WorkerState::Online);
+        // With no link, the worker goes offline.
+        hub.links.remove(id, link.conn_id);
+        hub.worker_went_offline(id).await.unwrap();
+        assert_eq!(state_of(&hub, id).await, WorkerState::Offline);
+        // An old connection that ended before the new link registered set the
+        // worker offline. The registration sets it online again.
+        hub.links.register(link);
+        assert!(hub.worker_link_registered(id).await.unwrap());
+        assert_eq!(state_of(&hub, id).await, WorkerState::Online);
+    }
+
+    #[tokio::test]
+    async fn a_revoked_worker_cannot_say_hello_and_its_link_is_refused() {
+        let (hub, _dir) = crate::hub::test_hub().await;
+        let id = online_worker(&hub).await;
+        hub.store
+            .write(move |tx| {
+                let mut worker = machine::worker_or_404(tx.db(), id)?;
+                worker.revoked_at = Some(tx.now());
+                worker.state = WorkerState::Offline;
+                tx.save_worker(&worker)
+            })
+            .await
+            .unwrap();
+        let hello = WorkerHello {
+            worker_id: id,
+            version: "test".to_owned(),
+            protocol_versions: vec![1],
+            sessions: Vec::new(),
+        };
+        let error = hub.worker_hello(id, hello, 1).await.unwrap_err();
+        assert_eq!(error.code(), ErrorCode::Unauthorized);
+        assert!(!hub.worker_link_registered(id).await.unwrap());
+        assert_eq!(state_of(&hub, id).await, WorkerState::Offline);
     }
 }

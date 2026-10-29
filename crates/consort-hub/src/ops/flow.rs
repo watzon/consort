@@ -10,6 +10,7 @@ use consort_proto::worker_link::{HubToWorker, SessionSteer, SessionTurn, TurnInp
 
 use crate::error::{HubError, Result};
 use crate::hub::Hub;
+use crate::limits::{NOTICE_TEXT_MAX_BYTES, cut_text};
 use crate::store::conversation::NewMessage;
 use crate::store::{Tx, machine, work};
 
@@ -28,11 +29,13 @@ impl Tx<'_> {
         kind: &str,
         text: &str,
     ) -> Result<Message> {
+        // Notice text often comes from a worker error, so it is cut, not refused.
+        let text = cut_text(text, NOTICE_TEXT_MAX_BYTES);
         let mut new = NewMessage::new(
             channel_id,
             Author::System,
             MessageKind::Notice,
-            notice_body(kind, text),
+            notice_body(kind, &text),
         );
         new.thread_root_id = thread_root;
         new.author_task_id = task_id;
@@ -68,6 +71,8 @@ pub(crate) fn transition(
     reason: Option<String>,
     wake_text: Option<String>,
 ) -> Result<bool> {
+    // A reason often holds text from a worker, so it is cut, not refused.
+    let reason = reason.map(|r| cut_text(&r, NOTICE_TEXT_MAX_BYTES));
     if task.status == to {
         if reason.is_some() && task.status_reason != reason {
             task.status_reason = reason;
@@ -107,10 +112,11 @@ pub(crate) struct Delivered {
     pub status_changed: bool,
 }
 
-/// Queues text for the session of a task: a new turn, a steering message, or
-/// a place in the inbox when the harness cannot steer. Moves a task under
-/// review back to Working. The caller pumps the worker and kicks the
-/// coordinator after the commit.
+/// Queues text for the session of a task: a new turn when no turn is open,
+/// a steering message for an open turn, or a place in the inbox while a turn
+/// is open and the hub cannot steer it (the worker is offline or the harness
+/// cannot steer). Moves a task under review back to Working. The caller pumps
+/// the worker and kicks the coordinator after the commit.
 pub(crate) fn deliver_in_tx(
     hub: &Hub,
     tx: &mut Tx<'_>,
@@ -164,15 +170,13 @@ pub(crate) fn deliver_in_tx(
         text: text.to_owned(),
         attachments: Vec::new(),
     };
+    // A session has one turn at a time. While a turn is open, the text
+    // steers it when the worker is online and the harness can steer, and
+    // otherwise waits in the inbox for the turn to end. That holds for an
+    // offline worker too: a queued turn would reach it while the old turn
+    // still runs.
     let online = hub.links.is_online(session.worker_id);
-    let delivery = if !online {
-        tx.queue_command(
-            session.worker_id,
-            &HubToWorker::SessionTurn(SessionTurn { session_id, turn }),
-        )?;
-        runtime.turn_open = true;
-        MessageDelivery::Queued
-    } else if runtime.turn_open && steer {
+    let delivery = if runtime.turn_open && online && steer {
         tx.queue_command(
             session.worker_id,
             &HubToWorker::SessionSteer(SessionSteer { session_id, turn }),
@@ -187,7 +191,11 @@ pub(crate) fn deliver_in_tx(
             &HubToWorker::SessionTurn(SessionTurn { session_id, turn }),
         )?;
         runtime.turn_open = true;
-        MessageDelivery::Turn
+        if online {
+            MessageDelivery::Turn
+        } else {
+            MessageDelivery::Queued
+        }
     };
     tx.save_session_runtime(session_id, &runtime)?;
     task.updated_at = tx.now();

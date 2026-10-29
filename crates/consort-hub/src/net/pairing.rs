@@ -25,46 +25,87 @@ use crate::hub::Hub;
 use crate::store::machine::{self, PairingKind};
 use crate::util::random_pairing_code;
 
+/// Attempts from one address in one window.
 const MAX_ATTEMPTS: usize = 10;
+/// Attempts from all addresses together in one window. Every address in
+/// the limiter has an attempt in the window, so this also caps the number
+/// of addresses that the limiter keeps.
+const MAX_GLOBAL_ATTEMPTS: usize = 60;
 const WINDOW: Duration = Duration::from_secs(60);
 
-/// Limits pairing requests per client IP address: 10 in 60 seconds. Behind a
-/// reverse proxy every request shares the proxy address, so the limit then
-/// applies to all pairing requests together. That is the safe direction.
+/// Limits pairing requests: 10 in 60 seconds from one address, and 60 in 60
+/// seconds from all addresses together. An IPv6 address counts by its /64
+/// network, because one host usually has a whole /64. Behind a reverse proxy
+/// every request shares the proxy address, so the limit then applies to all
+/// pairing requests together. That is the safe direction.
 #[derive(Default)]
 pub struct PairingLimiter {
-    attempts: Mutex<HashMap<IpAddr, VecDeque<Instant>>>,
+    state: Mutex<LimiterState>,
+}
+
+#[derive(Default)]
+struct LimiterState {
+    by_address: HashMap<IpAddr, VecDeque<Instant>>,
+    all: VecDeque<Instant>,
+}
+
+/// The key of an address: IPv4 as it is (also when mapped into IPv6), and
+/// the /64 network of an IPv6 address.
+fn limit_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => {
+                let s = v6.segments();
+                IpAddr::V6(std::net::Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0))
+            }
+        },
+        v4 => v4,
+    }
+}
+
+fn drop_old(times: &mut VecDeque<Instant>, now: Instant) {
+    while times
+        .front()
+        .is_some_and(|t| now.duration_since(*t) > WINDOW)
+    {
+        times.pop_front();
+    }
 }
 
 impl PairingLimiter {
-    /// Records an attempt. Returns false when the address made too many.
+    /// Records an attempt. Returns false when the address made too many, or
+    /// when all addresses together made too many.
     pub fn allow(&self, ip: IpAddr) -> bool {
         self.allow_at(ip, Instant::now())
     }
 
     fn allow_at(&self, ip: IpAddr, now: Instant) -> bool {
-        let ip = match ip {
-            IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(IpAddr::V6(v6), IpAddr::V4),
-            v4 => v4,
-        };
-        let Ok(mut attempts) = self.attempts.lock() else {
+        let key = limit_key(ip);
+        let Ok(mut state) = self.state.lock() else {
             return false;
         };
-        attempts.retain(|_, times| {
-            while times
-                .front()
-                .is_some_and(|t| now.duration_since(*t) > WINDOW)
-            {
-                times.pop_front();
-            }
+        let state = &mut *state;
+        drop_old(&mut state.all, now);
+        state.by_address.retain(|_, times| {
+            drop_old(times, now);
             !times.is_empty()
         });
-        let times = attempts.entry(ip).or_default();
+        if state.all.len() >= MAX_GLOBAL_ATTEMPTS {
+            return false;
+        }
+        let times = state.by_address.entry(key).or_default();
         if times.len() >= MAX_ATTEMPTS {
             return false;
         }
         times.push_back(now);
+        state.all.push_back(now);
         true
+    }
+
+    #[cfg(test)]
+    fn tracked(&self) -> usize {
+        self.state.lock().map(|s| s.by_address.len()).unwrap_or(0)
     }
 }
 
@@ -162,10 +203,22 @@ impl Hub {
         Ok((code, expires))
     }
 
+    /// Refuses a code that cannot work with a read, so a wrong code does not
+    /// wait for the writer or hold it up.
+    async fn check_code(&self, kind: PairingKind, code: &PairingCode) -> Result<()> {
+        let code = code.clone();
+        let usable = self
+            .store
+            .read(move |conn| machine::pairing_code_usable(conn, kind, &code, Timestamp::now()))
+            .await?;
+        if usable { Ok(()) } else { Err(bad_code()) }
+    }
+
     pub(crate) async fn pair_worker(
         &self,
         request: PairWorkerRequest,
     ) -> Result<PairWorkerResponse> {
+        self.check_code(PairingKind::Worker, &request.code).await?;
         let id = self
             .store
             .write(move |tx| {
@@ -211,6 +264,7 @@ impl Hub {
         &self,
         request: PairClientRequest,
     ) -> Result<PairClientResponse> {
+        self.check_code(PairingKind::Client, &request.code).await?;
         let id = self
             .store
             .write(move |tx| {
@@ -259,6 +313,66 @@ mod tests {
         assert!(limiter.allow_at("10.0.0.2".parse().unwrap(), start));
         // The window moves on.
         assert!(limiter.allow_at(ip, start + WINDOW + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn an_ipv6_address_counts_by_its_64_network() {
+        let limiter = PairingLimiter::default();
+        let start = Instant::now();
+        for i in 0..MAX_ATTEMPTS {
+            let ip: IpAddr = format!("2001:db8:1:2::{:x}", i + 1).parse().unwrap();
+            assert!(limiter.allow_at(ip, start));
+        }
+        // Another host in the same /64 is the same address.
+        assert!(!limiter.allow_at("2001:db8:1:2:ffff::9".parse().unwrap(), start));
+        // Another /64 is not.
+        assert!(limiter.allow_at("2001:db8:1:3::1".parse().unwrap(), start));
+    }
+
+    #[test]
+    fn all_addresses_together_have_a_limit_that_also_caps_the_map() {
+        let limiter = PairingLimiter::default();
+        let start = Instant::now();
+        let ip = |i: usize| -> IpAddr { format!("10.1.{}.{}", i / 200, i % 200).parse().unwrap() };
+        for i in 0..MAX_GLOBAL_ATTEMPTS {
+            assert!(limiter.allow_at(ip(i), start));
+        }
+        // A new address is refused too, and the map does not grow.
+        for i in MAX_GLOBAL_ATTEMPTS..1000 {
+            assert!(!limiter.allow_at(ip(i), start));
+        }
+        assert_eq!(limiter.tracked(), MAX_GLOBAL_ATTEMPTS);
+        // The window moves on.
+        assert!(limiter.allow_at(ip(5000), start + WINDOW + Duration::from_secs(1)));
+        assert_eq!(limiter.tracked(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_wrong_code_is_refused_without_waiting_for_the_writer() {
+        let (hub, _dir) = crate::hub::test_hub().await;
+        // A long write holds the writer.
+        let store = hub.store.clone();
+        let busy = tokio::spawn(async move {
+            store
+                .write(|_| {
+                    std::thread::sleep(Duration::from_secs(2));
+                    Ok(())
+                })
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let started = Instant::now();
+        let result = hub
+            .pair_client(PairClientRequest {
+                code: random_pairing_code(),
+                public_key: consort_proto::auth::PublicKey::from_bytes([7; 32]),
+                name: "Guess".to_owned(),
+                kind: consort_proto::model::ClientKind::Desktop,
+            })
+            .await;
+        assert_eq!(result.unwrap_err().code(), ErrorCode::Unauthorized);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        busy.await.unwrap().unwrap();
     }
 
     #[test]

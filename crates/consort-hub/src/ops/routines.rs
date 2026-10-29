@@ -257,6 +257,8 @@ fn check_text(name: &str, prompt: &str, action: &RoutineAction) -> Result<()> {
             "The prompt of the routine is empty. Write what the routine must do.",
         ));
     }
+    // A start_task routine makes the prompt the brief of its task.
+    crate::limits::check_text("prompt", prompt, crate::limits::BRIEF_MAX_BYTES)?;
     if let RoutineAction::StartTask { title, .. } = action
         && title.trim().is_empty()
     {

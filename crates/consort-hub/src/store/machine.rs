@@ -171,6 +171,26 @@ pub fn insert_pairing_code(
     Ok(expires)
 }
 
+/// Whether a pairing code can be used now. It only reads, so the hub can
+/// refuse a wrong code without the writer. [`consume_pairing_code`] still
+/// decides.
+pub fn pairing_code_usable(
+    conn: &Connection,
+    kind: PairingKind,
+    code: &PairingCode,
+    now: Timestamp,
+) -> Result<bool> {
+    let found: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM pairing_codes
+             WHERE code_hash = ?1 AND kind = ?2 AND used_at IS NULL AND expires_at > ?3",
+            params![pairing_code_hash(code), kind.as_str(), now.as_millis()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(found.is_some())
+}
+
 /// Uses a pairing code once. Returns false for an unknown, used, expired or
 /// wrong-kind code. The update is one statement, so two requests cannot both
 /// use the same code.

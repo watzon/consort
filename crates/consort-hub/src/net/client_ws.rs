@@ -8,7 +8,7 @@ use axum::extract::{State, WebSocketUpgrade};
 use axum::response::Response;
 use consort_proto::auth::{ClientHello, ClientHelloResult, PeerId};
 use consort_proto::client_api::{
-    ClientRequest, FeedEntry, HubToClient, SyncSnapshot, SyncSubscribe,
+    ClientRequest, FeedEntry, FeedSkipped, HubToClient, SyncSnapshot, SyncSubscribe,
 };
 use consort_proto::error::{ErrorBody, ErrorCode};
 use consort_proto::frame::{
@@ -82,26 +82,54 @@ async fn run_client(hub: Hub, mut socket: WebSocket) {
             return;
         }
     };
+    // A revoke closes only registered connections. So the hub registers this
+    // one first and then reads the revoke time again. A revoke that ran
+    // during the handshake is then seen here, and a later one closes the
+    // connection through the registry.
+    let cancel = hub.shutdown.child_token();
+    let connection = hub.clients.register(client_id, cancel.clone());
+    match hub.client_is_active(client_id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            hub.clients.unregister(connection);
+            let error =
+                ErrorBody::unauthorized("This client was removed. Pair this app again to connect.");
+            fail(&mut socket, &auth.hello, error, 1008, "unauthorized").await;
+            return;
+        }
+        Err(err) => {
+            hub.clients.unregister(connection);
+            fail(
+                &mut socket,
+                &auth.hello,
+                err.to_error_body(),
+                1011,
+                "internal",
+            )
+            .await;
+            return;
+        }
+    }
     let result = ClientHelloResult {
         protocol_version: version,
         hub_version: HUB_VERSION.to_owned(),
         feed_seq,
     };
-    let Ok(reply) = auth.hello.respond_ok(&result) else {
-        return;
+    let sent = match auth.hello.respond_ok(&result) {
+        Ok(reply) => send_frame(&mut socket, &reply).await,
+        Err(_) => false,
     };
-    if !send_frame(&mut socket, &reply).await {
+    if !sent {
+        hub.clients.unregister(connection);
         return;
     }
     if let Err(err) = hub.touch_client(client_id).await {
         tracing::warn!(error = %err, "could not record that a client connected");
     }
 
-    let cancel = hub.shutdown.child_token();
     let (outbox, rx) = Outbox::new(cancel.clone());
     let (sink, mut stream) = socket.split();
     let writer = tokio::spawn(write_loop(sink, rx, cancel.clone()));
-    let connection = hub.clients.register(client_id, cancel.clone());
     tracing::debug!(client_id = %client_id, "a client connected");
 
     let mut forwarder: Option<JoinHandle<()>> = None;
@@ -120,6 +148,10 @@ async fn run_client(hub: Hub, mut socket: WebSocket) {
             Message::Ping(_) | Message::Pong(_) => continue,
             Message::Binary(_) => break,
         };
+        // A revoke can land while a frame waits. Do not run it.
+        if cancel.is_cancelled() {
+            break;
+        }
         match Frame::parse(text.as_str()) {
             Ok(Frame::Request(request)) => {
                 handle_request(&hub, client_id, &outbox, &mut forwarder, request).await;
@@ -218,7 +250,7 @@ fn reply(outbox: &Outbox, request: &RequestFrame, result: Result<serde_json::Val
             .unwrap_or_else(|err| request.respond_error(err.to_error_body())),
         Err(err) => request.respond_error(err.to_error_body()),
     };
-    outbox.send_frame(&frame);
+    outbox.send_response(request, &frame);
 }
 
 /// Checks the position before the hub says `ok`.
@@ -312,12 +344,97 @@ fn passes(filter: Option<&HashSet<ChannelId>>, entry: &FeedEntry) -> bool {
     }
 }
 
+/// Sends one feed entry. Returns false when the connection is gone.
+///
+/// An entry that does not fit in one frame goes out as a small
+/// `feed.skipped` event in its place, so the client knows what it missed and
+/// the feed goes on.
 fn send_entry(outbox: &Outbox, entry: &FeedEntry) -> bool {
-    match Frame::family_event(&HubToClient::Feed(entry.clone())) {
-        Ok(frame) => outbox.send_frame(&frame),
+    let encoded =
+        Frame::family_event(&HubToClient::Feed(entry.clone())).and_then(|frame| frame.to_text());
+    match encoded {
+        Ok(text) => outbox.send_text(text),
         Err(err) => {
-            tracing::warn!(error = %err, "could not encode a feed entry");
-            true
+            tracing::warn!(seq = entry.seq, entity_id = %entry.entity_id, error = %err, "a feed entry does not fit in a frame, so the hub sends feed.skipped");
+            let skipped = HubToClient::FeedSkipped(FeedSkipped {
+                seq: entry.seq,
+                channel_id: entry.channel_id,
+                entity: entry.change.kind(),
+                entity_id: entry.entity_id.clone(),
+            });
+            match Frame::family_event(&skipped) {
+                Ok(frame) => outbox.send_frame(&frame),
+                Err(err) => {
+                    tracing::warn!(error = %err, "could not encode feed.skipped");
+                    true
+                }
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use consort_proto::client_api::{EntityKind, EntityPayload};
+    use consort_proto::frame::MAX_FRAME_BYTES;
+    use consort_proto::ids::MessageId;
+    use consort_proto::model::{Author, Message, MessageKind};
+    use consort_proto::time::Timestamp;
+    use tokio_util::sync::CancellationToken;
+
+    fn message(body: String) -> Message {
+        Message {
+            id: MessageId::new(),
+            channel_id: ChannelId::new(),
+            thread_root_id: None,
+            author: Author::Assistant,
+            author_session_id: None,
+            author_task_id: None,
+            author_routine_id: None,
+            kind: MessageKind::Text,
+            body,
+            attachments: vec![],
+            in_timeline: false,
+            client_message_id: None,
+            reply_count: 0,
+            last_reply_at: None,
+            reactions: vec![],
+            edited_at: None,
+            deleted_at: None,
+            created_at: Timestamp::now(),
+        }
+    }
+
+    fn next_event(rx: &mut tokio::sync::mpsc::Receiver<String>) -> HubToClient {
+        let text = rx.try_recv().expect("a frame");
+        let Ok(Frame::Event(event)) = Frame::parse(&text) else {
+            panic!("not an event: {text}");
+        };
+        event.decode().unwrap()
+    }
+
+    #[test]
+    fn a_feed_entry_that_does_not_fit_goes_out_as_feed_skipped_and_the_feed_goes_on() {
+        let (outbox, mut rx) = Outbox::new(CancellationToken::new());
+        let big = message("x".repeat(MAX_FRAME_BYTES));
+        let entry = FeedEntry::upsert(7, Timestamp::now(), EntityPayload::Message(big.clone()));
+        assert!(send_entry(&outbox, &entry), "the forwarder must go on");
+        let HubToClient::FeedSkipped(skipped) = next_event(&mut rx) else {
+            panic!("expected feed.skipped");
+        };
+        assert_eq!(skipped.seq, 7);
+        assert_eq!(skipped.entity, EntityKind::Message);
+        assert_eq!(skipped.entity_id, big.id.to_string());
+        assert_eq!(skipped.channel_id, Some(big.channel_id));
+
+        // The next entry goes out as usual.
+        let small = FeedEntry::upsert(
+            8,
+            Timestamp::now(),
+            EntityPayload::Message(message("hi".to_owned())),
+        );
+        assert!(send_entry(&outbox, &small));
+        assert!(matches!(next_event(&mut rx), HubToClient::Feed(e) if e.seq == 8));
     }
 }

@@ -21,6 +21,7 @@ use consort_proto::worker_link::{
 
 use crate::error::Result;
 use crate::hub::Hub;
+use crate::limits::{TURN_TEXT_MAX_BYTES, TURN_TEXT_MIN_BYTES, json_len, turn_room};
 use crate::placement::{PlacementInput, Subject, place};
 use crate::prompts;
 use crate::store::coordinator::{self as coord_store, CoordinatorRow};
@@ -85,6 +86,86 @@ impl Coordinators {
     }
 }
 
+/// The queued events that go into one turn, with their IDs and the turn
+/// text. Events go in arrival order while the text takes at most `room`
+/// bytes as a JSON string. The other events wait for the next turn, which
+/// starts when this one ends. A first event that alone does not fit is cut,
+/// with a note that tells the coordinator how to read all of it.
+fn turn_batch(events: &[(i64, WakeEvent)], room: usize) -> (Vec<i64>, Vec<WakeEvent>, String) {
+    let shell = json_len(&render_events(&[]));
+    let mut used = shell;
+    let mut ids = Vec::new();
+    let mut taken = Vec::new();
+    for (id, event) in events {
+        let cost = json_len(&render_events(std::slice::from_ref(event))) - shell;
+        if used + cost <= room {
+            used += cost;
+            ids.push(*id);
+            taken.push(event.clone());
+            continue;
+        }
+        if taken.is_empty() {
+            ids.push(*id);
+            taken.push(cut_event(event, room));
+        }
+        break;
+    }
+    let rendered = render_events(&taken);
+    (ids, taken, rendered)
+}
+
+/// The main text of an event: a message, a summary, a prompt or a note.
+fn main_text(event: &mut WakeEvent) -> Option<&mut String> {
+    match event {
+        WakeEvent::UserMessage { text, .. }
+        | WakeEvent::TaskUpdate { text, .. }
+        | WakeEvent::EverythingMessage { text, .. } => Some(text),
+        WakeEvent::Routine { prompt, .. } => Some(prompt),
+        WakeEvent::MemorySuggestion { note, .. } => Some(note),
+        WakeEvent::DecisionAnswered { text, .. } => text.as_mut(),
+    }
+}
+
+/// Cuts the main text of an event so that the event alone renders in at
+/// most `room` bytes as a JSON string.
+fn cut_event(event: &WakeEvent, room: usize) -> WakeEvent {
+    let mark = match event {
+        WakeEvent::UserMessage { id, .. } | WakeEvent::EverythingMessage { id, .. } => format!(
+            "\n\n[The hub cut this message here, because it is too long for one turn. Call fetch_thread with message_id \"{id}\" to read all of it.]"
+        ),
+        _ => "\n\n[The hub cut this text here, because it is too long for one turn.]".to_owned(),
+    };
+    let mut cut = event.clone();
+    let full = match main_text(&mut cut) {
+        Some(text) => std::mem::take(text),
+        None => return cut,
+    };
+    let bounds: Vec<usize> = full
+        .char_indices()
+        .map(|(i, _)| i)
+        .chain(std::iter::once(full.len()))
+        .collect();
+    let fits = |end: usize, cut: &mut WakeEvent| {
+        if let Some(text) = main_text(cut) {
+            *text = format!("{}{mark}", &full[..end]);
+        }
+        json_len(&render_events(std::slice::from_ref(cut))) <= room
+    };
+    // The longest start of the text that fits, by binary search over the
+    // character boundaries.
+    let (mut low, mut high) = (0_usize, bounds.len() - 1);
+    while low < high {
+        let mid = (low + high).div_ceil(2);
+        if fits(bounds[mid], &mut cut) {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    fits(bounds[low], &mut cut);
+    cut
+}
+
 /// A hash of what the system prompt of a coordinator says about its channel.
 /// When it changes, the hub replaces the session, so the new purpose,
 /// instructions or model reach the coordinator.
@@ -144,9 +225,6 @@ impl Hub {
         let Some(inputs) = self.read_coordinator_inputs(channel_id).await? else {
             return Ok(());
         };
-        let event_ids: Vec<i64> = inputs.events.iter().map(|(id, _)| *id).collect();
-        let events: Vec<WakeEvent> = inputs.events.iter().map(|(_, e)| e.clone()).collect();
-        let rendered = render_events(&events);
 
         let fingerprint = prompt_fingerprint(&inputs.channel, &inputs.everything);
         let mut inputs = inputs;
@@ -176,6 +254,7 @@ impl Hub {
         }
         if let Some(session) = inputs.session.clone() {
             let worker_id = session.worker_id;
+            let (event_ids, events, rendered) = turn_batch(&inputs.events, TURN_TEXT_MAX_BYTES);
             let started = self
                 .store
                 .write(move |tx| {
@@ -251,6 +330,11 @@ impl Hub {
             &inputs.global_index,
             &inputs.channel_index,
         );
+        // The first turn also holds the context pack, and the command holds
+        // the system prompt, so the events get the room that is left.
+        let room = turn_room(json_len(&system_prompt) + json_len(&inputs.context))
+            .max(TURN_TEXT_MIN_BYTES);
+        let (event_ids, events, rendered) = turn_batch(&inputs.events, room);
         let first_turn = format!("{}\n\n{rendered}", inputs.context);
         let worker_id = placement.worker_id;
         let files = inputs.files.clone();
@@ -338,8 +422,14 @@ impl Hub {
         self.store
             .read(move |conn| {
                 let tasks = work::tasks_in_channel(conn, channel_id, false)?;
-                let (mut messages, _) =
-                    conversation::messages_page(conn, channel_id, None, None, CONTEXT_MESSAGES)?;
+                let (mut messages, _) = conversation::messages_page(
+                    conn,
+                    channel_id,
+                    None,
+                    None,
+                    CONTEXT_MESSAGES,
+                    usize::MAX,
+                )?;
                 messages.reverse();
                 let files = knowledge::channel_files(conn, channel_id, None)?
                     .into_iter()
@@ -432,6 +522,7 @@ impl Hub {
                         None,
                         None,
                         CONTEXT_MESSAGES,
+                        usize::MAX,
                     )?;
                     messages.reverse();
                     let files = knowledge::channel_files(conn, channel_id, None)?
@@ -508,11 +599,125 @@ impl Hub {
                 Ok(out)
             })
             .await?;
+        // One session that fails does not stop the others.
         for session_id in stuck {
             tracing::warn!(session_id = %session_id, "a coordinator turn ran for too long, so the hub replaces the session");
-            self.mark_session_lost(session_id, "The turn ran for too long.")
-                .await?;
+            if let Err(err) = self
+                .mark_session_lost(session_id, "The turn ran for too long.")
+                .await
+            {
+                tracing::warn!(error = %err, session_id = %session_id, "could not replace a coordinator session with a stuck turn");
+            }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use consort_proto::ids::{AccountId, MessageId, WorkerId};
+    use consort_proto::model::ModelOptions;
+    use consort_proto::time::Timestamp;
+
+    use super::*;
+
+    fn said(text: &str) -> WakeEvent {
+        WakeEvent::UserMessage {
+            id: MessageId::new(),
+            thread: None,
+            at: Timestamp::now(),
+            text: text.to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_turn_takes_events_in_order_while_they_fit() {
+        let events: Vec<(i64, WakeEvent)> = (1..=3).map(|i| (i, said(&"a".repeat(100)))).collect();
+        let two: Vec<WakeEvent> = events[..2].iter().map(|(_, e)| e.clone()).collect();
+        let room = json_len(&render_events(&two));
+        let (ids, taken, text) = turn_batch(&events, room);
+        assert_eq!(ids, [1, 2]);
+        assert_eq!(taken, two);
+        assert!(json_len(&text) <= room);
+        let (ids, _, _) = turn_batch(&events, usize::MAX);
+        assert_eq!(ids, [1, 2, 3]);
+    }
+
+    #[test]
+    fn a_first_event_that_does_not_fit_alone_is_cut_with_a_pointer() {
+        let event = said(&"<b>".repeat(10_000));
+        let WakeEvent::UserMessage { id, .. } = event.clone() else {
+            unreachable!()
+        };
+        let events = vec![(1, event), (2, said("next"))];
+        let (ids, taken, text) = turn_batch(&events, 4_000);
+        assert_eq!(ids, [1]);
+        assert!(json_len(&text) <= 4_000, "{}", json_len(&text));
+        assert!(text.contains(&format!("message_id \"{id}\"")), "{text}");
+        assert!(text.contains("&lt;b&gt;"));
+        let WakeEvent::UserMessage { text: cut, .. } = &taken[0] else {
+            unreachable!()
+        };
+        assert!(cut.starts_with("<b><b>"));
+    }
+
+    #[tokio::test]
+    async fn one_stuck_turn_that_fails_does_not_stop_the_others() {
+        let (hub, _dir) = crate::hub::test_hub().await;
+        let everything = hub
+            .store
+            .read(conversation::everything_channel)
+            .await
+            .unwrap();
+        let session = Session {
+            id: SessionId::new(),
+            role: SessionRole::Coordinator,
+            channel_id: everything.id,
+            task_id: None,
+            worker_id: WorkerId::new(),
+            account_id: AccountId::new(),
+            harness: "fake".to_owned(),
+            model: "fake-1".to_owned(),
+            options: ModelOptions::new(),
+            workspace_path: String::new(),
+            native_ref: None,
+            state: SessionState::Active,
+            last_seq: 0,
+            usage: Usage::default(),
+            started_at: Timestamp::now(),
+            ended_at: None,
+            end_reason: None,
+        };
+        let good = session.id;
+        let old = Timestamp::now().plus_millis(-10_000);
+        hub.store
+            .write(move |tx| {
+                // A row whose session is gone fails. It comes first.
+                tx.save_coordinator(&CoordinatorRow {
+                    channel_id: ChannelId::new(),
+                    session_id: Some(SessionId::new()),
+                    turn_open: true,
+                    turn_started_at: Some(old),
+                    turn_events: Vec::new(),
+                })?;
+                tx.save_session(&session)?;
+                tx.save_coordinator(&CoordinatorRow {
+                    channel_id: everything.id,
+                    session_id: Some(good),
+                    turn_open: true,
+                    turn_started_at: Some(old),
+                    turn_events: Vec::new(),
+                })
+            })
+            .await
+            .unwrap();
+        hub.expire_stuck_turns(1_000).await.unwrap();
+        let state = hub
+            .store
+            .read(move |conn| work::session_or_404(conn, good))
+            .await
+            .unwrap()
+            .state;
+        assert_eq!(state, SessionState::Lost);
     }
 }

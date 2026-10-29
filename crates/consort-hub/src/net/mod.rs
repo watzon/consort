@@ -1,6 +1,5 @@
 //! HTTP and WebSocket transport.
 
-use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use consort_proto::auth::{CLIENT_WS_PATH, PAIR_CLIENT_PATH, PAIR_WORKER_PATH, WORKER_WS_PATH};
@@ -26,11 +25,11 @@ pub(crate) fn router(hub: Hub) -> Router {
         .route(PAIR_CLIENT_PATH, post(pairing::pair_client))
         .route(CLIENT_WS_PATH, get(client_ws::client_ws))
         .route(WORKER_WS_PATH, get(worker_ws::worker_ws))
+        // The upload reads its body as a stream and checks the size itself,
+        // after it has checked the request headers.
         .route(
             "/v1/blobs/{sha256}",
-            put(blobs::put_blob)
-                .get(blobs::get_blob)
-                .layer(DefaultBodyLimit::max(blobs::MAX_BLOB_BYTES + 1024)),
+            put(blobs::put_blob).get(blobs::get_blob),
         )
         .with_state(hub)
 }

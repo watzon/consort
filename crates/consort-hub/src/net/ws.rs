@@ -16,6 +16,28 @@ use crate::util::random_bytes;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const OUTBOX_CAPACITY: usize = 4096;
+/// The most connections that can be in the handshake at the same time. A
+/// personal hub has a few peers, so this is far above normal use. It stops a
+/// flood of sockets that never authenticate.
+pub(crate) const MAX_PENDING_HANDSHAKES: usize = 64;
+
+/// The slots for connections that have not finished the handshake.
+pub struct HandshakeSlots(std::sync::Arc<tokio::sync::Semaphore>);
+
+impl Default for HandshakeSlots {
+    fn default() -> Self {
+        Self(std::sync::Arc::new(tokio::sync::Semaphore::new(
+            MAX_PENDING_HANDSHAKES,
+        )))
+    }
+}
+
+impl HandshakeSlots {
+    /// A slot, or `None` when all slots are in use.
+    pub(crate) fn try_take(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.0.clone().try_acquire_owned().ok()
+    }
+}
 
 /// A queue of text frames for one connection. When the queue is full, the
 /// peer reads too slowly. The hub then closes the connection, and the peer
@@ -55,6 +77,23 @@ impl Outbox {
         }
     }
 
+    /// Sends the response to `request`. A response that does not fit in one
+    /// frame cannot go out, so the peer gets an error response in its place
+    /// and does not wait for ever.
+    pub(crate) fn send_response(&self, request: &RequestFrame, response: &Frame) -> bool {
+        match response.to_text() {
+            Ok(text) => self.send_text(text),
+            Err(FrameError::TooLarge { size }) => {
+                tracing::warn!(kind = %request.kind, size, "a response is larger than the frame limit, so the hub sends an error");
+                self.send_frame(&request.respond_error(too_large(size)))
+            }
+            Err(err) => {
+                tracing::warn!(kind = %request.kind, error = %err, "the hub could not encode a response");
+                self.send_frame(&request.respond_error(ErrorBody::internal()))
+            }
+        }
+    }
+
     pub(crate) fn close(&self) {
         self.cancel.cancel();
     }
@@ -62,6 +101,18 @@ impl Outbox {
     pub(crate) fn is_closed(&self) -> bool {
         self.cancel.is_cancelled() || self.tx.is_closed()
     }
+}
+
+/// The error for an answer that does not fit in one frame.
+pub(crate) fn too_large(size: usize) -> ErrorBody {
+    ErrorBody::new(
+        ErrorCode::Internal,
+        format!(
+            "The answer has {} KiB, and a frame can have at most {} KiB, so the hub cannot send it. Ask for less, for example with a smaller limit.",
+            size / 1024,
+            MAX_FRAME_BYTES / 1024
+        ),
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,6 +197,12 @@ pub(crate) async fn handshake(
     socket: &mut WebSocket,
     kind: PeerKind,
 ) -> Option<Authenticated> {
+    // The slot is free again when this function returns.
+    let Some(_slot) = hub.handshakes.try_take() else {
+        tracing::warn!("too many connections are in the handshake, so the hub refuses a new one");
+        close_with(socket, 1013, "too many connections, try again later").await;
+        return None;
+    };
     let nonce = Nonce::from_bytes(random_bytes::<32>());
     let challenge = Frame::event(&AuthChallenge { nonce }).ok()?;
     if !send_frame(socket, &challenge).await {
@@ -294,5 +351,32 @@ pub(crate) async fn write_loop(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use consort_proto::frame::FrameId;
+    use serde_json::json;
+
+    #[test]
+    fn a_response_that_does_not_fit_goes_out_as_an_error_response() {
+        let (outbox, mut rx) = Outbox::new(CancellationToken::new());
+        let request = RequestFrame {
+            id: FrameId::generate(),
+            kind: "message.list".to_owned(),
+            body: json!({}),
+        };
+        let big = request
+            .respond_ok(&json!({"pad": "x".repeat(MAX_FRAME_BYTES)}))
+            .unwrap();
+        assert!(outbox.send_response(&request, &big));
+        let Ok(Frame::Response(response)) = Frame::parse(&rx.try_recv().unwrap()) else {
+            panic!("expected a response");
+        };
+        assert_eq!(response.re, request.id);
+        let error = response.result.unwrap_err();
+        assert!(error.message.contains("KiB"), "{}", error.message);
     }
 }

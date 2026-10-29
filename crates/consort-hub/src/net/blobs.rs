@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use axum::body::Bytes;
+use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
@@ -19,7 +19,10 @@ use super::pairing::error_response;
 use super::ws::verify_signature;
 use crate::error::{HubError, Result};
 use crate::hub::Hub;
-use crate::util::{random_token, sha256};
+use crate::util::random_token;
+use futures_util::StreamExt;
+use sha2::{Digest, Sha256};
+use tokio::io::AsyncWriteExt;
 
 /// The largest blob that the hub accepts.
 pub(crate) const MAX_BLOB_BYTES: usize = 256 * 1024 * 1024;
@@ -90,44 +93,83 @@ fn parse_hash(text: &str) -> Result<Sha256Hash> {
     })
 }
 
+fn too_large() -> HubError {
+    HubError::invalid("The blob is too large. The limit is 256 MiB.")
+}
+
+/// Uploads a blob. The hub checks the headers first and reads no byte of
+/// the body before the request is authorized. Then it streams the body to a
+/// temp file with a running hash, so a large blob is never in memory.
 pub(crate) async fn put_blob(
     State(hub): State<Hub>,
     Path(name): Path<String>,
     method: Method,
     uri: Uri,
     headers: HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Response {
     let result: Result<Response> = async {
         hub.authorize_http(&method, &uri, &headers).await?;
         let expected = parse_hash(&name)?;
-        if body.len() > MAX_BLOB_BYTES {
-            return Err(HubError::invalid(
-                "The blob is too large. The limit is 256 MiB.",
-            ));
-        }
-        if sha256(&body) != expected {
-            return Err(HubError::invalid(
-                "The content does not match the hash in the URL. Upload the file again.",
-            ));
+        let declared = header_text(&headers, header::CONTENT_LENGTH.as_str())
+            .and_then(|v| v.parse::<u64>().ok());
+        if declared.is_some_and(|len| len > MAX_BLOB_BYTES as u64) {
+            return Err(too_large());
         }
         let target = hub.blob_file(&expected);
-        if !target.exists() {
-            let temp = target.with_extension(format!("tmp-{}", &random_token()[..12]));
-            tokio::fs::write(&temp, &body).await?;
-            if let Err(err) = tokio::fs::rename(&temp, &target).await {
+        let temp = target.with_extension(format!("tmp-{}", &random_token()[..12]));
+        let size = match receive(body, &temp, &expected).await {
+            Ok(size) => size,
+            Err(err) => {
+                // Best effort: the temp file may not exist.
                 let _ = tokio::fs::remove_file(&temp).await;
-                return Err(err.into());
+                return Err(err);
             }
+        };
+        if tokio::fs::try_exists(&target).await? {
+            let _ = tokio::fs::remove_file(&temp).await;
+        } else if let Err(err) = tokio::fs::rename(&temp, &target).await {
+            let _ = tokio::fs::remove_file(&temp).await;
+            return Err(err.into());
         }
         Ok((
             StatusCode::OK,
-            axum::Json(json!({"sha256": expected, "size": body.len()})),
+            axum::Json(json!({"sha256": expected, "size": size})),
         )
             .into_response())
     }
     .await;
     result.unwrap_or_else(|err| error_response(&err))
+}
+
+/// Writes the body to `temp` and checks its size and its hash on the way.
+/// Returns the size.
+async fn receive(body: Body, temp: &std::path::Path, expected: &Sha256Hash) -> Result<usize> {
+    let mut file = tokio::fs::File::create(temp).await?;
+    let mut hasher = Sha256::new();
+    let mut size = 0_usize;
+    let mut stream = body.into_data_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|err| {
+            HubError::invalid(format!(
+                "The upload stopped before the end: {err}. Upload the file again."
+            ))
+        })?;
+        size = size.saturating_add(chunk.len());
+        if size > MAX_BLOB_BYTES {
+            return Err(too_large());
+        }
+        hasher.update(&chunk);
+        file.write_all(&chunk).await?;
+    }
+    file.flush().await?;
+    let digest: [u8; 32] = hasher.finalize().into();
+    if Sha256Hash::from_bytes(digest) != *expected {
+        return Err(HubError::invalid(
+            "The content does not match the hash in the URL. Upload the file again.",
+        ));
+    }
+    Ok(size)
 }
 
 pub(crate) async fn get_blob(

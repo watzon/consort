@@ -9,14 +9,16 @@ use consort_proto::client_api::*;
 use consort_proto::frame::Empty;
 use consort_proto::ids::{ChannelId, GroupId, MessageId, RepoId};
 use consort_proto::model::{
-    Author, Channel, ChannelKind, Group, Message, MessageKind, Reaction, ReadMarker, Repo, Task,
+    Author, Channel, ChannelKind, Group, Message, MessageKind, Reaction, ReadMarker, Repo,
 };
+use consort_proto::status::Actor;
 use consort_proto::tools::SearchResult;
 use consort_proto::turn_input::WakeEvent;
 use rusqlite::Connection;
 
 use crate::error::{HubError, Result};
 use crate::hub::{Caller, Hub};
+use crate::ops::flow::{Delivered, deliver_in_tx};
 use crate::store::conversation::{self, NewMessage};
 use crate::store::{Tx, knowledge, work};
 
@@ -47,6 +49,17 @@ fn clean_name(what: &str, name: &str) -> Result<String> {
         )));
     }
     Ok(name.to_owned())
+}
+
+/// The purpose and the instructions go into every system prompt of the
+/// channel, so both have a size limit.
+fn check_channel_text(purpose: &str, instructions: &str) -> Result<()> {
+    crate::limits::check_text("purpose", purpose, crate::limits::CHANNEL_PURPOSE_MAX_BYTES)?;
+    crate::limits::check_text(
+        "instructions",
+        instructions,
+        crate::limits::CHANNEL_INSTRUCTIONS_MAX_BYTES,
+    )
 }
 
 fn to_position(index: usize) -> i64 {
@@ -132,10 +145,11 @@ fn require_users_text(message: &Message) -> Result<()> {
 enum Sent {
     /// The client already sent this message. Nothing changed.
     Repeat(Message),
-    /// The message is new. `task` is set when it went into a task thread.
+    /// The message is new. For a message in a task thread, `delivered` says
+    /// where the hub queued it for the task session, when it could.
     New {
         message: Message,
-        task: Option<Box<Task>>,
+        delivered: Option<(Delivered, ChannelId)>,
     },
 }
 
@@ -206,6 +220,7 @@ impl Hub {
         request: ChannelCreate,
     ) -> Result<ChannelResult> {
         let name = clean_name("channel", &request.name)?;
+        check_channel_text(&request.purpose, &request.instructions)?;
         let channel = self
             .store
             .write(move |tx| {
@@ -253,6 +268,10 @@ impl Hub {
         _caller: &Caller,
         request: ChannelUpdate,
     ) -> Result<ChannelResult> {
+        check_channel_text(
+            request.purpose.as_deref().unwrap_or_default(),
+            request.instructions.as_deref().unwrap_or_default(),
+        )?;
         let channel = self
             .store
             .write(move |tx| {
@@ -612,6 +631,7 @@ impl Hub {
             Caller::Hub => None,
         };
         let channel_id = request.channel_id;
+        let hub = self.clone();
         let sent = self
             .store
             .write(move |tx| {
@@ -639,10 +659,10 @@ impl Hub {
                 // The thread root of the stored message is the first message
                 // of the thread, also when the request named a reply.
                 let task = match message.thread_root_id {
-                    Some(root) => work::task_by_card(tx.db(), root)?.map(Box::new),
+                    Some(root) => work::task_by_card(tx.db(), root)?,
                     None => None,
                 };
-                if task.is_none() {
+                let Some(task) = task else {
                     tx.queue_wake(
                         channel_id,
                         &WakeEvent::UserMessage {
@@ -652,23 +672,54 @@ impl Hub {
                             text: message.body.clone(),
                         },
                     )?;
+                    return Ok(Sent::New {
+                        message,
+                        delivered: None,
+                    });
+                };
+                // The delivery to the task session goes into the same
+                // transaction, so a stored message always has its turn,
+                // steer or inbox entry, also when the hub stops right after.
+                match deliver_in_tx(&hub, tx, task.id, &message.body, Actor::User) {
+                    Ok(delivered) => Ok(Sent::New {
+                        message,
+                        delivered: Some((delivered, task.channel_id)),
+                    }),
+                    Err(HubError::Api(error)) => {
+                        tx.post_notice(
+                            task.channel_id,
+                            Some(task.card_message_id),
+                            Some(task.id),
+                            "message_not_sent",
+                            &error.message,
+                        )?;
+                        Ok(Sent::New {
+                            message,
+                            delivered: None,
+                        })
+                    }
+                    Err(other) => Err(other),
                 }
-                Ok(Sent::New { message, task })
             })
             .await?;
         match sent {
             Sent::Repeat(message) => Ok(MessageResult { message }),
             Sent::New {
                 message,
-                task: Some(task),
+                delivered: Some((delivered, task_channel)),
             } => {
-                self.route_user_message_to_task(&task, &message).await?;
+                self.pump_worker(delivered.worker_id);
+                if delivered.status_changed {
+                    self.kick_coordinator(task_channel);
+                }
                 Ok(MessageResult { message })
             }
             Sent::New {
                 message,
-                task: None,
+                delivered: None,
             } => {
+                // A user message queued a wake event. After a refused task
+                // delivery nothing is queued, and the kick does nothing.
                 self.kick_coordinator(channel_id);
                 Ok(MessageResult { message })
             }
@@ -697,6 +748,7 @@ impl Hub {
                     request.thread_root_id,
                     request.before,
                     limit,
+                    crate::limits::MESSAGE_PAGE_MAX_BYTES,
                 )
             })
             .await?;
@@ -724,6 +776,11 @@ impl Hub {
                     ));
                 }
                 if message.body != request.body {
+                    crate::limits::check_text(
+                        "message",
+                        &request.body,
+                        crate::limits::MESSAGE_BODY_MAX_BYTES,
+                    )?;
                     message.body = request.body;
                     message.edited_at = Some(tx.now());
                     tx.save_message(&message)?;
@@ -837,7 +894,7 @@ mod tests {
 
     use consort_proto::error::ErrorCode;
     use consort_proto::ids::{ClientId, TaskId};
-    use consort_proto::model::{BlobRef, TaskCreator};
+    use consort_proto::model::{BlobRef, Task, TaskCreator};
     use consort_proto::status::TaskStatus;
 
     use super::*;

@@ -130,17 +130,16 @@ impl Tx<'_> {
 
     /// Puts events back at the front of the queue, for example after a lost
     /// session. Row IDs only matter for order, so the events get IDs lower
-    /// than every queued row.
+    /// than every queued row. The IDs are unique across the whole table, not
+    /// only in one channel, so the lowest ID comes from every channel.
     pub fn requeue_wakes_first(
         &mut self,
         channel_id: ChannelId,
         events: &[WakeEvent],
     ) -> Result<()> {
-        let lowest: Option<i64> = self.db().query_row(
-            "SELECT MIN(id) FROM wake_events WHERE channel_id = ?1",
-            [channel_id.to_string()],
-            |row| row.get(0),
-        )?;
+        let lowest: Option<i64> =
+            self.db()
+                .query_row("SELECT MIN(id) FROM wake_events", [], |row| row.get(0))?;
         let mut next = lowest.unwrap_or(1) - i64::try_from(events.len()).unwrap_or(0) - 1;
         for event in events {
             next += 1;

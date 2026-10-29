@@ -22,6 +22,7 @@ use crate::error::Result;
 use crate::link::Links;
 use crate::net::clients::ClientRegistry;
 use crate::net::pairing::PairingLimiter;
+use crate::net::ws::HandshakeSlots;
 use crate::store::{Store, conversation};
 
 pub const HUB_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -113,6 +114,7 @@ pub struct HubInner {
     pub clients: ClientRegistry,
     pub coordinators: Coordinators,
     pub pairing_limiter: PairingLimiter,
+    pub handshakes: HandshakeSlots,
     pub shutdown: CancellationToken,
 }
 
@@ -142,6 +144,7 @@ impl Hub {
             clients: ClientRegistry::default(),
             coordinators: Coordinators::default(),
             pairing_limiter: PairingLimiter::default(),
+            handshakes: HandshakeSlots::default(),
             shutdown: CancellationToken::new(),
         }));
         hub.bootstrap().await?;

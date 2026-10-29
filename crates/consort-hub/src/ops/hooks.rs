@@ -2,10 +2,7 @@
 //! this file. Other owners call these functions and do not change them.
 
 use consort_proto::ids::{ChannelId, RoutineId};
-use consort_proto::model::{
-    ApprovalMode, Message, ModelSelection, PlacementRequest, Task, TaskCreator,
-};
-use consort_proto::status::Actor;
+use consort_proto::model::{ApprovalMode, ModelSelection, PlacementRequest, TaskCreator};
 use consort_proto::time::Timestamp;
 
 use crate::error::Result;
@@ -32,36 +29,6 @@ impl Hub {
     /// It never blocks and never fails.
     pub(crate) fn kick_coordinator(&self, channel_id: ChannelId) {
         self.coordinators.kick(self, channel_id);
-    }
-
-    /// Sends a message that the user wrote in a task thread to the task
-    /// session. The message is already stored. If the task cannot take the
-    /// message now, the hub posts a notice in the thread that says why.
-    pub(crate) async fn route_user_message_to_task(
-        &self,
-        task: &Task,
-        message: &Message,
-    ) -> Result<()> {
-        if let Err(err) = self
-            .deliver_to_task(task.id, message.body.clone(), Actor::User)
-            .await
-        {
-            let body = err.to_error_body().message;
-            let (channel_id, root, task_id) = (task.channel_id, task.card_message_id, task.id);
-            self.store
-                .write(move |tx| {
-                    tx.post_notice(
-                        channel_id,
-                        Some(root),
-                        Some(task_id),
-                        "message_not_sent",
-                        &body,
-                    )
-                    .map(|_| ())
-                })
-                .await?;
-        }
-        Ok(())
     }
 
     /// Stops every session of a channel. Call it before you delete the

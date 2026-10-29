@@ -14,11 +14,18 @@ mod routines;
 mod tasks;
 
 impl Hub {
-    /// Builds the tool context of a session.
+    /// Builds the tool context of a session. A session that has ended or is
+    /// lost has no hub tools: the hub no longer runs turns for it, so what
+    /// it does could not be seen or undone.
     pub(crate) async fn tool_ctx(&self, session_id: SessionId) -> Result<ToolCtx> {
         self.store
             .read(move |conn| {
                 let session = work::session_or_404(conn, session_id)?;
+                if session.state.is_final() {
+                    return Err(HubError::conflict(
+                        "This session has ended, so it cannot use hub tools. Stop the session.",
+                    ));
+                }
                 let channel = conversation::channel_or_404(conn, session.channel_id)?;
                 let task = match (session.role, session.task_id) {
                     (SessionRole::Task, Some(id)) => work::task(conn, id)?,
@@ -61,8 +68,19 @@ impl Hub {
         let ctx = self.tool_ctx(session_id).await?;
         let call = HubToolCall::parse_for(ctx.audience, name, arguments)
             .map_err(|e| HubError::Api(e.to_error_body()))?;
-        self.note_tool_call(&ctx, call.tool()).await?;
-        let ctx = &ctx;
+        let tool = call.tool();
+        let result = self.dispatch_tool(&ctx, call).await;
+        // Only a call that worked counts for the fallback post. A failed
+        // `post_message` posted nothing, so the turn still needs a post.
+        if result.is_ok()
+            && let Err(err) = self.note_tool_call(&ctx, tool).await
+        {
+            tracing::warn!(error = %err, tool = tool.name(), "could not record a hub tool call");
+        }
+        result
+    }
+
+    async fn dispatch_tool(&self, ctx: &ToolCtx, call: HubToolCall) -> Result<Value> {
         use HubToolCall as C;
         match call {
             C::MemoryList(a) => self.tool_memory_list(ctx, a).await,
