@@ -24,9 +24,8 @@ Fixed:
 2. A coordinator approval or decision in a channel showed as plain text, with no buttons. The timeline now shows cards (decisions 103 to 107).
 3. After a worker restart, the hub kept the old coordinator turn open, so new messages waited for ever. The worker now sends `reopened`, and the hub ends the old turn (decision 109).
 4. After an app restart, the timeline showed only messages that came in live. The client now loads channel history, thread replies and older pages (decisions 110 to 113).
-5. When a harness login expired, the probe still said "Signed in", and the task failed with only "Authentication required". In progress at the time of writing; see DECISIONS for the result.
-
-Open, sent to the desktop follow-up:
+5. When a harness login expired, the probe still said "Signed in", and the task failed with only "Authentication required". A turn that fails for its login now marks the account signed out and says how to sign in (decision 114). The probe itself still cannot see an expired Claude Code login.
+6. These desktop issues (decisions 115 to 122):
 
 - The review card shows the whole review summary as plain text with blank gaps, and "Open thread" sits in the middle of it.
 - A long approval summary (a file path) runs past the right edge of a task card.
@@ -36,6 +35,12 @@ Open, sent to the desktop follow-up:
 - In Settings > Workers, a long account detail (the Gemini CLI error) runs over the status column, and a detail that ends with a period gets a second one.
 - The Add a worker dialog keeps "Waiting for the worker to connect" after the worker connects.
 - The Add a worker dialog shows `curl -fsSL https://get.consort.dev | sh`. That installer does not exist yet.
+
+Checked in the real app after the fixes: the history loads after an app restart, the message menu and the selected-text menu have the planned items, the message menu opens upward near the bottom edge, and Copy puts the selected text on the clipboard.
+
+Open:
+
+- Copy of a partial selection adds a newline at the end.
 
 Not bugs:
 
