@@ -33,7 +33,8 @@ struct Request {
 }
 
 /// A handle to the client. Cheap to clone. The background runtime stops when
-/// the last handle drops.
+/// the last handle drops. Dropping it never waits for the runtime, so it is
+/// safe on a UI thread.
 #[derive(Clone)]
 pub struct Client {
     requests: mpsc::UnboundedSender<Request>,
@@ -44,16 +45,15 @@ pub struct Client {
 /// The background thread that runs the client's Tokio runtime.
 struct RuntimeThread {
     stop: Option<oneshot::Sender<()>>,
-    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Drop for RuntimeThread {
+    /// Tells the runtime to stop and returns at once. The thread ends on its
+    /// own. Nothing waits for a call that is stuck on the hub, and the
+    /// outbox is on disk already, so nothing is lost.
     fn drop(&mut self) {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
-        }
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
         }
     }
 }
@@ -78,13 +78,16 @@ impl Subscription {
 }
 
 /// What a backend does with commands. The mock and the hub connection are
-/// the two backends.
+/// the two backends. `handle` must not wait: it starts the work and sends the
+/// result on `reply` when it is done, so one slow command never holds up the
+/// next one.
 trait Backend: Send + 'static {
     fn handle(
         &mut self,
         command: Command,
+        reply: oneshot::Sender<Result<(), ClientError>>,
         publish: &watch::Sender<Arc<ViewState>>,
-    ) -> impl std::future::Future<Output = Result<(), ClientError>> + Send;
+    );
 }
 
 fn spawn_runtime<F, Fut>(name: &str, run: F) -> Result<RuntimeThread, ClientError>
@@ -99,7 +102,8 @@ where
         .build()
         .map_err(|err| ClientError::Other(format!("Cannot start the client runtime: {err}")))?;
     let (stop_tx, stop_rx) = oneshot::channel();
-    let thread = std::thread::Builder::new()
+    // The thread is not joined: see `RuntimeThread::drop`.
+    std::thread::Builder::new()
         .name(name.to_owned())
         .spawn(move || {
             runtime.block_on(run(stop_rx));
@@ -108,7 +112,6 @@ where
         .map_err(|err| ClientError::Other(format!("Cannot start the client thread: {err}")))?;
     Ok(RuntimeThread {
         stop: Some(stop_tx),
-        thread: Some(thread),
     })
 }
 
@@ -123,8 +126,7 @@ async fn serve<B: Backend>(
             _ = &mut stop => break,
             request = requests.recv() => {
                 let Some(request) = request else { break };
-                let result = backend.handle(request.command, &publish).await;
-                let _ = request.reply.send(result);
+                backend.handle(request.command, request.reply, &publish);
             }
         }
     }
@@ -172,6 +174,9 @@ impl Client {
         let (requests, rx) = mpsc::unbounded_channel();
         let runtime = spawn_runtime("consort-client", move |stop| async move {
             tokio::spawn(hub::run_link(shared.clone()));
+            tokio::spawn(hub::run_publisher(shared.clone()));
+            tokio::spawn(hub::run_outbox(shared.clone()));
+            tokio::spawn(hub::run_loader(shared.clone()));
             let backend = hub::HubBackend { shared };
             serve(backend, rx, publish, stop).await;
         })?;

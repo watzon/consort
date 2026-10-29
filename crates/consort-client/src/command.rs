@@ -96,6 +96,10 @@ pub enum Command {
         option: Option<u32>,
         text: Option<String>,
     },
+    /// Removes a message that the hub refused from the list of failed sends.
+    DismissSendFailure {
+        id: String,
+    },
     WorkerPairingCode,
     CancelWorkerPairing,
     RenameWorker {

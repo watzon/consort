@@ -41,12 +41,43 @@ pub enum MenuAction {
     EditLabels(String),
     PauseWorker(String, bool),
     RemoveWorker(String),
-    ComposerCut,
-    ComposerCopy,
-    ComposerPaste,
-    ComposerSelectAll,
-    /// Pick option `index` of the select `id`.
-    Select(&'static str, usize),
+    /// Cut, Copy, Paste or Select all in one of the message boxes.
+    TextEdit(TextTarget, EditOp),
+    /// Pick the option with the stable ID `option` in the select `id`. The ID
+    /// is the ID of the thing picked, so a state change between the opening
+    /// of the menu and the click cannot move the pick to another row.
+    Select(&'static str, String),
+}
+
+/// The message box that a Cut, Copy, Paste or Select all acts on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextTarget {
+    /// The composer under the timeline.
+    Composer,
+    /// The reply box in a task thread.
+    Reply,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EditOp {
+    Cut,
+    Copy,
+    Paste,
+    SelectAll,
+}
+
+/// The menu of a message box: Cut, Copy, Paste, Select all.
+pub fn text_edit_menu(target: TextTarget) -> Vec<MenuItem> {
+    vec![
+        MenuItem::new("Cut", MenuAction::TextEdit(target, EditOp::Cut)),
+        MenuItem::new("Copy", MenuAction::TextEdit(target, EditOp::Copy)),
+        MenuItem::new("Paste", MenuAction::TextEdit(target, EditOp::Paste)),
+        MenuItem::new(
+            "Select all",
+            MenuAction::TextEdit(target, EditOp::SelectAll),
+        )
+        .separated(),
+    ]
 }
 
 #[derive(Clone, Debug)]
@@ -295,3 +326,37 @@ pub fn render_menu<V: 'static>(
 /// Keeps `App` in the import list for doc links on every platform.
 #[allow(dead_code)]
 fn _app(_: &App) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_message_box_has_the_same_menu_in_the_same_order() {
+        for target in [TextTarget::Composer, TextTarget::Reply] {
+            let items = text_edit_menu(target);
+            let labels: Vec<&str> = items.iter().map(|i| i.label.as_ref()).collect();
+            assert_eq!(labels, ["Cut", "Copy", "Paste", "Select all"]);
+            assert!(
+                items
+                    .iter()
+                    .all(|i| matches!(i.action, MenuAction::TextEdit(t, _) if t == target))
+            );
+            assert!(items[3].separator_before);
+        }
+    }
+
+    #[test]
+    fn the_keyboard_steps_through_the_rows_and_wraps() {
+        let mut menu = OpenMenu::at(
+            point(Pixels::ZERO, Pixels::ZERO),
+            text_edit_menu(TextTarget::Composer),
+        );
+        menu.step(1);
+        assert_eq!(menu.highlighted, Some(0));
+        menu.step(-1);
+        assert_eq!(menu.highlighted, Some(3));
+        menu.step(1);
+        assert_eq!(menu.highlighted, Some(0));
+    }
+}

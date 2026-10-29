@@ -716,6 +716,7 @@ fn post(id: &str, speaker: Speaker, time: &str, bodies: Vec<PostBody>) -> Thread
         speaker,
         time_label: time.into(),
         bodies,
+        pending: false,
     }
 }
 
@@ -969,6 +970,7 @@ pub fn view_state() -> ViewState {
             text("Pi with Kimi K3"),
         ],
         worker_pairing: None,
+        send_failures: Vec::new(),
     };
     refresh(&mut state);
     state

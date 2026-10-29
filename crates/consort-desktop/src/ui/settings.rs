@@ -1,19 +1,19 @@
 //! Settings, in the window: Appearance and Workers, and a line for the
 //! sections that come later.
 
-use consort_client::{ApprovalMode, AuthState, WorkerView};
+use consort_client::{ApprovalMode, AuthState, ViewState, WorkerView};
 use consort_theme::{Appearance, Mode, TextSize, ThemeLibrary, Tokens, TypeExt as _};
 use gpui_kit::{
-    AnyElement, Context, Div, HighlightStyle, Hsla, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, ParentElement, SharedString, StatefulInteractiveElement as _, Styled,
-    StyledText, Window, div, prelude::FluentBuilder as _, px,
+    AnyElement, Context, Div, Hsla, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
+    ParentElement, SharedString, StatefulInteractiveElement as _, Styled, Window,
+    component::text::TextView, div, prelude::FluentBuilder as _, px,
 };
 
 use crate::{
     app::{ConsortApp, Dialog, Page, SettingsSection},
-    ui::sizes,
     ui::window_controls::DragArea as _,
     ui::{
+        links::file_url,
         menu::{MenuAction, MenuItem, OpenMenu},
         parts::{ButtonKind, button, detail, glyph, icon, icon_button, line, text, worker_dot},
         sidebar::{row, title_bar_height},
@@ -109,7 +109,7 @@ fn setting_row(label: &str, hint: &str, control: impl IntoElement, t: &Tokens) -
                 .flex()
                 .flex_col()
                 .flex_none()
-                .w(sizes::SETTINGS_LABEL)
+                .w(t.component.settings_label)
                 .pt(t.space.xs)
                 .child(text(label.to_owned(), t.text.ui_strong, c.text_primary))
                 .child(text(hint.to_owned(), detail(t), c.text_tertiary)),
@@ -131,7 +131,7 @@ pub fn switch(id: &str, on: bool, t: &Tokens) -> gpui_kit::Stateful<Div> {
         .items_center()
         .w(t.space.xxl)
         .h(t.space.lg + t.space.xxs)
-        .px(sizes::SWITCH_INSET)
+        .px(t.component.switch_inset)
         .rounded(t.radius.full)
         .cursor_pointer()
         .when(on, |d| d.bg(c.accent_text).justify_end())
@@ -316,7 +316,7 @@ impl ConsortApp {
             |_| t.text.ui,
             |_, value, window, cx| consort_theme::choose(None, Some(value), None, window, cx),
         )
-        .w(sizes::SETTINGS_SEGMENTED);
+        .w(t.component.settings_segmented);
         let mut cards = div().flex().flex_wrap().gap(t.space.md);
         for theme in &library.themes {
             let selected = theme.file.name == library.theme.as_ref();
@@ -338,7 +338,7 @@ impl ConsortApp {
                     .flex()
                     .flex_col()
                     .gap(t.space.md)
-                    .w(sizes::THEME_CARD)
+                    .w(t.component.theme_card)
                     .p(t.space.sm + t.space.xxs)
                     .rounded(t.radius.lg)
                     .border(t.border_width)
@@ -397,7 +397,7 @@ impl ConsortApp {
             .items_center()
             .gap(t.space.md)
             .w_full()
-            .max_w(sizes::THEME_ROW)
+            .max_w(t.component.theme_row)
             .py(t.space.md + t.space.xxs)
             .px(t.space.lg)
             .rounded(t.radius.lg)
@@ -429,7 +429,7 @@ impl ConsortApp {
                     move |this, _, _, cx| {
                         if let Some(dir) = open_dir.clone() {
                             let _ = std::fs::create_dir_all(&dir);
-                            cx.open_url(&format!("file://{}", dir.display()));
+                            cx.open_url(&file_url(&dir));
                         } else {
                             this.show_notice("Consort cannot find your config folder.".into(), cx);
                         }
@@ -441,7 +441,7 @@ impl ConsortApp {
             .flex_col()
             .gap(t.space.sm)
             .w_full()
-            .max_w(sizes::THEME_ROW);
+            .max_w(t.component.theme_row);
         for bad in &library.rejected {
             rejected = rejected.child(
                 div()
@@ -485,7 +485,7 @@ impl ConsortApp {
             },
             |_, value, window, cx| consort_theme::choose(None, None, Some(value), window, cx),
         )
-        .w(sizes::SETTINGS_SEGMENTED);
+        .w(t.component.settings_segmented);
         let _ = window;
         self.page_frame(t)
             .child(
@@ -544,7 +544,12 @@ impl ConsortApp {
                             .h(t.text.ui.line)
                             .flex()
                             .items_center()
-                            .child(worker_dot(worker.online, sizes::WORKER_DOT, t.icon.size, t)),
+                            .child(worker_dot(
+                                worker.online,
+                                t.component.worker_dot,
+                                t.icon.size,
+                                t,
+                            )),
                     )
                     .child(
                         div()
@@ -572,7 +577,7 @@ impl ConsortApp {
             .flex()
             .flex_col()
             .flex_none()
-            .w(sizes::WORKER_LIST)
+            .w(t.component.worker_list)
             .h_full()
             .border_r(t.border_width)
             .border_color(c.border_subtle)
@@ -688,6 +693,31 @@ impl ConsortApp {
             } else {
                 "Edit"
             };
+            // The detail is Markdown with the code words in backticks, so the
+            // reader can select and copy them.
+            let detail_source = detail_markdown(&account.detail, &account.detail_code);
+            let detail_state = self.texts.get(
+                &format!("account.{}.{}", w.id, account.id),
+                &detail_source,
+                cx,
+            );
+            // Text from a worker is not trusted: a link in it goes through
+            // the same policy as a link in a message.
+            let weak = cx.weak_entity();
+            let account_detail = div()
+                .w_full()
+                .min_w_0()
+                .type_style(detail(t))
+                .text_color(c.text_tertiary)
+                .child(TextView::new(&detail_state).max_lines(3).on_link_click(
+                    move |url, event, window, cx| {
+                        if !crate::ui::timeline::is_open_click(event) {
+                            return;
+                        }
+                        let action = crate::ui::links::click_action(&detail_source, url);
+                        let _ = weak.update(cx, |this, cx| this.follow_link(action, window, cx));
+                    },
+                ));
             accounts = accounts.child(
                 div()
                     .flex()
@@ -709,18 +739,18 @@ impl ConsortApp {
                                 t.text.ui_strong,
                                 c.text_primary,
                             ))
-                            .child(code_line(&account.detail, &account.detail_code, t)),
+                            .child(account_detail),
                     )
                     .child(
                         div()
                             .flex()
                             .items_center()
                             .gap(t.space.xs + t.space.xxs)
-                            .w(sizes::ACCOUNT_STATE)
+                            .w(t.component.account_state)
                             .flex_none()
                             .child(worker_dot(
                                 works,
-                                sizes::STATE_DOT,
+                                t.component.state_dot,
                                 t.space.sm + t.space.xxs,
                                 t,
                             ))
@@ -759,7 +789,7 @@ impl ConsortApp {
             .flex()
             .items_center()
             .justify_between()
-            .w(sizes::SETTINGS_SELECT)
+            .w(t.component.settings_select)
             .py(t.space.xs + t.space.xxs)
             .pl(t.space.md)
             .pr(t.space.sm + t.space.xxs)
@@ -776,10 +806,12 @@ impl ConsortApp {
                 if let Some(bounds) = this.triggers.get("approval-mode") {
                     let items = ApprovalMode::ALL
                         .iter()
-                        .enumerate()
-                        .map(|(i, m)| {
-                            MenuItem::new(m.label(), MenuAction::Select("approval-mode", i))
-                                .checked(*m == current_mode)
+                        .map(|m| {
+                            MenuItem::new(
+                                m.label(),
+                                MenuAction::Select("approval-mode", mode_key(*m).to_owned()),
+                            )
+                            .checked(*m == current_mode)
                         })
                         .collect();
                     this.open_menu(OpenMenu::under(bounds, items, true), cx);
@@ -865,7 +897,7 @@ impl ConsortApp {
                 div()
                     .flex()
                     .flex_col()
-                    .max_w(sizes::SETTINGS_DETAIL_MAX)
+                    .max_w(t.component.settings_detail_max)
                     .gap(t.space.xxl + t.space.xs)
                     .child(
                         div()
@@ -953,7 +985,12 @@ impl ConsortApp {
                                     .flex()
                                     .items_center()
                                     .gap(t.space.sm)
-                                    .child(worker_dot(w.online, sizes::WORKER_DOT, t.space.sm, t))
+                                    .child(worker_dot(
+                                        w.online,
+                                        t.component.worker_dot,
+                                        t.space.sm,
+                                        t,
+                                    ))
                                     .child(text(
                                         w.status_line.clone(),
                                         t.text.ui,
@@ -997,43 +1034,72 @@ impl ConsortApp {
             .into_any_element()
     }
 
-    /// A pick from a select menu.
+    /// A pick from a select menu. The menu names the pick by the ID of the
+    /// thing picked. It is matched against the state now, so a change
+    /// between the opening of the menu and the click cannot move the pick to
+    /// another row.
     pub fn pick_select(
         &mut self,
-        id: &'static str,
-        index: usize,
+        select: &'static str,
+        option: &str,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        match id {
-            "approval-mode" => {
-                let mode = ApprovalMode::ALL.get(index).copied().unwrap_or_default();
-                self.show_notice(
-                    format!("The approval mode is set on the worker. Set max_approval_mode to {} in worker.toml.", mode_key(mode)),
-                    cx,
-                );
-            }
-            "new-channel-group" => {
-                self.new_channel.group_id = self.state.groups.get(index).map(|g| g.id.clone());
-            }
-            "new-channel-selection" => {
-                self.new_channel.selection = self.state.selections.get(index).cloned();
-            }
-            "new-channel-worker" => {
-                let free: Vec<String> = self
-                    .state
-                    .workers
-                    .iter()
-                    .filter(|w| !self.new_channel.workers.contains(&w.id))
-                    .map(|w| w.id.clone())
-                    .collect();
-                if let Some(id) = free.get(index) {
-                    self.new_channel.workers.push(id.clone());
-                }
-            }
-            _ => {}
+        match resolve_pick(&self.state, &self.new_channel.workers, select, option) {
+            Some(Pick::ApprovalMode(mode)) => self.show_notice(
+                format!("The approval mode is set on the worker. Set max_approval_mode to {} in worker.toml.", mode_key(mode)),
+                cx,
+            ),
+            Some(Pick::Group(id)) => self.new_channel.group_id = Some(id),
+            Some(Pick::Selection(selection)) => self.new_channel.selection = Some(selection),
+            Some(Pick::Worker(id)) => self.new_channel.workers.push(id),
+            None => self.show_notice(
+                "That choice is not in the list any more. Open the list and choose again.".into(),
+                cx,
+            ),
         }
         cx.notify();
+    }
+}
+
+/// What a pick from a select menu means.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Pick {
+    ApprovalMode(ApprovalMode),
+    Group(String),
+    Selection(String),
+    Worker(String),
+}
+
+/// Matches the stable ID of a picked option to the state now. Returns `None`
+/// when the option is gone, or when a worker is already chosen.
+pub fn resolve_pick(
+    state: &ViewState,
+    chosen_workers: &[String],
+    select: &str,
+    option: &str,
+) -> Option<Pick> {
+    match select {
+        "approval-mode" => ApprovalMode::ALL
+            .iter()
+            .find(|mode| mode_key(**mode) == option)
+            .map(|mode| Pick::ApprovalMode(*mode)),
+        "new-channel-group" => state
+            .groups
+            .iter()
+            .find(|group| group.id == option)
+            .map(|group| Pick::Group(group.id.clone())),
+        "new-channel-selection" => state
+            .selections
+            .iter()
+            .find(|selection| *selection == option)
+            .map(|selection| Pick::Selection(selection.clone())),
+        "new-channel-worker" => state
+            .workers
+            .iter()
+            .find(|worker| worker.id == option && !chosen_workers.contains(&worker.id))
+            .map(|worker| Pick::Worker(worker.id.clone())),
+        _ => None,
     }
 }
 
@@ -1126,37 +1192,55 @@ fn limit_row(title: &str, hint: &str, control: AnyElement, border: bool, t: &Tok
         .child(control)
 }
 
-/// A detail line with code spans in mono.
-/// An account detail as one text that wraps inside its column, with the
-/// code words in the mono face. A long detail (a harness error) stops at
-/// three lines.
-fn code_line(detail_text: &str, code: &[String], t: &Tokens) -> Div {
-    let c = &t.colors;
+/// An account detail as Markdown: the code words in backticks, which the text
+/// view shows in the mono face without the backticks, and every other mark
+/// escaped, so the detail reads as the worker wrote it.
+fn detail_markdown(detail_text: &str, code: &[String]) -> String {
     let ranges = code_ranges(detail_text, code);
-    let mono = t.font_mono.clone();
-    div()
-        .w_full()
-        .min_w_0()
-        .overflow_hidden()
-        .type_style(detail(t))
-        .text_color(c.text_tertiary)
-        .line_clamp(3)
-        .text_ellipsis()
-        .child(
-            StyledText::new(detail_text.to_owned())
-                .with_highlights(
-                    ranges
-                        .iter()
-                        .map(|r| (r.clone(), HighlightStyle::default()))
-                        .collect::<Vec<_>>(),
-                )
-                .with_font_family_overrides(
-                    ranges
-                        .into_iter()
-                        .map(|r| (r, mono.clone()))
-                        .collect::<Vec<_>>(),
-                ),
-        )
+    let mut out = String::new();
+    let mut from = 0;
+    for range in ranges {
+        out.push_str(&escape_markdown(&detail_text[from..range.start]));
+        out.push_str(&code_span(&detail_text[range.clone()]));
+        from = range.end;
+    }
+    out.push_str(&escape_markdown(&detail_text[from..]));
+    out
+}
+
+/// Backslash-escapes every ASCII punctuation mark, and turns a line break
+/// into a hard break.
+fn escape_markdown(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '\n' => out.push_str("  \n"),
+            c if c.is_ascii_punctuation() => {
+                out.push('\\');
+                out.push(c);
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// A Markdown code span for `word`, with a fence longer than any run of
+/// backticks inside it.
+fn code_span(word: &str) -> String {
+    let mut longest = 0;
+    let mut run = 0;
+    for c in word.chars() {
+        run = if c == '`' { run + 1 } else { 0 };
+        longest = longest.max(run);
+    }
+    let fence = "`".repeat(longest + 1);
+    let pad = if word.starts_with('`') || word.ends_with('`') {
+        " "
+    } else {
+        ""
+    };
+    format!("{fence}{pad}{word}{pad}{fence}")
 }
 
 /// The byte ranges of the code words in a detail, in order, with no overlap.
@@ -1219,13 +1303,14 @@ fn folders_line(roots: &[String], t: &Tokens) -> Div {
 
 /// A small drawing of a theme mode: a sidebar, two lines and a card.
 fn theme_preview(theme: &consort_theme::ThemeFile, mode: Mode, t: &Tokens) -> Div {
-    use sizes::preview as pv;
+    let pv = t.component.theme_preview;
     let p = consort_theme::Palette::new(theme.mode(mode), mode);
-    let bar = |w: f32, color: Hsla| div().h(pv::BAR).w(px(w)).rounded(t.radius.full).bg(color);
+    let bar =
+        |w: gpui_kit::Pixels, color: Hsla| div().h(pv.bar).w(w).rounded(t.radius.full).bg(color);
     div()
         .flex()
         .flex_1()
-        .h(sizes::THEME_PREVIEW_HEIGHT)
+        .h(t.component.theme_preview_height)
         .rounded(t.radius.md)
         .overflow_hidden()
         .border(t.border_width)
@@ -1235,15 +1320,15 @@ fn theme_preview(theme: &consort_theme::ThemeFile, mode: Mode, t: &Tokens) -> Di
             div()
                 .flex()
                 .flex_col()
-                .gap(pv::BAR_GAP)
-                .w(pv::SIDEBAR)
+                .gap(pv.bar_gap)
+                .w(pv.sidebar)
                 .h_full()
                 .pt(t.space.sm)
                 .px(t.space.xs + t.space.xxs)
                 .bg(p.surface_sidebar)
-                .child(bar(pv::SIDEBAR_ITEM, p.border_strong))
-                .child(bar(pv::SIDEBAR_ITEM, p.border_strong))
-                .child(bar(pv::SIDEBAR_ITEM, p.border_strong)),
+                .child(bar(pv.sidebar_item, p.border_strong))
+                .child(bar(pv.sidebar_item, p.border_strong))
+                .child(bar(pv.sidebar_item, p.border_strong)),
         )
         .child(
             div()
@@ -1255,19 +1340,19 @@ fn theme_preview(theme: &consort_theme::ThemeFile, mode: Mode, t: &Tokens) -> Di
                 .px(t.space.sm)
                 .child(
                     div()
-                        .h(pv::CHIP)
-                        .w(pv::TITLE)
+                        .h(pv.chip)
+                        .w(pv.title)
                         .rounded(t.radius.full)
                         .bg(p.accent_surface),
                 )
-                .child(bar(pv::TEXT_LINE, p.text_secondary))
+                .child(bar(pv.text_line, p.text_secondary))
                 .child(
                     div()
                         .mt(t.space.xs)
                         .flex()
                         .items_end()
                         .gap(t.space.xs)
-                        .h(pv::CARD)
+                        .h(pv.card)
                         .p(t.space.xs + t.space.xxs)
                         .rounded(t.radius.sm)
                         .bg(p.surface_card)
@@ -1275,16 +1360,16 @@ fn theme_preview(theme: &consort_theme::ThemeFile, mode: Mode, t: &Tokens) -> Di
                         .border_color(p.border_strong)
                         .child(
                             div()
-                                .h(pv::CHIP)
-                                .w(pv::BUTTON)
-                                .rounded(pv::BUTTON_RADIUS)
+                                .h(pv.chip)
+                                .w(pv.button)
+                                .rounded(pv.button_radius)
                                 .bg(p.accent_fill),
                         )
                         .child(
                             div()
-                                .h(pv::CHIP)
-                                .w(pv::BUTTON)
-                                .rounded(pv::BUTTON_RADIUS)
+                                .h(pv.chip)
+                                .w(pv.button)
+                                .rounded(pv.button_radius)
                                 .bg(p.border_strong),
                         ),
                 ),
@@ -1297,7 +1382,102 @@ fn _unused(_: &MouseDownEvent, _: MouseButton) {}
 
 #[cfg(test)]
 mod tests {
-    use super::code_ranges;
+    use super::*;
+
+    #[test]
+    fn code_words_become_code_spans_and_other_marks_are_escaped() {
+        let detail = "Run gemini on bigboi. Set FIREWORKS_API_KEY_2 (or sign in).";
+        let md = detail_markdown(detail, &["gemini".to_owned()]);
+        assert_eq!(
+            md,
+            "Run `gemini` on bigboi\\. Set FIREWORKS\\_API\\_KEY\\_2 \\(or sign in\\)\\."
+        );
+        assert_eq!(detail_markdown("No code.", &[]), "No code\\.");
+        assert_eq!(detail_markdown("", &[]), "");
+    }
+
+    #[test]
+    fn a_code_word_with_a_backtick_gets_a_longer_fence() {
+        assert_eq!(code_span("ls"), "`ls`");
+        assert_eq!(code_span("a`b"), "``a`b``");
+        assert_eq!(code_span("`x"), "`` `x ``");
+    }
+
+    #[test]
+    fn a_line_break_stays_a_break() {
+        assert_eq!(escape_markdown("one\ntwo"), "one  \ntwo");
+    }
+
+    fn state_with_choices() -> ViewState {
+        let mut state = consort_client::mock::view_state();
+        state.selections = vec!["Claude Code, Opus".into(), "Codex, GPT".into()];
+        state
+    }
+
+    #[test]
+    fn a_pick_follows_the_id_when_the_list_changed() {
+        let mut state = state_with_choices();
+        assert!(state.groups.len() >= 2, "the mock has groups");
+        let wanted = state.groups[1].id.clone();
+        // The menu was built before this change moved the groups.
+        state.groups.reverse();
+        assert_eq!(
+            resolve_pick(&state, &[], "new-channel-group", &wanted),
+            Some(Pick::Group(wanted))
+        );
+        let selection = "Codex, GPT".to_owned();
+        state.selections.reverse();
+        assert_eq!(
+            resolve_pick(&state, &[], "new-channel-selection", &selection),
+            Some(Pick::Selection(selection))
+        );
+    }
+
+    #[test]
+    fn a_pick_that_is_gone_resolves_to_nothing() {
+        let state = state_with_choices();
+        assert_eq!(resolve_pick(&state, &[], "new-channel-group", "gone"), None);
+        assert_eq!(
+            resolve_pick(&state, &[], "new-channel-selection", "Gone, Model"),
+            None
+        );
+        assert_eq!(
+            resolve_pick(&state, &[], "new-channel-worker", "gone"),
+            None
+        );
+        assert_eq!(resolve_pick(&state, &[], "no-such-select", "x"), None);
+    }
+
+    #[test]
+    fn a_worker_that_is_already_chosen_is_not_added_twice() {
+        let state = state_with_choices();
+        let worker = state.workers[0].id.clone();
+        assert_eq!(
+            resolve_pick(&state, &[], "new-channel-worker", &worker),
+            Some(Pick::Worker(worker.clone()))
+        );
+        assert_eq!(
+            resolve_pick(
+                &state,
+                std::slice::from_ref(&worker),
+                "new-channel-worker",
+                &worker
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn the_approval_mode_pick_uses_the_key_of_the_mode() {
+        let state = ViewState::default();
+        for mode in ApprovalMode::ALL {
+            assert_eq!(
+                resolve_pick(&state, &[], "approval-mode", mode_key(mode)),
+                Some(Pick::ApprovalMode(mode))
+            );
+        }
+        assert_eq!(resolve_pick(&state, &[], "approval-mode", "root"), None);
+    }
 
     #[test]
     fn code_words_match_only_whole_words() {

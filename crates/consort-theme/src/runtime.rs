@@ -10,6 +10,7 @@ use gpui_kit::{
     App, Global, SharedString, Window, WindowAppearance,
     component::{Theme, ThemeConfig, ThemeMode, ThemeRegistry},
 };
+use serde::{Deserialize, Serialize};
 
 use crate::{
     file::{Mode, ThemeError, ThemeFile, load_theme},
@@ -18,7 +19,8 @@ use crate::{
 };
 
 /// The Mode setting.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Appearance {
     /// Match system.
     #[default]
@@ -73,6 +75,44 @@ pub fn builtin_theme_sources() -> [&'static str; 2] {
 /// The user themes folder: `<config dir>/consort/themes`.
 pub fn user_themes_dir() -> Option<PathBuf> {
     directories::BaseDirs::new().map(|dirs| dirs.config_dir().join("consort").join("themes"))
+}
+
+/// What the user chose in Settings, as it is saved between runs.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SavedChoice {
+    /// The theme name. `None` keeps the default theme.
+    pub theme: Option<String>,
+    pub appearance: Appearance,
+    pub text_size: TextSize,
+}
+
+/// The file that holds the choice: `<config dir>/consort/appearance.json`.
+pub fn choice_path() -> Option<PathBuf> {
+    directories::BaseDirs::new()
+        .map(|dirs| dirs.config_dir().join("consort").join("appearance.json"))
+}
+
+/// Reads the saved choice. A missing or damaged file gives the defaults, so a
+/// bad file never keeps the app from starting.
+pub fn read_choice(path: &Path) -> SavedChoice {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+/// Saves the choice through a temporary file and a rename.
+pub fn write_choice(path: &Path, choice: &SavedChoice) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let text = serde_json::to_string_pretty(choice).map_err(std::io::Error::other)?;
+    let temp = path.with_extension("json.tmp");
+    std::fs::write(&temp, text)?;
+    std::fs::rename(&temp, path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&temp);
+    })
 }
 
 /// Reads every `.json` file in `dir`. Files that fail a check are returned
@@ -195,6 +235,27 @@ impl ThemeLibrary {
     pub fn user_dir(&self) -> Option<&Path> {
         self.user_dir.as_deref()
     }
+
+    /// The choice to save.
+    pub fn choice(&self) -> SavedChoice {
+        SavedChoice {
+            theme: Some(self.theme.to_string()),
+            appearance: self.appearance,
+            text_size: self.text_size,
+        }
+    }
+
+    /// Applies a saved choice. A theme that is not here any more (the user
+    /// deleted its file) leaves the current theme as it is.
+    pub fn apply_choice(&mut self, choice: &SavedChoice) {
+        if let Some(name) = &choice.theme
+            && self.themes.iter().any(|t| &t.file.name == name)
+        {
+            self.theme = name.clone().into();
+        }
+        self.appearance = choice.appearance;
+        self.text_size = choice.text_size;
+    }
 }
 
 fn register(library: &ThemeLibrary, cx: &mut App) {
@@ -224,7 +285,10 @@ fn tracing_error(name: &str) {
 /// Loads the built-in and user themes, registers them with GPUI Kit, and
 /// sets the [`Tokens`] global. Call it once, after `gpui_kit::init`.
 pub fn init(cx: &mut App) {
-    let library = ThemeLibrary::load(user_themes_dir());
+    let mut library = ThemeLibrary::load(user_themes_dir());
+    if let Some(path) = choice_path() {
+        library.apply_choice(&read_choice(&path));
+    }
     register(&library, cx);
     cx.set_global(library);
     apply(cx.window_appearance(), cx);
@@ -275,8 +339,35 @@ pub fn apply(system: WindowAppearance, cx: &mut App) {
     cx.refresh_windows();
 }
 
-/// Changes the theme, the mode setting or the text size, and applies it.
+/// Changes the theme, the mode setting or the text size, applies it, and
+/// saves the choice for the next run.
 pub fn choose(
+    theme: Option<SharedString>,
+    appearance: Option<Appearance>,
+    text_size: Option<TextSize>,
+    window: &Window,
+    cx: &mut App,
+) {
+    choose_without_saving(theme, appearance, text_size, window, cx);
+    let choice = ThemeLibrary::global(cx).choice();
+    if let Some(path) = choice_path() {
+        // The write goes off the UI thread.
+        cx.background_executor()
+            .spawn(async move {
+                if let Err(err) = write_choice(&path, &choice) {
+                    eprintln!(
+                        "consort-theme: cannot save your theme choice in {}: {err}. Check that you may write to that folder",
+                        path.display()
+                    );
+                }
+            })
+            .detach();
+    }
+}
+
+/// Like [`choose`], but the choice lasts for this run only. For command line
+/// options such as `--dark`, which must not change the user's saved choice.
+pub fn choose_without_saving(
     theme: Option<SharedString>,
     appearance: Option<Appearance>,
     text_size: Option<TextSize>,
@@ -297,7 +388,8 @@ pub fn choose(
 }
 
 /// Reloads the user themes when a file in the folder changed. Returns true
-/// when it reloaded.
+/// when it reloaded. This reads the folder on the calling thread, so the
+/// poll in [`watch_user_themes`] does not call it.
 pub fn reload_if_changed(system: WindowAppearance, cx: &mut App) -> bool {
     let library = ThemeLibrary::global(cx);
     let Some(dir) = library.user_dir.clone() else {
@@ -306,8 +398,15 @@ pub fn reload_if_changed(system: WindowAppearance, cx: &mut App) -> bool {
     if dir_stamp(&dir) == library.user_stamp {
         return false;
     }
-    let previous = library.clone();
-    let mut fresh = ThemeLibrary::load(Some(dir));
+    let fresh = ThemeLibrary::load(Some(dir));
+    adopt(fresh, system, cx);
+    true
+}
+
+/// Takes a library that was just loaded from disk, keeps the user's choice
+/// where it still holds, and applies it.
+fn adopt(mut fresh: ThemeLibrary, system: WindowAppearance, cx: &mut App) {
+    let previous = ThemeLibrary::global(cx).clone();
     fresh.appearance = previous.appearance;
     fresh.text_size = previous.text_size;
     if fresh
@@ -320,20 +419,107 @@ pub fn reload_if_changed(system: WindowAppearance, cx: &mut App) -> bool {
     register(&fresh, cx);
     cx.set_global(fresh);
     apply(system, cx);
-    true
 }
 
 /// Polls the user themes folder every two seconds and applies a changed
-/// theme at once. Polling keeps the crate free of a file watcher dependency.
+/// theme at once. The folder is read and the themes are parsed on a
+/// background thread, so the UI thread only swaps in the result. Polling
+/// keeps the crate free of a file watcher dependency.
 pub fn watch_user_themes(cx: &mut App) {
     cx.spawn(async move |cx| {
         loop {
             cx.background_executor().timer(Duration::from_secs(2)).await;
-            cx.update(|cx| {
-                let system = cx.window_appearance();
-                reload_if_changed(system, cx);
-            });
+            let Some((dir, stamp)) = cx.update(|cx| {
+                let library = ThemeLibrary::global(cx);
+                library
+                    .user_dir
+                    .clone()
+                    .map(|dir| (dir, library.user_stamp.clone()))
+            }) else {
+                continue;
+            };
+            let fresh =
+                cx.background_executor()
+                    .spawn(async move {
+                        (dir_stamp(&dir) != stamp).then(|| ThemeLibrary::load(Some(dir)))
+                    })
+                    .await;
+            if let Some(fresh) = fresh {
+                cx.update(|cx| {
+                    let system = cx.window_appearance();
+                    adopt(fresh, system, cx);
+                });
+            }
         }
     })
     .detach();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn library() -> ThemeLibrary {
+        ThemeLibrary::load(None)
+    }
+
+    #[test]
+    fn a_choice_round_trips_through_a_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("appearance.json");
+        let choice = SavedChoice {
+            theme: Some("Velvet".into()),
+            appearance: Appearance::Dark,
+            text_size: TextSize::Larger,
+        };
+        write_choice(&path, &choice).expect("writes");
+        assert_eq!(read_choice(&path), choice);
+        assert!(!path.with_extension("json.tmp").exists(), "no temp file");
+    }
+
+    #[test]
+    fn a_missing_or_damaged_choice_file_gives_the_defaults() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("appearance.json");
+        assert_eq!(read_choice(&path), SavedChoice::default());
+        std::fs::write(&path, "{ not json").expect("writes");
+        assert_eq!(read_choice(&path), SavedChoice::default());
+        // A file from a newer version with unknown fields still reads.
+        std::fs::write(&path, r#"{"appearance":"light","future":1}"#).expect("writes");
+        assert_eq!(read_choice(&path).appearance, Appearance::Light);
+    }
+
+    #[test]
+    fn the_saved_choice_sets_theme_mode_and_text_size() {
+        let mut lib = library();
+        assert_eq!(lib.appearance, Appearance::System);
+        let velvet = lib
+            .themes
+            .iter()
+            .find(|t| t.file.name == "Velvet")
+            .map(|t| t.file.name.clone())
+            .expect("velvet");
+        lib.apply_choice(&SavedChoice {
+            theme: Some(velvet.clone()),
+            appearance: Appearance::Light,
+            text_size: TextSize::Smaller,
+        });
+        assert_eq!(lib.theme.as_ref(), velvet);
+        assert_eq!(lib.appearance, Appearance::Light);
+        assert_eq!(lib.text_size, TextSize::Smaller);
+        assert_eq!(lib.choice().theme.as_deref(), Some("Velvet"));
+    }
+
+    #[test]
+    fn a_saved_theme_that_is_gone_keeps_the_current_theme() {
+        let mut lib = library();
+        let before = lib.theme.clone();
+        lib.apply_choice(&SavedChoice {
+            theme: Some("Deleted".into()),
+            appearance: Appearance::Dark,
+            text_size: TextSize::Default,
+        });
+        assert_eq!(lib.theme, before);
+        assert_eq!(lib.appearance, Appearance::Dark);
+    }
 }

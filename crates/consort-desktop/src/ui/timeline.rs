@@ -1,5 +1,7 @@
 //! The main column: header, timeline and composer.
 
+use std::time::Instant;
+
 use consort_client::{
     ApprovalChoice, ApprovalView, ChannelKind, MessageView, RequestState, Speaker, TaskCardView,
     TaskStatus, TimelineItem,
@@ -14,18 +16,22 @@ use gpui_kit::{
 
 use crate::{
     app::{ConsortApp, Panel},
-    ui::sizes,
+    countdown,
     ui::window_controls::DragArea as _,
     ui::{
-        markdown::{Segment, segments},
-        menu::{MenuAction, MenuItem, OpenMenu},
+        links::click_action,
+        markdown::{Segment, exact_selection, segments},
+        menu::{MenuAction, MenuItem, OpenMenu, TextTarget, text_edit_menu},
         parts::{
-            ButtonKind, button, detail, icon, icon_button, line, status_glyph, text, worker_pill,
+            ButtonKind, button, detail, icon, icon_button, line, selectable, status_glyph, text,
+            worker_pill,
         },
     },
 };
 
-/// What a right click on a message offers.
+/// What a right click on a message offers. A message that is still on its
+/// way to the hub has a made-up ID, so it offers only what works on its text:
+/// no Reply in thread, Edit or Delete.
 pub fn message_menu(message: &MessageView) -> Vec<MenuItem> {
     let mut items = vec![
         MenuItem::new("Copy text", MenuAction::Copy(plain_text(&message.body))),
@@ -33,16 +39,18 @@ pub fn message_menu(message: &MessageView) -> Vec<MenuItem> {
             "Copy as Markdown",
             MenuAction::CopyMarkdown(message.body.clone()),
         ),
-        MenuItem::new(
+    ];
+    if !message.pending {
+        items.push(MenuItem::new(
             "Reply in thread",
             MenuAction::ReplyInThread(message.body.clone()),
-        ),
-        MenuItem::new(
-            "Quote in reply",
-            MenuAction::QuoteInReply(message.body.clone()),
-        ),
-    ];
-    if message.speaker == Speaker::You {
+        ));
+    }
+    items.push(MenuItem::new(
+        "Quote in reply",
+        MenuAction::QuoteInReply(message.body.clone()),
+    ));
+    if message.speaker == Speaker::You && !message.pending {
         items.push(
             MenuItem::new(
                 "Edit",
@@ -76,23 +84,28 @@ pub fn selection_menu(selected: String) -> Vec<MenuItem> {
     ]
 }
 
-/// What a right click on a task card or a task row offers.
-pub fn task_menu(task_id: &str, status: TaskStatus) -> Vec<MenuItem> {
+/// What a right click on a task card or a task row offers. Resolve is for a
+/// task that is Ready for review, and Not done is for a resolved task. The
+/// thread panel leaves out Open thread, because the thread is open.
+pub fn task_menu(task_id: &str, status: TaskStatus, with_open_thread: bool) -> Vec<MenuItem> {
     let id = task_id.to_owned();
-    let mut items = vec![MenuItem::new(
-        "Open thread",
-        MenuAction::OpenThread(id.clone()),
-    )];
-    if status == TaskStatus::Resolved {
+    let mut items = Vec::new();
+    if with_open_thread {
         items.push(MenuItem::new(
+            "Open thread",
+            MenuAction::OpenThread(id.clone()),
+        ));
+    }
+    match status {
+        TaskStatus::Resolved => items.push(MenuItem::new(
             "Not done",
             MenuAction::ReopenTask(id.clone()),
-        ));
-    } else {
-        items.push(MenuItem::new(
+        )),
+        TaskStatus::Review => items.push(MenuItem::new(
             "Resolve",
             MenuAction::ResolveTask(id.clone()),
-        ));
+        )),
+        _ => {}
     }
     if status == TaskStatus::Failed {
         items.push(MenuItem::new("Retry", MenuAction::RetryTask(id.clone())));
@@ -117,7 +130,7 @@ pub fn open_context_menu(
     window: &mut Window,
     cx: &mut Context<ConsortApp>,
 ) {
-    let selected = gpui_kit::base::TextSelection::selected_text(window, cx);
+    let selected = exact_selection(&gpui_kit::base::TextSelection::selected_text(window, cx));
     let items = if selected.trim().is_empty() {
         items
     } else {
@@ -144,7 +157,7 @@ impl ConsortApp {
             - panel_width
             - t.space.xl * 2.0)
             .min(t.layout.timeline_max_width);
-        let narrow = column < sizes::WIDE_TIMELINE;
+        let narrow = column < t.layout.wide_timeline;
         if narrow != self.narrow {
             self.narrow = narrow;
             self.timeline.remeasure();
@@ -188,7 +201,7 @@ impl ConsortApp {
             .flex_none()
             .items_center()
             .gap(t.space.sm)
-            .py(sizes::BUTTON_PAD_Y)
+            .py(t.component.button_pad_y)
             .px(t.space.md - t.space.xxs)
             .rounded(t.radius.md)
             .border(t.border_width)
@@ -547,11 +560,26 @@ impl ConsortApp {
                 Segment::Prose(prose) => {
                     let state = self.texts.get(&seg_key, &prose, cx);
                     let items = menu.clone();
+                    // A click on a link never opens it by itself. The link
+                    // policy decides: web and email links open, a link whose
+                    // words differ from its address asks first, and every
+                    // other scheme is refused.
+                    let weak = cx.weak_entity();
+                    let source = prose.clone();
+                    let view =
+                        TextView::new(&state).on_link_click(move |url, event, window, cx| {
+                            if !is_open_click(event) {
+                                return;
+                            }
+                            let action = click_action(&source, url);
+                            let _ =
+                                weak.update(cx, |this, cx| this.follow_link(action, window, cx));
+                        });
                     out = out.child(
                         div()
                             .id(SharedString::from(seg_key))
                             .min_w_0()
-                            .child(TextView::new(&state))
+                            .child(view)
                             .on_mouse_down(
                                 MouseButton::Right,
                                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
@@ -710,14 +738,8 @@ impl ConsortApp {
             }
             content
         };
-        self.speaker_row(
-            message.speaker,
-            &message.time_label,
-            message.edited,
-            top,
-            content,
-            t,
-        )
+        let time = time_text(&message.time_label, message.pending);
+        self.speaker_row(message.speaker, time, message.edited, top, content, t)
     }
 
     /// The text box that edits one of the user's messages in place. Enter
@@ -820,7 +842,7 @@ impl ConsortApp {
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                    open_context_menu(this, event, task_menu(&menu_task, status), window, cx)
+                    open_context_menu(this, event, task_menu(&menu_task, status, true), window, cx)
                 }),
             );
         if collapsed {
@@ -988,7 +1010,10 @@ impl ConsortApp {
                 .overflow_hidden()
                 .type_style(t.text.ui)
                 .text_color(c.text_secondary)
-                .child(div().max_w_full().child(approval.summary.clone()));
+                .child(div().max_w_full().child(SelectableText::new(
+                    SharedString::from(format!("{}.summary", approval.id)),
+                    approval.summary.clone(),
+                )));
             if let Some(folder) = &approval.folder {
                 summary = summary
                     .child(div().whitespace_nowrap().child(" in "))
@@ -998,7 +1023,10 @@ impl ConsortApp {
                             .truncate()
                             .font_family(t.font_mono.clone())
                             .text_color(c.text_primary)
-                            .child(folder.clone()),
+                            .child(SelectableText::new(
+                                SharedString::from(format!("{}.folder", approval.id)),
+                                folder.clone(),
+                            )),
                     );
             }
             detail_box = detail_box.child(summary);
@@ -1063,9 +1091,9 @@ impl ConsortApp {
                     kind,
                     t,
                 )
-                .on_click(
-                    cx.listener(move |this, _, _, cx| this.answer_approval(id.clone(), choice, cx)),
-                ),
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.answer_approval(id.clone(), choice, window, cx)
+                })),
             );
         }
         row
@@ -1113,12 +1141,23 @@ impl ConsortApp {
                 t,
             )
         };
-        let link = match &state.connection {
-            consort_client::Connection::Offline { retry_in_ms, .. } => Some(format!(
-                "Consort lost the connection to the hub. It tries again in {} s.",
-                retry_in_ms.div_ceil(1000)
-            )),
-            consort_client::Connection::Connecting => Some("Connecting to the hub".to_owned()),
+        // The line under the composer: the state of the link, and for an
+        // offline link the reason and a countdown that ticks once a second.
+        let link: Option<(String, Option<String>)> = match &state.connection {
+            consort_client::Connection::Offline {
+                retry_in_ms,
+                reason,
+            } => {
+                let left = self.offline.as_ref().map_or_else(
+                    || countdown::seconds_left(*retry_in_ms, std::time::Duration::ZERO),
+                    |o| o.seconds_left(Instant::now()),
+                );
+                let reason = Some(reason.trim().to_owned()).filter(|r| !r.is_empty());
+                Some((countdown::offline_line(left), reason))
+            }
+            consort_client::Connection::Connecting => {
+                Some(("Connecting to the hub".to_owned(), None))
+            }
             _ => None,
         };
         div()
@@ -1130,22 +1169,45 @@ impl ConsortApp {
             .px(t.space.xl)
             .pt(t.space.lg)
             .pb(t.space.xl)
-            .when_some(link, |d, line_text| {
+            .when_some(link, |d, (line_text, reason)| {
                 d.child(
                     div()
                         .flex()
-                        .items_center()
+                        .items_start()
                         .gap(t.space.sm)
                         .w_full()
                         .max_w(t.layout.timeline_max_width)
-                        .child(status_glyph(
-                            "link-state",
-                            TaskStatus::Working,
-                            t.icon.dense,
-                            t,
-                            cx,
-                        ))
-                        .child(text(line_text, detail(t), c.text_secondary)),
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .h(detail(t).line)
+                                .child(status_glyph(
+                                    "link-state",
+                                    TaskStatus::Working,
+                                    t.icon.dense,
+                                    t,
+                                    cx,
+                                )),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .flex_1()
+                                .min_w_0()
+                                .child(text(line_text, detail(t), c.text_secondary))
+                                .when_some(reason, |col, reason| {
+                                    // The reason is an error detail, so the
+                                    // user can select it and copy it.
+                                    col.child(selectable(
+                                        SharedString::from(format!("link-reason-{reason}")),
+                                        reason,
+                                        detail(t),
+                                        c.text_tertiary,
+                                    ))
+                                }),
+                        ),
                 )
             })
             .child(
@@ -1194,19 +1256,31 @@ impl ConsortApp {
                     .on_mouse_down(
                         MouseButton::Right,
                         cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                            let items = vec![
-                                MenuItem::new("Cut", MenuAction::ComposerCut),
-                                MenuItem::new("Copy", MenuAction::ComposerCopy),
-                                MenuItem::new("Paste", MenuAction::ComposerPaste),
-                                MenuItem::new("Select all", MenuAction::ComposerSelectAll)
-                                    .separated(),
-                            ];
+                            let items = text_edit_menu(TextTarget::Composer);
                             this.open_menu(OpenMenu::at(event.position, items), cx);
                             cx.stop_propagation();
                         }),
                     ),
             )
             .into_any_element()
+    }
+}
+
+/// The time under a speaker. A message or a post that is still on its way to
+/// the hub says "Sending" where its time goes.
+pub fn time_text(label: &str, pending: bool) -> &str {
+    if pending { "Sending" } else { label }
+}
+
+/// True for the clicks that open a link: the main or middle mouse button, a
+/// key press, or a tap. A right click or a long press does not.
+pub(crate) fn is_open_click(event: &gpui_kit::ClickEvent) -> bool {
+    match event {
+        gpui_kit::ClickEvent::Mouse(click) => {
+            matches!(click.up.button, MouseButton::Left | MouseButton::Middle)
+        }
+        gpui_kit::ClickEvent::Keyboard(_) => true,
+        gpui_kit::ClickEvent::Touch(click) => !click.long_press,
     }
 }
 
@@ -1221,3 +1295,120 @@ fn answered_label(choice: ApprovalChoice) -> &'static str {
 /// Keeps `App` in the import list on every platform.
 #[allow(dead_code)]
 fn _app(_: &App) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn message(speaker: Speaker, pending: bool) -> MessageView {
+        MessageView {
+            id: if pending {
+                "pending-abc".into()
+            } else {
+                "m1".into()
+            },
+            speaker,
+            body: "Hello".into(),
+            pending,
+            ..MessageView::default()
+        }
+    }
+
+    fn labels(items: &[MenuItem]) -> Vec<&str> {
+        items.iter().map(|i| i.label.as_ref()).collect()
+    }
+
+    #[test]
+    fn your_own_sent_message_can_be_edited_and_deleted() {
+        let items = message_menu(&message(Speaker::You, false));
+        assert_eq!(
+            labels(&items),
+            [
+                "Copy text",
+                "Copy as Markdown",
+                "Reply in thread",
+                "Quote in reply",
+                "Edit",
+                "Delete"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_pending_message_has_no_actions_that_need_a_real_id() {
+        let items = message_menu(&message(Speaker::You, true));
+        assert_eq!(
+            labels(&items),
+            ["Copy text", "Copy as Markdown", "Quote in reply"]
+        );
+        // Nothing in the menu carries the made-up ID.
+        assert!(items.iter().all(|i| !matches!(
+            &i.action,
+            MenuAction::EditMessage(..) | MenuAction::DeleteMessage(..)
+        )));
+    }
+
+    #[test]
+    fn a_pending_message_or_post_shows_sending_in_place_of_its_time() {
+        assert_eq!(time_text("9:12 AM", true), "Sending");
+        assert_eq!(time_text("9:12 AM", false), "9:12 AM");
+    }
+
+    #[test]
+    fn a_message_from_consort_has_no_edit_or_delete() {
+        let items = message_menu(&message(Speaker::Consort, false));
+        assert_eq!(
+            labels(&items),
+            [
+                "Copy text",
+                "Copy as Markdown",
+                "Reply in thread",
+                "Quote in reply"
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_is_only_for_a_task_that_is_ready_for_review() {
+        for status in [
+            TaskStatus::Scheduled,
+            TaskStatus::UpNext,
+            TaskStatus::Working,
+            TaskStatus::NeedsInput,
+            TaskStatus::Failed,
+        ] {
+            let items = task_menu("t1", status, true);
+            assert!(
+                !labels(&items).contains(&"Resolve"),
+                "{status:?} offers Resolve"
+            );
+            assert!(!labels(&items).contains(&"Not done"));
+        }
+        let review = task_menu("t1", TaskStatus::Review, true);
+        assert_eq!(labels(&review), ["Open thread", "Resolve", "Copy task ID"]);
+        let resolved = task_menu("t1", TaskStatus::Resolved, true);
+        assert_eq!(
+            labels(&resolved),
+            ["Open thread", "Not done", "Copy task ID"]
+        );
+    }
+
+    #[test]
+    fn retry_and_stop_match_the_status() {
+        let failed = task_menu("t1", TaskStatus::Failed, true);
+        assert_eq!(labels(&failed), ["Open thread", "Retry", "Copy task ID"]);
+        let working = task_menu("t1", TaskStatus::Working, true);
+        assert_eq!(labels(&working), ["Open thread", "Stop", "Copy task ID"]);
+    }
+
+    #[test]
+    fn the_thread_menu_leaves_out_open_thread_by_a_flag_not_by_its_label() {
+        let items = task_menu("t1", TaskStatus::Working, false);
+        assert_eq!(labels(&items), ["Stop", "Copy task ID"]);
+        assert!(
+            items
+                .iter()
+                .all(|i| !matches!(i.action, MenuAction::OpenThread(_)))
+        );
+    }
+}

@@ -71,11 +71,83 @@ pub fn segments(markdown: &str) -> Vec<Segment> {
     out
 }
 
+/// How many text states the cache keeps. A screen shows far fewer, so the
+/// states in view are always the newest ones.
+pub const TEXT_CACHE_CAP: usize = 512;
+
+/// A map that keeps at most `cap` entries. Reading or writing an entry makes
+/// it the newest. When the map is full, the entry that was used longest ago
+/// leaves.
+#[derive(Debug)]
+pub struct Lru<V> {
+    entries: HashMap<String, (u64, V)>,
+    clock: u64,
+    cap: usize,
+}
+
+impl<V> Lru<V> {
+    pub fn new(cap: usize) -> Lru<V> {
+        Lru {
+            entries: HashMap::new(),
+            clock: 0,
+            // A map that holds nothing cannot return what it just stored.
+            cap: cap.max(1),
+        }
+    }
+
+    /// The entry for `key`, marked as the newest.
+    pub fn get_mut(&mut self, key: &str) -> Option<&mut V> {
+        self.clock += 1;
+        let clock = self.clock;
+        self.entries.get_mut(key).map(|(used, value)| {
+            *used = clock;
+            value
+        })
+    }
+
+    /// Stores an entry as the newest. Returns the entry that left to make
+    /// room, if any. The entry just stored never leaves.
+    pub fn insert(&mut self, key: String, value: V) -> Option<(String, V)> {
+        self.clock += 1;
+        self.entries.insert(key.clone(), (self.clock, value));
+        if self.entries.len() <= self.cap {
+            return None;
+        }
+        let oldest = self
+            .entries
+            .iter()
+            .filter(|(k, _)| **k != key)
+            .min_by_key(|(_, (used, _))| *used)
+            .map(|(k, _)| k.clone())?;
+        self.entries
+            .remove(&oldest)
+            .map(|(_, value)| (oldest, value))
+    }
+
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[cfg(test)]
+    pub fn contains(&self, key: &str) -> bool {
+        self.entries.contains_key(key)
+    }
+}
+
 /// The text states of every rendered segment, by key. A state keeps its
-/// selection across renders.
-#[derive(Default)]
+/// selection across renders. The cache drops the states that were used
+/// longest ago, so a long session does not keep every message it ever drew.
 pub struct TextCache {
-    states: HashMap<String, (String, Entity<TextViewState>)>,
+    states: Lru<(String, Entity<TextViewState>)>,
+}
+
+impl Default for TextCache {
+    fn default() -> TextCache {
+        TextCache {
+            states: Lru::new(TEXT_CACHE_CAP),
+        }
+    }
 }
 
 impl TextCache {
@@ -96,6 +168,15 @@ impl TextCache {
             .insert(key.to_owned(), (text.to_owned(), state.clone()));
         state
     }
+}
+
+/// The text of a selection, exactly as the reader selected it. The text
+/// view ends each block it copies with a line break, so a partial selection
+/// such as "No other files were changed. The ta" arrives with a "\n" at its
+/// end. The reader did not select that break. Cmd+C already removes it, and
+/// the menu must give the same text.
+pub fn exact_selection(copied: &str) -> String {
+    copied.trim_end_matches(['\n', '\r']).to_owned()
 }
 
 #[cfg(test)]
@@ -122,6 +203,61 @@ mod tests {
     fn plain_text_is_one_segment() {
         assert_eq!(segments("Hi"), vec![Segment::Prose("Hi".into())]);
         assert!(segments("").is_empty());
+    }
+
+    #[test]
+    fn the_least_recently_used_entry_leaves_first() {
+        let mut cache: Lru<u32> = Lru::new(3);
+        assert!(cache.insert("a".into(), 1).is_none());
+        assert!(cache.insert("b".into(), 2).is_none());
+        assert!(cache.insert("c".into(), 3).is_none());
+        // Reading "a" makes "b" the oldest.
+        assert_eq!(cache.get_mut("a").copied(), Some(1));
+        assert_eq!(cache.insert("d".into(), 4), Some(("b".into(), 2)));
+        assert_eq!(cache.len(), 3);
+        assert!(cache.contains("a") && cache.contains("c") && cache.contains("d"));
+        assert!(!cache.contains("b"));
+    }
+
+    #[test]
+    fn the_cache_never_grows_past_its_cap() {
+        let mut cache: Lru<usize> = Lru::new(TEXT_CACHE_CAP);
+        for i in 0..TEXT_CACHE_CAP * 3 {
+            cache.insert(format!("message-{i}"), i);
+            assert!(cache.len() <= TEXT_CACHE_CAP);
+        }
+        assert_eq!(cache.len(), TEXT_CACHE_CAP);
+        // The newest entries stay and the oldest are gone.
+        assert!(cache.contains(&format!("message-{}", TEXT_CACHE_CAP * 3 - 1)));
+        assert!(!cache.contains("message-0"));
+    }
+
+    #[test]
+    fn the_entry_just_stored_stays_even_in_a_cache_of_one() {
+        let mut cache: Lru<u32> = Lru::new(0);
+        cache.insert("a".into(), 1);
+        assert_eq!(cache.insert("b".into(), 2), Some(("a".into(), 1)));
+        assert!(cache.contains("b"));
+        // Replacing an entry evicts nothing.
+        assert!(cache.insert("b".into(), 3).is_none());
+        assert_eq!(cache.get_mut("b").copied(), Some(3));
+    }
+
+    #[test]
+    fn a_partial_selection_copies_without_the_block_break() {
+        assert_eq!(
+            exact_selection("No other files were changed. The ta\n"),
+            "No other files were changed. The ta"
+        );
+        assert_eq!(
+            exact_selection("two blocks\nsecond\n\n"),
+            "two blocks\nsecond"
+        );
+        assert_eq!(exact_selection("windows\r\n"), "windows");
+        assert_eq!(exact_selection("nothing to trim"), "nothing to trim");
+        assert_eq!(exact_selection("\n"), "");
+        // Spaces the reader selected stay.
+        assert_eq!(exact_selection(" lead and trail \n"), " lead and trail ");
     }
 
     #[test]

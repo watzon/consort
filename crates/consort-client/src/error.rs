@@ -12,8 +12,12 @@ pub enum ClientError {
     BadCode,
     #[error("{message}")]
     Hub { code: String, message: String },
-    #[error("Cannot save the client keys in {path}: {message}")]
+    #[error(
+        "Cannot read or write the client file {path}: {message}. Check that the folder exists and that you may use it, then try again"
+    )]
     Storage { path: String, message: String },
+    #[error("The hub did not answer in time. Check the connection, then try again")]
+    TimedOut,
     #[error("The client stopped. Restart Consort")]
     Stopped,
     #[error("{0}")]

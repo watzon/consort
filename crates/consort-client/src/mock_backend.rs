@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 
 use crate::{
     Backend, ClientError, Command,
@@ -81,6 +81,7 @@ impl MockBackend {
                     speaker: Speaker::You,
                     time_label: time,
                     bodies: vec![PostBody::Text(body)],
+                    pending: false,
                 });
                 if let Some(task) = state.tasks.iter_mut().find(|t| t.id == task_id)
                     && task.status == TaskStatus::Review
@@ -204,7 +205,9 @@ impl MockBackend {
                 }
             }
             // The mock holds every message already.
-            Command::LoadThread { .. } | Command::LoadOlder { .. } => {}
+            Command::LoadThread { .. }
+            | Command::LoadOlder { .. }
+            | Command::DismissSendFailure { .. } => {}
             Command::ResolveTask { task_id } => {
                 set_status(&mut state, &task_id, TaskStatus::Resolved)?
             }
@@ -401,7 +404,18 @@ fn settle(state: &mut ViewState, task_id: &str) {
 const DEMO_REPLY: &str = "This is a demo with no hub, so no assistant reads your message. Connect Consort to a hub to talk to the assistant.";
 
 impl Backend for MockBackend {
-    async fn handle(
+    fn handle(
+        &mut self,
+        command: Command,
+        reply: oneshot::Sender<Result<(), ClientError>>,
+        publish: &watch::Sender<Arc<ViewState>>,
+    ) {
+        let _ = reply.send(self.apply_and_publish(command, publish));
+    }
+}
+
+impl MockBackend {
+    fn apply_and_publish(
         &mut self,
         command: Command,
         publish: &watch::Sender<Arc<ViewState>>,

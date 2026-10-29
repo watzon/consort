@@ -12,10 +12,10 @@ use gpui_kit::{
 
 use crate::{
     app::{ConsortApp, Dialog, Field},
-    ui::sizes,
+    notice::{Notice, NoticeKind},
     ui::{
         menu::{MenuAction, MenuItem, OpenMenu},
-        parts::{ButtonKind, button, detail, icon, icon_button, text},
+        parts::{ButtonKind, button, detail, error_box, icon, icon_button, selectable, text},
         settings::segmented,
     },
 };
@@ -38,7 +38,7 @@ fn field_block(label: &str, body: impl IntoElement, hint: Option<&str>, t: &Toke
 pub fn input_box(input: &Entity<InputState>, focused: bool, t: &Tokens) -> Div {
     let c = &t.colors;
     div()
-        .py(sizes::INPUT_PAD_Y)
+        .py(t.component.input_pad_y)
         .px(t.space.md)
         .bg(c.surface_card)
         .border(t.border_width)
@@ -67,7 +67,7 @@ fn select_box(
         .flex()
         .items_center()
         .justify_between()
-        .py(sizes::INPUT_PAD_Y)
+        .py(t.component.input_pad_y)
         .pl(t.space.md)
         .pr(t.space.sm + t.space.xxs)
         .bg(c.surface_card)
@@ -82,8 +82,11 @@ fn select_box(
 }
 
 impl ConsortApp {
-    pub fn render_notice(&self, notice: String, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+    /// The toast at the bottom. Its text is selectable. An error has a mark
+    /// and stays until the user dismisses it. An info notice times out.
+    pub fn render_notice(&self, notice: Notice, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
         let c = &t.colors;
+        let is_error = notice.kind == NoticeKind::Error;
         div()
             .absolute()
             .bottom(t.space.xl)
@@ -103,10 +106,25 @@ impl ConsortApp {
                     .pr(t.space.xs)
                     .bg(c.surface_raised)
                     .border(t.border_width)
-                    .border_color(c.border_strong)
+                    .border_color(if is_error {
+                        c.status_failed
+                    } else {
+                        c.border_strong
+                    })
                     .rounded(t.radius.lg)
                     .shadow(t.shadow_float())
-                    .child(text(notice, t.text.ui, c.text_primary))
+                    .when(is_error, |d| {
+                        d.child(icon("circle-alert", t.icon.size, c.status_failed))
+                    })
+                    .child(
+                        selectable(
+                            SharedString::from(format!("notice-text-{}", notice.serial)),
+                            notice.message,
+                            t.text.ui,
+                            c.text_primary,
+                        )
+                        .min_w_0(),
+                    )
                     .child(
                         icon_button(
                             "notice-close",
@@ -118,7 +136,7 @@ impl ConsortApp {
                             t,
                         )
                         .on_click(cx.listener(|this, _, _, cx| {
-                            this.notice = None;
+                            this.notices.dismiss();
                             cx.notify();
                         })),
                     ),
@@ -153,23 +171,27 @@ impl ConsortApp {
                     self.dialog_actions("Rename", t, cx, move |this, window, cx| {
                         let name = this.field(Field::Name, cx);
                         if name.is_empty() {
-                            this.show_notice("Enter a name for the channel.".into(), cx);
+                            this.dialog_error = Some("Enter a name for the channel.".into());
+                            cx.notify();
                             return;
                         }
                         let client = this.client.clone();
                         let id = id.clone();
-                        this.spawn_command(cx, async move {
-                            client
-                                .update_channel(
-                                    id,
-                                    ChannelChanges {
-                                        name: Some(name),
-                                        ..ChannelChanges::default()
-                                    },
-                                )
-                                .await
-                        });
-                        this.close_dialog(window, cx);
+                        this.submit_dialog(
+                            async move {
+                                client
+                                    .update_channel(
+                                        id,
+                                        ChannelChanges {
+                                            name: Some(name),
+                                            ..ChannelChanges::default()
+                                        },
+                                    )
+                                    .await
+                            },
+                            window,
+                            cx,
+                        );
                     }),
                 )
             }
@@ -200,12 +222,15 @@ impl ConsortApp {
                         let notes = this.inputs.notes.read(cx).value().to_string();
                         let client = this.client.clone();
                         let id = id.clone();
-                        this.spawn_command(cx, async move {
-                            client
-                                .update_channel(id, ChannelChanges { instructions: Some(notes), ..ChannelChanges::default() })
-                                .await
-                        });
-                        this.close_dialog(window, cx);
+                        this.submit_dialog(
+                            async move {
+                                client
+                                    .update_channel(id, ChannelChanges { instructions: Some(notes), ..ChannelChanges::default() })
+                                    .await
+                            },
+                            window,
+                            cx,
+                        );
                     }),
                 )
             }
@@ -224,10 +249,18 @@ impl ConsortApp {
                     field_block("Name", input_box(&self.inputs.name, focused, t), None, t),
                     self.dialog_actions("Rename", t, cx, move |this, window, cx| {
                         let name = this.field(Field::Name, cx);
+                        if name.is_empty() {
+                            this.dialog_error = Some("Enter a name for the worker.".into());
+                            cx.notify();
+                            return;
+                        }
                         let client = this.client.clone();
                         let id = id.clone();
-                        this.spawn_command(cx, async move { client.rename_worker(id, name).await });
-                        this.close_dialog(window, cx);
+                        this.submit_dialog(
+                            async move { client.rename_worker(id, name).await },
+                            window,
+                            cx,
+                        );
                     }),
                 )
             }
@@ -258,10 +291,11 @@ impl ConsortApp {
                             .collect();
                         let client = this.client.clone();
                         let id = id.clone();
-                        this.spawn_command(cx, async move {
-                            client.set_worker_labels(id, labels).await
-                        });
-                        this.close_dialog(window, cx);
+                        this.submit_dialog(
+                            async move { client.set_worker_labels(id, labels).await },
+                            window,
+                            cx,
+                        );
                     }),
                 )
             }
@@ -280,8 +314,11 @@ impl ConsortApp {
                     self.dialog_actions_kind("Delete channel", ButtonKind::Danger, t, cx, move |this, window, cx| {
                         let client = this.client.clone();
                         let id = id.clone();
-                        this.spawn_command(cx, async move { client.delete_channel(id).await });
-                        this.close_dialog(window, cx);
+                        this.submit_dialog(
+                            async move { client.delete_channel(id).await },
+                            window,
+                            cx,
+                        );
                     }),
                 )
             }
@@ -300,9 +337,39 @@ impl ConsortApp {
                     self.dialog_actions_kind("Remove worker", ButtonKind::Danger, t, cx, move |this, window, cx| {
                         let client = this.client.clone();
                         let id = id.clone();
-                        this.spawn_command(cx, async move {
-                            client.run(consort_client::Command::RemoveWorker { worker_id: id }).await
-                        });
+                        this.submit_dialog(
+                            async move {
+                                client.run(consort_client::Command::RemoveWorker { worker_id: id }).await
+                            },
+                            window,
+                            cx,
+                        );
+                    }),
+                )
+            }
+            Dialog::ConfirmOpenLink(url) => {
+                let url = url.clone();
+                let open = url.clone();
+                (
+                    "Open this link?".to_owned(),
+                    "The words of this link do not match where it goes. It goes to this address."
+                        .to_owned(),
+                    t.layout.panel_width + t.space.xxl * 4.0,
+                    div()
+                        .p(t.space.md)
+                        .bg(c.surface_card)
+                        .border(t.border_width)
+                        .border_color(c.border_subtle)
+                        .rounded(t.radius.md)
+                        .font_family(t.font_mono.clone())
+                        .child(selectable(
+                            SharedString::from(format!("link-url-{url}")),
+                            url,
+                            t.text.mono,
+                            c.text_primary,
+                        )),
+                    self.dialog_actions("Open link", t, cx, move |this, window, cx| {
+                        cx.open_url(&open);
                         this.close_dialog(window, cx);
                     }),
                 )
@@ -356,6 +423,11 @@ impl ConsortApp {
                     ),
             )
             .child(body)
+            .children(
+                self.dialog_error.clone().map(|err| {
+                    error_box(SharedString::from(format!("dialog-error-{err}")), err, t)
+                }),
+            )
             .child(actions);
         div()
             .id("scrim")
@@ -395,12 +467,15 @@ impl ConsortApp {
         on_confirm: impl Fn(&mut ConsortApp, &mut Window, &mut Context<ConsortApp>) + 'static,
     ) -> Div {
         let c = &t.colors;
+        let busy = self.dialog_busy();
+        let danger_hover = t.opacity.danger_hover;
         let confirm = button("dialog-confirm", label.to_owned(), kind, t)
             .when(kind == ButtonKind::Danger, |b| {
                 b.bg(c.status_failed)
                     .text_color(c.on_failed)
-                    .hover(|s| s.bg(c.status_failed).opacity(0.9))
+                    .hover(|s| s.bg(c.status_failed).opacity(danger_hover))
             })
+            .when(busy, |b| b.opacity(t.opacity.busy))
             .px(t.space.md + t.space.xxs)
             .on_click(cx.listener(move |this, _, window, cx| on_confirm(this, window, cx)));
         div()
@@ -452,11 +527,10 @@ impl ConsortApp {
                 if let Some(bounds) = this.triggers.get("new-channel-group") {
                     let items = groups
                         .iter()
-                        .enumerate()
-                        .map(|(i, g)| {
+                        .map(|g| {
                             MenuItem::new(
                                 g.name.clone(),
-                                MenuAction::Select("new-channel-group", i),
+                                MenuAction::Select("new-channel-group", g.id.clone()),
                             )
                             .checked(current_group.as_deref() == Some(g.id.as_str()))
                         })
@@ -521,11 +595,10 @@ impl ConsortApp {
                         if let Some(bounds) = this.triggers.get("new-channel-worker") {
                             let items = free
                                 .iter()
-                                .enumerate()
-                                .map(|(i, (_, name))| {
+                                .map(|(id, name)| {
                                     MenuItem::new(
                                         name.clone(),
-                                        MenuAction::Select("new-channel-worker", i),
+                                        MenuAction::Select("new-channel-worker", id.clone()),
                                     )
                                 })
                                 .collect();
@@ -548,10 +621,12 @@ impl ConsortApp {
             if let Some(bounds) = this.triggers.get("new-channel-selection") {
                 let items = selections
                     .iter()
-                    .enumerate()
-                    .map(|(i, s)| {
-                        MenuItem::new(s.clone(), MenuAction::Select("new-channel-selection", i))
-                            .checked(current_selection.as_deref() == Some(s.as_str()))
+                    .map(|s| {
+                        MenuItem::new(
+                            s.clone(),
+                            MenuAction::Select("new-channel-selection", s.clone()),
+                        )
+                        .checked(current_selection.as_deref() == Some(s.as_str()))
                     })
                     .collect();
                 this.open_menu(OpenMenu::under(bounds, items, true), cx);
@@ -621,7 +696,7 @@ impl ConsortApp {
                     .child(
                         field_block("Name", input_box(&self.inputs.name, name_focused, t), None, t).flex_1(),
                     )
-                    .child(field_block("Group", group_select, None, t).w(sizes::GROUP_SELECT).flex_none()),
+                    .child(field_block("Group", group_select, None, t).w(t.component.group_select).flex_none()),
             )
             .child(field_block(
                 "Purpose",
@@ -641,14 +716,14 @@ impl ConsortApp {
                     .flex()
                     .gap(t.space.md)
                     .child(field_block("Default harness for tasks", selection_select, None, t).flex_1())
-                    .child(field_block("Workspace", isolation, None, t).w(sizes::WORKSPACE_CONTROL).flex_none()),
+                    .child(field_block("Workspace", isolation, None, t).w(t.component.workspace_control).flex_none()),
             )
             .child(text(isolation_hint, detail(t), c.text_tertiary))
-            .when_some(form.error.clone(), |d, err| d.child(text(err, t.text.ui, c.status_failed)));
+;
         let actions = self.dialog_actions("Create channel", t, cx, |this, window, cx| {
             let name = this.field(Field::Name, cx);
             if name.is_empty() {
-                this.new_channel.error = Some("Enter a name for the channel.".into());
+                this.dialog_error = Some("Enter a name for the channel.".into());
                 cx.notify();
                 return;
             }
@@ -666,8 +741,11 @@ impl ConsortApp {
             let before = this.state.channels.iter().map(|c| c.id.clone()).collect();
             this.open_created = Some((channel.name.clone(), before));
             let client = this.client.clone();
-            this.spawn_command(cx, async move { client.create_channel(channel).await });
-            this.close_dialog(window, cx);
+            this.submit_dialog(
+                async move { client.create_channel(channel).await },
+                window,
+                cx,
+            );
         });
         (
             "New channel".to_owned(),
@@ -900,7 +978,7 @@ impl ConsortApp {
             .and_then(|id| self.state.workers.iter().find(|w| &w.id == id));
         let (status, note, done): (AnyElement, String, bool) = match added {
             Some(w) if w.online => (
-                crate::ui::parts::worker_dot(true, sizes::STATE_DOT, t.icon.size, t)
+                crate::ui::parts::worker_dot(true, t.component.state_dot, t.icon.size, t)
                     .into_any_element(),
                 format!("{} connected. It shows in the list, selected.", w.name),
                 true,

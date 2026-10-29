@@ -1,9 +1,11 @@
 //! The first-launch screen: connect to a hub with its URL and a setup code.
 
+use consort_client::Connection;
 use consort_theme::{Tokens, TypeExt as _};
 use gpui_kit::{
     AnyElement, Context, Focusable as _, InteractiveElement, IntoElement, ParentElement,
-    StatefulInteractiveElement as _, Styled, Window, div, prelude::FluentBuilder as _,
+    SharedString, StatefulInteractiveElement as _, Styled, Window, div,
+    prelude::FluentBuilder as _,
 };
 
 use crate::{
@@ -11,7 +13,7 @@ use crate::{
     ui::window_controls::DragArea as _,
     ui::{
         dialogs::input_box,
-        parts::{ButtonKind, button, detail, glyph, icon, text},
+        parts::{ButtonKind, button, detail, error_box, glyph, text},
     },
 };
 
@@ -70,6 +72,24 @@ impl ConsortApp {
             .focus_handle(cx)
             .is_focused(window);
         let busy = self.onboarding.busy;
+        // The hub refused this app, or its saved key is damaged. The user
+        // pairs again with a new code. The reason says what happened.
+        let refused = matches!(self.state.connection, Connection::Refused { .. });
+        let (title, intro, action, action_busy) = if refused {
+            (
+                "Pair this app again",
+                "The hub does not accept this app. Enter the address of your hub and a new setup code to pair this app again.",
+                "Pair again",
+                "Pairing",
+            )
+        } else {
+            (
+                "Connect to your hub",
+                "The hub keeps your channels, tasks and memory. This app connects to it once with a setup code, and then on every start.",
+                "Connect",
+                "Connecting",
+            )
+        };
         let mark_color = if t.is_dark() {
             c.accent_fill
         } else {
@@ -110,12 +130,8 @@ impl ConsortApp {
                     .flex()
                     .flex_col()
                     .gap(t.space.sm)
-                    .child(text("Connect to your hub", t.text.display, c.text_primary))
-                    .child(text(
-                        "The hub keeps your channels, tasks and memory. This app connects to it once with a setup code, and then on every start.",
-                        t.text.body,
-                        c.text_secondary,
-                    )),
+                    .child(text(title, t.text.display, c.text_primary))
+                    .child(text(intro, t.text.body, c.text_secondary)),
             )
             .child(field(
                 "Hub URL",
@@ -128,22 +144,18 @@ impl ConsortApp {
                 "The hub prints this code when it starts for the first time. A paired app can also make one.",
             ))
             .when_some(self.onboarding.error.clone(), |d, err| {
-                d.child(
-                    div()
-                        .flex()
-                        .gap(t.space.sm)
-                        .p(t.space.md)
-                        .rounded(t.radius.md)
-                        .bg(c.tint_failed)
-                        .child(icon("circle-alert", t.icon.size, c.status_failed))
-                        .child(text(err, t.text.ui, c.text_primary).flex_1()),
-                )
+                // The error is selectable, so the user can copy it.
+                d.child(error_box(
+                    SharedString::from(format!("onboarding-error-{err}")),
+                    err,
+                    t,
+                ))
             })
             .child(
                 div().flex().child(
-                    button("connect", if busy { "Connecting" } else { "Connect" }, ButtonKind::Primary, t)
+                    button("connect", if busy { action_busy } else { action }, ButtonKind::Primary, t)
                         .px(t.space.xl)
-                        .when(busy, |b| b.opacity(0.7))
+                        .when(busy, |b| b.opacity(t.opacity.busy))
                         .on_click(cx.listener(|this, _, window, cx| {
                             if !this.onboarding.busy {
                                 this.connect(window, cx)

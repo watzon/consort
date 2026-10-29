@@ -8,7 +8,8 @@ use consort_theme::{Tokens, Type, TypeExt as _};
 use gpui_kit::{
     Animation, AnimationExt as _, AnyElement, App, Div, ElementId, Hsla, InteractiveElement,
     IntoElement, ParentElement, Pixels, SharedString, Stateful, StatefulInteractiveElement as _,
-    Styled, Svg, Transformation, div, percentage, prelude::FluentBuilder as _, svg,
+    Styled, Svg, Transformation, base::SelectableText, div, percentage,
+    prelude::FluentBuilder as _, svg,
 };
 
 /// A Lucide icon from `assets/icons`.
@@ -113,6 +114,39 @@ pub fn text(content: impl Into<SharedString>, style: Type, color: Hsla) -> Div {
         .child(content.into())
 }
 
+/// A line of text in one style and color that the user can select and copy.
+/// `id` must be unique and stable, because the selection keeps its state by
+/// it.
+pub fn selectable(
+    id: impl Into<ElementId>,
+    content: impl Into<SharedString>,
+    style: Type,
+    color: Hsla,
+) -> Div {
+    div()
+        .type_style(style)
+        .text_color(color)
+        .child(SelectableText::new(id, content))
+}
+
+/// An error on a tinted ground, with the text selectable so the user can
+/// copy the details.
+pub fn error_box(id: impl Into<ElementId>, message: impl Into<SharedString>, t: &Tokens) -> Div {
+    let c = &t.colors;
+    div()
+        .flex()
+        .gap(t.space.sm)
+        .p(t.space.md)
+        .rounded(t.radius.md)
+        .bg(c.tint_failed)
+        .child(icon("circle-alert", t.icon.size, c.status_failed))
+        .child(
+            selectable(id, message, t.text.ui, c.text_primary)
+                .flex_1()
+                .min_w_0(),
+        )
+}
+
 /// A text that ends with an ellipsis when it does not fit.
 pub fn line(content: impl Into<SharedString>, style: Type, color: Hsla) -> Div {
     text(content, style, color).min_w_0().truncate()
@@ -154,7 +188,7 @@ pub fn button(
         .child(label.into());
     // Every kind is 30 px high: 20 px of text plus 5 px above and below. The
     // secondary button's border takes 1 px of each.
-    let pad = crate::ui::sizes::BUTTON_PAD_Y;
+    let pad = t.component.button_pad_y;
     match kind {
         ButtonKind::Primary => base
             .py(pad)

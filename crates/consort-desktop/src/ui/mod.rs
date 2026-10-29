@@ -1,4 +1,5 @@
 pub mod dialogs;
+pub mod links;
 pub mod markdown;
 pub mod menu;
 pub mod onboarding;
@@ -6,7 +7,7 @@ pub mod panels;
 pub mod parts;
 pub mod settings;
 pub mod sidebar;
-pub mod sizes;
+pub mod startup_error;
 pub mod switcher;
 pub mod timeline;
 pub mod window_controls;

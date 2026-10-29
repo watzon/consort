@@ -14,11 +14,12 @@ use crate::{
     app::{ConsortApp, Panel, TasksTab},
     ui::window_controls::DragArea as _,
     ui::{
-        menu::{MenuAction, OpenMenu},
+        menu::{MenuAction, OpenMenu, TextTarget, text_edit_menu},
         parts::{
-            ButtonKind, button, detail, icon, icon_button, line, status_color, status_glyph, text,
+            ButtonKind, button, detail, icon, icon_button, line, selectable, status_color,
+            status_glyph, text,
         },
-        timeline::{open_context_menu, task_menu},
+        timeline::{open_context_menu, task_menu, time_text},
     },
 };
 
@@ -312,7 +313,7 @@ impl ConsortApp {
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                    open_context_menu(this, event, task_menu(&menu_id, status), window, cx)
+                    open_context_menu(this, event, task_menu(&menu_id, status, true), window, cx)
                 }),
             )
             .into_any_element()
@@ -396,10 +397,8 @@ impl ConsortApp {
                         )
                         .on_click(cx.listener(move |this, _, _, cx| {
                             if let Some(bounds) = this.triggers.get("thread-more") {
-                                let items = task_menu(&menu_task, status)
-                                    .into_iter()
-                                    .filter(|i| i.label.as_ref() != "Open thread")
-                                    .collect();
+                                // The thread is open, so the menu has no Open thread.
+                                let items = task_menu(&menu_task, status, false);
                                 this.open_menu(OpenMenu::under(bounds, items, false), cx);
                             }
                         })),
@@ -527,6 +526,15 @@ impl ConsortApp {
                 .border(t.border_width)
                 .border_color(c.border_strong)
                 .rounded(t.radius.lg)
+                // The reply box has the same menu as the composer.
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                        let items = text_edit_menu(TextTarget::Reply);
+                        this.open_menu(OpenMenu::at(event.position, items), cx);
+                        cx.stop_propagation();
+                    }),
+                )
                 .child(
                     div()
                         .flex_1()
@@ -696,7 +704,7 @@ impl ConsortApp {
                     if you { c.accent_text } else { c.text_secondary },
                 ))
                 .child(text(
-                    post.time_label.clone(),
+                    time_text(&post.time_label, post.pending).to_owned(),
                     t.text.caption,
                     c.text_tertiary,
                 )),
@@ -782,13 +790,17 @@ impl ConsortApp {
                                 .px(t.space.sm + t.space.xxs)
                                 .pb(t.space.sm)
                                 .pl(t.icon.dense + t.space.sm + t.space.sm + t.space.xxs);
-                            for item in items {
+                            for (n, item) in items.iter().enumerate() {
+                                // Command lines are selectable, so the user
+                                // can copy them.
                                 list = list.child(
-                                    div()
-                                        .font_family(t.font_mono.clone())
-                                        .type_style(detail(t))
-                                        .text_color(c.text_tertiary)
-                                        .child(item.clone()),
+                                    selectable(
+                                        SharedString::from(format!("{key}-item-{n}")),
+                                        item.clone(),
+                                        detail(t),
+                                        c.text_tertiary,
+                                    )
+                                    .font_family(t.font_mono.clone()),
                                 );
                             }
                             d.child(list)
@@ -840,9 +852,14 @@ impl ConsortApp {
                         cx,
                     ))
                     .child(
-                        text(approval.summary.clone(), t.text.ui_strong, c.text_primary)
-                            .flex_1()
-                            .min_w_0(),
+                        selectable(
+                            SharedString::from(format!("{key}-summary")),
+                            approval.summary.clone(),
+                            t.text.ui_strong,
+                            c.text_primary,
+                        )
+                        .flex_1()
+                        .min_w_0(),
                     ),
             )
             .child(self.render_approval_detail(approval, false, t, cx));
@@ -916,7 +933,7 @@ impl ConsortApp {
                         c.border_strong
                     })
                     .when(recommended || chosen, |d| d.bg(c.surface_raised))
-                    .when(dim, |d| d.opacity(0.6))
+                    .when(dim, |d| d.opacity(t.opacity.answered_dim))
                     .when(!answered, |d| {
                         d.cursor_pointer().hover(|s| s.bg(c.hover_card))
                     })
@@ -967,15 +984,16 @@ impl ConsortApp {
                                         d.child(text("Recommended", detail(t), c.accent_text))
                                     }),
                             )
-                            .child(text(
+                            .child(selectable(
+                                SharedString::from(format!("{key}-consequence-{i}")),
                                 option.consequence.clone(),
                                 detail(t),
                                 c.text_secondary,
                             )),
                     )
                     .when(!answered, |d| {
-                        d.on_click(cx.listener(move |this, _, _, cx| {
-                            this.answer_decision(id.clone(), Some(i), None, cx)
+                        d.on_click(cx.listener(move |this, _, window, cx| {
+                            this.answer_decision(id.clone(), Some(i), None, window, cx)
                         }))
                     }),
             );
@@ -1040,10 +1058,9 @@ impl ConsortApp {
                                     if text.is_empty() {
                                         return;
                                     }
-                                    this.inputs
-                                        .decision_answer
-                                        .update(cx, |input, cx| input.set_value("", window, cx));
-                                    this.answer_decision(id.clone(), None, Some(text), cx);
+                                    // The answer box keeps the text until the
+                                    // hub takes the answer.
+                                    this.answer_decision(id.clone(), None, Some(text), window, cx);
                                 },
                             )),
                         )
@@ -1134,14 +1151,21 @@ impl ConsortApp {
                             .min_w_0()
                             .gap(t.space.xs)
                             .child(
-                                div()
-                                    .type_style(t.text.body)
-                                    .font_weight(t.text.title.weight)
-                                    .text_color(c.text_primary)
-                                    .child(decision.question.clone()),
+                                selectable(
+                                    SharedString::from(format!("{key}-question")),
+                                    decision.question.clone(),
+                                    t.text.body,
+                                    c.text_primary,
+                                )
+                                .font_weight(t.text.title.weight),
                             )
                             .when_some(decision.context.clone(), |d, ctx| {
-                                d.child(text(ctx, t.text.ui, c.text_secondary))
+                                d.child(selectable(
+                                    SharedString::from(format!("{key}-context")),
+                                    ctx,
+                                    t.text.ui,
+                                    c.text_secondary,
+                                ))
                             }),
                     ),
             )

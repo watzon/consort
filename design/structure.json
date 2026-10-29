@@ -24,6 +24,36 @@
   },
   "motion": { "fast_ms": 120, "normal_ms": 180, "slow_ms": 280, "ease_enter": [0.2, 0, 0, 1], "ease_exit": [0.4, 0, 1, 1] },
   "icon": { "set": "lucide", "size": 16, "dense_size": 14, "toolbar_size": 20, "stroke": 1.5 },
-  "layout": { "sidebar_width": 248, "panel_width": 400, "timeline_max_width": 720, "speaker_gutter": 64, "min_window": [960, 600] },
+  "layout": {
+    "sidebar_width": 248,
+    "panel_width": 400,
+    "timeline_max_width": 720,
+    "speaker_gutter": 64,
+    "min_window": [960, 600],
+    "default_window": [1440, 900],
+    "wide_timeline": 600,
+    "list_overdraw": 400
+  },
+  "opacity": { "answered_dim": 0.6, "busy": 0.7, "danger_hover": 0.9 },
+  "component": {
+    "settings_label": 160,
+    "settings_segmented": 336,
+    "theme_card": 310,
+    "theme_row": 632,
+    "theme_preview_height": 92,
+    "worker_list": 288,
+    "settings_detail_max": 760,
+    "account_state": 140,
+    "settings_select": 160,
+    "group_select": 200,
+    "workspace_control": 230,
+    "input_pad_y": 7,
+    "button_pad_y": 5,
+    "worker_dot": 7,
+    "state_dot": 6,
+    "worker_row_pad_y": 3,
+    "switch_inset": 3,
+    "theme_preview": { "bar": 4, "bar_gap": 5, "sidebar": 32, "sidebar_item": 20, "text_line": 76, "title": 48, "chip": 6, "card": 28, "button": 22, "button_radius": 2 }
+  },
   "derive": { "hover_delta_l": 0.035, "active_delta_l": 0.07, "selection_alpha": 0.28, "status_tint_alpha": 0.16, "scrim_alpha": { "dark": 0.55, "light": 0.3 } }
 }

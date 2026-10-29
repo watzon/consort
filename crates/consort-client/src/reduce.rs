@@ -4,15 +4,16 @@
 use std::collections::BTreeMap;
 
 use consort_proto::{
+    ids::{MessageId, TaskId},
     model::{
         self, ApprovalDetails, ApprovalStatus, AuthState as ProtoAuth, Author, ChannelKind as PK,
-        DecisionStatus, ItemPayload, MessageKind, RequestOptionKind, WorkerState,
+        DecisionStatus, MessageKind, RequestOptionKind, WorkerState,
     },
     status::TaskStatus as PS,
 };
 
 use crate::{
-    cache::Cache,
+    cache::{Cache, ItemSummary},
     derive::{refresh, waiting_detail},
     format,
     view::*,
@@ -198,20 +199,49 @@ fn approval_summary(a: &model::Approval) -> String {
     }
 }
 
-fn approval_view(a: &model::Approval) -> ApprovalView {
-    let (folder, detail) = match &a.details {
+/// The folder and the detail block of an approval. The detail block holds
+/// the real action: the command, the files, the tool with its server and
+/// arguments, or the network target. The summary line is text that the agent
+/// wrote, so the user must be able to check it against the detail.
+fn approval_detail(details: &ApprovalDetails) -> (Option<String>, Option<String>) {
+    match details {
         ApprovalDetails::Command { command, cwd } => (cwd.clone(), Some(command.clone())),
         ApprovalDetails::FileChange { paths, .. } => (None, Some(paths.join("\n"))),
-        ApprovalDetails::Tool { arguments, .. } => (
-            None,
-            match arguments {
+        ApprovalDetails::Tool {
+            server,
+            tool,
+            arguments,
+        } => {
+            let (prefix_server, name) = split_tool_name(tool);
+            let mut lines = vec![format!("Tool: {name}")];
+            if let Some(server) = server.as_deref().or(prefix_server) {
+                lines.push(format!("Server: {server}"));
+            }
+            let arguments = match arguments {
                 serde_json::Value::Null => None,
                 serde_json::Value::Object(map) if map.is_empty() => None,
                 value => serde_json::to_string_pretty(value).ok(),
-            },
+            };
+            let mut text = lines.join("\n");
+            if let Some(arguments) = arguments {
+                text.push_str("\n\n");
+                text.push_str(&arguments);
+            }
+            (None, Some(text))
+        }
+        ApprovalDetails::Network { target } => (None, Some(format!("Network: {target}"))),
+        ApprovalDetails::Other { text } => (
+            None,
+            text.as_deref()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_owned),
         ),
-        _ => (None, None),
-    };
+    }
+}
+
+fn approval_view(a: &model::Approval) -> ApprovalView {
+    let (folder, detail) = approval_detail(&a.details);
     let mut choices: Vec<ApprovalChoice> = Vec::new();
     for option in &a.options {
         if let Some(choice) = approval_choice(option.kind)
@@ -411,6 +441,41 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
         .map(|t| (t.card_message_id.to_string(), t))
         .collect();
 
+    // Indexes, so a timeline of many messages does not scan every approval,
+    // decision and reply for each one.
+    let approval_by_message: BTreeMap<MessageId, &model::Approval> = cache
+        .approvals
+        .values()
+        .map(|a| (a.message_id, a))
+        .collect();
+    let decision_by_message: BTreeMap<MessageId, &model::Decision> = cache
+        .decisions
+        .values()
+        .map(|d| (d.message_id, d))
+        .collect();
+    // The oldest pending approval of each task, for the inline card.
+    let mut first_pending: BTreeMap<TaskId, &model::Approval> = BTreeMap::new();
+    for a in cache
+        .approvals
+        .values()
+        .filter(|a| a.status == ApprovalStatus::Pending)
+    {
+        if let Some(task) = a.task_id {
+            let slot = first_pending.entry(task).or_insert(a);
+            if a.created_at < slot.created_at {
+                *slot = a;
+            }
+        }
+    }
+    let mut replies_by_root: BTreeMap<MessageId, Vec<&model::Message>> = BTreeMap::new();
+    for m in cache.messages.values() {
+        if let Some(root) = m.thread_root_id
+            && m.deleted_at.is_none()
+        {
+            replies_by_root.entry(root).or_default().push(m);
+        }
+    }
+
     // Timelines.
     let mut by_channel: BTreeMap<String, Vec<&model::Message>> = BTreeMap::new();
     for m in cache.messages.values() {
@@ -425,12 +490,15 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
     let mut unread: BTreeMap<String, u32> = BTreeMap::new();
     for channel in &channel_views {
         let mut messages = by_channel.remove(&channel.id).unwrap_or_default();
-        messages.sort_by_key(|m| (m.created_at, m.id.to_string()));
-        let marker = cache
+        messages.sort_by_key(|m| (m.created_at, m.id));
+        // Where the read marker sits in time. A marker whose message is not
+        // loaded (it is older than the newest page) sits before every
+        // loaded message, so the count starts at the oldest one.
+        let marker_at = cache
             .read_markers
             .get(&channel.id)
-            .map(|m| m.last_read_message_id.to_string());
-        let mut after_marker = marker.is_none();
+            .and_then(|m| cache.messages.get(&m.last_read_message_id.to_string()))
+            .map(|m| (m.created_at, m.id));
         let mut count = 0u32;
         let mut items = Vec::new();
         let mut last_day = String::new();
@@ -446,23 +514,16 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
         };
         for m in &messages {
             let at = m.created_at.as_millis();
+            let after_marker = marker_at.is_none_or(|at| (m.created_at, m.id) > at);
             if after_marker && m.author != Author::User {
                 count += 1;
-            }
-            if marker.as_deref() == Some(m.id.to_string().as_str()) {
-                after_marker = true;
             }
             push_day(&mut items, at);
             if m.kind == MessageKind::TaskCard
                 && let Some(task) = task_by_card.get(&m.id.to_string())
             {
                 let status = task_status(task.status);
-                let approval = cache
-                    .approvals
-                    .values()
-                    .filter(|a| a.task_id == Some(task.id) && a.status == ApprovalStatus::Pending)
-                    .min_by_key(|a| a.created_at)
-                    .map(approval_view);
+                let approval = first_pending.get(&task.id).copied().map(approval_view);
                 let worker = task
                     .worker_id
                     .as_ref()
@@ -503,10 +564,9 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
             } else if m.kind == MessageKind::Approval {
                 // Snapshots hold only pending approvals, so an answered one
                 // may have just its message left.
-                let approval = cache
-                    .approvals
-                    .values()
-                    .find(|a| a.message_id == m.id)
+                let approval = approval_by_message
+                    .get(&m.id)
+                    .copied()
                     .map(approval_view)
                     .unwrap_or_else(|| closed_approval(m));
                 items.push(TimelineItem::Approval(ApprovalCardView {
@@ -516,10 +576,9 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                     approval,
                 }));
             } else if m.kind == MessageKind::Decision {
-                let decision = cache
-                    .decisions
-                    .values()
-                    .find(|d| d.message_id == m.id)
+                let decision = decision_by_message
+                    .get(&m.id)
+                    .copied()
                     .map(decision_view)
                     .unwrap_or_else(|| closed_decision(m));
                 items.push(TimelineItem::Decision(DecisionCardView {
@@ -571,40 +630,34 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
 
     // Task threads.
     let mut threads = Vec::new();
-    for task in cache.tasks.values() {
+    // An archived task has no thread to open.
+    for task in cache.tasks.values().filter(|t| t.archived_at.is_none()) {
         let root = task.card_message_id;
-        let mut replies: Vec<&model::Message> = cache
-            .messages
-            .values()
-            .filter(|m| m.thread_root_id == Some(root) && m.deleted_at.is_none())
-            .collect();
+        let mut replies: Vec<&model::Message> =
+            replies_by_root.get(&root).cloned().unwrap_or_default();
         replies.sort_by_key(|m| m.created_at);
         let mut posts = Vec::new();
         let (mut decisions, mut approvals) = (0, 0);
         for m in replies {
             let body = match m.kind {
-                MessageKind::Approval => Some(
-                    match cache.approvals.values().find(|a| a.message_id == m.id) {
-                        Some(a) => {
-                            if a.status == ApprovalStatus::Pending {
-                                approvals += 1;
-                            }
-                            PostBody::Approval(approval_view(a))
+                MessageKind::Approval => Some(match approval_by_message.get(&m.id).copied() {
+                    Some(a) => {
+                        if a.status == ApprovalStatus::Pending {
+                            approvals += 1;
                         }
-                        None => PostBody::Approval(closed_approval(m)),
-                    },
-                ),
-                MessageKind::Decision => Some(
-                    match cache.decisions.values().find(|d| d.message_id == m.id) {
-                        Some(d) => {
-                            if d.status == DecisionStatus::Pending {
-                                decisions += 1;
-                            }
-                            PostBody::Decision(decision_view(d))
+                        PostBody::Approval(approval_view(a))
+                    }
+                    None => PostBody::Approval(closed_approval(m)),
+                }),
+                MessageKind::Decision => Some(match decision_by_message.get(&m.id).copied() {
+                    Some(d) => {
+                        if d.status == DecisionStatus::Pending {
+                            decisions += 1;
                         }
-                        None => PostBody::Decision(closed_decision(m)),
-                    },
-                ),
+                        PostBody::Decision(decision_view(d))
+                    }
+                    None => PostBody::Decision(closed_decision(m)),
+                }),
                 _ => Some(PostBody::Text(m.body.clone())),
             };
             if let Some(body) = body {
@@ -613,6 +666,7 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                     speaker: speaker(m),
                     time_label: format::time_label(m.created_at.as_millis()),
                     bodies: vec![body],
+                    pending: false,
                 });
             }
         }
@@ -626,6 +680,7 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                 speaker: Speaker::You,
                 time_label: format::time_label(p.created_at),
                 bodies: vec![PostBody::Text(p.body.clone())],
+                pending: true,
             });
         }
         // Folds the session's commands and file changes into one line, as
@@ -635,21 +690,21 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
             let mut lines = Vec::new();
             for item in cache
                 .session_items
-                .values()
-                .filter(|i| i.session_id == session)
+                .get(&session.to_string())
+                .into_iter()
+                .flat_map(|items| items.values())
             {
-                match &item.payload {
-                    ItemPayload::Command(c) => {
+                match item {
+                    ItemSummary::Command(command) => {
                         commands += 1;
-                        lines.push(c.command.clone());
+                        lines.push(command.clone());
                     }
-                    ItemPayload::FileChange(f) => {
-                        for change in &f.changes {
-                            files.insert(change.path.clone());
-                            lines.push(format!("Changed {}", change.path));
+                    ItemSummary::Files(paths) => {
+                        for path in paths {
+                            files.insert(path.clone());
+                            lines.push(format!("Changed {path}"));
                         }
                     }
-                    _ => {}
                 }
             }
             if commands + files.len() > 0 {
@@ -672,6 +727,7 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                             summary,
                             items: lines,
                         }],
+                        pending: false,
                     },
                 );
             }
@@ -843,6 +899,24 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
         workers,
         selections,
         worker_pairing: None,
+        send_failures: cache
+            .send_failures
+            .iter()
+            .map(|f| SendFailureView {
+                id: f.id.clone(),
+                channel_id: f.channel_id.clone(),
+                channel_name: cache
+                    .channels
+                    .get(&f.channel_id)
+                    .map(|c| c.name.clone())
+                    .unwrap_or_default(),
+                body: f.body.clone(),
+                message: format!(
+                    "{} Copy your text, then send it again.",
+                    sentence(&f.message)
+                ),
+            })
+            .collect(),
     };
     // Collapsed groups and unread counts come from the hub, so seed the
     // sidebar before the shared rules rebuild it.
@@ -1773,5 +1847,277 @@ mod tests {
         let state = view(&w.cache);
         assert!(state.task(&w.task.to_string()).is_none());
         let _ = w.card;
+    }
+
+    /// Finding 11: with the read marker older than the loaded page, five
+    /// unread messages counted as zero.
+    #[test]
+    fn unread_counts_from_the_oldest_loaded_message_when_the_marker_is_older() {
+        let mut cache = Cache::default();
+        let everything = ChannelId::new();
+        let c = channel(everything, ChannelKind::Everything, "Everything", None);
+        cache.channels.insert(c.id.to_string(), c);
+        for i in 0..5 {
+            let m = message(
+                MessageId::new(),
+                everything,
+                Author::Assistant,
+                MessageKind::Text,
+                None,
+                NOW - 10_000 + i,
+            );
+            cache.messages.insert(m.id.to_string(), m);
+        }
+        let mine = message(
+            MessageId::new(),
+            everything,
+            Author::User,
+            MessageKind::Text,
+            None,
+            NOW - 9_000,
+        );
+        cache.messages.insert(mine.id.to_string(), mine);
+        // The marker names a message that this client has not loaded.
+        cache.read_markers.insert(
+            everything.to_string(),
+            ReadMarker {
+                channel_id: everything,
+                thread_root_id: None,
+                last_read_message_id: MessageId::new(),
+            },
+        );
+        let state = view(&cache);
+        assert_eq!(state.sidebar.everything.unread, 5);
+    }
+
+    #[test]
+    fn unread_counts_only_the_messages_after_a_marker_that_was_deleted() {
+        let mut w = world();
+        let ids: Vec<MessageId> = (0..4)
+            .map(|i| {
+                let m = message(
+                    MessageId::new(),
+                    w.everything,
+                    Author::Assistant,
+                    MessageKind::Text,
+                    None,
+                    NOW - 8_000 + i * 1_000,
+                );
+                let id = m.id;
+                w.cache.messages.insert(id.to_string(), m);
+                id
+            })
+            .collect();
+        // The second message is the marker, and it was deleted since.
+        if let Some(m) = w.cache.messages.get_mut(&ids[1].to_string()) {
+            m.deleted_at = Some(Timestamp::from_millis(NOW));
+        }
+        w.cache.read_markers.insert(
+            w.everything.to_string(),
+            ReadMarker {
+                channel_id: w.everything,
+                thread_root_id: None,
+                last_read_message_id: ids[1],
+            },
+        );
+        let state = view(&w.cache);
+        assert_eq!(state.sidebar.everything.unread, 2);
+    }
+
+    /// Finding 3: deleting a channel left its tasks, messages, approvals and
+    /// the rest in the cache, and the Tasks panel still showed the tasks.
+    #[test]
+    fn a_channel_delete_drops_everything_that_belongs_to_the_channel() {
+        let mut w = world();
+        // A running command in the task's session, and a message that waits.
+        let session = w
+            .cache
+            .tasks
+            .get(&w.task.to_string())
+            .and_then(|t| t.current_session_id);
+        let session = session.expect("session");
+        let item: consort_proto::model::SessionItem = serde_json::from_value(serde_json::json!({
+            "id": consort_proto::ids::ItemId::new(),
+            "session_id": session,
+            "turn_id": "turn-1",
+            "kind": "command",
+            "payload": {"command": "cargo build", "cwd": null, "output": "x".repeat(10_000), "exit_code": null, "duration_ms": null},
+            "status": "in_progress",
+            "created_at": NOW,
+            "updated_at": NOW
+        }))
+        .expect("item");
+        assert!(w.cache.apply(FeedEntry::upsert(
+            1,
+            Timestamp::from_millis(NOW),
+            EntityPayload::SessionItem(item)
+        )));
+        w.cache.pending.push(PendingSend {
+            client_message_id: "c-1".into(),
+            channel_id: w.sayso.to_string(),
+            thread_root_id: None,
+            body: "Hi".into(),
+            created_at: NOW,
+        });
+        w.cache.has_older.insert(w.sayso.to_string(), true);
+        w.cache.channels_loaded.insert(w.sayso.to_string());
+        w.cache.loaded_threads.insert(w.card.to_string());
+        assert!(w.cache.apply(FeedEntry::delete(
+            2,
+            Timestamp::from_millis(NOW),
+            consort_proto::client_api::EntityKind::Channel,
+            w.sayso.to_string(),
+            Some(w.sayso),
+        )));
+        let c = &w.cache;
+        assert_eq!(c.channels.len(), 1, "only Everything is left");
+        assert!(c.messages.is_empty(), "{:?}", c.messages.len());
+        assert!(c.tasks.is_empty());
+        assert!(c.approvals.is_empty());
+        assert!(c.decisions.is_empty());
+        assert!(c.read_markers.is_empty());
+        assert!(c.session_items.is_empty());
+        assert!(c.pending.is_empty());
+        assert!(c.has_older.is_empty());
+        assert!(c.channels_loaded.is_empty());
+        assert!(c.loaded_threads.is_empty());
+        let state = view(&w.cache);
+        assert!(state.tasks.is_empty());
+        assert_eq!(state.tasks_panel.need_you, 0);
+        assert!(state.timeline(&w.sayso.to_string()).is_none());
+    }
+
+    /// A session item keeps a command line and not the output.
+    #[test]
+    fn a_session_item_keeps_only_what_the_view_reads() {
+        let mut w = world();
+        let session = w
+            .cache
+            .tasks
+            .get(&w.task.to_string())
+            .and_then(|t| t.current_session_id)
+            .expect("session");
+        let item: consort_proto::model::SessionItem = serde_json::from_value(serde_json::json!({
+            "id": consort_proto::ids::ItemId::new(),
+            "session_id": session,
+            "turn_id": "turn-1",
+            "kind": "command",
+            "payload": {"command": "cargo test", "cwd": null, "output": "x".repeat(10_000), "exit_code": 0, "duration_ms": 5},
+            "status": "completed",
+            "created_at": NOW,
+            "updated_at": NOW
+        }))
+        .expect("item");
+        w.cache.apply(FeedEntry::upsert(
+            1,
+            Timestamp::from_millis(NOW),
+            EntityPayload::SessionItem(item),
+        ));
+        let state = view(&w.cache);
+        let thread = state.thread(&w.task.to_string()).expect("thread");
+        let PostBody::Activity { summary, items } = &thread.posts[0].bodies[0] else {
+            panic!("no activity line");
+        };
+        assert_eq!(summary, "Ran 1 command");
+        assert_eq!(items, &vec!["cargo test".to_owned()]);
+    }
+
+    /// Finding 14: the detail block names the real action, whatever the
+    /// summary says.
+    #[test]
+    fn the_detail_block_names_the_tool_the_server_and_the_network_target() {
+        let mut w = world();
+        let id = coordinator_approval(&mut w);
+        let detail = |w: &World| {
+            view(&w.cache)
+                .timeline(&w.everything.to_string())
+                .and_then(|t| {
+                    t.items.iter().find_map(|i| match i {
+                        TimelineItem::Approval(card) => Some(card.approval.clone()),
+                        _ => None,
+                    })
+                })
+                .expect("card")
+        };
+        // A tool with a readable, agent-written summary.
+        if let Some(a) = w.cache.approvals.get_mut(&id.to_string()) {
+            a.summary = "Look up one harmless record".into();
+            a.details = ApprovalDetails::Tool {
+                server: Some("payments".into()),
+                tool: "mcp__payments__refund_all".into(),
+                arguments: serde_json::json!({"scope": "everyone"}),
+            };
+        }
+        let card = detail(&w);
+        assert_eq!(card.summary, "Look up one harmless record");
+        let text = card.detail.expect("detail");
+        assert!(text.contains("Tool: refund_all"), "{text}");
+        assert!(text.contains("Server: payments"), "{text}");
+        assert!(text.contains("\"scope\": \"everyone\""), "{text}");
+
+        if let Some(a) = w.cache.approvals.get_mut(&id.to_string()) {
+            a.summary = "Fetch the docs".into();
+            a.details = ApprovalDetails::Network {
+                target: "evil.example.com".into(),
+            };
+        }
+        let card = detail(&w);
+        assert_eq!(card.summary, "Fetch the docs");
+        assert_eq!(card.detail.as_deref(), Some("Network: evil.example.com"));
+
+        if let Some(a) = w.cache.approvals.get_mut(&id.to_string()) {
+            a.details = ApprovalDetails::Other {
+                text: Some("Delete the build folder".into()),
+            };
+        }
+        assert_eq!(
+            detail(&w).detail.as_deref(),
+            Some("Delete the build folder")
+        );
+    }
+
+    /// Finding 24: Deny takes `deny_once` before `deny_always`, whatever the
+    /// order of the options.
+    #[test]
+    fn deny_prefers_deny_once_in_any_order() {
+        let mut w = world();
+        let id = coordinator_approval(&mut w);
+        let option = |id: &str, kind| RequestOption {
+            id: id.into(),
+            label: id.into(),
+            kind,
+            description: None,
+        };
+        if let Some(a) = w.cache.approvals.get_mut(&id.to_string()) {
+            a.options = vec![
+                option("never", RequestOptionKind::DenyAlways),
+                option("no", RequestOptionKind::DenyOnce),
+                option("yes", RequestOptionKind::AllowOnce),
+            ];
+        }
+        let stored = w.cache.approvals.get(&id.to_string()).expect("stored");
+        assert_eq!(
+            crate::hub::option_for(stored, ApprovalChoice::Deny).as_deref(),
+            Some("no")
+        );
+        let mut only_always = stored.clone();
+        only_always.options = vec![option("never", RequestOptionKind::DenyAlways)];
+        assert_eq!(
+            crate::hub::option_for(&only_always, ApprovalChoice::Deny).as_deref(),
+            Some("never")
+        );
+    }
+
+    /// Finding 18: archived tasks have no thread, and the view of a large
+    /// cache stays correct with the indexes.
+    #[test]
+    fn an_archived_task_has_no_thread_view() {
+        let mut w = world();
+        if let Some(t) = w.cache.tasks.get_mut(&w.task.to_string()) {
+            t.archived_at = Some(Timestamp::from_millis(NOW));
+        }
+        let state = view(&w.cache);
+        assert!(state.thread(&w.task.to_string()).is_none());
+        assert!(state.task(&w.task.to_string()).is_none());
     }
 }

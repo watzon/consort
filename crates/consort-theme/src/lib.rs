@@ -18,8 +18,9 @@ pub use file::{
     contrast_report, load_theme, parse_theme,
 };
 pub use runtime::{
-    Appearance, LoadedTheme, RejectedTheme, ThemeLibrary, ThemeSource, apply, choose, init,
-    read_user_themes, resolve_mode, user_themes_dir, watch_user_themes,
+    Appearance, LoadedTheme, RejectedTheme, SavedChoice, ThemeLibrary, ThemeSource, apply,
+    choice_path, choose, choose_without_saving, init, read_choice, read_user_themes, resolve_mode,
+    user_themes_dir, watch_user_themes, write_choice,
 };
 pub use structure::{Structure, structure};
 pub use tokens::{ActiveTokens, Palette, TextSize, Tokens, Type, TypeExt};

@@ -1,7 +1,10 @@
 //! The root view: app state, client subscription, actions and the layout of
 //! the window.
 
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use consort_client::{
     ApprovalChoice, ChannelChanges, Client, ClientError, Connection, Isolation, Os, ViewState,
@@ -14,13 +17,25 @@ use gpui_kit::{
     component::input::{InputEvent, InputState, TextareaState},
     div,
     prelude::FluentBuilder as _,
-    px,
 };
 
-use crate::ui::{
-    markdown::TextCache,
-    menu::{MenuAction, MenuItem, OpenMenu, TriggerBounds, render_menu},
+use crate::{
+    countdown::{self, RetryCountdown},
+    drafts::{self, InFlight},
+    notice::{INFO_TIMEOUT, NoticeKind, Notices},
+    read_marker::{self, ReadMarker},
+    ui::{
+        links::LinkAction,
+        markdown::TextCache,
+        menu::{EditOp, MenuAction, MenuItem, OpenMenu, TextTarget, TriggerBounds, render_menu},
+    },
 };
+
+/// The key that guards the open dialog against a second submit.
+const DIALOG_KEY: &str = "dialog";
+
+/// How often the offline countdown redraws.
+const COUNTDOWN_TICK: Duration = Duration::from_secs(1);
 
 /// Which page fills the window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,6 +83,8 @@ pub enum Dialog {
     EditLabels(String),
     ConfirmDeleteChannel(String),
     ConfirmRemoveWorker(String),
+    /// A link whose words do not match its address: the address to show.
+    ConfirmOpenLink(String),
 }
 
 /// The fields of the New channel dialog that are not text inputs.
@@ -77,7 +94,6 @@ pub struct NewChannelForm {
     pub workers: Vec<String>,
     pub selection: Option<String>,
     pub isolation: Isolation,
-    pub error: Option<String>,
 }
 
 /// The onboarding form state.
@@ -121,7 +137,9 @@ pub struct ConsortApp {
     pub timeline_channel: String,
     pub thread: ListState,
     pub thread_keys: Vec<String>,
-    pub notice: Option<String>,
+    pub notices: Notices,
+    /// The IDs of the refused messages that a notice already showed.
+    announced_failures: std::collections::HashSet<String>,
     pub new_channel: NewChannelForm,
     pub add_worker_os: Os,
     pub decision_writing: Option<String>,
@@ -144,6 +162,20 @@ pub struct ConsortApp {
     /// The composer placeholder must follow a channel change made without a
     /// window.
     placeholder_stale: bool,
+    /// The commands that run now, so a second submit waits.
+    pub in_flight: InFlight,
+    /// What went wrong in the open dialog. The dialog shows it.
+    pub dialog_error: Option<String>,
+    /// Counts the dialogs that opened, so a command that ends late can tell
+    /// whether its dialog is still the open one.
+    dialog_serial: u64,
+    /// The newest message that the app marked as read, by channel.
+    read_marker: ReadMarker,
+    /// The window has the focus.
+    window_active: bool,
+    /// The retry countdown, while the link is offline.
+    pub offline: Option<RetryCountdown>,
+    offline_ticker: bool,
     /// The open switcher and its selected row.
     pub switcher: Option<usize>,
     pub onboarding: Onboarding,
@@ -153,11 +185,10 @@ pub struct ConsortApp {
     _subscriptions: Vec<Subscription>,
 }
 
-const OVERDRAW: f32 = 400.0;
-
 impl ConsortApp {
     pub fn new(client: Client, demo: bool, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let state = client.state();
+        let overdraw = Self::tokens(cx).layout.list_overdraw;
         let channel_id = state.everything().map(|c| c.id.clone()).unwrap_or_default();
         let textarea = |placeholder: &str,
                         rows: (usize, usize),
@@ -234,6 +265,14 @@ impl ConsortApp {
         subscriptions.push(cx.observe_window_appearance(window, |_, window, cx| {
             consort_theme::apply(window.appearance(), cx);
         }));
+        // Unread messages in the open channel clear when the window has the
+        // focus, not while it sits behind other windows.
+        subscriptions.push(cx.observe_window_activation(window, |this, window, cx| {
+            this.window_active = window.is_window_active();
+            if this.window_active {
+                this.mark_read(cx);
+            }
+        }));
         let mut sub = client.subscribe();
         cx.spawn(async move |this, cx| {
             while let Some(state) = sub.next().await {
@@ -247,7 +286,12 @@ impl ConsortApp {
         })
         .detach();
 
-        let page = if demo || state.connection != Connection::NotPaired {
+        // A refused client shows onboarding, with the reason, even when the
+        // refusal came before the window opened.
+        let page = if demo
+            || (state.connection != Connection::NotPaired
+                && !matches!(state.connection, Connection::Refused { .. }))
+        {
             Page::Main
         } else {
             Page::Onboarding
@@ -267,12 +311,13 @@ impl ConsortApp {
             menu_anchor: None,
             inputs,
             texts: TextCache::default(),
-            timeline: ListState::new(0, ListAlignment::Bottom, px(OVERDRAW)),
+            timeline: ListState::new(0, ListAlignment::Bottom, overdraw),
             timeline_keys: Vec::new(),
             timeline_channel: String::new(),
-            thread: ListState::new(0, ListAlignment::Bottom, px(OVERDRAW)),
+            thread: ListState::new(0, ListAlignment::Bottom, overdraw),
             thread_keys: Vec::new(),
-            notice: None,
+            notices: Notices::default(),
+            announced_failures: std::collections::HashSet::new(),
             new_channel: NewChannelForm::default(),
             add_worker_os: Os::Linux,
             decision_writing: None,
@@ -285,6 +330,13 @@ impl ConsortApp {
             add_worker_before: Vec::new(),
             added_worker: None,
             placeholder_stale: false,
+            in_flight: InFlight::default(),
+            dialog_error: None,
+            dialog_serial: 0,
+            read_marker: ReadMarker::default(),
+            window_active: window.is_window_active(),
+            offline: None,
+            offline_ticker: false,
             switcher: None,
             onboarding: Onboarding::default(),
             triggers: TriggerBounds::default(),
@@ -294,6 +346,8 @@ impl ConsortApp {
         };
         this.sync_lists();
         this.update_placeholder(window, cx);
+        this.follow_connection(cx);
+        this.mark_read(cx);
         // Reaching the top of the timeline loads older messages.
         let weak = cx.weak_entity();
         this.timeline.set_scroll_handler(move |event, _, cx| {
@@ -348,7 +402,17 @@ impl ConsortApp {
         cx.tokens().clone()
     }
 
+    /// Takes a new view state from the client. The client publishes changes
+    /// only, but a state that equals the old one would still make every row
+    /// measure again, so it ends here.
     fn set_state(&mut self, state: Arc<ViewState>, cx: &mut Context<Self>) {
+        if Arc::ptr_eq(&state, &self.state) || *state == *self.state {
+            return;
+        }
+        self.apply_state(state, cx);
+    }
+
+    fn apply_state(&mut self, state: Arc<ViewState>, cx: &mut Context<Self>) {
         let was_paired = self.state.connection != Connection::NotPaired;
         self.state = state;
         if self.state.channel(&self.channel_id).is_none()
@@ -359,10 +423,7 @@ impl ConsortApp {
         if !self.demo && !was_paired && self.state.connection != Connection::NotPaired {
             self.page = Page::Main;
         }
-        if let Connection::Refused { reason } = &self.state.connection {
-            self.page = Page::Onboarding;
-            self.onboarding.error = Some(reason.clone());
-        }
+        self.follow_connection(cx);
         if let Panel::Thread(task_id) = &self.panel
             && self.state.thread(task_id).is_none()
             && self.state.task(task_id).is_none()
@@ -396,7 +457,111 @@ impl ConsortApp {
             self.added_worker = Some(added);
         }
         self.sync_lists();
+        self.report_send_failures(cx);
+        self.mark_read(cx);
         cx.notify();
+    }
+
+    /// Shows the messages that waited in the outbox and that the hub then
+    /// refused. The notice holds the text, so the user can copy it. The
+    /// client forgets the failure once the notice shows.
+    fn report_send_failures(&mut self, cx: &mut Context<Self>) {
+        let fresh: Vec<_> = self
+            .state
+            .send_failures
+            .iter()
+            .filter(|f| self.announced_failures.insert(f.id.clone()))
+            .cloned()
+            .collect();
+        if fresh.is_empty() {
+            return;
+        }
+        let text = fresh
+            .iter()
+            .map(|f| format!("{}\n{}", f.message, f.body))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        self.show_error(text, cx);
+        let client = self.client.clone();
+        cx.spawn(async move |_, _| {
+            for failure in fresh {
+                let _ = client
+                    .run(consort_client::Command::DismissSendFailure { id: failure.id })
+                    .await;
+            }
+        })
+        .detach();
+    }
+
+    /// Acts on the state of the link: a refused client goes to onboarding
+    /// with the reason, and an offline link starts its retry countdown.
+    fn follow_connection(&mut self, cx: &mut Context<Self>) {
+        if let Connection::Refused { reason } = &self.state.connection {
+            self.page = Page::Onboarding;
+            self.onboarding.error = Some(reason.clone());
+        }
+        self.offline =
+            countdown::follow(self.offline.take(), &self.state.connection, Instant::now());
+        if self.offline.is_some() && !self.offline_ticker {
+            self.offline_ticker = true;
+            // The countdown redraws once a second while the link is offline,
+            // and not at all otherwise.
+            cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(COUNTDOWN_TICK).await;
+                    let keep = this.update(cx, |this, cx| {
+                        if this.offline.is_none() {
+                            this.offline_ticker = false;
+                            return false;
+                        }
+                        cx.notify();
+                        true
+                    });
+                    if !matches!(keep, Ok(true)) {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        }
+    }
+
+    /// Marks the open channel as read when its newest message is one the app
+    /// has not marked yet, the window has the focus and the link is up. A new
+    /// message in the open channel clears its unread count; a state change
+    /// that brings no new message sends nothing.
+    pub fn mark_read(&mut self, cx: &mut Context<Self>) {
+        if self.page != Page::Main
+            || !self.window_active
+            || !matches!(self.state.connection, Connection::Online | Connection::Demo)
+        {
+            return;
+        }
+        let newest = self
+            .state
+            .timeline(&self.channel_id)
+            .and_then(read_marker::newest_message)
+            .map(str::to_owned);
+        if !self
+            .read_marker
+            .should_mark(&self.channel_id, newest.as_deref())
+        {
+            return;
+        }
+        let client = self.client.clone();
+        let channel_id = self.channel_id.clone();
+        cx.spawn(async move |this, cx| {
+            let marked = client
+                .run(consort_client::Command::MarkRead {
+                    channel_id: channel_id.clone(),
+                })
+                .await;
+            if marked.is_err() {
+                // Try again at the next state change.
+                let _ = this.update(cx, |this, _| this.read_marker.forget(&channel_id));
+            }
+        })
+        .detach();
     }
 
     /// Keeps the virtual lists in step with the state: appended rows are
@@ -544,7 +709,7 @@ impl ConsortApp {
                             .iter()
                             .any(|w| &w.id == id && w.name != "bigboi")
                     });
-                    self.set_state(self.state.clone(), cx);
+                    self.apply_state(self.state.clone(), cx);
                 }
             }
             "new-channel" => {
@@ -590,14 +755,13 @@ impl ConsortApp {
             // A right click near the bottom of the window: the menu opens
             // upward, because there is no room below.
             "menu" => {
+                let t = Self::tokens(cx);
                 let items = crate::ui::timeline::selection_menu("Two tasks need you".into());
-                self.open_menu(
-                    OpenMenu::at(
-                        gpui_kit::point(gpui_kit::px(620.0), gpui_kit::px(840.0)),
-                        items,
-                    ),
-                    cx,
+                let at = gpui_kit::point(
+                    t.layout.sidebar_width + t.layout.timeline_max_width / 2.0,
+                    window.viewport_size().height - t.space.xl,
                 );
+                self.open_menu(OpenMenu::at(at, items), cx);
             }
             // The menu of a channel row in the sidebar.
             "channel-menu" => {
@@ -611,13 +775,9 @@ impl ConsortApp {
                             .separated(),
                         MenuItem::new("Delete", MenuAction::DeleteChannel(id)).danger(),
                     ];
-                    self.open_menu(
-                        OpenMenu::at(
-                            gpui_kit::point(gpui_kit::px(120.0), gpui_kit::px(170.0)),
-                            items,
-                        ),
-                        cx,
-                    );
+                    let t = Self::tokens(cx);
+                    let at = gpui_kit::point(t.layout.sidebar_width / 2.0, t.space.page * 3.5);
+                    self.open_menu(OpenMenu::at(at, items), cx);
                 }
             }
             _ => {}
@@ -628,17 +788,11 @@ impl ConsortApp {
     // Navigation
 
     pub fn open_channel(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
-        self.channel_id = id.clone();
+        self.channel_id = id;
         self.page = Page::Main;
         self.sync_lists();
         self.update_placeholder(window, cx);
-        let client = self.client.clone();
-        cx.spawn(async move |_, _| {
-            let _ = client
-                .run(consort_client::Command::MarkRead { channel_id: id })
-                .await;
-        })
-        .detach();
+        self.mark_read(cx);
         cx.notify();
     }
 
@@ -679,7 +833,7 @@ impl ConsortApp {
             let _ = this.update(cx, |this, cx| {
                 this.loading_older = None;
                 if let Err(err) = result {
-                    this.show_notice(err.to_string(), cx);
+                    this.show_error(err.to_string(), cx);
                 }
             });
         })
@@ -709,6 +863,8 @@ impl ConsortApp {
 
     pub fn open_dialog(&mut self, dialog: Dialog, window: &mut Window, cx: &mut Context<Self>) {
         self.menu = None;
+        self.dialog_error = None;
+        self.dialog_serial += 1;
         match &dialog {
             Dialog::NewChannel => {
                 self.new_channel = NewChannelForm {
@@ -716,7 +872,6 @@ impl ConsortApp {
                     workers: Vec::new(),
                     selection: self.state.selections.first().cloned(),
                     isolation: Isolation::Worktree,
-                    error: None,
                 };
                 self.set_field(Field::Name, "", window, cx);
                 self.set_field(Field::Purpose, "", window, cx);
@@ -766,9 +921,26 @@ impl ConsortApp {
                 self.add_worker_before = self.state.workers.iter().map(|w| w.id.clone()).collect();
                 self.added_worker = None;
                 let client = self.client.clone();
-                self.spawn_command(cx, async move { client.worker_pairing_code().await });
+                let serial = self.dialog_serial;
+                // Without a code the dialog is empty, so its error shows
+                // in the dialog.
+                cx.spawn(async move |this, cx| {
+                    if let Err(err) = client.worker_pairing_code().await {
+                        let _ = this.update(cx, |this, cx| {
+                            if this.dialog_serial == serial && this.dialog.is_some() {
+                                this.dialog_error = Some(err.to_string());
+                            } else {
+                                this.show_error(err.to_string(), cx);
+                            }
+                            cx.notify();
+                        });
+                    }
+                })
+                .detach();
             }
-            Dialog::ConfirmDeleteChannel(_) | Dialog::ConfirmRemoveWorker(_) => {}
+            Dialog::ConfirmDeleteChannel(_)
+            | Dialog::ConfirmRemoveWorker(_)
+            | Dialog::ConfirmOpenLink(_) => {}
         }
         self.dialog = Some(dialog);
         cx.notify();
@@ -785,8 +957,53 @@ impl ConsortApp {
             self.added_worker = None;
         }
         self.dialog = None;
+        self.dialog_error = None;
         self.focus.focus(window, cx);
         cx.notify();
+    }
+
+    /// Runs the command of the open dialog. The dialog stays open while the
+    /// command runs, and a second submit waits. The dialog closes when the
+    /// command succeeds. When it fails, the dialog stays with its text and
+    /// shows the error, so the user can fix it and try again.
+    pub fn submit_dialog<F>(&mut self, command: F, window: &mut Window, cx: &mut Context<Self>)
+    where
+        F: std::future::Future<Output = Result<(), ClientError>> + 'static,
+    {
+        if !self.in_flight.begin(DIALOG_KEY) {
+            return;
+        }
+        self.dialog_error = None;
+        let serial = self.dialog_serial;
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = command.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.in_flight.finish(DIALOG_KEY);
+                // The user may have closed the dialog while the command ran.
+                let still_open = this.dialog_serial == serial && this.dialog.is_some();
+                match result {
+                    Ok(()) if still_open => this.close_dialog(window, cx),
+                    Ok(()) => {}
+                    Err(err) => {
+                        // A failed command makes no channel to open.
+                        this.open_created = None;
+                        if still_open {
+                            this.dialog_error = Some(err.to_string());
+                        } else {
+                            this.show_error(err.to_string(), cx);
+                        }
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// True while the open dialog waits for its command.
+    pub fn dialog_busy(&self) -> bool {
+        self.in_flight.is_running(DIALOG_KEY)
     }
 
     pub fn set_field(
@@ -825,25 +1042,88 @@ impl ConsortApp {
     {
         cx.spawn(async move |this, cx| {
             if let Err(err) = command.await {
-                let _ = this.update(cx, |this, cx| this.show_notice(err.to_string(), cx));
+                let _ = this.update(cx, |this, cx| this.show_error(err.to_string(), cx));
             }
         })
         .detach();
     }
 
+    /// Shows a short fact. It goes away by itself.
     pub fn show_notice(&mut self, message: String, cx: &mut Context<Self>) {
-        self.notice = Some(message);
+        self.push_notice(NoticeKind::Info, message, cx);
+    }
+
+    /// Shows an error. It stays until the user dismisses it.
+    pub fn show_error(&mut self, message: String, cx: &mut Context<Self>) {
+        self.push_notice(NoticeKind::Error, message, cx);
+    }
+
+    fn push_notice(&mut self, kind: NoticeKind, message: String, cx: &mut Context<Self>) {
+        let Some(notice) = self.notices.show(kind, message) else {
+            return;
+        };
         cx.notify();
-        cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(std::time::Duration::from_secs(6))
-                .await;
-            let _ = this.update(cx, |this, cx| {
-                this.notice = None;
+        if kind == NoticeKind::Info {
+            // The timer clears only its own notice. A newer one stays.
+            let serial = notice.serial;
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(INFO_TIMEOUT).await;
+                let _ = this.update(cx, |this, cx| {
+                    if this.notices.clear_if(serial) {
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+        }
+    }
+
+    /// Runs a command once at a time for `key`. A second call with the same
+    /// key does nothing until the first ends. A failure shows the error with
+    /// `kept`, a sentence that says what the user still has. On success,
+    /// `on_ok` runs.
+    fn run_guarded<F>(
+        &mut self,
+        key: String,
+        command: F,
+        kept: &'static str,
+        on_ok: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) where
+        F: std::future::Future<Output = Result<(), ClientError>> + 'static,
+    {
+        if !self.in_flight.begin(&key) {
+            return;
+        }
+        cx.spawn_in(window, async move |this, cx| {
+            let result = command.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.in_flight.finish(&key);
+                match result {
+                    Ok(()) => on_ok(this, window, cx),
+                    Err(err) => {
+                        this.show_error(drafts::failure_message(&err.to_string(), kept), cx)
+                    }
+                }
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    /// Empties a message box after its text went out, if the box still holds
+    /// what was sent. Text that the user typed meanwhile stays.
+    fn clear_draft_if_sent(
+        input: &Entity<TextareaState>,
+        sent: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let now = input.read(cx).value().to_string();
+        if drafts::can_clear_after_send(sent, &now) {
+            input.update(cx, |input, cx| input.set_value("", window, cx));
+        }
     }
 
     pub fn send_message(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -851,14 +1131,18 @@ impl ConsortApp {
         if body.is_empty() {
             return;
         }
-        self.inputs
-            .composer
-            .update(cx, |input, cx| input.set_value("", window, cx));
         let client = self.client.clone();
         let channel_id = self.channel_id.clone();
-        self.spawn_command(
-            cx,
+        let input = self.inputs.composer.clone();
+        let sent = body.clone();
+        // The text stays in the box until the client takes the message.
+        self.run_guarded(
+            "composer".into(),
             async move { client.send_message(channel_id, body).await },
+            "Your message is still in the box.",
+            move |_, window, cx| Self::clear_draft_if_sent(&input, &sent, window, cx),
+            window,
+            cx,
         );
     }
 
@@ -870,31 +1154,45 @@ impl ConsortApp {
         if body.is_empty() {
             return;
         }
-        self.inputs
-            .reply
-            .update(cx, |input, cx| input.set_value("", window, cx));
         let client = self.client.clone();
-        self.spawn_command(cx, async move { client.reply_to_task(task_id, body).await });
+        let input = self.inputs.reply.clone();
+        let sent = body.clone();
+        self.run_guarded(
+            "reply".into(),
+            async move { client.reply_to_task(task_id, body).await },
+            "Your reply is still in the box.",
+            move |_, window, cx| Self::clear_draft_if_sent(&input, &sent, window, cx),
+            window,
+            cx,
+        );
     }
 
     pub fn save_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(message_id) = self.editing.take() else {
+        let Some(message_id) = self.editing.clone() else {
             return;
         };
         let body = self.inputs.edit.read(cx).value().trim().to_owned();
-        self.timeline.remeasure();
-        self.focus.focus(window, cx);
-        cx.notify();
         let unchanged = self.state.timelines.iter().flat_map(|t| t.items.iter()).any(|i| {
             matches!(i, consort_client::TimelineItem::Message(m) if m.id == message_id && m.body.trim() == body)
         });
         if body.is_empty() || unchanged {
+            self.cancel_edit(window, cx);
             return;
         }
         let client = self.client.clone();
-        self.spawn_command(
+        let edited = message_id.clone();
+        // The edit box stays open until the hub takes the new text.
+        self.run_guarded(
+            format!("edit:{message_id}"),
+            async move { client.edit_message(edited, body).await },
+            "Your edit is still in the box.",
+            move |this, window, cx| {
+                if this.editing.as_deref() == Some(message_id.as_str()) {
+                    this.cancel_edit(window, cx);
+                }
+            },
+            window,
             cx,
-            async move { client.edit_message(message_id, body).await },
         );
     }
 
@@ -905,49 +1203,96 @@ impl ConsortApp {
         cx.notify();
     }
 
-    pub fn answer_approval(&mut self, id: String, choice: ApprovalChoice, cx: &mut Context<Self>) {
+    pub fn answer_approval(
+        &mut self,
+        id: String,
+        choice: ApprovalChoice,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let client = self.client.clone();
-        self.spawn_command(cx, async move { client.answer_approval(id, choice).await });
+        let approval_id = id.clone();
+        self.run_guarded(
+            format!("approval:{id}"),
+            async move { client.answer_approval(approval_id, choice).await },
+            "The request still waits for your answer.",
+            |_, _, _| {},
+            window,
+            cx,
+        );
     }
 
+    /// Answers a decision with an option, or with text from the answer box.
+    /// The answer box closes and empties only after the hub takes the answer.
     pub fn answer_decision(
         &mut self,
         id: String,
         option: Option<u32>,
         text: Option<String>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.decision_writing = None;
         let client = self.client.clone();
-        self.spawn_command(
+        let decision_id = id.clone();
+        let sent = text.clone();
+        let input = self.inputs.decision_answer.clone();
+        self.run_guarded(
+            format!("decision:{id}"),
+            async move { client.answer_decision(decision_id, option, text).await },
+            "The decision still waits for your answer.",
+            move |this, window, cx| {
+                if this.decision_writing.as_deref() == Some(id.as_str()) {
+                    this.decision_writing = None;
+                }
+                if let Some(sent) = sent {
+                    Self::clear_draft_if_sent(&input, &sent, window, cx);
+                }
+            },
+            window,
             cx,
-            async move { client.answer_decision(id, option, text).await },
         );
     }
 
-    pub fn quote_in_reply(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let quoted: String = text.lines().map(|l| format!("> {l}\n")).collect::<String>() + "\n";
-        let target = if matches!(self.panel, Panel::Thread(_)) {
-            &self.inputs.reply
-        } else {
-            &self.inputs.composer
-        };
-        target.update(cx, |input, cx| {
-            let current = input.value().to_string();
-            input.set_value(format!("{current}{quoted}"), window, cx);
+    /// Adds a quote after the draft in a message box. The draft stays.
+    fn quote_into(
+        input: &Entity<TextareaState>,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let quote = drafts::quote_block(text);
+        input.update(cx, |input, cx| {
+            let draft = input.value().to_string();
+            input.set_value(drafts::append_quote(&draft, &quote), window, cx);
             input.focus(window, cx);
         });
+    }
+
+    pub fn quote_in_reply(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let target = if matches!(self.panel, Panel::Thread(_)) {
+            self.inputs.reply.clone()
+        } else {
+            self.inputs.composer.clone()
+        };
+        Self::quote_into(&target, text, window, cx);
     }
 
     pub fn ask_consort(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(everything) = self.state.everything().map(|c| c.id.clone()) {
             self.open_channel(everything, window, cx);
         }
-        let quoted: String = text.lines().map(|l| format!("> {l}\n")).collect();
-        self.inputs.composer.update(cx, |input, cx| {
-            input.set_value(format!("{quoted}\n"), window, cx);
-            input.focus(window, cx);
-        });
+        // The composer may hold a draft. The quote goes after it.
+        let composer = self.inputs.composer.clone();
+        Self::quote_into(&composer, text, window, cx);
+    }
+
+    /// Acts on a link that the reader clicked.
+    pub fn follow_link(&mut self, action: LinkAction, window: &mut Window, cx: &mut Context<Self>) {
+        match action {
+            LinkAction::Open(url) => cx.open_url(&url),
+            LinkAction::Confirm(url) => self.open_dialog(Dialog::ConfirmOpenLink(url), window, cx),
+            LinkAction::Block(blocked) => self.show_notice(blocked.notice(), cx),
+        }
     }
 
     pub fn open_menu(&mut self, menu: OpenMenu, cx: &mut Context<Self>) {
@@ -1090,19 +1435,8 @@ impl ConsortApp {
             MenuAction::RemoveWorker(id) => {
                 self.open_dialog(Dialog::ConfirmRemoveWorker(id), window, cx)
             }
-            MenuAction::ComposerCut => {
-                self.composer_action(window, cx, Box::new(gpui_kit::component::input::Cut))
-            }
-            MenuAction::ComposerCopy => {
-                self.composer_action(window, cx, Box::new(gpui_kit::component::input::Copy))
-            }
-            MenuAction::ComposerPaste => {
-                self.composer_action(window, cx, Box::new(gpui_kit::component::input::Paste))
-            }
-            MenuAction::ComposerSelectAll => {
-                self.composer_action(window, cx, Box::new(gpui_kit::component::input::SelectAll))
-            }
-            MenuAction::Select(id, index) => self.pick_select(id, index, window, cx),
+            MenuAction::TextEdit(target, op) => self.text_edit(target, op, window, cx),
+            MenuAction::Select(id, option) => self.pick_select(id, &option, window, cx),
         }
         cx.notify();
     }
@@ -1113,14 +1447,27 @@ impl ConsortApp {
         self.menu_anchor.clone()
     }
 
-    fn composer_action(
+    /// Cut, Copy, Paste or Select all in one of the message boxes.
+    fn text_edit(
         &mut self,
+        target: TextTarget,
+        op: EditOp,
         window: &mut Window,
         cx: &mut Context<Self>,
-        action: Box<dyn gpui_kit::Action>,
     ) {
-        let handle = self.inputs.composer.read(cx).focus_handle(cx);
+        use gpui_kit::component::input::{Copy, Cut, Paste, SelectAll};
+        let input = match target {
+            TextTarget::Composer => &self.inputs.composer,
+            TextTarget::Reply => &self.inputs.reply,
+        };
+        let handle = input.read(cx).focus_handle(cx);
         handle.focus(window, cx);
+        let action: Box<dyn gpui_kit::Action> = match op {
+            EditOp::Cut => Box::new(Cut),
+            EditOp::Copy => Box::new(Copy),
+            EditOp::Paste => Box::new(Paste),
+            EditOp::SelectAll => Box::new(SelectAll),
+        };
         window.dispatch_action(action, cx);
     }
 
@@ -1149,6 +1496,7 @@ impl ConsortApp {
                 cx.stop_propagation();
             } else if self.page == Page::Settings {
                 self.page = Page::Main;
+                self.mark_read(cx);
                 cx.notify();
                 cx.stop_propagation();
             } else if self.panel != Panel::None {
@@ -1282,7 +1630,7 @@ impl Render for ConsortApp {
                     .when_some(self.dialog.clone(), |layer, dialog| {
                         layer.child(self.render_dialog(&dialog, &t, window, cx))
                     })
-                    .when_some(self.notice.clone(), |layer, notice| {
+                    .when_some(self.notices.current().cloned(), |layer, notice| {
                         layer.child(self.render_notice(notice, &t, cx))
                     })
                     .when(self.switcher.is_some(), |layer| {

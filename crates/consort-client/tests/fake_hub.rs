@@ -22,7 +22,8 @@ use axum::{
     routing::{get, post},
 };
 use consort_client::{
-    ApprovalChoice, Client, Connection, TaskStatus, TimelineItem, ViewState, hub::ClientOptions,
+    ApprovalChoice, Client, ClientError, Command, Connection, TaskStatus, TimelineItem, ViewState,
+    hub::{ClientOptions, Timeouts},
     store::Store,
 };
 use consort_proto::{
@@ -36,7 +37,7 @@ use consort_proto::{
         SyncSubscribe,
     },
     error::{ErrorBody, ErrorCode},
-    frame::{Empty, Frame, RequestFrame},
+    frame::{Empty, EventFrame, Frame, RequestFrame},
     ids::{ApprovalId, ChannelId, ClientId, MessageId, RequestId, SessionId, TaskId},
     model::{
         Approval, ApprovalDetails, ApprovalMode, ApprovalStatus, Author, Channel, ChannelKind,
@@ -66,6 +67,29 @@ struct Hub {
     resync_on_reconnect: bool,
     resync_sent: bool,
     kick: Arc<tokio::sync::Notify>,
+    /// More channels, besides `channel`.
+    extra: Vec<Channel>,
+    /// Stop reading from every socket, so the hub answers no ping.
+    mute: Arc<tokio::sync::Notify>,
+    /// Store `message.send` requests but never answer them.
+    silent_sends: bool,
+    /// Frames to push to the connected client.
+    outbound: Vec<Frame>,
+    push: Arc<tokio::sync::Notify>,
+    /// The next N channel snapshots fail.
+    fail_channel_snapshots: usize,
+    /// The channels that a client asked a snapshot for, in order.
+    channel_snapshots: Vec<ChannelId>,
+    /// `Some(x)` forces `messages_has_more` in a channel snapshot.
+    force_has_more: Option<bool>,
+    /// Every `client_message_id` that `message.send` carried, in order.
+    sent_ids: Vec<String>,
+    /// The body of every `message.send`, in order.
+    sent_bodies: Vec<String>,
+    /// The messages of every `read.mark`.
+    read_marks: Vec<MessageId>,
+    /// The `after_seq` of every `sync.subscribe`.
+    subscribe_after: Vec<u64>,
 }
 
 type Shared = Arc<Mutex<Hub>>;
@@ -228,13 +252,28 @@ async fn session(hub: Shared, mut socket: WebSocket) {
         h.sessions.len() - 1
     };
     send(&mut socket, Frame::event(&AuthChallenge { nonce }).unwrap()).await;
-    let kick = hub.lock().unwrap().kick.clone();
+    let (kick, mute, push) = {
+        let h = hub.lock().unwrap();
+        (h.kick.clone(), h.mute.clone(), h.push.clone())
+    };
     loop {
         let req = tokio::select! {
             req = next_request(&mut socket) => req,
             _ = kick.notified() => {
                 let _ = socket.send(WsMessage::Close(None)).await;
                 return;
+            }
+            _ = mute.notified() => {
+                // Stop reading. The client's pings get no answer.
+                std::future::pending::<()>().await;
+                return;
+            }
+            _ = push.notified() => {
+                let frames = std::mem::take(&mut hub.lock().unwrap().outbound);
+                for frame in frames {
+                    send(&mut socket, frame).await;
+                }
+                continue;
             }
         };
         let Some(req) = req else { return };
@@ -261,20 +300,33 @@ async fn session(hub: Shared, mut socket: WebSocket) {
                 .unwrap(),
             "sync.snapshot" => {
                 let body: SyncSnapshot = req.decode_as().unwrap();
-                let h = hub.lock().unwrap();
+                let mut h = hub.lock().unwrap();
                 // As the real hub: scope `all` has no messages. A channel
                 // snapshot has the newest top-level messages of one channel.
                 match body.scope {
                     SnapshotScope::All => req
                         .respond_ok(&Snapshot {
                             seq: h.seq,
-                            channels: h.channel.clone().into_iter().collect(),
+                            channels: h
+                                .channel
+                                .clone()
+                                .into_iter()
+                                .chain(h.extra.clone())
+                                .collect(),
                             tasks: h.task.clone().into_iter().collect(),
                             approvals: h.approval.clone().into_iter().collect(),
                             ..Snapshot::default()
                         })
                         .unwrap(),
+                    SnapshotScope::Channel(_) if h.fail_channel_snapshots > 0 => {
+                        h.fail_channel_snapshots -= 1;
+                        req.respond_error(ErrorBody::new(
+                            ErrorCode::Internal,
+                            "The fake hub fails this snapshot.",
+                        ))
+                    }
                     SnapshotScope::Channel(channel_id) => {
+                        h.channel_snapshots.push(channel_id);
                         let mut top: Vec<Message> = h
                             .messages
                             .iter()
@@ -283,9 +335,11 @@ async fn session(hub: Shared, mut socket: WebSocket) {
                             .collect();
                         top.sort_by_key(|m| m.created_at);
                         let skip = top.len().saturating_sub(SNAPSHOT_MESSAGE_LIMIT);
+                        let has_more = h.force_has_more.unwrap_or(skip > 0);
                         req.respond_ok(&Snapshot {
                             seq: h.seq,
                             messages: top.split_off(skip),
+                            messages_has_more: has_more,
                             tasks: h.task.clone().into_iter().collect(),
                             approvals: h.approval.clone().into_iter().collect(),
                             ..Snapshot::default()
@@ -325,8 +379,9 @@ async fn session(hub: Shared, mut socket: WebSocket) {
                 .unwrap()
             }
             "sync.subscribe" => {
-                let _: SyncSubscribe = req.decode_as().unwrap();
+                let body: SyncSubscribe = req.decode_as().unwrap();
                 let mut h = hub.lock().unwrap();
+                h.subscribe_after.push(body.after_seq);
                 if index > 0 && h.resync_on_reconnect && !h.resync_sent {
                     h.resync_sent = true;
                     req.respond_error(ErrorBody::new(
@@ -339,6 +394,46 @@ async fn session(hub: Shared, mut socket: WebSocket) {
             }
             "message.send" => {
                 let send_body: MessageSend = req.decode_as().unwrap();
+                let (known, existing, silent) = {
+                    let mut h = hub.lock().unwrap();
+                    h.sent_ids.push(send_body.client_message_id.clone());
+                    h.sent_bodies.push(send_body.body.clone());
+                    let known = h
+                        .channel
+                        .iter()
+                        .chain(h.extra.iter())
+                        .any(|c| c.id == send_body.channel_id);
+                    // As the real hub: the first copy of a `client_message_id`
+                    // wins.
+                    let existing = h
+                        .messages
+                        .iter()
+                        .find(|m| {
+                            m.client_message_id.as_deref()
+                                == Some(send_body.client_message_id.as_str())
+                        })
+                        .cloned();
+                    (known, existing, h.silent_sends)
+                };
+                if !known {
+                    send(
+                        &mut socket,
+                        req.respond_error(ErrorBody::new(
+                            ErrorCode::NotFound,
+                            "That channel does not exist.",
+                        )),
+                    )
+                    .await;
+                    continue;
+                }
+                if let Some(message) = existing {
+                    send(
+                        &mut socket,
+                        req.respond_ok(&MessageResult { message }).unwrap(),
+                    )
+                    .await;
+                    continue;
+                }
                 let message = Message {
                     id: MessageId::new(),
                     channel_id: send_body.channel_id,
@@ -359,6 +454,12 @@ async fn session(hub: Shared, mut socket: WebSocket) {
                     deleted_at: None,
                     created_at: Timestamp::now(),
                 };
+                if silent {
+                    // The hub stores the message, but the answer and the
+                    // feed entry never reach the client.
+                    hub.lock().unwrap().messages.push(message);
+                    continue;
+                }
                 let event = {
                     let mut h = hub.lock().unwrap();
                     h.messages.push(message.clone());
@@ -370,6 +471,14 @@ async fn session(hub: Shared, mut socket: WebSocket) {
                 )
                 .await;
                 event
+            }
+            "read.mark" => {
+                let mark: consort_proto::client_api::ReadMark = req.decode_as().unwrap();
+                hub.lock()
+                    .unwrap()
+                    .read_marks
+                    .push(mark.last_read_message_id);
+                req.respond_ok(&Empty {}).unwrap()
             }
             "approval.answer" => {
                 let answer: ApprovalAnswer = req.decode_as().unwrap();
@@ -705,4 +814,637 @@ async fn a_restart_loads_history_threads_and_older_pages() {
         .collect();
     assert_eq!(texts, vec!["First reply", "Second reply"]);
     let _ = card;
+}
+
+// ---------------------------------------------------------------------------
+// Helpers for the tests below.
+
+/// Short limits, so a test that waits for a timeout stays quick.
+fn quick() -> Timeouts {
+    Timeouts {
+        connect: Duration::from_secs(2),
+        handshake: Duration::from_secs(2),
+        call: Duration::from_millis(600),
+        idle: Duration::from_millis(900),
+    }
+}
+
+fn options(timeouts: Timeouts) -> ClientOptions {
+    let mut options = ClientOptions::desktop();
+    options.timeouts = timeouts;
+    options
+}
+
+async fn paired_client(url: &str, dir: &std::path::Path, options: ClientOptions) -> Client {
+    let client = Client::start_with(Some(Store::new(dir)), options).unwrap();
+    client.pair(url.to_owned(), CODE.into()).await.unwrap();
+    wait_for(&client, "online", |s| {
+        s.connection == Connection::Online && s.everything().is_some()
+    })
+    .await;
+    client
+}
+
+fn push(hub: &Shared, frames: Vec<Frame>) {
+    let notify = {
+        let mut h = hub.lock().unwrap();
+        h.outbound.extend(frames);
+        h.push.clone()
+    };
+    notify.notify_one();
+}
+
+async fn until(what: &str, mut ready: impl FnMut() -> bool) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !ready() {
+        assert!(tokio::time::Instant::now() < deadline, "timed out: {what}");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+fn bodies_of(state: &ViewState, channel: &str) -> Vec<(String, bool)> {
+    state
+        .timeline(channel)
+        .map(|t| {
+            t.items
+                .iter()
+                .filter_map(|i| match i {
+                    TimelineItem::Message(m) => Some((m.body.clone(), m.pending)),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn everything_id(client: &Client) -> String {
+    client.state().everything().unwrap().id.clone()
+}
+
+// ---------------------------------------------------------------------------
+// Review findings: feed, loading, links, outbox.
+
+/// Finding 2: a feed entry that does not decode used to end the link with
+/// `Lost`, and `seq` stayed put, so the reconnect replayed the entry for ever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unreadable_feed_entry_is_skipped_and_never_replayed() {
+    let (url, hub) = start_hub().await;
+    let dir = tempfile::tempdir().unwrap();
+    let client = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
+    let everything = everything_id(&client);
+    let (good_seq, frames) = {
+        let mut h = hub.lock().unwrap();
+        let channel_id = h.channel.as_ref().unwrap().id;
+        h.seq += 1;
+        let bad = Frame::Event(EventFrame {
+            kind: "feed".into(),
+            body: serde_json::json!({
+                "seq": h.seq, "at": 1, "channel_id": channel_id,
+                "entity": "widget", "entity_id": "x", "op": "upsert", "payload": {}
+            }),
+        });
+        let m = text_message(
+            channel_id,
+            "after the bad entry",
+            Timestamp::now().as_millis(),
+            None,
+        );
+        h.messages.push(m.clone());
+        let good = feed(&mut h, EntityPayload::Message(m));
+        (h.seq, vec![bad, good])
+    };
+    push(&hub, frames);
+    wait_for(&client, "the entry after the bad one", |s| {
+        bodies_of(s, &everything)
+            .iter()
+            .any(|(b, _)| b == "after the bad entry")
+    })
+    .await;
+    // The link stayed up, and the client loaded the channel again.
+    until("the channel loads again", || {
+        hub.lock().unwrap().channel_snapshots.len() >= 2
+    })
+    .await;
+    assert_eq!(hub.lock().unwrap().sessions.len(), 1, "no reconnect");
+
+    // A reconnect asks for the feed after the last entry, not before the bad
+    // one.
+    let kick = hub.lock().unwrap().kick.clone();
+    kick.notify_one();
+    until("a second subscribe", || {
+        hub.lock().unwrap().subscribe_after.len() >= 2
+    })
+    .await;
+    assert_eq!(hub.lock().unwrap().subscribe_after[1], good_seq);
+}
+
+/// The hub sends `feed.skipped` for an entry that is too large. The client
+/// moves past it and loads the channel again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn feed_skipped_moves_past_the_entry_and_loads_the_channel_again() {
+    let (url, hub) = start_hub().await;
+    let dir = tempfile::tempdir().unwrap();
+    let client = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
+    let everything = everything_id(&client);
+    let (seq, frame) = {
+        let mut h = hub.lock().unwrap();
+        let channel_id = h.channel.as_ref().unwrap().id;
+        // A message that the client never got in the feed.
+        let m = text_message(
+            channel_id,
+            "too large for the feed",
+            Timestamp::now().as_millis(),
+            None,
+        );
+        h.messages.push(m);
+        h.seq += 1;
+        let frame = Frame::event(&consort_proto::client_api::FeedSkipped {
+            seq: h.seq,
+            channel_id: Some(channel_id),
+            entity: consort_proto::client_api::EntityKind::Message,
+            entity_id: "msg".into(),
+        })
+        .unwrap();
+        (h.seq, frame)
+    };
+    push(&hub, vec![frame]);
+    wait_for(&client, "the message from the snapshot", |s| {
+        bodies_of(s, &everything)
+            .iter()
+            .any(|(b, _)| b == "too large for the feed")
+    })
+    .await;
+    assert_eq!(hub.lock().unwrap().sessions.len(), 1, "no reconnect");
+    let kick = hub.lock().unwrap().kick.clone();
+    kick.notify_one();
+    until("a second subscribe", || {
+        hub.lock().unwrap().subscribe_after.len() >= 2
+    })
+    .await;
+    assert_eq!(hub.lock().unwrap().subscribe_after[1], seq);
+}
+
+/// Finding 4: one channel snapshot that fails left that channel without
+/// messages for ever, because the cache counted as loaded already.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_channel_snapshot_that_fails_is_tried_again() {
+    let (url, hub) = start_hub().await;
+    {
+        let mut h = hub.lock().unwrap();
+        let channel_id = h.channel.as_ref().unwrap().id;
+        let m = text_message(
+            channel_id,
+            "history",
+            Timestamp::now().as_millis() - 5_000,
+            None,
+        );
+        h.messages.push(m);
+        h.fail_channel_snapshots = 1;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let client = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
+    let everything = everything_id(&client);
+    assert!(
+        !bodies_of(&client.state(), &everything)
+            .iter()
+            .any(|(b, _)| b == "history"),
+        "the first snapshot failed"
+    );
+    wait_for(&client, "the second try", |s| {
+        bodies_of(s, &everything)
+            .iter()
+            .any(|(b, _)| b == "history")
+    })
+    .await;
+    assert_eq!(hub.lock().unwrap().sessions.len(), 1, "no reconnect");
+}
+
+/// Finding 4: a channel that is unarchived later never loaded its messages.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_channel_that_is_unarchived_gets_its_snapshot() {
+    let (url, hub) = start_hub().await;
+    let archived_id = {
+        let mut h = hub.lock().unwrap();
+        let mut channel = h.channel.clone().unwrap();
+        channel.id = ChannelId::new();
+        channel.kind = ChannelKind::Standard;
+        channel.name = "Old".into();
+        channel.archived_at = Some(ts(5));
+        let m = text_message(
+            channel.id,
+            "from the old channel",
+            Timestamp::now().as_millis() - 5_000,
+            None,
+        );
+        h.messages.push(m);
+        let id = channel.id;
+        h.extra.push(channel);
+        id
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let client = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
+    assert!(
+        !hub.lock().unwrap().channel_snapshots.contains(&archived_id),
+        "an archived channel loads no snapshot"
+    );
+    // Someone unarchives it: a feed entry, and no snapshot from the hub.
+    let upsert = {
+        let mut h = hub.lock().unwrap();
+        h.extra[0].archived_at = None;
+        let open = h.extra[0].clone();
+        feed(&mut h, EntityPayload::Channel(open))
+    };
+    push(&hub, vec![upsert]);
+    let id = archived_id.to_string();
+    wait_for(&client, "the unarchived channel", |s| {
+        bodies_of(s, &id)
+            .iter()
+            .any(|(b, _)| b == "from the old channel")
+    })
+    .await;
+}
+
+/// Finding 9 and 5: a send in flight when the link fails stays pending, and
+/// goes out again with the same `client_message_id`. The hub keeps one copy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_send_that_gets_no_answer_stays_pending_and_is_not_doubled() {
+    let (url, hub) = start_hub().await;
+    let dir = tempfile::tempdir().unwrap();
+    let client = paired_client(&url, dir.path(), options(quick())).await;
+    let everything = everything_id(&client);
+    hub.lock().unwrap().silent_sends = true;
+    // The hub stores the message and never answers. The call times out, the
+    // link ends, and the message stays pending: the caller sees no error.
+    client
+        .send_message(everything.clone(), "Hello hub".into())
+        .await
+        .unwrap();
+    assert!(
+        bodies_of(&client.state(), &everything)
+            .iter()
+            .any(|(b, pending)| b == "Hello hub" && *pending),
+        "the message shows as pending"
+    );
+    hub.lock().unwrap().silent_sends = false;
+    wait_for(&client, "the message after the reconnect", |s| {
+        bodies_of(s, &everything)
+            .iter()
+            .any(|(b, pending)| b == "Hello hub" && !*pending)
+    })
+    .await;
+    let h = hub.lock().unwrap();
+    assert!(h.sessions.len() >= 2, "the link restarted");
+    assert_eq!(h.sent_ids.len(), 2, "sent twice");
+    assert_eq!(h.sent_ids[0], h.sent_ids[1], "with the same ID");
+    let stored = h.messages.iter().filter(|m| m.body == "Hello hub").count();
+    assert_eq!(stored, 1, "the hub keeps one copy");
+}
+
+/// Finding 5: one command that waits for the hub does not hold up the rest.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stuck_command_does_not_block_the_next_one() {
+    let (url, hub) = start_hub().await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut timeouts = quick();
+    timeouts.call = Duration::from_secs(5);
+    timeouts.idle = Duration::from_secs(30);
+    let client = paired_client(&url, dir.path(), options(timeouts)).await;
+    let everything = everything_id(&client);
+    hub.lock().unwrap().silent_sends = true;
+    let stuck = {
+        let client = client.clone();
+        let everything = everything.clone();
+        tokio::spawn(async move { client.send_message(everything, "Stuck".into()).await })
+    };
+    until("the hub got the send", || {
+        !hub.lock().unwrap().sent_ids.is_empty()
+    })
+    .await;
+    let started = std::time::Instant::now();
+    let task_id = client.state().tasks[0].id.clone();
+    let err = client.resolve_task(task_id).await.unwrap_err();
+    assert!(matches!(err, ClientError::Hub { .. }), "{err:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the second command waited for the first"
+    );
+    assert!(!stuck.is_finished(), "the first command still waits");
+}
+
+/// Finding 5: a hub that stops answering ends the link, even with no request
+/// in flight.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hub_that_goes_silent_ends_the_link() {
+    let (url, hub) = start_hub().await;
+    let dir = tempfile::tempdir().unwrap();
+    let client = paired_client(&url, dir.path(), options(quick())).await;
+    let mute = hub.lock().unwrap().mute.clone();
+    mute.notify_one();
+    until("a second connection", || {
+        hub.lock().unwrap().sessions.len() >= 2
+    })
+    .await;
+    wait_for(&client, "online again", |s| {
+        s.connection == Connection::Online
+    })
+    .await;
+}
+
+/// Finding 5: dropping the client never waits for a call that is stuck.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dropping_the_client_does_not_wait_for_a_stuck_call() {
+    let (url, hub) = start_hub().await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut timeouts = quick();
+    timeouts.call = Duration::from_secs(20);
+    timeouts.idle = Duration::from_secs(60);
+    let client = paired_client(&url, dir.path(), options(timeouts)).await;
+    let everything = everything_id(&client);
+    hub.lock().unwrap().silent_sends = true;
+    let _ = tokio::time::timeout(
+        Duration::from_millis(200),
+        client.send_message(everything, "Stuck".into()),
+    )
+    .await;
+    let started = std::time::Instant::now();
+    drop(client);
+    assert!(
+        started.elapsed() < Duration::from_millis(500),
+        "drop waited {:?}",
+        started.elapsed()
+    );
+}
+
+/// Findings 6, 7 and 8: the outbox survives a quit, goes out in the order of
+/// the queue, and a message that the hub refuses leaves it and shows as a
+/// failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_outbox_survives_a_restart_and_goes_out_in_order() {
+    let (url, hub) = start_hub().await;
+    let dir = tempfile::tempdir().unwrap();
+    let first = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
+    let everything = everything_id(&first);
+    drop(first);
+    let store = Store::new(dir.path());
+    let client_id = store.load().unwrap().unwrap().config.client_id;
+    let pending = |id: &str, channel: &str, body: &str| consort_client::cache::PendingSend {
+        client_message_id: id.into(),
+        channel_id: channel.into(),
+        thread_root_id: None,
+        body: body.into(),
+        created_at: Timestamp::now().as_millis(),
+    };
+    let missing = ChannelId::new().to_string();
+    store
+        .save_outbox(
+            &client_id,
+            &[
+                pending("c-1", &everything, "one"),
+                pending("c-2", &missing, "lost"),
+                pending("c-3", &everything, "two"),
+                pending("c-4", &everything, "three"),
+            ],
+        )
+        .unwrap();
+
+    let client =
+        Client::start_with(Some(Store::new(dir.path())), ClientOptions::desktop()).unwrap();
+    let state = wait_for(&client, "the refused message", |s| {
+        !s.send_failures.is_empty()
+    })
+    .await;
+    assert_eq!(state.send_failures[0].body, "lost");
+    assert!(
+        state.send_failures[0].message.contains("does not exist"),
+        "{}",
+        state.send_failures[0].message
+    );
+    wait_for(&client, "the sent messages", |s| {
+        let b = bodies_of(s, &everything);
+        ["one", "two", "three"]
+            .iter()
+            .all(|body| b.iter().any(|(x, pending)| x == body && !pending))
+    })
+    .await;
+    assert_eq!(
+        hub.lock().unwrap().sent_bodies,
+        vec!["one", "lost", "two", "three"],
+        "in the order of the queue"
+    );
+    until("the outbox file is gone", || {
+        !dir.path().join("outbox.json").exists()
+    })
+    .await;
+    client
+        .run(Command::DismissSendFailure { id: "c-2".into() })
+        .await
+        .unwrap();
+    wait_for(&client, "the dismissed failure", |s| {
+        s.send_failures.is_empty()
+    })
+    .await;
+}
+
+/// A queued message is written to disk at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_queued_message_is_saved_in_the_outbox_file() {
+    let (url, hub) = start_hub().await;
+    let dir = tempfile::tempdir().unwrap();
+    let client = paired_client(&url, dir.path(), options(quick())).await;
+    let everything = everything_id(&client);
+    hub.lock().unwrap().silent_sends = true;
+    client
+        .send_message(everything, "Keep me".into())
+        .await
+        .unwrap();
+    let file = std::fs::read_to_string(dir.path().join("outbox.json")).unwrap();
+    assert!(file.contains("Keep me"), "{file}");
+}
+
+/// Finding 12: the snapshot says whether older messages exist. A page can be
+/// short when messages are large, or full of replies in the timeline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn has_older_follows_messages_has_more() {
+    let (url, hub) = start_hub().await;
+    {
+        let mut h = hub.lock().unwrap();
+        let channel_id = h.channel.as_ref().unwrap().id;
+        let m = text_message(
+            channel_id,
+            "only one",
+            Timestamp::now().as_millis() - 5_000,
+            None,
+        );
+        h.messages.push(m);
+        h.force_has_more = Some(true);
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let client = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
+    let everything = everything_id(&client);
+    wait_for(&client, "the message", |s| {
+        bodies_of(s, &everything)
+            .iter()
+            .any(|(b, _)| b == "only one")
+    })
+    .await;
+    assert!(
+        client.state().timeline(&everything).unwrap().has_older,
+        "a short page with has_more means older messages"
+    );
+
+    // A full page with has_more false: nothing older.
+    let (url, hub) = start_hub().await;
+    {
+        let mut h = hub.lock().unwrap();
+        let channel_id = h.channel.as_ref().unwrap().id;
+        let base = Timestamp::now().as_millis() - 1_000_000;
+        for i in 0..SNAPSHOT_MESSAGE_LIMIT as i64 {
+            let m = text_message(channel_id, &format!("m {i}"), base + i, None);
+            h.messages.push(m);
+        }
+        h.force_has_more = Some(false);
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let client = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
+    let everything = everything_id(&client);
+    wait_for(&client, "the messages", |s| {
+        bodies_of(s, &everything).iter().any(|(b, _)| b == "m 49")
+    })
+    .await;
+    assert!(!client.state().timeline(&everything).unwrap().has_older);
+}
+
+/// Finding 23: a thread with more than 200 replies loads in pages.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_long_thread_loads_in_pages() {
+    let (url, hub) = start_hub().await;
+    let (task_id, count) = {
+        let mut h = hub.lock().unwrap();
+        let channel_id = h.channel.as_ref().unwrap().id;
+        let card = h.task.as_ref().unwrap().card_message_id;
+        let base = Timestamp::now().as_millis() - 1_000_000;
+        for i in 0..450 {
+            let m = text_message(channel_id, &format!("reply {i}"), base + i, Some(card));
+            h.messages.push(m);
+        }
+        (h.task.as_ref().unwrap().id.to_string(), 450)
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let client = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
+    client.load_thread(task_id.clone()).await.unwrap();
+    let state = wait_for(&client, "every reply", |s| {
+        s.thread(&task_id).is_some_and(|t| t.posts.len() >= count)
+    })
+    .await;
+    assert_eq!(state.thread(&task_id).unwrap().posts.len(), count);
+}
+
+/// Finding 11: MarkRead goes out once for the newest message, and a new
+/// message in the open channel needs a new one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mark_read_is_sent_once_for_each_newest_message() {
+    let (url, hub) = start_hub().await;
+    {
+        let mut h = hub.lock().unwrap();
+        let channel_id = h.channel.as_ref().unwrap().id;
+        let m = text_message(
+            channel_id,
+            "unread",
+            Timestamp::now().as_millis() - 5_000,
+            None,
+        );
+        h.messages.push(m);
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let client = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
+    let everything = everything_id(&client);
+    let state = wait_for(&client, "the unread message", |s| {
+        s.sidebar.everything.unread >= 1
+    })
+    .await;
+    assert!(state.sidebar.everything.unread >= 1);
+    client
+        .run(Command::MarkRead {
+            channel_id: everything.clone(),
+        })
+        .await
+        .unwrap();
+    wait_for(&client, "nothing unread", |s| {
+        s.sidebar.everything.unread == 0
+    })
+    .await;
+    assert_eq!(hub.lock().unwrap().read_marks.len(), 1);
+    client
+        .run(Command::MarkRead {
+            channel_id: everything.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        hub.lock().unwrap().read_marks.len(),
+        1,
+        "the newest message is read already"
+    );
+    // A new message from the assistant is unread, and a new mark follows.
+    let frame = {
+        let mut h = hub.lock().unwrap();
+        let channel_id = h.channel.as_ref().unwrap().id;
+        let m = text_message(channel_id, "newer", Timestamp::now().as_millis(), None);
+        h.messages.push(m.clone());
+        feed(&mut h, EntityPayload::Message(m))
+    };
+    push(&hub, vec![frame]);
+    wait_for(&client, "one unread", |s| s.sidebar.everything.unread == 1).await;
+    client
+        .run(Command::MarkRead {
+            channel_id: everything.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(hub.lock().unwrap().read_marks.len(), 2);
+}
+
+/// Finding 18: a burst of feed entries makes a few view states, not one per
+/// entry, and a change that leaves the state as it was publishes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_burst_of_feed_entries_publishes_few_states() {
+    let (url, hub) = start_hub().await;
+    let dir = tempfile::tempdir().unwrap();
+    let client = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
+    let everything = everything_id(&client);
+    let frames = {
+        let mut h = hub.lock().unwrap();
+        let channel_id = h.channel.as_ref().unwrap().id;
+        let base = Timestamp::now().as_millis();
+        (0..300)
+            .map(|i| {
+                let m = text_message(channel_id, &format!("burst {i}"), base + i, None);
+                h.messages.push(m.clone());
+                feed(&mut h, EntityPayload::Message(m))
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut sub = client.subscribe();
+    sub.current();
+    push(&hub, frames);
+    let mut states = 0;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let Ok(Some(state)) = tokio::time::timeout_at(deadline, sub.next()).await else {
+            panic!("timed out; {states} states");
+        };
+        states += 1;
+        if bodies_of(&state, &everything)
+            .iter()
+            .any(|(b, _)| b == "burst 299")
+        {
+            break;
+        }
+    }
+    assert!(states <= 30, "{states} states for 300 entries");
+
+    // Nothing changed, so nothing is published.
+    client.run(Command::CancelWorkerPairing).await.unwrap();
+    let quiet = tokio::time::timeout(Duration::from_millis(300), sub.next()).await;
+    assert!(quiet.is_err(), "an unchanged state was published");
 }

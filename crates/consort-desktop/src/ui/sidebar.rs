@@ -11,7 +11,6 @@ use gpui_kit::{
 
 use crate::{
     app::{ConsortApp, Dialog, Page, SettingsSection},
-    ui::sizes,
     ui::window_controls::DragArea as _,
     ui::{
         menu::{MenuAction, MenuItem, OpenMenu},
@@ -362,12 +361,17 @@ impl ConsortApp {
             .flex()
             .items_center()
             .gap(t.space.sm)
-            .py(sizes::WORKER_ROW_PAD_Y)
+            .py(t.component.worker_row_pad_y)
             .px(t.space.sm)
             .rounded(t.radius.md)
             .cursor_pointer()
             .hover(|s| s.bg(c.hover_sidebar))
-            .child(worker_dot(worker.online, sizes::WORKER_DOT, t.icon.size, t))
+            .child(worker_dot(
+                worker.online,
+                t.component.worker_dot,
+                t.icon.size,
+                t,
+            ))
             .child(
                 line(
                     worker.name.clone(),

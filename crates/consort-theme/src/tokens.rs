@@ -5,6 +5,7 @@
 use std::time::Duration;
 
 use gpui_kit::{App, BoxShadow, FontWeight, Global, Hsla, Pixels, SharedString, Styled, point, px};
+use serde::{Deserialize, Serialize};
 
 use crate::{
     color::{Rgb, Rgba},
@@ -225,6 +226,99 @@ pub struct Layout {
     pub timeline_max_width: Pixels,
     pub speaker_gutter: Pixels,
     pub min_window: (Pixels, Pixels),
+    /// The size of a new window.
+    pub default_window: (Pixels, Pixels),
+    /// Below this timeline column width, the speaker and the time share one
+    /// line above each message.
+    pub wide_timeline: Pixels,
+    /// How far a virtual list lays out rows beyond its edges.
+    pub list_overdraw: Pixels,
+}
+
+/// Opacities of dimmed parts, as shares of full color.
+#[derive(Clone, Copy, Debug)]
+pub struct Opacity {
+    /// An option that was not chosen in an answered decision.
+    pub answered_dim: f32,
+    /// A button that waits for the hub to answer.
+    pub busy: f32,
+    /// A danger button under the pointer.
+    pub danger_hover: f32,
+}
+
+/// Sizes of single components, from `structure.json`.
+#[derive(Clone, Copy, Debug)]
+pub struct Components {
+    pub settings_label: Pixels,
+    pub settings_segmented: Pixels,
+    pub theme_card: Pixels,
+    pub theme_row: Pixels,
+    pub theme_preview_height: Pixels,
+    pub worker_list: Pixels,
+    pub settings_detail_max: Pixels,
+    pub account_state: Pixels,
+    pub settings_select: Pixels,
+    pub group_select: Pixels,
+    pub workspace_control: Pixels,
+    pub input_pad_y: Pixels,
+    pub button_pad_y: Pixels,
+    pub worker_dot: Pixels,
+    pub state_dot: Pixels,
+    pub worker_row_pad_y: Pixels,
+    pub switch_inset: Pixels,
+    pub theme_preview: ThemePreview,
+}
+
+/// The drawing of a theme in its card.
+#[derive(Clone, Copy, Debug)]
+pub struct ThemePreview {
+    pub bar: Pixels,
+    pub bar_gap: Pixels,
+    pub sidebar: Pixels,
+    pub sidebar_item: Pixels,
+    pub text_line: Pixels,
+    pub title: Pixels,
+    pub chip: Pixels,
+    pub card: Pixels,
+    pub button: Pixels,
+    pub button_radius: Pixels,
+}
+
+impl Components {
+    fn new(c: &structure::Components) -> Components {
+        let p = &c.theme_preview;
+        Components {
+            settings_label: px(c.settings_label),
+            settings_segmented: px(c.settings_segmented),
+            theme_card: px(c.theme_card),
+            theme_row: px(c.theme_row),
+            theme_preview_height: px(c.theme_preview_height),
+            worker_list: px(c.worker_list),
+            settings_detail_max: px(c.settings_detail_max),
+            account_state: px(c.account_state),
+            settings_select: px(c.settings_select),
+            group_select: px(c.group_select),
+            workspace_control: px(c.workspace_control),
+            input_pad_y: px(c.input_pad_y),
+            button_pad_y: px(c.button_pad_y),
+            worker_dot: px(c.worker_dot),
+            state_dot: px(c.state_dot),
+            worker_row_pad_y: px(c.worker_row_pad_y),
+            switch_inset: px(c.switch_inset),
+            theme_preview: ThemePreview {
+                bar: px(p.bar),
+                bar_gap: px(p.bar_gap),
+                sidebar: px(p.sidebar),
+                sidebar_item: px(p.sidebar_item),
+                text_line: px(p.text_line),
+                title: px(p.title),
+                chip: px(p.chip),
+                card: px(p.card),
+                button: px(p.button),
+                button_radius: px(p.button_radius),
+            },
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -235,7 +329,8 @@ pub struct Icons {
 }
 
 /// How large the app sets text. The Appearance setting changes it.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TextSize {
     Smaller,
     #[default]
@@ -268,6 +363,8 @@ pub struct Tokens {
     pub stroke: Pixels,
     pub motion: Motion,
     pub layout: Layout,
+    pub opacity: Opacity,
+    pub component: Components,
     pub icon: Icons,
     pub font_sans: SharedString,
     pub font_mono: SharedString,
@@ -326,7 +423,19 @@ impl Tokens {
                 timeline_max_width: px(s.layout.timeline_max_width),
                 speaker_gutter: px(s.layout.speaker_gutter),
                 min_window: (px(s.layout.min_window[0]), px(s.layout.min_window[1])),
+                default_window: (
+                    px(s.layout.default_window[0]),
+                    px(s.layout.default_window[1]),
+                ),
+                wide_timeline: px(s.layout.wide_timeline),
+                list_overdraw: px(s.layout.list_overdraw),
             },
+            opacity: Opacity {
+                answered_dim: s.opacity.answered_dim,
+                busy: s.opacity.busy,
+                danger_hover: s.opacity.danger_hover,
+            },
+            component: Components::new(&s.component),
             icon: Icons {
                 size: px(s.icon.size),
                 dense: px(s.icon.dense_size),
@@ -390,3 +499,38 @@ pub trait TypeExt: Styled + Sized {
 }
 
 impl<T: Styled> TypeExt for T {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::builtin_themes;
+
+    fn tokens() -> Tokens {
+        let theme = builtin_themes()
+            .into_iter()
+            .next()
+            .expect("a built-in theme");
+        Tokens::new(&theme, Mode::Dark, TextSize::Default)
+    }
+
+    #[test]
+    fn layout_tokens_reach_the_views() {
+        let t = tokens();
+        assert_eq!(t.layout.default_window, (px(1440.0), px(900.0)));
+        assert_eq!(t.layout.wide_timeline, px(600.0));
+        assert_eq!(t.layout.list_overdraw, px(400.0));
+    }
+
+    #[test]
+    fn opacity_and_component_tokens_reach_the_views() {
+        let t = tokens();
+        assert_eq!(t.opacity.answered_dim, 0.6);
+        assert_eq!(t.opacity.busy, 0.7);
+        assert_eq!(t.opacity.danger_hover, 0.9);
+        assert_eq!(t.component.settings_label, px(160.0));
+        assert_eq!(t.component.theme_row, px(632.0));
+        assert_eq!(t.component.button_pad_y, px(5.0));
+        assert_eq!(t.component.theme_preview.sidebar_item, px(20.0));
+        assert_eq!(t.component.theme_preview.button_radius, px(2.0));
+    }
+}

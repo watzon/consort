@@ -6,13 +6,17 @@
 
 mod app;
 mod assets;
+mod countdown;
+mod drafts;
 mod fonts;
+mod notice;
+mod read_marker;
 mod ui;
 
 use consort_client::Client;
 use gpui_kit::{
     AppContext as _, Bounds, Menu, MenuItem, TitlebarOptions, WindowBounds, WindowOptions, actions,
-    point, px, size,
+    point, size,
 };
 
 actions!(consort, [Quit]);
@@ -67,13 +71,11 @@ fn main() {
     } else {
         Client::start()
     };
-    let client = match client {
-        Ok(client) => client,
-        Err(err) => {
-            eprintln!("consort: {err}");
-            std::process::exit(1);
-        }
-    };
+    // A client that cannot start still gets a window, which says what
+    // happened and what to do next. The error also goes to stderr.
+    if let Err(err) = &client {
+        eprintln!("consort: {err}");
+    }
     gpui_kit::application()
         .with_assets(assets::Assets)
         .run(move |cx| {
@@ -95,7 +97,8 @@ fn main() {
             cx.activate(true);
             let tokens = consort_theme::ActiveTokens::tokens(cx).clone();
             let (min_w, min_h) = tokens.layout.min_window;
-            let bounds = Bounds::centered(None, size(px(1440.0), px(900.0)), cx);
+            let (width, height) = tokens.layout.default_window;
+            let bounds = Bounds::centered(None, size(width, height), cx);
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 window_min_size: Some(size(min_w, min_h)),
@@ -106,30 +109,37 @@ fn main() {
                 }),
                 ..WindowOptions::default()
             };
-            let result = gpui_kit::open_window(options, cx, move |window, cx| {
-                if args.appearance.is_some() || args.theme.is_some() {
-                    consort_theme::choose(
-                        args.theme.clone().map(|t| {
-                            let mut c = t.chars();
-                            c.next()
-                                .map(|f| f.to_uppercase().collect::<String>() + c.as_str())
-                                .unwrap_or_default()
-                                .into()
-                        }),
-                        args.appearance,
-                        None,
-                        window,
-                        cx,
-                    );
-                }
-                cx.new(|cx| {
-                    let mut app = app::ConsortApp::new(client, mock, window, cx);
-                    if let Some(screen) = &args.screen {
-                        app.open_screen(screen, window, cx);
+            let result = match client {
+                Ok(client) => gpui_kit::open_window(options, cx, move |window, cx| {
+                    if args.appearance.is_some() || args.theme.is_some() {
+                        consort_theme::choose_without_saving(
+                            args.theme.clone().map(|t| {
+                                let mut c = t.chars();
+                                c.next()
+                                    .map(|f| f.to_uppercase().collect::<String>() + c.as_str())
+                                    .unwrap_or_default()
+                                    .into()
+                            }),
+                            args.appearance,
+                            None,
+                            window,
+                            cx,
+                        );
                     }
-                    app
+                    cx.new(|cx| {
+                        let mut app = app::ConsortApp::new(client, mock, window, cx);
+                        if let Some(screen) = &args.screen {
+                            app.open_screen(screen, window, cx);
+                        }
+                        app
+                    })
                 })
-            });
+                .map(|_| ()),
+                Err(err) => gpui_kit::open_window(options, cx, move |_, cx| {
+                    cx.new(|_| ui::startup_error::StartupError::new(err.to_string()))
+                })
+                .map(|_| ()),
+            };
             if let Err(err) = result {
                 eprintln!("consort: cannot open the window: {err}");
                 cx.quit();

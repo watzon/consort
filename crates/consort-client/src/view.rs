@@ -23,6 +23,23 @@ pub struct ViewState {
     pub selections: Vec<String>,
     /// Set while the Add worker dialog waits for a pairing code.
     pub worker_pairing: Option<PairingCodeView>,
+    /// Messages that waited in the outbox and that the hub then refused.
+    /// The text is here so the user can copy it. Dismiss one with
+    /// [`crate::Command::DismissSendFailure`].
+    pub send_failures: Vec<SendFailureView>,
+}
+
+/// A message that the hub refused after it left the composer.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SendFailureView {
+    /// The `client_message_id` of the message.
+    pub id: String,
+    pub channel_id: String,
+    pub channel_name: String,
+    /// The text that the user wrote.
+    pub body: String,
+    /// What happened and what to do next.
+    pub message: String,
 }
 
 impl ViewState {
@@ -533,6 +550,8 @@ pub struct ThreadPost {
     pub speaker: Speaker,
     pub time_label: String,
     pub bodies: Vec<PostBody>,
+    /// The post is still on its way to the hub.
+    pub pending: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]

@@ -1191,6 +1191,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tokio-tungstenite 0.28.0",
+ "tracing",
  "url",
  "uuid",
 ]
@@ -1281,6 +1282,7 @@ dependencies = [
  "gpui-kit",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.21",
 ]
 
