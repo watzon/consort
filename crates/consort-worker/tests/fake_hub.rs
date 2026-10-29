@@ -53,6 +53,7 @@ fn session_start(session_id: SessionId, account_id: AccountId) -> SessionStart {
         system_prompt_append: "You are a task.".into(),
         allowed_local_mcp_servers: vec![],
         channel_files: vec![],
+        extensions: Default::default(),
         resume: None,
         turn: Some(TurnInput {
             text: "Run the tests".into(),

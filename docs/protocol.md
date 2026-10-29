@@ -76,6 +76,12 @@ Each side sends the protocol versions that it supports in `hello`. The hub picks
 | `tool_install_failed` | The worker could not install or update a managed tool. `message` says why |
 | `invalid_tag` | A tag is not 1 to 32 lowercase letters, digits or `-`. `message` names the tag |
 | `unsupported` | The peer knows the request type but does not carry it out yet. `message` names the type, for example "Not built yet: account.create." |
+| `connector_not_available` | The connection does not exist, or the session's channel cannot use it. `message` names the connectors that the channel can use |
+| `composio_not_configured` | The hub has no Composio key. The user adds one in Settings > Connectors |
+| `composio_error` | Composio refused a request or did not answer. `message` says why |
+| `needs_user` | The action needs the user first, for example a connection that needs a new sign-in. `message` says what the user must do |
+| `skill_blocked` | The skill is blocked, for example because its audit failed. `message` says why |
+| `skill_invalid` | The skill does not follow the Agent Skills format or breaks a limit. `message` names the file or the limit |
 
 A reader that gets a code it does not know treats it as `internal` and shows the message.
 
@@ -137,6 +143,7 @@ A client that needs the blob endpoints sends `auth.http_token` and gets a bearer
 | `tool.list` | `session_id` | `tools`: the hub tools for that session's role, each with `name`, `description` and `input_schema`. A session that has ended or is lost gets `conflict` |
 | `tool.call` | `session_id`, `call_id`, `name`, `arguments` | `content` (MCP text blocks, `{"type": "text", "text": ...}`), `is_error`, and optional `structured_content`. A session that has ended or is lost gets an error result with `conflict`. The hub runs at most 16 tool calls of one worker at the same time; more calls wait |
 | `sign_in.update` | `sign_in_id`, `state` (see [Sign-in](#sign-in)) | None. The hub stores the new state and sends a feed upsert of the sign-in |
+| `skill_bundle.get` | `content_hash` | `skill_id`, `name`, `content_hash` and `files` (each `path`, `sha256`, `size` and `executable`, sorted by path). The hub answers only for a hash that a `session.start` to this worker named, and `not_found` otherwise. The worker downloads each file with `GET /v1/blobs/{sha256}`, checks the content hash (see [data-model.md](data-model.md#skill)), and keeps the bundle in a cache by its hash |
 
 ### Hub to worker
 
@@ -144,7 +151,7 @@ Every hub command is a request. The envelope `id` of a hub command is its comman
 
 | Type | Body | Result |
 |---|---|---|
-| `session.start` | `session_id`, `role`, `channel_id`, `task_id` (for a task session), `account_id`, `model`, `options`, `approval_mode`, `workspace` (see below), `system_prompt_append`, `allowed_local_mcp_servers`, `channel_files` (a list of `path` and `sha256`), optional `resume` with a `native_ref`, optional first `turn` | `workspace_path` and optional `native_ref` |
+| `session.start` | `session_id`, `role`, `channel_id`, `task_id` (for a task session), `account_id`, `model`, `options`, `approval_mode`, `workspace` (see below), `system_prompt_append`, `allowed_local_mcp_servers`, `channel_files` (a list of `path` and `sha256`), optional `extensions` (see [Connectors and skills of a session](#connectors-and-skills-of-a-session)), optional `resume` with a `native_ref`, optional first `turn` | `workspace_path` and optional `native_ref` |
 | `session.turn` | `session_id`, `turn` (`text` and `attachments`) | `turn_id` |
 | `session.steer` | `session_id`, `turn` | None. The worker sends `policy_denied` if the harness cannot steer. The worker refuses a steer when no turn runs, for example because the turn ended first. The hub does not lose the text of a refused steer (see [Delivery rules](#delivery-rules)) |
 | `session.interrupt` | `session_id` | None |
@@ -154,7 +161,7 @@ Every hub command is a request. The envelope `id` of a hub command is its comman
 | `item.detail` | `session_id`, `item_id` | `sha256`, `size` and `mime` of a blob with the full command output or diff |
 | `inventory.refresh` | Empty | None |
 | `account.create` | `account_id` (the hub chooses it), `harness`, `label`, optional `acp`, `env` | None. The worker makes the profile folder, writes `env` to `env.json` in it, adds the account to `worker.toml`, and sends a new inventory |
-| `account.update` | `account_id`, optional `label`, `env_set`, `env_remove` | None |
+| `account.update` | `account_id`, optional `label`, `env_set`, `env_remove`, `extras_enabled` | None. `extras_enabled` turns the provider extras of the account on or off from the next session. A worker that does not have the toggle yet refuses the whole command with `unsupported` |
 | `account.remove` | `account_id` | None. The worker signs out where it can and deletes the profile folder |
 | `account.sign_out` | `account_id` | None |
 | `sign_in.start` | `sign_in_id`, `account_id`, `method` | None. The worker sends each state as `sign_in.update` |
@@ -176,6 +183,31 @@ The `workspace` object of `session.start` has these fields:
 | `carry_uncommitted` | Copy uncommitted changes from the checkout into the worktree. Allowed only with `worktree` |
 
 A workspace with no repos is an empty folder in `workspaces/`. Coordinators usually run in one.
+
+#### Connectors and skills of a session
+
+The `extensions` object of `session.start` holds the session's effective set when the session starts (see [data-model.md](data-model.md#effective-set)). A change reaches the next session. The hub ends an idle coordinator session when the effective set of its channel changes, as it does for a new model.
+
+| Field | Notes |
+|---|---|
+| `connectors` | One entry per connection: `handle`, `service_name`, optional `identity` and `needs_sign_in` |
+| `skills` | One entry per skill: `skill_id`, `name` and `content_hash`. The worker gets a bundle that it does not have with `skill_bundle.get`, and writes each skill into a folder per session, where its harness reads skills |
+| `skill_context` | The `name` and `description` of each skill, in the order of `skills` |
+
+The worker appends the context blocks to the system prompt with `SessionExtensions::prompt_blocks` in `consort-proto`, so every adapter shows the same text:
+
+```text
+Connectors in this channel:
+- gmail_work: Gmail, chris@work.example
+- gmail_personal: Gmail, chris@example.com
+To use one, call list_connector_tools with its handle, then run_connector_tool.
+
+Skills in this channel:
+- pdf-forms: Fill and read PDF forms.
+They are installed as skills. Use one when the task fits it.
+```
+
+A harness that does not load skills itself gets the last line "Before you use one, call read_skill with its name and follow its SKILL.md.", and the hub lists `list_skills` and `read_skill` for its session. A hub that sends no `extensions` leaves the field out, and the session has no connector and no skill.
 
 The hub waits 60 minutes for the answer to `session.start`, because the worker prepares the workspace first and a clone can take 15 minutes. It waits 10 minutes for any other queued command. When the time runs out, the hub keeps the link open (the read loop closes a link only when the worker sends nothing, not even a ping, for 60 seconds) and sends the same command again. The worker runs a command ID once and answers when the first run ends.
 
@@ -223,7 +255,7 @@ The `code` of an `error` event is one of these:
 
 The hub stores each `error` event as a failed item of the session. After `signed_out`, the hub also marks the account `signed_out` in the stored inventory of the worker, so placement does not choose it until the next inventory from the worker. A coordinator session on that account ends as `lost`: its turn's events go back to the queue, and placement starts a new session on another signed-in account. When no account fits, the channel gets a notice that names the account and the worker to sign in on, and the events wait for the next inventory. A failed coordinator turn on an account that the inventory shows as signed out has the same result.
 
-The `details` of an approval request has a `kind` and the fields for that kind: `command` (`command`, `cwd`), `file_change` (`paths`), `tool` (`server`, `tool`, `arguments`), `network` (`target`) or `other` (`text`). Every `command` approval has its `cwd`. A Codex network approval comes as `command` details, with the command and its folder, and its summary names the host, for example "Run `git fetch` with network access to github.com". The `details` of a question has `question`, `context` and `allow_free_text`. Each option has `id`, `label`, `kind` (`allow_once`, `allow_always`, `deny_once`, `deny_always` or `choice`) and an optional `description`.
+The `details` of an approval request has a `kind` and the fields for that kind: `command` (`command`, `cwd`), `file_change` (`paths`), `tool` (`server`, `tool`, `arguments`), `network` (`target`) or `other` (`text`). The hub card kinds (`connector`, `management`, `connect_service`, `sign_in` and `skill_install`) are for approvals that the hub makes itself. The hub reads one of them from a worker as `other`, with the summary as the text. Every `command` approval has its `cwd`. A Codex network approval comes as `command` details, with the command and its folder, and its summary names the host, for example "Run `git fetch` with network access to github.com". The `details` of a question has `question`, `context` and `allow_free_text`. Each option has `id`, `label`, `kind` (`allow_once`, `allow_always`, `deny_once`, `deny_always` or `choice`) and an optional `description`.
 
 The hub makes an approval for an approval request. It makes a decision with a `request_id` for a question, and it sends the answer back with `session.respond`, not as a new turn.
 
@@ -256,7 +288,7 @@ The worker sends a full inventory after `hello` and again when any part changes.
 | `hash` | Hash of the rest of the inventory: `fnv1a64:` and 16 hex characters over the JSON of the inventory with an empty `hash`. It detects changes. It is not a security hash |
 | `hostname`, `os`, `arch` | |
 | `tags` | The detected tags (`macos`, `windows`, `linux`, `arm64`, `x64`, `ram-<n>gb`, `cpu-<n>`, `gpu-nvidia`, `gpu-amd`, `gpu-apple`) and the `tags` in `worker.toml`. An older worker sends `labels`, which reads as `tags` |
-| `accounts` | Each harness account: `account_id`, `harness`, `label`, `harness_version`, `auth_state`, `auth_detail`, `models`, `capabilities`, `enabled`, `profile` (true for an account that Consort made, with a profile folder), `email`, `plan`, `secret_names` (the names in `env.json`, never the values) and `sign_in_methods`. Never a credential |
+| `accounts` | Each harness account: `account_id`, `harness`, `label`, `harness_version`, `auth_state`, `auth_detail`, `models`, `capabilities`, `enabled`, `profile` (true for an account that Consort made, with a profile folder), `email`, `plan`, `secret_names` (the names in `env.json`, never the values), `sign_in_methods`, `extras_enabled` (true when the field is missing) and optional `extras` (what the account syncs from the provider, see [data-model.md](data-model.md#harness-account)). Never a credential |
 | `tools` | Each managed tool: `tool`, `version`, `latest`, `state` (`missing`, `installing`, `ready`, `update_available` or `failed`) and `detail`. `tool` is `node`, `claude-code`, `claude-agent-acp`, `codex`, `opencode`, `gemini-cli` or `acp:<registry id>` |
 | `local_mcp_servers` | Each server's `name`, `description` and tool names. Never a URL with a secret, and never a credential |
 | `checkouts` | Each checkout's `repo_url`, `path` and `managed` flag |
@@ -370,6 +402,8 @@ The Everything coordinator also has these tools:
 
 Memory tools in the Everything coordinator accept any `scope` for reads. Writes go to `global` only.
 
+The Everything coordinator also has the management tools in [Management tools](#management-tools).
+
 ### Tools for task sessions
 
 | Tool | Arguments | Result |
@@ -379,9 +413,75 @@ Memory tools in the Everything coordinator accept any `scope` for reads. Writes 
 | `publish_artifact` | `path` (in the workspace), `title` | The artifact's channel file path |
 | `suggest_memory` | `note`, `reason` | Sends the note to the channel coordinator as input to its next turn. The coordinator decides whether to write it |
 
+### Connector and skill tools
+
+Every session can have these tools. The hub lists the connector tools only for a session whose channel can use at least one connection, and the skill tools only for a harness that does not load skills itself. A connector is named by its handle, as the "Connectors in this channel" block shows it.
+
+| Tool | Arguments | Result |
+|---|---|---|
+| `list_connector_tools` | `connector`, optional `search` | `connector`, `service_name`, `tools` (each `slug`, `description`, `kind` and `approval`, at most 200) and `has_more` |
+| `get_connector_tool` | `connector`, `tool` | `connector`, the tool fields, and `input_schema` |
+| `run_connector_tool` | `connector`, `tool`, `arguments` (an object) | `status`: `ran` with `call_id`, `successful`, `data`, optional `error` and `truncated`; `waiting_for_user` with `approval_id` and `message`; or `denied` with `call_id` and `message` |
+| `list_skills` | None | `skills`, each `name` and `description` |
+| `read_skill` | `skill` (the name), optional `path` (default `SKILL.md`) | `skill`, `path`, `content` (at most 512 KiB), `truncated`, and `files` (the other paths) for `SKILL.md` |
+
+`run_connector_tool` works like this:
+
+1. The hub finds the connection by its handle or ID in the session's effective set. A connection outside the set fails with `connector_not_available`, also when it exists. A connection that needs a new sign-in fails with `needs_user`, and the message asks the assistant to tell the user to reconnect it in Settings > Connectors. No key fails with `composio_not_configured`.
+2. The tool kind picks the rule. "Ask every time" posts a connector approval card. "Ask once per task" posts one for the first call of that kind in the task (or in the coordinator session), and runs later calls of that kind without asking.
+3. The hub waits up to 5 minutes for the answer. Allow runs the call. Don't returns `denied`. When the time runs out, the call returns `waiting_for_user`. When the user allows the card later, the call runs then, and the result arrives as a `card_answered` event (a coordinator) or a message to the task.
+4. The hub runs the tool with the connection's Composio connected account, writes a connector call record (see [data-model.md](data-model.md#connector-call)), and returns the result. A `data` larger than 256 KiB is cut, with `truncated` set.
+
+### Management tools
+
+The hub enforces the scope and the risk rule. A change runs at once and posts a short activity line when it adds something new and narrow, or makes access smaller or approvals stricter. It waits for the user on a management approval card when it deletes or archives, widens access (more channels or workers, or every channel), makes approvals looser, turns on a skill with scripts, changes worker or channel tags, or turns provider extras on. A sign-in or a key always goes through a card that the user completes in the app or the browser. The assistant never handles a secret.
+
+Every tool that changes something returns `status` (`applied`, `waiting_for_user` or `refused`), `summary`, and the IDs that apply: `approval_id` (the card, for `waiting_for_user`), `channel_id`, `connection_id`, `skill_id` or `account_id`. The answer to a card arrives as a `card_answered` event. A connection is named by its handle or its ID, and a skill by its name or its ID.
+
+For the coordinators of every channel:
+
+| Tool | Arguments | Notes |
+|---|---|---|
+| `list_connections` | None | `connections`. A channel's coordinator sees the ones that its channel can use, and `off_in_this_channel` |
+| `list_installed_skills` | None | `skills`, with the same rule, and `off_in_this_channel` |
+| `connect_service` | `service`, `name`, optional `use_in`, `approvals` | Posts a connect card. In a channel, the default `use_in` is the channels with this channel's tags, or this channel alone when it has no tags. In Everything, every channel |
+| `add_skill` | `source` (a git URL, `owner/repo` or a `search_skills` entry ID), optional `path`, `use_in` | Posts an install card with the license, the scripts and the audits. Same defaults for `use_in` |
+
+For the Everything coordinator only:
+
+| Tool | Arguments | Notes |
+|---|---|---|
+| `create_channel` | `name`, `purpose`, optional `group` (a group name, made when missing), `tags`, `model`, `task_model` | Runs at once |
+| `update_channel` | `channel`, optional `name`, `purpose`, `instructions`, `group`, `tags`, `model`, `task_model`, `repos` (git remote URLs) | A change to `tags` asks first |
+| `archive_channel` | `channel` | Asks first |
+| `set_default_model` | `model` (a model selection) | Everything's selection |
+| `set_worker_tags` | `worker`, `tags` | Asks first |
+| `install_tool` | `worker`, `tool` | As `worker.tool_install` |
+| `add_account` | `worker`, `provider`, `name` | Makes the account, then posts a sign-in card |
+| `start_sign_in` | `worker`, `account`, optional `method` (a method kind) | Posts a sign-in card |
+| `set_account_extras` | `worker`, `account`, `enabled` | Turning them on asks first |
+| `search_connector_catalog` | `search`, optional `category` | `services` |
+| `update_connection` | `connection`, optional `name`, `use_in`, `approvals` | Follows the risk rule |
+| `disconnect` | `connection` | Asks first |
+| `search_skills` | `search`, optional `source` | `entries` |
+| `update_skill` | `skill`, optional `enabled`, `use_in`, `accept_new_version` | Follows the risk rule |
+| `remove_skill` | `skill` | Asks first |
+
+For a channel's coordinator, only for its own channel:
+
+| Tool | Arguments | Notes |
+|---|---|---|
+| `update_this_channel` | optional `purpose`, `instructions`, `model`, `task_model`, `repos` | Runs at once |
+| `set_channel_tags` | `tags` | Asks first |
+| `set_channel_connector` | `connection`, `enabled` | Only for a connection whose `use_in` gives it to the channel. Otherwise `refused` |
+| `set_channel_skill` | `skill`, `enabled` | The same rule |
+| `request_access` | `connection` or `skill` | Posts a management approval card that asks the user to widen the item's `use_in` to this channel |
+
+Task sessions have no management tools.
+
 ## Coordinator turn input
 
-The hub wakes a coordinator when one of these events happens in its channel: a user message, a task status change to `review`, `needs_input` or `failed`, a decision answer, a routine run, a message from Everything, or a memory suggestion. A memory suggestion comes from a task to its channel coordinator, or from a channel coordinator to the Everything coordinator. The hub runs one turn at a time for each channel. Events that arrive during a turn go into the next turn.
+The hub wakes a coordinator when one of these events happens in its channel: a user message, a task status change to `review`, `needs_input` or `failed`, a decision answer, a routine run, a message from Everything, a memory suggestion, or the answer to a hub card that the coordinator posted. A memory suggestion comes from a task to its channel coordinator, or from a channel coordinator to the Everything coordinator. The hub runs one turn at a time for each channel. Events that arrive during a turn go into the next turn.
 
 The hub writes the events into the turn text in this form:
 
@@ -393,6 +493,7 @@ The hub writes the events into the turn text in this form:
   <routine id="rtn_..." name="Morning brief">Summarize my calendar and open tasks.</routine>
   <memory_suggestion from="tsk_..." reason="The user said this twice in the thread">Never push to main in sayso. Open a PR.</memory_suggestion>
   <everything_message id="msg_..." at="2026-10-28T21:49:00Z">Check the release notes before you ship.</everything_message>
+  <card_answered id="apr_..." kind="management" outcome="allowed">GitHub Work is now available in 4 more channels.</card_answered>
 </events>
 ```
 
@@ -408,7 +509,7 @@ The client API uses the same frames, errors and authentication as the worker lin
 
 | Type | Body | Result |
 |---|---|---|
-| `sync.snapshot` | `scope`: `all` or a channel ID | The entities in that scope and the current feed `seq`. For `all`: every group, channel, repo, worker and read marker, the tasks that are not archived, the pending approvals and decisions, every routine, and `sign_ins`: the sign-ins that have not ended (an ended sign-in is left out, and the field is left out when it is empty). A client that loads during a sign-in shows it from there and then follows its feed entries. It also has `preferences`, the user's preferences (see [data-model.md](data-model.md#preferences)). A channel snapshot leaves `preferences` out. For a channel: the channel, its newest 50 timeline messages (oldest first), its tasks that are not archived, its pending approvals and decisions, its routines and its channel files. Large messages can make the page shorter than 50. `messages_has_more` is true when older timeline messages exist. See [Tasks in a snapshot](#tasks-in-a-snapshot) |
+| `sync.snapshot` | `scope`: `all` or a channel ID | The entities in that scope and the current feed `seq`. For `all`: every group, channel, repo, worker and read marker, the tasks that are not archived, the pending approvals and decisions, every routine, and `sign_ins`: the sign-ins that have not ended (an ended sign-in is left out, and the field is left out when it is empty). A client that loads during a sign-in shows it from there and then follows its feed entries. It also has `preferences`, the user's preferences (see [data-model.md](data-model.md#preferences)), and `connections` and `skills`, every connection and installed skill (each left out when empty). A channel snapshot leaves `preferences` out. For a channel: the channel, its newest 50 timeline messages (oldest first), its tasks that are not archived, its pending approvals and decisions, its routines and its channel files. Large messages can make the page shorter than 50. `messages_has_more` is true when older timeline messages exist. See [Tasks in a snapshot](#tasks-in-a-snapshot) |
 | `sync.subscribe` | `after_seq`, optional `channel_ids` | `ok`. The hub then sends `feed` messages |
 | `feed` (from the hub) | `seq`, `at`, `channel_id`, `entity`, `entity_id`, `op` and `payload` | None. `payload` is `null` for `delete` |
 | `feed.skipped` (from the hub) | `seq`, `channel_id`, `entity` and `entity_id` | None. The hub could not send the entry `seq`, because it does not fit in one frame. The feed goes on after it. Get the entity again, for example with `message.list` or a new snapshot. A client that does not know this event ignores it |
@@ -439,9 +540,14 @@ A client that does not know these fields shows the preview, which ends with a no
 | Channel files | `files.list`, `files.put` (after a blob upload), `files.move`, `files.delete` |
 | Routines | `routine.create`, `routine.update`, `routine.delete`, `routine.run_now`, `routine.runs` |
 | Workers | `worker.list`, `worker.pairing_code`, `worker.rename`, `worker.set_tags` (with `worker_id` and `tags`), `worker.set_paused`, `worker.revoke`, `worker.refresh_inventory`, `worker.tools_check` (with `worker_id`), `worker.tool_install` (with `worker_id` and `tool`) |
-| Accounts | `account.create` (with `worker_id`, `harness`, `label`, optional `acp`, `env`; the result has `account_id`), `account.update` (with `worker_id`, `account_id`, optional `label`, `env_set`, `env_remove`), `account.remove` and `account.sign_out` (with `worker_id` and `account_id`), `acp_registry.list` (the result has `agents`, each with `id`, `name`, `description`, `version`, `icon_url` and `supported`) |
+| Accounts | `account.create` (with `worker_id`, `harness`, `label`, optional `acp`, `env`; the result has `account_id`), `account.update` (with `worker_id`, `account_id`, optional `label`, `env_set`, `env_remove`, `extras_enabled`), `account.remove` and `account.sign_out` (with `worker_id` and `account_id`), `acp_registry.list` (the result has `agents`, each with `id`, `name`, `description`, `version`, `icon_url` and `supported`) |
 | Sign-in | `sign_in.start` (with `worker_id`, `account_id` and `method`; the result has `sign_in`), `sign_in.submit_code` (with `sign_in_id` and `code`), `sign_in.cancel` (with `sign_in_id`) |
 | Preferences | `preferences.set_favorite_model` (with `account_label`, `model` and `favorite`; the result has `preferences`) |
+| Composio | `composio.set_key` (with `api_key`), `composio.remove_key`, `composio.status`. Each result has `status`: `key_present`, `key_hint` (the last 4 characters), `plan`, `usage` (`used`, `limit`, `resets_at`), `error` and `checked_at`. Never the key |
+| Connector catalog | `connector_catalog.search` (with optional `search`, `category`, `cursor`, `limit`; the result has `services` and `next_cursor`), `connector_catalog.categories`, `connector_catalog.service` (with `service`; the result has `service` and its `tools`) |
+| Connections | `connection.connect` (with `service`, `name`, optional `use_in`, `approvals`, `auth_scheme`, `credentials`, `approval_id`; the result is a connect attempt: `connection`, `redirect_url` and `expires_at`), `connection.update` (with `connection_id`, optional `name`, `use_in`, `approvals`), `connection.disconnect`, `connection.reconnect` (with `connection_id`, optional `credentials`), `connection.calls` (with `connection_id`, optional `before`, `limit`; the result has `calls`, newest first, and `has_more`) |
+| Channel exceptions | `channel.set_connection_enabled` (with `channel_id`, `connection_id`, `enabled`), `channel.set_skill_enabled` (with `channel_id`, `skill_id`, `enabled`). The result has `channel` |
+| Skills | `skill_directory.search` (with optional `search`, `source`, `cursor`, `limit`; the result has `entries`, `next_cursor` and `unavailable`), `skill_directory.sources`, `skill_directory.add_source` (with `url`), `skill_directory.remove_source` (with `id`), `skill.preview` (with `source`), `skill.install` (with `source`, optional `use_in`, `enabled`, `approval_id`; the result has `skill`), `skill.update` (with `skill_id`, optional `enabled`, `use_in`, `accept_new_version`), `skill.remove`, `skill.files` (with `skill_id`, optional `version`: `installed` or `pending`), `skill.read_file` (with `skill_id`, `path`, optional `version`) |
 | Clients | `client.pairing_code`, `client.list`, `client.revoke`, `client.push_register` |
 | Auth | `auth.http_token` |
 
@@ -466,6 +572,24 @@ The hub makes the `account_id` of `account.create` and sends it to the worker. I
 The hub ends a sign-in with `expired` when no update comes for 15 minutes (it checks every 5 seconds). When a worker disconnects, each of its sign-ins that has not ended becomes `failed` with "The worker went offline. Start the sign-in again." The hub deletes a sign-in one day after its last update.
 
 `task.retry` works for a Failed task, and for a task in Ready for review or Resolved whose session has ended. `task.reopen` (Not done) fails with `conflict` when archive deleted the workspace of the task. Retry is the way on then.
+
+#### Connectors and skills
+
+The connect flow:
+
+1. The client sends `connection.connect`. The hub checks the name and the scope, makes or reuses a Composio auth config (Composio-managed first), and calls Composio's `connected_accounts/link` with an alias.
+2. The hub stores the connection in `connecting` with the `redirect_url`, and answers with the connect attempt. The client opens the URL in the system browser.
+3. The hub polls Composio until the account is active, for at most 10 minutes. Each change is a feed upsert of the connection: `active` with the `identity`, or `failed` with a message.
+
+A scheme with no browser step, such as an API key, sends the form values in `credentials`. They go to Composio once and Consort does not store them. The `Debug` output of a request with `credentials`, and of `composio.set_key`, hides the values. The hub keeps the Composio key encrypted at rest and never returns it.
+
+`connection.connect` with an `approval_id` answers a connect card: the hub marks the card allowed and puts the `connection_id` on it. `skill.install` with an `approval_id` answers an install card in the same way. `approval.answer` on any hub card works too: the hub then acts with the settings on the card.
+
+`skill.install` fetches the skill at a commit, checks the format and the limits, and refuses path traversal, symlinks that leave the folder, and absolute paths, with `skill_invalid`. A skill whose audit failed is refused with `skill_blocked`. A skill with scripts is installed off. The hub removes Claude-specific `hooks`. An upload is a zip file that the client sends first with `PUT /v1/blobs/{sha256}`, at most 25 MiB. `skill.preview` does the same checks without installing, so the add dialog can show the facts first.
+
+The hub checks the sources of installed skills once a day. A new commit sets `update` to `available` with the changed files. Only `skill.update` with `accept_new_version` moves the pin. A new version that adds or changes a script turns the skill off until the user turns it on again. Running sessions keep their version.
+
+`channel.set_connection_enabled` and `channel.set_skill_enabled` change one exception for each request, so two clients do not undo each other. Turning an item on removes the exception only. An item whose `use_in` does not give it to the channel fails with `conflict`.
 
 ### Push notifications
 

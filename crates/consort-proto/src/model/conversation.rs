@@ -5,7 +5,10 @@ use serde::{Deserialize, Serialize};
 use super::common::{BlobRef, ModelSelection};
 use super::knowledge::MemoryScope;
 use super::work::{ApprovalMode, Isolation};
-use crate::ids::{ChannelId, GroupId, MessageId, RepoId, RoutineId, SessionId, TaskId, WorkerId};
+use crate::ids::{
+    ChannelId, ConnectionId, GroupId, MessageId, RepoId, RoutineId, SessionId, SkillId, TaskId,
+    WorkerId,
+};
 use crate::time::Timestamp;
 
 /// A named folder of channels in the sidebar.
@@ -80,6 +83,14 @@ pub struct Channel {
     /// coordinator turns, tasks and routine runs.
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Connections that this channel turned off (channel exceptions). A
+    /// channel can turn off only a connection whose "Use in" gives it to the
+    /// channel.
+    #[serde(default)]
+    pub disabled_connections: Vec<ConnectionId>,
+    /// Skills that this channel turned off (channel exceptions).
+    #[serde(default)]
+    pub disabled_skills: Vec<SkillId>,
     /// When the channel was archived.
     pub archived_at: Option<Timestamp>,
     /// When the channel was created.

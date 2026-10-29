@@ -531,6 +531,52 @@ fn approval_detail(details: &ApprovalDetails) -> (Option<String>, Option<String>
                 .filter(|t| !t.is_empty())
                 .map(str::to_owned),
         ),
+        // Hub cards. The desktop draws its own card for each kind later.
+        // Until then, the detail block names the facts that the user
+        // decides on.
+        ApprovalDetails::Connector(card) => {
+            let mut lines = vec![
+                format!(
+                    "Connector: {} ({})",
+                    card.connection_name, card.service_name
+                ),
+                format!("Tool: {}", card.tool),
+            ];
+            if !card.fields.is_empty() {
+                lines.push(String::new());
+                lines.extend(
+                    card.fields
+                        .iter()
+                        .map(|f| format!("{}: {}", f.label, f.value)),
+                );
+            }
+            (None, Some(lines.join("\n")))
+        }
+        ApprovalDetails::Management(card) => {
+            (None, Some(format!("{}\n\n{}", card.change, card.effect)))
+        }
+        ApprovalDetails::ConnectService(card) => (
+            None,
+            Some(format!(
+                "Service: {}\nName: {}",
+                card.service_name, card.name
+            )),
+        ),
+        ApprovalDetails::SignIn(card) => (None, Some(format!("Account: {}", card.account_label))),
+        ApprovalDetails::SkillInstall(card) => {
+            let mut lines = vec![format!("Skill: {}", card.name)];
+            lines.push(format!(
+                "License: {}",
+                card.license.as_deref().unwrap_or("not given")
+            ));
+            if !card.scripts.is_empty() {
+                lines.push(format!("Scripts: {}", card.scripts.join(", ")));
+            }
+            if let Some(reason) = &card.blocked_reason {
+                lines.push(format!("Blocked: {reason}"));
+            }
+            (None, Some(lines.join("\n")))
+        }
     }
 }
 
@@ -1596,6 +1642,8 @@ mod tests {
             default_approval_mode: ApprovalMode::AutoEdits,
             allowed_local_mcp_servers: vec![],
             memory_enabled: true,
+            disabled_connections: Vec::new(),
+            disabled_skills: Vec::new(),
             archived_at: None,
             created_at: Timestamp::from_millis(NOW - 100_000),
             updated_at: Timestamp::from_millis(NOW - 100_000),
@@ -3075,6 +3123,8 @@ mod tests {
                 plan: None,
                 secret_names: vec![],
                 sign_in_methods: vec![],
+                extras_enabled: true,
+                extras: None,
             }
         }
 

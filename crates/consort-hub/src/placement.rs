@@ -837,6 +837,8 @@ mod tests {
             plan: None,
             secret_names: Vec::new(),
             sign_in_methods: Vec::new(),
+            extras_enabled: true,
+            extras: None,
         }
     }
 

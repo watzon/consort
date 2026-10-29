@@ -67,6 +67,7 @@ async fn hub_tools_reach_with(kind: HarnessKind, allow_shell: bool) {
         system_prompt_append: String::new(),
         allowed_local_mcp_servers: vec![],
         channel_files: vec![],
+        extensions: Default::default(),
         resume: None,
         turn: None,
     };

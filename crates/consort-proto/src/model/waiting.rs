@@ -1,12 +1,23 @@
 //! Things that wait for the user: approvals and decisions.
+//!
+//! An approval comes from a harness (`request.opened`), or the hub makes it
+//! itself as a **hub card**: a connector approval, a management approval
+//! card, a connect card, a sign-in card or an install card. A hub card uses
+//! the same entity, the same card message and the same `approval.answer`
+//! path. Its `request_id` starts with [`HUB_CARD_REQUEST_PREFIX`], and the
+//! hub never sends `session.respond` for it.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::account::SignInMethod;
 use super::common::ValidationError;
+use super::connector::{DisplayField, ToolApprovals, ToolKind, UseIn};
+use super::skill::{SkillAudit, SkillSource};
 use crate::ids::{
-    ApprovalId, ChannelId, ClientId, DecisionId, MessageId, RequestId, SessionId, TaskId,
+    AccountId, ApprovalId, ChannelId, ClientId, ConnectionId, DecisionId, MessageId, RequestId,
+    SessionId, SignInId, SkillId, TaskId, WorkerId,
 };
 use crate::time::Timestamp;
 
@@ -24,6 +35,59 @@ pub enum ApprovalKind {
     Network,
     /// Anything else.
     Other,
+    /// Run a connector tool (a hub card).
+    Connector,
+    /// A change by a management tool (the management approval card).
+    Management,
+    /// Connect a service (the connect card).
+    ConnectService,
+    /// Sign in to a harness account (the sign-in card).
+    SignIn,
+    /// Install a skill (the install card).
+    SkillInstall,
+}
+
+impl ApprovalKind {
+    /// The wire string.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Command => "command",
+            Self::FileChange => "file_change",
+            Self::Tool => "tool",
+            Self::Network => "network",
+            Self::Other => "other",
+            Self::Connector => "connector",
+            Self::Management => "management",
+            Self::ConnectService => "connect_service",
+            Self::SignIn => "sign_in",
+            Self::SkillInstall => "skill_install",
+        }
+    }
+
+    /// Whether the hub makes approvals of this kind itself.
+    pub fn is_hub_card(self) -> bool {
+        matches!(
+            self,
+            Self::Connector
+                | Self::Management
+                | Self::ConnectService
+                | Self::SignIn
+                | Self::SkillInstall
+        )
+    }
+}
+
+/// The start of the `request_id` of every hub card: `hub:` and the approval
+/// ID. The hub answers a hub card itself and never sends `session.respond`.
+pub const HUB_CARD_REQUEST_PREFIX: &str = "hub:";
+/// The option ID that allows a hub card.
+pub const HUB_CARD_ALLOW: &str = "allow";
+/// The option ID that denies a hub card.
+pub const HUB_CARD_DENY: &str = "deny";
+
+/// The `request_id` of a hub card.
+pub fn hub_card_request_id(approval_id: ApprovalId) -> RequestId {
+    RequestId::new(format!("{HUB_CARD_REQUEST_PREFIX}{approval_id}"))
 }
 
 /// What an approval asks for. Serialized with a `kind` field.
@@ -63,6 +127,138 @@ pub enum ApprovalDetails {
         /// What the harness says about the action.
         text: Option<String>,
     },
+    /// A connector tool call whose approval rule asks the user. The card
+    /// shows `fields`. Allow runs the call. Don't refuses it.
+    Connector(Box<ConnectorCard>),
+    /// A management change that asks first. Allow makes the change. Don't
+    /// leaves everything as it is.
+    Management(Box<ManagementCard>),
+    /// The connect card. Continue in browser connects with these settings.
+    /// The app can change them first ("Change settings") and then send
+    /// `connection.connect` with this approval's ID.
+    ConnectService(Box<ConnectServiceCard>),
+    /// The sign-in card. The app shows the account's sign-in flow inline,
+    /// with the states of the sign-in dialog.
+    SignIn(Box<SignInCard>),
+    /// The install card, with the safety facts. Add installs the skill. Not
+    /// now drops it.
+    SkillInstall(Box<SkillInstallCard>),
+}
+
+/// A connector tool call whose approval rule asks the user. The card
+/// shows `fields`. Allow runs the call. Don't refuses it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConnectorCard {
+    /// The connection.
+    pub connection_id: ConnectionId,
+    /// The connection name, for example "Gmail Work".
+    pub connection_name: String,
+    /// The service name, for example "Gmail".
+    pub service_name: String,
+    /// The tool slug, for example `GMAIL_SEND_EMAIL`.
+    pub tool: String,
+    /// The tool kind.
+    pub tool_kind: ToolKind,
+    /// The arguments in a form to read, for example To, Subject and
+    /// Body.
+    #[serde(default)]
+    pub fields: Vec<DisplayField>,
+    /// The exact arguments that run when the user allows the call.
+    #[serde(default)]
+    pub arguments: Value,
+}
+
+/// A management change that asks first. Allow makes the change. Don't
+/// leaves everything as it is.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ManagementCard {
+    /// The management tool, for example `update_connection`.
+    pub tool: String,
+    /// What changes, for example "Use GitHub Work in channels with the
+    /// tag work".
+    pub change: String,
+    /// Its effect, for example "GitHub Work becomes available in 4 more
+    /// channels".
+    pub effect: String,
+    /// The arguments of the tool call, which the hub runs on Allow.
+    #[serde(default)]
+    pub arguments: Value,
+}
+
+/// The connect card. Continue in browser connects with these settings.
+/// The app can change them first ("Change settings") and then send
+/// `connection.connect` with this approval's ID.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConnectServiceCard {
+    /// The Composio toolkit slug.
+    pub service: String,
+    /// The service name.
+    pub service_name: String,
+    /// The service logo.
+    #[serde(default)]
+    pub logo_url: Option<String>,
+    /// The connection name.
+    pub name: String,
+    /// Where the connection can be used.
+    pub use_in: UseIn,
+    /// The approval rules.
+    pub approvals: ToolApprovals,
+    /// The connection, after the user continued.
+    #[serde(default)]
+    pub connection_id: Option<ConnectionId>,
+}
+
+/// The sign-in card. The app shows the account's sign-in flow inline,
+/// with the states of the sign-in dialog.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SignInCard {
+    /// The worker.
+    pub worker_id: WorkerId,
+    /// The account.
+    pub account_id: AccountId,
+    /// The account name.
+    pub account_label: String,
+    /// The harness.
+    pub harness: String,
+    /// The method that the assistant asked for. Empty lets the user
+    /// choose.
+    #[serde(default)]
+    pub method: Option<SignInMethod>,
+    /// The sign-in, after the user started it.
+    #[serde(default)]
+    pub sign_in_id: Option<SignInId>,
+}
+
+/// The install card, with the safety facts. Add installs the skill. Not
+/// now drops it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SkillInstallCard {
+    /// The skill name.
+    pub name: String,
+    /// What it does.
+    pub description: String,
+    /// Where it comes from.
+    pub source: SkillSource,
+    /// The commit that would be pinned.
+    #[serde(default)]
+    pub commit: Option<String>,
+    /// The license.
+    #[serde(default)]
+    pub license: Option<String>,
+    /// The files that can run.
+    #[serde(default)]
+    pub scripts: Vec<String>,
+    /// The audit results.
+    #[serde(default)]
+    pub audits: Vec<SkillAudit>,
+    /// Where it can be used.
+    pub use_in: UseIn,
+    /// Why the hub would block it. A blocked skill cannot be added.
+    #[serde(default)]
+    pub blocked_reason: Option<String>,
+    /// The skill, after the user added it.
+    #[serde(default)]
+    pub skill_id: Option<SkillId>,
 }
 
 impl ApprovalDetails {
@@ -74,7 +270,46 @@ impl ApprovalDetails {
             Self::Tool { .. } => ApprovalKind::Tool,
             Self::Network { .. } => ApprovalKind::Network,
             Self::Other { .. } => ApprovalKind::Other,
+            Self::Connector(_) => ApprovalKind::Connector,
+            Self::Management(_) => ApprovalKind::Management,
+            Self::ConnectService(_) => ApprovalKind::ConnectService,
+            Self::SignIn(_) => ApprovalKind::SignIn,
+            Self::SkillInstall(_) => ApprovalKind::SkillInstall,
         }
+    }
+
+    /// Whether the hub makes this approval itself (a hub card).
+    pub fn is_hub_card(&self) -> bool {
+        self.kind().is_hub_card()
+    }
+
+    /// The two options of a hub card, with the button text of the design:
+    /// Allow and Don't for a connector or management card, Continue in
+    /// browser and Not now for a connect card, Sign in and Not now for a
+    /// sign-in card, and Add and Not now for an install card. `None` for an
+    /// approval from a harness.
+    pub fn hub_card_options(&self) -> Option<Vec<RequestOption>> {
+        let (allow, deny) = match self.kind() {
+            ApprovalKind::Connector | ApprovalKind::Management => ("Allow", "Don't"),
+            ApprovalKind::ConnectService => ("Continue in browser", "Not now"),
+            ApprovalKind::SignIn => ("Sign in", "Not now"),
+            ApprovalKind::SkillInstall => ("Add", "Not now"),
+            _ => return None,
+        };
+        Some(vec![
+            RequestOption {
+                id: HUB_CARD_ALLOW.to_owned(),
+                label: allow.to_owned(),
+                kind: RequestOptionKind::AllowOnce,
+                description: None,
+            },
+            RequestOption {
+                id: HUB_CARD_DENY.to_owned(),
+                label: deny.to_owned(),
+                kind: RequestOptionKind::DenyOnce,
+                description: None,
+            },
+        ])
     }
 }
 
@@ -172,6 +407,16 @@ impl Approval {
     /// The option with this ID.
     pub fn option(&self, option_id: &str) -> Option<&RequestOption> {
         self.options.iter().find(|o| o.id == option_id)
+    }
+
+    /// Whether the hub made this approval itself. The hub then carries out
+    /// the answer, and sends no `session.respond`.
+    pub fn is_hub_card(&self) -> bool {
+        self.details.is_hub_card()
+            && self
+                .request_id
+                .as_str()
+                .starts_with(HUB_CARD_REQUEST_PREFIX)
     }
 }
 
@@ -481,6 +726,140 @@ mod tests {
         assert_eq!(details.kind(), ApprovalKind::Command);
         let other: ApprovalDetails = serde_json::from_value(json!({"kind": "other"})).unwrap();
         assert_eq!(other, ApprovalDetails::Other { text: None });
+    }
+
+    fn hub_cards() -> Vec<ApprovalDetails> {
+        vec![
+            ApprovalDetails::Connector(Box::new(ConnectorCard {
+                connection_id: ConnectionId::new(),
+                connection_name: "Gmail Work".into(),
+                service_name: "Gmail".into(),
+                tool: "GMAIL_SEND_EMAIL".into(),
+                tool_kind: ToolKind::Change,
+                fields: vec![
+                    DisplayField {
+                        label: "To".into(),
+                        value: "kevin@example.com".into(),
+                    },
+                    DisplayField {
+                        label: "Subject".into(),
+                        value: "Friday".into(),
+                    },
+                ],
+                arguments: json!({"recipient_email": "kevin@example.com", "subject": "Friday"}),
+            })),
+            ApprovalDetails::Management(Box::new(ManagementCard {
+                tool: "update_connection".into(),
+                change: "Use GitHub Work in every channel".into(),
+                effect: "GitHub Work becomes available in 4 more channels".into(),
+                arguments: json!({"connection": "github_work", "use_in": {"kind": "every_channel"}}),
+            })),
+            ApprovalDetails::ConnectService(Box::new(ConnectServiceCard {
+                service: "gmail".into(),
+                service_name: "Gmail".into(),
+                logo_url: None,
+                name: "Gmail Work".into(),
+                use_in: UseIn::Tags {
+                    tags: vec!["work".into()],
+                },
+                approvals: ToolApprovals::default(),
+                connection_id: None,
+            })),
+            ApprovalDetails::SignIn(Box::new(SignInCard {
+                worker_id: WorkerId::new(),
+                account_id: AccountId::new(),
+                account_label: "Claude Work".into(),
+                harness: "claude".into(),
+                method: Some(SignInMethod::ClaudePlan),
+                sign_in_id: Some(SignInId::new()),
+            })),
+            ApprovalDetails::SkillInstall(Box::new(SkillInstallCard {
+                name: "pdf-forms".into(),
+                description: "Fill PDF forms.".into(),
+                source: SkillSource::Git {
+                    url: "https://github.com/anthropics/skills".into(),
+                    path: Some("pdf".into()),
+                    git_ref: None,
+                },
+                commit: Some("abc123".into()),
+                license: Some("MIT".into()),
+                scripts: vec!["scripts/fill.py".into()],
+                audits: vec![],
+                use_in: UseIn::EveryChannel,
+                blocked_reason: None,
+                skill_id: None,
+            })),
+        ]
+    }
+
+    #[test]
+    fn hub_card_details_round_trip() {
+        let kinds = [
+            "connector",
+            "management",
+            "connect_service",
+            "sign_in",
+            "skill_install",
+        ];
+        for (details, kind) in hub_cards().into_iter().zip(kinds) {
+            let value = serde_json::to_value(&details).unwrap();
+            assert_eq!(value["kind"], kind);
+            assert_eq!(details.kind().as_str(), kind);
+            assert_eq!(serde_json::to_value(details.kind()).unwrap(), json!(kind));
+            assert!(details.is_hub_card());
+            let options = details.hub_card_options().unwrap();
+            assert_eq!(options.len(), 2);
+            assert_eq!(options[0].id, HUB_CARD_ALLOW);
+            assert!(options[0].kind.is_allow());
+            assert_eq!(options[1].id, HUB_CARD_DENY);
+            assert!(options[1].kind.is_deny());
+            assert_eq!(
+                serde_json::from_value::<ApprovalDetails>(value).unwrap(),
+                details
+            );
+        }
+        let labels: Vec<String> = hub_cards()
+            .iter()
+            .map(|d| d.hub_card_options().unwrap()[0].label.clone())
+            .collect();
+        assert_eq!(
+            labels,
+            ["Allow", "Allow", "Continue in browser", "Sign in", "Add"]
+        );
+        let harness = ApprovalDetails::Network {
+            target: "github.com".into(),
+        };
+        assert!(!harness.is_hub_card());
+        assert_eq!(harness.hub_card_options(), None);
+    }
+
+    #[test]
+    fn a_hub_card_approval_needs_the_hub_request_id() {
+        let id = ApprovalId::new();
+        let mut approval = Approval {
+            id,
+            channel_id: ChannelId::new(),
+            session_id: SessionId::new(),
+            task_id: None,
+            message_id: MessageId::new(),
+            request_id: hub_card_request_id(id),
+            summary: "Send an email with Gmail Work".into(),
+            details: hub_cards().remove(0),
+            options: hub_cards()[0].hub_card_options().unwrap(),
+            status: ApprovalStatus::Pending,
+            answer_option_id: None,
+            answered_at: None,
+            answered_by_client_id: None,
+            created_at: crate::time::Timestamp::from_millis(1),
+        };
+        assert!(approval.request_id.as_str().starts_with("hub:apr_"));
+        assert!(approval.is_hub_card());
+        let back: Approval =
+            serde_json::from_value(serde_json::to_value(&approval).unwrap()).unwrap();
+        assert_eq!(back, approval);
+        // A harness cannot make a hub card by naming the kind.
+        approval.request_id = RequestId::new("toolu_1");
+        assert!(!approval.is_hub_card());
     }
 
     #[test]

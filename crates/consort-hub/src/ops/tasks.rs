@@ -301,6 +301,7 @@ impl Hub {
                         system_prompt_append: system_prompt,
                         allowed_local_mcp_servers: local_mcp,
                         channel_files: files,
+                        extensions: Default::default(),
                         resume: None,
                         turn: Some(TurnInput {
                             text: first_turn,

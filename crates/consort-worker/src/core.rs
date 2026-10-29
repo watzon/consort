@@ -788,6 +788,10 @@ impl Core {
                     plan: status.and_then(|s| s.plan.clone()),
                     secret_names: self.secret_names(account),
                     sign_in_methods: crate::accounts::sign_in_methods(account, status),
+                    // The extras toggle is not built yet: every account runs with its
+                    // provider extras, as before.
+                    extras_enabled: true,
+                    extras: None,
                 }
             })
             .collect();

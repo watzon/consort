@@ -428,6 +428,8 @@ pub fn inventory(account_id: AccountId) -> Inventory {
             plan: None,
             secret_names: Vec::new(),
             sign_in_methods: Vec::new(),
+            extras_enabled: true,
+            extras: None,
         }],
         local_mcp_servers: Vec::new(),
         checkouts: Vec::new(),

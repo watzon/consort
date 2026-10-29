@@ -199,6 +199,7 @@ async fn create_update_and_remove_an_account_with_a_profile_folder() {
             label: Some("Claude Work".into()),
             env_set,
             env_remove: vec!["ANTHROPIC_API_KEY".into()],
+            extras_enabled: None,
         }
         .into(),
     )
@@ -206,6 +207,25 @@ async fn create_update_and_remove_an_account_with_a_profile_folder() {
     .unwrap();
     assert_eq!(core.config_snapshot().accounts[0].label, "Claude Work");
     assert_eq!(core.inventory().accounts[0].secret_names, ["OTHER_KEY"]);
+
+    // The provider extras toggle is not built yet. The worker refuses the
+    // whole update, so the name does not change either.
+    let err = core
+        .account_command(
+            AccountUpdateCommand {
+                account_id: id,
+                label: Some("Claude Other".into()),
+                env_set: SecretEnv::new(),
+                env_remove: vec![],
+                extras_enabled: Some(false),
+            }
+            .into(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::Unsupported);
+    assert_eq!(core.config_snapshot().accounts[0].label, "Claude Work");
+    assert!(core.inventory().accounts[0].extras_enabled);
 
     core.account_command(AccountRemoveCommand { account_id: id }.into())
         .await
@@ -326,6 +346,7 @@ async fn an_api_key_sign_in_probes_the_saved_key() {
             label: None,
             env_set,
             env_remove: vec![],
+            extras_enabled: None,
         }
         .into(),
     )

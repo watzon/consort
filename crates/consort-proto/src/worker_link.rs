@@ -19,9 +19,11 @@ use crate::ids::{
     AccountId, ChannelId, ItemId, NativeRef, RepoId, RequestId, SessionId, SignInId, TaskId, TurnId,
 };
 use crate::model::{
-    AcpAccountSpec, ApprovalDetails, ApprovalMode, BlobRef, FileRef, Inventory, Isolation,
-    ModelOptions, RequestOption, SecretEnv, SessionItem, SessionRole, SessionState, Sha256Hash,
-    SignInMethod, SignInState, ToolId, Usage, ValidationError,
+    AcpAccountSpec, ApprovalDetails, ApprovalMode, BlobRef, ConnectorContextEntry, FileRef,
+    Inventory, Isolation, ModelOptions, RequestOption, SecretEnv, SessionItem, SessionRole,
+    SessionState, Sha256Hash, SignInMethod, SignInState, SkillBundle, SkillBundleRef,
+    SkillContextEntry, ToolId, Usage, ValidationError, render_connectors_block,
+    render_skills_block,
 };
 use crate::time::Timestamp;
 use crate::tools::{ToolCallResult, ToolDefinition};
@@ -303,6 +305,16 @@ pub struct SignInUpdate {
     pub state: SignInState,
 }
 
+/// `skill_bundle.get`: the file list of one skill version, by its content
+/// hash. The hub answers only for a hash that a `session.start` to this
+/// worker named, and `not_found` otherwise. The worker then downloads each
+/// file with `GET /v1/blobs/{sha256}` and checks the content hash.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillBundleGet {
+    /// The content hash from [`SkillBundleRef`].
+    pub content_hash: Sha256Hash,
+}
+
 message_family! {
     /// Everything that a worker sends to the hub after authentication.
     pub enum WorkerToHub {
@@ -318,6 +330,8 @@ message_family! {
         ToolCall("tool.call", ToolCall => ToolCallResult),
         /// A sign-in changed. No response.
         SignInUpdate("sign_in.update", SignInUpdate),
+        /// The files of a skill version.
+        SkillBundleGet("skill_bundle.get", SkillBundleGet => SkillBundle),
     }
 }
 
@@ -388,6 +402,46 @@ pub struct ResumeSpec {
     pub native_ref: NativeRef,
 }
 
+/// The connectors and skills of a session: its channel's effective set
+/// when the session starts. The hub fills it, and the worker renders the
+/// context blocks with [`SessionExtensions::prompt_blocks`] and delivers the
+/// skills. A change to the effective set reaches the next session.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionExtensions {
+    /// One entry per connection that the session can use, for the
+    /// "Connectors in this channel" block.
+    #[serde(default)]
+    pub connectors: Vec<ConnectorContextEntry>,
+    /// The skills that the worker writes into the session's skill folder.
+    #[serde(default)]
+    pub skills: Vec<SkillBundleRef>,
+    /// The name and description of each skill, for the "Skills in this
+    /// channel" block, in the order of `skills`.
+    #[serde(default)]
+    pub skill_context: Vec<SkillContextEntry>,
+}
+
+impl SessionExtensions {
+    /// Whether the session has no connector and no skill.
+    pub fn is_empty(&self) -> bool {
+        self.connectors.is_empty() && self.skills.is_empty() && self.skill_context.is_empty()
+    }
+
+    /// The context blocks to append to the system prompt, with a blank line
+    /// between them. `native_skills` is true when the harness loads the
+    /// skills itself. Empty when there is nothing to say.
+    pub fn prompt_blocks(&self, native_skills: bool) -> String {
+        [
+            render_connectors_block(&self.connectors),
+            render_skills_block(&self.skill_context, native_skills),
+        ]
+        .into_iter()
+        .filter(|b| !b.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+    }
+}
+
 /// `session.start`: open a harness session.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionStart {
@@ -420,6 +474,9 @@ pub struct SessionStart {
     /// `<workspace>/.channel/files/`.
     #[serde(default)]
     pub channel_files: Vec<FileRef>,
+    /// The connectors and skills of the session. Empty from an older hub.
+    #[serde(default, skip_serializing_if = "SessionExtensions::is_empty")]
+    pub extensions: SessionExtensions,
     /// Resume this harness session instead of starting a new one.
     pub resume: Option<ResumeSpec>,
     /// The first turn.
@@ -569,6 +626,10 @@ pub struct AccountUpdateCommand {
     /// Secret variables to remove, by name.
     #[serde(default)]
     pub env_remove: Vec<String>,
+    /// Turn the provider extras of the account on or off. The worker
+    /// stores it in `worker.toml` and uses it from the next session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extras_enabled: Option<bool>,
 }
 
 /// `account.remove`: sign out where possible and delete the profile folder.
@@ -928,6 +989,10 @@ mod tests {
                 },
             }
             .into(),
+            SkillBundleGet {
+                content_hash: "c".repeat(64).parse().unwrap(),
+            }
+            .into(),
         ];
         assert_eq!(messages.len(), WorkerToHub::TYPES.len() - 1);
         for message in messages {
@@ -939,6 +1004,133 @@ mod tests {
             assert_eq!(req.decode::<WorkerToHub>().unwrap(), message);
         }
         assert!(WorkerToHub::TYPES.contains(&"tool.call"));
+    }
+
+    fn extensions() -> SessionExtensions {
+        SessionExtensions {
+            connectors: vec![ConnectorContextEntry {
+                handle: "gmail_work".into(),
+                service_name: "Gmail".into(),
+                identity: Some("chris@work.example".into()),
+                needs_sign_in: false,
+            }],
+            skills: vec![SkillBundleRef {
+                skill_id: "skl_00000000-0000-0000-0000-000000000005".parse().unwrap(),
+                name: "pdf-forms".into(),
+                content_hash: "c".repeat(64).parse().unwrap(),
+            }],
+            skill_context: vec![SkillContextEntry {
+                name: "pdf-forms".into(),
+                description: "Fill PDF forms.".into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn session_extensions_render_and_default() {
+        let ext = extensions();
+        assert_eq!(
+            ext.prompt_blocks(true),
+            "Connectors in this channel:
+- gmail_work: Gmail, chris@work.example
+To use one, call list_connector_tools with its handle, then run_connector_tool.
+
+Skills in this channel:
+- pdf-forms: Fill PDF forms.
+They are installed as skills. Use one when the task fits it."
+        );
+        assert_eq!(SessionExtensions::default().prompt_blocks(false), "");
+        let only_skills = SessionExtensions {
+            connectors: vec![],
+            ..ext.clone()
+        };
+        assert!(
+            only_skills
+                .prompt_blocks(false)
+                .starts_with("Skills in this channel:")
+        );
+        // A `session.start` from an older hub has no extensions, and an
+        // empty set is left out of the wire.
+        let start = SessionStart {
+            session_id: ses(),
+            role: SessionRole::Coordinator,
+            channel_id: ChannelId::new(),
+            task_id: None,
+            account_id: AccountId::new(),
+            model: "opus".into(),
+            options: ModelOptions::new(),
+            approval_mode: ApprovalMode::Ask,
+            workspace: WorkspaceSpec {
+                repos: vec![],
+                isolation: Isolation::Clone,
+                carry_uncommitted: false,
+            },
+            system_prompt_append: String::new(),
+            allowed_local_mcp_servers: vec![],
+            channel_files: vec![],
+            extensions: SessionExtensions::default(),
+            resume: None,
+            turn: None,
+        };
+        let value = serde_json::to_value(&start).unwrap();
+        assert!(value.get("extensions").is_none());
+        assert_eq!(
+            serde_json::from_value::<SessionStart>(value).unwrap(),
+            start
+        );
+        let with = SessionStart {
+            extensions: ext,
+            ..start
+        };
+        let value = serde_json::to_value(&with).unwrap();
+        assert_eq!(value["extensions"]["skills"][0]["name"], "pdf-forms");
+        assert_eq!(serde_json::from_value::<SessionStart>(value).unwrap(), with);
+    }
+
+    #[test]
+    fn skill_bundle_get_is_a_request() {
+        let get = SkillBundleGet {
+            content_hash: "c".repeat(64).parse().unwrap(),
+        };
+        let frame = Frame::request(FrameId::new("b1"), &get).unwrap();
+        let value: Value = serde_json::from_str(&frame.to_text().unwrap()).unwrap();
+        assert_eq!(
+            value,
+            json!({"v": 1, "id": "b1", "type": "skill_bundle.get", "body": {"content_hash": "c".repeat(64)}})
+        );
+        let bundle = SkillBundle {
+            skill_id: "skl_00000000-0000-0000-0000-000000000005".parse().unwrap(),
+            name: "pdf-forms".into(),
+            content_hash: crate::model::skill_content_hash(&[]),
+            files: vec![],
+        };
+        let ok = Frame::ok(FrameId::new("b1"), &bundle).unwrap();
+        let Frame::Response(resp) = Frame::parse(&ok.to_text().unwrap()).unwrap() else {
+            panic!("expected a response");
+        };
+        assert_eq!(resp.into_response::<SkillBundleGet>().unwrap(), bundle);
+    }
+
+    #[test]
+    fn account_update_carries_the_extras_toggle() {
+        let update = AccountUpdateCommand {
+            account_id: "acc_00000000-0000-0000-0000-000000000009".parse().unwrap(),
+            label: None,
+            env_set: SecretEnv::new(),
+            env_remove: vec![],
+            extras_enabled: Some(false),
+        };
+        let value = serde_json::to_value(&update).unwrap();
+        assert_eq!(value["extras_enabled"], false);
+        assert_eq!(
+            serde_json::from_value::<AccountUpdateCommand>(value).unwrap(),
+            update
+        );
+        let old: AccountUpdateCommand = serde_json::from_value(
+            json!({"account_id": "acc_00000000-0000-0000-0000-000000000009"}),
+        )
+        .unwrap();
+        assert_eq!(old.extras_enabled, None);
     }
 
     #[test]
@@ -982,6 +1174,7 @@ mod tests {
             label: None,
             env_set: [("OPENAI_API_KEY", "sk-proj-other")].into_iter().collect(),
             env_remove: vec![],
+            extras_enabled: None,
         };
         let code = SignInCodeCommand {
             sign_in_id: SignInId::new(),
@@ -1038,6 +1231,7 @@ mod tests {
                 system_prompt_append: "You are a task.".into(),
                 allowed_local_mcp_servers: vec!["home-assistant".into()],
                 channel_files: vec![],
+                extensions: extensions(),
                 resume: Some(ResumeSpec {
                     native_ref: NativeRef::new("abc"),
                 }),
@@ -1099,6 +1293,7 @@ mod tests {
                 label: Some("Renamed".into()),
                 env_set: [("KEY", "v")].into_iter().collect(),
                 env_remove: vec!["OLD".into()],
+                extras_enabled: Some(true),
             }
             .into(),
             AccountRemoveCommand {

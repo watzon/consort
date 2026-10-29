@@ -30,14 +30,35 @@ use crate::ids::{
 };
 use crate::model::{
     AcpAccountSpec, AcpRegistryAgent, Approval, ApprovalMode, BlobRef, Channel, ChannelFile,
-    Client, Decision, DecisionAnswer, ExpectedHash, FavoriteModel, Group, Isolation, MemoryNote,
-    MemoryScope, Message, ModelSelection, PREFERENCES_ENTITY_ID, PlacementRequest, Preferences,
-    PushProvider, ReadMarker, Repo, Routine, RoutineAction, RoutineRun, RoutineSchedule, SecretEnv,
-    SessionItem, Sha256Hash, SignIn, SignInMethod, Task, ToolId, Worker, memory_note_entity_id,
+    Client, Connection, Decision, DecisionAnswer, ExpectedHash, FavoriteModel, Group, Isolation,
+    MemoryNote, MemoryScope, Message, ModelSelection, PREFERENCES_ENTITY_ID, PlacementRequest,
+    Preferences, PushProvider, ReadMarker, Repo, Routine, RoutineAction, RoutineRun,
+    RoutineSchedule, SecretEnv, SessionItem, Sha256Hash, SignIn, SignInMethod, Skill, Task, ToolId,
+    Worker, memory_note_entity_id,
 };
 use crate::time::Timestamp;
 use crate::tools::{FilesListResult, MemoryListResult, RoutineResult, SearchResult};
 use crate::worker_link::ItemDetailResult;
+
+mod connectors;
+mod skills;
+
+pub use connectors::{
+    CATALOG_PAGE_MAX, CONNECTOR_CALLS_PAGE_MAX, ChannelSetConnectionEnabled,
+    ChannelSetSkillEnabled, ComposioGetStatus, ComposioRemoveKey, ComposioSetKey,
+    ComposioStatusResult, ConnectAttempt, ConnectionCalls, ConnectionCallsResult,
+    ConnectionConnect, ConnectionDisconnect, ConnectionReconnect, ConnectionResult,
+    ConnectionUpdate, ConnectorCatalogCategories, ConnectorCatalogCategoriesResult,
+    ConnectorCatalogSearch, ConnectorCatalogSearchResult, ConnectorCatalogService,
+    ConnectorServiceDetail,
+};
+pub use skills::{
+    SKILL_DIRECTORY_PAGE_MAX, SkillDirectoryAddSource, SkillDirectoryRemoveSource,
+    SkillDirectorySearch, SkillDirectorySearchResult, SkillDirectorySources,
+    SkillDirectorySourcesResult, SkillFileContent, SkillFiles, SkillFilesResult, SkillInstall,
+    SkillInstallSource, SkillPreview, SkillPreviewResult, SkillReadFile, SkillRemove, SkillResult,
+    SkillUpdate, SkillVersion,
+};
 
 /// How long the hub keeps feed entries, in milliseconds (30 days).
 pub const FEED_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1_000;
@@ -179,6 +200,12 @@ pub struct Snapshot {
     /// snapshot from an older hub leave it out.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preferences: Option<Preferences>,
+    /// Every connection, for the scope `all`. Left out when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub connections: Vec<Connection>,
+    /// Every installed skill, for the scope `all`. Left out when empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub skills: Vec<Skill>,
 }
 
 /// `sync.subscribe`. The hub answers `ok`, then sends every feed entry after
@@ -231,6 +258,10 @@ pub enum EntityKind {
     /// [`Preferences`]. There is one record, with the ID
     /// [`PREFERENCES_ENTITY_ID`].
     Preferences,
+    /// [`Connection`].
+    Connection,
+    /// [`Skill`].
+    Skill,
 }
 
 /// The full client view of an entity after a write.
@@ -269,6 +300,10 @@ pub enum EntityPayload {
     SignIn(SignIn),
     /// The user's preferences.
     Preferences(Preferences),
+    /// A connection.
+    Connection(Connection),
+    /// An installed skill.
+    Skill(Skill),
 }
 
 impl EntityPayload {
@@ -291,6 +326,8 @@ impl EntityPayload {
             Self::Client(_) => EntityKind::Client,
             Self::SignIn(_) => EntityKind::SignIn,
             Self::Preferences(_) => EntityKind::Preferences,
+            Self::Connection(_) => EntityKind::Connection,
+            Self::Skill(_) => EntityKind::Skill,
         }
     }
 
@@ -319,6 +356,8 @@ impl EntityPayload {
             Self::Client(e) => e.id.to_string(),
             Self::SignIn(e) => e.id.to_string(),
             Self::Preferences(_) => PREFERENCES_ENTITY_ID.to_owned(),
+            Self::Connection(e) => e.id.to_string(),
+            Self::Skill(e) => e.id.to_string(),
         }
     }
 
@@ -345,7 +384,9 @@ impl EntityPayload {
             | Self::Worker(_)
             | Self::Client(_)
             | Self::SignIn(_)
-            | Self::Preferences(_) => None,
+            | Self::Preferences(_)
+            | Self::Connection(_)
+            | Self::Skill(_) => None,
         }
     }
 }
@@ -1381,6 +1422,9 @@ pub struct AccountUpdate {
     /// Secret variables to remove, by name.
     #[serde(default)]
     pub env_remove: Vec<String>,
+    /// Turn the provider extras of the account on or off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extras_enabled: Option<bool>,
 }
 
 /// `account.remove`: the worker signs out where it can and deletes the
@@ -1667,6 +1711,52 @@ message_family! {
         PreferencesSetFavoriteModel("preferences.set_favorite_model", PreferencesSetFavoriteModel => PreferencesResult),
         /// Get a bearer token for the blob endpoints.
         AuthHttpToken("auth.http_token", AuthHttpToken => HttpToken),
+        /// Store the Composio key on the hub.
+        ComposioSetKey("composio.set_key", ComposioSetKey => ComposioStatusResult),
+        /// Delete the Composio key.
+        ComposioRemoveKey("composio.remove_key", ComposioRemoveKey => ComposioStatusResult),
+        /// The Composio settings, without the key.
+        ComposioGetStatus("composio.status", ComposioGetStatus => ComposioStatusResult),
+        /// Search the connector catalog.
+        ConnectorCatalogSearch("connector_catalog.search", ConnectorCatalogSearch => ConnectorCatalogSearchResult),
+        /// The categories of the connector catalog.
+        ConnectorCatalogCategories("connector_catalog.categories", ConnectorCatalogCategories => ConnectorCatalogCategoriesResult),
+        /// One service with its tools.
+        ConnectorCatalogService("connector_catalog.service", ConnectorCatalogService => ConnectorServiceDetail),
+        /// Connect a service.
+        ConnectionConnect("connection.connect", ConnectionConnect => ConnectAttempt),
+        /// Change a connection.
+        ConnectionUpdate("connection.update", ConnectionUpdate => ConnectionResult),
+        /// Disconnect a connection.
+        ConnectionDisconnect("connection.disconnect", ConnectionDisconnect => Empty),
+        /// Sign a connection in again.
+        ConnectionReconnect("connection.reconnect", ConnectionReconnect => ConnectAttempt),
+        /// A page of a connection's audit log.
+        ConnectionCalls("connection.calls", ConnectionCalls => ConnectionCallsResult),
+        /// Turn a connection off or on in one channel.
+        ChannelSetConnectionEnabled("channel.set_connection_enabled", ChannelSetConnectionEnabled => ChannelResult),
+        /// Turn a skill off or on in one channel.
+        ChannelSetSkillEnabled("channel.set_skill_enabled", ChannelSetSkillEnabled => ChannelResult),
+        /// Search the skill directories.
+        SkillDirectorySearch("skill_directory.search", SkillDirectorySearch => SkillDirectorySearchResult),
+        /// The skill directories.
+        SkillDirectorySources("skill_directory.sources", SkillDirectorySources => SkillDirectorySourcesResult),
+        /// Add a marketplace file.
+        SkillDirectoryAddSource("skill_directory.add_source", SkillDirectoryAddSource => SkillDirectorySourcesResult),
+        /// Remove a marketplace file.
+        SkillDirectoryRemoveSource("skill_directory.remove_source", SkillDirectoryRemoveSource => SkillDirectorySourcesResult),
+        /// Fetch and check a skill without installing it.
+        SkillPreview("skill.preview", SkillPreview => SkillPreviewResult),
+        /// Install a skill.
+        SkillInstall("skill.install", SkillInstall => SkillResult),
+        /// Change a skill.
+        SkillUpdate("skill.update", SkillUpdate => SkillResult),
+        /// Remove a skill.
+        SkillRemove("skill.remove", SkillRemove => Empty),
+        /// The file list of a skill.
+        SkillFiles("skill.files", SkillFiles => SkillFilesResult),
+        /// One file of a skill.
+        SkillReadFile("skill.read_file", SkillReadFile => SkillFileContent),
     }
 }
 
@@ -1701,8 +1791,11 @@ message_family! {
 mod tests {
     use super::*;
     use crate::frame::{Frame, FrameId, MessageFamily};
+    use crate::ids::{ConnectionId, ConnectorCallId, SkillId};
     use crate::model::{
-        ApprovalMode, Author, ChannelKind, Isolation, MemoryAuthor, MessageKind, TaskCreator,
+        ApprovalMode, AuthSchemeKind, Author, ChannelKind, ConnectionStatus, Isolation,
+        MemoryAuthor, MessageKind, SkillSource, SkillUpdateState, TaskCreator, ToolApprovals,
+        UseIn,
     };
     use crate::status::TaskStatus;
     use serde_json::json;
@@ -2246,6 +2339,7 @@ mod tests {
                 label: Some("Claude Work".into()),
                 env_set: [("ANTHROPIC_API_KEY", "sk")].into_iter().collect(),
                 env_remove: vec!["OLD".into()],
+                extras_enabled: Some(false),
             }
             .into(),
             AccountRemove {
@@ -2291,7 +2385,406 @@ mod tests {
             }
             .into(),
             AuthHttpToken {}.into(),
+            ComposioSetKey {
+                api_key: "ak_secret".into(),
+            }
+            .into(),
+            ComposioRemoveKey {}.into(),
+            ComposioGetStatus {}.into(),
+            ConnectorCatalogSearch {
+                search: Some("mail".into()),
+                category: Some("email".into()),
+                cursor: None,
+                limit: Some(20),
+            }
+            .into(),
+            ConnectorCatalogCategories {}.into(),
+            ConnectorCatalogService {
+                service: "gmail".into(),
+            }
+            .into(),
+            ConnectionConnect {
+                service: "gmail".into(),
+                name: "Gmail Work".into(),
+                use_in: UseIn::Tags {
+                    tags: vec!["work".into()],
+                },
+                approvals: ToolApprovals::default(),
+                auth_scheme: Some(AuthSchemeKind::Oauth2),
+                credentials: SecretEnv::new(),
+                approval_id: Some(ApprovalId::new()),
+            }
+            .into(),
+            ConnectionUpdate {
+                connection_id: con(),
+                name: Some("Gmail Office".into()),
+                use_in: Some(UseIn::EveryChannel),
+                approvals: None,
+            }
+            .into(),
+            ConnectionDisconnect {
+                connection_id: con(),
+            }
+            .into(),
+            ConnectionReconnect {
+                connection_id: con(),
+                credentials: [("api_key", "k")].into_iter().collect(),
+            }
+            .into(),
+            ConnectionCalls {
+                connection_id: con(),
+                before: Some(ConnectorCallId::new()),
+                limit: Some(20),
+            }
+            .into(),
+            ChannelSetConnectionEnabled {
+                channel_id: chn(),
+                connection_id: con(),
+                enabled: false,
+            }
+            .into(),
+            ChannelSetSkillEnabled {
+                channel_id: chn(),
+                skill_id: skl(),
+                enabled: true,
+            }
+            .into(),
+            SkillDirectorySearch {
+                search: Some("pdf".into()),
+                source: Some("smithery".into()),
+                cursor: Some("c2".into()),
+                limit: None,
+            }
+            .into(),
+            SkillDirectorySources {}.into(),
+            SkillDirectoryAddSource {
+                url: "https://example.com/.claude-plugin/marketplace.json".into(),
+            }
+            .into(),
+            SkillDirectoryRemoveSource {
+                id: "https://example.com/.claude-plugin/marketplace.json".into(),
+            }
+            .into(),
+            SkillPreview {
+                source: SkillInstallSource::Git {
+                    url: "anthropics/skills".into(),
+                    path: Some("pdf".into()),
+                    git_ref: Some("main".into()),
+                },
+            }
+            .into(),
+            SkillInstall {
+                source: SkillInstallSource::Upload {
+                    blob_sha256: "f".repeat(64).parse().unwrap(),
+                    size: 2_048,
+                    file_name: "my-skill.zip".into(),
+                },
+                use_in: UseIn::Channels {
+                    channel_ids: vec![chn()],
+                },
+                enabled: Some(true),
+                approval_id: None,
+            }
+            .into(),
+            SkillUpdate {
+                skill_id: skl(),
+                enabled: Some(true),
+                use_in: None,
+                accept_new_version: true,
+            }
+            .into(),
+            SkillRemove { skill_id: skl() }.into(),
+            SkillFiles {
+                skill_id: skl(),
+                version: SkillVersion::Pending,
+            }
+            .into(),
+            SkillReadFile {
+                skill_id: skl(),
+                path: "SKILL.md".into(),
+                version: SkillVersion::Installed,
+            }
+            .into(),
         ]
+    }
+
+    fn con() -> ConnectionId {
+        "con_00000000-0000-0000-0000-00000000000b".parse().unwrap()
+    }
+
+    fn skl() -> SkillId {
+        "skl_00000000-0000-0000-0000-00000000000c".parse().unwrap()
+    }
+
+    fn connection() -> Connection {
+        Connection {
+            id: con(),
+            name: "Gmail Work".into(),
+            handle: "gmail_work".into(),
+            service: "gmail".into(),
+            service_name: "Gmail".into(),
+            logo_url: None,
+            identity: Some("chris@work.example".into()),
+            use_in: UseIn::EveryChannel,
+            approvals: ToolApprovals::default(),
+            status: ConnectionStatus::Connecting {
+                redirect_url: Some("https://connect.composio.dev/link/abc".into()),
+                expires_at: Timestamp::from_millis(600_000),
+            },
+            last_used_at: None,
+            created_at: Timestamp::from_millis(1),
+            updated_at: Timestamp::from_millis(1),
+        }
+    }
+
+    fn skill() -> Skill {
+        Skill {
+            id: skl(),
+            name: "pdf-forms".into(),
+            description: "Fill PDF forms.".into(),
+            source: SkillSource::Upload {
+                file_name: "pdf-forms.zip".into(),
+            },
+            commit: None,
+            content_hash: "d".repeat(64).parse().unwrap(),
+            license: None,
+            scripts: vec![],
+            audits: vec![],
+            enabled: true,
+            use_in: UseIn::EveryChannel,
+            update: SkillUpdateState::UpToDate,
+            blocked_reason: None,
+            hooks_removed: true,
+            file_count: 1,
+            size_bytes: 300,
+            installed_at: Timestamp::from_millis(1),
+            updated_at: Timestamp::from_millis(1),
+        }
+    }
+
+    #[test]
+    fn connection_and_skill_feed_entries_and_snapshot() {
+        for payload in [
+            EntityPayload::Connection(connection()),
+            EntityPayload::Skill(skill()),
+        ] {
+            assert_eq!(payload.channel_id(), None);
+            let kind = payload.kind();
+            let id = payload.entity_id();
+            let entry = FeedEntry::upsert(11, Timestamp::from_millis(10), payload);
+            let value = serde_json::to_value(&entry).unwrap();
+            assert_eq!(value["entity"], serde_json::to_value(kind).unwrap());
+            assert_eq!(value["entity_id"], id);
+            assert_eq!(serde_json::from_value::<FeedEntry>(value).unwrap(), entry);
+        }
+        assert_eq!(
+            serde_json::to_value(EntityKind::Connection).unwrap(),
+            "connection"
+        );
+        assert_eq!(serde_json::to_value(EntityKind::Skill).unwrap(), "skill");
+        let snapshot = Snapshot {
+            seq: 4,
+            connections: vec![connection()],
+            skills: vec![skill()],
+            ..Snapshot::default()
+        };
+        let value = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(value["connections"][0]["handle"], "gmail_work");
+        assert_eq!(serde_json::from_value::<Snapshot>(value).unwrap(), snapshot);
+        let old: Snapshot = serde_json::from_value(json!({ "seq": 5 })).unwrap();
+        assert!(old.connections.is_empty() && old.skills.is_empty());
+        let out = serde_json::to_value(&old).unwrap();
+        assert!(out.get("connections").is_none() && out.get("skills").is_none());
+    }
+
+    #[test]
+    fn connector_and_skill_results_round_trip() {
+        fn round<T>(value: &T)
+        where
+            T: Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,
+        {
+            let back: T = serde_json::from_value(serde_json::to_value(value).unwrap()).unwrap();
+            assert_eq!(&back, value);
+        }
+        round(&ComposioStatusResult {
+            status: crate::model::ComposioStatus {
+                key_present: true,
+                key_hint: Some("x9k2".into()),
+                ..Default::default()
+            },
+        });
+        let service = crate::model::ConnectorService {
+            slug: "gmail".into(),
+            name: "Gmail".into(),
+            description: String::new(),
+            logo_url: None,
+            categories: vec![],
+            tool_count: 2,
+            auth_schemes: vec![],
+            connected_count: 0,
+        };
+        round(&ConnectorCatalogSearchResult {
+            services: vec![service.clone()],
+            next_cursor: Some("n".into()),
+        });
+        round(&ConnectorCatalogCategoriesResult {
+            categories: vec![crate::model::ConnectorCategory {
+                slug: "email".into(),
+                name: "Email".into(),
+                service_count: None,
+            }],
+        });
+        round(&ConnectorServiceDetail {
+            service,
+            tools: vec![crate::model::ConnectorToolSummary {
+                slug: "GMAIL_FETCH_EMAILS".into(),
+                description: "Fetch emails.".into(),
+                kind: crate::model::ToolKind::Read,
+            }],
+        });
+        round(&ConnectAttempt {
+            connection: connection(),
+            redirect_url: Some("https://connect.composio.dev/link/abc".into()),
+            expires_at: Some(Timestamp::from_millis(600_000)),
+        });
+        round(&ConnectionResult {
+            connection: connection(),
+        });
+        round(&ConnectionCallsResult {
+            calls: vec![],
+            has_more: false,
+        });
+        round(&SkillDirectorySearchResult {
+            entries: vec![],
+            next_cursor: None,
+            unavailable: vec!["Smithery".into()],
+        });
+        round(&SkillDirectorySourcesResult { sources: vec![] });
+        round(&SkillPreviewResult {
+            name: "pdf-forms".into(),
+            description: "Fill PDF forms.".into(),
+            commit: Some("abc".into()),
+            content_hash: "d".repeat(64).parse().unwrap(),
+            license: Some("MIT".into()),
+            scripts: vec!["scripts/fill.py".into()],
+            audits: vec![],
+            files: vec![],
+            has_hooks: true,
+            blocked_reason: None,
+            installed_skill_id: None,
+        });
+        round(&SkillResult { skill: skill() });
+        round(&SkillFilesResult {
+            content_hash: "d".repeat(64).parse().unwrap(),
+            files: vec![],
+        });
+        round(&SkillFileContent {
+            path: "SKILL.md".into(),
+            sha256: "a".repeat(64).parse().unwrap(),
+            size: 12,
+            content: Some("---\nname: pdf\n".into()),
+            binary: false,
+            truncated: false,
+        });
+    }
+
+    #[test]
+    fn new_requests_read_minimal_bodies() {
+        let connect: ConnectionConnect =
+            serde_json::from_value(json!({"service": "gmail", "name": "Gmail Work"})).unwrap();
+        assert_eq!(connect.use_in, UseIn::EveryChannel);
+        assert_eq!(connect.approvals, ToolApprovals::default());
+        assert!(connect.credentials.is_empty());
+        assert_eq!(connect.approval_id, None);
+        let files: SkillFiles =
+            serde_json::from_value(json!({"skill_id": skl().to_string()})).unwrap();
+        assert_eq!(files.version, SkillVersion::Installed);
+        let update = SkillUpdate {
+            skill_id: skl(),
+            enabled: None,
+            use_in: None,
+            accept_new_version: false,
+        };
+        assert_eq!(
+            serde_json::to_value(&update).unwrap(),
+            json!({"skill_id": skl().to_string()})
+        );
+        let install: SkillInstall = serde_json::from_value(json!({
+            "source": {"kind": "directory", "entry_id": "@anthropic/pdf"}
+        }))
+        .unwrap();
+        assert_eq!(install.use_in, UseIn::EveryChannel);
+        assert!(matches!(
+            install.source,
+            SkillInstallSource::Directory { source: None, .. }
+        ));
+        let git = serde_json::to_value(SkillInstallSource::Git {
+            url: "anthropics/skills".into(),
+            path: None,
+            git_ref: Some("v1".into()),
+        })
+        .unwrap();
+        assert_eq!(git["ref"], "v1");
+        assert_eq!(git["kind"], "git");
+        // `account.update` from an older client leaves the extras alone.
+        let old: AccountUpdate = serde_json::from_value(json!({
+            "worker_id": "wrk_00000000-0000-0000-0000-000000000006",
+            "account_id": "acc_00000000-0000-0000-0000-000000000009"
+        }))
+        .unwrap();
+        assert_eq!(old.extras_enabled, None);
+        assert!(
+            serde_json::to_value(&old)
+                .unwrap()
+                .get("extras_enabled")
+                .is_none()
+        );
+    }
+
+    /// The Composio key and connector credentials never show in `Debug`,
+    /// also through the request enum.
+    #[test]
+    fn debug_hides_connector_secrets() {
+        let key = ComposioSetKey {
+            api_key: "ak_composio_secret".into(),
+        };
+        let connect = ConnectionConnect {
+            service: "linear".into(),
+            name: "Linear".into(),
+            use_in: UseIn::EveryChannel,
+            approvals: ToolApprovals::default(),
+            auth_scheme: Some(AuthSchemeKind::ApiKey),
+            credentials: [("api_key", "lin_api_secret")].into_iter().collect(),
+            approval_id: None,
+        };
+        let reconnect = ConnectionReconnect {
+            connection_id: con(),
+            credentials: [("api_key", "lin_api_other")].into_iter().collect(),
+        };
+        let texts = [
+            format!("{key:?}"),
+            format!("{:?}", ClientRequest::from(key.clone())),
+            format!("{connect:?}"),
+            format!("{:#?}", ClientRequest::from(connect.clone())),
+            format!("{reconnect:?}"),
+            format!("{:?}", ClientRequest::from(reconnect)),
+        ];
+        for text in &texts {
+            for secret in ["ak_composio_secret", "lin_api_secret", "lin_api_other"] {
+                assert!(!text.contains(secret), "{text}");
+            }
+        }
+        assert!(texts[0].contains("<redacted>"), "{}", texts[0]);
+        assert!(texts[2].contains("api_key"), "{}", texts[2]);
+        // The wire still carries the values.
+        assert_eq!(
+            serde_json::to_value(&key).unwrap()["api_key"],
+            "ak_composio_secret"
+        );
+        assert_eq!(
+            serde_json::to_value(&connect).unwrap()["credentials"]["api_key"],
+            "lin_api_secret"
+        );
     }
 
     #[test]
@@ -2382,6 +2875,29 @@ mod tests {
             "client.push_register",
             "auth.http_token",
             "preferences.set_favorite_model",
+            "composio.set_key",
+            "composio.remove_key",
+            "composio.status",
+            "connector_catalog.search",
+            "connector_catalog.categories",
+            "connector_catalog.service",
+            "connection.connect",
+            "connection.update",
+            "connection.disconnect",
+            "connection.reconnect",
+            "connection.calls",
+            "channel.set_connection_enabled",
+            "channel.set_skill_enabled",
+            "skill_directory.search",
+            "skill_directory.sources",
+            "skill_directory.add_source",
+            "skill_directory.remove_source",
+            "skill.preview",
+            "skill.install",
+            "skill.update",
+            "skill.remove",
+            "skill.files",
+            "skill.read_file",
         ];
         for ty in expected {
             assert!(ClientRequest::TYPES.contains(&ty), "{ty} is missing");
@@ -2432,6 +2948,8 @@ mod tests {
             allowed_local_mcp_servers: vec!["home-assistant".into()],
             memory_enabled: true,
             tags: vec!["work".into()],
+            disabled_connections: vec![],
+            disabled_skills: vec![],
             archived_at: None,
             created_at: Timestamp::from_millis(0),
             updated_at: Timestamp::from_millis(0),
@@ -2469,6 +2987,8 @@ mod tests {
             allowed_local_mcp_servers: vec!["home-assistant".into()],
             memory_enabled: true,
             tags: vec!["work".into()],
+            disabled_connections: vec![],
+            disabled_skills: vec![],
             archived_at: None,
             created_at: Timestamp::from_millis(0),
             updated_at: Timestamp::from_millis(0),
@@ -2479,9 +2999,16 @@ mod tests {
             .unwrap()
             .remove("allowed_local_mcp_servers");
         value.as_object_mut().unwrap().remove("tags");
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("disabled_connections");
+        value.as_object_mut().unwrap().remove("disabled_skills");
         let old: Channel = serde_json::from_value(value).unwrap();
         assert!(old.allowed_local_mcp_servers.is_empty());
         assert!(old.tags.is_empty());
+        assert!(old.disabled_connections.is_empty());
+        assert!(old.disabled_skills.is_empty());
         let update = serde_json::to_value(ChannelUpdate::new(chn())).unwrap();
         assert!(update.get("allowed_local_mcp_servers").is_none());
         assert!(update.get("tags").is_none());
@@ -2521,6 +3048,7 @@ mod tests {
                 .into_iter()
                 .collect(),
             env_remove: vec![],
+            extras_enabled: None,
         };
         let code = SignInSubmitCode {
             sign_in_id: SignInId::new(),

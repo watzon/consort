@@ -385,6 +385,8 @@ pub(crate) mod testing {
             default_approval_mode: ApprovalMode::Ask,
             allowed_local_mcp_servers: Vec::new(),
             memory_enabled: true,
+            disabled_connections: Vec::new(),
+            disabled_skills: Vec::new(),
             archived_at: archived.then_some(now),
             created_at: now,
             updated_at: now,

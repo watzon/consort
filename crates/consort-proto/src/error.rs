@@ -48,6 +48,23 @@ pub enum ErrorCode {
     /// The peer does not support this request yet. The message names the
     /// request type.
     Unsupported,
+    /// The connection does not exist, or the session's channel cannot use
+    /// it. The message names the connectors that the channel can use.
+    ConnectorNotAvailable,
+    /// The hub has no Composio key. The user adds one in Settings >
+    /// Connectors.
+    ComposioNotConfigured,
+    /// Composio refused a request or did not answer. The message says why.
+    ComposioError,
+    /// The action needs the user first, for example a connection that needs
+    /// a new sign-in. The message says what the user must do.
+    NeedsUser,
+    /// The skill is blocked, for example because its audit failed. The
+    /// message says why.
+    SkillBlocked,
+    /// The skill does not follow the Agent Skills format or breaks a limit.
+    /// The message names the file or the limit.
+    SkillInvalid,
     /// A code that this version does not know. A newer peer sent it. Treat it
     /// like [`ErrorCode::Internal`] and show the message.
     Unknown,
@@ -55,7 +72,7 @@ pub enum ErrorCode {
 
 impl ErrorCode {
     /// Every known code, in the order of protocol.md.
-    pub const ALL: [ErrorCode; 16] = [
+    pub const ALL: [ErrorCode; 22] = [
         Self::Unauthorized,
         Self::ProtocolMismatch,
         Self::Invalid,
@@ -72,6 +89,12 @@ impl ErrorCode {
         Self::ToolInstallFailed,
         Self::InvalidTag,
         Self::Unsupported,
+        Self::ConnectorNotAvailable,
+        Self::ComposioNotConfigured,
+        Self::ComposioError,
+        Self::NeedsUser,
+        Self::SkillBlocked,
+        Self::SkillInvalid,
     ];
 
     /// The wire string, for example `worker_offline`.
@@ -93,6 +116,12 @@ impl ErrorCode {
             Self::ToolInstallFailed => "tool_install_failed",
             Self::InvalidTag => "invalid_tag",
             Self::Unsupported => "unsupported",
+            Self::ConnectorNotAvailable => "connector_not_available",
+            Self::ComposioNotConfigured => "composio_not_configured",
+            Self::ComposioError => "composio_error",
+            Self::NeedsUser => "needs_user",
+            Self::SkillBlocked => "skill_blocked",
+            Self::SkillInvalid => "skill_invalid",
             Self::Unknown => "unknown",
         }
     }
@@ -101,12 +130,12 @@ impl ErrorCode {
     pub const fn http_status(self) -> u16 {
         match self {
             Self::Unauthorized => 401,
-            Self::ProtocolMismatch | Self::Invalid | Self::InvalidTag => 400,
-            Self::NotFound | Self::WorkerUnknown => 404,
-            Self::StaleWrite | Self::Conflict | Self::ResyncRequired => 409,
-            Self::PolicyDenied => 403,
-            Self::WorkerOffline | Self::NoMatchingAccount => 503,
-            Self::SignInFailed | Self::ToolInstallFailed => 502,
+            Self::ProtocolMismatch | Self::Invalid | Self::InvalidTag | Self::SkillInvalid => 400,
+            Self::NotFound | Self::WorkerUnknown | Self::ConnectorNotAvailable => 404,
+            Self::StaleWrite | Self::Conflict | Self::ResyncRequired | Self::NeedsUser => 409,
+            Self::PolicyDenied | Self::SkillBlocked => 403,
+            Self::WorkerOffline | Self::NoMatchingAccount | Self::ComposioNotConfigured => 503,
+            Self::SignInFailed | Self::ToolInstallFailed | Self::ComposioError => 502,
             Self::Unsupported => 501,
             Self::Internal | Self::Unknown => 500,
         }
@@ -258,6 +287,35 @@ mod tests {
         let body = ErrorBody::not_built("account.create");
         assert_eq!(body.code, ErrorCode::Unsupported);
         assert!(body.message.starts_with("Not built yet: account.create."));
+    }
+
+    #[test]
+    fn connector_and_skill_codes_have_their_wire_strings() {
+        for (code, text, status) in [
+            (
+                ErrorCode::ConnectorNotAvailable,
+                "connector_not_available",
+                404,
+            ),
+            (
+                ErrorCode::ComposioNotConfigured,
+                "composio_not_configured",
+                503,
+            ),
+            (ErrorCode::ComposioError, "composio_error", 502),
+            (ErrorCode::NeedsUser, "needs_user", 409),
+            (ErrorCode::SkillBlocked, "skill_blocked", 403),
+            (ErrorCode::SkillInvalid, "skill_invalid", 400),
+        ] {
+            assert_eq!(serde_json::to_value(code).unwrap(), text);
+            assert_eq!(text.parse::<ErrorCode>().unwrap(), code);
+            assert_eq!(code.http_status(), status);
+            assert!(ErrorCode::ALL.contains(&code));
+            let body = ErrorBody::new(code, "The user must reconnect GitHub Work.");
+            let back: ErrorBody =
+                serde_json::from_value(serde_json::to_value(&body).unwrap()).unwrap();
+            assert_eq!(back, body);
+        }
     }
 
     #[test]

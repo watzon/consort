@@ -1,8 +1,11 @@
 //! Hub tool dispatch for `tool.list` and `tool.call`.
 
+use consort_proto::error::ErrorBody;
 use consort_proto::ids::SessionId;
 use consort_proto::model::SessionRole;
-use consort_proto::tools::{HubToolCall, ToolAudience, ToolCallResult, ToolDefinition, tools_for};
+use consort_proto::tools::{
+    HubTool, HubToolCall, ToolAudience, ToolCallResult, ToolDefinition, tools_for,
+};
 use serde_json::Value;
 
 use crate::error::{HubError, Result};
@@ -12,6 +15,42 @@ use crate::store::{conversation, work};
 mod chat;
 mod routines;
 mod tasks;
+
+/// The hub tools that the proto defines but the hub does not carry out yet
+/// (docs/CONNECTORS-SKILLS-PLAN.md). `tool.list` leaves them out, so no
+/// session sees them, and a call gets `unsupported`. Take a tool out of
+/// this list when its handler is built.
+pub(crate) const NOT_BUILT: &[HubTool] = &[
+    HubTool::ListConnectorTools,
+    HubTool::GetConnectorTool,
+    HubTool::RunConnectorTool,
+    HubTool::ListSkills,
+    HubTool::ReadSkill,
+    HubTool::ListConnections,
+    HubTool::ListInstalledSkills,
+    HubTool::ConnectService,
+    HubTool::AddSkill,
+    HubTool::CreateChannel,
+    HubTool::UpdateChannel,
+    HubTool::ArchiveChannel,
+    HubTool::SetDefaultModel,
+    HubTool::SetWorkerTags,
+    HubTool::InstallTool,
+    HubTool::AddAccount,
+    HubTool::StartSignIn,
+    HubTool::SetAccountExtras,
+    HubTool::SearchConnectorCatalog,
+    HubTool::UpdateConnection,
+    HubTool::Disconnect,
+    HubTool::SearchSkills,
+    HubTool::UpdateSkill,
+    HubTool::RemoveSkill,
+    HubTool::UpdateThisChannel,
+    HubTool::SetChannelTags,
+    HubTool::SetChannelConnector,
+    HubTool::SetChannelSkill,
+    HubTool::RequestAccess,
+];
 
 impl Hub {
     /// Builds the tool context of a session. A session that has ended or is
@@ -48,7 +87,10 @@ impl Hub {
         session_id: SessionId,
     ) -> Result<Vec<ToolDefinition>> {
         let ctx = self.tool_ctx(session_id).await?;
-        Ok(tools_for(ctx.audience))
+        Ok(tools_for(ctx.audience)
+            .into_iter()
+            .filter(|t| HubTool::from_name(&t.name).is_none_or(|tool| !NOT_BUILT.contains(&tool)))
+            .collect())
     }
 
     /// Runs one `tool.call`. Errors become an `is_error` result.
@@ -116,6 +158,134 @@ impl Hub {
             C::PostUpdate(a) => self.tool_post_update(ctx, a).await,
             C::SubmitForReview(a) => self.tool_submit_for_review(ctx, a).await,
             C::PublishArtifact(a) => self.tool_publish_artifact(ctx, a).await,
+            // See NOT_BUILT.
+            C::ListConnectorTools(_)
+            | C::GetConnectorTool(_)
+            | C::RunConnectorTool(_)
+            | C::ListSkills(_)
+            | C::ReadSkill(_)
+            | C::ListConnections(_)
+            | C::ListInstalledSkills(_)
+            | C::ConnectService(_)
+            | C::AddSkill(_)
+            | C::CreateChannel(_)
+            | C::UpdateChannel(_)
+            | C::ArchiveChannel(_)
+            | C::SetDefaultModel(_)
+            | C::SetWorkerTags(_)
+            | C::InstallTool(_)
+            | C::AddAccount(_)
+            | C::StartSignIn(_)
+            | C::SetAccountExtras(_)
+            | C::SearchConnectorCatalog(_)
+            | C::UpdateConnection(_)
+            | C::Disconnect(_)
+            | C::SearchSkills(_)
+            | C::UpdateSkill(_)
+            | C::RemoveSkill(_)
+            | C::UpdateThisChannel(_)
+            | C::SetChannelTags(_)
+            | C::SetChannelConnector(_)
+            | C::SetChannelSkill(_)
+            | C::RequestAccess(_) => Err(HubError::Api(ErrorBody::not_built(call.tool().name()))),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use consort_proto::client_api::{ClientRequest, ConnectionDisconnect, SkillDirectorySources};
+    use consort_proto::error::ErrorCode;
+    use consort_proto::ids::{AccountId, ConnectionId, WorkerId};
+    use consort_proto::model::{ModelOptions, Session, SessionState, Usage};
+    use consort_proto::time::Timestamp;
+    use serde_json::json;
+
+    use super::*;
+    use crate::hub::{Caller, test_hub};
+
+    async fn everything_session(hub: &Hub) -> SessionId {
+        let channel = hub
+            .store
+            .read(conversation::everything_channel)
+            .await
+            .unwrap();
+        let session = Session {
+            id: SessionId::new(),
+            role: SessionRole::Coordinator,
+            channel_id: channel.id,
+            task_id: None,
+            worker_id: WorkerId::new(),
+            account_id: AccountId::new(),
+            harness: "fake".to_owned(),
+            model: "fake-1".to_owned(),
+            options: ModelOptions::new(),
+            workspace_path: "/tmp/workspace".to_owned(),
+            native_ref: None,
+            state: SessionState::Idle,
+            last_seq: 0,
+            usage: Usage::default(),
+            started_at: Timestamp::now(),
+            ended_at: None,
+            end_reason: None,
+        };
+        let id = session.id;
+        hub.store
+            .write(move |tx| tx.save_session(&session))
+            .await
+            .unwrap();
+        id
+    }
+
+    /// The tools of the connectors and skills plan are in the proto, but no
+    /// session sees them until the hub carries them out.
+    #[tokio::test]
+    async fn tools_that_are_not_built_stay_out_of_the_list_and_answer_unsupported() {
+        let (hub, _dir) = test_hub().await;
+        let session_id = everything_session(&hub).await;
+        let names: Vec<String> = hub
+            .tool_definitions(session_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        for tool in NOT_BUILT {
+            assert!(!names.contains(&tool.name().to_owned()), "{}", tool.name());
+        }
+        assert!(names.contains(&"list_channels".to_owned()));
+        let result = hub
+            .call_tool(
+                session_id,
+                "run_connector_tool",
+                json!({"connector": "gmail_work", "tool": "GMAIL_SEND_EMAIL", "arguments": {}}),
+            )
+            .await;
+        assert!(result.is_error);
+        let body = result.structured_content.unwrap();
+        assert_eq!(body["error"]["code"], "unsupported");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("run_connector_tool")
+        );
+    }
+
+    #[tokio::test]
+    async fn requests_that_are_not_built_answer_unsupported() {
+        let (hub, _dir) = test_hub().await;
+        for request in [
+            ClientRequest::from(ConnectionDisconnect {
+                connection_id: ConnectionId::new(),
+            }),
+            ClientRequest::from(SkillDirectorySources {}),
+        ] {
+            let err = crate::api::dispatch(&hub, Caller::Hub, request)
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), ErrorCode::Unsupported);
+            assert!(err.to_error_body().message.starts_with("Not built yet: "));
         }
     }
 }

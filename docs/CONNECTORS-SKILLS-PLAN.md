@@ -146,3 +146,127 @@ The assistant never handles a secret. A sign-in or a key always goes through a c
    - Desktop: Settings > Connectors, Settings > Skills, dialogs, the channel dialog, the account dialog and the new cards.
 3. Skills sources and install pipeline (hub).
 4. A live end-to-end run with the user's Composio key, if the user provides one through the app.
+
+## Step 1 notes
+
+The contract as built (the Rust names in `consort-proto`, and the wire names). See `docs/DECISIONS.md` rows 343 to 358, ADR 0011, protocol.md and data-model.md.
+
+**IDs** (`consort_proto::ids`): `ConnectionId` (`con_`), `SkillId` (`skl_`), `ConnectorCallId` (`ccl_`, an audit record).
+
+**Error codes** (`ErrorCode`): `ConnectorNotAvailable` (`connector_not_available`), `ComposioNotConfigured` (`composio_not_configured`), `ComposioError` (`composio_error`), `NeedsUser` (`needs_user`), `SkillBlocked` (`skill_blocked`), `SkillInvalid` (`skill_invalid`).
+
+**Connector model** (`consort_proto::model`, file `model/connector.rs`):
+
+- `Connection { id, name, handle, service, service_name, logo_url, identity, use_in, approvals, status, last_used_at, created_at, updated_at }`, a feed entity (`EntityKind::Connection`, `"connection"`, no channel). `Connection::is_available_in(&Channel)`.
+- `UseIn` (`kind`): `EveryChannel` (`every_channel`, the default), `Tags { tags }` (`tags`), `Channels { channel_ids }` (`channels`). `matches`, `matches_channel`, `normalized`, `added_channels(old, channels)` (for the risk rule).
+- `ToolKind`: `Read`, `Change`, `Delete`, with `ToolKind::from_hints(read_only, create, update, destructive)`. `ApprovalRule`: `RunWithoutAsking`, `AskOncePerTask`, `AskEveryTime`, with `strictness()`. `ToolApprovals { read, change, delete }`, `Default` is the plan's defaults, `rule_for(kind)`, `is_looser_than(old)`.
+- `ConnectionStatus` (`kind`): `Connecting { redirect_url, expires_at }`, `Active`, `NeedsSignIn { message }`, `Failed { message }`. This is how connect attempts are delivered: there is no attempt entity. `CONNECT_ATTEMPT_TIMEOUT_MS` (10 minutes), `CATALOG_REFRESH_MS` (one day).
+- Handles: `connection_handle(name)`, `unique_connection_handle(name, taken)`, `validate_connection_name`, `CONNECTION_NAME_MAX_CHARS` (80), `CONNECTION_HANDLE_MAX_CHARS` (40).
+- Catalog: `ConnectorService { slug, name, description, logo_url, categories, tool_count, auth_schemes, connected_count }`, `AuthScheme { kind, managed, fields }`, `AuthSchemeKind` (`oauth2`, `oauth1`, `api_key`, `bearer_token`, `basic`, `no_auth`, `other`), `CredentialField { name, label, description, secret, required }`, `ConnectorCategory { slug, name, service_count }`, `ConnectorToolSummary { slug, description, kind }`.
+- Audit: `ConnectorCall { id, connection_id, channel_id, session_id, task_id, tool, tool_kind, arguments_sha256, decision, outcome, error, composio_log_id, result_bytes, duration_ms, at }`, `CallDecision` (`ran_without_asking`, `allowed_by_user`, `allowed_earlier_in_task`, `denied_by_user`, `expired`), `CallOutcome` (`succeeded`, `failed`, `not_run`), `canonical_json(&Value)` for the hash.
+- Composio: `ComposioStatus { key_present, key_hint, plan, usage, error, checked_at }`, `ComposioUsage { used, limit, resets_at }`.
+- Context: `ConnectorContextEntry { handle, service_name, identity, needs_sign_in }` (`From<&Connection>`), `render_connectors_block(&[..])`. `DisplayField { label, value }` for card arguments.
+
+**Skill model** (`model/skill.rs`):
+
+- `Skill { id, name, description, source, commit, content_hash, license, scripts, audits, enabled, use_in, update, blocked_reason, hooks_removed, file_count, size_bytes, installed_at, updated_at }`, a feed entity (`EntityKind::Skill`, `"skill"`). `has_scripts()`, `is_available_in(&Channel)`, `bundle_ref()`.
+- `SkillSource` (`kind`): `Git { url, path, git_ref }` (wire `ref`), `Directory { directory, entry_id, url, path }`, `Upload { file_name }`. `SkillDirectoryKind`: `smithery`, `anthropic`, `marketplace`, `skills_sh`.
+- `SkillUpdateState` (`kind`): `UpToDate`, `Available { commit, content_hash, changes, scripts_changed, found_at }`, `CheckFailed { message }`. `SkillFileChange { path, change }`, `SkillFileChangeKind` (`added`, `modified`, `removed`).
+- `SkillAudit { source, status, summary, url }`, `AuditStatus` (`passed`, `warning`, `failed`, `unknown`).
+- Files and bundles: `SkillFileInfo { path, sha256, size, executable }`, `SkillBundleRef { skill_id, name, content_hash }`, `SkillBundle { skill_id, name, content_hash, files }` with `is_consistent()`, `skill_content_hash(&[SkillFileInfo])`, `validate_skill_files`, `validate_skill_name`, `validate_skill_description`.
+- Directory: `SkillDirectorySource { id, kind, name, url, removable }`, `SkillDirectoryEntry { entry_id, directory, source_id, name, description, author, url, repo_url, path, license, installs, audits, installed_skill_id }`.
+- Context: `SkillContextEntry { name, description }`, `render_skills_block(&[..], native)`.
+- Limits: `SKILL_NAME_MAX_CHARS`, `SKILL_DESCRIPTION_MAX_CHARS`, `SKILL_MAX_FILES` (500), `SKILL_MAX_FILE_BYTES` (5 MiB), `SKILL_MAX_TOTAL_BYTES` (20 MiB), `SKILL_UPLOAD_MAX_BYTES` (25 MiB), `SKILL_READ_MAX_BYTES` (512 KiB), `SKILL_MANIFEST_FILE`, `SKILL_UPDATE_CHECK_MS`.
+
+**Channels and accounts:**
+
+- `Channel.disabled_connections: Vec<ConnectionId>` and `Channel.disabled_skills: Vec<SkillId>` (serde default, empty).
+- `HarnessAccount.extras_enabled: bool` (missing reads as true) and `HarnessAccount.extras: Option<ProviderExtras>`. `ProviderExtras { mcp_servers, plugins, skills, cannot_turn_off }`, `ExtrasGroup { count, names }`, `PROVIDER_EXTRAS_NAMES_MAX` (20).
+- `client_api::AccountUpdate.extras_enabled: Option<bool>` and `worker_link::AccountUpdateCommand.extras_enabled: Option<bool>`.
+
+**Hub cards** (`model/waiting.rs`): new `ApprovalDetails` variants `Connector(Box<ConnectorCard>)`, `Management(Box<ManagementCard>)`, `ConnectService(Box<ConnectServiceCard>)`, `SignIn(Box<SignInCard>)`, `SkillInstall(Box<SkillInstallCard>)`, with the wire kinds `connector`, `management`, `connect_service`, `sign_in`, `skill_install` and the same `ApprovalKind` variants (`ApprovalKind::as_str`, `is_hub_card`). Helpers: `ApprovalDetails::is_hub_card`, `ApprovalDetails::hub_card_options` (Allow and Don't, Continue in browser and Not now, Sign in and Not now, Add and Not now), `Approval::is_hub_card`, `hub_card_request_id(approval_id)` (`hub:<approval id>`), `HUB_CARD_REQUEST_PREFIX`, `HUB_CARD_ALLOW` (`allow`), `HUB_CARD_DENY` (`deny`). The hub already reads a hub card kind from a worker as `other` (`link/events.rs`, `worker_approval_details`).
+
+**Turn input:** `WakeEvent::CardAnswered { id: ApprovalId, kind: ApprovalKind, outcome: ApprovalStatus, text }`, rendered as `<card_answered id="apr_..." kind="management" outcome="allowed">text</card_answered>`.
+
+**Client requests** (`ClientRequest` variant, body type, wire name, response):
+
+| Variant and body | Wire name | Response |
+|---|---|---|
+| `ComposioSetKey { api_key }` (redacted `Debug`) | `composio.set_key` | `ComposioStatusResult { status }` |
+| `ComposioRemoveKey {}` | `composio.remove_key` | `ComposioStatusResult` |
+| `ComposioGetStatus {}` | `composio.status` | `ComposioStatusResult` |
+| `ConnectorCatalogSearch { search, category, cursor, limit }` | `connector_catalog.search` | `ConnectorCatalogSearchResult { services, next_cursor }` |
+| `ConnectorCatalogCategories {}` | `connector_catalog.categories` | `ConnectorCatalogCategoriesResult { categories }` |
+| `ConnectorCatalogService { service }` | `connector_catalog.service` | `ConnectorServiceDetail { service, tools }` |
+| `ConnectionConnect { service, name, use_in, approvals, auth_scheme, credentials: SecretEnv, approval_id }` | `connection.connect` | `ConnectAttempt { connection, redirect_url, expires_at }` |
+| `ConnectionUpdate { connection_id, name, use_in, approvals }` | `connection.update` | `ConnectionResult { connection }` |
+| `ConnectionDisconnect { connection_id }` | `connection.disconnect` | `Empty` |
+| `ConnectionReconnect { connection_id, credentials: SecretEnv }` | `connection.reconnect` | `ConnectAttempt` |
+| `ConnectionCalls { connection_id, before, limit }` | `connection.calls` | `ConnectionCallsResult { calls, has_more }` |
+| `ChannelSetConnectionEnabled { channel_id, connection_id, enabled }` | `channel.set_connection_enabled` | `ChannelResult` |
+| `ChannelSetSkillEnabled { channel_id, skill_id, enabled }` | `channel.set_skill_enabled` | `ChannelResult` |
+| `SkillDirectorySearch { search, source, cursor, limit }` | `skill_directory.search` | `SkillDirectorySearchResult { entries, next_cursor, unavailable }` |
+| `SkillDirectorySources {}` | `skill_directory.sources` | `SkillDirectorySourcesResult { sources }` |
+| `SkillDirectoryAddSource { url }` | `skill_directory.add_source` | `SkillDirectorySourcesResult` |
+| `SkillDirectoryRemoveSource { id }` | `skill_directory.remove_source` | `SkillDirectorySourcesResult` |
+| `SkillPreview { source: SkillInstallSource }` | `skill.preview` | `SkillPreviewResult { name, description, commit, content_hash, license, scripts, audits, files, has_hooks, blocked_reason, installed_skill_id }` |
+| `SkillInstall { source, use_in, enabled, approval_id }` | `skill.install` | `SkillResult { skill }` |
+| `SkillUpdate { skill_id, enabled, use_in, accept_new_version }` | `skill.update` | `SkillResult` |
+| `SkillRemove { skill_id }` | `skill.remove` | `Empty` |
+| `SkillFiles { skill_id, version: SkillVersion }` | `skill.files` | `SkillFilesResult { content_hash, files }` |
+| `SkillReadFile { skill_id, path, version }` | `skill.read_file` | `SkillFileContent { path, sha256, size, content, binary, truncated }` |
+
+`SkillInstallSource` (`kind`): `Directory { source, entry_id }`, `Git { url, path, git_ref }` (wire `ref`), `Upload { blob_sha256, size, file_name }`. `SkillVersion`: `installed` (default), `pending`. Page limits: `CATALOG_PAGE_MAX`, `CONNECTOR_CALLS_PAGE_MAX`, `SKILL_DIRECTORY_PAGE_MAX`. The bodies live in `client_api/connectors.rs` and `client_api/skills.rs`, and are re-exported from `client_api`.
+
+**Snapshot and feed:** `Snapshot.connections: Vec<Connection>` and `Snapshot.skills: Vec<Skill>` (scope `all`, left out when empty). `EntityPayload::Connection` and `EntityPayload::Skill`, with the entity ID as the feed ID and no channel.
+
+**Worker link:**
+
+- `SessionStart.extensions: SessionExtensions { connectors: Vec<ConnectorContextEntry>, skills: Vec<SkillBundleRef>, skill_context: Vec<SkillContextEntry> }`, left out when empty. `SessionExtensions::prompt_blocks(native_skills)` gives the context text.
+- `WorkerToHub::SkillBundleGet(SkillBundleGet { content_hash })`, wire `skill_bundle.get`, response `SkillBundle`.
+- No new hub command.
+
+**Hub tools** (`HubTool` variant, wire name, args type, result type, audience):
+
+| Variant | Name | Args | Result | Audience |
+|---|---|---|---|---|
+| `ListConnectorTools` | `list_connector_tools` | `ListConnectorToolsArgs { connector, search }` | `ListConnectorToolsResult { connector, service_name, tools: Vec<ConnectorToolInfo>, has_more }` | every session |
+| `GetConnectorTool` | `get_connector_tool` | `GetConnectorToolArgs { connector, tool }` | `GetConnectorToolResult { connector, tool (flattened), input_schema }` | every session |
+| `RunConnectorTool` | `run_connector_tool` | `RunConnectorToolArgs { connector, tool, arguments }` | `RunConnectorToolResult` (`status`: `ran`, `waiting_for_user`, `denied`) | every session |
+| `ListSkills` | `list_skills` | `NoArgs` | `ListSkillsResult { skills }` | every session |
+| `ReadSkill` | `read_skill` | `ReadSkillArgs { skill, path }` | `ReadSkillResult { skill, path, content, truncated, files }` | every session |
+| `ListConnections` | `list_connections` | `NoArgs` | `ListConnectionsResult { connections, off_in_this_channel }` | coordinators |
+| `ListInstalledSkills` | `list_installed_skills` | `NoArgs` | `ListInstalledSkillsResult { skills, off_in_this_channel }` | coordinators |
+| `ConnectService` | `connect_service` | `ConnectServiceArgs { service, name, use_in, approvals }` | `ManagementResult` | coordinators |
+| `AddSkill` | `add_skill` | `AddSkillArgs { source, path, use_in }` | `ManagementResult` | coordinators |
+| `CreateChannel` | `create_channel` | `CreateChannelArgs { name, purpose, group, tags, model, task_model }` | `ManagementResult` | Everything |
+| `UpdateChannel` | `update_channel` | `UpdateChannelArgs { channel, name, purpose, instructions, group, tags, model, task_model, repos }` | `ManagementResult` | Everything |
+| `ArchiveChannel` | `archive_channel` | `ArchiveChannelArgs { channel }` | `ManagementResult` | Everything |
+| `SetDefaultModel` | `set_default_model` | `SetDefaultModelArgs { model }` | `ManagementResult` | Everything |
+| `SetWorkerTags` | `set_worker_tags` | `SetWorkerTagsArgs { worker, tags }` | `ManagementResult` | Everything |
+| `InstallTool` | `install_tool` | `InstallToolArgs { worker, tool }` | `ManagementResult` | Everything |
+| `AddAccount` | `add_account` | `AddAccountArgs { worker, provider, name }` | `ManagementResult` | Everything |
+| `StartSignIn` | `start_sign_in` | `StartSignInArgs { worker, account, method }` | `ManagementResult` | Everything |
+| `SetAccountExtras` | `set_account_extras` | `SetAccountExtrasArgs { worker, account, enabled }` | `ManagementResult` | Everything |
+| `SearchConnectorCatalog` | `search_connector_catalog` | `SearchConnectorCatalogArgs { search, category }` | `SearchConnectorCatalogResult { services }` | Everything |
+| `UpdateConnection` | `update_connection` | `UpdateConnectionArgs { connection, name, use_in, approvals }` | `ManagementResult` | Everything |
+| `Disconnect` | `disconnect` | `DisconnectArgs { connection }` | `ManagementResult` | Everything |
+| `SearchSkills` | `search_skills` | `SearchSkillsArgs { search, source }` | `SearchSkillsResult { entries }` | Everything |
+| `UpdateSkill` | `update_skill` | `UpdateSkillArgs { skill, enabled, use_in, accept_new_version }` | `ManagementResult` | Everything |
+| `RemoveSkill` | `remove_skill` | `RemoveSkillArgs { skill }` | `ManagementResult` | Everything |
+| `UpdateThisChannel` | `update_this_channel` | `UpdateThisChannelArgs { purpose, instructions, model, task_model, repos }` | `ManagementResult` | channel coordinator |
+| `SetChannelTags` | `set_channel_tags` | `SetChannelTagsArgs { tags }` | `ManagementResult` | channel coordinator |
+| `SetChannelConnector` | `set_channel_connector` | `SetChannelConnectorArgs { connection, enabled }` | `ManagementResult` | channel coordinator |
+| `SetChannelSkill` | `set_channel_skill` | `SetChannelSkillArgs { skill, enabled }` | `ManagementResult` | channel coordinator |
+| `RequestAccess` | `request_access` | `RequestAccessArgs { connection, skill }` | `ManagementResult` | channel coordinator |
+
+`ManagementResult { status: ChangeStatus, summary, approval_id, channel_id, connection_id, skill_id, account_id }`, with `ChangeStatus` `applied`, `waiting_for_user`, `refused`, and the constructors `ManagementResult::applied`, `waiting_for_user(approval_id, ..)`, `refused`. `ConnectorToolInfo { slug, description, kind, approval }`. Constants: `CONNECTOR_TOOLS_LIST_MAX` (200), `CONNECTOR_RESULT_MAX_BYTES` (256 KiB), `CONNECTOR_APPROVAL_WAIT_MS` (5 minutes). The new audience constant is `CHANNEL_COORDINATOR_ONLY` (private, like the others). The args and results live in `tools/connectors.rs` and `tools/management.rs`, and are re-exported from `tools`.
+
+**Placeholders for step 2.** Each part answers `unsupported` ("Not built yet: <name>.") until it is built. Remove the entry when you build it:
+
+- Hub client requests: the or-pattern at the end of `consort-hub/src/api/mod.rs`.
+- Hub tools: `consort-hub/src/tools/mod.rs`, the `NOT_BUILT` list (which also keeps the tools out of `tool.list`) and the matching arm of `dispatch_tool`. Also make `tool.list` show the connector tools only when the session's channel has a connection, and `list_skills` and `read_skill` only for a harness with no native skills.
+- `skill_bundle.get`: `consort-hub/src/net/worker_ws.rs`.
+- The extras toggle: `consort-worker/src/accounts.rs` (`update_account` refuses `extras_enabled`), and `core.rs` reports `extras_enabled: true` and `extras: None`.
+- The worker ignores `SessionStart.extensions` today. The hub sends an empty set, so nothing changes yet.
+- The desktop shows hub cards with the generic approval card (`consort-client/src/reduce.rs`, `approval_detail`) until it has its own cards.

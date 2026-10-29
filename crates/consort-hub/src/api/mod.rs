@@ -7,6 +7,8 @@
 //! body and returns the proto response type.
 
 use consort_proto::client_api::ClientRequest;
+use consort_proto::error::ErrorBody;
+use consort_proto::frame::MessageFamily;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -89,8 +91,40 @@ pub(crate) async fn dispatch(hub: &Hub, caller: Caller, request: ClientRequest) 
         R::PreferencesSetFavoriteModel(r) => {
             to_value(&hub.preferences_set_favorite_model(caller, r).await?)
         }
+        // Connectors and skills (docs/CONNECTORS-SKILLS-PLAN.md). The
+        // contract is in place, the handlers are not. Take a request out of
+        // this list when its handler is built.
+        r @ (R::ComposioSetKey(_)
+        | R::ComposioRemoveKey(_)
+        | R::ComposioGetStatus(_)
+        | R::ConnectorCatalogSearch(_)
+        | R::ConnectorCatalogCategories(_)
+        | R::ConnectorCatalogService(_)
+        | R::ConnectionConnect(_)
+        | R::ConnectionUpdate(_)
+        | R::ConnectionDisconnect(_)
+        | R::ConnectionReconnect(_)
+        | R::ConnectionCalls(_)
+        | R::ChannelSetConnectionEnabled(_)
+        | R::ChannelSetSkillEnabled(_)
+        | R::SkillDirectorySearch(_)
+        | R::SkillDirectorySources(_)
+        | R::SkillDirectoryAddSource(_)
+        | R::SkillDirectoryRemoveSource(_)
+        | R::SkillPreview(_)
+        | R::SkillInstall(_)
+        | R::SkillUpdate(_)
+        | R::SkillRemove(_)
+        | R::SkillFiles(_)
+        | R::SkillReadFile(_)) => Err(not_built(&r)),
         R::Hello(_) | R::SyncSnapshot(_) | R::SyncSubscribe(_) | R::AuthHttpToken(_) => Err(
             HubError::invalid("This request belongs to the connection and cannot be routed."),
         ),
     }
+}
+
+/// The `unsupported` error for a request that the hub knows but does not
+/// carry out yet.
+fn not_built(request: &ClientRequest) -> HubError {
+    HubError::Api(ErrorBody::not_built(request.type_name()))
 }

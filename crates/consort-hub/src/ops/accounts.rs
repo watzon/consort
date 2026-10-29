@@ -73,6 +73,13 @@ fn map_worker_error(error: ErrorBody, relay: Relay) -> ErrorBody {
         | ErrorCode::StaleWrite
         | ErrorCode::ResyncRequired
         | ErrorCode::Internal
+        // Hub-side codes that a worker never sends for these requests.
+        | ErrorCode::ConnectorNotAvailable
+        | ErrorCode::ComposioNotConfigured
+        | ErrorCode::ComposioError
+        | ErrorCode::NeedsUser
+        | ErrorCode::SkillBlocked
+        | ErrorCode::SkillInvalid
         | ErrorCode::Unknown => {
             let code = match relay {
                 Relay::Account => ErrorCode::Internal,
@@ -270,7 +277,11 @@ impl Hub {
                 )));
             }
         }
-        if label.is_none() && request.env_set.is_empty() && request.env_remove.is_empty() {
+        if label.is_none()
+            && request.env_set.is_empty()
+            && request.env_remove.is_empty()
+            && request.extras_enabled.is_none()
+        {
             return Err(HubError::invalid(
                 "The update changes nothing. Give a new name or a variable to set or remove.",
             ));
@@ -288,6 +299,7 @@ impl Hub {
             label,
             env_set: request.env_set,
             env_remove: request.env_remove,
+            extras_enabled: request.extras_enabled,
         });
         self.relay(request.worker_id, command, Relay::Account, &secrets)
             .await?;

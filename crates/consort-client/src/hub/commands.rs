@@ -644,6 +644,7 @@ async fn run(shared: Arc<Shared>, command: Command) -> Result<CommandOutput, Cli
                     label,
                     env_set,
                     env_remove,
+                    extras_enabled: None,
                 })
                 .await?;
         }

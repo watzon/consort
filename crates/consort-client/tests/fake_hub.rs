@@ -171,6 +171,8 @@ fn seed(hub: &mut Hub) {
         default_approval_mode: ApprovalMode::AutoEdits,
         allowed_local_mcp_servers: vec![],
         memory_enabled: true,
+        disabled_connections: Vec::new(),
+        disabled_skills: Vec::new(),
         archived_at: None,
         created_at: ts(now - 10_000),
         updated_at: ts(now - 10_000),

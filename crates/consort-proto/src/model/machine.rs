@@ -230,6 +230,56 @@ pub struct HarnessAccount {
     /// The sign-in methods that a client may offer for this account.
     #[serde(default)]
     pub sign_in_methods: Vec<SignInMethod>,
+    /// Whether the worker starts this account's harness with its
+    /// account-synced extras, such as claude.ai connectors and synced
+    /// plugins and skills. On by default. An inventory from an older worker
+    /// has no field, which reads as on.
+    #[serde(default = "default_true")]
+    pub extras_enabled: bool,
+    /// What the account brings from the provider's side, when the worker
+    /// can tell. Never a secret value.
+    #[serde(default)]
+    pub extras: Option<ProviderExtras>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// The most names in one group of [`ProviderExtras`]. The count can be
+/// higher.
+pub const PROVIDER_EXTRAS_NAMES_MAX: usize = 20;
+
+/// One kind of provider extra: how many the account has, and some names.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ExtrasGroup {
+    /// How many there are.
+    #[serde(default)]
+    pub count: u32,
+    /// Short names, at most [`PROVIDER_EXTRAS_NAMES_MAX`].
+    #[serde(default)]
+    pub names: Vec<String>,
+}
+
+/// What a harness account syncs from the provider's side, as the worker
+/// reports it in the inventory. For Claude Code: the claude.ai MCP servers
+/// (connectors), the synced plugins and the synced skills.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ProviderExtras {
+    /// MCP servers that the provider adds, such as claude.ai connectors.
+    #[serde(default)]
+    pub mcp_servers: ExtrasGroup,
+    /// Plugins that the provider syncs.
+    #[serde(default)]
+    pub plugins: ExtrasGroup,
+    /// Skills that the provider syncs.
+    #[serde(default)]
+    pub skills: ExtrasGroup,
+    /// Extras that the worker cannot turn off for this provider, in words
+    /// for the account dialog, for example "Plugins that you installed by
+    /// hand in this profile".
+    #[serde(default)]
+    pub cannot_turn_off: Vec<String>,
 }
 
 impl HarnessAccount {
@@ -495,6 +545,8 @@ mod tests {
                     variable: "ANTHROPIC_API_KEY".into(),
                 },
             ],
+            extras_enabled: true,
+            extras: None,
         }
     }
 
@@ -594,6 +646,8 @@ mod tests {
                 "plan",
                 "secret_names",
                 "sign_in_methods",
+                "extras_enabled",
+                "extras",
             ] {
                 account.remove(key);
             }
@@ -607,6 +661,9 @@ mod tests {
         assert!(!account.profile);
         assert_eq!(account.email, None);
         assert!(account.sign_in_methods.is_empty());
+        // An older worker reports no extras toggle, which reads as on.
+        assert!(account.extras_enabled);
+        assert_eq!(account.extras, None);
         // The new name is what goes out.
         let out = serde_json::to_value(worker(&["work"], None)).unwrap();
         assert!(out.get("labels").is_none());
@@ -633,6 +690,30 @@ mod tests {
         let value = serde_json::to_value(&inv).unwrap();
         assert_eq!(value["tools"][0]["tool"], "claude-code");
         assert_eq!(serde_json::from_value::<Inventory>(value).unwrap(), inv);
+    }
+
+    #[test]
+    fn provider_extras_round_trip() {
+        let mut a = account("Claude Personal", AuthState::SignedIn);
+        a.extras_enabled = false;
+        a.extras = Some(ProviderExtras {
+            mcp_servers: ExtrasGroup {
+                count: 3,
+                names: vec!["Gmail".into(), "Google Drive".into(), "Linear".into()],
+            },
+            plugins: ExtrasGroup::default(),
+            skills: ExtrasGroup {
+                count: 25,
+                names: vec!["pdf".into()],
+            },
+            cannot_turn_off: vec!["Plugins that you installed by hand in this profile".into()],
+        });
+        let value = serde_json::to_value(&a).unwrap();
+        assert_eq!(value["extras_enabled"], false);
+        assert_eq!(value["extras"]["mcp_servers"]["count"], 3);
+        assert_eq!(serde_json::from_value::<HarnessAccount>(value).unwrap(), a);
+        let empty: ProviderExtras = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty, ProviderExtras::default());
     }
 
     #[test]

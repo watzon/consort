@@ -183,6 +183,8 @@ impl Hub {
                         allowed_local_mcp_servers: Vec::new(),
                         memory_enabled: true,
                         tags: Vec::new(),
+                        disabled_connections: Vec::new(),
+                        disabled_skills: Vec::new(),
                         archived_at: None,
                         created_at: now,
                         updated_at: now,

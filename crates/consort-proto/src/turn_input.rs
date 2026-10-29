@@ -2,8 +2,9 @@
 //!
 //! The hub wakes a coordinator when one of these happens in its channel: a
 //! user message, a task status change to `review`, `needs_input` or
-//! `failed`, a decision answer, a routine run, a message from Everything, or
-//! a memory suggestion. Events that arrive during a turn go into the next
+//! `failed`, a decision answer, a routine run, a message from Everything, a
+//! memory suggestion, or the answer to a hub card that the coordinator
+//! posted. Events that arrive during a turn go into the next
 //! turn. [`render_events`] writes them as the turn text:
 //!
 //! ```text
@@ -21,7 +22,8 @@ use std::fmt::{self, Write as _};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::ids::{ChannelId, DecisionId, MessageId, RoutineId, TaskId};
+use crate::ids::{ApprovalId, ChannelId, DecisionId, MessageId, RoutineId, TaskId};
+use crate::model::{ApprovalKind, ApprovalStatus};
 use crate::status::TaskStatus;
 use crate::time::Timestamp;
 
@@ -128,6 +130,30 @@ pub enum WakeEvent {
         /// The message text.
         text: String,
     },
+    /// The user answered a hub card that a management tool or a connector
+    /// tool of this coordinator posted, or the card ended without an
+    /// answer.
+    CardAnswered {
+        /// The card.
+        id: ApprovalId,
+        /// The kind of card.
+        kind: ApprovalKind,
+        /// `allowed`, `denied`, `expired` or `canceled`.
+        outcome: ApprovalStatus,
+        /// What happened, for example "GitHub Work is now available in 4
+        /// more channels.", or the result of a connector call.
+        text: String,
+    },
+}
+
+fn approval_status_str(status: ApprovalStatus) -> &'static str {
+    match status {
+        ApprovalStatus::Pending => "pending",
+        ApprovalStatus::Allowed => "allowed",
+        ApprovalStatus::Denied => "denied",
+        ApprovalStatus::Expired => "expired",
+        ApprovalStatus::Canceled => "canceled",
+    }
 }
 
 /// Replaces characters that XML 1.0 does not allow with U+FFFD.
@@ -199,6 +225,7 @@ impl WakeEvent {
             Self::Routine { .. } => "routine",
             Self::MemorySuggestion { .. } => "memory_suggestion",
             Self::EverythingMessage { .. } => "everything_message",
+            Self::CardAnswered { .. } => "card_answered",
         }
     }
 
@@ -268,6 +295,21 @@ impl WakeEvent {
                 name,
                 &[("id", Some(id.to_string())), ("at", Some(at.to_rfc3339()))],
                 Some(text),
+            ),
+            Self::CardAnswered {
+                id,
+                kind,
+                outcome,
+                text,
+            } => element(
+                out,
+                name,
+                &[
+                    ("id", Some(id.to_string())),
+                    ("kind", Some(kind.as_str().to_owned())),
+                    ("outcome", Some(approval_status_str(*outcome).to_owned())),
+                ],
+                Some(text).filter(|t| !t.is_empty()).map(String::as_str),
             ),
         }
     }
@@ -393,6 +435,36 @@ line 2</task_update>
         assert_eq!(
             out,
             "<events>\n  <decision_answered id=\"dec_00000000-0000-0000-0000-000000000004\">Do it on Friday</decision_answered>\n</events>"
+        );
+    }
+
+    #[test]
+    fn card_answers_render_and_serialize() {
+        let apr: ApprovalId = "apr_00000000-0000-0000-0000-000000000007".parse().unwrap();
+        let event = WakeEvent::CardAnswered {
+            id: apr,
+            kind: ApprovalKind::Management,
+            outcome: ApprovalStatus::Allowed,
+            text: "GitHub Work is now available in 4 more channels.".into(),
+        };
+        assert_eq!(
+            render_events(std::slice::from_ref(&event)),
+            "<events>\n  <card_answered id=\"apr_00000000-0000-0000-0000-000000000007\" kind=\"management\" outcome=\"allowed\">GitHub Work is now available in 4 more channels.</card_answered>\n</events>"
+        );
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["type"], "card_answered");
+        assert_eq!(value["kind"], "management");
+        assert_eq!(value["outcome"], "allowed");
+        assert_eq!(serde_json::from_value::<WakeEvent>(value).unwrap(), event);
+        let denied = WakeEvent::CardAnswered {
+            id: apr,
+            kind: ApprovalKind::ConnectService,
+            outcome: ApprovalStatus::Denied,
+            text: String::new(),
+        };
+        assert_eq!(
+            render_events(&[denied]),
+            "<events>\n  <card_answered id=\"apr_00000000-0000-0000-0000-000000000007\" kind=\"connect_service\" outcome=\"denied\"/>\n</events>"
         );
     }
 

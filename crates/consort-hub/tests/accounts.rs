@@ -208,6 +208,7 @@ async fn account_update_remove_and_sign_out_reach_the_worker() {
         label: Some("Renamed".to_owned()),
         env_set: env(&[("KEY", "new-value")]),
         env_remove: vec!["OLD".to_owned()],
+        extras_enabled: None,
     };
     let (result, command) = ask(&mut world, update, Ok(())).await;
     result.unwrap();
@@ -256,6 +257,7 @@ async fn account_update_remove_and_sign_out_reach_the_worker() {
         label: None,
         env_set: SecretEnv::new(),
         env_remove: Vec::new(),
+        extras_enabled: None,
     };
     let error = world.client.request(nothing).await.unwrap_err();
     assert_eq!(error.code, ErrorCode::Invalid);
@@ -437,6 +439,7 @@ async fn secret_values_stay_out_of_the_database_the_feed_the_logs_and_errors() {
         label: None,
         env_set: env(&[("ANTHROPIC_API_KEY", updated_secret)]),
         env_remove: Vec::new(),
+        extras_enabled: None,
     };
     let (result, command) = ask(&mut world, update, Ok(())).await;
     result.unwrap();

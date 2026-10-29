@@ -493,6 +493,11 @@ impl Core {
         self: &Arc<Self>,
         update: AccountUpdateCommand,
     ) -> Result<(), ErrorBody> {
+        // The provider extras toggle is not built yet. Refuse the whole
+        // command before it changes anything, so a retry is safe.
+        if update.extras_enabled.is_some() {
+            return Err(ErrorBody::not_built("account.update extras_enabled"));
+        }
         let account = self
             .config_snapshot()
             .account(update.account_id)

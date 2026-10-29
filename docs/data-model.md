@@ -7,7 +7,8 @@ This page lists the entities that the hub, the workers and the clients store, wi
 | Role | Store | Contents |
 |---|---|---|
 | Hub | `hub.db` (SQLite, WAL mode) | Every entity on this page except the worker-local state |
-| Hub | `blobs/` | Attachments, channel files and artifacts, named by SHA-256 |
+| Hub | `blobs/` | Attachments, channel files, artifacts, skill files and skill uploads, named by SHA-256 |
+| Hub | `composio.key` | The Composio project key, encrypted with a key that the hub makes (mode 0600). See ADR 0011 |
 | Hub | FTS5 tables in `hub.db` | Search index over messages, memory notes and task titles |
 | Worker | `worker.toml` | Hub URL, tags, worker policy, harness accounts, local MCP servers, checkouts |
 | Worker | `worker.db` (SQLite) | Event spool, processed command IDs, local session registry |
@@ -19,7 +20,7 @@ This page lists the entities that the hub, the workers and the clients store, wi
 
 The Consort home is `~/.consort` (`%USERPROFILE%\.consort` on Windows). `CONSORT_HOME` overrides it. `consort dev` sets it to `<data>/home` unless `CONSORT_HOME` is set.
 
-The hub is the source of truth for everything except harness logins, secret variables and raw transcripts. A session's native state on a worker is a cache that the hub can rebuild from the timeline and memory.
+The hub is the source of truth for everything except harness logins, secret variables and raw transcripts. It is also the source of connectors and skills: workers get a session's skills from the hub, and only the hub talks to Composio. A session's native state on a worker is a cache that the hub can rebuild from the timeline and memory.
 
 On Unix the hub data folder and `blobs/` have mode 0700, and `hub.db` with its `-wal` and `-shm` files has mode 0600, also when they exist already. The hub writes each blob with mode 0600.
 
@@ -44,6 +45,9 @@ Every ID is a UUIDv7 string with a type prefix, for example `tsk_0192f0c4-...`. 
 | `acc_` | Harness account (unique per worker) |
 | `cli_` | Client |
 | `sgn_` | Sign-in |
+| `con_` | Connection |
+| `skl_` | Skill |
+| `ccl_` | Connector call (audit record) |
 
 All timestamps are UTC, stored as Unix milliseconds. Hub tool arguments also accept RFC 3339 strings, because models write those more reliably.
 
@@ -81,6 +85,8 @@ Turn IDs, harness request IDs and native references are opaque strings that the 
 | `allowed_local_mcp_servers` | list of text | The local MCP servers, by name, that a task that the assistant starts may use. Empty by default. A task that the user starts is not limited by it |
 | `memory_enabled` | bool | |
 | `tags` | list of text | Requirements. A coordinator turn, a task or a routine run of the channel runs only on a worker that has every tag. Empty by default |
+| `disabled_connections` | list of connection IDs | Channel exceptions: connections that the channel turned off. Empty by default |
+| `disabled_skills` | list of skill IDs | Channel exceptions: skills that the channel turned off. Empty by default |
 | `archived_at` | timestamp, optional | |
 | `created_at`, `updated_at` | timestamp | |
 
@@ -255,12 +261,26 @@ The payload for each kind:
 | `message_id` | ID | The approval card in the task thread |
 | `request_id` | text | The harness request. `session.respond` sends it back |
 | `summary` | text | One line for the card and the push notification |
-| `details` | JSON | Has a `kind`: `command`, `file_change`, `tool`, `network` or `other`. The other fields depend on the kind: command and folder, paths, or tool name and arguments |
+| `details` | JSON | Has a `kind`: `command`, `file_change`, `tool`, `network` or `other` from a harness, or a hub card kind: `connector`, `management`, `connect_service`, `sign_in` or `skill_install`. The other fields depend on the kind: command and folder, paths, tool name and arguments, or the facts of the card (see [Hub cards](#hub-cards)) |
 | `options` | list | From the harness, for example allow once, allow for this session, deny. Each has `id`, `label`, `kind` and `description` |
 | `status` | `pending`, `allowed`, `denied`, `expired` or `canceled` | |
 | `answer_option_id` | text, optional | The option that the user chose |
 | `answered_at`, `answered_by_client_id` | timestamp, ID | |
 | `created_at` | timestamp | |
+
+### Hub cards
+
+A hub card is an approval that the hub makes itself, not a harness. Its `request_id` is `hub:<approval id>`, its options are `allow` and `deny`, and the hub carries out the answer. It never sends `session.respond` for it. The hub refuses a hub card kind in a `request.opened` from a worker, and reads it as `other`.
+
+| `kind` | Card | Fields | Allow | Deny |
+|---|---|---|---|---|
+| `connector` | Connector approval | `connection_id`, `connection_name`, `service_name`, `tool`, `tool_kind`, `fields` (each `label` and `value`, such as To, Subject and Body), `arguments` | Allow: the call runs | Don't |
+| `management` | Management approval card | `tool`, `change`, `effect` (for example "GitHub Work becomes available in 4 more channels"), `arguments` | Allow: the hub makes the change | Don't |
+| `connect_service` | Connect card | `service`, `service_name`, `logo_url`, `name`, `use_in`, `approvals`, and `connection_id` after the user continued | Continue in browser | Not now |
+| `sign_in` | Sign-in card | `worker_id`, `account_id`, `account_label`, `harness`, `method`, and `sign_in_id` after the user started | Sign in | Not now |
+| `skill_install` | Install card | `name`, `description`, `source`, `commit`, `license`, `scripts`, `audits`, `use_in`, `blocked_reason`, and `skill_id` after the user added it | Add | Not now |
+
+A hub card in a task makes the task Needs input, as any approval does. When a card that a coordinator posted closes, the hub wakes the coordinator with a `card_answered` event (see [protocol.md](protocol.md#coordinator-turn-input)).
 
 ### Decision
 
@@ -379,6 +399,8 @@ The worker owns the account configuration and the login. The hub stores only wha
 | `email`, `plan` | text, optional | Who is signed in and on which plan, when the harness tells |
 | `secret_names` | list of text | The names of the variables in `env.json`. Never the values |
 | `sign_in_methods` | list | The methods that a client may offer. See [protocol.md](protocol.md#sign-in) |
+| `extras_enabled` | bool | Whether the harness starts with its provider extras. True by default, and for an inventory from an older worker |
+| `extras` | object, optional | What the account syncs from the provider: `mcp_servers`, `plugins` and `skills`, each with a `count` and at most 20 short `names`, and `cannot_turn_off`, the extras that the worker cannot turn off, in words. Never a secret |
 
 ### Sign-in
 
@@ -428,6 +450,77 @@ A model selection is a value, not a row: `account_label`, `model` and `options`.
 
 A worker has the same `paired_by` and `revoked_by`. Each pairing code records who made it in `created_by`. When a client is removed, the codes that it made and that are not used yet are deleted.
 
+## Connector and skill entities
+
+See ADR 0011 for why the hub owns these.
+
+### Connection
+
+One connected account of one Composio service. A feed entity with no channel (`connection`).
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | ID | `con_` |
+| `name` | text | For example "Gmail Work". At most 80 characters |
+| `handle` | text | The assistant's name for it: a unique slug of the name, such as `gmail_work`. At most 40 lowercase ASCII letters, digits and `_`. A repeat gets `_2`, `_3` |
+| `service`, `service_name` | text | The Composio toolkit slug (`gmail`) and its name (`Gmail`) |
+| `logo_url` | text, optional | From the hub's logo cache |
+| `identity` | text, optional | The account's email address or login, when the service tells |
+| `use_in` | object | `kind`: `every_channel`, `tags` with `tags` (a channel needs all of them), or `channels` with `channel_ids` |
+| `approvals` | object | `read`, `change` and `delete`, each `run_without_asking`, `ask_once_per_task` or `ask_every_time`. The defaults are run without asking, ask every time and ask every time |
+| `status` | object | `kind`: `connecting` with `redirect_url` and `expires_at`, `active`, `needs_sign_in` with `message`, or `failed` with `message` |
+| `last_used_at` | timestamp, optional | |
+| `created_at`, `updated_at` | timestamp | |
+
+A connect attempt is not an entity of its own. `connection.connect` makes the connection in `connecting`, and each change of the status is a feed upsert. The hub waits 10 minutes, then sets `failed`. The Composio connected account ID stays on the hub and is not in the client view.
+
+The tool kind comes from Composio's hints: `destructiveHint` gives `delete`, a tool with only `readOnlyHint` gives `read`, and every other tool gives `change`.
+
+### Connector call
+
+One row of the audit log, kept on the hub. Not a feed entity. A client reads it with `connection.calls`.
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | ID | `ccl_` |
+| `connection_id` | ID | |
+| `channel_id`, `session_id`, `task_id` | ID, optional | |
+| `tool`, `tool_kind` | text | |
+| `arguments_sha256` | text | The SHA-256 of the canonical JSON of the arguments (keys sorted, no spaces). The hub never stores the arguments or the result |
+| `decision` | text | `ran_without_asking`, `allowed_by_user`, `allowed_earlier_in_task`, `denied_by_user` or `expired` |
+| `outcome` | text | `succeeded`, `failed` or `not_run` |
+| `error`, `composio_log_id` | text, optional | |
+| `result_bytes`, `duration_ms` | integer | |
+| `at` | timestamp | |
+
+### Skill
+
+An installed skill. A feed entity with no channel (`skill`).
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | ID | `skl_` |
+| `name`, `description` | text | From `SKILL.md`. The name is 1 to 64 lowercase letters, digits and `-`, and is unique on the hub. The description has at most 1,024 characters |
+| `source` | object | `kind`: `git` with `url`, `path` and `ref`, `directory` with `directory`, `entry_id`, `url` and `path`, or `upload` with `file_name` |
+| `commit` | text, optional | The pinned commit. Empty for an upload |
+| `content_hash` | text | The SHA-256 of one line per file, sorted by path: `<path>\0<sha256>\0<x or ->\n`, where `x` marks an executable file |
+| `license` | text, optional | |
+| `scripts` | list of text | Files that can run: files with the executable bit and files under `scripts/` |
+| `audits` | list | Each has `source`, `status` (`passed`, `warning`, `failed` or `unknown`), `summary` and `url` |
+| `enabled` | bool | A skill with scripts stays off until the user turns it on |
+| `use_in` | object | As for a connection |
+| `update` | object | `kind`: `up_to_date`, `available` with `commit`, `content_hash`, `changes`, `scripts_changed` and `found_at`, or `check_failed` with `message` |
+| `blocked_reason` | text, optional | Set when the hub blocks it, for example after a failed audit |
+| `hooks_removed` | bool | True when the hub removed Claude-specific `hooks` |
+| `file_count`, `size_bytes` | integer | At most 500 files, 5 MiB for one file and 20 MiB together |
+| `installed_at`, `updated_at` | timestamp | |
+
+The files of each version are blobs. The hub keeps the file list of each version that a running session may still use.
+
+### Effective set
+
+A session gets the connections and skills whose `use_in` matches its channel, minus the channel's exceptions. A skill must also be on and not blocked. The Everything channel matches only `every_channel`, unless it has tags of its own.
+
 ## Preferences
 
 The user's preferences are one record that every client shares. The hub stores it as JSON in the `meta` table, under the key `preferences`, so it needs no table of its own. A hub that has no record yet has empty preferences.
@@ -447,7 +540,7 @@ Every write on the hub adds one feed entry in the same database transaction. Cli
 | `seq` | integer | Increases by one for each entry, across the whole hub |
 | `at` | timestamp | |
 | `channel_id` | ID, optional | Lets a client filter by channel |
-| `entity` | text | `channel`, `group`, `repo`, `message`, `read_marker`, `task`, `session_item`, `approval`, `decision`, `memory_note`, `channel_file`, `routine`, `worker`, `client`, `sign_in` or `preferences` |
+| `entity` | text | `channel`, `group`, `repo`, `message`, `read_marker`, `task`, `session_item`, `approval`, `decision`, `memory_note`, `channel_file`, `routine`, `worker`, `client`, `sign_in`, `preferences`, `connection` or `skill` |
 | `entity_id` | text | The entity's ID. A memory note uses `<scope>:<path>`, a channel file `<channel-id>:<path>`, a read marker `<channel-id>` or `<channel-id>:<thread-root-id>`, a session item `<session-id>:<item-id>`, and the preferences `preferences` |
 | `op` | `upsert` or `delete` | |
 | `payload` | JSON | The full client view of the entity after the write. `null` for `delete` |

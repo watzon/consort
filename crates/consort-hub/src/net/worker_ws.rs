@@ -256,6 +256,11 @@ async fn handle_request(
                 .map(|()| Empty {});
             reply(link, &request, result);
         }
+        WorkerToHub::SkillBundleGet(_) => {
+            // Skill delivery is not built yet (docs/CONNECTORS-SKILLS-PLAN.md).
+            link.outbox
+                .send_frame(&request.respond_error(ErrorBody::not_built("skill_bundle.get")));
+        }
         WorkerToHub::ToolCall(call) => {
             // A tool call can take long, so it must not block other frames.
             let hub = hub.clone();

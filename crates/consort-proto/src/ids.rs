@@ -200,6 +200,18 @@ define_id!(
     /// (`sgn_`).
     SignInId, "sgn_"
 );
+define_id!(
+    /// One connected account of one connector service (`con_`).
+    ConnectionId, "con_"
+);
+define_id!(
+    /// An installed skill (`skl_`).
+    SkillId, "skl_"
+);
+define_id!(
+    /// One record in the audit log of connector tool calls (`ccl_`).
+    ConnectorCallId, "ccl_"
+);
 
 macro_rules! define_text_id {
     ($(#[$meta:meta])* $name:ident) => {
@@ -310,18 +322,25 @@ mod tests {
             AccountId::new().to_string(),
             ClientId::new().to_string(),
             SignInId::new().to_string(),
+            ConnectionId::new().to_string(),
+            SkillId::new().to_string(),
+            ConnectorCallId::new().to_string(),
         ];
         let prefixes: Vec<&str> = ids.iter().map(|s| &s[..4]).collect();
         assert_eq!(
             prefixes,
             [
                 "grp_", "chn_", "msg_", "tsk_", "ses_", "itm_", "apr_", "dec_", "rep_", "cko_",
-                "rtn_", "wrk_", "acc_", "cli_", "sgn_"
+                "rtn_", "wrk_", "acc_", "cli_", "sgn_", "con_", "skl_", "ccl_"
             ]
         );
         assert!(ids[0].parse::<GroupId>().is_ok());
         assert!(ids[13].parse::<ClientId>().is_ok());
         assert!(ids[14].parse::<SignInId>().is_ok());
+        assert!(ids[15].parse::<ConnectionId>().is_ok());
+        assert!(ids[16].parse::<SkillId>().is_ok());
+        assert!(ids[17].parse::<ConnectorCallId>().is_ok());
+        assert!(ids[15].parse::<SkillId>().is_err());
     }
 
     #[test]

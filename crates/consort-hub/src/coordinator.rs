@@ -192,7 +192,8 @@ fn main_text(event: &mut WakeEvent) -> Option<&mut String> {
     match event {
         WakeEvent::UserMessage { text, .. }
         | WakeEvent::TaskUpdate { text, .. }
-        | WakeEvent::EverythingMessage { text, .. } => Some(text),
+        | WakeEvent::EverythingMessage { text, .. }
+        | WakeEvent::CardAnswered { text, .. } => Some(text),
         WakeEvent::Routine { prompt, .. } => Some(prompt),
         WakeEvent::MemorySuggestion { note, .. } => Some(note),
         WakeEvent::DecisionAnswered { text, .. } => text.as_mut(),
@@ -514,6 +515,7 @@ impl Hub {
                         system_prompt_append: system_prompt,
                         allowed_local_mcp_servers: Vec::new(),
                         channel_files: files,
+                        extensions: Default::default(),
                         resume: None,
                         turn: Some(TurnInput {
                             text: first_turn,

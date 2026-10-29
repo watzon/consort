@@ -89,7 +89,7 @@ If the home network is down, the phone still reaches the hub. Chat, memory, rout
 
 Each channel has one coordinator session. The coordinator is the assistant in that channel. Its system prompt holds the channel's purpose, its instructions, the index of global memory and channel memory, and the rules for the hub tools.
 
-The Everything coordinator has three more tools: `list_channels`, `read_channel` and `message_channel`. With those, it can answer questions about any channel, and it can steer a channel by posting a message in that channel. It writes only global memory. Channel coordinators read global memory and write only their own channel memory. That split comes straight from Duet: the main chat sees everything but owns only the facts about the user.
+The Everything coordinator has three more tools: `list_channels`, `read_channel` and `message_channel`. With those, it can answer questions about any channel, and it can steer a channel by posting a message in that channel. It also has the management tools for channels, workers, accounts, connections and skills (see [Connectors, skills and management](#connectors-skills-and-management)). It writes only global memory. Channel coordinators read global memory and write only their own channel memory. That split comes straight from Duet: the main chat sees everything but owns only the facts about the user.
 
 Memory changes move up one level at a time. A task that learns something, such as "never push to main", calls `suggest_memory`. Its channel coordinator gets the suggestion in its next turn and decides whether to write a channel memory note. A channel coordinator that learns a fact about the user suggests it to the Everything coordinator in the same way. So the assistant keeps one memory with one owner for each scope, and every note has a coordinator that chose to keep it.
 
@@ -119,6 +119,23 @@ Because the session is a cache, the user can change a channel's harness or model
 Each channel has a coordinator selection (account, model and options such as the effort). A channel without its own selection uses Everything's, so Everything's selection is the default for every such channel. The user chooses it in the composer, in the New channel dialog, or with Model in the channel menu. The client sends `channel.update { coordinator_selection }` at once, and the hub stores it.
 
 When the selection that a channel uses changes, its own or Everything's for a channel that has none, the hub ends the open coordinator session of that channel if no turn runs. A turn that runs is not cut: the next run of the channel sees that the prompt fingerprint (which holds the selection) changed, ends the session, and starts a new one. The next turn then starts with the new model and options. The hub passes the options in `session.start`. The ACP adapter sets them with `session/set_config_option` after the model. The Codex adapter sends the effort with each turn. The hub does not switch the model inside a session.
+
+## Connectors, skills and management
+
+Consort, not the provider of each harness, is the source of the assistant's connectors and skills (ADR 0011). So every harness on every worker gets the same set, and the hub can enforce approvals and scope.
+
+```
+ Session ──MCP──> Worker ──tool.call──> Hub ──HTTPS──> Composio ──> Gmail, GitHub, ...
+                    ^                    |
+                    └─ skill_bundle.get ─┘  (skills, by content hash)
+```
+
+- **Connectors.** The user brings a Composio key, which only the hub holds. Each connection is one connected account of one service, with a handle such as `gmail_work`. A session sees the connections of its channel in a "Connectors in this channel" block, and uses them only through `list_connector_tools`, `get_connector_tool` and `run_connector_tool`. Tool schemas stay out of the context until the assistant asks for the tools of one connector. The hub checks the scope, applies the approval rule of the tool kind, runs the call with the exact connected account, and writes an audit record.
+- **Skills.** The hub installs a skill from a git repo, a directory entry or an upload, pins it to a commit and a content hash, and stores its files as blobs. The worker gets the skills of a session by hash and writes them where its harness reads skills (a plugin folder for Claude Code, a skills folder for Codex and Gemini CLI, the `skills` paths of OpenCode). A harness with no skill support gets `list_skills` and `read_skill`.
+- **Scope.** Each connection and skill has a "Use in" scope: every channel, the channels with all of some tags, or a list of channels. A channel can turn off an item that its scope gives it (a channel exception). The effective set of a session is fixed when the session starts.
+- **Cards.** A connector approval, a connect card, a sign-in card, an install card and a management approval card are approvals that the hub makes itself (hub cards). They use the approval card, `approval.answer`, push and Needs input. When a card that a coordinator posted closes, the coordinator gets a `card_answered` event.
+- **Management.** The Everything coordinator manages everything, and a channel's coordinator manages its own channel. The hub enforces the risk rule: a narrow or stricter change runs at once, and a change that deletes, widens access, loosens approvals, turns on scripts, changes tags or turns on provider extras waits for the user. The assistant never handles a secret.
+- **Provider extras.** Each harness account has a toggle for what it syncs from the provider, such as claude.ai connectors. It is on by default. Off starts the harness without them, as far as the provider lets the worker turn them off.
 
 ## Placement
 
@@ -224,6 +241,7 @@ The binary name `app` is a placeholder until the product has a name.
 The hub can tell any worker to run a harness, and a harness can run commands. So the hub is the most valuable target in the system, and the design limits what a stolen hub can do:
 
 - **Model credentials do not stay on the hub.** Subscription logins stay in each account's profile folder on the worker, in the harness's own files or keychain entry, and Consort never reads them. An API key goes once from the app through the hub to the worker, which writes it to `env.json` in the profile folder. The hub never stores or logs it. The code that the user pastes during a Claude sign-in goes the same way to the stdin of `claude auth login`, and nobody stores it. See ADR 0010.
+- **Connector keys stay on the hub.** The Composio key is encrypted at rest on the hub and never leaves it. Credentials for a connector with no browser step go from the app through the hub to Composio once, and Consort does not store them. The assistant never handles a key or a sign-in: a card sends the user to the app or the browser. The hub keeps a hash of each connector call's arguments, never the arguments. See ADR 0011.
 - **Workers set the limits.** Worker policy caps the approval mode, the folders and shell access. The hub cannot raise a worker's limits.
 - **Keys, not passwords.** Workers and clients prove their identity with Ed25519 keys made during pairing. Pairing codes are single use and expire after 10 minutes. The user can revoke any worker or client.
 - **Local tokens stay local.** The bearer token for a session's MCP endpoint exists only on that worker, and the endpoint listens only on 127.0.0.1.

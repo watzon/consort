@@ -27,6 +27,25 @@ use crate::model::{
 use crate::status::TaskStatus;
 use crate::time::Timestamp;
 
+mod connectors;
+mod management;
+
+pub use connectors::{
+    CONNECTOR_APPROVAL_WAIT_MS, CONNECTOR_RESULT_MAX_BYTES, CONNECTOR_TOOLS_LIST_MAX,
+    ConnectorToolInfo, GetConnectorToolArgs, GetConnectorToolResult, ListConnectorToolsArgs,
+    ListConnectorToolsResult, ListSkillsResult, ReadSkillArgs, ReadSkillResult,
+    RunConnectorToolArgs, RunConnectorToolResult,
+};
+pub use management::{
+    AddAccountArgs, AddSkillArgs, ArchiveChannelArgs, ChangeStatus, ConnectServiceArgs,
+    CreateChannelArgs, DisconnectArgs, InstallToolArgs, ListConnectionsResult,
+    ListInstalledSkillsResult, ManagementResult, RemoveSkillArgs, RequestAccessArgs,
+    SearchConnectorCatalogArgs, SearchConnectorCatalogResult, SearchSkillsArgs, SearchSkillsResult,
+    SetAccountExtrasArgs, SetChannelConnectorArgs, SetChannelSkillArgs, SetChannelTagsArgs,
+    SetDefaultModelArgs, SetWorkerTagsArgs, StartSignInArgs, UpdateChannelArgs,
+    UpdateConnectionArgs, UpdateSkillArgs, UpdateThisChannelArgs,
+};
+
 /// The kind of session that a tool is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -66,6 +85,7 @@ const EVERYTHING_ONLY: &[ToolAudience] = &[ToolAudience::EverythingCoordinator];
 const CHANNEL_COORDINATOR_AND_TASK: &[ToolAudience] =
     &[ToolAudience::ChannelCoordinator, ToolAudience::TaskSession];
 const TASK_ONLY: &[ToolAudience] = &[ToolAudience::TaskSession];
+const CHANNEL_COORDINATOR_ONLY: &[ToolAudience] = &[ToolAudience::ChannelCoordinator];
 
 /// One tool in `tool.list`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -646,6 +666,23 @@ hub_tools! {
     /// `search`.
     Search("search", SearchArgs, EVERY_SESSION,
         "Search messages, memory notes and task titles."),
+    /// `list_connector_tools`. The hub lists it only when the channel can
+    /// use a connection.
+    ListConnectorTools("list_connector_tools", ListConnectorToolsArgs, EVERY_SESSION,
+        "List the tools of one connector from \"Connectors in this channel\", by its handle. Each tool has its slug, a short description, its kind (read, change or delete) and whether the user must approve it. Use search for a service with many tools."),
+    /// `get_connector_tool`.
+    GetConnectorTool("get_connector_tool", GetConnectorToolArgs, EVERY_SESSION,
+        "Get the input schema of one connector tool. Call it before run_connector_tool."),
+    /// `run_connector_tool`.
+    RunConnectorTool("run_connector_tool", RunConnectorToolArgs, EVERY_SESSION,
+        "Run one connector tool with its arguments. When the connection's rule asks the user, the user sees a card with the arguments and allows or denies the call. The result has a status: ran, waiting_for_user or denied. When the connector needs a new sign-in, ask the user to reconnect it in Settings > Connectors."),
+    /// `list_skills`. The hub lists it only for a harness that does not
+    /// load skills itself.
+    ListSkills("list_skills", NoArgs, EVERY_SESSION,
+        "List the skills of this channel with their descriptions."),
+    /// `read_skill`.
+    ReadSkill("read_skill", ReadSkillArgs, EVERY_SESSION,
+        "Read a skill's SKILL.md, or another file of the skill. Follow its instructions when the task fits the skill."),
     // Coordinators.
     /// `post_message`.
     PostMessage("post_message", PostMessageArgs, COORDINATORS,
@@ -707,6 +744,18 @@ hub_tools! {
     /// `routine_delete`.
     RoutineDelete("routine_delete", RoutineDeleteArgs, COORDINATORS,
         "Delete a routine."),
+    /// `list_connections`.
+    ListConnections("list_connections", NoArgs, COORDINATORS,
+        "List the connections with their handle, service, account, scope, approval rules and status. In a channel, it lists the ones that this channel can use, and says which ones this channel turned off."),
+    /// `list_installed_skills`.
+    ListInstalledSkills("list_installed_skills", NoArgs, COORDINATORS,
+        "List the installed skills with their scope, whether they are on, whether they have scripts, and whether a new version waits for review. In a channel, it lists the ones that this channel can use, and says which ones this channel turned off."),
+    /// `connect_service`.
+    ConnectService("connect_service", ConnectServiceArgs, COORDINATORS,
+        "Post a connect card for a service. The user checks the settings and continues in the browser. You never handle a password or a key. In a channel, the default scope is the channels with this channel's tags, or this channel alone."),
+    /// `add_skill`.
+    AddSkill("add_skill", AddSkillArgs, COORDINATORS,
+        "Post an install card for a skill from a git URL, owner/repo, or a search_skills entry. The card shows its license, scripts and audits, and the user adds it or not."),
     /// `suggest_memory`.
     SuggestMemory("suggest_memory", SuggestMemoryArgs, CHANNEL_COORDINATOR_AND_TASK,
         "Suggest a note for memory. A task sends it to the channel coordinator. A channel coordinator sends it to the Everything coordinator as a global memory suggestion. The coordinator that gets it decides whether to keep it."),
@@ -720,6 +769,67 @@ hub_tools! {
     /// `message_channel`.
     MessageChannel("message_channel", MessageChannelArgs, EVERYTHING_ONLY,
         "Post in a channel as a message from Everything. This wakes the coordinator of that channel."),
+    /// `create_channel`.
+    CreateChannel("create_channel", CreateChannelArgs, EVERYTHING_ONLY,
+        "Create a channel with a name and a purpose, and optionally a group, tags and models."),
+    /// `update_channel`.
+    UpdateChannel("update_channel", UpdateChannelArgs, EVERYTHING_ONLY,
+        "Change a channel. Fields that you leave out do not change. A change to its tags asks the user first."),
+    /// `archive_channel`.
+    ArchiveChannel("archive_channel", ArchiveChannelArgs, EVERYTHING_ONLY,
+        "Archive a channel. This asks the user first."),
+    /// `set_default_model`.
+    SetDefaultModel("set_default_model", SetDefaultModelArgs, EVERYTHING_ONLY,
+        "Set the model of Everything, which is also the model of every channel that has no model of its own."),
+    /// `set_worker_tags`.
+    SetWorkerTags("set_worker_tags", SetWorkerTagsArgs, EVERYTHING_ONLY,
+        "Replace the user tags of a worker. This asks the user first."),
+    /// `install_tool`.
+    InstallTool("install_tool", InstallToolArgs, EVERYTHING_ONLY,
+        "Install or update a managed tool, such as claude-code or codex, on a worker."),
+    /// `add_account`.
+    AddAccount("add_account", AddAccountArgs, EVERYTHING_ONLY,
+        "Add a provider account on a worker and post a sign-in card. The user signs in on the card."),
+    /// `start_sign_in`.
+    StartSignIn("start_sign_in", StartSignInArgs, EVERYTHING_ONLY,
+        "Post a sign-in card for an account that is signed out. The user signs in on the card."),
+    /// `set_account_extras`.
+    SetAccountExtras("set_account_extras", SetAccountExtrasArgs, EVERYTHING_ONLY,
+        "Turn an account's provider extras, such as claude.ai connectors and synced plugins and skills, on or off. Turning them on asks the user first."),
+    /// `search_connector_catalog`.
+    SearchConnectorCatalog("search_connector_catalog", SearchConnectorCatalogArgs, EVERYTHING_ONLY,
+        "Search the connector catalog for services to connect, such as Gmail or GitHub."),
+    /// `update_connection`.
+    UpdateConnection("update_connection", UpdateConnectionArgs, EVERYTHING_ONLY,
+        "Change a connection's name, scope or approval rules. A wider scope or a looser rule asks the user first."),
+    /// `disconnect`.
+    Disconnect("disconnect", DisconnectArgs, EVERYTHING_ONLY,
+        "Disconnect a connection. This asks the user first."),
+    /// `search_skills`.
+    SearchSkills("search_skills", SearchSkillsArgs, EVERYTHING_ONLY,
+        "Search the skill directories for skills to add."),
+    /// `update_skill`.
+    UpdateSkill("update_skill", UpdateSkillArgs, EVERYTHING_ONLY,
+        "Turn a skill on or off, change its scope, or take its new version. Turning on a skill with scripts or a wider scope asks the user first."),
+    /// `remove_skill`.
+    RemoveSkill("remove_skill", RemoveSkillArgs, EVERYTHING_ONLY,
+        "Remove a skill. This asks the user first."),
+    // A channel's coordinator, for its own channel only.
+    /// `update_this_channel`.
+    UpdateThisChannel("update_this_channel", UpdateThisChannelArgs, CHANNEL_COORDINATOR_ONLY,
+        "Change this channel's purpose, instructions, models or repos. Fields that you leave out do not change."),
+    /// `set_channel_tags`.
+    SetChannelTags("set_channel_tags", SetChannelTagsArgs, CHANNEL_COORDINATOR_ONLY,
+        "Replace this channel's tags. This asks the user first."),
+    /// `set_channel_connector`.
+    SetChannelConnector("set_channel_connector", SetChannelConnectorArgs, CHANNEL_COORDINATOR_ONLY,
+        "Turn a connection off or on in this channel. You can turn on only a connection whose scope gives it to this channel."),
+    /// `set_channel_skill`.
+    SetChannelSkill("set_channel_skill", SetChannelSkillArgs, CHANNEL_COORDINATOR_ONLY,
+        "Turn a skill off or on in this channel. You can turn on only a skill whose scope gives it to this channel."),
+    /// `request_access`.
+    RequestAccess("request_access", RequestAccessArgs, CHANNEL_COORDINATOR_ONLY,
+        "Post a card that asks the user to give this channel a connection or a skill that its scope does not give it."),
     // Task sessions.
     /// `post_update`.
     PostUpdate("post_update", PostUpdateArgs, TASK_ONLY,
@@ -1190,6 +1300,7 @@ pub struct PublishArtifactResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::UseIn;
     use serde_json::json;
 
     fn names(audience: ToolAudience) -> Vec<String> {
@@ -1228,19 +1339,58 @@ mod tests {
             "routine_update",
             "routine_delete",
         ];
-        let everything_only = ["list_channels", "read_channel", "message_channel"];
+        let every_extensions = [
+            "list_connector_tools",
+            "get_connector_tool",
+            "run_connector_tool",
+            "list_skills",
+            "read_skill",
+        ];
+        let coordinator_extensions = [
+            "list_connections",
+            "list_installed_skills",
+            "connect_service",
+            "add_skill",
+        ];
+        let everything_only = [
+            "list_channels",
+            "read_channel",
+            "message_channel",
+            "create_channel",
+            "update_channel",
+            "archive_channel",
+            "set_default_model",
+            "set_worker_tags",
+            "install_tool",
+            "add_account",
+            "start_sign_in",
+            "set_account_extras",
+            "search_connector_catalog",
+            "update_connection",
+            "disconnect",
+            "search_skills",
+            "update_skill",
+            "remove_skill",
+        ];
+        let channel_only = [
+            "update_this_channel",
+            "set_channel_tags",
+            "set_channel_connector",
+            "set_channel_skill",
+            "request_access",
+        ];
         let task_only = ["post_update", "submit_for_review", "publish_artifact"];
 
         let everything = names(ToolAudience::EverythingCoordinator);
         let channel = names(ToolAudience::ChannelCoordinator);
         let task = names(ToolAudience::TaskSession);
 
-        for name in every {
+        for name in every.into_iter().chain(every_extensions) {
             assert!(everything.contains(&name.to_owned()));
             assert!(channel.contains(&name.to_owned()));
             assert!(task.contains(&name.to_owned()));
         }
-        for name in coordinator {
+        for name in coordinator.into_iter().chain(coordinator_extensions) {
             assert!(everything.contains(&name.to_owned()), "{name}");
             assert!(channel.contains(&name.to_owned()), "{name}");
             assert!(!task.contains(&name.to_owned()), "{name}");
@@ -1255,17 +1405,27 @@ mod tests {
             assert!(!everything.contains(&name.to_owned()));
             assert!(!channel.contains(&name.to_owned()));
         }
+        for name in channel_only {
+            assert!(channel.contains(&name.to_owned()), "{name}");
+            assert!(!everything.contains(&name.to_owned()), "{name}");
+            assert!(!task.contains(&name.to_owned()), "{name}");
+        }
         // suggest_memory: channel coordinators and tasks, not Everything.
         assert!(channel.contains(&"suggest_memory".to_owned()));
         assert!(task.contains(&"suggest_memory".to_owned()));
         assert!(!everything.contains(&"suggest_memory".to_owned()));
 
+        let every_len = every.len() + every_extensions.len();
+        let coordinator_len = coordinator.len() + coordinator_extensions.len();
         assert_eq!(
             everything.len(),
-            every.len() + coordinator.len() + everything_only.len()
+            every_len + coordinator_len + everything_only.len()
         );
-        assert_eq!(channel.len(), every.len() + coordinator.len() + 1);
-        assert_eq!(task.len(), every.len() + task_only.len() + 1);
+        assert_eq!(
+            channel.len(),
+            every_len + coordinator_len + channel_only.len() + 1
+        );
+        assert_eq!(task.len(), every_len + task_only.len() + 1);
     }
 
     #[test]
@@ -1471,6 +1631,341 @@ mod tests {
         ]));
         assert!(!needs_fallback_post([HubTool::StartTask, HubTool::Reply]));
         assert!(!needs_fallback_post([HubTool::NoReplyNeeded]));
+    }
+
+    #[test]
+    fn connector_tools_parse() {
+        let run = HubToolCall::parse_for(
+            ToolAudience::TaskSession,
+            "run_connector_tool",
+            json!({"connector": "gmail_work", "tool": "GMAIL_SEND_EMAIL",
+                   "arguments": {"recipient_email": "kevin@example.com", "subject": "Friday"}}),
+        )
+        .unwrap();
+        let HubToolCall::RunConnectorTool(args) = &run else {
+            panic!("wrong variant");
+        };
+        assert_eq!(args.connector, "gmail_work");
+        assert_eq!(args.arguments["subject"], "Friday");
+        let no_args =
+            HubToolCall::parse("run_connector_tool", json!({"connector": "c", "tool": "T"}))
+                .unwrap();
+        let HubToolCall::RunConnectorTool(args) = no_args else {
+            panic!("wrong variant");
+        };
+        assert_eq!(args.arguments, Value::Null);
+        let schema = HubTool::RunConnectorTool.input_schema();
+        assert_eq!(schema["properties"]["arguments"]["type"], "object");
+        let list = HubToolCall::parse(
+            "list_connector_tools",
+            json!({"connector": "github_work", "search": "issue"}),
+        )
+        .unwrap();
+        assert!(matches!(
+            list,
+            HubToolCall::ListConnectorTools(ListConnectorToolsArgs {
+                search: Some(_),
+                ..
+            })
+        ));
+        assert!(HubToolCall::parse("get_connector_tool", json!({"connector": "c"})).is_err());
+        let read = HubToolCall::parse("read_skill", json!({"skill": "pdf-forms"})).unwrap();
+        assert_eq!(
+            read,
+            HubToolCall::ReadSkill(ReadSkillArgs {
+                skill: "pdf-forms".into(),
+                path: None
+            })
+        );
+        assert_eq!(
+            HubToolCall::parse("list_skills", Value::Null).unwrap(),
+            HubToolCall::ListSkills(NoArgs {})
+        );
+    }
+
+    #[test]
+    fn management_tools_parse_and_respect_audiences() {
+        let update = HubToolCall::parse_for(
+            ToolAudience::EverythingCoordinator,
+            "update_connection",
+            json!({"connection": "github_work", "use_in": {"kind": "tags", "tags": ["work"]},
+                   "approvals": {"read": "run_without_asking", "change": "ask_once_per_task", "delete": "ask_every_time"}}),
+        )
+        .unwrap();
+        let HubToolCall::UpdateConnection(args) = update else {
+            panic!("wrong variant");
+        };
+        assert_eq!(
+            args.use_in,
+            Some(UseIn::Tags {
+                tags: vec!["work".into()]
+            })
+        );
+        assert_eq!(
+            args.approvals.unwrap().change,
+            crate::model::ApprovalRule::AskOncePerTask
+        );
+        // The channel assistant cannot use Everything's tools, and the other
+        // way round.
+        for (audience, tool, args) in [
+            (
+                ToolAudience::ChannelCoordinator,
+                "update_connection",
+                json!({"connection": "x"}),
+            ),
+            (
+                ToolAudience::ChannelCoordinator,
+                "create_channel",
+                json!({"name": "a", "purpose": "b"}),
+            ),
+            (
+                ToolAudience::EverythingCoordinator,
+                "set_channel_tags",
+                json!({"tags": []}),
+            ),
+            (
+                ToolAudience::TaskSession,
+                "connect_service",
+                json!({"service": "gmail", "name": "Gmail"}),
+            ),
+            (ToolAudience::TaskSession, "list_connections", json!({})),
+        ] {
+            let err = HubToolCall::parse_for(audience, tool, args).unwrap_err();
+            assert!(
+                matches!(err, ToolCallError::NotAllowed { .. }),
+                "{tool}: {err}"
+            );
+        }
+        let calls = [
+            (
+                "create_channel",
+                json!({"name": "Sayso", "purpose": "The Sayso app", "group": "Work", "tags": ["work"],
+                "model": {"account_label": "Claude Work", "model": "claude-opus-5-5"}}),
+            ),
+            (
+                "update_channel",
+                json!({"channel": "chn_00000000-0000-0000-0000-000000000001", "repos": ["git@github.com:watzon/sayso.git"]}),
+            ),
+            (
+                "archive_channel",
+                json!({"channel": "chn_00000000-0000-0000-0000-000000000001"}),
+            ),
+            (
+                "set_default_model",
+                json!({"model": {"account_label": "Claude Work", "model": "claude-opus-5-5", "options": {"effort": "high"}}}),
+            ),
+            (
+                "set_worker_tags",
+                json!({"worker": "wrk_00000000-0000-0000-0000-000000000006", "tags": ["gpu"]}),
+            ),
+            (
+                "install_tool",
+                json!({"worker": "wrk_00000000-0000-0000-0000-000000000006", "tool": "codex"}),
+            ),
+            (
+                "add_account",
+                json!({"worker": "wrk_00000000-0000-0000-0000-000000000006", "provider": "claude", "name": "Claude Work"}),
+            ),
+            (
+                "start_sign_in",
+                json!({"worker": "wrk_00000000-0000-0000-0000-000000000006", "account": "acc_00000000-0000-0000-0000-000000000009"}),
+            ),
+            (
+                "set_account_extras",
+                json!({"worker": "wrk_00000000-0000-0000-0000-000000000006", "account": "acc_00000000-0000-0000-0000-000000000009", "enabled": false}),
+            ),
+            ("search_connector_catalog", json!({"search": "email"})),
+            ("list_connections", json!({})),
+            (
+                "connect_service",
+                json!({"service": "gmail", "name": "Gmail Work", "use_in": {"kind": "every_channel"}}),
+            ),
+            ("disconnect", json!({"connection": "gmail_work"})),
+            (
+                "search_skills",
+                json!({"search": "pdf", "source": "smithery"}),
+            ),
+            ("list_installed_skills", Value::Null),
+            (
+                "add_skill",
+                json!({"source": "anthropics/skills", "path": "pdf"}),
+            ),
+            (
+                "update_skill",
+                json!({"skill": "pdf-forms", "enabled": true, "accept_new_version": true}),
+            ),
+            ("remove_skill", json!({"skill": "pdf-forms"})),
+            ("update_this_channel", json!({"purpose": "Ship Sayso"})),
+            ("set_channel_tags", json!({"tags": ["work"]})),
+            (
+                "set_channel_connector",
+                json!({"connection": "gmail_work", "enabled": false}),
+            ),
+            (
+                "set_channel_skill",
+                json!({"skill": "pdf-forms", "enabled": true}),
+            ),
+            ("request_access", json!({"connection": "github_work"})),
+        ];
+        for (name, args) in calls {
+            let call = HubToolCall::parse(name, args).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(call.tool().name(), name);
+        }
+        let schema = HubTool::ConnectService.input_schema();
+        let text = schema.to_string();
+        assert!(text.contains("every_channel"), "{text}");
+        assert!(text.contains("ask_once_per_task"), "{text}");
+    }
+
+    #[test]
+    fn connector_results_have_a_status() {
+        let call_id: crate::ids::ConnectorCallId =
+            "ccl_00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let ran = RunConnectorToolResult::Ran {
+            call_id,
+            successful: true,
+            data: json!({"id": "msg-1"}),
+            error: None,
+            truncated: false,
+        };
+        assert_eq!(
+            serde_json::to_value(&ran).unwrap(),
+            json!({"status": "ran", "call_id": "ccl_00000000-0000-0000-0000-000000000001",
+                   "successful": true, "data": {"id": "msg-1"}})
+        );
+        let waiting = RunConnectorToolResult::WaitingForUser {
+            approval_id: "apr_00000000-0000-0000-0000-000000000002".parse().unwrap(),
+            message: "The user has not answered yet.".into(),
+        };
+        let denied = RunConnectorToolResult::Denied {
+            call_id,
+            message: "The user denied the call.".into(),
+        };
+        for result in [ran, waiting, denied] {
+            let value = serde_json::to_value(&result).unwrap();
+            assert!(value["status"].is_string());
+            assert_eq!(
+                serde_json::from_value::<RunConnectorToolResult>(value).unwrap(),
+                result
+            );
+        }
+        let info = ConnectorToolInfo {
+            slug: "GMAIL_SEND_EMAIL".into(),
+            description: "Send an email.".into(),
+            kind: crate::model::ToolKind::Change,
+            approval: crate::model::ApprovalRule::AskEveryTime,
+        };
+        let list = ListConnectorToolsResult {
+            connector: "gmail_work".into(),
+            service_name: "Gmail".into(),
+            tools: vec![info.clone()],
+            has_more: true,
+        };
+        assert_eq!(
+            serde_json::from_value::<ListConnectorToolsResult>(
+                serde_json::to_value(&list).unwrap()
+            )
+            .unwrap(),
+            list
+        );
+        let get = GetConnectorToolResult {
+            connector: "gmail_work".into(),
+            tool: info,
+            input_schema: json!({"type": "object"}),
+        };
+        let value = serde_json::to_value(&get).unwrap();
+        assert_eq!(value["slug"], "GMAIL_SEND_EMAIL");
+        assert_eq!(
+            serde_json::from_value::<GetConnectorToolResult>(value).unwrap(),
+            get
+        );
+        let skills = ListSkillsResult {
+            skills: vec![crate::model::SkillContextEntry {
+                name: "pdf-forms".into(),
+                description: "Fill PDF forms.".into(),
+            }],
+        };
+        assert_eq!(
+            serde_json::from_value::<ListSkillsResult>(serde_json::to_value(&skills).unwrap())
+                .unwrap(),
+            skills
+        );
+        let read = ReadSkillResult {
+            skill: "pdf-forms".into(),
+            path: "SKILL.md".into(),
+            content: "---\nname: pdf-forms\n---".into(),
+            truncated: false,
+            files: vec!["scripts/fill.py".into()],
+        };
+        assert_eq!(
+            serde_json::from_value::<ReadSkillResult>(serde_json::to_value(&read).unwrap())
+                .unwrap(),
+            read
+        );
+    }
+
+    #[test]
+    fn management_results_say_what_happened() {
+        let apr: crate::ids::ApprovalId =
+            "apr_00000000-0000-0000-0000-000000000002".parse().unwrap();
+        let applied = ManagementResult {
+            channel_id: Some("chn_00000000-0000-0000-0000-000000000001".parse().unwrap()),
+            ..ManagementResult::applied("Created the channel Sayso.")
+        };
+        assert_eq!(
+            serde_json::to_value(&applied).unwrap(),
+            json!({"status": "applied", "summary": "Created the channel Sayso.",
+                   "channel_id": "chn_00000000-0000-0000-0000-000000000001"})
+        );
+        let waiting = ManagementResult::waiting_for_user(
+            apr,
+            "The user must allow this: GitHub Work becomes available in 4 more channels.",
+        );
+        assert_eq!(waiting.status, ChangeStatus::WaitingForUser);
+        assert_eq!(waiting.approval_id, Some(apr));
+        let refused = ManagementResult::refused(
+            "This channel's scope does not give it Gmail Work. Use request_access.",
+        );
+        for result in [applied, waiting, refused] {
+            let value = serde_json::to_value(&result).unwrap();
+            assert_eq!(
+                serde_json::from_value::<ManagementResult>(value).unwrap(),
+                result
+            );
+        }
+        let lists = ListConnectionsResult {
+            connections: vec![],
+            off_in_this_channel: vec![],
+        };
+        assert_eq!(
+            serde_json::to_value(&lists).unwrap(),
+            json!({"connections": []})
+        );
+        let skills = ListInstalledSkillsResult {
+            skills: vec![],
+            off_in_this_channel: vec!["skl_00000000-0000-0000-0000-000000000003".parse().unwrap()],
+        };
+        assert_eq!(
+            serde_json::from_value::<ListInstalledSkillsResult>(
+                serde_json::to_value(&skills).unwrap()
+            )
+            .unwrap(),
+            skills
+        );
+        let search = SearchConnectorCatalogResult { services: vec![] };
+        assert_eq!(
+            serde_json::from_value::<SearchConnectorCatalogResult>(
+                serde_json::to_value(&search).unwrap()
+            )
+            .unwrap(),
+            search
+        );
+        let entries = SearchSkillsResult { entries: vec![] };
+        assert_eq!(
+            serde_json::from_value::<SearchSkillsResult>(serde_json::to_value(&entries).unwrap())
+                .unwrap(),
+            entries
+        );
     }
 
     #[test]

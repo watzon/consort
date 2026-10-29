@@ -182,6 +182,10 @@ _Avoid_: question card, poll, choice
 The task status while an approval or a decision waits for the user.
 _Avoid_: blocked, waiting, paused
 
+**Card**:
+A message in the timeline that waits for the user, which the hub makes itself and shows like an approval: a connect card, a sign-in card, an install card, a management approval card, or a connector approval. Code calls it a hub card.
+_Avoid_: prompt, popup, form, modal
+
 ## Knowledge
 
 **Memory**:
@@ -215,3 +219,41 @@ _Avoid_: output, deliverable, attachment
 **Hub tools**:
 The tools that the hub gives every session so it can post messages, start tasks, ask decisions and use memory.
 _Avoid_: MCP tools, assistant tools, built-ins
+
+**Management tool**:
+A hub tool with which the assistant changes channels, workers, accounts, connections or skills. The Everything coordinator manages everything, and a channel's coordinator manages only its own channel. A risky change waits for the user on a management approval card.
+_Avoid_: admin tool, settings tool
+
+## Connectors and skills
+
+**Connector**:
+A service from the connector catalog, such as Gmail or GitHub, that the assistant can use through Composio. The UI calls it a connector, and Composio calls it a toolkit.
+_Avoid_: integration, app, toolkit (in the UI), MCP server
+
+**Connection**:
+One connected account of one connector, such as "Gmail Work", with a name, a handle that the assistant uses (`gmail_work`), a "Use in" scope and an approval rule for each tool kind.
+_Avoid_: connected account, link, credential
+
+**Tool kind**:
+What a connector tool does: read, change (create or update) or delete. It picks the approval rule: run without asking, ask once per task, or ask every time.
+_Avoid_: permission level, scope
+
+**Skill**:
+A folder in the Agent Skills format, with a `SKILL.md`, that the hub installs from a source, pins to a commit and a content hash, and gives to sessions.
+_Avoid_: plugin, prompt, recipe, tool
+
+**Use in**:
+Where a connection or a skill can be used: every channel, the channels that have all of some tags, or a list of channels. The Everything channel matches only "every channel", unless it has tags of its own.
+_Avoid_: scope (in the UI), visibility, sharing
+
+**Channel exception**:
+A connection or a skill that one channel turned off, though its "Use in" gives it to the channel. A channel cannot turn on an item that its "Use in" does not give it.
+_Avoid_: override, block list
+
+**Effective set**:
+The connections and skills that a session gets: the ones whose "Use in" matches the session's channel, minus the channel's exceptions.
+_Avoid_: enabled tools, active connectors
+
+**Provider extras**:
+What a harness account brings from the provider's side, such as claude.ai connectors and synced plugins and skills. Each account has a toggle for them, on by default.
+_Avoid_: built-in connectors, cloud extras, synced stuff

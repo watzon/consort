@@ -290,6 +290,8 @@ impl Hub {
                     allowed_local_mcp_servers: Vec::new(),
                     memory_enabled: request.memory_enabled.unwrap_or(true),
                     tags,
+                    disabled_connections: Vec::new(),
+                    disabled_skills: Vec::new(),
                     archived_at: None,
                     created_at: now,
                     updated_at: now,

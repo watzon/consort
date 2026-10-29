@@ -185,6 +185,8 @@ mod tests {
             default_approval_mode: ApprovalMode::Ask,
             allowed_local_mcp_servers: Vec::new(),
             memory_enabled: true,
+            disabled_connections: Vec::new(),
+            disabled_skills: Vec::new(),
             archived_at: None,
             created_at: Timestamp::EPOCH,
             updated_at: Timestamp::EPOCH,

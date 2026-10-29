@@ -10,12 +10,14 @@
 
 mod account;
 mod common;
+mod connector;
 mod conversation;
 mod knowledge;
 mod machine;
 mod preferences;
 mod routine;
 mod session;
+mod skill;
 mod tag;
 mod tool;
 mod waiting;
@@ -30,6 +32,14 @@ pub use common::{
     BlobRef, HashParseError, ModelOptions, ModelSelection, OptionValue, Os, Sha256Hash,
     ValidationError, validate_relative_path,
 };
+pub use connector::{
+    ApprovalRule, AuthScheme, AuthSchemeKind, CATALOG_REFRESH_MS, CONNECT_ATTEMPT_TIMEOUT_MS,
+    CONNECTION_HANDLE_MAX_CHARS, CONNECTION_NAME_MAX_CHARS, CallDecision, CallOutcome,
+    ComposioStatus, ComposioUsage, Connection, ConnectionStatus, ConnectorCall, ConnectorCategory,
+    ConnectorContextEntry, ConnectorService, ConnectorToolSummary, CredentialField, DisplayField,
+    ToolApprovals, ToolKind, UseIn, canonical_json, connection_handle, render_connectors_block,
+    unique_connection_handle, validate_connection_name,
+};
 pub use conversation::{
     Author, Channel, ChannelKind, ChannelRepo, Group, Message, MessageKind, Reaction, ReadMarker,
     Repo,
@@ -40,9 +50,10 @@ pub use knowledge::{
     memory_note_entity_id, validate_memory_path,
 };
 pub use machine::{
-    AuthState, Capabilities, Checkout, CheckoutInfo, Client, ClientKind, HarnessAccount, Inventory,
-    LocalMcpServerInfo, ModelInfo, OptionChoice, OptionDescriptor, PushProvider, PushRegistration,
-    Worker, WorkerLoad, WorkerPolicy, WorkerState,
+    AuthState, Capabilities, Checkout, CheckoutInfo, Client, ClientKind, ExtrasGroup,
+    HarnessAccount, Inventory, LocalMcpServerInfo, ModelInfo, OptionChoice, OptionDescriptor,
+    PROVIDER_EXTRAS_NAMES_MAX, ProviderExtras, PushProvider, PushRegistration, Worker, WorkerLoad,
+    WorkerPolicy, WorkerState,
 };
 pub use preferences::{
     FAVORITE_FIELD_MAX_CHARS, FAVORITE_MODELS_MAX, FavoriteModel, PREFERENCES_ENTITY_ID,
@@ -58,12 +69,23 @@ pub use session::{
     PlanStepStatus, ReasoningPayload, Session, SessionItem, SessionRole, SessionState,
     SubagentPayload, ToolCallPayload, Usage, WebSearchPayload, tail_of,
 };
+pub use skill::{
+    AuditStatus, SKILL_DESCRIPTION_MAX_CHARS, SKILL_MANIFEST_FILE, SKILL_MAX_FILE_BYTES,
+    SKILL_MAX_FILES, SKILL_MAX_TOTAL_BYTES, SKILL_NAME_MAX_CHARS, SKILL_READ_MAX_BYTES,
+    SKILL_UPDATE_CHECK_MS, SKILL_UPLOAD_MAX_BYTES, Skill, SkillAudit, SkillBundle, SkillBundleRef,
+    SkillContextEntry, SkillDirectoryEntry, SkillDirectoryKind, SkillDirectorySource,
+    SkillFileChange, SkillFileChangeKind, SkillFileInfo, SkillSource, SkillUpdateState,
+    render_skills_block, skill_content_hash, validate_skill_description, validate_skill_files,
+    validate_skill_name,
+};
 pub use tag::{InvalidTag, TAG_MAX_CHARS, is_valid_tag, normalize_tags, validate_tag};
 pub use tool::{ToolId, ToolState, ToolStatus};
 pub use waiting::{
-    Approval, ApprovalDetails, ApprovalKind, ApprovalStatus, DECISION_CONSEQUENCE_MAX_CHARS,
-    DECISION_LABEL_MAX_CHARS, DECISION_MAX_OPTIONS, DECISION_MIN_OPTIONS,
-    DECISION_QUESTION_MAX_CHARS, Decision, DecisionAnswer, DecisionOption, DecisionStatus,
-    RequestOption, RequestOptionKind, validate_decision,
+    Approval, ApprovalDetails, ApprovalKind, ApprovalStatus, ConnectServiceCard, ConnectorCard,
+    DECISION_CONSEQUENCE_MAX_CHARS, DECISION_LABEL_MAX_CHARS, DECISION_MAX_OPTIONS,
+    DECISION_MIN_OPTIONS, DECISION_QUESTION_MAX_CHARS, Decision, DecisionAnswer, DecisionOption,
+    DecisionStatus, HUB_CARD_ALLOW, HUB_CARD_DENY, HUB_CARD_REQUEST_PREFIX, ManagementCard,
+    RequestOption, RequestOptionKind, SignInCard, SkillInstallCard, hub_card_request_id,
+    validate_decision,
 };
 pub use work::{ApprovalMode, Isolation, PlacementRequest, PlacementRequire, Task, TaskCreator};
