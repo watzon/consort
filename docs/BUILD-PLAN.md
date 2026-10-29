@@ -20,11 +20,11 @@ The first build, started 2026-10-29 while the user was away. It builds the deskt
 |---|---|---|---|
 | 0 | Repo, docs, `AGENTS.md`, this plan, decisions log | Lead | Done |
 | A | `consort-proto`: the full wire contract | Agent (Opus) | Done |
-| A | `consort-theme`, `consort-desktop` UI on mock data, then `consort-client` | Agent (Opus) | Done (Windows controls and polish in follow-up) |
-| B | `consort-hub` | Agent (Sonnet) | Started |
-| B | `consort-harness`, `consort-worker`, `consort-testkit`, `consort-cli` | Agent (Opus) | Started |
-| C | End-to-end on macOS, then Windows on `bigboi` | Lead | |
-| D | Up to three review cycles with independent reviewer agents | Lead | |
+| A | `consort-theme`, `consort-desktop` UI on mock data, then `consort-client` | Agent (Opus) | Done |
+| B | `consort-hub` | Agent (Sonnet) | Done |
+| B | `consort-harness`, `consort-worker`, `consort-testkit`, `consort-cli` | Agent (Opus) | Done |
+| C | End-to-end on macOS, then Windows on `bigboi` | Lead | Done, see [E2E.md](E2E.md) |
+| D | Up to three review cycles with independent reviewer agents | Lead | Started |
 
 Agents use their own build folder to avoid lock waits: `CARGO_TARGET_DIR=target/<crate-or-agent>`. Agents do not run git. The lead commits at each integration point.
 
