@@ -38,11 +38,28 @@ Fixed:
 
 Checked in the real app after the fixes: the history loads after an app restart, the message menu and the selected-text menu have the planned items, the message menu opens upward near the bottom edge, and Copy puts the selected text on the clipboard.
 
-Open:
-
-- Copy of a partial selection adds a newline at the end.
-
 Not bugs:
 
 - Tasks asked before they wrote a file because both channels use the Ask approval mode by default.
 - The computer-use driver's `return` key did not reach the composer, but its `enter` key did. The app handles both.
+
+## Final run after the three review cycles
+
+The lead ran the same setup again at commit `ccebf5e`, on the data from the first run:
+
+- The hub applied migrations 2 and 3 to the existing `hub.db` with no error. The data folder and `hub.db` became private (0700 and 0600).
+- `consort hub client list` and `consort hub worker list` worked while the hub ran. Pairings from before migration 3 show "by unknown".
+- The app reconnected with the saved `http` URL on the LAN, and loaded the full history.
+- Both workers reconnected, also `bigboi` on Windows. A second worker on the same folder on Windows refused to start.
+- A coordinator turn started a task in Ask mode. The approval card showed the mode, the folder, and the harness's own label for the "always" button. Allow once worked, and the task went to Ready for review with the right output.
+
+`cargo test --workspace` passes with 887 tests on macOS and 873 on Windows (some tests run on Unix only). `cargo clippy --workspace --all-targets -- -D warnings` and `cargo fmt --check` pass.
+
+## Still open
+
+- A model task on Windows: the Claude Code login on `bigboi` has expired and Codex there is signed out. Sign in there (`claude`, then `/login`, or `codex login`) and ask Consort to retry the bigboi task.
+- The probe cannot see an expired Claude Code login. The worker marks the account signed out after the first failed turn.
+- The app offers Retry only for failed tasks. The hub also allows Retry for a task in review or resolved whose session ended.
+- Archived tasks cannot be listed or brought back from the app, because the hub has no request for that yet.
+- A channel's allowed local MCP servers (new in review cycle 3) can be set through `channel.update`, but the app has no field for it yet.
+- In an approval card, the "Folder" label lines up with the second line of a long wrapped path.
