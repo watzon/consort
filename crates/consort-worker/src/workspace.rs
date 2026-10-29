@@ -524,6 +524,10 @@ mod tests {
         git(&["config", "commit.gpgsign", "false"], Some(&repo))
             .await
             .unwrap();
+        // Keep line endings as they are. Without this, a user's
+        // `core.autocrlf = true` (common on Windows) changes LF to CRLF in
+        // the checkouts, and the byte checks below fail.
+        std::fs::write(repo.join(".gitattributes"), "* -text\n").unwrap();
         std::fs::write(repo.join("a.txt"), "one\n").unwrap();
         git(&["add", "."], Some(&repo)).await.unwrap();
         git(&["commit", "-q", "-m", "first"], Some(&repo))
