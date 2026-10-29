@@ -922,7 +922,6 @@ impl ConsortApp {
                     .group_name
                     .update(cx, |input, cx| input.focus(window, cx));
             }
-            Some(Pick::Selection(selection)) => self.new_channel.selection = Some(selection),
             Some(Pick::Worker(id)) => self.new_channel.workers.push(id),
             Some(Pick::Tag(tag)) => {
                 let tags = if matches!(self.dialog, Some(Dialog::ChannelTags(_))) {
@@ -952,8 +951,6 @@ pub enum Pick {
     NoGroup,
     /// The new channel goes in a group that the dialog makes.
     NewGroup,
-    /// The key of a model selection.
-    Selection(String),
     Worker(String),
     /// A worker tag for a channel.
     Tag(String),
@@ -979,9 +976,6 @@ pub fn resolve_pick(
             .iter()
             .find(|group| group.id == option)
             .map(|group| Pick::Group(group.id.clone())),
-        "new-channel-selection" => state
-            .selection(option)
-            .map(|selection| Pick::Selection(selection.key())),
         "channel-tag" => state
             .tags
             .iter()
@@ -1313,18 +1307,7 @@ mod tests {
     }
 
     fn state_with_choices() -> ViewState {
-        let mut state = consort_client::mock::view_state();
-        let choice = |account: &str, id: &str, name: &str| consort_client::SelectionView {
-            account_label: account.into(),
-            model_id: id.into(),
-            model_name: name.into(),
-            options: Vec::new(),
-        };
-        state.selections = vec![
-            choice("Claude Code", "claude-opus", "Opus"),
-            choice("Codex", "gpt-5.5", "GPT"),
-        ];
-        state
+        consort_client::mock::view_state()
     }
 
     #[test]
@@ -1337,12 +1320,6 @@ mod tests {
         assert_eq!(
             resolve_pick(&state, &[], "new-channel-group", &wanted),
             Some(Pick::Group(wanted))
-        );
-        let selection = state.selections[1].key();
-        state.selections.reverse();
-        assert_eq!(
-            resolve_pick(&state, &[], "new-channel-selection", &selection),
-            Some(Pick::Selection(selection))
         );
         assert_eq!(
             resolve_pick(&state, &[], "channel-tag", "gpu-nvidia"),
@@ -1358,10 +1335,6 @@ mod tests {
     fn a_pick_that_is_gone_resolves_to_nothing() {
         let state = state_with_choices();
         assert_eq!(resolve_pick(&state, &[], "new-channel-group", "gone"), None);
-        assert_eq!(
-            resolve_pick(&state, &[], "new-channel-selection", "Gone, Model"),
-            None
-        );
         assert_eq!(
             resolve_pick(&state, &[], "new-channel-worker", "gone"),
             None

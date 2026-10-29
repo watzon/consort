@@ -1,7 +1,8 @@
 //! Key presses in the text inputs of the app, in a headless window.
 
 use crate::app::{ConsortApp, Dialog, Field, Page, SettingsSection};
-use consort_client::Client;
+use crate::ui::{menu::MenuAnchor, model_picker::PickerTarget};
+use consort_client::{Client, SelectionSource};
 use gpui::{AnyWindowHandle, TestAppContext, VisualTestContext};
 use gpui_kit::{AppContext as _, Entity, WindowOptions};
 
@@ -107,4 +108,274 @@ fn escape_in_the_tag_field_closes_only_the_field(cx: &mut TestAppContext) {
     // The next Escape leaves Settings.
     cx.simulate_keystrokes("escape");
     app.read_with(cx, |app, _| assert_eq!(app.page, Page::Main));
+}
+
+/// The app on mock content in Everything, with the model picker of the
+/// composer open.
+fn app_with_the_picker(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<ConsortApp>) {
+    let (handle, app) = app_with_a_dialog(cx);
+    let cx = &mut VisualTestContext::from_window(handle, cx);
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            app.close_dialog(window, cx);
+            let target = PickerTarget::Assistant(app.channel_id.clone());
+            app.open_picker(
+                target,
+                MenuAnchor::Point(gpui_kit::point(gpui_kit::px(600.), gpui_kit::px(800.))),
+                window,
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    (handle, app)
+}
+
+/// Waits until the mock client's thread has answered and the app has the
+/// new state, then reads the model of a channel's assistant.
+fn assistant_model(
+    app: &Entity<ConsortApp>,
+    cx: &mut VisualTestContext,
+    channel: &str,
+) -> (String, Option<String>, SelectionSource) {
+    for _ in 0..20 {
+        cx.run_until_parked();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    app.read_with(cx, |app, _| {
+        let chosen = app
+            .state
+            .channels
+            .iter()
+            .find(|c| c.name == channel)
+            .and_then(|c| c.coordinator_selection.clone())
+            .expect("a model");
+        (
+            chosen.selection.model_id.clone(),
+            chosen.selection.effort().map(str::to_owned),
+            chosen.source,
+        )
+    })
+}
+
+/// The picker opens, the search filters it, the keyboard chooses, and the
+/// choice goes to the hub as `channel.update` for Everything. The effort
+/// stays, because the new model offers it. A channel without its own model
+/// follows, and a channel with its own keeps it.
+#[gpui::test]
+fn the_picker_filters_chooses_and_updates_the_channel(cx: &mut TestAppContext) {
+    let (handle, app) = app_with_the_picker(cx);
+    let cx = &mut VisualTestContext::from_window(handle, cx);
+    assert_eq!(
+        assistant_model(&app, cx, "Everything"),
+        (
+            "claude-opus-5-5".into(),
+            Some("high".into()),
+            SelectionSource::Channel
+        )
+    );
+    cx.simulate_input("sonnet personal");
+    app.read_with(cx, |app, cx| {
+        let query = app.inputs.model_search.read(cx).value().to_string();
+        let found = consort_client::picker::filter(&app.state.model_groups, &query);
+        assert_eq!(
+            found.len(),
+            1,
+            "only Claude Personal has a Sonnet that matches"
+        );
+        assert_eq!(found[0].models.len(), 1);
+        assert_eq!(app.picker.as_ref().and_then(|p| p.highlighted), Some(0));
+    });
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    app.read_with(cx, |app, _| {
+        assert!(app.picker.is_none(), "a choice closes the picker")
+    });
+    assert_eq!(
+        assistant_model(&app, cx, "Everything"),
+        (
+            "claude-sonnet-5-5".into(),
+            Some("high".into()),
+            SelectionSource::Channel
+        )
+    );
+    assert_eq!(
+        assistant_model(&app, cx, "homelab"),
+        (
+            "claude-sonnet-5-5".into(),
+            Some("high".into()),
+            SelectionSource::Everything
+        )
+    );
+    // sayso has its own model, Sonnet 5.5 of Claude Work, and keeps it.
+    let (model, _, source) = assistant_model(&app, cx, "sayso");
+    assert_eq!(
+        (model.as_str(), source),
+        ("claude-sonnet-5-5", SelectionSource::Channel)
+    );
+    let account = app.read_with(cx, |app, _| {
+        app.state
+            .channels
+            .iter()
+            .find(|c| c.name == "sayso")
+            .and_then(|c| c.coordinator_selection.clone())
+            .map(|e| e.selection.account_label)
+    });
+    assert_eq!(account.as_deref(), Some("Claude Work"));
+}
+
+/// A model without the chosen effort level falls back to its default: the
+/// selection has no effort.
+#[gpui::test]
+fn a_model_without_the_effort_level_falls_back_to_its_default(cx: &mut TestAppContext) {
+    let (handle, app) = app_with_the_picker(cx);
+    let cx = &mut VisualTestContext::from_window(handle, cx);
+    // Codex offers Low to Extra high, and the effort is High: it stays.
+    cx.simulate_input("gpt-5.5");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(
+        assistant_model(&app, cx, "Everything"),
+        (
+            "gpt-5.5".into(),
+            Some("high".into()),
+            SelectionSource::Channel
+        )
+    );
+    // Haiku 4.5 has no effort levels at all.
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            let target = PickerTarget::Assistant(app.channel_id.clone());
+            app.open_picker(
+                target,
+                MenuAnchor::Point(gpui_kit::point(gpui_kit::px(600.), gpui_kit::px(800.))),
+                window,
+                cx,
+            );
+        })
+    });
+    cx.simulate_input("haiku 4.5");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert_eq!(
+        assistant_model(&app, cx, "Everything"),
+        ("claude-haiku-4-5".into(), None, SelectionSource::Channel)
+    );
+}
+
+/// The arrow keys move through every model and wrap, and the list scrolls
+/// inside the picker to keep the row in view.
+#[gpui::test]
+fn the_arrow_keys_wrap_and_scroll_the_list(cx: &mut TestAppContext) {
+    let (handle, app) = app_with_the_picker(cx);
+    let cx = &mut VisualTestContext::from_window(handle, cx);
+    let total: usize = app.read_with(cx, |app, _| {
+        app.state.model_groups.iter().map(|g| g.models.len()).sum()
+    });
+    // The current model, Opus 5.5 of Claude Personal, is the first row.
+    app.read_with(cx, |app, _| {
+        assert_eq!(app.picker.as_ref().and_then(|p| p.highlighted), Some(0))
+    });
+    cx.simulate_keystrokes("up");
+    app.read_with(cx, |app, _| {
+        assert_eq!(
+            app.picker.as_ref().and_then(|p| p.highlighted),
+            Some(total - 1)
+        )
+    });
+    cx.update(|window, _| window.refresh());
+    cx.run_until_parked();
+    let offset = app.read_with(cx, |app, _| {
+        app.picker.as_ref().map(|p| p.scroll.offset().y)
+    });
+    assert!(
+        offset.is_some_and(|y| y < gpui_kit::px(0.)),
+        "the last row scrolled into view: {offset:?}"
+    );
+    cx.simulate_keystrokes("down");
+    app.read_with(cx, |app, _| {
+        assert_eq!(app.picker.as_ref().and_then(|p| p.highlighted), Some(0))
+    });
+}
+
+/// Escape in the picker of the New channel dialog closes only the picker.
+#[gpui::test]
+fn escape_in_the_picker_closes_only_the_picker(cx: &mut TestAppContext) {
+    let (handle, app) = app_with_a_dialog(cx);
+    let cx = &mut VisualTestContext::from_window(handle, cx);
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            app.open_picker(
+                PickerTarget::NewChannelTasks,
+                MenuAnchor::Point(gpui_kit::point(gpui_kit::px(400.), gpui_kit::px(300.))),
+                window,
+                cx,
+            );
+        })
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("escape");
+    app.read_with(cx, |app, _| {
+        assert!(app.picker.is_none(), "the picker is closed");
+        assert_eq!(app.dialog, Some(Dialog::NewChannel), "the dialog stays");
+        assert_eq!(app.new_channel.task_selection, None, "nothing was chosen");
+    });
+    // A choice in the dialog changes only the form.
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            app.open_picker(
+                PickerTarget::NewChannelTasks,
+                MenuAnchor::Point(gpui_kit::point(gpui_kit::px(400.), gpui_kit::px(300.))),
+                window,
+                cx,
+            );
+        })
+    });
+    cx.simulate_input("codex");
+    cx.simulate_keystrokes("enter");
+    app.read_with(cx, |app, _| {
+        let chosen = app
+            .new_channel
+            .task_selection
+            .clone()
+            .expect("a model for tasks");
+        assert_eq!(chosen.account_label, "Codex Personal");
+        assert_eq!(
+            app.new_channel.coordinator_selection, None,
+            "Same as Everything"
+        );
+        assert_eq!(app.dialog, Some(Dialog::NewChannel));
+    });
+}
+
+/// The effort menu chooses a level for the channel's assistant.
+#[gpui::test]
+fn the_effort_menu_chooses_a_level(cx: &mut TestAppContext) {
+    let (handle, app) = app_with_a_dialog(cx);
+    let cx = &mut VisualTestContext::from_window(handle, cx);
+    cx.update(|window, cx| app.update(cx, |app, cx| app.close_dialog(window, cx)));
+    // The composer draws once, so the chip has bounds.
+    cx.update(|window, _| window.refresh());
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            let target = PickerTarget::Assistant(app.channel_id.clone());
+            app.open_effort("composer-effort", target, window, cx);
+        })
+    });
+    app.read_with(cx, |app, _| {
+        assert!(app.effort_menu.is_some(), "the menu is open")
+    });
+    // Low, Medium (Default), High (chosen), Max: down goes to Max.
+    cx.simulate_keystrokes("down enter");
+    cx.run_until_parked();
+    assert_eq!(
+        assistant_model(&app, cx, "Everything"),
+        (
+            "claude-opus-5-5".into(),
+            Some("max".into()),
+            SelectionSource::Channel
+        )
+    );
+    app.read_with(cx, |app, _| assert!(app.effort_menu.is_none()));
 }

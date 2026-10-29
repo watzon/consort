@@ -22,6 +22,7 @@ use crate::{
         links::click_action,
         markdown::{Segment, exact_selection, segments},
         menu::{MenuAction, MenuItem, OpenMenu, TextTarget, text_edit_menu},
+        model_picker::{PickerTarget, TriggerStyle},
         parts::{
             ButtonKind, button, detail, focusable, icon, icon_button, line, selectable,
             status_glyph, text, worker_pill,
@@ -1298,17 +1299,21 @@ impl ConsortApp {
         let c = &t.colors;
         let state = self.state.clone();
         let channel = state.channel(&self.channel_id);
-        let hint = channel
-            .and_then(
-                |ch| match (&ch.coordinator_worker, &ch.coordinator_account) {
-                    (Some(w), Some(a)) => Some(format!("Runs on {w} with {a}")),
-                    (Some(w), None) => Some(format!("Runs on {w}")),
-                    _ => None,
-                },
-            )
-            .unwrap_or_default();
-        let is_everything = channel.is_some_and(|ch| ch.kind == ChannelKind::Everything);
-        let _ = is_everything;
+        // A channel without its own model says that it uses Everything's.
+        let inherited = channel.is_some_and(|ch| {
+            ch.kind != ChannelKind::Everything
+                && ch
+                    .coordinator_selection
+                    .as_ref()
+                    .is_some_and(|e| e.source == consort_client::SelectionSource::Everything)
+        });
+        let target = PickerTarget::Assistant(self.channel_id.clone());
+        let model_chip = channel.map(|_| {
+            self.render_model_trigger("composer-model", target.clone(), TriggerStyle::Chip, t, cx)
+        });
+        let effort_chip = channel.and_then(|_| {
+            self.render_effort_trigger("composer-effort", target.clone(), TriggerStyle::Chip, t, cx)
+        });
         let input = crate::ui::parts::textarea(&self.inputs.composer, t.text.body);
         let send = focusable(div().id("send"), t)
             .size(t.space.xl + t.space.xs)
@@ -1460,7 +1465,16 @@ impl ConsortApp {
                                 this.show_notice("Voice input comes in a later build.".into(), cx)
                             })))
                             .child(div().flex_1())
-                            .child(text(hint, detail(t), c.text_tertiary).pr(t.space.sm))
+                            .when(inherited, |d| {
+                                d.child(
+                                    text("Same as Everything", detail(t), c.text_tertiary)
+                                        .flex_none()
+                                        .pr(t.space.xs),
+                                )
+                            })
+                            .children(model_chip)
+                            .children(effort_chip)
+                            .child(div().w(t.space.xs).flex_none())
                             .child(send),
                     )
                     .on_mouse_down(

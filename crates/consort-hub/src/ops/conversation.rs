@@ -312,7 +312,7 @@ impl Hub {
         )?;
         let tags_in_request = request.tags.is_some();
         let hub = self.clone();
-        let (channel, fx) = self
+        let (channel, fx, moved) = self
             .store
             .write(move |tx| {
                 let before = conversation::channel_or_404(tx.db(), request.channel_id)?;
@@ -369,10 +369,17 @@ impl Hub {
                     channel.tags = normalize_tags(&tags)?;
                 }
                 if channel == before {
-                    return Ok((channel, Default::default()));
+                    return Ok((channel, Default::default(), Vec::new()));
                 }
                 channel.updated_at = tx.now();
                 tx.save_channel(&channel)?;
+                let moved = if channel.coordinator_selection != before.coordinator_selection {
+                    let everything = conversation::everything_channel(tx.db())?;
+                    let channels = conversation::channels(tx.db())?;
+                    crate::coordinator::moved_selections(&before, &channel, &everything, &channels)
+                } else {
+                    Vec::new()
+                };
                 // Work that runs keeps running. The coordinator moves off a
                 // worker that does not have every new tag.
                 let fx = if channel.tags != before.tags {
@@ -382,10 +389,12 @@ impl Hub {
                 } else {
                     Default::default()
                 };
-                Ok((channel, fx))
+                Ok((channel, fx, moved))
             })
             .await?;
         self.run_effects(fx);
+        // The next coordinator turn of each moved channel uses the new model.
+        self.coordinator_selection_changed(moved).await;
         if tags_in_request {
             // Fewer tags can make a worker qualify for work that waits.
             self.retry_waiting_work();

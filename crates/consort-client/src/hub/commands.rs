@@ -81,6 +81,46 @@ pub(crate) fn selection(view: &Option<SelectionView>) -> Option<ModelSelection> 
     })
 }
 
+/// The `channel.update` for some changes, or `None` when they change no
+/// field of it. A group change is a `channel.move`, so it is not here. A
+/// selection of `Some(None)` sends `null`, which takes the selection away.
+pub(crate) fn channel_update(
+    id: consort_proto::ids::ChannelId,
+    changes: crate::command::ChannelChanges,
+) -> Result<Option<ChannelUpdate>, ClientError> {
+    let mut patch = serde_json::json!({ "channel_id": id });
+    if let Some(name) = changes.name {
+        patch["name"] = name.into();
+    }
+    if let Some(purpose) = changes.purpose {
+        patch["purpose"] = purpose.into();
+    }
+    if let Some(instructions) = changes.instructions {
+        patch["instructions"] = instructions.into();
+    }
+    if let Some(icon) = changes.icon {
+        patch["icon"] = icon.into();
+    }
+    if let Some(tags) = changes.tags {
+        patch["tags"] = tags.into();
+    }
+    let json = |s: Option<ModelSelection>| {
+        serde_json::to_value(s).map_err(|e| ClientError::Other(e.to_string()))
+    };
+    if let Some(chosen) = changes.coordinator_selection {
+        patch["coordinator_selection"] = json(selection(&chosen))?;
+    }
+    if let Some(chosen) = changes.task_selection {
+        patch["task_selection"] = json(selection(&chosen))?;
+    }
+    if patch.as_object().is_none_or(|o| o.len() <= 1) {
+        return Ok(None);
+    }
+    serde_json::from_value(patch)
+        .map(Some)
+        .map_err(|e| ClientError::Other(e.to_string()))
+}
+
 async fn run(shared: Arc<Shared>, command: Command) -> Result<CommandOutput, ClientError> {
     match command {
         Command::Pair { hub_url, code } => {
@@ -188,7 +228,7 @@ async fn run(shared: Arc<Shared>, command: Command) -> Result<CommandOutput, Cli
                     icon: None,
                     color: None,
                     group_id,
-                    coordinator_selection: None,
+                    coordinator_selection: selection(&new.coordinator_selection),
                     task_selection: selection(&new.task_selection),
                     repo_ids: Vec::new(),
                     default_isolation: Some(match new.isolation {
@@ -222,28 +262,11 @@ async fn run(shared: Arc<Shared>, command: Command) -> Result<CommandOutput, Cli
             changes,
         } => {
             let id: consort_proto::ids::ChannelId = parse(&channel_id, "channel")?;
-            let mut patch = serde_json::json!({ "channel_id": id });
-            if let Some(name) = changes.name {
-                patch["name"] = name.into();
-            }
-            if let Some(purpose) = changes.purpose {
-                patch["purpose"] = purpose.into();
-            }
-            if let Some(instructions) = changes.instructions {
-                patch["instructions"] = instructions.into();
-            }
-            if let Some(icon) = changes.icon {
-                patch["icon"] = icon.into();
-            }
-            if let Some(tags) = changes.tags {
-                patch["tags"] = tags.into();
-            }
-            if patch.as_object().is_some_and(|o| o.len() > 1) {
-                let update: ChannelUpdate =
-                    serde_json::from_value(patch).map_err(|e| ClientError::Other(e.to_string()))?;
+            let group = changes.group_id.clone();
+            if let Some(update) = channel_update(id, changes)? {
                 shared.call(update).await?;
             }
-            if let Some(group) = changes.group_id {
+            if let Some(group) = group {
                 shared
                     .call(ChannelMove {
                         channel_id: id,
@@ -1006,6 +1029,64 @@ mod tests {
         );
         assert_eq!(sent.options.get("thinking"), Some(&OptionValue::Bool(true)));
         assert_eq!(selection(&None), None);
+    }
+
+    #[test]
+    fn a_model_change_sends_channel_update_with_the_selection_or_null() {
+        let id = consort_proto::ids::ChannelId::new();
+        let chosen = SelectionView {
+            account_label: "Claude Personal".into(),
+            model_id: "opus".into(),
+            model_name: "Opus 5.5".into(),
+            options: vec![("effort".into(), SelectionOption::Text("high".into()))],
+        };
+        let update = channel_update(
+            id,
+            crate::command::ChannelChanges {
+                coordinator_selection: Some(Some(chosen)),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+        let sent = update.coordinator_selection.clone().flatten().unwrap();
+        assert_eq!(sent.model, "opus");
+        assert_eq!(
+            sent.options.get("effort"),
+            Some(&OptionValue::Text("high".into()))
+        );
+        assert_eq!(update.task_selection, None, "the task model stays");
+        let wire = serde_json::to_value(&update).unwrap();
+        assert_eq!(
+            wire["coordinator_selection"]["account_label"],
+            "Claude Personal"
+        );
+
+        // "Use the Everything model" sends null.
+        let cleared = channel_update(
+            id,
+            crate::command::ChannelChanges {
+                coordinator_selection: Some(None),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(cleared.coordinator_selection, Some(None));
+        let wire = serde_json::to_value(&cleared).unwrap();
+        assert!(wire["coordinator_selection"].is_null());
+        assert!(
+            wire.as_object()
+                .unwrap()
+                .contains_key("coordinator_selection")
+        );
+
+        // A change with no field of channel.update sends nothing.
+        assert!(
+            channel_update(id, crate::command::ChannelChanges::default())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

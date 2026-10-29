@@ -49,6 +49,8 @@ pub enum MenuAction {
     EditTags(String),
     /// The Worker tags dialog of a channel.
     ChannelTags(String),
+    /// The model picker for a channel's assistant.
+    ChannelModel(String),
     /// The worker ID and the account ID.
     RenameAccount(String, String),
     SignOutAccount(String, String),
@@ -121,13 +123,14 @@ pub fn account_menu(worker_id: &str, account_id: &str, can_sign_out: bool) -> Ve
     items
 }
 
-/// The menu of a channel row: Rename, Instructions, Worker tags, Change
-/// icon, Move to group, Archive and Delete.
+/// The menu of a channel row: Rename, Instructions, Model, Worker tags,
+/// Change icon, Move to group, Archive and Delete.
 pub fn channel_menu(channel_id: &str) -> Vec<MenuItem> {
     let id = channel_id.to_owned();
     vec![
         MenuItem::new("Rename", MenuAction::RenameChannel(id.clone())),
         MenuItem::new("Instructions", MenuAction::ChannelInstructions(id.clone())),
+        MenuItem::new("Model", MenuAction::ChannelModel(id.clone())),
         MenuItem::new("Worker tags", MenuAction::ChannelTags(id.clone())),
         MenuItem::new("Change icon", MenuAction::ChangeIcon(id.clone())),
         MenuItem::new("Move to group", MenuAction::MoveToGroup(id.clone())),
@@ -293,16 +296,6 @@ pub fn render_menu<V: 'static>(
     on_close: impl Fn(&mut V, &mut Window, &mut Context<V>) + Clone + 'static,
 ) -> AnyElement {
     let c = &t.colors;
-    let gap = t.space.xs;
-    let (position, pad) = match menu.anchor {
-        MenuAnchor::Point(p) => (p, Pixels::ZERO),
-        // From the middle of the trigger, padded by half its height and the
-        // gap, the menu clears the trigger whichever way it opens.
-        MenuAnchor::Trigger(b) => (
-            point(b.origin.x, b.origin.y + b.size.height / 2.0),
-            b.size.height / 2.0 + gap,
-        ),
-    };
     let mut list = div()
         .id("menu")
         .occlude()
@@ -366,6 +359,38 @@ pub fn render_menu<V: 'static>(
                 })),
         );
     }
+    floating(
+        menu.anchor,
+        list.into_any_element(),
+        t,
+        window,
+        cx,
+        on_close,
+    )
+}
+
+/// Draws `content` at `anchor` above everything, with a layer behind it
+/// that closes it on a click outside. A menu, a popover or a select uses it,
+/// so all of them flip: the content opens downward when there is room and
+/// upward when there is not (GPUI's `anchored` with anchor switching).
+pub fn floating<V: 'static>(
+    anchor: MenuAnchor,
+    content: AnyElement,
+    t: &Tokens,
+    window: &Window,
+    cx: &mut Context<V>,
+    on_close: impl Fn(&mut V, &mut Window, &mut Context<V>) + Clone + 'static,
+) -> AnyElement {
+    let gap = t.space.xs;
+    let (position, pad) = match anchor {
+        MenuAnchor::Point(p) => (p, Pixels::ZERO),
+        // From the middle of the trigger, padded by half its height and the
+        // gap, the content clears the trigger whichever way it opens.
+        MenuAnchor::Trigger(b) => (
+            point(b.origin.x, b.origin.y + b.size.height / 2.0),
+            b.size.height / 2.0 + gap,
+        ),
+    };
     let close = on_close.clone();
     let viewport = window.viewport_size();
     let catcher = div()
@@ -396,7 +421,7 @@ pub fn render_menu<V: 'static>(
                         anchored()
                             .position(position)
                             .anchor(Anchor::TopLeft)
-                            .child(div().py(pad).child(list)),
+                            .child(div().py(pad).child(content)),
                     ),
             ),
     )
@@ -461,6 +486,7 @@ mod tests {
             [
                 "Rename",
                 "Instructions",
+                "Model",
                 "Worker tags",
                 "Change icon",
                 "Move to group",

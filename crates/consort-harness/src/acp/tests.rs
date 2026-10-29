@@ -445,7 +445,7 @@ fn models_come_from_config_options() {
             {"group": "g", "name": "Levels", "options": [{"value": "low", "name": "Low"}, {"value": "high", "name": "High"}]}
         ]}),
     ];
-    let models = models_from_config(&options);
+    let models = models_from_config(&options, &BTreeMap::new());
     assert_eq!(models.len(), 2);
     assert_eq!(models[1].id, "sonnet");
     match &models[0].options[0] {
@@ -461,7 +461,63 @@ fn models_come_from_config_options() {
         }
         other => panic!("{other:?}"),
     }
-    assert!(models_from_config(&[]).is_empty());
+    assert!(models_from_config(&[], &BTreeMap::new()).is_empty());
+}
+
+/// `claude-agent-acp` 0.99.0 lists `default` first among the effort levels
+/// and has it as the current value. OpenCode 2.2.1 lists it last. It is not
+/// a level, so it leaves the list, and the provider default is unknown.
+/// The levels also differ by model.
+#[test]
+fn effort_levels_come_per_model_without_the_default_value() {
+    let model = json!({"id": "model", "category": "model", "type": "select", "currentValue": "default", "options": [
+        {"value": "default", "name": "Default (recommended)"}, {"value": "opus", "name": "Opus 5.5"},
+        {"value": "claude-haiku-4-5", "name": "Haiku 4.5"}, {"value": "sonnet", "name": "Sonnet"}
+    ]});
+    let effort = |levels: &[&str], current: &str| {
+        let options: Vec<Value> = levels
+            .iter()
+            .map(|v| json!({"value": v, "name": v.to_uppercase()}))
+            .collect();
+        json!({"id": "effort", "category": "thought_level", "type": "select", "currentValue": current, "options": options})
+    };
+    let first = vec![
+        model.clone(),
+        effort(&["default", "low", "high", "xhigh", "max"], "default"),
+    ];
+    let mut per_model = BTreeMap::new();
+    per_model.insert("opus".to_owned(), first.clone());
+    // Haiku 4.5 has no effort option.
+    per_model.insert("claude-haiku-4-5".to_owned(), vec![model.clone()]);
+    per_model.insert(
+        "sonnet".to_owned(),
+        vec![model, effort(&["low", "high", "default"], "high")],
+    );
+    let models = models_from_config(&first, &per_model);
+    let levels = |m: &ModelInfo| match m.options.first() {
+        Some(OptionDescriptor::Select {
+            choices, default, ..
+        }) => Some((
+            choices.iter().map(|c| c.value.clone()).collect::<Vec<_>>(),
+            default.clone(),
+        )),
+        _ => None,
+    };
+    let by_id = |id: &str| models.iter().find(|m| m.id == id).unwrap();
+    assert_eq!(
+        levels(by_id("opus")),
+        Some((
+            vec!["low".into(), "high".into(), "xhigh".into(), "max".into()],
+            None
+        ))
+    );
+    assert_eq!(levels(by_id("claude-haiku-4-5")), None);
+    assert_eq!(
+        levels(by_id("sonnet")),
+        Some((vec!["low".into(), "high".into()], Some("high".into())))
+    );
+    // A model that the probe did not reach gets the first model's levels.
+    assert_eq!(levels(by_id("default")), levels(by_id("opus")));
 }
 
 #[test]
@@ -557,7 +613,7 @@ mod fake_agent {
     fn fake_options(mode: &str, behavior: Behavior) -> Vec<Value> {
         let mut options = vec![
             json!({"id": "model", "name": "Model", "category": "model", "type": "select", "currentValue": "opus",
-             "options": [{"value": "opus", "name": "Opus"}, {"value": "sonnet", "name": "Sonnet"}]}),
+             "options": [{"value": "opus", "name": "Opus"}, {"value": "sonnet", "name": "Sonnet"}, {"value": "haiku", "name": "Haiku"}]}),
             json!({"id": "effort", "name": "Effort", "category": "thought_level", "type": "select", "currentValue": "medium",
              "options": [{"value": "medium", "name": "Medium"}, {"value": "high", "name": "High"}]}),
         ];
@@ -639,6 +695,15 @@ mod fake_agent {
                             send(&mut write, json!({"jsonrpc": "2.0", "id": id.clone(), "error": {"code": -32603, "message": "Internal error"}})).await;
                             continue;
                         }
+                    }
+                    if msg["params"]["configId"] == "model" && msg["params"]["value"] == "haiku" {
+                        // Haiku has no effort option in the fake agent.
+                        let options: Vec<Value> = fake_options(&mode, behavior)
+                            .into_iter()
+                            .filter(|o| o["id"] != "effort")
+                            .collect();
+                        send(&mut write, reply(json!({"configOptions": options}))).await;
+                        continue;
                     }
                     if msg["params"]["configId"] == "mode" && !behavior.ignore_mode {
                         mode = msg["params"]["value"]
@@ -1576,6 +1641,11 @@ mod fake_agent {
         .await
         .unwrap();
         assert_eq!(ready.bypass, Some(false));
+        // The probe read the options of each model.
+        let models = models_from_config(&ready.config_options, &ready.model_options);
+        assert_eq!(models.len(), 3);
+        assert_eq!(models[0].options.len(), 1, "Opus has an effort option");
+        assert!(models[2].options.is_empty(), "Haiku has none");
         let new = log
             .lock()
             .unwrap()

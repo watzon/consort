@@ -3,6 +3,7 @@ pub mod dialogs;
 pub mod links;
 pub mod markdown;
 pub mod menu;
+pub mod model_picker;
 pub mod onboarding;
 pub mod panels;
 pub mod parts;

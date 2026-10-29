@@ -157,6 +157,7 @@ impl MockBackend {
                     }
                     None => new.group_id,
                 };
+                let inherited = everything_selection(&state);
                 state.channels.push(ChannelView {
                     id: channel_id_new.clone(),
                     kind: ChannelKind::Standard,
@@ -165,7 +166,10 @@ impl MockBackend {
                     icon: "hash".into(),
                     group_id,
                     coordinator_worker: Some("hub".into()),
-                    coordinator_account: Some("Claude Personal".into()),
+                    coordinator_selection: crate::picker::effective_selection(
+                        new.coordinator_selection,
+                        inherited,
+                    ),
                     preferred_workers: new.preferred_workers,
                     task_selection: new.task_selection,
                     default_isolation: new.isolation,
@@ -206,6 +210,9 @@ impl MockBackend {
                 if let Some(tags) = changes.tags {
                     channel.tags = checked_tags(&tags)?;
                 }
+                if let Some(chosen) = changes.task_selection {
+                    channel.task_selection = chosen;
+                }
                 let name = channel.name.clone();
                 for task in state
                     .tasks
@@ -213,6 +220,9 @@ impl MockBackend {
                     .filter(|t| t.channel_id == channel_id)
                 {
                     task.channel_name = name.clone();
+                }
+                if let Some(chosen) = changes.coordinator_selection {
+                    set_coordinator_selection(&mut state, &channel_id, chosen);
                 }
             }
             Command::ArchiveChannel { channel_id } | Command::DeleteChannel { channel_id } => {
@@ -665,6 +675,47 @@ impl MockBackend {
         }
         applied.reply_to = reply_to;
         Ok(applied)
+    }
+}
+
+/// Everything's own model of the assistant.
+fn everything_selection(state: &ViewState) -> Option<SelectionView> {
+    state
+        .everything()
+        .and_then(|c| c.coordinator_selection.as_ref())
+        .map(|e| e.selection.clone())
+}
+
+/// Sets or takes away a channel's own model of the assistant, as the hub
+/// does. A new Everything model reaches every channel without its own.
+fn set_coordinator_selection(
+    state: &mut ViewState,
+    channel_id: &str,
+    chosen: Option<SelectionView>,
+) {
+    let is_everything = state
+        .channel(channel_id)
+        .is_some_and(|c| c.kind == ChannelKind::Everything);
+    if is_everything {
+        for channel in &mut state.channels {
+            let inherits = channel.kind != ChannelKind::Everything
+                && channel
+                    .coordinator_selection
+                    .as_ref()
+                    .is_none_or(|e| e.source == SelectionSource::Everything);
+            if channel.id == channel_id {
+                channel.coordinator_selection =
+                    crate::picker::effective_selection(chosen.clone(), None);
+            } else if inherits {
+                channel.coordinator_selection =
+                    crate::picker::effective_selection(None, chosen.clone());
+            }
+        }
+        return;
+    }
+    let everything = everything_selection(state);
+    if let Some(channel) = state.channels.iter_mut().find(|c| c.id == channel_id) {
+        channel.coordinator_selection = crate::picker::effective_selection(chosen, everything);
     }
 }
 

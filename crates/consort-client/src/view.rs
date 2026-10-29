@@ -25,9 +25,10 @@ pub struct ViewState {
     /// Every worker tag: the user tags of all workers first, then the
     /// detected tags, each once and sorted. Tag fields offer these.
     pub tags: Vec<String>,
-    /// The model selections that tasks can use: an account label and a
-    /// model, with the model ID kept for the hub.
-    pub selections: Vec<SelectionView>,
+    /// The model picker's list: one group per signed-in account label, in
+    /// the order of the inventory, with the models of that account on every
+    /// worker where it is signed in. See [`crate::picker`].
+    pub model_groups: Vec<ModelGroupView>,
     /// The sign-ins that this client started, newest last. A sign-in that
     /// another client started does not show (see DECISIONS row 269).
     pub sign_ins: Vec<SignInView>,
@@ -137,9 +138,26 @@ impl ViewState {
         names
     }
 
-    /// The selection with this key.
-    pub fn selection(&self, key: &str) -> Option<&SelectionView> {
-        self.selections.iter().find(|s| s.key() == key)
+    /// The group and the model of the picker with this account label and
+    /// model ID.
+    pub fn model_choice(
+        &self,
+        account_label: &str,
+        model_id: &str,
+    ) -> Option<(&ModelGroupView, &ModelChoiceView)> {
+        let group = self
+            .model_groups
+            .iter()
+            .find(|g| g.account_label == account_label)?;
+        let model = group.models.iter().find(|m| m.id == model_id)?;
+        Some((group, model))
+    }
+
+    /// The effort levels that the model of a selection offers. `None` when
+    /// the model has no effort option, or when no worker reports it now.
+    pub fn effort_for(&self, selection: &SelectionView) -> Option<&EffortView> {
+        self.model_choice(&selection.account_label, &selection.model_id)
+            .and_then(|(_, model)| model.effort.as_ref())
     }
 
     /// The provider logo of the account with this label. Accounts with one
@@ -221,6 +239,77 @@ impl SelectionView {
     pub fn key(&self) -> String {
         format!("{}\u{1f}{}", self.account_label, self.model_id)
     }
+
+    /// The effort value of the selection, if it has one.
+    pub fn effort(&self) -> Option<&str> {
+        self.options.iter().find_map(|(id, value)| match value {
+            SelectionOption::Text(v) if id == crate::picker::EFFORT => Some(v.as_str()),
+            _ => None,
+        })
+    }
+}
+
+/// One account in the model picker. Accounts with one label on several
+/// workers are one group.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ModelGroupView {
+    pub account_label: String,
+    /// The provider name, such as "Claude Code".
+    pub provider: String,
+    pub logo: ProviderLogo,
+    /// The names of the workers where this account is signed in.
+    pub workers: Vec<String>,
+    /// The union of the models of the account on those workers, in the
+    /// order that the workers report them.
+    pub models: Vec<ModelChoiceView>,
+}
+
+/// One model in the picker.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ModelChoiceView {
+    /// The model ID, as the account reports it.
+    pub id: String,
+    /// The name to show.
+    pub name: String,
+    /// The effort levels. `None` when the model has no effort option.
+    pub effort: Option<EffortView>,
+}
+
+/// The effort levels that a provider reports for one model.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EffortView {
+    /// The levels, lowest first, as the provider orders them.
+    pub levels: Vec<EffortLevel>,
+    /// The level that the provider uses when the selection has none. `None`
+    /// when the provider does not say.
+    pub default: Option<String>,
+}
+
+/// One effort level.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EffortLevel {
+    /// The value to send.
+    pub value: String,
+    /// The text to show, such as "High".
+    pub label: String,
+}
+
+/// Where the coordinator selection of a channel comes from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SelectionSource {
+    /// The channel has its own selection. Everything's own selection also
+    /// counts as this.
+    #[default]
+    Channel,
+    /// The channel has none, so it uses Everything's.
+    Everything,
+}
+
+/// The coordinator selection that a channel uses, and where it comes from.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EffectiveSelection {
+    pub selection: SelectionView,
+    pub source: SelectionSource,
 }
 
 /// The state of the link to the hub.
@@ -388,8 +477,9 @@ pub struct ChannelView {
     pub group_id: Option<String>,
     /// The worker the coordinator runs on, for the composer hint.
     pub coordinator_worker: Option<String>,
-    /// The harness account of the coordinator, for the composer hint.
-    pub coordinator_account: Option<String>,
+    /// The model of the coordinator, with the fallback to Everything's.
+    /// `None` when neither channel has one: placement then chooses.
+    pub coordinator_selection: Option<EffectiveSelection>,
     pub repos: Vec<RepoView>,
     pub preferred_workers: Vec<String>,
     pub task_selection: Option<SelectionView>,
@@ -786,6 +876,10 @@ pub struct TaskThreadView {
     pub text_is_preview: bool,
     /// The approval mode that the task asked for. The worker may cap it.
     pub approval_mode: ApprovalMode,
+    /// The model of the task, such as "Opus 5.5, Claude Personal, High
+    /// effort". The thread composer shows it. `None` when the task has no
+    /// selection and its channel and Everything have none.
+    pub model_label: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]

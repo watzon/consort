@@ -25,6 +25,7 @@ One component, `ModelPicker`, with a trigger and a popover.
   - Below the search field, one group per account label, in the order of the inventory, with signed-in accounts only. The group header has the provider logo, the account name, and the workers that have that account signed in, for example "work-laptop, work-desktop". The models are the union of the models of that account on those workers.
   - The selected row has the selected background and a check. A model with effort levels shows "Low to Max effort", using the first and last choice labels.
   - The list has a fixed maximum height (a new size token) and scrolls inside the popover, with the top and bottom fades of AGENTS.md rule 3. The popover flips up or down by the room it has (rule 4).
+  - The group headers are sticky. While the list scrolls, the header of the group whose models are in view sticks to the top of the list, directly under the search field. The next group's header pushes it up and replaces it as it arrives. The sticky header has the popover background, so rows do not show through, and the top fade of the list goes under it, not over it.
   - A footer line says what the choice changes. It is one of:
     - "The assistant in Everything uses this model. Channels without their own model use it too."
     - "The assistant in <channel> uses this model."

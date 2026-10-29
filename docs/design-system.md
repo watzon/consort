@@ -223,6 +223,16 @@ Settings > Workers uses these sizes from `component` in `structure.json`:
 | `sign_in_tile`, `sign_in_logo` | 40, 22 | The logo tile before the title of the sign-in step |
 | `step_marker` | 22 | The round marker of a numbered step in a sign-in flow |
 
+The model picker uses these sizes from `component`:
+
+| Token | Size (px) | Use |
+|---|---|---|
+| `model_picker` | 400 | The width of the model picker popover |
+| `model_list_max` | 340 | The model list grows to this height, then scrolls |
+| `effort_menu` | 240 | The width of the effort menu |
+| `effort_select` | 150 | The effort select next to a model field in a dialog |
+| `composer_chip` | 28 | The height of the model chip and the effort chip in the composer |
+
 ## Provider logos
 
 Every provider shows with its logo, never as text alone. The logos are in `crates/consort-desktop/assets/providers/` (see the NOTICE there).
@@ -231,6 +241,21 @@ Every provider shows with its logo, never as text alone. The logos are in `crate
 - Codex, OpenCode and the ACP registry icons draw in the color of the text next to them, like an icon. Registry icons are SVGs that draw in `currentColor`. The client loads them from the registry (`https` only, at most 64 KiB, SVG only), and the app draws them like a Lucide icon.
 - A provider with no logo, such as a custom command, or a registry icon that did not load, gets the Lucide `bot` glyph.
 - A provider that is not signed in or not installed shows its logo at 60 percent opacity, with its name in `text.secondary`.
+
+## Model picker
+
+One component chooses a model everywhere: the composer, the New channel dialog, and Model in the channel menu.
+
+- **Trigger.** The provider logo, the model name in medium weight, and the account name in `text.tertiary`, then a chevron. In the composer it is a chip, `component.composer_chip` (28 px) high, with `md` corners and no ground until hover. While its popover is open, the chip has `surface.selected`. In a dialog it is a select field, as wide as its column. A dialog field with no model of its own says "Same as Everything", with Everything's model in `text.tertiary`. A channel that uses Everything's model shows "Same as Everything" before the chip in the composer.
+- **Popover.** `component.model_picker` (400 px) wide, `surface.raised`, `lg` corners, `border.strong`, `shadow.float`. A search field is at the top. Typing filters by model name, model ID, account name and provider name. Arrow keys move, Enter chooses, Escape closes only the popover.
+- **Groups.** One group per signed-in account name, in the order of the inventory. The header has the provider logo, the account name in label style, and the workers where the account is signed in, in caption style. Model rows start under the account name.
+- **Rows.** The selected row has `surface.selected`, the name in medium weight, and an `accent.text` check. A model with effort levels shows the range, such as "Low to Max effort", in caption style.
+- **Scroll.** The list grows to `component.model_list_max` (340 px), then scrolls inside the popover. It fades into `surface.raised` at the top and the bottom while more rows are there.
+- **Sticky headers.** While the list scrolls, the header of the group in view sticks to the top of the list, under the search field, on `surface.raised`. The next header pushes it up and takes its place. The top fade starts under the sticky header, so the header stays solid. Groups are apart by a `sm` margin, so every header row has the same height.
+- **Footer.** On `surface.card`, with an info icon: what the choice changes ("The assistant in Everything uses this model. Channels without their own model use it too.", "The assistant in <channel> uses this model." or "Tasks in <channel> start with this model."). A channel with its own model also has the button Use the Everything model.
+- **No account.** "No account is signed in. Add one in Settings > Workers." with the button Open Settings.
+- **Effort.** A second chip next to the model chip: the Lucide `signal` icon and the level. Its menu is `component.effort_menu` (240 px) wide, with the title "Effort for <model>", one row per level, "Default" after the provider's default level, and the note "<Provider> offers these levels for this model. More effort thinks longer and uses more of your plan." When the provider does not name its default, the first row is Default, which takes the effort out. The chip is not there for a model with no effort levels. In a dialog, the effort is a select of `component.effort_select` (150 px) next to the model field. A new model keeps the effort when it offers that level. Otherwise the effort goes back to the new model's default.
+- **Task threads** show the task's model under the reply box as text, such as "Runs with Opus 5.5, Claude Personal, High effort". A task keeps the model it started with.
 
 ## Worker tags
 

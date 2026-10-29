@@ -254,6 +254,36 @@ fn prompt_fingerprint(channel: &Channel, everything: &Channel) -> String {
     crate::util::sha256(text.as_bytes()).to_string()
 }
 
+/// The channels whose effective coordinator selection differs after one
+/// channel changed from `before` to `after`. A change to Everything moves
+/// every channel that has no selection of its own.
+pub(crate) fn moved_selections(
+    before: &Channel,
+    after: &Channel,
+    everything: &Channel,
+    channels: &[Channel],
+) -> Vec<ChannelId> {
+    let (everything_before, everything_after) = if after.is_everything() {
+        (before, after)
+    } else {
+        (everything, everything)
+    };
+    channels
+        .iter()
+        .filter(|c| c.archived_at.is_none())
+        .filter_map(|c| {
+            let (old, new) = if c.id == after.id {
+                (before, after)
+            } else {
+                (c, c)
+            };
+            let moved = old.effective_coordinator_selection(everything_before)
+                != new.effective_coordinator_selection(everything_after);
+            moved.then_some(c.id)
+        })
+        .collect()
+}
+
 struct Inputs {
     channel: Channel,
     everything: Channel,
@@ -308,8 +338,12 @@ impl Hub {
                 .await?;
             if current.prompt_fingerprint.as_deref() != Some(fingerprint.as_str()) {
                 // The settings of the channel changed. Retire this session.
-                self.retire_coordinator_session(channel_id, session.id)
-                    .await?;
+                self.retire_coordinator_session(
+                    channel_id,
+                    Some(session.id),
+                    "The channel settings changed.",
+                )
+                .await?;
                 inputs.session = None;
                 let (workers, open) = self
                     .store
@@ -544,28 +578,33 @@ impl Hub {
 
     /// Ends a healthy coordinator session on purpose, for example because the
     /// channel settings changed. The worker stops the session. The next turn
-    /// starts a new one.
+    /// starts a new one. With `None`, it ends the channel's current session.
+    /// A session with an open turn stays: the turn is not cut, and the next
+    /// run sees that the prompt fingerprint changed.
     async fn retire_coordinator_session(
         &self,
         channel_id: ChannelId,
-        session_id: SessionId,
+        session_id: Option<SessionId>,
+        reason: &'static str,
     ) -> Result<()> {
         let hub = self.clone();
         let fx = self
             .store
             .write(move |tx| {
                 let mut fx = Effects::default();
+                let mut row = coord_store::coordinator(tx.db(), channel_id)?;
+                let Some(session_id) = session_id.or(row.session_id) else {
+                    return Ok(fx);
+                };
                 let Some(mut session) = work::session(tx.db(), session_id)? else {
                     return Ok(fx);
                 };
-                let mut row = coord_store::coordinator(tx.db(), channel_id)?;
                 if row.turn_open || row.session_id != Some(session_id) {
                     return Ok(fx);
                 }
                 row.session_id = None;
                 tx.save_coordinator(&row)?;
                 if !session.state.is_final() {
-                    let reason = "The channel settings changed.";
                     session.state = SessionState::Ended;
                     session.ended_at = Some(tx.now());
                     session.end_reason = Some(reason.to_owned());
@@ -577,6 +616,25 @@ impl Hub {
             .await?;
         self.run_effects(fx);
         Ok(())
+    }
+
+    /// The model selection of these channels' coordinators changed. An idle
+    /// session ends now, so the next turn starts a session with the new
+    /// model and options. A session whose turn runs keeps the turn, and the
+    /// next run of the channel replaces it (see [`prompt_fingerprint`]).
+    pub(crate) async fn coordinator_selection_changed(&self, channels: Vec<ChannelId>) {
+        for channel_id in channels {
+            if let Err(err) = self
+                .retire_coordinator_session(
+                    channel_id,
+                    None,
+                    "The model for the assistant changed.",
+                )
+                .await
+            {
+                tracing::warn!(error = %err, channel_id = %channel_id, "could not end a coordinator session after a model change");
+            }
+        }
     }
 
     async fn read_coordinator_inputs(&self, channel_id: ChannelId) -> Result<Option<Inputs>> {
@@ -736,6 +794,45 @@ mod tests {
             at: Timestamp::now(),
             text: text.to_owned(),
         }
+    }
+
+    #[tokio::test]
+    async fn a_change_to_everything_moves_only_the_channels_that_inherit_it() {
+        let (hub, _dir) = crate::hub::test_hub().await;
+        let everything = hub
+            .store
+            .read(conversation::everything_channel)
+            .await
+            .unwrap();
+        let sel = |model: &str| consort_proto::model::ModelSelection {
+            account_label: "Claude".to_owned(),
+            model: model.to_owned(),
+            options: ModelOptions::new(),
+        };
+        let mut inherits = everything.clone();
+        inherits.id = ChannelId::new();
+        inherits.kind = consort_proto::model::ChannelKind::Standard;
+        inherits.coordinator_selection = None;
+        let mut own = inherits.clone();
+        own.id = ChannelId::new();
+        own.coordinator_selection = Some(sel("own"));
+        let mut archived = inherits.clone();
+        archived.id = ChannelId::new();
+        archived.archived_at = Some(Timestamp::now());
+        let mut after = everything.clone();
+        after.coordinator_selection = Some(sel("new"));
+        let all = vec![after.clone(), inherits.clone(), own.clone(), archived];
+        let moved = moved_selections(&everything, &after, &everything, &all);
+        assert_eq!(moved, [everything.id, inherits.id]);
+
+        // A channel's own change moves only that channel, and only when the
+        // effective selection changes.
+        let mut own_after = own.clone();
+        own_after.coordinator_selection = Some(sel("other"));
+        assert_eq!(moved_selections(&own, &own_after, &after, &all), [own.id]);
+        let mut same = inherits.clone();
+        same.coordinator_selection = Some(sel("new"));
+        assert!(moved_selections(&inherits, &same, &after, &all).is_empty());
     }
 
     #[test]

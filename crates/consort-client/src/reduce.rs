@@ -649,6 +649,9 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
     };
     let everything = cache.channels.values().find(|c| c.kind == PK::Everything);
     let fallback_selection = everything.and_then(|c| c.coordinator_selection.clone());
+    let everything_selection = fallback_selection
+        .as_ref()
+        .map(|s| selection_view(cache, s));
 
     // Channels, Everything first, then by group and position.
     let mut channels: Vec<&model::Channel> = cache
@@ -681,6 +684,10 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                     })
                 })
                 .map(|w| w.name.clone());
+            let own = c
+                .coordinator_selection
+                .as_ref()
+                .map(|s| selection_view(cache, s));
             ChannelView {
                 id: c.id.to_string(),
                 kind: if c.kind == PK::Everything {
@@ -701,7 +708,10 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                 }),
                 group_id: c.group_id.map(|g| g.to_string()),
                 coordinator_worker: worker,
-                coordinator_account: account,
+                coordinator_selection: crate::picker::effective_selection(
+                    own,
+                    everything_selection.clone(),
+                ),
                 repos: Vec::new(),
                 preferred_workers: c.preferred_workers.iter().map(|w| w.to_string()).collect(),
                 task_selection: c.task_selection.as_ref().map(|s| selection_view(cache, s)),
@@ -1118,6 +1128,7 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                 .filter(|summary| !summary.trim().is_empty()),
             text_is_preview: cache.task_previews.contains(&task.id.to_string()),
             approval_mode: approval_mode(task.approval_mode),
+            model_label: task_model_label(cache, task),
         });
     }
 
@@ -1235,31 +1246,16 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
         .collect();
     workers.sort_by_key(|w| (!w.online, w.name.to_lowercase()));
 
-    // The model ID stays in each selection, and the name is for the eye.
-    let mut selections: Vec<SelectionView> = Vec::new();
-    let mut push = |s: SelectionView| {
-        if !selections.iter().any(|x| x.key() == s.key()) {
-            selections.push(s);
-        }
-    };
-    for w in cache.workers.values() {
-        for a in w.inventory.iter().flat_map(|i| i.accounts.iter()) {
-            for m in &a.models {
-                push(SelectionView {
-                    account_label: a.label.clone(),
-                    model_id: m.id.clone(),
-                    model_name: m.name.clone(),
-                    options: Vec::new(),
-                });
-            }
-            if a.models.is_empty() {
-                push(SelectionView {
-                    account_label: a.label.clone(),
-                    ..SelectionView::default()
-                });
-            }
-        }
-    }
+    // The picker groups models by account label. A paused or offline
+    // worker still counts: placement waits for it.
+    let model_groups = crate::picker::model_groups(
+        cache.workers.values().filter_map(|w| {
+            w.inventory
+                .as_ref()
+                .map(|i| (w.name.as_str(), i.accounts.as_slice()))
+        }),
+        |harness| provider_logo_of(cache, harness),
+    );
     let mut sign_ins: Vec<&model::SignIn> = cache
         .sign_ins
         .values()
@@ -1314,7 +1310,7 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
         tasks_panel: TasksPanelView::default(),
         workers,
         tags: Vec::new(),
-        selections,
+        model_groups,
         sign_ins,
         acp_registry,
         worker_pairing: None,
@@ -1437,6 +1433,49 @@ pub(crate) fn sentence(text: &str) -> String {
     } else {
         format!("{text}.")
     }
+}
+
+/// The model of a task in words, from the task's own selection, its
+/// channel's default or the Everything default. The task keeps the model it
+/// started with, so the thread shows it and does not offer to change it.
+fn task_model_label(cache: &Cache, task: &model::Task) -> Option<String> {
+    let channel = cache.channels.get(&task.channel_id.to_string());
+    let everything = cache.channels.values().find(|c| c.kind == PK::Everything);
+    let chosen = task
+        .model_selection
+        .as_ref()
+        .or(channel.and_then(|c| c.task_selection.as_ref()))
+        .or(everything.and_then(|c| c.task_selection.as_ref()))?;
+    let view = selection_view(cache, chosen);
+    let effort = model_effort(cache, &chosen.account_label, &chosen.model);
+    Some(crate::picker::selection_words(&view, effort.as_ref()))
+}
+
+/// The effort levels of a model, from the first worker that reports it.
+fn model_effort(cache: &Cache, account_label: &str, model_id: &str) -> Option<EffortView> {
+    cache
+        .workers
+        .values()
+        .filter_map(|w| w.inventory.as_ref())
+        .flat_map(|i| i.accounts.iter())
+        .filter(|a| a.label == account_label)
+        .flat_map(|a| a.models.iter())
+        .find(|m| m.id == model_id)
+        .and_then(|m| crate::picker::effort_view(&m.options))
+}
+
+/// The provider name and logo of a harness, with the icon of a registry
+/// agent once the client has it.
+fn provider_logo_of(cache: &Cache, harness: &str) -> (String, ProviderLogo) {
+    let (name, logo) = provider_of(harness);
+    let logo = match logo {
+        ProviderLogo::Registry { id, .. } => {
+            let svg = cache.acp_icons.get(&id).cloned();
+            ProviderLogo::Registry { id, svg }
+        }
+        other => other,
+    };
+    (name, logo)
 }
 
 /// The account and model of a task, best known first: the task's own
@@ -3328,34 +3367,106 @@ mod tests {
             claude.models = vec![ModelInfo {
                 id: "claude-opus-5-5".into(),
                 name: "Opus 5.5".into(),
-                options: vec![],
+                options: vec![consort_proto::model::OptionDescriptor::Select {
+                    id: "effort".into(),
+                    label: "Effort".into(),
+                    choices: ["low", "high"]
+                        .iter()
+                        .map(|v| consort_proto::model::OptionChoice {
+                            value: (*v).into(),
+                            label: v.to_uppercase(),
+                        })
+                        .collect(),
+                    default: Some("low".into()),
+                }],
             }];
             inventory(&mut bigboi).accounts = vec![claude];
             w.cache.workers.insert(bigboi.id.to_string(), bigboi);
+            let chosen = ModelSelection {
+                account_label: "Claude Personal".into(),
+                model: "claude-opus-5-5".into(),
+                options: [("effort".to_owned(), OptionValue::Text("high".into()))]
+                    .into_iter()
+                    .collect(),
+            };
             if let Some(channel) = w.cache.channels.get_mut(&w.sayso.to_string()) {
-                channel.task_selection = Some(ModelSelection {
-                    account_label: "Claude Personal".into(),
-                    model: "claude-opus-5-5".into(),
-                    options: [("effort".to_owned(), OptionValue::Text("high".into()))]
-                        .into_iter()
-                        .collect(),
-                });
+                channel.task_selection = Some(chosen.clone());
             }
             let state = view(&w.cache);
-            let first = &state.selections[0];
-            assert_eq!(first.model_id, "claude-opus-5-5");
-            assert_eq!(first.label(), "Claude Personal, Opus 5.5");
-            let chosen = state
+            let group = &state.model_groups[0];
+            assert_eq!(group.account_label, "Claude Personal");
+            assert_eq!(group.workers, ["bigboi"]);
+            assert_eq!(group.models[0].id, "claude-opus-5-5");
+            assert_eq!(group.models[0].name, "Opus 5.5");
+            let chosen_view = state
                 .channel(&w.sayso.to_string())
                 .and_then(|c| c.task_selection.clone())
                 .expect("selection");
-            assert_eq!(chosen.label(), "Claude Personal, Opus 5.5");
-            assert_eq!(chosen.model_id, "claude-opus-5-5");
+            assert_eq!(chosen_view.label(), "Claude Personal, Opus 5.5");
+            assert_eq!(chosen_view.model_id, "claude-opus-5-5");
             assert_eq!(
-                chosen.options,
+                chosen_view.options,
                 [("effort".to_owned(), SelectionOption::Text("high".into()))]
             );
-            assert_eq!(state.selection(&chosen.key()), Some(first));
+            assert_eq!(
+                state.effort_for(&chosen_view).map(|e| e.levels.len()),
+                Some(2)
+            );
+        }
+
+        #[test]
+        fn a_channel_without_its_own_model_uses_everything_and_says_so() {
+            let mut w = world();
+            let sel = |model: &str| ModelSelection {
+                account_label: "Claude Personal".into(),
+                model: model.into(),
+                options: Default::default(),
+            };
+            for channel in w.cache.channels.values_mut() {
+                channel.coordinator_selection = match channel.kind {
+                    PK::Everything => Some(sel("opus")),
+                    PK::Standard => None,
+                };
+            }
+            let state = view(&w.cache);
+            let everything = state.everything().unwrap();
+            let own = everything.coordinator_selection.clone().unwrap();
+            assert_eq!(own.source, SelectionSource::Channel);
+            assert_eq!(own.selection.model_id, "opus");
+            let sayso = state.channel(&w.sayso.to_string()).unwrap();
+            let inherited = sayso.coordinator_selection.clone().unwrap();
+            assert_eq!(inherited.source, SelectionSource::Everything);
+            assert_eq!(inherited.selection.model_id, "opus");
+
+            if let Some(channel) = w.cache.channels.get_mut(&w.sayso.to_string()) {
+                channel.coordinator_selection = Some(sel("sonnet"));
+            }
+            let state = view(&w.cache);
+            let sayso = state.channel(&w.sayso.to_string()).unwrap();
+            let own = sayso.coordinator_selection.clone().unwrap();
+            assert_eq!(own.source, SelectionSource::Channel);
+            assert_eq!(own.selection.model_id, "sonnet");
+        }
+
+        #[test]
+        fn a_signed_out_account_is_not_in_the_picker() {
+            let mut w = world();
+            let mut bigboi = worker("bigboi", &[], &[]);
+            let mut out = account("Claude Work", "claude", PA::SignedOut);
+            out.models = vec![ModelInfo {
+                id: "opus".into(),
+                name: "Opus".into(),
+                options: vec![],
+            }];
+            inventory(&mut bigboi).accounts = vec![out];
+            w.cache.workers.insert(bigboi.id.to_string(), bigboi);
+            let state = view(&w.cache);
+            assert!(
+                state
+                    .model_groups
+                    .iter()
+                    .all(|g| g.account_label != "Claude Work")
+            );
         }
 
         fn sign_in(state: SignInState) -> SignIn {

@@ -52,7 +52,14 @@ fn channel(id: &str, name: &str, purpose: &str, icon: &str, group: Option<&str>)
         icon: icon.into(),
         group_id: group.map(Into::into),
         coordinator_worker: Some(text("hub")),
-        coordinator_account: Some(text("Claude Personal")),
+        coordinator_selection: Some(EffectiveSelection {
+            selection: assistant_model(),
+            source: if id == EVERYTHING {
+                SelectionSource::Channel
+            } else {
+                SelectionSource::Everything
+            },
+        }),
         repos: Vec::new(),
         preferred_workers: Vec::new(),
         task_selection: Some(selection("Claude Personal", "claude-opus-5-5", "Opus 5.5")),
@@ -200,6 +207,117 @@ fn card(
 }
 
 /// A model selection with no options.
+/// The model of the assistant in Everything: Opus 5.5 with high effort.
+fn assistant_model() -> SelectionView {
+    let mut chosen = selection("Claude Personal", "claude-opus-5-5", "Opus 5.5");
+    chosen.options = vec![(
+        crate::picker::EFFORT.to_owned(),
+        SelectionOption::Text(text("high")),
+    )];
+    chosen
+}
+
+/// Effort levels, with the provider's default.
+fn levels(values: &[(&str, &str)], default: Option<&str>) -> Option<EffortView> {
+    Some(EffortView {
+        levels: values
+            .iter()
+            .map(|(value, label)| EffortLevel {
+                value: text(value),
+                label: text(label),
+            })
+            .collect(),
+        default: default.map(text),
+    })
+}
+
+/// The model picker groups of the mock: three signed-in accounts on the
+/// mock workers, and OpenCode with enough models to make the list scroll.
+pub fn model_groups() -> Vec<ModelGroupView> {
+    let claude = || {
+        levels(
+            &[
+                ("low", "Low"),
+                ("medium", "Medium"),
+                ("high", "High"),
+                ("max", "Max"),
+            ],
+            Some("medium"),
+        )
+    };
+    let codex = || {
+        levels(
+            &[
+                ("low", "Low"),
+                ("medium", "Medium"),
+                ("high", "High"),
+                ("xhigh", "Extra high"),
+            ],
+            Some("medium"),
+        )
+    };
+    let model = |id: &str, name: &str, effort: Option<EffortView>| ModelChoiceView {
+        id: text(id),
+        name: text(name),
+        effort,
+    };
+    vec![
+        ModelGroupView {
+            account_label: text("Claude Personal"),
+            provider: text("Claude Code"),
+            logo: ProviderLogo::ClaudeCode,
+            workers: vec![text("hub"), text("MacBook Pro")],
+            models: vec![
+                model("claude-opus-5-5", "Opus 5.5", claude()),
+                model("claude-sonnet-5-5", "Sonnet 5.5", claude()),
+                model("claude-haiku-5-5", "Haiku 5.5", claude()),
+                model("claude-haiku-4-5", "Haiku 4.5", None),
+            ],
+        },
+        ModelGroupView {
+            account_label: text("Claude Work"),
+            provider: text("Claude Code"),
+            logo: ProviderLogo::ClaudeCode,
+            workers: vec![text("MacBook Pro")],
+            models: vec![
+                model("claude-opus-5-5", "Opus 5.5", claude()),
+                model("claude-sonnet-5-5", "Sonnet 5.5", claude()),
+            ],
+        },
+        ModelGroupView {
+            account_label: text("Codex Personal"),
+            provider: text("Codex"),
+            logo: ProviderLogo::Codex,
+            workers: vec![text("hub"), text("bigboi")],
+            models: vec![
+                model("gpt-5.5", "GPT-5.5", codex()),
+                model("gpt-6.1-sol", "GPT-6.1-Sol", codex()),
+                model("gpt-6-astra", "GPT-6-Astra", codex()),
+            ],
+        },
+        ModelGroupView {
+            account_label: text("OpenCode with Fireworks"),
+            provider: text("OpenCode"),
+            logo: ProviderLogo::OpenCode,
+            workers: vec![text("homelab")],
+            models: vec![
+                model(
+                    "fireworks/deepseek-v4p1-flash",
+                    "DeepSeek V4.1 Flash",
+                    levels(&[("low", "Low"), ("high", "High"), ("max", "Max")], None),
+                ),
+                model(
+                    "fireworks/glm-5p3",
+                    "GLM 5.3",
+                    levels(&[("low", "Low"), ("high", "High"), ("max", "Max")], None),
+                ),
+                model("fireworks/kimi-k3", "Kimi K3", None),
+                model("fireworks/qwen-4-coder", "Qwen 4 Coder", None),
+            ],
+        },
+    ]
+}
+
 fn selection(account: &str, model_id: &str, model_name: &str) -> SelectionView {
     SelectionView {
         account_label: account.into(),
@@ -945,6 +1063,7 @@ fn threads() -> Vec<TaskThreadView> {
             review_summary: None,
             text_is_preview: false,
             approval_mode: ApprovalMode::Ask,
+            model_label: Some(text("GPT-5.5, Codex Personal, High effort")),
             posts: vec![
                 post(
                     "pst_sayso_1",
@@ -985,6 +1104,7 @@ fn threads() -> Vec<TaskThreadView> {
             brief: text(SPAM_BRIEF),
             review_summary: Some(text(SPAM_SUMMARY)),
             approval_mode: ApprovalMode::AutoEdits,
+            model_label: Some(text("Opus 5.5, Claude Personal")),
             posts: vec![post(
                 "pst_spam_1",
                 Speaker::Task,
@@ -1141,6 +1261,11 @@ pub fn view_state() -> ViewState {
         }];
         sayso.preferred_workers = vec![text("wrk_bigboi"), text("wrk_macbook")];
         sayso.task_selection = Some(selection("Codex Personal", "gpt-5.5", "GPT-5.5"));
+        // sayso has its own model for the assistant.
+        sayso.coordinator_selection = Some(EffectiveSelection {
+            selection: selection("Claude Work", "claude-sonnet-5-5", "Sonnet 5.5"),
+            source: SelectionSource::Channel,
+        });
         sayso.tags = vec![text("personal")];
     }
     let mut state = ViewState {
@@ -1172,13 +1297,7 @@ pub fn view_state() -> ViewState {
         tasks_panel: TasksPanelView::default(),
         workers: workers(),
         tags: Vec::new(),
-        selections: vec![
-            selection("Claude Personal", "claude-opus-5-5", "Opus 5.5"),
-            selection("Claude Personal", "claude-sonnet-5-5", "Sonnet 5.5"),
-            selection("Claude Work", "claude-opus-5-5", "Opus 5.5"),
-            selection("Codex Personal", "gpt-5.5", "GPT-5.5"),
-            selection("OpenCode with Fireworks", "", ""),
-        ],
+        model_groups: model_groups(),
         sign_ins: Vec::new(),
         acp_registry: AcpRegistryView::default(),
         worker_pairing: None,

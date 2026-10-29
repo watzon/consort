@@ -57,6 +57,9 @@ pub struct NewChannel {
     pub group_id: Option<String>,
     pub repos: Vec<String>,
     pub preferred_workers: Vec<String>,
+    /// The model of the channel's assistant. `None` uses Everything's.
+    pub coordinator_selection: Option<SelectionView>,
+    /// The model that tasks start with. `None` uses Everything's.
     pub task_selection: Option<SelectionView>,
     pub isolation: Isolation,
     /// The worker tags that the channel requires.
@@ -78,6 +81,11 @@ pub struct ChannelChanges {
     /// The worker tags that the channel requires. `Some(vec![])` removes
     /// them all.
     pub tags: Option<Vec<String>>,
+    /// The model of the channel's assistant. `Some(None)` takes the
+    /// channel's own model away, so it uses Everything's.
+    pub coordinator_selection: Option<Option<SelectionView>>,
+    /// The model that tasks start with. `Some(None)` takes it away.
+    pub task_selection: Option<Option<SelectionView>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

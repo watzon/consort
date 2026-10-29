@@ -505,35 +505,113 @@ fn find_option<'a>(options: &'a [Value], category: &str, ids: &[&str]) -> Option
         })
 }
 
+/// The value that `claude-agent-acp` and OpenCode put in the effort list for
+/// "let the model decide". It is not a level, so the adapter leaves it out:
+/// a selection without an effort gets the same.
+const EFFORT_DEFAULT_VALUE: &str = "default";
+
+/// The `effort` option from a session's thought level option, if it has
+/// one. The `default` value is not a level, and when it is the current
+/// value, the provider does not say which level is its default.
+fn effort_option(options: &[Value]) -> Option<OptionDescriptor> {
+    let option = find_option(options, "thought_level", &["effort", "thought_level"])?;
+    let choices: Vec<OptionChoice> = option_choices(option)
+        .into_iter()
+        .filter(|(value, _)| value != EFFORT_DEFAULT_VALUE)
+        .map(|(value, label)| OptionChoice { value, label })
+        .collect();
+    if choices.is_empty() {
+        return None;
+    }
+    let default = option
+        .get("currentValue")
+        .and_then(Value::as_str)
+        .filter(|v| choices.iter().any(|c| c.value == *v))
+        .map(str::to_owned);
+    Some(OptionDescriptor::Select {
+        id: "effort".to_owned(),
+        label: "Effort".to_owned(),
+        choices,
+        default,
+    })
+}
+
 /// The models in a session's config options, with an `effort` option when
-/// the agent has a thought level option.
-pub fn models_from_config(options: &[Value]) -> Vec<ModelInfo> {
-    let effort = find_option(options, "thought_level", &["effort", "thought_level"]).map(|o| {
-        let choices = option_choices(o);
-        OptionDescriptor::Select {
-            id: "effort".to_owned(),
-            label: "Effort".to_owned(),
-            choices: choices
-                .into_iter()
-                .map(|(value, label)| OptionChoice { value, label })
-                .collect(),
-            default: o
-                .get("currentValue")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-        }
-    });
+/// the agent has a thought level option. `per_model` holds the config
+/// options that the agent sent back after the probe chose each model,
+/// because the effort levels differ by model (for example, Claude Code
+/// offers none for Haiku 4.5). A model that the probe did not reach gets the
+/// effort of the session's first model.
+pub fn models_from_config(
+    options: &[Value],
+    per_model: &BTreeMap<String, Vec<Value>>,
+) -> Vec<ModelInfo> {
+    let effort = effort_option(options);
     let Some(model) = find_option(options, "model", &["model"]) else {
         return Vec::new();
     };
     option_choices(model)
         .into_iter()
-        .map(|(id, name)| ModelInfo {
-            id,
-            name,
-            options: effort.iter().cloned().collect(),
+        .map(|(id, name)| {
+            let options = match per_model.get(&id) {
+                Some(model_options) => effort_option(model_options),
+                None => effort.clone(),
+            };
+            ModelInfo {
+                id,
+                name,
+                options: options.into_iter().collect(),
+            }
         })
         .collect()
+}
+
+/// How long a probe may spend to read the options of each model.
+const MODEL_WALK_BUDGET: Duration = Duration::from_secs(30);
+/// The most models whose options a probe reads.
+const MODEL_WALK_MAX: usize = 1_000;
+
+/// Chooses each model of a probe session in turn and keeps the config
+/// options that the agent sends back, by model ID. `claude-agent-acp` 0.99.0
+/// and OpenCode 2.2.1 change the effort levels with the model. A model that
+/// fails, or that the budget does not reach, is left out.
+async fn walk_models(
+    cx: &ConnectionTo<Agent>,
+    session: &NativeRef,
+    options: &[Value],
+) -> BTreeMap<String, Vec<Value>> {
+    let mut out = BTreeMap::new();
+    let Some(model) = find_option(options, "model", &["model"]) else {
+        return out;
+    };
+    let Some(config_id) = model.get("id").and_then(Value::as_str) else {
+        return out;
+    };
+    let started = std::time::Instant::now();
+    for (value, _) in option_choices(model).into_iter().take(MODEL_WALK_MAX) {
+        let Some(left) = MODEL_WALK_BUDGET.checked_sub(started.elapsed()) else {
+            tracing::info!(
+                read = out.len(),
+                "the probe ran out of time to read the options of every model"
+            );
+            break;
+        };
+        let reply = tokio::time::timeout(
+            left,
+            request(
+                cx,
+                "session/set_config_option",
+                json!({"sessionId": session.as_str(), "configId": config_id, "value": value}),
+            ),
+        )
+        .await;
+        if let Ok(Ok(reply)) = reply
+            && let Some(updated) = reply.get("configOptions").and_then(Value::as_array)
+        {
+            out.insert(value, updated.clone());
+        }
+    }
+    out
 }
 
 /// How the adapter sets the permission mode of a Claude session.
@@ -554,6 +632,9 @@ struct Ready {
     capabilities: Capabilities,
     agent_version: Option<String>,
     config_options: Vec<Value>,
+    /// For a probe: the config options after the probe chose each model,
+    /// by model ID.
+    model_options: BTreeMap<String, Vec<Value>>,
     auth_label: Option<String>,
     /// For Claude Code: whether the agent offers `bypassPermissions`.
     bypass: Option<bool>,
@@ -811,11 +892,17 @@ impl Actor {
         let (config_options, mode) = self
             .configure(cx, &native_ref, &response, config_options)
             .await?;
+        let model_options = if self.probe {
+            walk_models(cx, &native_ref, &config_options).await
+        } else {
+            BTreeMap::new()
+        };
         Ok(Ready {
             native_ref,
             capabilities: self.capabilities.clone(),
             agent_version,
             config_options,
+            model_options,
             auth_label: None,
             bypass: mode.as_ref().map(|(bypass, _)| *bypass),
             mode_setter: mode.map(|(_, setter)| setter).unwrap_or(ModeSetter::None),
@@ -1709,7 +1796,7 @@ impl Harness for AcpHarness {
                             "OpenCode signs in per model provider. Run `opencode auth list` to see which ones.".to_owned()
                         })
                     }),
-                    models: models_from_config(&ready.config_options),
+                    models: models_from_config(&ready.config_options, &ready.model_options),
                     capabilities,
                     ..AccountStatus::default()
                 }

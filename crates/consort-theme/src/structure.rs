@@ -207,6 +207,16 @@ pub struct Components {
     pub group_select: f32,
     /// The Workspace control in the New channel dialog.
     pub workspace_control: f32,
+    /// The width of the model picker popover.
+    pub model_picker: f32,
+    /// The tallest the model list in the picker grows before it scrolls.
+    pub model_list_max: f32,
+    /// The width of the effort menu.
+    pub effort_menu: f32,
+    /// The effort select next to a model field in a dialog.
+    pub effort_select: f32,
+    /// The height of a chip in the composer, such as the model chip.
+    pub composer_chip: f32,
     /// The vertical padding of a text input: 36 px with its border.
     pub input_pad_y: f32,
     /// The vertical padding of a text button: 30 px high.
@@ -357,6 +367,11 @@ mod tests {
         assert_eq!(c.settings_select, 160.0);
         assert_eq!(c.group_select, 200.0);
         assert_eq!(c.workspace_control, 230.0);
+        assert_eq!(
+            (c.model_picker, c.model_list_max, c.effort_menu),
+            (400.0, 340.0, 240.0)
+        );
+        assert_eq!((c.effort_select, c.composer_chip), (150.0, 28.0));
         // A 20 px line, the padding and a 1 px border make 36 px and 30 px.
         assert_eq!(c.input_pad_y * 2.0 + 20.0 + 2.0, 36.0);
         assert_eq!(c.button_pad_y * 2.0 + 20.0, 30.0);

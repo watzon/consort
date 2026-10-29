@@ -597,6 +597,15 @@ impl Runtime {
             resume,
             process_watcher: Some(watcher),
         };
+        // The model and its options (such as the effort) go in the log, so a
+        // user can check what a session started with. They hold no secret.
+        tracing::info!(
+            session = %self.session_id,
+            account = %account.label,
+            model = %spec.model,
+            options = ?spec.options,
+            "opening a harness session"
+        );
         let (session, events) = match adapter.open(&account, spec).await {
             Ok(s) => s,
             Err(err) => {

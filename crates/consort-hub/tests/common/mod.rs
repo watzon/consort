@@ -391,11 +391,31 @@ pub fn inventory(account_id: AccountId) -> Inventory {
             harness_version: Some("1.0.0".to_owned()),
             auth_state: AuthState::SignedIn,
             auth_detail: None,
-            models: vec![ModelInfo {
-                id: "opus".to_owned(),
-                name: "Opus".to_owned(),
-                options: Vec::new(),
-            }],
+            models: vec![
+                ModelInfo {
+                    id: "opus".to_owned(),
+                    name: "Opus".to_owned(),
+                    options: Vec::new(),
+                },
+                // A second model with effort levels, for the tests of a
+                // model change.
+                ModelInfo {
+                    id: "sonnet".to_owned(),
+                    name: "Sonnet".to_owned(),
+                    options: vec![consort_proto::model::OptionDescriptor::Select {
+                        id: "effort".to_owned(),
+                        label: "Effort".to_owned(),
+                        choices: ["low", "high"]
+                            .iter()
+                            .map(|v| consort_proto::model::OptionChoice {
+                                value: (*v).to_owned(),
+                                label: (*v).to_owned(),
+                            })
+                            .collect(),
+                        default: Some("low".to_owned()),
+                    }],
+                },
+            ],
             capabilities: Capabilities {
                 steer: true,
                 resume: true,

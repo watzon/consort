@@ -666,65 +666,93 @@ impl ConsortApp {
         )
         .size_full();
 
-        let reply = div().flex_none().px(t.space.lg).pb(t.space.xl).child(
-            div()
-                .flex()
-                .items_center()
-                .gap(t.space.sm)
-                .py(t.space.sm + t.space.xxs)
-                .pl(t.space.md + t.space.xxs)
-                .pr(t.space.sm + t.space.xxs)
-                .bg(c.surface_card)
-                .border(t.border_width)
-                .border_color(c.border_strong)
-                .rounded(t.radius.lg)
-                // The reply box has the same menu as the composer.
-                .on_mouse_down(
-                    MouseButton::Right,
-                    cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                        let items = text_edit_menu(TextTarget::Reply);
-                        this.open_menu(OpenMenu::at(event.position, items), cx);
-                        cx.stop_propagation();
-                    }),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .type_style(t.text.ui)
-                        .child(crate::ui::parts::textarea(&self.inputs.reply, t.text.ui)),
-                )
-                .child(
-                    icon_button(
-                        "reply-attach",
-                        "plus",
-                        t.space.xl + t.space.xs,
-                        t.icon.size,
-                        c.text_secondary,
-                        c.hover_card,
-                        t,
+        // The task keeps the model that it started with. The thread shows it
+        // as text, with no way to change it.
+        let model_label = self
+            .state
+            .thread(task_id)
+            .and_then(|th| th.model_label.clone());
+        let reply = div()
+            .flex_none()
+            .px(t.space.lg)
+            .pb(t.space.xl)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(t.space.sm)
+                    .py(t.space.sm + t.space.xxs)
+                    .pl(t.space.md + t.space.xxs)
+                    .pr(t.space.sm + t.space.xxs)
+                    .bg(c.surface_card)
+                    .border(t.border_width)
+                    .border_color(c.border_strong)
+                    .rounded(t.radius.lg)
+                    // The reply box has the same menu as the composer.
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                            let items = text_edit_menu(TextTarget::Reply);
+                            this.open_menu(OpenMenu::at(event.position, items), cx);
+                            cx.stop_propagation();
+                        }),
                     )
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.show_notice("Attachments come in a later build.".into(), cx)
-                    })),
-                )
-                .child(
-                    focusable(div().id("reply-send"), t)
-                        .size(t.space.xl + t.space.xs)
-                        .flex_none()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .type_style(t.text.ui)
+                            .child(crate::ui::parts::textarea(&self.inputs.reply, t.text.ui)),
+                    )
+                    .child(
+                        icon_button(
+                            "reply-attach",
+                            "plus",
+                            t.space.xl + t.space.xs,
+                            t.icon.size,
+                            c.text_secondary,
+                            c.hover_card,
+                            t,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.show_notice("Attachments come in a later build.".into(), cx)
+                        })),
+                    )
+                    .child(
+                        focusable(div().id("reply-send"), t)
+                            .size(t.space.xl + t.space.xs)
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(t.radius.md)
+                            .bg(c.surface_raised)
+                            .border(t.border_width)
+                            .border_color(c.border_strong)
+                            .cursor_pointer()
+                            .hover(|s| s.bg(c.hover_raised))
+                            .child(icon("corner-down-left", t.icon.dense, c.text_primary))
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.send_reply(window, cx)),
+                            ),
+                    ),
+            )
+            .when_some(model_label, |d, label| {
+                d.child(
+                    div()
                         .flex()
                         .items_center()
-                        .justify_center()
-                        .rounded(t.radius.md)
-                        .bg(c.surface_raised)
-                        .border(t.border_width)
-                        .border_color(c.border_strong)
-                        .cursor_pointer()
-                        .hover(|s| s.bg(c.hover_raised))
-                        .child(icon("corner-down-left", t.icon.dense, c.text_primary))
-                        .on_click(cx.listener(|this, _, window, cx| this.send_reply(window, cx))),
-                ),
-        );
+                        .gap(t.space.xs + t.space.xxs)
+                        .pt(t.space.sm)
+                        .px(t.space.md)
+                        .child(icon("signal", t.icon.dense, c.text_tertiary))
+                        .child(line(
+                            format!("Runs with {label}"),
+                            crate::ui::parts::detail(t),
+                            c.text_tertiary,
+                        )),
+                )
+            });
 
         let fade = |top: bool| {
             let (from, to, angle) = (

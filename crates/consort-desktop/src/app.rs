@@ -10,7 +10,7 @@ use std::{
 
 use consort_client::{
     ApprovalChoice, ChannelChanges, Client, ClientError, Connection, Drafts, Isolation, Os,
-    ViewState,
+    SelectionView, ViewState,
 };
 use consort_theme::{ActiveTokens as _, Tokens, TypeExt as _};
 use gpui_kit::{
@@ -31,6 +31,7 @@ use crate::{
         links::LinkAction,
         markdown::TextCache,
         menu::{EditOp, MenuAction, MenuItem, OpenMenu, TextTarget, TriggerBounds, render_menu},
+        model_picker::{OpenEffort, OpenPicker, PickerTarget},
         parts::Spin,
     },
     waiting::{Waiting, waiting_for_channel},
@@ -159,8 +160,10 @@ pub struct NewChannelForm {
     /// `group_name` input.
     pub new_group: bool,
     pub workers: Vec<String>,
-    /// The key of the chosen selection (see `SelectionView::key`).
-    pub selection: Option<String>,
+    /// "Model for the assistant". `None` is "Same as Everything".
+    pub coordinator_selection: Option<SelectionView>,
+    /// "Model for tasks". `None` is "Same as Everything".
+    pub task_selection: Option<SelectionView>,
     pub isolation: Isolation,
     /// The worker tags that the channel requires.
     pub tags: Vec<String>,
@@ -200,6 +203,8 @@ pub struct Inputs {
     pub api_key: Entity<InputState>,
     /// A new tag for a worker.
     pub tag: Entity<InputState>,
+    /// The search of the model picker.
+    pub model_search: Entity<InputState>,
 }
 
 /// What the Enter key does in the open dialog, as the last render set it.
@@ -218,6 +223,10 @@ pub struct ConsortApp {
     pub dialog: Option<Dialog>,
     pub menu: Option<OpenMenu>,
     pub menu_anchor: Option<OpenMenu>,
+    /// The open model picker.
+    pub picker: Option<OpenPicker>,
+    /// The open effort menu.
+    pub effort_menu: Option<OpenEffort>,
     pub inputs: Inputs,
     pub texts: TextCache,
     pub timeline: ListState,
@@ -356,6 +365,7 @@ impl ConsortApp {
                     .masked(true)
             }),
             tag: field("New tag", window, cx),
+            model_search: field("Search models and accounts", window, cx),
         };
         let mut subscriptions = Vec::new();
         subscriptions.push(cx.subscribe_in(
@@ -437,6 +447,16 @@ impl ConsortApp {
                 },
             ));
         }
+        // A new search moves the keyboard to the first model that matches.
+        subscriptions.push(cx.subscribe_in(
+            &inputs.model_search,
+            window,
+            |this, _, event: &InputEvent, _, cx| {
+                if let InputEvent::Change = event {
+                    this.picker_search_changed(cx);
+                }
+            },
+        ));
         subscriptions.push(cx.subscribe_in(
             &inputs.edit,
             window,
@@ -515,6 +535,8 @@ impl ConsortApp {
             dialog: None,
             menu: None,
             menu_anchor: None,
+            picker: None,
+            effort_menu: None,
             inputs,
             texts: TextCache::default(),
             timeline: ListState::new(0, ListAlignment::Bottom, overdraw),
@@ -626,6 +648,7 @@ impl ConsortApp {
             &self.inputs.sign_in_code,
             &self.inputs.api_key,
             &self.inputs.tag,
+            &self.inputs.model_search,
         ] {
             let style = style.clone();
             field.update(cx, |s, cx| {
@@ -1188,6 +1211,20 @@ impl ConsortApp {
                     self.run_menu(MenuAction::EditMessage(id, body), window, cx);
                 }
             }
+            // The model picker and the effort menu of the composer. They
+            // open under their chips, which have bounds after the first
+            // frame.
+            "model-picker" | "effort-menu" => {
+                let effort = screen == "effort-menu";
+                cx.on_next_frame(window, move |this, window, cx| {
+                    let target = PickerTarget::Assistant(this.channel_id.clone());
+                    if effort {
+                        this.open_effort("composer-effort", target, window, cx);
+                    } else {
+                        this.open_picker_under("composer-model", target, window, cx);
+                    }
+                });
+            }
             "switcher" => {
                 self.open_switcher(window, cx);
                 self.inputs
@@ -1208,16 +1245,7 @@ impl ConsortApp {
             // The menu of a channel row in the sidebar.
             "channel-menu" => {
                 if let Some(id) = sayso {
-                    let items = vec![
-                        MenuItem::new("Rename", MenuAction::RenameChannel(id.clone())),
-                        MenuItem::new("Instructions", MenuAction::ChannelInstructions(id.clone())),
-                        MenuItem::new("Worker tags", MenuAction::ChannelTags(id.clone())),
-                        MenuItem::new("Change icon", MenuAction::ChangeIcon(id.clone())),
-                        MenuItem::new("Move to group", MenuAction::MoveToGroup(id.clone())),
-                        MenuItem::new("Archive", MenuAction::ArchiveChannel(id.clone()))
-                            .separated(),
-                        MenuItem::new("Delete", MenuAction::DeleteChannel(id)).danger(),
-                    ];
+                    let items = crate::ui::menu::channel_menu(&id);
                     let t = Self::tokens(cx);
                     let at = gpui_kit::point(
                         t.layout.sidebar_width / 2.0,
@@ -1549,6 +1577,8 @@ impl ConsortApp {
 
     pub fn open_dialog(&mut self, dialog: Dialog, window: &mut Window, cx: &mut Context<Self>) {
         self.menu = None;
+        self.picker = None;
+        self.effort_menu = None;
         self.dialog_error = None;
         self.dialog_serial += 1;
         match &dialog {
@@ -1557,7 +1587,8 @@ impl ConsortApp {
                     group_id: self.state.groups.first().map(|g| g.id.clone()),
                     new_group: false,
                     workers: Vec::new(),
-                    selection: self.state.selections.first().map(|s| s.key()),
+                    coordinator_selection: None,
+                    task_selection: None,
                     isolation: Isolation::Worktree,
                     tags: Vec::new(),
                 };
@@ -1691,6 +1722,8 @@ impl ConsortApp {
         }
         self.dialog = None;
         self.dialog_error = None;
+        self.picker = None;
+        self.effort_menu = None;
         self.focus.focus(window, cx);
         cx.notify();
     }
@@ -2187,6 +2220,12 @@ impl ConsortApp {
                 self.open_dialog(Dialog::ConfirmRemoveWorker(id), window, cx)
             }
             MenuAction::ChannelTags(id) => self.open_dialog(Dialog::ChannelTags(id), window, cx),
+            MenuAction::ChannelModel(id) => {
+                // The picker opens where the channel menu was.
+                if let Some(anchor) = self.last_menu_anchor() {
+                    self.open_picker(PickerTarget::Assistant(id), anchor.anchor, window, cx);
+                }
+            }
             MenuAction::RenameAccount(worker_id, account_id) => {
                 self.open_dialog(Dialog::RenameAccount(worker_id, account_id), window, cx)
             }
@@ -2257,6 +2296,10 @@ impl ConsortApp {
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
+        if self.effort_key(key, window, cx) {
+            cx.stop_propagation();
+            return;
+        }
         if let Some(menu) = self.menu.as_mut() {
             match key {
                 "escape" => self.menu = None,
@@ -2437,6 +2480,8 @@ impl Render for ConsortApp {
             Page::Main => self.render_main(&t, window, cx),
         };
         let menu = self.menu.clone();
+        let picker = self.render_picker(&t, window, cx);
+        let effort = self.render_effort_menu(&t, window, cx);
         self.follow_spinner(cx);
         div()
             .id("consort")
@@ -2473,6 +2518,8 @@ impl Render for ConsortApp {
                         layer.child(self.render_switcher(&t, cx))
                     }),
             )
+            .children(picker)
+            .children(effort)
             .when_some(menu, |root, menu| {
                 root.child(render_menu(
                     &menu,

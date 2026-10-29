@@ -62,6 +62,15 @@ Four rules keep the adapters honest:
 | `mcp_http` | The harness accepts an HTTP MCP server with a bearer token |
 | `approval_modes` | The approval modes that the adapter can enforce |
 
+## Models and effort
+
+The probe of an account reports its models, each with its options. The `effort` option is a select with the levels that the provider offers for that model, lowest first, and the provider's default level when it names one.
+
+- **Codex** reports the levels per model in `model/list` (`supportedReasoningEfforts` and `defaultReasoningEffort`). The adapter sends the effort with each turn.
+- **ACP agents** (Claude Code through `claude-agent-acp` 0.99.0, OpenCode 2.2.1, Gemini CLI) report a `thought_level` config option. The levels change with the model: for example, Claude Code offers no effort for Haiku 4.5, and no Extra high for Opus 4.6. So the probe chooses each model in turn with `session/set_config_option` and reads the options that come back. It stops after 30 seconds or 1,000 models. A model that it does not reach gets the levels of the first model. Both agents list a value `default` that means "the model decides". It is not a level, so the adapter leaves it out, and the provider default is then unknown. At session start the adapter sets the model, then the effort, with `session/set_config_option`. A value that the agent refuses becomes an `option_failed` error, and the session uses the default.
+
+The worker writes the model and the options of each session that it opens to its log (`opening a harness session`).
+
 ## Harness accounts
 
 In the UI a harness is a **provider**, and a harness account is an **account**. Accounts belong to a worker. The user makes them in Settings > Workers, with `account.create` (see [protocol.md](protocol.md#requests)). One provider can have several accounts on one worker. A new worker has no accounts, and the worker does not pick up a login that already exists on the machine.

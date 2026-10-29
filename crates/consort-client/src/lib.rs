@@ -16,6 +16,7 @@ pub mod hub;
 pub mod limits;
 pub mod mock;
 mod mock_backend;
+pub mod picker;
 pub mod reduce;
 pub mod store;
 pub mod view;

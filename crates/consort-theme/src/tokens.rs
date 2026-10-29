@@ -85,6 +85,9 @@ pub struct Palette {
     pub canvas_clear: Hsla,
     /// Transparent `surface.sidebar`, the end stop of the panel fades.
     pub sidebar_clear: Hsla,
+    /// Transparent `surface.raised`, the end stop of the fades in a list
+    /// that scrolls inside a popover.
+    pub raised_clear: Hsla,
 }
 
 impl Palette {
@@ -150,6 +153,7 @@ impl Palette {
             shadow: hsla(shadow),
             canvas_clear: hsla(colors.surface.canvas.with_alpha(0.0)),
             sidebar_clear: hsla(colors.surface.sidebar.with_alpha(0.0)),
+            raised_clear: hsla(colors.surface.raised.with_alpha(0.0)),
         }
     }
 }
@@ -288,6 +292,11 @@ pub struct Components {
     pub settings_select: Pixels,
     pub group_select: Pixels,
     pub workspace_control: Pixels,
+    pub model_picker: Pixels,
+    pub model_list_max: Pixels,
+    pub effort_menu: Pixels,
+    pub effort_select: Pixels,
+    pub composer_chip: Pixels,
     pub input_pad_y: Pixels,
     pub button_pad_y: Pixels,
     pub worker_dot: Pixels,
@@ -342,6 +351,11 @@ impl Components {
             settings_select: px(c.settings_select),
             group_select: px(c.group_select),
             workspace_control: px(c.workspace_control),
+            model_picker: px(c.model_picker),
+            model_list_max: px(c.model_list_max),
+            effort_menu: px(c.effort_menu),
+            effort_select: px(c.effort_select),
+            composer_chip: px(c.composer_chip),
             input_pad_y: px(c.input_pad_y),
             button_pad_y: px(c.button_pad_y),
             worker_dot: px(c.worker_dot),

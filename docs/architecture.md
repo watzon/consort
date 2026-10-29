@@ -114,6 +114,12 @@ The hub's timeline and memory are the source of truth. A coordinator's harness s
 
 Because the session is a cache, the user can change a channel's harness or model at any time. The next coordinator session starts on the new choice with the same context pack.
 
+### The model of the assistant
+
+Each channel has a coordinator selection (account, model and options such as the effort). A channel without its own selection uses Everything's, so Everything's selection is the default for every such channel. The user chooses it in the composer, in the New channel dialog, or with Model in the channel menu. The client sends `channel.update { coordinator_selection }` at once, and the hub stores it.
+
+When the selection that a channel uses changes, its own or Everything's for a channel that has none, the hub ends the open coordinator session of that channel if no turn runs. A turn that runs is not cut: the next run of the channel sees that the prompt fingerprint (which holds the selection) changed, ends the session, and starts a new one. The next turn then starts with the new model and options. The hub passes the options in `session.start`. The ACP adapter sets them with `session/set_config_option` after the model. The Codex adapter sends the effort with each turn. The hub does not switch the model inside a session.
+
 ## Placement
 
 Placement turns a task's model selection and placement request into one worker and one harness account. It follows these steps in order:

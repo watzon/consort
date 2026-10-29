@@ -15,6 +15,7 @@ use crate::{
     notice::{Notice, NoticeKind},
     ui::{
         menu::{MenuAction, MenuItem, OpenMenu},
+        model_picker::{PickerTarget, TriggerStyle},
         parts::{
             ButtonKind, button, detail, error_box, focusable, icon, icon_button, selectable, text,
         },
@@ -1106,36 +1107,50 @@ impl ConsortApp {
                     })),
             );
         }
-        let selections = state.selections.clone();
-        let current_selection = form.selection.clone();
-        let chosen = form
-            .selection
-            .as_deref()
-            .and_then(|key| state.selection(key));
-        let selection_select = select_box_with_logo(
-            "new-channel-selection",
-            chosen
-                .map(|s| s.label())
-                .unwrap_or_else(|| "Choose an account".to_owned()),
-            chosen.and_then(|s| state.account_logo(&s.account_label)),
-            self,
+        let assistant_model = self.render_model_trigger(
+            "new-channel-assistant",
+            PickerTarget::NewChannelAssistant,
+            TriggerStyle::Field,
             t,
-        )
-        .on_click(cx.listener(move |this, _, _, cx| {
-            if let Some(bounds) = this.triggers.get("new-channel-selection") {
-                let items = selections
-                    .iter()
-                    .map(|s| {
-                        MenuItem::new(
-                            s.label(),
-                            MenuAction::Select("new-channel-selection", s.key()),
-                        )
-                        .checked(current_selection.as_deref() == Some(s.key().as_str()))
-                    })
-                    .collect();
-                this.open_menu(OpenMenu::under(bounds, items, true), cx);
-            }
-        }));
+            cx,
+        );
+        let assistant_effort = self.render_effort_trigger(
+            "new-channel-assistant-effort",
+            PickerTarget::NewChannelAssistant,
+            TriggerStyle::Field,
+            t,
+            cx,
+        );
+        let task_model = self.render_model_trigger(
+            "new-channel-tasks",
+            PickerTarget::NewChannelTasks,
+            TriggerStyle::Field,
+            t,
+            cx,
+        );
+        let task_effort = self.render_effort_trigger(
+            "new-channel-tasks-effort",
+            PickerTarget::NewChannelTasks,
+            TriggerStyle::Field,
+            t,
+            cx,
+        );
+        // A model field, with the effort select next to it when the model
+        // has effort levels.
+        let model_row = |label: &str, model: AnyElement, effort: Option<AnyElement>| {
+            field_block(
+                label,
+                div()
+                    .flex()
+                    .gap(t.space.sm)
+                    .child(div().flex_1().min_w_0().child(model))
+                    .when_some(effort, |d, effort| {
+                        d.child(div().flex_none().w(t.component.effort_select).child(effort))
+                    }),
+                None,
+                t,
+            )
+        };
         let isolation = segmented(
             "isolation",
             &[
@@ -1218,20 +1233,27 @@ impl ConsortApp {
             })
             .child(field_block("Repos", repos, None, t))
             .child(self.tags_field(&form.tags, false, t, cx))
-            .child(field_block(
-                "Run tasks on",
-                chips,
-                Some("Consort tries these in order, then any online worker with the repo and the account."),
-                t,
-            ))
+            .child(model_row("Model for the assistant", assistant_model, assistant_effort))
+            .child(model_row("Model for tasks", task_model, task_effort))
             .child(
                 div()
                     .flex()
                     .gap(t.space.md)
-                    .child(field_block("Default account for tasks", selection_select, None, t).flex_1())
+                    .child(field_block("Run tasks on", chips, None, t).flex_1().min_w_0())
                     .child(field_block("Workspace", isolation, None, t).w(t.component.workspace_control).flex_none()),
             )
-            .child(text(isolation_hint, detail(t), c.text_tertiary))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(t.space.xs)
+                    .child(text(
+                        "Consort tries the workers in order, then any online worker with the repo and the account.",
+                        detail(t),
+                        c.text_tertiary,
+                    ))
+                    .child(text(isolation_hint, detail(t), c.text_tertiary)),
+            )
 ;
         let actions = self.dialog_actions("Create channel", t, cx, |this, window, cx| {
             let name = this.field(Field::Name, cx);
@@ -1259,11 +1281,8 @@ impl ConsortApp {
                 new_group,
                 repos: Vec::new(),
                 preferred_workers: form.workers,
-                task_selection: form
-                    .selection
-                    .as_deref()
-                    .and_then(|key| this.state.selection(key))
-                    .cloned(),
+                coordinator_selection: form.coordinator_selection,
+                task_selection: form.task_selection,
                 isolation: form.isolation,
                 tags: form.tags,
             };
