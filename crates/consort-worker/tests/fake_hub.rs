@@ -412,3 +412,81 @@ async fn sessions_resume_after_a_worker_restart() {
     assert!(turn.result.is_ok(), "{:?}", turn.result);
     worker.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn the_worker_allows_hub_tools_without_asking_the_hub() {
+    let hub = FakeHub::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    consort_worker::pair(&hub.url, CODE, dir.path(), None, vec![])
+        .await
+        .unwrap();
+    let mut toml = WorkerToml::load(dir.path()).unwrap();
+    toml.auto_discover = false;
+    let account = AccountConfig::default_for(HarnessKind::ClaudeCode);
+    let account_id = account.id;
+    toml.accounts = vec![account];
+    toml.save(dir.path()).unwrap();
+
+    let script = FakeScript {
+        turns: vec![vec![
+            FakeStep::ToolApproval {
+                request_id: "hub-1".into(),
+                server: "hub".into(),
+                tool: "post_message".into(),
+            },
+            FakeStep::ToolApproval {
+                request_id: "other-1".into(),
+                server: "github".into(),
+                tool: "create_issue".into(),
+            },
+            FakeStep::Text("Posted.".into()),
+        ]],
+    };
+    let fake = FakeHarness::new(HarnessKind::ClaudeCode, script);
+    let mut harnesses: Harnesses = HashMap::new();
+    harnesses.insert(
+        HarnessKind::ClaudeCode,
+        Arc::new(fake.clone()) as Arc<dyn Harness>,
+    );
+    let worker = consort_worker::run_with(
+        WorkerConfig {
+            config_dir: dir.path().to_path_buf(),
+        },
+        harnesses,
+    )
+    .await
+    .unwrap();
+    hub.wait_connected().await;
+    let session_id = SessionId::new();
+    let start = session_start(session_id, account_id);
+    assert!(hub.command("start-1", start.into()).await.result.is_ok());
+
+    // The hub tool is allowed on the worker. The hub sees only the second
+    // approval, which is for a tool that is not a hub tool.
+    let request = hub
+        .wait_for("request.opened", |h| {
+            h.events(session_id)
+                .into_iter()
+                .find_map(|e| match e.event {
+                    SessionEvent::RequestOpened(r) => Some(r),
+                    _ => None,
+                })
+        })
+        .await;
+    assert_eq!(request.request_id.as_str(), "other-1");
+    let hub_tool_closed = hub
+        .events(session_id)
+        .into_iter()
+        .find_map(|e| match e.event {
+            SessionEvent::RequestClosed {
+                request_id,
+                outcome,
+            } if request_id.as_str() == "hub-1" => Some(outcome),
+            _ => None,
+        });
+    assert_eq!(
+        hub_tool_closed,
+        Some(consort_proto::worker_link::RequestOutcome::Allowed)
+    );
+    worker.shutdown().await.unwrap();
+}

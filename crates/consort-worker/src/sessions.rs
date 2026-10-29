@@ -12,7 +12,9 @@ use consort_harness::{EventReceiver, HarnessSession, McpServerSpec, SessionSpec,
 use consort_proto::error::{ErrorBody, ErrorCode};
 use consort_proto::frame::FrameId;
 use consort_proto::ids::{ItemId, RequestId, SessionId};
-use consort_proto::model::{ApprovalDetails, ApprovalMode, Capabilities, SessionState, Sha256Hash};
+use consort_proto::model::{
+    ApprovalDetails, ApprovalMode, Capabilities, RequestOptionKind, SessionState, Sha256Hash,
+};
 use consort_proto::tools::{ToolCallResult, ToolDefinition};
 use consort_proto::worker_link::{
     HubToWorker, OUTPUT_DELTA_INTERVAL_MS, RequestAnswer, RequestBody, SessionEvent, SessionStart,
@@ -39,6 +41,12 @@ pub(crate) enum Job {
     PolicyDeny {
         request_id: RequestId,
         option_id: Option<String>,
+    },
+    /// Allow a call to a hub tool. The hub checks its own tools, so the
+    /// user never sees an approval for them.
+    AllowHubTool {
+        request_id: RequestId,
+        option_id: String,
     },
     /// Close the harness but keep the session for resume.
     Shutdown,
@@ -128,6 +136,33 @@ impl Coalescer {
     }
 }
 
+/// The name of the MCP server that carries the hub tools.
+pub(crate) const HUB_SERVER: &str = "hub";
+
+/// The allow-once option of an approval for a hub tool, if the request is
+/// one. Falls back to an allow-always option when the harness offers no
+/// allow-once option.
+fn hub_tool_allow(opened: &consort_proto::worker_link::RequestOpened) -> Option<String> {
+    let RequestBody::Approval(ApprovalDetails::Tool {
+        server: Some(server),
+        ..
+    }) = &opened.body
+    else {
+        return None;
+    };
+    if server != HUB_SERVER {
+        return None;
+    }
+    let pick = |kind: RequestOptionKind| {
+        opened
+            .options
+            .iter()
+            .find(|o| o.kind == kind)
+            .map(|o| o.id.clone())
+    };
+    pick(RequestOptionKind::AllowOnce).or_else(|| pick(RequestOptionKind::AllowAlways))
+}
+
 /// The deny option of a request, for a policy denial.
 fn deny_option(options: &[consort_proto::model::RequestOption]) -> Option<String> {
     options
@@ -157,6 +192,12 @@ async fn pump(
         tokio::select! {
             event = events.recv() => {
                 let Some(event) = event else { break };
+                if let SessionEvent::RequestOpened(opened) = &event
+                    && let Some(option_id) = hub_tool_allow(opened)
+                {
+                    let _ = jobs.send(Job::AllowHubTool { request_id: opened.request_id.clone(), option_id });
+                    continue;
+                }
                 let mut policy_deny = None;
                 if deny_commands
                     && let SessionEvent::RequestOpened(opened) = &event
@@ -316,7 +357,7 @@ impl Runtime {
             .await
             .map_err(|e| e.to_error_body())?;
         let mut servers = vec![McpServerSpec {
-            name: "hub".to_owned(),
+            name: HUB_SERVER.to_owned(),
             url: endpoint.url.clone(),
             bearer_token: Some(endpoint.token.clone()),
             bridge: core.bridge_program.as_ref().map(|program| StdioCommand {
@@ -333,6 +374,12 @@ impl Runtime {
             }),
         }];
         for local in &config.local_mcp_servers {
+            if local.name == HUB_SERVER {
+                tracing::warn!(
+                    "a local MCP server is named `hub`, which Consort keeps for the hub tools; rename it to use it"
+                );
+                continue;
+            }
             if start.allowed_local_mcp_servers.contains(&local.name) {
                 servers.push(McpServerSpec {
                     name: local.name.clone(),
@@ -625,6 +672,22 @@ pub(crate) async fn run_session(
                             request_id,
                             RequestAnswer {
                                 option_id,
+                                text: None,
+                            },
+                        )
+                        .await;
+                }
+            }
+            Job::AllowHubTool {
+                request_id,
+                option_id,
+            } => {
+                if let Ok(h) = runtime.harness() {
+                    let _ = h
+                        .respond(
+                            request_id,
+                            RequestAnswer {
+                                option_id: Some(option_id),
                                 text: None,
                             },
                         )

@@ -49,6 +49,16 @@ pub enum FakeStep {
         /// The command.
         command: String,
     },
+    /// Open an approval for an MCP tool and wait for the answer, like
+    /// `Approval`.
+    ToolApproval {
+        /// The request ID.
+        request_id: String,
+        /// The MCP server name.
+        server: String,
+        /// The tool name.
+        tool: String,
+    },
     /// Wait.
     Sleep(Duration),
     /// End the turn as failed.
@@ -274,10 +284,31 @@ async fn play(
                 };
                 send(now_item(&spec, &turn, ItemPayload::Command(payload))).await;
             }
-            FakeStep::Approval {
-                request_id,
-                command,
-            } => {
+            step @ (FakeStep::Approval { .. } | FakeStep::ToolApproval { .. }) => {
+                let (request_id, summary, body) = match step {
+                    FakeStep::ToolApproval {
+                        request_id,
+                        server,
+                        tool,
+                    } => (
+                        request_id,
+                        format!("mcp__{server}__{tool}"),
+                        ApprovalDetails::Tool {
+                            server: Some(server),
+                            tool,
+                            arguments: serde_json::Value::Null,
+                        },
+                    ),
+                    FakeStep::Approval {
+                        request_id,
+                        command,
+                    } => (
+                        request_id,
+                        format!("Run `{command}`"),
+                        ApprovalDetails::Command { command, cwd: None },
+                    ),
+                    _ => unreachable!("the outer pattern allows only approvals"),
+                };
                 let request_id = RequestId::new(request_id);
                 let (tx, rx) = oneshot::channel();
                 if let Ok(mut w) = waiters.lock() {
@@ -285,8 +316,8 @@ async fn play(
                 }
                 send(SessionEvent::RequestOpened(RequestOpened {
                     request_id: request_id.clone(),
-                    summary: format!("Run `{command}`"),
-                    body: RequestBody::Approval(ApprovalDetails::Command { command, cwd: None }),
+                    summary,
+                    body: RequestBody::Approval(body),
                     options: vec![
                         RequestOption {
                             id: "allow".into(),
