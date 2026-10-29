@@ -38,9 +38,9 @@ const DAY_MS: i64 = 24 * 60 * 60 * 1_000;
 /// until then. The worker stores a result after the hub made the command,
 /// so a command that arrives again always finds its result. The extra day
 /// covers a clock difference between the hub and the worker and the hub's
-/// expiry loop. The worker does not use `COMMAND_RESULT_TTL_MS` (24 hours)
-/// alone, because a `session.turn` that the hub sends again after that would
-/// run twice.
+/// expiry loop. `COMMAND_RESULT_TTL_MS` in the protocol is now 8 days too;
+/// the worker keeps whichever is longer, so a `session.turn` that the hub
+/// sends again never runs twice.
 pub const COMMAND_RESULT_KEEP_MS: i64 = {
     let keep = QUEUED_COMMAND_TTL_MS + DAY_MS;
     if keep > COMMAND_RESULT_TTL_MS {

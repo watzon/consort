@@ -89,15 +89,30 @@ async fn bridge_ignores_proxy_variables() {
     let endpoint = mcp::start(SessionId::new(), dir.path().to_path_buf(), backend.clone())
         .await
         .unwrap();
-    // A "proxy" that counts connections and closes them at once.
+    // A "proxy" that counts the requests that carry the session token.
+    // It does not count every connection: other programs on a developer
+    // machine sometimes connect to new local ports, and that made this
+    // test fail about one run in six.
     let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy_url = format!("http://{}", proxy.local_addr().unwrap());
     let connections = Arc::new(Mutex::new(0_usize));
     let counter = connections.clone();
+    let token = endpoint.token.clone();
     tokio::spawn(async move {
-        while let Ok((stream, _)) = proxy.accept().await {
-            *counter.lock().unwrap() += 1;
-            drop(stream);
+        while let Ok((mut stream, _)) = proxy.accept().await {
+            let counter = counter.clone();
+            let token = token.clone();
+            tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                let mut buf = vec![0_u8; 8192];
+                let read =
+                    tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf)).await;
+                if let Ok(Ok(n)) = read
+                    && String::from_utf8_lossy(&buf[..n]).contains(&token)
+                {
+                    *counter.lock().unwrap() += 1;
+                }
+            });
         }
     });
 
