@@ -446,6 +446,28 @@ impl ConsortApp {
                 .into_any_element(),
             TimelineItem::Message(message) => self.render_message(&message, t, window, cx),
             TimelineItem::TaskCard(card) => self.render_card_row(&card, t, cx),
+            TimelineItem::Approval(card) => {
+                let element = self.render_approval_card(&card.approval, &card.message_id, t, cx);
+                self.speaker_row(
+                    card.speaker,
+                    &card.time_label,
+                    false,
+                    t.space.md,
+                    element,
+                    t,
+                )
+            }
+            TimelineItem::Decision(card) => {
+                let element = self.render_decision(&card.decision, &card.message_id, false, t, cx);
+                self.speaker_row(
+                    card.speaker,
+                    &card.time_label,
+                    false,
+                    t.space.md,
+                    element,
+                    t,
+                )
+            }
         }
     }
 
@@ -1030,7 +1052,7 @@ impl ConsortApp {
             row = row.child(
                 button(
                     SharedString::from(format!("{}-{i}", approval.id)),
-                    choice.label(),
+                    approval.choice_label(choice),
                     kind,
                     t,
                 )

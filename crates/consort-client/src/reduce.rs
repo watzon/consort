@@ -73,16 +73,52 @@ pub fn approval_choice(kind: RequestOptionKind) -> Option<ApprovalChoice> {
     }
 }
 
+/// A tool name without the `mcp__<server>__` prefix that harnesses add, and
+/// the server named in that prefix.
+fn split_tool_name(name: &str) -> (Option<&str>, &str) {
+    match name
+        .strip_prefix("mcp__")
+        .and_then(|rest| rest.split_once("__"))
+    {
+        Some((server, tool)) => (Some(server), tool),
+        None => (None, name),
+    }
+}
+
+/// The line on an approval card. A tool approval reads "Consort wants to
+/// use post_message from hub", never a raw `mcp__hub__post_message`.
+fn approval_summary(a: &model::Approval) -> String {
+    let ApprovalDetails::Tool { tool, server, .. } = &a.details else {
+        return a.summary.clone();
+    };
+    let raw = a.summary.trim();
+    let readable = !raw.is_empty() && !raw.starts_with("mcp__") && raw != tool;
+    if readable {
+        return a.summary.clone();
+    }
+    let (prefix_server, name) = split_tool_name(tool);
+    let who = if a.task_id.is_some() {
+        "The task"
+    } else {
+        "Consort"
+    };
+    match server.as_deref().or(prefix_server) {
+        Some(server) => format!("{who} wants to use {name} from {server}"),
+        None => format!("{who} wants to use {name}"),
+    }
+}
+
 fn approval_view(a: &model::Approval) -> ApprovalView {
     let (folder, detail) = match &a.details {
         ApprovalDetails::Command { command, cwd } => (cwd.clone(), Some(command.clone())),
         ApprovalDetails::FileChange { paths, .. } => (None, Some(paths.join("\n"))),
-        ApprovalDetails::Tool { tool, server, .. } => (
+        ApprovalDetails::Tool { arguments, .. } => (
             None,
-            Some(match server {
-                Some(server) => format!("{server}: {tool}"),
-                None => tool.clone(),
-            }),
+            match arguments {
+                serde_json::Value::Null => None,
+                serde_json::Value::Object(map) if map.is_empty() => None,
+                value => serde_json::to_string_pretty(value).ok(),
+            },
         ),
         _ => (None, None),
     };
@@ -109,8 +145,8 @@ fn approval_view(a: &model::Approval) -> ApprovalView {
         .and_then(|o| approval_choice(o.kind));
     ApprovalView {
         id: a.id.to_string(),
-        task_id: a.task_id.map(|t| t.to_string()).unwrap_or_default(),
-        summary: a.summary.clone(),
+        task_id: a.task_id.map(|t| t.to_string()),
+        summary: approval_summary(a),
         folder,
         detail,
         choices,
@@ -373,6 +409,26 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                         TaskStatus::Failed | TaskStatus::UpNext => task.status_reason.clone(),
                         _ => None,
                     },
+                }));
+            } else if let Some(approval) = (m.kind == MessageKind::Approval)
+                .then(|| cache.approvals.values().find(|a| a.message_id == m.id))
+                .flatten()
+            {
+                items.push(TimelineItem::Approval(ApprovalCardView {
+                    message_id: m.id.to_string(),
+                    speaker: speaker(m),
+                    time_label: format::time_label(at),
+                    approval: approval_view(approval),
+                }));
+            } else if let Some(decision) = (m.kind == MessageKind::Decision)
+                .then(|| cache.decisions.values().find(|d| d.message_id == m.id))
+                .flatten()
+            {
+                items.push(TimelineItem::Decision(DecisionCardView {
+                    message_id: m.id.to_string(),
+                    speaker: speaker(m),
+                    time_label: format::time_label(at),
+                    decision: decision_view(decision),
                 }));
             } else {
                 items.push(TimelineItem::Message(MessageView {
@@ -1117,6 +1173,250 @@ mod tests {
         assert_eq!(mine.len(), 1, "no duplicate after the hub stored it");
         assert!(
             matches!(mine[0], TimelineItem::Message(m) if !m.pending && m.speaker == Speaker::You)
+        );
+    }
+
+    /// What the hub stores when Claude Code asks to use a hub tool in a
+    /// coordinator turn: a top-level approval message with no task.
+    fn coordinator_approval(w: &mut World) -> ApprovalId {
+        let mut message = message(
+            MessageId::new(),
+            w.everything,
+            Author::Assistant,
+            MessageKind::Approval,
+            None,
+            NOW - 1_000,
+        );
+        message.body = "mcp__hub__post_message".into();
+        let id = ApprovalId::new();
+        let option = |id: &str, label: &str, kind| RequestOption {
+            id: id.into(),
+            label: label.into(),
+            kind,
+            description: None,
+        };
+        w.cache.approvals.insert(
+            id.to_string(),
+            Approval {
+                id,
+                channel_id: w.everything,
+                session_id: SessionId::new(),
+                task_id: None,
+                message_id: message.id,
+                request_id: RequestId::new("tool-1"),
+                summary: "mcp__hub__post_message".into(),
+                details: ApprovalDetails::Tool {
+                    server: Some("hub".into()),
+                    tool: "post_message".into(),
+                    arguments: serde_json::json!({ "body": "Good morning" }),
+                },
+                options: vec![
+                    option("yes", "Yes", RequestOptionKind::AllowOnce),
+                    option(
+                        "always",
+                        "Yes, and don't ask again",
+                        RequestOptionKind::AllowAlways,
+                    ),
+                    option("no", "No", RequestOptionKind::DenyOnce),
+                ],
+                status: ApprovalStatus::Pending,
+                answer_option_id: None,
+                answered_at: None,
+                answered_by_client_id: None,
+                created_at: Timestamp::from_millis(NOW - 1_000),
+            },
+        );
+        w.cache.messages.insert(message.id.to_string(), message);
+        id
+    }
+
+    #[test]
+    fn a_coordinator_approval_is_a_card_in_the_timeline() {
+        let mut w = world();
+        let id = coordinator_approval(&mut w);
+        let state = view(&w.cache);
+        let items = &state
+            .timeline(&w.everything.to_string())
+            .expect("timeline")
+            .items;
+        let card = items
+            .iter()
+            .find_map(|i| match i {
+                TimelineItem::Approval(card) => Some(card),
+                _ => None,
+            })
+            .expect("an approval card, not a plain message");
+        assert!(
+            !items
+                .iter()
+                .any(|i| matches!(i, TimelineItem::Message(m) if m.body.contains("mcp__"))),
+            "the raw tool name is not a message"
+        );
+        let approval = &card.approval;
+        assert_eq!(approval.id, id.to_string());
+        assert_eq!(approval.task_id, None);
+        assert_eq!(
+            approval.summary,
+            "Consort wants to use post_message from hub"
+        );
+        assert!(
+            approval
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.contains("\"body\": \"Good morning\""))
+        );
+        assert_eq!(
+            approval.choices,
+            vec![
+                ApprovalChoice::AllowOnce,
+                ApprovalChoice::AllowForTask,
+                ApprovalChoice::Deny
+            ]
+        );
+        assert_eq!(
+            approval.choice_label(ApprovalChoice::AllowForTask),
+            "Always allow"
+        );
+        assert_eq!(
+            approval.choice_label(ApprovalChoice::AllowOnce),
+            "Allow once"
+        );
+        assert_eq!(card.speaker, Speaker::Consort);
+        // Everything waits for the user.
+        assert_eq!(
+            state.sidebar.everything.status,
+            Some(TaskStatus::NeedsInput)
+        );
+        assert!(state.sidebar.everything.attention);
+        // The answer goes out by approval ID, with no task.
+        let stored = w.cache.approvals.get(&id.to_string()).expect("stored");
+        assert_eq!(
+            crate::hub::option_for(stored, ApprovalChoice::AllowForTask).as_deref(),
+            Some("always")
+        );
+        assert_eq!(
+            crate::hub::option_for(stored, ApprovalChoice::Deny).as_deref(),
+            Some("no")
+        );
+    }
+
+    #[test]
+    fn a_raw_tool_name_never_becomes_the_summary() {
+        let mut w = world();
+        let id = coordinator_approval(&mut w);
+        if let Some(a) = w.cache.approvals.get_mut(&id.to_string()) {
+            a.details = ApprovalDetails::Tool {
+                server: None,
+                tool: "mcp__github__create_issue".into(),
+                arguments: serde_json::Value::Null,
+            };
+        }
+        let state = view(&w.cache);
+        let summary = state
+            .timeline(&w.everything.to_string())
+            .and_then(|t| {
+                t.items.iter().find_map(|i| match i {
+                    TimelineItem::Approval(card) => Some(card.approval.summary.clone()),
+                    _ => None,
+                })
+            })
+            .expect("card");
+        assert_eq!(summary, "Consort wants to use create_issue from github");
+    }
+
+    #[test]
+    fn a_task_approval_keeps_its_label_and_its_summary() {
+        let w = world();
+        let state = view(&w.cache);
+        let thread = state.thread(&w.task.to_string()).expect("thread");
+        let PostBody::Approval(approval) = &thread.posts[0].bodies[0] else {
+            panic!("not an approval");
+        };
+        assert_eq!(
+            approval.task_id.as_deref(),
+            Some(w.task.to_string().as_str())
+        );
+        assert_eq!(
+            approval.choice_label(ApprovalChoice::AllowForTask),
+            "Allow for this task"
+        );
+        assert_eq!(approval.summary, "Codex wants to run a command");
+    }
+
+    #[test]
+    fn a_channel_decision_is_a_card_and_marks_the_channel() {
+        let mut w = world();
+        // The sayso task no longer waits, so only the decision can mark it.
+        if let Some(task) = w.cache.tasks.get_mut(&w.task.to_string()) {
+            task.status = PS::Working;
+        }
+        w.cache.approvals.clear();
+        w.cache.decisions.clear();
+        let msg = message(
+            MessageId::new(),
+            w.sayso,
+            Author::Assistant,
+            MessageKind::Decision,
+            None,
+            NOW - 500,
+        );
+        let id = DecisionId::new();
+        let option = |label: &str, consequence: &str| PO {
+            label: label.into(),
+            consequence: consequence.into(),
+            id: None,
+        };
+        w.cache.decisions.insert(
+            id.to_string(),
+            Decision {
+                id,
+                channel_id: w.sayso,
+                task_id: None,
+                session_id: SessionId::new(),
+                message_id: msg.id,
+                request_id: None,
+                question: "Which build ships first?".into(),
+                context: Some("Both pass.".into()),
+                options: vec![
+                    option("x86_64", "Most users get it today."),
+                    option("arm64", "Mac users get it today."),
+                ],
+                recommended_index: Some(0),
+                allow_free_text: true,
+                status: DecisionStatus::Pending,
+                answer: None,
+                answered_at: None,
+                created_at: Timestamp::from_millis(NOW - 500),
+            },
+        );
+        w.cache.messages.insert(msg.id.to_string(), msg);
+        let state = view(&w.cache);
+        let items = &state
+            .timeline(&w.sayso.to_string())
+            .expect("timeline")
+            .items;
+        let card = items
+            .iter()
+            .find_map(|i| match i {
+                TimelineItem::Decision(card) => Some(card),
+                _ => None,
+            })
+            .expect("a decision card");
+        assert_eq!(card.decision.question, "Which build ships first?");
+        assert_eq!(card.decision.task_id, None);
+        assert_eq!(card.decision.recommended, Some(0));
+        let row = &state.sidebar.groups[0].channels[0];
+        assert_eq!(row.status, Some(TaskStatus::NeedsInput));
+        assert!(row.attention);
+        // Once answered, the channel shows its task's glyph again.
+        let mut answered = w.cache.clone();
+        if let Some(d) = answered.decisions.get_mut(&id.to_string()) {
+            d.status = DecisionStatus::Answered;
+        }
+        let state = view(&answered);
+        assert_eq!(
+            state.sidebar.groups[0].channels[0].status,
+            Some(TaskStatus::Working)
         );
     }
 

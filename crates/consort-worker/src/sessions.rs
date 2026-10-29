@@ -530,6 +530,10 @@ impl Runtime {
             self.lost("the session has no harness reference to resume");
             return;
         };
+        // Tell the hub first, so that it closes the old turn before any
+        // event from the new harness process.
+        self.core
+            .record_event(self.session_id, &SessionEvent::Reopened);
         let path = std::path::PathBuf::from(&record.workspace_path);
         if let Err(err) = self.open(&record.start, &path, Some(native)).await {
             self.lost(&err.message);

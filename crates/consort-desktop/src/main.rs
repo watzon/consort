@@ -53,7 +53,9 @@ fn parse_args() -> Args {
 fn main() {
     let args = parse_args();
     let mock = args.mock;
-    let client = if mock {
+    let client = if mock && args.screen.as_deref() == Some("channel-requests") {
+        Client::mock_with(consort_client::mock::view_state_with_requests())
+    } else if mock {
         Client::mock()
     } else {
         Client::start()

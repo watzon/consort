@@ -190,6 +190,10 @@ pub enum SessionEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
+    /// The worker opened the session again after the worker restarted. A
+    /// turn or a request that was open before the restart is gone.
+    #[serde(rename = "reopened")]
+    Reopened,
     /// An error that is not tied to an item.
     #[serde(rename = "error")]
     Error {

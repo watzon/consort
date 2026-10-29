@@ -396,6 +396,14 @@ async fn sessions_resume_after_a_worker_restart() {
         Some(format!("fake-{session_id}"))
     );
     assert_eq!(resumed.session_id, session_id);
+    // The hub learns that the old harness process and its turn are gone.
+    hub.wait_for("session reopened", |h| {
+        h.events(session_id)
+            .iter()
+            .any(|e| matches!(e.event, SessionEvent::Reopened))
+            .then_some(())
+    })
+    .await;
     let turn = hub
         .command(
             "turn-1",

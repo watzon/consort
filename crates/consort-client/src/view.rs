@@ -241,6 +241,10 @@ pub enum TimelineItem {
     Day(DayView),
     Message(MessageView),
     TaskCard(TaskCardView),
+    /// An approval in the timeline itself, from the channel coordinator.
+    Approval(ApprovalCardView),
+    /// A decision in the timeline itself, from the channel coordinator.
+    Decision(DecisionCardView),
 }
 
 impl TimelineItem {
@@ -250,8 +254,28 @@ impl TimelineItem {
             TimelineItem::Day(day) => &day.key,
             TimelineItem::Message(m) => &m.id,
             TimelineItem::TaskCard(c) => &c.message_id,
+            TimelineItem::Approval(r) => &r.message_id,
+            TimelineItem::Decision(r) => &r.message_id,
         }
     }
+}
+
+/// An approval that the coordinator posted in the timeline.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ApprovalCardView {
+    pub message_id: String,
+    pub speaker: Speaker,
+    pub time_label: String,
+    pub approval: ApprovalView,
+}
+
+/// A decision that the coordinator posted in the timeline.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DecisionCardView {
+    pub message_id: String,
+    pub speaker: Speaker,
+    pub time_label: String,
+    pub decision: DecisionView,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -365,7 +389,8 @@ pub enum RequestState {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ApprovalView {
     pub id: String,
-    pub task_id: String,
+    /// The task that asks. `None` for the channel coordinator.
+    pub task_id: Option<String>,
     /// One line, such as "Codex wants to run a command".
     pub summary: String,
     /// The folder of a command, shown in mono after "in".
@@ -376,6 +401,17 @@ pub struct ApprovalView {
     pub state: RequestState,
     /// The answer, once given.
     pub answer: Option<ApprovalChoice>,
+}
+
+impl ApprovalView {
+    /// The words on a choice's button. "Allow for this task" reads wrong
+    /// when the coordinator asks, so it is "Always allow" there.
+    pub fn choice_label(&self, choice: ApprovalChoice) -> &'static str {
+        match (choice, &self.task_id) {
+            (ApprovalChoice::AllowForTask, None) => "Always allow",
+            _ => choice.label(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]

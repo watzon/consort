@@ -224,7 +224,7 @@ impl MockBackend {
                 for_each_approval(&mut state, &approval_id, |approval| {
                     approval.state = RequestState::Answered;
                     approval.answer = Some(choice);
-                    task_id = Some(approval.task_id.clone());
+                    task_id = approval.task_id.clone();
                 });
                 if let Some(task_id) = task_id {
                     settle(&mut state, &task_id);
@@ -236,6 +236,17 @@ impl MockBackend {
                 text,
             } => {
                 let mut task_id = None;
+                for timeline in &mut state.timelines {
+                    for item in &mut timeline.items {
+                        if let TimelineItem::Decision(card) = item
+                            && card.decision.id == decision_id
+                        {
+                            card.decision.state = RequestState::Answered;
+                            card.decision.chosen = option;
+                            card.decision.answer_text = text.clone();
+                        }
+                    }
+                }
                 for thread in &mut state.threads {
                     for post in &mut thread.posts {
                         for body in &mut post.bodies {
@@ -335,11 +346,16 @@ fn set_status(state: &mut ViewState, task_id: &str, status: TaskStatus) -> Resul
 fn for_each_approval(state: &mut ViewState, id: &str, mut f: impl FnMut(&mut ApprovalView)) {
     for timeline in &mut state.timelines {
         for item in &mut timeline.items {
-            if let TimelineItem::TaskCard(card) = item
-                && let Some(approval) = card.approval.as_mut()
-                && approval.id == id
-            {
-                f(approval);
+            match item {
+                TimelineItem::TaskCard(card) => {
+                    if let Some(approval) = card.approval.as_mut()
+                        && approval.id == id
+                    {
+                        f(approval);
+                    }
+                }
+                TimelineItem::Approval(card) if card.approval.id == id => f(&mut card.approval),
+                _ => {}
             }
         }
     }

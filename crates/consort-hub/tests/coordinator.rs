@@ -9,7 +9,7 @@ mod common;
 use common::*;
 use consort_proto::client_api::{EntityPayload, MessageList, SnapshotScope, WorkerSetPaused};
 use consort_proto::model::{Author, ItemStatus, MessageKind, SessionRole, SessionState};
-use consort_proto::worker_link::{HubToWorker, TurnEndReason};
+use consort_proto::worker_link::{HubToWorker, SessionEvent, TurnEndReason};
 use serde_json::json;
 
 #[tokio::test]
@@ -421,5 +421,60 @@ async fn session_items_reach_the_client_and_fast_updates_merge() {
         updates <= 3,
         "the hub merged the fast updates, but sent {updates} entries"
     );
+    world.hub.handle.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_reopened_session_drops_its_old_turn_and_requests() {
+    let mut world = World::start().await;
+    let start = world.start_coordinator("Start").await;
+    world
+        .worker
+        .send_events(start.session_id, vec![approval_request("r1", "ls")])
+        .await;
+    world
+        .client
+        .wait_feed(|e| matches!(upserted(e), Some(EntityPayload::Approval(a)) if a.request_id.as_str() == "r1"))
+        .await;
+
+    // A message waits behind the open turn.
+    world.say(world.everything, "Still there?").await;
+    assert!(
+        world
+            .worker
+            .try_next_command(std::time::Duration::from_millis(300))
+            .await
+            .is_none(),
+        "no second turn while one runs"
+    );
+
+    // The worker restarted and opened the session again. The old turn and its
+    // approval are gone, so the waiting message goes out.
+    world
+        .worker
+        .send_events(start.session_id, vec![SessionEvent::Reopened])
+        .await;
+    let canceled = world
+        .client
+        .wait_feed(|e| matches!(upserted(e), Some(EntityPayload::Approval(a)) if a.status == consort_proto::model::ApprovalStatus::Canceled))
+        .await;
+    let Some(EntityPayload::Approval(canceled)) = upserted(&canceled) else {
+        unreachable!()
+    };
+    assert_eq!(canceled.request_id.as_str(), "r1");
+    let notice = world
+        .client
+        .wait_feed(|e| matches!(upserted(e), Some(EntityPayload::Message(m)) if m.kind == MessageKind::Notice))
+        .await;
+    let Some(EntityPayload::Message(notice)) = upserted(&notice) else {
+        unreachable!()
+    };
+    assert!(notice.body.contains("worker restarted"), "{}", notice.body);
+    let (_, command) = world.worker.next_command().await;
+    let HubToWorker::SessionTurn(turn) = command else {
+        panic!("expected session.turn");
+    };
+    assert_eq!(turn.session_id, start.session_id);
+    assert!(turn.turn.text.contains("Still there?"));
     world.hub.handle.shutdown().await.unwrap();
 }

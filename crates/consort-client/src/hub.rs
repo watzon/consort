@@ -850,24 +850,14 @@ impl HubBackend {
                 approval_id,
                 choice,
             } => {
+                // An approval is answered by its ID alone, so one from the
+                // channel coordinator (with no task) works the same way.
                 let option_id = shared
                     .cache
                     .lock()
                     .ok()
                     .and_then(|c| c.approvals.get(&approval_id).cloned())
-                    .and_then(|a| {
-                        let wanted: &[RequestOptionKind] = match choice {
-                            ApprovalChoice::AllowOnce => &[RequestOptionKind::AllowOnce],
-                            ApprovalChoice::AllowForTask => &[RequestOptionKind::AllowAlways],
-                            ApprovalChoice::Deny => {
-                                &[RequestOptionKind::DenyOnce, RequestOptionKind::DenyAlways]
-                            }
-                        };
-                        a.options
-                            .iter()
-                            .find(|o| wanted.contains(&o.kind))
-                            .map(|o| o.id.clone())
-                    })
+                    .and_then(|a| option_for(&a, choice))
                     .ok_or_else(|| {
                         invalid("This approval has no such answer. It may have closed.")
                     })?;
@@ -948,6 +938,23 @@ impl HubBackend {
         }
         Ok(())
     }
+}
+
+/// The harness option that a button stands for.
+pub(crate) fn option_for(
+    approval: &consort_proto::model::Approval,
+    choice: ApprovalChoice,
+) -> Option<String> {
+    let wanted: &[RequestOptionKind] = match choice {
+        ApprovalChoice::AllowOnce => &[RequestOptionKind::AllowOnce],
+        ApprovalChoice::AllowForTask => &[RequestOptionKind::AllowAlways],
+        ApprovalChoice::Deny => &[RequestOptionKind::DenyOnce, RequestOptionKind::DenyAlways],
+    };
+    approval
+        .options
+        .iter()
+        .find(|o| wanted.contains(&o.kind))
+        .map(|o| o.id.clone())
 }
 
 /// Shows a message at once as pending, and sends it when the link is up.

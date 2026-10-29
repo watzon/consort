@@ -140,7 +140,10 @@ The `event` field of a session event is one of these objects:
 | `request.closed` | `request_id`, `outcome` | `allowed`, `denied`, `answered`, `canceled` or `expired` |
 | `usage` | `input_tokens`, `output_tokens`, `cached_tokens`, optional `cost_usd` | Totals for the session |
 | `turn.ended` | `turn_id`, `reason` (`completed`, `interrupted` or `failed`), optional `error` | |
+| `reopened` | | The worker opened the session again after the worker restarted. The hub cancels the session's pending approvals and decisions and ends an open turn as failed |
 | `error` | `code`, `message` | |
+
+The worker answers an approval request for a tool of the `hub` MCP server itself, with the allow-once option, and does not send it. The hub checks its own tools. The name `hub` is kept for this server.
 
 The `details` of an approval request has a `kind` and the fields for that kind: `command` (`command`, `cwd`), `file_change` (`paths`), `tool` (`server`, `tool`, `arguments`), `network` (`target`) or `other` (`text`). The `details` of a question has `question`, `context` and `allow_free_text`. Each option has `id`, `label`, `kind` (`allow_once`, `allow_always`, `deny_once`, `deny_always` or `choice`) and an optional `description`.
 

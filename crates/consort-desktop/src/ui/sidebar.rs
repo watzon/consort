@@ -318,7 +318,7 @@ impl ConsortApp {
                         .mr(t.space.xs + t.space.xxs),
                 )
             })
-            .when(!everything, |d| d.child(status))
+            .when(!everything || channel.status.is_some(), |d| d.child(status))
             .on_click(
                 cx.listener(move |this, _, window, cx| this.open_channel(id.clone(), window, cx)),
             )

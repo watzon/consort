@@ -102,7 +102,7 @@ fn message(id: &str, channel_id: &str, speaker: Speaker, time: &str, body: &str)
 fn sayso_approval() -> ApprovalView {
     ApprovalView {
         id: text("apr_0192f0c4-windows-build"),
-        task_id: T_SAYSO.into(),
+        task_id: Some(T_SAYSO.into()),
         summary: text("Codex wants to run a command"),
         folder: Some(text(r"C:\Code\sayso")),
         detail: Some(text(
@@ -976,6 +976,63 @@ pub fn view_state() -> ViewState {
         ],
         worker_pairing: None,
     };
+    refresh(&mut state);
+    state
+}
+
+/// The mock with a coordinator tool approval and a coordinator decision in
+/// the house-lights timeline, for `--screen channel-requests`.
+pub fn view_state_with_requests() -> ViewState {
+    let mut state = view_state();
+    if let Some(timeline) = state.timelines.iter_mut().find(|t| t.channel_id == LIGHTS) {
+        timeline.items.push(TimelineItem::Approval(ApprovalCardView {
+            message_id: text("msg_lights_approval"),
+            speaker: Speaker::Consort,
+            time_label: text("9:02 AM"),
+            approval: ApprovalView {
+                id: text("apr_lights_post"),
+                task_id: None,
+                summary: text("Consort wants to use post_message from hub"),
+                folder: None,
+                detail: Some(text(
+                    "{\n  \"body\": \"Two kits work with Home Assistant without a cloud account.\"\n}",
+                )),
+                choices: vec![
+                    ApprovalChoice::AllowOnce,
+                    ApprovalChoice::AllowForTask,
+                    ApprovalChoice::Deny,
+                ],
+                state: RequestState::Pending,
+                answer: None,
+            },
+        }));
+        timeline.items.push(TimelineItem::Decision(DecisionCardView {
+            message_id: text("msg_lights_decision"),
+            speaker: Speaker::Consort,
+            time_label: text("9:03 AM"),
+            decision: DecisionView {
+                id: text("dec_lights_kit"),
+                task_id: None,
+                question: text("Which roofline kit should I price in detail?"),
+                context: Some(text("Both work with Home Assistant without a cloud account.")),
+                options: vec![
+                    DecisionOption {
+                        label: text("Govee Permanent Outdoor Lights 2"),
+                        consequence: text("Cheaper, and it installs in an afternoon. The app needs a Govee account for setup."),
+                    },
+                    DecisionOption {
+                        label: text("Gemstone Lights"),
+                        consequence: text("Brighter and made to last, but a dealer must install it."),
+                    },
+                ],
+                recommended: Some(0),
+                allow_free_text: true,
+                state: RequestState::Pending,
+                chosen: None,
+                answer_text: None,
+            },
+        }));
+    }
     refresh(&mut state);
     state
 }

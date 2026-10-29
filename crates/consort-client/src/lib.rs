@@ -133,7 +133,12 @@ async fn serve<B: Backend>(
 impl Client {
     /// A client on mock data from the designs, with no hub.
     pub fn mock() -> Result<Client, ClientError> {
-        let initial = Arc::new(mock::view_state());
+        Client::mock_with(mock::view_state())
+    }
+
+    /// A client on the given mock state, with no hub.
+    pub fn mock_with(state: ViewState) -> Result<Client, ClientError> {
+        let initial = Arc::new(state);
         let (publish, state) = watch::channel(initial.clone());
         let (requests, rx) = mpsc::unbounded_channel();
         let runtime = spawn_runtime("consort-client", move |stop| async move {

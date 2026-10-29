@@ -4,8 +4,8 @@
 //! place.
 
 use crate::view::{
-    ChannelKind, SidebarChannel, SidebarGroup, SidebarView, TaskSection, TaskSectionKind,
-    TaskStatus, TasksPanelView, TimelineItem, ViewState,
+    ChannelKind, RequestState, SidebarChannel, SidebarGroup, SidebarView, TaskSection,
+    TaskSectionKind, TaskStatus, TasksPanelView, TimelineItem, ViewState,
 };
 
 /// Recomputes every derived part of `state`.
@@ -49,8 +49,24 @@ pub fn task_meta(task: &crate::view::TaskView) -> String {
     }
 }
 
-/// The most urgent status that the sidebar shows for a channel.
+/// True when the channel's own timeline has an approval or a decision that
+/// waits for the user (one from the coordinator, not from a task).
+pub fn channel_waits(state: &ViewState, channel_id: &str) -> bool {
+    state.timeline(channel_id).is_some_and(|t| {
+        t.items.iter().any(|item| match item {
+            TimelineItem::Approval(a) => a.approval.state == RequestState::Pending,
+            TimelineItem::Decision(d) => d.decision.state == RequestState::Pending,
+            _ => false,
+        })
+    })
+}
+
+/// The most urgent status that the sidebar shows for a channel. A pending
+/// coordinator approval or decision counts as Needs input.
 pub fn channel_status(state: &ViewState, channel_id: &str) -> Option<TaskStatus> {
+    if channel_waits(state, channel_id) {
+        return Some(TaskStatus::NeedsInput);
+    }
     state
         .tasks
         .iter()
@@ -62,8 +78,9 @@ pub fn channel_status(state: &ViewState, channel_id: &str) -> Option<TaskStatus>
 
 fn sidebar_channel(state: &ViewState, channel_id: &str, unread: u32) -> Option<SidebarChannel> {
     let channel = state.channel(channel_id)?;
+    // Everything shows no task glyph, but its own requests still mark it.
     let status = if channel.kind == ChannelKind::Everything {
-        None
+        channel_waits(state, channel_id).then_some(TaskStatus::NeedsInput)
     } else {
         channel_status(state, channel_id)
     };

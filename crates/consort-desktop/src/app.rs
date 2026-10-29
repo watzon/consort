@@ -402,6 +402,17 @@ impl ConsortApp {
             .first()
             .and_then(|s| s.task_ids.first().cloned());
         match screen {
+            "channel-requests" => {
+                if let Some(id) = self
+                    .state
+                    .channels
+                    .iter()
+                    .find(|c| c.name == "house-lights")
+                    .map(|c| c.id.clone())
+                {
+                    self.open_channel(id, window, cx);
+                }
+            }
             "sayso" => {
                 if let Some(id) = sayso {
                     self.open_channel(id, window, cx);

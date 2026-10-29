@@ -283,6 +283,7 @@ fn apply_event(tx: &mut Tx<'_>, ctx: &mut Ctx<'_>, event: &SessionEvent) -> Resu
         SessionEvent::TurnEnded { reason, error, .. } => {
             on_turn_ended(tx, ctx, *reason, error.as_deref())
         }
+        SessionEvent::Reopened => on_reopened(tx, ctx),
         SessionEvent::Error { code, message } => {
             let item = SessionItem {
                 id: ItemId::new(),
@@ -312,6 +313,40 @@ fn on_state(tx: &mut Tx<'_>, ctx: &mut Ctx<'_>, state: SessionState) -> Result<(
     Ok(())
 }
 
+/// The worker restarted and opened the session again. The old harness
+/// process is gone, so its open turn and its requests are gone too.
+fn on_reopened(tx: &mut Tx<'_>, ctx: &mut Ctx<'_>) -> Result<()> {
+    if ctx.session.state.is_final() {
+        return Ok(());
+    }
+    cancel_pending_requests(tx, ctx.session.id)?;
+    if ctx.runtime.turn_open {
+        let text = match ctx.session.role {
+            SessionRole::Coordinator => {
+                "The worker restarted before the assistant finished. Send your message again."
+            }
+            SessionRole::Task => "The worker restarted during this turn. Retry the task.",
+        };
+        on_turn_ended(tx, ctx, TurnEndReason::Failed, Some(text))?;
+    }
+    Ok(())
+}
+
+/// Cancels the approvals and decisions that wait on a session. Nobody can
+/// answer them once the harness request is gone.
+fn cancel_pending_requests(tx: &mut Tx<'_>, session_id: SessionId) -> Result<()> {
+    let (approvals, decisions) = work::pending_for_session(tx.db(), session_id)?;
+    for mut approval in approvals {
+        approval.status = ApprovalStatus::Canceled;
+        tx.save_approval(&approval)?;
+    }
+    for mut decision in decisions {
+        decision.status = DecisionStatus::Canceled;
+        tx.save_decision(&decision)?;
+    }
+    Ok(())
+}
+
 /// Called when a session ended or was lost, whoever noticed it.
 pub(crate) fn finish_session(
     tx: &mut Tx<'_>,
@@ -327,15 +362,7 @@ pub(crate) fn finish_session(
     ctx.runtime.turn_open = false;
 
     // Nobody can answer a request of a session that is gone.
-    let (approvals, decisions) = work::pending_for_session(tx.db(), ctx.session.id)?;
-    for mut approval in approvals {
-        approval.status = ApprovalStatus::Canceled;
-        tx.save_approval(&approval)?;
-    }
-    for mut decision in decisions {
-        decision.status = DecisionStatus::Canceled;
-        tx.save_decision(&decision)?;
-    }
+    cancel_pending_requests(tx, ctx.session.id)?;
 
     match ctx.session.role {
         SessionRole::Coordinator => release_coordinator(tx, ctx)?,

@@ -702,73 +702,97 @@ impl ConsortApp {
                         })
                         .into_any_element()
                 }
-                PostBody::Approval(approval) => {
-                    let answered = approval.state == RequestState::Answered;
-                    let mut card = div()
-                        .flex()
-                        .flex_col()
-                        .gap(t.space.sm + t.space.xxs)
-                        .pt(t.space.md)
-                        .pb(t.space.md + t.space.xxs)
-                        .px(t.space.md + t.space.xxs)
-                        .bg(c.surface_card)
-                        .border(t.border_width)
-                        .border_color(c.border_subtle)
-                        .rounded(t.radius.lg)
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(t.space.sm + t.space.xxs)
-                                .child(status_glyph(
-                                    SharedString::from(format!("{key}-glyph")),
-                                    if answered {
-                                        TaskStatus::Resolved
-                                    } else {
-                                        TaskStatus::NeedsInput
-                                    },
-                                    t.icon.size,
-                                    t,
-                                    cx,
-                                ))
-                                .child(text(
-                                    approval.summary.clone(),
-                                    t.text.ui_strong,
-                                    c.text_primary,
-                                )),
-                        )
-                        .child(self.render_approval_detail(approval, false, t, cx));
-                    card = if answered {
-                        card.child(text(
-                            match approval.answer {
-                                Some(consort_client::ApprovalChoice::AllowOnce) => {
-                                    "You allowed it once."
-                                }
-                                Some(consort_client::ApprovalChoice::AllowForTask) => {
-                                    "You allowed it for this task."
-                                }
-                                Some(consort_client::ApprovalChoice::Deny) => "You denied it.",
-                                None => "Answered.",
-                            },
-                            t.text.ui,
-                            c.text_secondary,
-                        ))
-                    } else {
-                        card.child(self.render_approval_buttons(approval, t, cx))
-                    };
-                    card.into_any_element()
-                }
-                PostBody::Decision(decision) => self.render_decision(decision, &key, t, cx),
+                PostBody::Approval(approval) => self.render_approval_card(approval, &key, t, cx),
+                PostBody::Decision(decision) => self.render_decision(decision, &key, true, t, cx),
             };
             col = col.child(element);
         }
         col.into_any_element()
     }
 
-    fn render_decision(
+    /// An approval card: what asks, the detail, and the buttons or the answer.
+    /// Task threads and the timeline both use it.
+    pub fn render_approval_card(
+        &mut self,
+        approval: &consort_client::ApprovalView,
+        key: &str,
+        t: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let c = &t.colors;
+        let answered = approval.state == RequestState::Answered;
+        let card = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_w_0()
+            .gap(t.space.sm + t.space.xxs)
+            .pt(t.space.md)
+            .pb(t.space.md + t.space.xxs)
+            .px(t.space.md + t.space.xxs)
+            .bg(c.surface_card)
+            .border(t.border_width)
+            .border_color(c.border_subtle)
+            .rounded(t.radius.lg)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(t.space.sm + t.space.xxs)
+                    .child(status_glyph(
+                        SharedString::from(format!("{key}-glyph")),
+                        if answered {
+                            TaskStatus::Resolved
+                        } else {
+                            TaskStatus::NeedsInput
+                        },
+                        t.icon.size,
+                        t,
+                        cx,
+                    ))
+                    .child(
+                        text(approval.summary.clone(), t.text.ui_strong, c.text_primary)
+                            .flex_1()
+                            .min_w_0(),
+                    ),
+            )
+            .child(self.render_approval_detail(approval, false, t, cx));
+        let task = approval.task_id.is_some();
+        let card = if answered {
+            card.child(text(
+                match approval.answer {
+                    Some(consort_client::ApprovalChoice::AllowOnce) => "You allowed it once.",
+                    Some(consort_client::ApprovalChoice::AllowForTask) if task => {
+                        "You allowed it for this task."
+                    }
+                    Some(consort_client::ApprovalChoice::AllowForTask) => {
+                        "You allowed it from now on."
+                    }
+                    Some(consort_client::ApprovalChoice::Deny) => "You denied it.",
+                    None => "Answered.",
+                },
+                t.text.ui,
+                c.text_secondary,
+            ))
+        } else if approval.state == RequestState::Expired {
+            card.child(text(
+                "This request closed before anyone answered it.",
+                t.text.ui,
+                c.text_secondary,
+            ))
+        } else {
+            card.child(self.render_approval_buttons(approval, t, cx))
+        };
+        card.into_any_element()
+    }
+
+    /// A decision card. In a task thread, Answer later closes the panel. In
+    /// the timeline the decision simply stays until you answer it.
+    pub fn render_decision(
         &mut self,
         decision: &DecisionView,
         key: &str,
+        in_thread: bool,
         t: &Tokens,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -970,15 +994,19 @@ impl ConsortApp {
                         },
                     )))
                 })
-                .child(
-                    link("later", "Answer later")
-                        .on_click(cx.listener(|this, _, _, cx| this.close_panel(cx))),
-                )
+                .when(in_thread, |d| {
+                    d.child(
+                        link("later", "Answer later")
+                            .on_click(cx.listener(|this, _, _, cx| this.close_panel(cx))),
+                    )
+                })
                 .into_any_element()
         };
         div()
             .flex()
             .flex_col()
+            .flex_1()
+            .min_w_0()
             .gap(t.space.md)
             .p(t.space.md + t.space.xxs)
             .bg(c.surface_card)
