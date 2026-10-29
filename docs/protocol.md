@@ -185,6 +185,10 @@ The `code` of an `error` event is one of these:
 | `option_failed` | ACP adapter | The harness refused a model option, for example the model or the effort. The session goes on with the harness default |
 | `elicitation_declined` | Codex adapter | An MCP server asked for input. The worker declined it, because Consort does not support MCP elicitation yet |
 | `codex_error` | Codex adapter | Codex reported an error that it will not retry |
+| `mode_reset` | ACP adapter | The agent raised its permission mode above the worker's limit, and the adapter set it back |
+| `mode_reset_failed` | ACP adapter | The adapter could not set a raised permission mode back, so it stopped the agent. The session is lost |
+| `approval_too_long` | Worker | An approval was too long to show in full, so the worker denied it. The model gets the same reason as a steer when the harness can steer |
+| `approval_mode_lowered` | Worker | The session asked for Full access, but the agent offers no bypass mode, so the session runs in Auto |
 
 The hub stores each `error` event as a failed item of the session. After `signed_out`, the hub also marks the account `signed_out` in the stored inventory of the worker, so placement does not choose it until the next inventory from the worker. A coordinator session on that account ends as `lost`: its turn's events go back to the queue, and placement starts a new session on another signed-in account. When no account fits, the channel gets a notice that names the account and the worker to sign in on, and the events wait for the next inventory. A failed coordinator turn on an account that the inventory shows as signed out has the same result.
 
