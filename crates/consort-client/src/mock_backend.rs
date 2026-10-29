@@ -436,6 +436,24 @@ impl MockBackend {
                 let tags = checked_tags(&tags)?;
                 worker_mut(&mut state, &worker_id)?.tags = tags;
             }
+            Command::SetFavoriteModel {
+                account_label,
+                model_id,
+                favorite,
+            } => {
+                let star = FavoriteModelView {
+                    account_label,
+                    model_id,
+                };
+                let at = state.favorite_models.iter().position(|f| *f == star);
+                match (at, favorite) {
+                    (None, true) => state.favorite_models.push(star),
+                    (Some(i), false) => {
+                        state.favorite_models.remove(i);
+                    }
+                    _ => {}
+                }
+            }
             Command::SetWorkerPaused { worker_id, paused } => {
                 worker_mut(&mut state, &worker_id)?.paused = paused;
             }

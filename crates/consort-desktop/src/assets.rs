@@ -39,7 +39,12 @@ pub fn remote_icon(agent_id: &str, svg: &str) -> SharedString {
     path.into()
 }
 
-const FILES: [(&str, &[u8]); 57] = [
+const FILES: [(&str, &[u8]); 59] = [
+    ("icons/star.svg", include_bytes!("../assets/icons/star.svg")),
+    (
+        "icons/star-filled.svg",
+        include_bytes!("../assets/icons/star-filled.svg"),
+    ),
     ("icons/info.svg", include_bytes!("../assets/icons/info.svg")),
     (
         "icons/signal.svg",

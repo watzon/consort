@@ -86,6 +86,9 @@ pub(crate) async fn dispatch(hub: &Hub, caller: Caller, request: ClientRequest) 
         R::WorkerToolsCheck(r) => to_value(&hub.worker_tools_check(caller, r).await?),
         R::WorkerToolInstall(r) => to_value(&hub.worker_tool_install(caller, r).await?),
         R::AcpRegistryList(r) => to_value(&hub.acp_registry_list(caller, r).await?),
+        R::PreferencesSetFavoriteModel(r) => {
+            to_value(&hub.preferences_set_favorite_model(caller, r).await?)
+        }
         R::Hello(_) | R::SyncSnapshot(_) | R::SyncSubscribe(_) | R::AuthHttpToken(_) => Err(
             HubError::invalid("This request belongs to the connection and cannot be routed."),
         ),

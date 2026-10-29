@@ -231,6 +231,25 @@ fn levels(values: &[(&str, &str)], default: Option<&str>) -> Option<EffortView> 
     })
 }
 
+/// The favorite models of the mock: one from each account, and one of an
+/// account that no worker has now, which the picker hides.
+pub fn favorite_models() -> Vec<FavoriteModelView> {
+    [
+        ("Claude Personal", "claude-opus-5-5"),
+        ("Claude Personal", "claude-sonnet-5-5"),
+        ("Claude Work", "claude-opus-5-5"),
+        ("Claude Old", "claude-opus-4-5"),
+        ("Codex Personal", "gpt-6.1-sol"),
+        ("OpenCode with Fireworks", "fireworks/glm-5p3"),
+    ]
+    .into_iter()
+    .map(|(label, id)| FavoriteModelView {
+        account_label: text(label),
+        model_id: text(id),
+    })
+    .collect()
+}
+
 /// The model picker groups of the mock: three signed-in accounts on the
 /// mock workers, and OpenCode with enough models to make the list scroll.
 pub fn model_groups() -> Vec<ModelGroupView> {
@@ -1298,6 +1317,7 @@ pub fn view_state() -> ViewState {
         workers: workers(),
         tags: Vec::new(),
         model_groups: model_groups(),
+        favorite_models: favorite_models(),
         sign_ins: Vec::new(),
         acp_registry: AcpRegistryView::default(),
         worker_pairing: None,

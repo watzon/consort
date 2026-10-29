@@ -1311,6 +1311,15 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
         workers,
         tags: Vec::new(),
         model_groups,
+        favorite_models: cache
+            .preferences
+            .favorite_models
+            .iter()
+            .map(|f| FavoriteModelView {
+                account_label: f.account_label.clone(),
+                model_id: f.model.clone(),
+            })
+            .collect(),
         sign_ins,
         acp_registry,
         worker_pairing: None,

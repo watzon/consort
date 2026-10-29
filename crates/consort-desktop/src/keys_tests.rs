@@ -1,7 +1,10 @@
 //! Key presses in the text inputs of the app, in a headless window.
 
 use crate::app::{ConsortApp, Dialog, Field, Page, SettingsSection};
-use crate::ui::{menu::MenuAnchor, model_picker::PickerTarget};
+use crate::ui::{
+    menu::MenuAnchor,
+    model_picker::{PickerFocus, PickerTarget},
+};
 use consort_client::{Client, SelectionSource};
 use gpui::{AnyWindowHandle, TestAppContext, VisualTestContext};
 use gpui_kit::{AppContext as _, Entity, WindowOptions};
@@ -263,16 +266,16 @@ fn a_model_without_the_effort_level_falls_back_to_its_default(cx: &mut TestAppCo
     );
 }
 
-/// The arrow keys move through every model and wrap, and the list scrolls
-/// inside the picker to keep the row in view.
+/// The arrow keys move through the rows and wrap, and the list scrolls
+/// inside the picker to keep the row in view. A search for "e" matches more
+/// rows than the list can show.
 #[gpui::test]
 fn the_arrow_keys_wrap_and_scroll_the_list(cx: &mut TestAppContext) {
     let (handle, app) = app_with_the_picker(cx);
     let cx = &mut VisualTestContext::from_window(handle, cx);
-    let total: usize = app.read_with(cx, |app, _| {
-        app.state.model_groups.iter().map(|g| g.models.len()).sum()
-    });
-    // The current model, Opus 5.5 of Claude Personal, is the first row.
+    cx.simulate_input("e");
+    let total = app.read_with(cx, |app, cx| app.picker_rows(cx).0.len());
+    assert!(total > 10, "{total} rows");
     app.read_with(cx, |app, _| {
         assert_eq!(app.picker.as_ref().and_then(|p| p.highlighted), Some(0))
     });
@@ -295,6 +298,123 @@ fn the_arrow_keys_wrap_and_scroll_the_list(cx: &mut TestAppContext) {
     cx.simulate_keystrokes("down");
     app.read_with(cx, |app, _| {
         assert_eq!(app.picker.as_ref().and_then(|p| p.highlighted), Some(0))
+    });
+}
+
+/// The picker opens on Favorites, because the mock has favorites. Left
+/// moves the keyboard to the rail, Down shows the first account, Right goes
+/// back to its rows, and typing searches every account with the rail
+/// hidden.
+#[gpui::test]
+fn the_rail_takes_the_arrow_keys_and_typing_searches(cx: &mut TestAppContext) {
+    use consort_client::picker::PickerView;
+    let (handle, app) = app_with_the_picker(cx);
+    let cx = &mut VisualTestContext::from_window(handle, cx);
+    app.read_with(cx, |app, _| {
+        let open = app.picker.as_ref().expect("open");
+        assert_eq!(open.view, PickerView::Favorites);
+        assert_eq!(open.focus, PickerFocus::List);
+    });
+    cx.simulate_keystrokes("left down");
+    app.read_with(cx, |app, cx| {
+        let open = app.picker.as_ref().expect("open");
+        assert_eq!(open.view, PickerView::Account("Claude Personal".into()));
+        assert_eq!(open.focus, PickerFocus::Rail { ring: true });
+        let (rows, searching) = app.picker_rows(cx);
+        assert!(!searching);
+        assert_eq!(rows.len(), 4, "the models of Claude Personal");
+        // The current model, Opus 5.5 of Claude Personal, has the keyboard.
+        assert_eq!(open.highlighted, Some(0));
+    });
+    cx.simulate_keystrokes("down");
+    app.read_with(cx, |app, _| {
+        let open = app.picker.as_ref().expect("open");
+        assert_eq!(open.view, PickerView::Account("Claude Work".into()));
+    });
+    cx.simulate_keystrokes("right");
+    app.read_with(cx, |app, _| {
+        assert_eq!(
+            app.picker.as_ref().map(|p| p.focus),
+            Some(PickerFocus::List)
+        )
+    });
+    cx.simulate_keystrokes("left");
+    cx.simulate_input("gpt");
+    app.read_with(cx, |app, cx| {
+        let open = app.picker.as_ref().expect("open");
+        assert_eq!(open.focus, PickerFocus::List, "typing leaves the rail");
+        let (rows, searching) = app.picker_rows(cx);
+        assert!(searching);
+        let accounts: Vec<&str> = rows
+            .iter()
+            .map(|r| app.state.model_groups[r.group].account_label.as_str())
+            .collect();
+        assert_eq!(accounts, ["Codex Personal"; 3]);
+    });
+    // Escape clears the search first, and the account comes back.
+    cx.simulate_keystrokes("escape");
+    app.read_with(cx, |app, cx| {
+        assert_eq!(app.inputs.model_search.read(cx).value(), "");
+        let open = app.picker.as_ref().expect("still open");
+        assert_eq!(open.view, PickerView::Account("Claude Work".into()));
+    });
+    cx.simulate_keystrokes("escape");
+    app.read_with(cx, |app, _| assert!(app.picker.is_none()));
+}
+
+/// A click on the star of a row changes the favorite only: the picker stays
+/// open, and the channel keeps its model.
+#[gpui::test]
+fn the_star_toggles_a_favorite_without_choosing_the_model(cx: &mut TestAppContext) {
+    let (handle, app) = app_with_the_picker(cx);
+    let cx = &mut VisualTestContext::from_window(handle, cx);
+    let before = assistant_model(&app, cx, "Everything");
+    // Down to Sonnet 5.5 of Claude Personal, a favorite in the mock.
+    cx.simulate_keystrokes("down");
+    cx.update(|window, _| window.refresh());
+    cx.run_until_parked();
+    let star = app
+        .read_with(cx, |app, _| app.triggers.get("picker-star"))
+        .expect("the star of the highlighted row has bounds");
+    assert!(app.read_with(cx, |app, _| {
+        app.state
+            .is_favorite("Claude Personal", "claude-sonnet-5-5")
+    }));
+    cx.simulate_click(star.center(), gpui_kit::Modifiers::default());
+    let after = assistant_model(&app, cx, "Everything");
+    app.read_with(cx, |app, _| {
+        assert!(app.picker.is_some(), "the picker stays open");
+        assert!(
+            !app.state
+                .is_favorite("Claude Personal", "claude-sonnet-5-5"),
+            "the star is off"
+        );
+    });
+    assert_eq!(after, before, "the model did not change");
+}
+
+/// The pointer on a rail button shows a tooltip with the account name.
+#[gpui::test]
+fn a_rail_button_shows_a_tooltip(cx: &mut TestAppContext) {
+    let (handle, app) = app_with_the_picker(cx);
+    let cx = &mut VisualTestContext::from_window(handle, cx);
+    cx.update(|window, _| window.refresh());
+    cx.run_until_parked();
+    // The first account is the third child of the rail, after Favorites
+    // and the divider.
+    let button = app
+        .read_with(cx, |app, _| {
+            app.picker
+                .as_ref()
+                .and_then(|p| p.rail_scroll.bounds_for_item(2))
+        })
+        .expect("the rail has bounds");
+    cx.simulate_mouse_move(button.center(), None, gpui_kit::Modifiers::default());
+    cx.run_until_parked();
+    app.read_with(cx, |app, cx| {
+        assert_eq!(app.picker.as_ref().and_then(|p| p.rail_hover), Some(1));
+        let t = ConsortApp::tokens(cx);
+        assert!(app.render_picker_tooltip(&t).is_some());
     });
 }
 

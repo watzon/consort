@@ -9,7 +9,7 @@ use consort_proto::status::TaskStatus;
 use crate::error::Result;
 use crate::hub::Hub;
 use crate::limits::{SNAPSHOT_MAX_BYTES, preview_task};
-use crate::store::{conversation, feed, knowledge, machine, routines, sign_ins, work};
+use crate::store::{conversation, feed, knowledge, machine, preferences, routines, sign_ins, work};
 
 /// Puts the tasks into a snapshot that holds everything else already.
 ///
@@ -56,8 +56,8 @@ impl Hub {
     /// The `all` scope has no messages and no channel files. A channel scope
     /// has its newest 50 timeline messages, oldest first, or fewer when they
     /// are large. `messages_has_more` says whether older ones exist. The `all`
-    /// scope also has the sign-ins that have not ended. Tasks go in last, see
-    /// [`add_tasks`].
+    /// scope also has the sign-ins that have not ended and the preferences.
+    /// Tasks go in last, see [`add_tasks`].
     pub(crate) async fn snapshot(&self, scope: SnapshotScope) -> Result<Snapshot> {
         self.store
             .read(move |conn| {
@@ -75,6 +75,7 @@ impl Hub {
                         decisions: work::pending_decisions(&tx, None)?,
                         routines: routines::routines(&tx)?,
                         sign_ins: sign_ins::open_sign_ins(&tx)?,
+                        preferences: Some(preferences::preferences(&tx)?),
                         ..Snapshot::default()
                     },
                     SnapshotScope::Channel(channel_id) => {

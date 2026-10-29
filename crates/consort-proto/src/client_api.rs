@@ -30,10 +30,10 @@ use crate::ids::{
 };
 use crate::model::{
     AcpAccountSpec, AcpRegistryAgent, Approval, ApprovalMode, BlobRef, Channel, ChannelFile,
-    Client, Decision, DecisionAnswer, ExpectedHash, Group, Isolation, MemoryNote, MemoryScope,
-    Message, ModelSelection, PlacementRequest, PushProvider, ReadMarker, Repo, Routine,
-    RoutineAction, RoutineRun, RoutineSchedule, SecretEnv, SessionItem, Sha256Hash, SignIn,
-    SignInMethod, Task, ToolId, Worker, memory_note_entity_id,
+    Client, Decision, DecisionAnswer, ExpectedHash, FavoriteModel, Group, Isolation, MemoryNote,
+    MemoryScope, Message, ModelSelection, PREFERENCES_ENTITY_ID, PlacementRequest, Preferences,
+    PushProvider, ReadMarker, Repo, Routine, RoutineAction, RoutineRun, RoutineSchedule, SecretEnv,
+    SessionItem, Sha256Hash, SignIn, SignInMethod, Task, ToolId, Worker, memory_note_entity_id,
 };
 use crate::time::Timestamp;
 use crate::tools::{FilesListResult, MemoryListResult, RoutineResult, SearchResult};
@@ -175,6 +175,10 @@ pub struct Snapshot {
     /// feed entries. Ended sign-ins are not in the list.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sign_ins: Vec<SignIn>,
+    /// The user's preferences, for the scope `all`. A channel snapshot and a
+    /// snapshot from an older hub leave it out.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preferences: Option<Preferences>,
 }
 
 /// `sync.subscribe`. The hub answers `ok`, then sends every feed entry after
@@ -224,6 +228,9 @@ pub enum EntityKind {
     Client,
     /// [`SignIn`].
     SignIn,
+    /// [`Preferences`]. There is one record, with the ID
+    /// [`PREFERENCES_ENTITY_ID`].
+    Preferences,
 }
 
 /// The full client view of an entity after a write.
@@ -260,6 +267,8 @@ pub enum EntityPayload {
     Client(Client),
     /// A sign-in.
     SignIn(SignIn),
+    /// The user's preferences.
+    Preferences(Preferences),
 }
 
 impl EntityPayload {
@@ -281,6 +290,7 @@ impl EntityPayload {
             Self::Worker(_) => EntityKind::Worker,
             Self::Client(_) => EntityKind::Client,
             Self::SignIn(_) => EntityKind::SignIn,
+            Self::Preferences(_) => EntityKind::Preferences,
         }
     }
 
@@ -308,6 +318,7 @@ impl EntityPayload {
             Self::Worker(e) => e.id.to_string(),
             Self::Client(e) => e.id.to_string(),
             Self::SignIn(e) => e.id.to_string(),
+            Self::Preferences(_) => PREFERENCES_ENTITY_ID.to_owned(),
         }
     }
 
@@ -333,7 +344,8 @@ impl EntityPayload {
             | Self::SessionItem(_)
             | Self::Worker(_)
             | Self::Client(_)
-            | Self::SignIn(_) => None,
+            | Self::SignIn(_)
+            | Self::Preferences(_) => None,
         }
     }
 }
@@ -1493,6 +1505,25 @@ pub struct ClientPushRegister {
     pub token: String,
 }
 
+/// `preferences.set_favorite_model`: star a model in the model picker, or
+/// take the star away. Adding a favorite that is there already, or removing
+/// one that is not, changes nothing, so a retry is safe.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreferencesSetFavoriteModel {
+    /// The account label and the model ID.
+    #[serde(flatten)]
+    pub model: FavoriteModel,
+    /// True to add the star, false to take it away.
+    pub favorite: bool,
+}
+
+/// The preferences after a change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreferencesResult {
+    /// The preferences.
+    pub preferences: Preferences,
+}
+
 message_family! {
     /// Every request from a client to the hub after authentication.
     pub enum ClientRequest {
@@ -1632,6 +1663,8 @@ message_family! {
         ClientRevoke("client.revoke", ClientRevoke => Empty),
         /// Set the push token.
         ClientPushRegister("client.push_register", ClientPushRegister => Empty),
+        /// Star a model, or take the star away.
+        PreferencesSetFavoriteModel("preferences.set_favorite_model", PreferencesSetFavoriteModel => PreferencesResult),
         /// Get a bearer token for the blob endpoints.
         AuthHttpToken("auth.http_token", AuthHttpToken => HttpToken),
     }
@@ -2249,6 +2282,14 @@ mod tests {
                 token: "t".into(),
             }
             .into(),
+            PreferencesSetFavoriteModel {
+                model: FavoriteModel {
+                    account_label: "Claude Personal".into(),
+                    model: "claude-opus-5-5".into(),
+                },
+                favorite: true,
+            }
+            .into(),
             AuthHttpToken {}.into(),
         ]
     }
@@ -2340,6 +2381,7 @@ mod tests {
             "client.revoke",
             "client.push_register",
             "auth.http_token",
+            "preferences.set_favorite_model",
         ];
         for ty in expected {
             assert!(ClientRequest::TYPES.contains(&ty), "{ty} is missing");
@@ -2608,5 +2650,65 @@ mod tests {
         let back: SignInResult =
             serde_json::from_value(serde_json::to_value(&result).unwrap()).unwrap();
         assert_eq!(back, result);
+    }
+
+    #[test]
+    fn preferences_round_trip_in_a_request_a_snapshot_and_the_feed() {
+        let favorite = FavoriteModel {
+            account_label: "Claude Work".into(),
+            model: "claude-sonnet-5-5".into(),
+        };
+        // The request has the fields of the favorite at its top level.
+        let request = PreferencesSetFavoriteModel {
+            model: favorite.clone(),
+            favorite: false,
+        };
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            value,
+            json!({ "account_label": "Claude Work", "model": "claude-sonnet-5-5", "favorite": false })
+        );
+        assert_eq!(
+            serde_json::from_value::<PreferencesSetFavoriteModel>(value).unwrap(),
+            request
+        );
+        let preferences = Preferences {
+            favorite_models: vec![favorite],
+        };
+        let result = PreferencesResult {
+            preferences: preferences.clone(),
+        };
+        let back: PreferencesResult =
+            serde_json::from_value(serde_json::to_value(&result).unwrap()).unwrap();
+        assert_eq!(back, result);
+        // In the feed: one record, with no channel.
+        let payload = EntityPayload::Preferences(preferences.clone());
+        assert_eq!(payload.kind(), EntityKind::Preferences);
+        assert_eq!(payload.entity_id(), "preferences");
+        assert_eq!(payload.channel_id(), None);
+        let entry = FeedEntry::upsert(9, Timestamp::from_millis(10), payload);
+        let value = serde_json::to_value(&entry).unwrap();
+        assert_eq!(value["entity"], "preferences");
+        assert_eq!(
+            value["payload"]["favorite_models"][0]["model"],
+            "claude-sonnet-5-5"
+        );
+        assert_eq!(serde_json::from_value::<FeedEntry>(value).unwrap(), entry);
+        // In a snapshot of `all`. An older snapshot has none.
+        let snapshot = Snapshot {
+            seq: 4,
+            preferences: Some(preferences),
+            ..Snapshot::default()
+        };
+        let value = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(serde_json::from_value::<Snapshot>(value).unwrap(), snapshot);
+        let old: Snapshot = serde_json::from_value(json!({ "seq": 5 })).unwrap();
+        assert_eq!(old.preferences, None);
+        assert!(
+            serde_json::to_value(&old)
+                .unwrap()
+                .get("preferences")
+                .is_none()
+        );
     }
 }

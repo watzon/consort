@@ -40,6 +40,7 @@ pub mod feed;
 pub mod knowledge;
 pub mod machine;
 pub mod migrations;
+pub mod preferences;
 pub mod routines;
 pub mod sign_ins;
 pub mod work;

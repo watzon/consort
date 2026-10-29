@@ -428,6 +428,16 @@ A model selection is a value, not a row: `account_label`, `model` and `options`.
 
 A worker has the same `paired_by` and `revoked_by`. Each pairing code records who made it in `created_by`. When a client is removed, the codes that it made and that are not used yet are deleted.
 
+## Preferences
+
+The user's preferences are one record that every client shares. The hub stores it as JSON in the `meta` table, under the key `preferences`, so it needs no table of its own. A hub that has no record yet has empty preferences.
+
+| Field | Type | Notes |
+|---|---|---|
+| `favorite_models` | list of `{account_label, model}` | The favorite models of the model picker, in the order that the user starred them. At most 200. Each field has at most 200 characters |
+
+A favorite whose account is not signed in on any worker, or whose account no longer offers the model, stays in the list. The clients do not show it until the account or the model comes back. The feed `entity_id` of the record is `preferences`, and its entries have no channel.
+
 ## Feed
 
 Every write on the hub adds one feed entry in the same database transaction. Clients use the feed to stay in sync.
@@ -437,8 +447,8 @@ Every write on the hub adds one feed entry in the same database transaction. Cli
 | `seq` | integer | Increases by one for each entry, across the whole hub |
 | `at` | timestamp | |
 | `channel_id` | ID, optional | Lets a client filter by channel |
-| `entity` | text | `channel`, `group`, `repo`, `message`, `read_marker`, `task`, `session_item`, `approval`, `decision`, `memory_note`, `channel_file`, `routine`, `worker`, `client` or `sign_in` |
-| `entity_id` | text | The entity's ID. A memory note uses `<scope>:<path>`, a channel file `<channel-id>:<path>`, a read marker `<channel-id>` or `<channel-id>:<thread-root-id>`, and a session item `<session-id>:<item-id>` |
+| `entity` | text | `channel`, `group`, `repo`, `message`, `read_marker`, `task`, `session_item`, `approval`, `decision`, `memory_note`, `channel_file`, `routine`, `worker`, `client`, `sign_in` or `preferences` |
+| `entity_id` | text | The entity's ID. A memory note uses `<scope>:<path>`, a channel file `<channel-id>:<path>`, a read marker `<channel-id>` or `<channel-id>:<thread-root-id>`, a session item `<session-id>:<item-id>`, and the preferences `preferences` |
 | `op` | `upsert` or `delete` | |
 | `payload` | JSON | The full client view of the entity after the write. `null` for `delete` |
 

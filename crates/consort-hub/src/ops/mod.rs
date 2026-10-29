@@ -6,6 +6,7 @@ pub(crate) mod flow;
 pub(crate) mod hooks;
 mod knowledge;
 pub(crate) mod machines;
+mod preferences;
 pub(crate) mod registry;
 mod routines;
 mod sync;

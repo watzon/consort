@@ -194,6 +194,13 @@ pub enum Command {
         worker_id: String,
         tags: Vec<String>,
     },
+    /// Stars a model in the model picker, or takes the star away. The hub
+    /// keeps the favorites for every client.
+    SetFavoriteModel {
+        account_label: String,
+        model_id: String,
+        favorite: bool,
+    },
     SetWorkerPaused {
         worker_id: String,
         paused: bool,

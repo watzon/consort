@@ -9,7 +9,7 @@ use consort_proto::{
     ids::{ChannelId, TaskId},
     model::{
         AcpRegistryAgent, Approval, Channel, Decision, Group, ItemPayload, Message, MessageKind,
-        ReadMarker, Repo, SessionItem, SignIn, Task, Worker,
+        PREFERENCES_ENTITY_ID, Preferences, ReadMarker, Repo, SessionItem, SignIn, Task, Worker,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -125,6 +125,9 @@ pub struct Cache {
     pub acp_registry_load: crate::view::RegistryLoad,
     /// The icons of registry agents that loaded, as SVG text, by agent ID.
     pub acp_icons: BTreeMap<String, String>,
+    /// The user's preferences, from the `all` snapshot and the feed. Empty
+    /// until they load.
+    pub preferences: Preferences,
 }
 
 /// Why a message that waited for a channel did not go out when the channel
@@ -357,6 +360,9 @@ impl Cache {
         snapshot
             .sign_ins
             .retain(|s| !self.changed_after(EntityKind::SignIn, &s.id.to_string(), at));
+        if self.changed_after(EntityKind::Preferences, PREFERENCES_ENTITY_ID, at) {
+            snapshot.preferences = None;
+        }
     }
 
     /// Remembers that the feed entry at `seq` changed the entity.
@@ -438,6 +444,10 @@ impl Cache {
             if !s.state.is_final() && !self.sign_ins_dismissed.contains(&id) {
                 self.sign_ins.insert(id, s);
             }
+        }
+        // Only the `all` snapshot has the preferences.
+        if let Some(preferences) = snapshot.preferences {
+            self.preferences = preferences;
         }
     }
 
@@ -581,6 +591,12 @@ impl Cache {
                         return false;
                     }
                     self.sign_ins.insert(id, sign_in);
+                }
+                EntityPayload::Preferences(preferences) => {
+                    if self.preferences == preferences {
+                        return false;
+                    }
+                    self.preferences = preferences;
                 }
                 // Memory notes, files, routines and clients have no view
                 // yet.
@@ -732,6 +748,62 @@ mod tests {
         cache.merge_entities(snapshot);
         assert_eq!(cache.groups[&id.to_string()].name, "New name");
         assert_eq!(cache.seq, 12, "the feed position stays");
+    }
+
+    /// The favorites come from the `all` snapshot and then from the feed,
+    /// and the view lists them. An older snapshot does not undo a newer
+    /// star, and a channel snapshot leaves them as they are.
+    #[test]
+    fn the_cache_applies_preferences_from_the_snapshot_and_the_feed() {
+        use consort_proto::model::{FavoriteModel, Preferences};
+        let prefs = |models: &[&str]| Preferences {
+            favorite_models: models
+                .iter()
+                .map(|m| FavoriteModel {
+                    account_label: "Claude Work".into(),
+                    model: (*m).into(),
+                })
+                .collect(),
+        };
+        let mut cache = Cache::default();
+        let mut snapshot = snapshot_at(5);
+        snapshot.preferences = Some(prefs(&["opus"]));
+        cache.load_snapshot(snapshot);
+        assert_eq!(cache.preferences, prefs(&["opus"]));
+
+        assert!(cache.apply(upsert(
+            6,
+            EntityPayload::Preferences(prefs(&["opus", "haiku"]))
+        )));
+        assert!(
+            !cache.apply(upsert(
+                7,
+                EntityPayload::Preferences(prefs(&["opus", "haiku"]))
+            )),
+            "the same preferences change nothing"
+        );
+        // A snapshot read at seq 5 arrives late, and a channel snapshot has
+        // no preferences.
+        let mut old = snapshot_at(5);
+        old.preferences = Some(prefs(&["opus"]));
+        cache.merge_entities(old);
+        cache.merge_entities(snapshot_at(9));
+        assert_eq!(cache.preferences, prefs(&["opus", "haiku"]));
+
+        let view = crate::reduce::view_state(
+            &cache,
+            crate::view::Connection::Online,
+            crate::view::UserView::default(),
+            0,
+        );
+        let ids: Vec<&str> = view
+            .favorite_models
+            .iter()
+            .map(|f| f.model_id.as_str())
+            .collect();
+        assert_eq!(ids, ["opus", "haiku"]);
+        assert!(view.is_favorite("Claude Work", "haiku"));
+        assert!(!view.is_favorite("Claude Personal", "haiku"));
     }
 
     #[test]

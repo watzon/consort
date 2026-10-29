@@ -411,6 +411,22 @@ impl Client {
         self.run(Command::SetWorkerTags { worker_id, tags }).await
     }
 
+    /// Stars a model in the model picker, or takes the star away. The hub
+    /// keeps the favorites, so every client shows them.
+    pub async fn set_favorite_model(
+        &self,
+        account_label: String,
+        model_id: String,
+        favorite: bool,
+    ) -> Result<(), ClientError> {
+        self.run(Command::SetFavoriteModel {
+            account_label,
+            model_id,
+            favorite,
+        })
+        .await
+    }
+
     /// Makes an account on a worker and returns its ID.
     pub async fn create_account(&self, account: NewAccount) -> Result<String, ClientError> {
         match self.run_for(Command::CreateAccount(account)).await? {

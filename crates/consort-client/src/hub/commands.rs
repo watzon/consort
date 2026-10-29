@@ -7,14 +7,15 @@ use consort_proto::{
         AccountCreate, AccountRemove, AccountSignOut, AccountUpdate, AcpRegistryList,
         ChannelArchive, ChannelCreate, ChannelDelete, ChannelMove, ChannelUpdate,
         DecisionAnswerRequest, GroupCreate, GroupUpdate, MessageDelete, MessageEdit, MessageList,
-        ReadMark, SignInCancel, SignInStart, SignInSubmitCode, TaskArchive, TaskInterrupt,
-        TaskReopen, TaskResolve, TaskRetry, WorkerPairingCode, WorkerRename, WorkerRevoke,
-        WorkerSetPaused, WorkerSetTags, WorkerToolInstall, WorkerToolsCheck,
+        PreferencesSetFavoriteModel, ReadMark, SignInCancel, SignInStart, SignInSubmitCode,
+        TaskArchive, TaskInterrupt, TaskReopen, TaskResolve, TaskRetry, WorkerPairingCode,
+        WorkerRename, WorkerRevoke, WorkerSetPaused, WorkerSetTags, WorkerToolInstall,
+        WorkerToolsCheck,
     },
     ids::{ChannelId, GroupId},
     model::{
-        AcpAccountSpec, DecisionAnswer, ModelSelection, OptionValue, RequestOptionKind,
-        SignInMethod, ToolId,
+        AcpAccountSpec, DecisionAnswer, FavoriteModel, ModelSelection, OptionValue,
+        RequestOptionKind, SignInMethod, ToolId,
     },
 };
 use futures_util::StreamExt as _;
@@ -567,6 +568,23 @@ async fn run(shared: Arc<Shared>, command: Command) -> Result<CommandOutput, Cli
                 .call(WorkerSetTags {
                     worker_id: parse(&worker_id, "worker")?,
                     tags,
+                })
+                .await?;
+        }
+        Command::SetFavoriteModel {
+            account_label,
+            model_id,
+            favorite,
+        } => {
+            // The feed entry of the change updates the view, here and in
+            // every other client.
+            shared
+                .call(PreferencesSetFavoriteModel {
+                    model: FavoriteModel {
+                        account_label,
+                        model: model_id,
+                    },
+                    favorite,
                 })
                 .await?;
         }

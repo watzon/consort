@@ -3,29 +3,32 @@
 //! - A trigger, as a compact chip in the composer or as a full-width select
 //!   field in a dialog. It shows the provider logo, the model name and the
 //!   account name.
-//! - A popover with a search field, one group per signed-in account, a list
-//!   that scrolls inside the popover with fades at its edges (AGENTS.md rule
-//!   3), and a footer that says what the choice changes. It flips up or down
-//!   by the room it has (rule 4).
+//! - A popover with a rail at its left (Favorites, then one button per
+//!   signed-in account) and a main pane: a search field, a header line, and
+//!   the models of the view that the rail selects. Typing a search hides the
+//!   rail and shows the matching models of every account. The list scrolls
+//!   inside the popover with fades at its edges (AGENTS.md rule 3), and the
+//!   popover flips up or down by the room it has (rule 4).
 //! - The effort control: a chip (or a select in a dialog) with a small menu
 //!   of the levels that the provider reports for the model.
 //!
-//! The data and the rules (groups, search, effort fallback) are in
-//! `consort_client::picker`, so they have tests without a window.
+//! The data and the rules (rail, badges, Favorites, search, effort fallback)
+//! are in `consort_client::picker`, so they have tests without a window.
 
 use consort_client::{
     ChannelChanges, ChannelKind, EffortView, ModelGroupView, SelectionSource, SelectionView,
-    picker::{self, EffortRow, PickerPurpose},
+    picker::{self, EffortRow, PickerView, RowRef},
 };
 use consort_theme::{Tokens, TypeExt as _};
 use gpui_kit::{
-    AnyElement, Context, Div, InteractiveElement, IntoElement, KeyDownEvent, MouseButton,
-    ParentElement, Pixels, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled,
-    Window, div, linear_color_stop, linear_gradient, prelude::FluentBuilder as _,
+    AnyElement, Context, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, ParentElement,
+    Pixels, ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled, Window, anchored,
+    deferred, div, linear_color_stop, linear_gradient, point, prelude::FluentBuilder as _,
+    transparent_black,
 };
 
 use crate::{
-    app::{ConsortApp, Field, SettingsSection},
+    app::{ConsortApp, SettingsSection},
     ui::{
         menu::{MenuAnchor, floating},
         parts::{ButtonKind, button, detail, focusable, icon, line, provider_logo, text},
@@ -44,15 +47,36 @@ pub enum PickerTarget {
     NewChannelTasks,
 }
 
+/// The part of the picker that the arrow keys move in. The search field
+/// keeps the text focus in both, so typing always searches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PickerFocus {
+    /// Up and Down move between Favorites and the accounts. `ring` is true
+    /// when the keyboard moved here, so the selected button shows the focus
+    /// ring. A click on the rail does not show it.
+    Rail { ring: bool },
+    /// Up and Down move between the model rows.
+    List,
+}
+
 /// The open model picker.
 #[derive(Clone, Debug)]
 pub struct OpenPicker {
     pub target: PickerTarget,
     pub anchor: MenuAnchor,
-    /// The model row that the keyboard is on, as an index into the models
-    /// that the search shows.
+    /// What the rail selects: Favorites or an account. A search replaces it
+    /// while the query has a word.
+    pub view: PickerView,
+    pub focus: PickerFocus,
+    /// The model row that the keyboard is on, as an index into the rows
+    /// that the main pane shows.
     pub highlighted: Option<usize>,
     pub scroll: ScrollHandle,
+    /// The rail, which scrolls when it has more accounts than room.
+    pub rail_scroll: ScrollHandle,
+    /// The rail button under the pointer, as an index into the rail, for
+    /// its tooltip.
+    pub rail_hover: Option<usize>,
     /// The list row to scroll to once the list knows the bounds of its
     /// rows, which is after its first frame.
     pub pending_row: Option<usize>,
@@ -76,63 +100,18 @@ pub enum TriggerStyle {
     Field,
 }
 
-/// One row of the picker list.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum PickerRow {
-    /// The header of a group, by group index.
-    Group(usize),
-    /// A model: the group index, the model index in that group, and the
-    /// index among the model rows.
-    Model(usize, usize, usize),
-}
-
-/// The rows of the picker list for some groups, headers and models in
-/// order. The list scrolls by these rows, so a row's index is its child
-/// index in the list.
-pub fn picker_rows(groups: &[ModelGroupView]) -> Vec<PickerRow> {
-    let mut rows = Vec::new();
-    let mut n = 0;
-    for (gi, group) in groups.iter().enumerate() {
-        rows.push(PickerRow::Group(gi));
-        for mi in 0..group.models.len() {
-            rows.push(PickerRow::Model(gi, mi, n));
-            n += 1;
-        }
-    }
-    rows
-}
-
-/// The number of model rows in some groups.
-fn model_count(groups: &[ModelGroupView]) -> usize {
-    groups.iter().map(|g| g.models.len()).sum()
-}
-
-/// The group and model index of the `n`th model row.
-fn nth_model(groups: &[ModelGroupView], n: usize) -> Option<(usize, usize)> {
-    picker_rows(groups).into_iter().find_map(|row| match row {
-        PickerRow::Model(gi, mi, i) if i == n => Some((gi, mi)),
-        _ => None,
+/// The index among `rows` of a selection's model, if the rows show it.
+fn row_of(groups: &[ModelGroupView], rows: &[RowRef], selection: &SelectionView) -> Option<usize> {
+    rows.iter().position(|r| {
+        groups[r.group].account_label == selection.account_label
+            && groups[r.group].models[r.model].id == selection.model_id
     })
 }
 
-/// The child index in the list of the `n`th model row.
-fn row_of_model(groups: &[ModelGroupView], n: usize) -> Option<usize> {
-    picker_rows(groups)
-        .iter()
-        .position(|row| matches!(row, PickerRow::Model(_, _, i) if *i == n))
-}
-
-/// The index among the model rows of a selection, if the list shows it.
-fn model_index_of(groups: &[ModelGroupView], selection: &SelectionView) -> Option<usize> {
-    picker_rows(groups).into_iter().find_map(|row| match row {
-        PickerRow::Model(gi, mi, n)
-            if groups[gi].account_label == selection.account_label
-                && groups[gi].models[mi].id == selection.model_id =>
-        {
-            Some(n)
-        }
-        _ => None,
-    })
+/// The child index in the rail of rail item `index`: Favorites is the first
+/// child, then the divider, then the accounts.
+fn rail_child(index: usize) -> usize {
+    if index == 0 { 0 } else { index + 1 }
 }
 
 /// Moves a highlight by `delta` rows in a list of `len` rows, and wraps.
@@ -168,21 +147,6 @@ impl ConsortApp {
                 .map(|e| e.selection.clone()),
             PickerTarget::NewChannelAssistant => self.new_channel.coordinator_selection.clone(),
             PickerTarget::NewChannelTasks => self.new_channel.task_selection.clone(),
-        }
-    }
-
-    /// What a choice changes, for the footer.
-    fn picker_purpose(&self, target: &PickerTarget, cx: &gpui_kit::App) -> PickerPurpose {
-        match target {
-            PickerTarget::Assistant(id) => match self.state.channel(id) {
-                Some(c) if c.kind == ChannelKind::Everything => PickerPurpose::Everything,
-                Some(c) => PickerPurpose::Channel(c.name.clone()),
-                None => PickerPurpose::Channel(String::new()),
-            },
-            PickerTarget::NewChannelAssistant => {
-                PickerPurpose::Channel(self.field(Field::Name, cx))
-            }
-            PickerTarget::NewChannelTasks => PickerPurpose::Tasks(self.field(Field::Name, cx)),
         }
     }
 
@@ -232,14 +196,42 @@ impl ConsortApp {
         cx.notify();
     }
 
-    /// The groups that the search shows now.
-    fn picker_groups(&self, cx: &gpui_kit::App) -> Vec<ModelGroupView> {
-        let query = self.inputs.model_search.read(cx).value().to_string();
-        picker::filter(&self.state.model_groups, &query)
+    /// The search text of the picker.
+    fn picker_query(&self, cx: &gpui_kit::App) -> String {
+        self.inputs.model_search.read(cx).value().to_string()
+    }
+
+    /// The rows that the main pane of the open picker shows now, and
+    /// whether a search is on (then the rail is hidden).
+    pub fn picker_rows(&self, cx: &gpui_kit::App) -> (Vec<RowRef>, bool) {
+        let query = self.picker_query(cx);
+        let searching = !query.trim().is_empty();
+        let view = self
+            .picker
+            .as_ref()
+            .map(|p| p.view.clone())
+            .unwrap_or(PickerView::Favorites);
+        let rows = picker::view_rows(
+            &self.state.model_groups,
+            &self.state.favorite_models,
+            &view,
+            &query,
+        );
+        (rows, searching)
+    }
+
+    /// The row to put the keyboard on in some rows: the current model, else
+    /// the first row.
+    fn first_highlight(&self, target: &PickerTarget, rows: &[RowRef]) -> Option<usize> {
+        self.picker_selection(target)
+            .and_then(|s| row_of(&self.state.model_groups, rows, &s))
+            .or_else(|| (!rows.is_empty()).then_some(0))
     }
 
     /// Opens the picker for a target, with an empty search that has the
-    /// focus, and the keyboard on the current model.
+    /// focus. It opens on Favorites when a favorite has a row, else on the
+    /// account of the current model (see `picker::initial_view`), with the
+    /// keyboard on the current model.
     pub fn open_picker(
         &mut self,
         target: PickerTarget,
@@ -254,17 +246,21 @@ impl ConsortApp {
             input.focus(window, cx);
         });
         let current = self.picker_selection(&target);
-        let groups = self.state.model_groups.clone();
-        let highlighted = current
-            .as_ref()
-            .and_then(|s| model_index_of(&groups, s))
-            .or_else(|| (model_count(&groups) > 0).then_some(0));
+        let groups = &self.state.model_groups;
+        let favorites = &self.state.favorite_models;
+        let view = picker::initial_view(groups, favorites, current.as_ref());
+        let rows = picker::view_rows(groups, favorites, &view, "");
+        let highlighted = self.first_highlight(&target, &rows);
         self.picker = Some(OpenPicker {
             target,
             anchor,
+            view,
+            focus: PickerFocus::List,
             highlighted,
             scroll: ScrollHandle::new(),
-            pending_row: highlighted.and_then(|n| row_of_model(&groups, n)),
+            rail_scroll: ScrollHandle::new(),
+            rail_hover: None,
+            pending_row: highlighted,
         });
         cx.notify();
     }
@@ -301,62 +297,165 @@ impl ConsortApp {
         }
     }
 
-    /// Chooses the `n`th model row that the search shows. The effort stays
+    /// Shows Favorites or an account in the main pane, with the keyboard on
+    /// the current model of that view, or on its first row.
+    pub fn show_picker_view(&mut self, view: PickerView, cx: &mut Context<Self>) {
+        let Some(target) = self.picker.as_ref().map(|p| p.target.clone()) else {
+            return;
+        };
+        let rows = picker::view_rows(
+            &self.state.model_groups,
+            &self.state.favorite_models,
+            &view,
+            "",
+        );
+        let highlighted = self.first_highlight(&target, &rows);
+        if let Some(open) = self.picker.as_mut() {
+            open.view = view;
+            open.highlighted = highlighted;
+            open.scroll.scroll_to_item(0);
+            open.pending_row = highlighted;
+        }
+        cx.notify();
+    }
+
+    /// Moves the rail selection by `delta` buttons, and shows that view.
+    fn step_rail(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let rail = picker::rail(&self.state.model_groups);
+        let Some(open) = self.picker.as_ref() else {
+            return;
+        };
+        let at = rail.iter().position(|r| r.view == open.view);
+        if let Some(next) = step(at, delta, rail.len()) {
+            self.show_picker_view(rail[next].view.clone(), cx);
+        }
+    }
+
+    /// Chooses the `n`th row that the main pane shows. The effort stays
     /// when the new model offers that level (see `picker::choose_model`).
     pub fn choose_model_row(&mut self, n: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(open) = self.picker.clone() else {
             return;
         };
-        let groups = self.picker_groups(cx);
-        let Some((gi, mi)) = nth_model(&groups, n) else {
+        let (rows, _) = self.picker_rows(cx);
+        let Some(row) = rows.get(n).copied() else {
             return;
         };
+        let groups = &self.state.model_groups;
         let previous = self.picker_selection(&open.target);
-        let chosen = picker::choose_model(previous.as_ref(), &groups[gi], &groups[gi].models[mi]);
+        let chosen = picker::choose_model(
+            previous.as_ref(),
+            &groups[row.group],
+            &groups[row.group].models[row.model],
+        );
         self.close_picker(window, cx);
         // A pick of the model that the channel uses already, from
         // Everything, makes it the channel's own.
         self.apply_selection(&open.target, Some(chosen), cx);
     }
 
-    /// Keys in the open picker: arrows move, Enter chooses, Escape closes
-    /// only the picker.
+    /// Stars a model, or takes its star away. The picker stays open and the
+    /// selection does not change. The hub keeps the favorites, and its feed
+    /// entry updates every client.
+    pub fn toggle_favorite(
+        &mut self,
+        account_label: String,
+        model_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        let on = !self.state.is_favorite(&account_label, &model_id);
+        let client = self.client.clone();
+        self.spawn_command(cx, async move {
+            client.set_favorite_model(account_label, model_id, on).await
+        });
+        cx.notify();
+    }
+
+    /// Keys in the open picker. Up and Down move in the rail or in the
+    /// list, Right and typing go from the rail to the list, Left goes from
+    /// the list to the rail when the search is empty, Enter chooses, and
+    /// Escape clears the search first, then closes only the picker.
     fn picker_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(open) = self.picker.as_ref() else {
+        let Some(open) = self.picker.clone() else {
             return;
         };
-        let groups = self.picker_groups(cx);
-        let len = model_count(&groups);
-        match event.keystroke.key.as_str() {
+        let (rows, searching) = self.picker_rows(cx);
+        let len = rows.len();
+        let has_rail = !searching && !self.state.model_groups.is_empty();
+        let on_rail = has_rail && matches!(open.focus, PickerFocus::Rail { .. });
+        let key = event.keystroke.key.as_str();
+        match key {
+            "escape" if searching => {
+                self.inputs
+                    .model_search
+                    .update(cx, |input, cx| input.set_value("", window, cx));
+                self.picker_search_changed(cx);
+            }
             "escape" => self.close_picker(window, cx),
             "down" | "up" => {
-                let delta = if event.keystroke.key == "down" { 1 } else { -1 };
-                let next = step(open.highlighted.filter(|h| *h < len), delta, len);
-                if let Some(row) = next.and_then(|n| row_of_model(&groups, n)) {
-                    open.scroll.scroll_to_item(row);
+                let delta = if key == "down" { 1 } else { -1 };
+                if on_rail {
+                    self.set_picker_focus(PickerFocus::Rail { ring: true });
+                    self.step_rail(delta, cx);
+                } else {
+                    let next = step(open.highlighted.filter(|h| *h < len), delta, len);
+                    if let Some(row) = next {
+                        open.scroll.scroll_to_item(row);
+                    }
+                    if let Some(open) = self.picker.as_mut() {
+                        open.highlighted = next;
+                    }
                 }
-                if let Some(open) = self.picker.as_mut() {
-                    open.highlighted = next;
-                }
+            }
+            "right" | "enter" if on_rail => self.set_picker_focus(PickerFocus::List),
+            "left" if has_rail && open.focus == PickerFocus::List => {
+                self.set_picker_focus(PickerFocus::Rail { ring: true })
             }
             "enter" => {
                 if let Some(n) = open.highlighted.filter(|h| *h < len) {
                     self.choose_model_row(n, window, cx);
                 }
             }
-            _ => return,
+            _ => {
+                // A typed character goes on to the search field, and the
+                // keyboard leaves the rail.
+                if on_rail && event.keystroke.key_char.is_some() {
+                    self.set_picker_focus(PickerFocus::List);
+                }
+                return;
+            }
         }
         cx.stop_propagation();
         cx.notify();
     }
 
-    /// The search changed: the keyboard goes to the first match.
-    pub fn picker_search_changed(&mut self, cx: &mut Context<Self>) {
-        let has_rows = model_count(&self.picker_groups(cx)) > 0;
+    fn set_picker_focus(&mut self, focus: PickerFocus) {
         if let Some(open) = self.picker.as_mut() {
-            open.highlighted = has_rows.then_some(0);
-            open.pending_row = None;
+            open.focus = focus;
+        }
+    }
+
+    /// The search changed. With a query, the keyboard goes to the first
+    /// match. With none, the view of the rail comes back, with the keyboard
+    /// on the current model.
+    pub fn picker_search_changed(&mut self, cx: &mut Context<Self>) {
+        let (rows, searching) = self.picker_rows(cx);
+        let Some(target) = self.picker.as_ref().map(|p| p.target.clone()) else {
+            return;
+        };
+        let highlighted = if searching {
+            (!rows.is_empty()).then_some(0)
+        } else {
+            self.first_highlight(&target, &rows)
+        };
+        if let Some(open) = self.picker.as_mut() {
+            open.highlighted = highlighted;
+            open.rail_hover = None;
             open.scroll.scroll_to_item(0);
+            open.pending_row = if searching { None } else { highlighted };
+            if searching {
+                open.focus = PickerFocus::List;
+            }
         }
         cx.notify();
     }
@@ -682,9 +781,10 @@ impl ConsortApp {
             }
         }
         let c = &t.colors;
-        let groups = self.picker_groups(cx);
+        let groups = self.state.model_groups.clone();
+        let (rows, searching) = self.picker_rows(cx);
         let current = self.picker_selection(&open.target);
-        let query = self.inputs.model_search.read(cx).value().trim().to_owned();
+        let query = self.picker_query(cx).trim().to_owned();
         let search = div()
             .flex()
             .flex_none()
@@ -703,99 +803,68 @@ impl ConsortApp {
                         &self.inputs.model_search,
                         t.text.ui,
                     )),
-            )
-            .child(
-                div()
-                    .px(t.space.xs)
-                    .rounded(t.radius.sm)
-                    .border(t.border_width)
-                    .border_color(c.border_strong)
-                    .type_style(t.text.caption)
-                    .text_color(c.text_tertiary)
-                    .child("Esc"),
             );
-        let body: AnyElement = if self.state.model_groups.is_empty() {
-            self.render_no_account(t, cx)
-        } else if groups.is_empty() {
-            div()
-                .flex()
-                .flex_col()
-                .gap(t.space.xxs)
-                .p(t.space.md)
-                .child(text(
-                    format!("No model matches \u{201C}{query}\u{201D}."),
-                    t.text.ui_strong,
-                    c.text_primary,
-                ))
-                .child(text(
-                    "Try another word, or the name of an account.",
-                    t.text.ui,
-                    c.text_secondary,
-                ))
-                .into_any_element()
-        } else {
-            self.render_picker_list(&groups, &open, current.as_ref(), t, cx)
-        };
-        let purpose = self.picker_purpose(&open.target, cx);
-        let can_inherit = self.picker_can_inherit(&open.target);
-        let target = open.target.clone();
-        let footer = div()
+        let main = div()
             .flex()
-            .flex_none()
-            .items_start()
-            .gap(t.space.sm)
-            .px(t.space.md)
-            .py(t.space.sm + t.space.xxs)
-            .bg(c.surface_card)
-            .border_t(t.border_width)
-            .border_color(c.border_subtle)
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .h(t.text.caption.line)
-                    .child(icon("info", t.icon.dense, c.text_tertiary)),
-            )
-            .child(
+            .flex_col()
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .child(search);
+        let main = if groups.is_empty() {
+            main.child(self.render_no_account(t, cx))
+        } else {
+            let (title, detail_text) = if searching {
+                ("Search results".to_owned(), "From every account".to_owned())
+            } else {
+                match &open.view {
+                    PickerView::Favorites => {
+                        ("Favorites".to_owned(), "From every account".to_owned())
+                    }
+                    PickerView::Account(label) => (
+                        label.clone(),
+                        groups
+                            .iter()
+                            .find(|g| &g.account_label == label)
+                            .map(|g| g.workers.join(", "))
+                            .unwrap_or_default(),
+                    ),
+                }
+            };
+            // The header line sits outside the list, so it stays under the
+            // search field while the list scrolls.
+            let header = self.render_picker_header(title, detail_text, &open.target, t, cx);
+            let body: AnyElement = if searching && rows.is_empty() {
                 div()
                     .flex()
                     .flex_col()
-                    .flex_1()
-                    .min_w_0()
-                    .gap(t.space.xs)
+                    .gap(t.space.xxs)
+                    .px(t.space.md + t.space.xxs)
+                    .py(t.space.sm)
                     .child(text(
-                        purpose.footer(),
-                        consort_theme::Type {
-                            line: t.text.caption.line,
-                            ..detail(t)
-                        },
-                        c.text_tertiary,
+                        format!("No model matches \u{201C}{query}\u{201D}."),
+                        t.text.ui_strong,
+                        c.text_primary,
                     ))
-                    .when(can_inherit, |d| {
-                        d.child(
-                            div().flex().child(
-                                button(
-                                    "use-everything-model",
-                                    "Use the Everything model",
-                                    ButtonKind::Secondary,
-                                    t,
-                                )
-                                .on_click(cx.listener(
-                                    move |this, _, window, cx| {
-                                        this.close_picker(window, cx);
-                                        this.apply_selection(&target, None, cx);
-                                    },
-                                )),
-                            ),
-                        )
-                    }),
-            );
+                    .child(text(
+                        "Try another word, or the name of an account.",
+                        t.text.ui,
+                        c.text_secondary,
+                    ))
+                    .into_any_element()
+            } else {
+                let wide = searching || open.view == PickerView::Favorites;
+                let hint = !searching && open.view == PickerView::Favorites;
+                self.render_picker_list(&groups, &rows, &open, current.as_ref(), wide, hint, t, cx)
+            };
+            main.child(header).child(body)
+        };
         let panel = div()
             .id("model-picker")
             .occlude()
             .flex()
-            .flex_col()
             .w(t.component.model_picker)
+            .when(!groups.is_empty(), |d| d.h(t.component.model_picker_height))
             .overflow_hidden()
             .bg(c.surface_raised)
             .border(t.border_width)
@@ -804,9 +873,10 @@ impl ConsortApp {
             .shadow(t.shadow_float())
             .font_family(t.font_sans.clone())
             .capture_key_down(cx.listener(Self::picker_key))
-            .child(search)
-            .child(body)
-            .child(footer)
+            .when(!searching && !groups.is_empty(), |d| {
+                d.child(self.render_rail(&groups, &open, t, cx))
+            })
+            .child(main)
             .into_any_element();
         Some(floating(
             open.anchor,
@@ -818,94 +888,273 @@ impl ConsortApp {
         ))
     }
 
-    /// The groups and models, in a list that scrolls inside the picker.
-    fn render_picker_list(
+    /// The header line of the main pane: a title in semibold, a detail in
+    /// `text.tertiary`, and, for a target with a model of its own, the text
+    /// button "Use the Everything model" at its right end.
+    fn render_picker_header(
         &self,
-        groups: &[ModelGroupView],
-        open: &OpenPicker,
-        current: Option<&SelectionView>,
+        title: String,
+        detail_text: String,
+        target: &PickerTarget,
         t: &Tokens,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let c = &t.colors;
-        let indent = t.space.sm + t.icon.dense + t.space.sm;
+        let semibold = consort_theme::Type {
+            weight: t.text.title.weight,
+            ..t.text.ui
+        };
+        let target = target.clone();
+        div()
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(t.space.sm)
+            .pt(t.space.sm + t.space.xxs)
+            .pb(t.space.xs)
+            .px(t.space.md + t.space.xxs)
+            .child(line(title, semibold, c.text_primary).flex_none())
+            .child(line(detail_text, t.text.caption, c.text_tertiary).flex_1())
+            .when(self.picker_can_inherit(&target), |d| {
+                d.child(
+                    focusable(div().id("use-everything-model"), t)
+                        .flex_none()
+                        .px(t.space.xs)
+                        .rounded(t.radius.sm)
+                        .cursor_pointer()
+                        .type_style(detail(t))
+                        .text_color(c.text_secondary)
+                        .hover(|s| s.text_color(c.text_primary).bg(c.hover_raised))
+                        .child("Use the Everything model")
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.close_picker(window, cx);
+                            this.apply_selection(&target, None, cx);
+                        })),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// The rail: Favorites, a divider, then one button per account. The
+    /// selected button has `surface.selected` and an accent bar on the
+    /// rail's right edge. Accounts of one provider carry badges.
+    fn render_rail(
+        &self,
+        groups: &[ModelGroupView],
+        open: &OpenPicker,
+        t: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let c = &t.colors;
+        let size = t.component.picker_rail_button;
+        let ring = t.focus_ring();
+        let mut rail = div()
+            .id("picker-rail")
+            .flex()
+            .flex_col()
+            .flex_none()
+            .items_center()
+            .gap(t.space.xs)
+            .w(t.component.picker_rail)
+            .py(t.space.xs + t.space.xxs)
+            .bg(c.surface_card)
+            .border_r(t.border_width)
+            .border_color(c.border_subtle)
+            .overflow_y_scroll()
+            .track_scroll(&open.rail_scroll);
+        for (index, item) in picker::rail(groups).into_iter().enumerate() {
+            let selected = item.view == open.view;
+            let content: AnyElement = match &item.view {
+                PickerView::Favorites => {
+                    icon("star-filled", t.component.provider_logo, c.accent_text).into_any_element()
+                }
+                PickerView::Account(label) => {
+                    let logo = groups
+                        .iter()
+                        .find(|g| &g.account_label == label)
+                        .map(|g| g.logo.clone())
+                        .unwrap_or_default();
+                    provider_logo(&logo, t.component.provider_logo, c.text_primary)
+                }
+            };
+            let view = item.view.clone();
+            let button = div()
+                .id(("picker-rail-item", index))
+                .relative()
+                .flex()
+                .flex_none()
+                .items_center()
+                .justify_center()
+                .size(size)
+                .rounded(t.radius.md)
+                .cursor_pointer()
+                .when(selected, |d| d.bg(c.surface_selected))
+                .when(!selected, |d| d.hover(|s| s.bg(c.hover_card)))
+                .when(
+                    selected && open.focus == (PickerFocus::Rail { ring: true }),
+                    |d| d.shadow(ring.clone()),
+                )
+                .child(content)
+                .when_some(item.badge, |d, badge| {
+                    d.child(rail_badge(badge, selected, t))
+                })
+                .when(selected, |d| {
+                    // The bar sits on the rail's right edge, centred on the
+                    // button.
+                    d.child(
+                        div()
+                            .absolute()
+                            .right(-(t.component.picker_rail - size) / 2.0)
+                            .top((size - t.component.picker_rail_marker_height) / 2.0)
+                            .w(t.component.picker_rail_marker)
+                            .h(t.component.picker_rail_marker_height)
+                            .rounded(t.radius.sm)
+                            .bg(c.accent_text),
+                    )
+                })
+                .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                    if let Some(open) = this.picker.as_mut() {
+                        if *hovered {
+                            open.rail_hover = Some(index);
+                        } else if open.rail_hover == Some(index) {
+                            open.rail_hover = None;
+                        }
+                    }
+                    cx.notify();
+                }))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.set_picker_focus(PickerFocus::Rail { ring: false });
+                    this.show_picker_view(view.clone(), cx);
+                }));
+            rail = rail.child(button);
+            if index == 0 {
+                rail = rail.child(
+                    div()
+                        .flex_none()
+                        .w(size - t.space.sm)
+                        .h(t.border_width)
+                        .bg(c.border_strong),
+                );
+            }
+        }
+        rail.into_any_element()
+    }
+
+    /// The tooltip of the rail button under the pointer: the account name
+    /// and its workers, or Favorites. It shows to the right of the button,
+    /// above the main pane. `None` when no button is under the pointer.
+    pub fn render_picker_tooltip(&self, t: &Tokens) -> Option<AnyElement> {
+        let open = self.picker.as_ref()?;
+        let index = open.rail_hover?;
+        let bounds = open.rail_scroll.bounds_for_item(rail_child(index))?;
+        let item = picker::rail(&self.state.model_groups)
+            .into_iter()
+            .nth(index)?;
+        let (title, detail_text) = match &item.view {
+            PickerView::Favorites => ("Favorites".to_owned(), "From every account".to_owned()),
+            PickerView::Account(label) => (
+                label.clone(),
+                self.state
+                    .model_groups
+                    .iter()
+                    .find(|g| &g.account_label == label)
+                    .map(|g| g.workers.join(", "))
+                    .unwrap_or_default(),
+            ),
+        };
+        let c = &t.colors;
+        let tip = div()
+            .flex()
+            .flex_col()
+            .px(t.space.sm)
+            .py(t.space.xs)
+            .bg(c.surface_card)
+            .border(t.border_width)
+            .border_color(c.border_strong)
+            .rounded(t.radius.md)
+            .shadow(t.shadow_float())
+            .font_family(t.font_sans.clone())
+            .whitespace_nowrap()
+            .child(text(title, t.text.ui_strong, c.text_primary))
+            .when(!detail_text.is_empty(), |d| {
+                d.child(text(detail_text, t.text.caption, c.text_secondary))
+            });
+        Some(
+            deferred(
+                anchored()
+                    .position(point(bounds.right() + t.space.sm, bounds.top()))
+                    .snap_to_window()
+                    .child(tip),
+            )
+            .with_priority(3)
+            .into_any_element(),
+        )
+    }
+
+    /// The model rows, in a list that scrolls inside the picker. `wide`
+    /// rows (Favorites and search) show the provider logo and the account
+    /// name. `hint` ends the list with the note about stars.
+    #[allow(clippy::too_many_arguments)]
+    fn render_picker_list(
+        &self,
+        groups: &[ModelGroupView],
+        rows: &[RowRef],
+        open: &OpenPicker,
+        current: Option<&SelectionView>,
+        wide: bool,
+        hint: bool,
+        t: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let c = &t.colors;
         let mut list = div()
             .id("model-list")
             .flex()
             .flex_col()
             .gap(t.border_width)
-            .max_h(t.component.model_list_max)
-            .p(t.space.xs + t.space.xxs)
+            .size_full()
+            .px(t.space.xs + t.space.xxs)
+            .pt(t.space.xxs)
+            .pb(t.space.xs + t.space.xxs)
             .overflow_y_scroll()
             .track_scroll(&open.scroll);
-        for row in picker_rows(groups) {
-            match row {
-                PickerRow::Group(gi) => {
-                    // The space between groups is a margin, so every header
-                    // row has the height of the pinned header.
-                    list =
-                        list.child(group_header(&groups[gi], t).when(gi > 0, |d| d.mt(t.space.sm)));
-                }
-                PickerRow::Model(gi, mi, n) => {
-                    let group = &groups[gi];
-                    let model = &group.models[mi];
-                    let selected = current.is_some_and(|s| {
-                        s.account_label == group.account_label && s.model_id == model.id
-                    });
-                    let highlighted = open.highlighted == Some(n);
-                    let range = model.effort.as_ref().map(EffortView::range_label);
-                    list = list.child(
-                        div()
-                            .id(SharedString::from(format!(
-                                "model-row-{}-{}",
-                                group.account_label, model.id
-                            )))
-                            .flex()
-                            .flex_none()
-                            .items_center()
-                            .gap(t.space.sm)
-                            .py(t.space.xs + t.space.xxs)
-                            .pl(indent)
-                            .pr(t.space.sm)
-                            .rounded(t.radius.md)
-                            .cursor_pointer()
-                            .when(selected && !highlighted, |d| d.bg(c.surface_selected))
-                            .when(selected && highlighted, |d| d.bg(c.hover_selected))
-                            .when(!selected && highlighted, |d| d.bg(c.hover_raised))
-                            .when(!selected, |d| d.hover(|s| s.bg(c.hover_raised)))
-                            .child(
-                                line(
-                                    model.name.clone(),
-                                    if selected {
-                                        t.text.ui_strong
-                                    } else {
-                                        t.text.ui
-                                    },
-                                    c.text_primary,
-                                )
-                                .flex_1(),
-                            )
-                            .when_some(range, |d, range| {
-                                // `text.tertiary` never sits on `surface.selected`.
-                                d.child(text(
-                                    range,
-                                    t.text.caption,
-                                    if selected {
-                                        c.text_secondary
-                                    } else {
-                                        c.text_tertiary
-                                    },
-                                ))
-                            })
-                            .child(div().flex_none().w(t.icon.dense).when(selected, |d| {
-                                d.child(icon("check", t.icon.dense, c.accent_text))
-                            }))
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                this.choose_model_row(n, window, cx)
-                            })),
-                    );
-                }
-            }
+        for (n, row) in rows.iter().copied().enumerate() {
+            let group = &groups[row.group];
+            let model = &group.models[row.model];
+            let selected = current
+                .is_some_and(|s| s.account_label == group.account_label && s.model_id == model.id);
+            let highlighted = open.highlighted == Some(n);
+            let favorite = self.state.is_favorite(&group.account_label, &model.id);
+            list = list.child(self.render_model_row(
+                n,
+                group,
+                model,
+                RowLook {
+                    wide,
+                    selected,
+                    highlighted,
+                    favorite,
+                },
+                t,
+                cx,
+            ));
+        }
+        if hint {
+            list = list.child(
+                div()
+                    .flex_none()
+                    .px(t.space.sm)
+                    .pt(t.space.md + t.space.xxs)
+                    .pb(t.space.xs)
+                    .child(text(
+                        "Star a model in any account to add it here.",
+                        consort_theme::Type {
+                            line: t.text.caption.line,
+                            ..detail(t)
+                        },
+                        c.text_tertiary,
+                    )),
+            );
         }
         // The list never stops at a hard edge (AGENTS.md rule 3): it fades
         // into the popover where more rows are above or below.
@@ -914,53 +1163,19 @@ impl ConsortApp {
         let above = offset.y < -Pixels::from(0.5);
         let below = -offset.y + Pixels::from(0.5) < max.y;
         let fade = t.space.xl + t.space.md;
-        // The header of the group in view sticks under the search field.
-        // The bounds are from the last frame, which is how the list lies now.
-        let list_top = open.scroll.bounds().top();
-        let rows = picker_rows(groups);
-        let header_rows: Vec<usize> = rows
-            .iter()
-            .enumerate()
-            .filter_map(|(i, row)| matches!(row, PickerRow::Group(_)).then_some(i))
-            .collect();
-        let tops: Option<Vec<f32>> = header_rows
-            .iter()
-            .map(|row| {
-                open.scroll
-                    .bounds_for_item(*row)
-                    .map(|b| f32::from(b.top() - list_top))
-            })
-            .collect();
-        let height = header_rows
-            .first()
-            .and_then(|row| open.scroll.bounds_for_item(*row))
-            .map(|b| f32::from(b.size.height));
-        let pinned = tops
-            .zip(height)
-            .filter(|(tops, _)| tops.len() == groups.len())
-            .and_then(|(tops, height)| pinned_header(&tops, height, f32::from(-offset.y)));
-        let pinned_height = height.map(Pixels::from).unwrap_or_default();
         div()
             .relative()
             .flex()
             .flex_col()
+            .flex_1()
             .min_h_0()
-            // A header that the next one pushes up leaves at the top edge
-            // of the list, not over the search field.
             .overflow_hidden()
             .child(list)
             .when(above, |d| {
-                // The top fade starts under a pinned header, so the header
-                // stays solid and the rows fade below it.
-                let start = if pinned.is_some() {
-                    pinned_height
-                } else {
-                    Pixels::ZERO
-                };
                 d.child(
                     div()
                         .absolute()
-                        .top(start)
+                        .top_0()
                         .left_0()
                         .right_0()
                         .h(fade)
@@ -986,20 +1201,130 @@ impl ConsortApp {
                         )),
                 )
             })
-            .when_some(pinned, |d, (gi, y)| {
-                d.child(
-                    div()
-                        .absolute()
-                        .top(Pixels::from(y))
-                        .left_0()
-                        .right_0()
-                        .px(t.space.xs + t.space.xxs)
-                        .bg(c.surface_raised)
-                        // Rows under the header take no hover or click.
-                        .occlude()
-                        .child(group_header(&groups[gi], t)),
+            .into_any_element()
+    }
+
+    /// One model row: the name, then (in an account) the effort range or
+    /// (in Favorites and search) the provider logo before the name and the
+    /// account name after it, then the star and the check.
+    fn render_model_row(
+        &self,
+        n: usize,
+        group: &ModelGroupView,
+        model: &consort_client::ModelChoiceView,
+        look: RowLook,
+        t: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let c = &t.colors;
+        let RowLook {
+            wide,
+            selected,
+            highlighted,
+            favorite,
+        } = look;
+        let name = line(
+            model.name.clone(),
+            if selected {
+                t.text.ui_strong
+            } else {
+                t.text.ui
+            },
+            c.text_primary,
+        );
+        // `text.tertiary` never sits on `surface.selected`.
+        let muted = if selected {
+            c.text_secondary
+        } else {
+            c.text_tertiary
+        };
+        let label = group.account_label.clone();
+        let id = model.id.clone();
+        // The star is filled for a favorite. Otherwise it shows as an
+        // outline only while the pointer or the keyboard is on the row.
+        let star_color = if favorite {
+            c.accent_text
+        } else if highlighted {
+            c.text_secondary
+        } else {
+            transparent_black()
+        };
+        let star = div()
+            .id(("picker-star", n))
+            .relative()
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .size(t.icon.dense)
+            .cursor_pointer()
+            .when(highlighted, |d| d.child(self.triggers.track("picker-star")))
+            .child(
+                icon(
+                    if favorite { "star-filled" } else { "star" },
+                    t.icon.dense,
+                    star_color,
                 )
+                .when(!favorite, |s| {
+                    s.group_hover("picker-row", |s| s.text_color(c.text_secondary))
+                }),
+            )
+            // A click on the star changes the favorite only. It does not
+            // choose the model or close the picker.
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.toggle_favorite(label.clone(), id.clone(), cx);
+            }));
+        let range = (!wide)
+            .then(|| model.effort.as_ref().map(EffortView::range_label))
+            .flatten();
+        div()
+            .id(SharedString::from(format!(
+                "model-row-{}-{}",
+                group.account_label, model.id
+            )))
+            .group("picker-row")
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(if wide {
+                t.space.sm + t.space.xxs
+            } else {
+                t.space.sm
             })
+            .py(t.space.xs + t.space.xxs)
+            .px(t.space.sm)
+            .rounded(t.radius.md)
+            .cursor_pointer()
+            .when(selected && !highlighted, |d| d.bg(c.surface_selected))
+            .when(selected && highlighted, |d| d.bg(c.hover_selected))
+            .when(!selected && highlighted, |d| d.bg(c.hover_raised))
+            .when(!selected, |d| d.hover(|s| s.bg(c.hover_raised)))
+            .map(|d| {
+                if wide {
+                    d.child(provider_logo(&group.logo, t.icon.dense, c.text_primary))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_1()
+                                .min_w_0()
+                                .items_center()
+                                .gap(t.space.sm)
+                                .child(name.flex_none())
+                                .child(line(group.account_label.clone(), t.text.caption, muted)),
+                        )
+                } else {
+                    d.child(name.flex_1()).when_some(range, |d, range| {
+                        d.child(text(range, t.text.caption, muted))
+                    })
+                }
+            })
+            .child(star)
+            .child(div().flex_none().w(t.icon.dense).when(selected, |d| {
+                d.child(icon("check", t.icon.dense, c.accent_text))
+            }))
+            .on_click(cx.listener(move |this, _, window, cx| this.choose_model_row(n, window, cx)))
             .into_any_element()
     }
 
@@ -1105,42 +1430,44 @@ impl ConsortApp {
     }
 }
 
-/// The header of a group: the provider logo, the account name and the
-/// workers where the account is signed in.
-fn group_header(group: &ModelGroupView, t: &Tokens) -> Div {
-    let c = &t.colors;
-    div()
-        .flex()
-        .flex_none()
-        .items_center()
-        .gap(t.space.sm)
-        .px(t.space.sm)
-        .pt(t.space.xs)
-        .pb(t.space.xs)
-        .child(provider_logo(&group.logo, t.icon.dense, c.text_secondary))
-        .child(line(group.account_label.clone(), t.text.label, c.text_secondary).flex_none())
-        .child(line(
-            group.workers.join(", "),
-            t.text.caption,
-            c.text_tertiary,
-        ))
+/// How a model row looks.
+#[derive(Clone, Copy)]
+struct RowLook {
+    /// A row of Favorites or of a search: logo and account name.
+    wide: bool,
+    selected: bool,
+    highlighted: bool,
+    favorite: bool,
 }
 
-/// The group header that sticks to the top of the list, and where it sits.
-///
-/// `tops` are the tops of the group headers in the list content, in order,
-/// and `height` is the height of a header. `scrolled` is how far the list
-/// has scrolled down. The pinned header is the last one whose top has
-/// scrolled past the top of the list. The next header pushes it up as it
-/// arrives, so the returned offset is 0 or less. `None` when no header has
-/// scrolled past the top, so the headers sit in the list as they are.
-pub fn pinned_header(tops: &[f32], height: f32, scrolled: f32) -> Option<(usize, f32)> {
-    let index = tops.iter().rposition(|top| *top < scrolled)?;
-    let y = match tops.get(index + 1) {
-        Some(next) => (next - scrolled - height).min(0.0),
-        None => 0.0,
-    };
-    Some((index, y))
+/// The badge on an account button of the rail, such as "P1": at its bottom
+/// right corner, on `surface.raised` with a `border.strong` ring.
+fn rail_badge(badge: String, selected: bool, t: &Tokens) -> impl IntoElement {
+    let c = &t.colors;
+    let side = t.component.picker_rail_badge;
+    div()
+        .absolute()
+        .bottom(t.border_width)
+        .right(t.border_width)
+        .flex()
+        .items_center()
+        .justify_center()
+        .h(side)
+        .min_w(side)
+        .px(t.space.xxs + t.border_width)
+        .bg(c.surface_raised)
+        .border(t.border_width)
+        .border_color(c.border_strong)
+        .rounded(t.radius.full)
+        .text_size(t.component.picker_rail_badge_text)
+        .line_height(side - t.border_width * 2.0)
+        .font_weight(t.text.title.weight)
+        .text_color(if selected {
+            c.text_primary
+        } else {
+            c.text_secondary
+        })
+        .child(badge)
 }
 
 /// One row of the effort menu.
@@ -1200,46 +1527,11 @@ fn effort_row(
 mod tests {
     use super::*;
 
-    fn groups() -> Vec<ModelGroupView> {
-        consort_client::mock::model_groups()
-    }
-
     #[test]
-    fn rows_put_each_group_header_before_its_models() {
-        let groups = groups();
-        let rows = picker_rows(&groups);
-        assert_eq!(rows[0], PickerRow::Group(0));
-        assert_eq!(rows[1], PickerRow::Model(0, 0, 0));
-        let models = rows
-            .iter()
-            .filter(|r| matches!(r, PickerRow::Model(..)))
-            .count();
-        assert_eq!(models, model_count(&groups));
-        assert_eq!(rows.len(), models + groups.len());
-        // The second group's first model is the row after its header.
-        let second = groups[0].models.len();
-        assert_eq!(row_of_model(&groups, second), Some(second + 2));
-        assert_eq!(nth_model(&groups, second), Some((1, 0)));
-    }
-
-    #[test]
-    fn the_header_of_the_group_in_view_is_pinned_and_pushed_up_by_the_next() {
-        // Three groups: headers at 6, 150 and 300, each 24 high.
-        let tops = [6.0, 150.0, 300.0];
-        // At the top, the headers sit in the list.
-        assert_eq!(pinned_header(&tops, 24.0, 0.0), None);
-        assert_eq!(pinned_header(&tops, 24.0, 6.0), None);
-        // The first header has scrolled past the top: it is pinned.
-        assert_eq!(pinned_header(&tops, 24.0, 7.0), Some((0, 0.0)));
-        assert_eq!(pinned_header(&tops, 24.0, 100.0), Some((0, 0.0)));
-        // The second header arrives and pushes the first one up.
-        assert_eq!(pinned_header(&tops, 24.0, 136.0), Some((0, -10.0)));
-        assert_eq!(pinned_header(&tops, 24.0, 149.0), Some((0, -23.0)));
-        // Then it replaces it.
-        assert_eq!(pinned_header(&tops, 24.0, 151.0), Some((1, 0.0)));
-        // The last header stays pinned to the end.
-        assert_eq!(pinned_header(&tops, 24.0, 900.0), Some((2, 0.0)));
-        assert_eq!(pinned_header(&[], 24.0, 50.0), None);
+    fn the_rail_divider_comes_after_favorites() {
+        assert_eq!(rail_child(0), 0);
+        assert_eq!(rail_child(1), 2);
+        assert_eq!(rail_child(4), 5);
     }
 
     #[test]

@@ -1,13 +1,14 @@
-//! The data of the model picker: the groups of models by account, the search
-//! filter, the effort levels of a model, and the rules that make a new
-//! selection when the user chooses a model or an effort. Every function is
+//! The data of the model picker: the groups of models by account, the rail
+//! with its badges, the Favorites view, the search across accounts, the
+//! effort levels of a model, and the rules that make a new selection when
+//! the user chooses a model or an effort. Every function is
 //! pure, so each client draws the same picker from the same view state.
 
 use consort_proto::model::{AuthState, HarnessAccount, OptionDescriptor};
 
 use crate::view::{
-    EffectiveSelection, EffortLevel, EffortView, ModelChoiceView, ModelGroupView, ProviderLogo,
-    SelectionOption, SelectionSource, SelectionView,
+    EffectiveSelection, EffortLevel, EffortView, FavoriteModelView, ModelChoiceView,
+    ModelGroupView, ProviderLogo, SelectionOption, SelectionSource, SelectionView,
 };
 
 /// The option ID of the effort in a model selection.
@@ -114,12 +115,27 @@ pub fn model_groups<'a>(
     groups
 }
 
-/// The groups and models that match a search. Each word of the query must
-/// be in the model name, the model ID, the account name or the provider
-/// name, in any case. A group with no match is left out. An empty query
-/// keeps everything.
+/// The lowercase words of a search query.
+fn query_words(query: &str) -> Vec<String> {
+    query.split_whitespace().map(str::to_lowercase).collect()
+}
+
+/// Whether a model matches every word of a search: each word must be in the
+/// model name, the model ID, the account name or the provider name, in any
+/// case.
+fn matches(group: &ModelGroupView, model: &ModelChoiceView, words: &[String]) -> bool {
+    let text = format!(
+        "{}\n{}\n{}\n{}",
+        model.name, model.id, group.account_label, group.provider
+    )
+    .to_lowercase();
+    words.iter().all(|w| text.contains(w.as_str()))
+}
+
+/// The groups and models that match a search (see [`matches`]). A group
+/// with no match is left out. An empty query keeps everything.
 pub fn filter(groups: &[ModelGroupView], query: &str) -> Vec<ModelGroupView> {
-    let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+    let words = query_words(query);
     if words.is_empty() {
         return groups.to_vec();
     }
@@ -129,20 +145,248 @@ pub fn filter(groups: &[ModelGroupView], query: &str) -> Vec<ModelGroupView> {
             let models: Vec<ModelChoiceView> = group
                 .models
                 .iter()
-                .filter(|model| {
-                    let text = format!(
-                        "{}\n{}\n{}\n{}",
-                        model.name, model.id, group.account_label, group.provider
-                    )
-                    .to_lowercase();
-                    words.iter().all(|w| text.contains(w.as_str()))
-                })
+                .filter(|model| matches(group, model, &words))
                 .cloned()
                 .collect();
             (!models.is_empty()).then(|| ModelGroupView {
                 models,
                 ..group.clone()
             })
+        })
+        .collect()
+}
+
+/// One model row of the picker, by its group index and its model index in
+/// that group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RowRef {
+    pub group: usize,
+    pub model: usize,
+}
+
+/// What the main pane of the picker shows when the search is empty.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PickerView {
+    /// The favorite models of every account.
+    Favorites,
+    /// The models of the account with this label.
+    Account(String),
+}
+
+/// The rows of a search: the models of every account that match, in the
+/// order of the groups. Empty for an empty query.
+pub fn search_rows(groups: &[ModelGroupView], query: &str) -> Vec<RowRef> {
+    let words = query_words(query);
+    if words.is_empty() {
+        return Vec::new();
+    }
+    let mut rows = Vec::new();
+    for (gi, group) in groups.iter().enumerate() {
+        for (mi, model) in group.models.iter().enumerate() {
+            if matches(group, model, &words) {
+                rows.push(RowRef {
+                    group: gi,
+                    model: mi,
+                });
+            }
+        }
+    }
+    rows
+}
+
+/// The rows of the Favorites view, in the order that the user starred the
+/// models. A favorite whose account is not signed in on any worker now, or
+/// whose account no longer offers the model, stays stored on the hub, but
+/// has no row.
+pub fn favorite_rows(groups: &[ModelGroupView], favorites: &[FavoriteModelView]) -> Vec<RowRef> {
+    let mut rows: Vec<RowRef> = Vec::new();
+    for favorite in favorites {
+        let Some(gi) = groups
+            .iter()
+            .position(|g| g.account_label == favorite.account_label)
+        else {
+            continue;
+        };
+        let Some(mi) = groups[gi]
+            .models
+            .iter()
+            .position(|m| m.id == favorite.model_id)
+        else {
+            continue;
+        };
+        let row = RowRef {
+            group: gi,
+            model: mi,
+        };
+        if !rows.contains(&row) {
+            rows.push(row);
+        }
+    }
+    rows
+}
+
+/// The rows that the main pane shows: the search results while the query
+/// has a word, else the rows of the view.
+pub fn view_rows(
+    groups: &[ModelGroupView],
+    favorites: &[FavoriteModelView],
+    view: &PickerView,
+    query: &str,
+) -> Vec<RowRef> {
+    if !query_words(query).is_empty() {
+        return search_rows(groups, query);
+    }
+    match view {
+        PickerView::Favorites => favorite_rows(groups, favorites),
+        PickerView::Account(label) => groups
+            .iter()
+            .position(|g| &g.account_label == label)
+            .map(|gi| {
+                (0..groups[gi].models.len())
+                    .map(|mi| RowRef {
+                        group: gi,
+                        model: mi,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
+/// The view that the picker opens on: Favorites when at least one favorite
+/// has a row, else the account of the current selection, else the first
+/// account. With no account at all, Favorites (the picker then shows that
+/// no account is signed in).
+pub fn initial_view(
+    groups: &[ModelGroupView],
+    favorites: &[FavoriteModelView],
+    current: Option<&SelectionView>,
+) -> PickerView {
+    if !favorite_rows(groups, favorites).is_empty() {
+        return PickerView::Favorites;
+    }
+    current
+        .and_then(|s| groups.iter().find(|g| g.account_label == s.account_label))
+        .or_else(|| groups.first())
+        .map(|g| PickerView::Account(g.account_label.clone()))
+        .unwrap_or(PickerView::Favorites)
+}
+
+/// One button of the picker's rail.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RailItem {
+    pub view: PickerView,
+    /// The short label on the logo of an account whose provider has more
+    /// than one account here, such as "P1". `None` for Favorites and for
+    /// the only account of a provider.
+    pub badge: Option<String>,
+}
+
+/// The rail: Favorites first, then one button per account, in the order of
+/// the groups (the inventory order). Accounts that share a provider get
+/// badges (see [`badge_labels`]).
+pub fn rail(groups: &[ModelGroupView]) -> Vec<RailItem> {
+    let mut badges: Vec<Option<String>> = vec![None; groups.len()];
+    let mut providers: Vec<&str> = Vec::new();
+    for group in groups {
+        if !providers.contains(&group.provider.as_str()) {
+            providers.push(&group.provider);
+        }
+    }
+    for provider in providers {
+        let members: Vec<usize> = (0..groups.len())
+            .filter(|i| groups[*i].provider == provider)
+            .collect();
+        if members.len() < 2 {
+            continue;
+        }
+        let labels: Vec<&str> = members
+            .iter()
+            .map(|i| groups[*i].account_label.as_str())
+            .collect();
+        for (i, badge) in members.into_iter().zip(badge_labels(&labels)) {
+            badges[i] = Some(badge);
+        }
+    }
+    std::iter::once(RailItem {
+        view: PickerView::Favorites,
+        badge: None,
+    })
+    .chain(groups.iter().zip(badges).map(|(g, badge)| RailItem {
+        view: PickerView::Account(g.account_label.clone()),
+        badge,
+    }))
+    .collect()
+}
+
+/// The most characters in a rail badge.
+pub const BADGE_MAX_CHARS: usize = 3;
+
+/// The words of an account label for a badge. A word of digits only joins
+/// the word before it, so "Personal 1" is one word, "Personal1".
+fn badge_words(label: &str) -> Vec<String> {
+    let mut words: Vec<String> = Vec::new();
+    for word in label.split_whitespace() {
+        let digits = word.chars().all(|c| c.is_ascii_digit());
+        match words.last_mut() {
+            Some(last) if digits => last.push_str(word),
+            _ => words.push(word.to_owned()),
+        }
+    }
+    words
+}
+
+/// The badge part of one word: its first letter or digit in upper case,
+/// plus the digits at its end. "Personal1" gives "P1", "Work" gives "W",
+/// and "2" gives "2".
+fn word_badge(word: &str) -> String {
+    let body = word.trim_end_matches(|c: char| c.is_ascii_digit());
+    let digits = &word[body.len()..];
+    match body.chars().find(|c| c.is_alphanumeric()) {
+        Some(first) => first.to_uppercase().chain(digits.chars()).collect(),
+        None => digits.to_owned(),
+    }
+}
+
+/// The short labels that tell apart the accounts of one provider, in the
+/// order of `labels`. For each label, keep the words that no other label
+/// has (in any case, after a number joins the word before it). The badge is
+/// the first letter of each kept word, in upper case, plus the digits at
+/// the end of the word, cut to [`BADGE_MAX_CHARS`]. So "Claude Code
+/// Personal 1" and "Claude Code Personal 2" give "P1" and "P2", and
+/// "Claude Work" next to them gives "W". A label with no word of its own,
+/// or a badge that two labels share, gets its position instead ("1", "2").
+pub fn badge_labels(labels: &[&str]) -> Vec<String> {
+    let words: Vec<Vec<String>> = labels.iter().map(|l| badge_words(l)).collect();
+    let badges: Vec<String> = words
+        .iter()
+        .enumerate()
+        .map(|(i, own)| {
+            let others: Vec<String> = words
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| *j != i)
+                .flat_map(|(_, ws)| ws.iter().map(|w| w.to_lowercase()))
+                .collect();
+            own.iter()
+                .filter(|w| !others.contains(&w.to_lowercase()))
+                .map(|w| word_badge(w))
+                .collect::<String>()
+                .chars()
+                .take(BADGE_MAX_CHARS)
+                .collect()
+        })
+        .collect();
+    badges
+        .iter()
+        .enumerate()
+        .map(|(i, badge)| {
+            let shared = badges.iter().filter(|b| *b == badge).count() > 1;
+            if badge.is_empty() || shared {
+                (i + 1).to_string()
+            } else {
+                badge.clone()
+            }
         })
         .collect()
 }
@@ -276,39 +520,6 @@ pub fn effective_selection(
             source: SelectionSource::Everything,
         }),
         (None, None) => None,
-    }
-}
-
-/// What a choice in the picker changes. The picker says it in its footer.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum PickerPurpose {
-    /// The assistant in Everything, and the default for every channel.
-    Everything,
-    /// The assistant in the channel with this name.
-    Channel(String),
-    /// The tasks of the channel with this name.
-    Tasks(String),
-}
-
-impl PickerPurpose {
-    /// The footer line of the picker.
-    pub fn footer(&self) -> String {
-        match self {
-            PickerPurpose::Everything => "The assistant in Everything uses this model. Channels without their own model use it too.".to_owned(),
-            PickerPurpose::Channel(name) => format!("The assistant in {} uses this model.", channel_words(name)),
-            PickerPurpose::Tasks(name) => format!("Tasks in {} start with this model.", channel_words(name)),
-        }
-    }
-}
-
-/// A channel name in a sentence. A channel with no name yet, in the New
-/// channel dialog, is "this channel".
-fn channel_words(name: &str) -> String {
-    let name = name.trim();
-    if name.is_empty() {
-        "this channel".to_owned()
-    } else {
-        name.to_owned()
     }
 }
 
@@ -576,23 +787,6 @@ mod tests {
     }
 
     #[test]
-    fn the_footer_says_what_a_choice_changes() {
-        assert!(
-            PickerPurpose::Everything
-                .footer()
-                .contains("Channels without their own model")
-        );
-        assert_eq!(
-            PickerPurpose::Channel("sayso".into()).footer(),
-            "The assistant in sayso uses this model."
-        );
-        assert_eq!(
-            PickerPurpose::Tasks(" ".into()).footer(),
-            "Tasks in this channel start with this model."
-        );
-    }
-
-    #[test]
     fn a_selection_in_words() {
         let groups = groups();
         let work = &groups[0];
@@ -605,5 +799,174 @@ mod tests {
             selection_words(&sel, None),
             "Model opus, Claude Work, High effort"
         );
+    }
+
+    fn fav(label: &str, id: &str) -> FavoriteModelView {
+        FavoriteModelView {
+            account_label: label.into(),
+            model_id: id.into(),
+        }
+    }
+
+    fn group(label: &str, provider: &str, models: &[&str]) -> ModelGroupView {
+        ModelGroupView {
+            account_label: label.into(),
+            provider: provider.into(),
+            models: models
+                .iter()
+                .map(|id| ModelChoiceView {
+                    id: (*id).into(),
+                    name: (*id).into(),
+                    effort: None,
+                })
+                .collect(),
+            ..ModelGroupView::default()
+        }
+    }
+
+    #[test]
+    fn badges_keep_the_words_of_each_account_as_initials_and_digits() {
+        assert_eq!(
+            badge_labels(&["Claude Code Personal 1", "Claude Code Personal 2"]),
+            ["P1", "P2"]
+        );
+        assert_eq!(
+            badge_labels(&[
+                "Claude Code Personal 1",
+                "Claude Code Personal 2",
+                "Claude Work"
+            ]),
+            ["P1", "P2", "W"]
+        );
+        assert_eq!(
+            badge_labels(&["Claude Personal", "Claude Work"]),
+            ["P", "W"]
+        );
+        // The case of a word does not make it differ.
+        assert_eq!(badge_labels(&["codex home", "Codex Lab"]), ["H", "L"]);
+        // Digits at the end of a word stay, and the badge has at most three
+        // characters.
+        assert_eq!(
+            badge_labels(&["Team gpu12", "Team Alpha Beta Gamma"]),
+            ["G12", "ABG"]
+        );
+        assert_eq!(badge_labels(&["Lab 120", "Lab 7"]), ["L12", "L7"]);
+        // A label with no word of its own, and two labels with one badge,
+        // get their positions.
+        assert_eq!(badge_labels(&["Claude", "Claude Work"]), ["1", "W"]);
+        assert_eq!(
+            badge_labels(&["Personal Mac", "Project Mini", "Work"]),
+            ["1", "2", "W"]
+        );
+    }
+
+    #[test]
+    fn the_rail_has_favorites_then_every_account_in_order_with_badges() {
+        let groups = vec![
+            group("Claude Code Personal 1", "Claude Code", &["opus"]),
+            group("Codex Personal", "Codex", &["gpt"]),
+            group("Claude Code Personal 2", "Claude Code", &["opus"]),
+            group("Claude Work", "Claude Code", &["sonnet"]),
+        ];
+        let rail = rail(&groups);
+        let views: Vec<PickerView> = rail.iter().map(|r| r.view.clone()).collect();
+        assert_eq!(
+            views,
+            [
+                PickerView::Favorites,
+                PickerView::Account("Claude Code Personal 1".into()),
+                PickerView::Account("Codex Personal".into()),
+                PickerView::Account("Claude Code Personal 2".into()),
+                PickerView::Account("Claude Work".into()),
+            ]
+        );
+        let badges: Vec<Option<&str>> = rail.iter().map(|r| r.badge.as_deref()).collect();
+        assert_eq!(
+            badges,
+            [None, Some("P1"), None, Some("P2"), Some("W")],
+            "only the provider with more than one account has badges"
+        );
+        assert_eq!(super::rail(&[]).len(), 1, "Favorites is always there");
+    }
+
+    #[test]
+    fn favorites_hide_a_gone_account_or_model_and_keep_their_order() {
+        let groups = vec![
+            group("Claude Work", "Claude Code", &["opus", "sonnet"]),
+            group("Codex Personal", "Codex", &["gpt"]),
+        ];
+        let favorites = [
+            fav("Codex Personal", "gpt"),
+            fav("Claude Old", "opus"),
+            fav("Claude Work", "haiku"),
+            fav("Claude Work", "sonnet"),
+            fav("Codex Personal", "gpt"),
+        ];
+        assert_eq!(
+            favorite_rows(&groups, &favorites),
+            [RowRef { group: 1, model: 0 }, RowRef { group: 0, model: 1 }],
+            "a gone account or model has no row, and a row shows once"
+        );
+        assert!(favorite_rows(&groups, &[]).is_empty());
+    }
+
+    #[test]
+    fn the_picker_opens_on_favorites_else_the_account_of_the_selection() {
+        let groups = vec![
+            group("Claude Work", "Claude Code", &["opus"]),
+            group("Codex Personal", "Codex", &["gpt"]),
+        ];
+        let current = SelectionView {
+            account_label: "Codex Personal".into(),
+            model_id: "gpt".into(),
+            model_name: "gpt".into(),
+            options: Vec::new(),
+        };
+        assert_eq!(
+            initial_view(&groups, &[fav("Claude Work", "opus")], Some(&current)),
+            PickerView::Favorites
+        );
+        // A favorite with no row does not count.
+        assert_eq!(
+            initial_view(&groups, &[fav("Gone", "opus")], Some(&current)),
+            PickerView::Account("Codex Personal".into())
+        );
+        assert_eq!(
+            initial_view(&groups, &[], None),
+            PickerView::Account("Claude Work".into())
+        );
+        assert_eq!(initial_view(&[], &[], None), PickerView::Favorites);
+    }
+
+    #[test]
+    fn search_spans_every_account_and_replaces_the_view() {
+        let groups = vec![
+            group("Claude Work", "Claude Code", &["opus", "sonnet"]),
+            group("Claude Personal", "Claude Code", &["opus"]),
+            group("Codex Personal", "Codex", &["gpt"]),
+        ];
+        let favorites = [fav("Codex Personal", "gpt")];
+        let rows = view_rows(&groups, &favorites, &PickerView::Favorites, "opus");
+        assert_eq!(
+            rows,
+            [RowRef { group: 0, model: 0 }, RowRef { group: 1, model: 0 }],
+            "the search finds models in every account, not only the favorites"
+        );
+        assert_eq!(
+            view_rows(&groups, &favorites, &PickerView::Favorites, "  "),
+            [RowRef { group: 2, model: 0 }]
+        );
+        assert_eq!(
+            view_rows(
+                &groups,
+                &favorites,
+                &PickerView::Account("Claude Work".into()),
+                ""
+            )
+            .len(),
+            2
+        );
+        assert!(search_rows(&groups, "").is_empty());
+        assert!(search_rows(&groups, "nothing").is_empty());
     }
 }

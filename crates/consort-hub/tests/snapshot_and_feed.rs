@@ -7,10 +7,11 @@ mod common;
 
 use common::*;
 use consort_proto::client_api::{
-    EntityPayload, MessageList, MessageSend, SnapshotScope, SyncSubscribe,
+    ClientPairingCode, EntityPayload, MessageList, MessageSend, PreferencesSetFavoriteModel,
+    SnapshotScope, SyncSubscribe,
 };
 use consort_proto::error::ErrorCode;
-use consort_proto::model::Author;
+use consort_proto::model::{Author, FavoriteModel};
 
 #[tokio::test]
 async fn a_snapshot_has_the_everything_channel_and_the_feed_position() {
@@ -209,5 +210,44 @@ async fn a_channel_filter_hides_the_entries_of_other_channels() {
     assert!(!client.feed.iter().any(
         |e| matches!(upserted(e), Some(EntityPayload::Message(m)) if m.body == "in everything")
     ));
+    hub.handle.shutdown().await.unwrap();
+}
+
+/// A star from one client reaches another client through the feed, and the
+/// next snapshot has it.
+#[tokio::test]
+async fn a_favorite_model_reaches_every_client() {
+    let hub = TestHub::start().await;
+    let mut desktop = FakeClient::pair_and_connect(&hub).await;
+    let code = desktop.request(ClientPairingCode {}).await.unwrap();
+    let mut phone = FakeClient::pair_with_code_and_connect(&hub, &code.code.to_string()).await;
+    let snapshot = phone.snapshot(SnapshotScope::All).await;
+    assert_eq!(
+        snapshot.preferences.map(|p| p.favorite_models.len()),
+        Some(0)
+    );
+    phone.subscribe(snapshot.seq).await.unwrap();
+
+    let opus = FavoriteModel {
+        account_label: "Claude Personal".into(),
+        model: "claude-opus-5-5".into(),
+    };
+    desktop
+        .request(PreferencesSetFavoriteModel {
+            model: opus.clone(),
+            favorite: true,
+        })
+        .await
+        .unwrap();
+    let entry = phone
+        .wait_feed(|e| matches!(upserted(e), Some(EntityPayload::Preferences(_))))
+        .await;
+    assert_eq!(entry.entity_id, "preferences");
+    let Some(EntityPayload::Preferences(preferences)) = upserted(&entry) else {
+        panic!("a preferences upsert");
+    };
+    assert_eq!(preferences.favorite_models, std::slice::from_ref(&opus));
+    let again = desktop.snapshot(SnapshotScope::All).await;
+    assert_eq!(again.preferences.unwrap().favorite_models, [opus]);
     hub.handle.shutdown().await.unwrap();
 }

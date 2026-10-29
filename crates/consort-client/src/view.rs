@@ -29,6 +29,11 @@ pub struct ViewState {
     /// the order of the inventory, with the models of that account on every
     /// worker where it is signed in. See [`crate::picker`].
     pub model_groups: Vec<ModelGroupView>,
+    /// The models that the user starred, from the hub's preferences, in the
+    /// order they were starred. Every client shows the same ones. A favorite
+    /// whose account or model is gone stays here, and the picker hides it
+    /// (see [`crate::picker::favorite_rows`]).
+    pub favorite_models: Vec<FavoriteModelView>,
     /// The sign-ins that this client started, newest last. A sign-in that
     /// another client started does not show (see DECISIONS row 269).
     pub sign_ins: Vec<SignInView>,
@@ -160,6 +165,14 @@ impl ViewState {
             .and_then(|(_, model)| model.effort.as_ref())
     }
 
+    /// Whether the user starred the model with this account label and
+    /// model ID.
+    pub fn is_favorite(&self, account_label: &str, model_id: &str) -> bool {
+        self.favorite_models
+            .iter()
+            .any(|f| f.account_label == account_label && f.model_id == model_id)
+    }
+
     /// The provider logo of the account with this label. Accounts with one
     /// label on several workers are one account, so the first one counts.
     pub fn account_logo(&self, label: &str) -> Option<&ProviderLogo> {
@@ -262,6 +275,13 @@ pub struct ModelGroupView {
     /// The union of the models of the account on those workers, in the
     /// order that the workers report them.
     pub models: Vec<ModelChoiceView>,
+}
+
+/// A model that the user starred: an account label and a model ID.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct FavoriteModelView {
+    pub account_label: String,
+    pub model_id: String,
 }
 
 /// One model in the picker.

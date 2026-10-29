@@ -209,8 +209,21 @@ pub struct Components {
     pub workspace_control: f32,
     /// The width of the model picker popover.
     pub model_picker: f32,
-    /// The tallest the model list in the picker grows before it scrolls.
-    pub model_list_max: f32,
+    /// The height of the model picker popover. The list of the main pane
+    /// scrolls inside it.
+    pub model_picker_height: f32,
+    /// The width of the rail at the left of the model picker.
+    pub picker_rail: f32,
+    /// A square button in the rail: Favorites or an account.
+    pub picker_rail_button: f32,
+    /// The height and the least width of the badge on an account button.
+    pub picker_rail_badge: f32,
+    /// The text size of that badge.
+    pub picker_rail_badge_text: f32,
+    /// The width of the accent bar that marks the selected rail button.
+    pub picker_rail_marker: f32,
+    /// The height of that bar.
+    pub picker_rail_marker_height: f32,
     /// The width of the effort menu.
     pub effort_menu: f32,
     /// The effort select next to a model field in a dialog.
@@ -368,8 +381,16 @@ mod tests {
         assert_eq!(c.group_select, 200.0);
         assert_eq!(c.workspace_control, 230.0);
         assert_eq!(
-            (c.model_picker, c.model_list_max, c.effort_menu),
-            (400.0, 340.0, 240.0)
+            (c.model_picker, c.model_picker_height, c.effort_menu),
+            (440.0, 420.0, 240.0)
+        );
+        // The rail button sits in the rail with equal room on each side, and
+        // the marker sits on the rail's right edge, centred on the button.
+        assert_eq!((c.picker_rail, c.picker_rail_button), (48.0, 36.0));
+        assert_eq!((c.picker_rail_badge, c.picker_rail_badge_text), (14.0, 9.0));
+        assert_eq!(
+            (c.picker_rail_marker, c.picker_rail_marker_height),
+            (3.0, 20.0)
         );
         assert_eq!((c.effort_select, c.composer_chip), (150.0, 28.0));
         // A 20 px line, the padding and a 1 px border make 36 px and 30 px.

@@ -71,6 +71,11 @@ fn main() {
         Client::mock_with(consort_client::mock::view_state_with_requests())
     } else if mock && args.screen.as_deref() == Some("worker-added") {
         Client::mock_with(consort_client::mock::view_state_with_long_detail())
+    } else if mock && args.screen.as_deref() == Some("model-picker-no-account") {
+        // No account is signed in on any worker.
+        let mut state = consort_client::mock::view_state();
+        state.model_groups.clear();
+        Client::mock_with(state)
     } else if mock {
         Client::mock()
     } else {

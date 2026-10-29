@@ -160,6 +160,10 @@ _Avoid_: provider (alone, which means a harness), vendor, backend
 A harness account label, a model and its options, such as "Claude Personal, Opus 5.5, high effort".
 _Avoid_: profile, preset, model config
 
+**Favorite model**:
+An account label and a model that the user marked with a star in the model picker. The hub keeps the favorites in the user's preferences, so every client shows the same ones.
+_Avoid_: pinned model, starred model
+
 **Approval mode**:
 How much a session may do without asking: Ask, Auto edits, Auto or Full access.
 _Avoid_: runtime mode, permission mode, autonomy

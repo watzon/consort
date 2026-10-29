@@ -13,6 +13,7 @@ mod common;
 mod conversation;
 mod knowledge;
 mod machine;
+mod preferences;
 mod routine;
 mod session;
 mod tag;
@@ -42,6 +43,10 @@ pub use machine::{
     AuthState, Capabilities, Checkout, CheckoutInfo, Client, ClientKind, HarnessAccount, Inventory,
     LocalMcpServerInfo, ModelInfo, OptionChoice, OptionDescriptor, PushProvider, PushRegistration,
     Worker, WorkerLoad, WorkerPolicy, WorkerState,
+};
+pub use preferences::{
+    FAVORITE_FIELD_MAX_CHARS, FAVORITE_MODELS_MAX, FavoriteModel, PREFERENCES_ENTITY_ID,
+    Preferences,
 };
 pub use routine::{
     ROUTINE_MIN_INTERVAL_SECONDS, Routine, RoutineAction, RoutineRun, RoutineRunStatus,

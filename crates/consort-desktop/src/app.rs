@@ -365,7 +365,7 @@ impl ConsortApp {
                     .masked(true)
             }),
             tag: field("New tag", window, cx),
-            model_search: field("Search models and accounts", window, cx),
+            model_search: field("Search every account", window, cx),
         };
         let mut subscriptions = Vec::new();
         subscriptions.push(cx.subscribe_in(
@@ -1214,14 +1214,45 @@ impl ConsortApp {
             // The model picker and the effort menu of the composer. They
             // open under their chips, which have bounds after the first
             // frame.
-            "model-picker" | "effort-menu" => {
-                let effort = screen == "effort-menu";
+            // `model-picker` opens as a user sees it (on Favorites in the
+            // mock), `model-picker-favorites` the same, `model-picker-rail`
+            // on the account of the current model, and `model-picker-search`
+            // with a search for "5.5".
+            "model-picker"
+            | "model-picker-no-account"
+            | "model-picker-favorites"
+            | "model-picker-rail"
+            | "model-picker-search"
+            | "effort-menu" => {
+                let screen = screen.to_owned();
                 cx.on_next_frame(window, move |this, window, cx| {
                     let target = PickerTarget::Assistant(this.channel_id.clone());
-                    if effort {
+                    if screen == "effort-menu" {
                         this.open_effort("composer-effort", target, window, cx);
-                    } else {
-                        this.open_picker_under("composer-model", target, window, cx);
+                        return;
+                    }
+                    this.open_picker_under("composer-model", target.clone(), window, cx);
+                    match screen.as_str() {
+                        "model-picker-rail" => {
+                            if let Some(account) =
+                                this.picker_selection(&target).map(|s| s.account_label)
+                            {
+                                this.show_picker_view(
+                                    consort_client::picker::PickerView::Account(account),
+                                    cx,
+                                );
+                            }
+                        }
+                        "model-picker-favorites" => {
+                            this.show_picker_view(consort_client::picker::PickerView::Favorites, cx)
+                        }
+                        "model-picker-search" => {
+                            this.inputs
+                                .model_search
+                                .update(cx, |input, cx| input.set_value("5.5", window, cx));
+                            this.picker_search_changed(cx);
+                        }
+                        _ => {}
                     }
                 });
             }
@@ -2481,6 +2512,7 @@ impl Render for ConsortApp {
         };
         let menu = self.menu.clone();
         let picker = self.render_picker(&t, window, cx);
+        let picker_tip = self.render_picker_tooltip(&t);
         let effort = self.render_effort_menu(&t, window, cx);
         self.follow_spinner(cx);
         div()
@@ -2519,6 +2551,7 @@ impl Render for ConsortApp {
                     }),
             )
             .children(picker)
+            .children(picker_tip)
             .children(effort)
             .when_some(menu, |root, menu| {
                 root.child(render_menu(
