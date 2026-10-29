@@ -9,3 +9,22 @@ publish = false
 workspace = true
 
 [dependencies]
+consort-proto.workspace = true
+chrono.workspace = true
+directories.workspace = true
+ed25519-dalek.workspace = true
+futures-util.workspace = true
+gethostname.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time", "macros", "net"] }
+tokio-tungstenite.workspace = true
+url.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+axum = { workspace = true, features = ["ws"] }
+tempfile.workspace = true

@@ -4,8 +4,16 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
+description = "The Consort desktop app (GPUI)."
+
+[[bin]]
+name = "consort-desktop"
+path = "src/main.rs"
+
+[dependencies]
+consort-client.workspace = true
+consort-theme.workspace = true
+gpui-kit.workspace = true
 
 [lints]
 workspace = true
-
-[dependencies]
