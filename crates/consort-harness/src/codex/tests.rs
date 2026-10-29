@@ -272,13 +272,17 @@ fn approvals_and_questions() {
         net.summary,
         "Needs network. The command connects to https://example.com."
     );
+    // An absolute folder stays as it is. `/w` is not absolute on Windows,
+    // so use a folder that is absolute on every platform.
+    let other = std::env::temp_dir().join("codex-other");
+    let other = other.to_string_lossy().into_owned();
     let net = m.command_approval(
         RequestId::new("codex-4"),
         &CommandApprovalParams {
             turn_id: "t".into(),
             item_id: "c".into(),
             command: Some("git fetch".into()),
-            cwd: Some("/w".into()),
+            cwd: Some(other.clone()),
             reason: None,
             network_approval_context: Some(json!({"host": "github.com"})),
         },
@@ -288,7 +292,7 @@ fn approvals_and_questions() {
         "Run `git fetch` with network access to github.com"
     );
     assert!(
-        matches!(&net.body, RequestBody::Approval(ApprovalDetails::Command { cwd: Some(c), .. }) if c == "/w")
+        matches!(&net.body, RequestBody::Approval(ApprovalDetails::Command { cwd: Some(c), .. }) if c == &other)
     );
     let q: UserInputQuestion = serde_json::from_value(json!({
         "id": "db", "header": "Database", "question": "Which database?", "isOther": true,
