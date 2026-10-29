@@ -724,7 +724,7 @@ impl Core {
         // A profile account signs in from the app, not with a command on
         // the worker.
         let detail = if profile {
-            "Signed out. Sign in to this account in Settings > Workers."
+            &format!("Signed out. {}", consort_proto::model::SIGN_IN_IN_SETTINGS)
         } else {
             detail
         };

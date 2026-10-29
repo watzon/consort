@@ -161,6 +161,12 @@ impl Hub {
             }
             return;
         }
+        // `reopened` must know that this turn belongs to this connection.
+        if command.kind == "session.turn"
+            && let Some(session_id) = command.session_id
+        {
+            self.links.record_turn_sent(session_id, link.conn_id);
+        }
         let outcome = link
             .call(
                 command.id.clone(),

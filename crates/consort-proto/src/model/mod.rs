@@ -22,8 +22,8 @@ mod work;
 
 pub(crate) use account::Redacted;
 pub use account::{
-    AcpAccountSpec, AcpRegistryAgent, SIGN_IN_IDLE_EXPIRY_MS, SIGN_IN_RETENTION_MS, SecretEnv,
-    SignIn, SignInMethod, SignInState,
+    AcpAccountSpec, AcpRegistryAgent, SIGN_IN_IDLE_EXPIRY_MS, SIGN_IN_IN_SETTINGS,
+    SIGN_IN_RETENTION_MS, SecretEnv, SignIn, SignInMethod, SignInState,
 };
 pub use common::{
     BlobRef, HashParseError, ModelOptions, ModelSelection, OptionValue, Os, Sha256Hash,

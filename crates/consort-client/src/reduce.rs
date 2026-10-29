@@ -200,10 +200,12 @@ fn account_view(
             .iter()
             .any(|t| t.tool.as_str() == tool && t.state == ToolStateProto::Installing)
     });
+    // The row is in Settings > Workers already, so it does not tell the user
+    // to go there.
     let auth_detail = a
         .auth_detail
         .as_deref()
-        .map(str::trim)
+        .map(|d| strip_settings_step(d.trim()))
         .filter(|d| !d.is_empty());
     let has_key = !a.secret_names.is_empty();
     let (status, text) = if installing {
@@ -1161,6 +1163,7 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                 .filter(|t| t.worker_id == Some(w.id) && t.status == PS::Working)
                 .count();
             let os_label = os(w.os).label();
+            let arch = format::arch_label(&w.arch);
             let mut list = vec![os_label.to_owned()];
             list.push(format!(
                 "{} {}",
@@ -1195,14 +1198,14 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                     }
                 },
                 status_line: if online {
-                    format!("Online. {os_label}, {}, worker {}.", w.arch, w.version)
+                    format!("Online. {os_label}, {arch}, worker {}.", w.version)
                 } else {
                     match &last_seen {
                         Some(t) => format!(
-                            "Offline since {t}. {os_label}, {}, worker {}.",
-                            w.arch, w.version
+                            "Offline since {t}. {os_label}, {arch}, worker {}.",
+                            w.version
                         ),
-                        None => format!("Offline. {os_label}, {}, worker {}.", w.arch, w.version),
+                        None => format!("Offline. {os_label}, {arch}, worker {}.", w.version),
                     }
                 },
                 tags: w.tags.clone(),
@@ -1411,6 +1414,15 @@ fn account_detail_code(text: &str) -> (String, Vec<String>) {
         plain.push_str(part);
     }
     (plain, code)
+}
+
+/// The reason of an account without the step "Sign in to this account in
+/// Settings > Workers." at its end. A reason that is only that step becomes
+/// "Not signed in." for a signed-out account (see `account_view`).
+fn strip_settings_step(detail: &str) -> &str {
+    detail
+        .strip_suffix(model::SIGN_IN_IN_SETTINGS)
+        .map_or(detail, str::trim_end)
 }
 
 /// The text as a sentence: a period goes on the end only when the text
@@ -3081,7 +3093,17 @@ mod tests {
             }];
             // An account written by hand in worker.toml offers no method.
             let by_hand = account("Pi with Kimi", "pi", PA::SignedOut);
-            inventory(&mut bigboi).accounts = vec![personal, work, fireworks, amp, by_hand];
+            // The worker adds the step to Settings > Workers, and the row is
+            // in Settings > Workers already.
+            let mut signed_out = account("Claude Spare", "claude", PA::SignedOut);
+            signed_out.auth_detail =
+                Some("Not signed in. Sign in to this account in Settings > Workers.".into());
+            signed_out.sign_in_methods = vec![SignInMethod::ClaudePlan];
+            let mut step_only = account("Claude Step", "claude", PA::SignedOut);
+            step_only.auth_detail = Some("Sign in to this account in Settings > Workers.".into());
+            inventory(&mut bigboi).accounts = vec![
+                personal, work, fireworks, amp, by_hand, signed_out, step_only,
+            ];
             w.cache.workers.insert(bigboi.id.to_string(), bigboi);
             let state = view(&w.cache);
 
@@ -3110,6 +3132,22 @@ mod tests {
             );
             assert!(
                 matches!(&amp.logo, ProviderLogo::Registry { id, svg: None } if id == "amp-acp")
+            );
+
+            assert_eq!(
+                state.account_logo("Claude Personal"),
+                Some(&ProviderLogo::ClaudeCode),
+                "a task account shows its provider logo"
+            );
+            assert_eq!(state.account_logo("No such account"), None);
+
+            let spare = row(&state, "Claude Spare");
+            assert_eq!(spare.detail, "Not signed in.");
+            assert_eq!(spare.status, AccountStatus::NotSignedIn);
+            assert_eq!(
+                row(&state, "Claude Step").detail,
+                "Not signed in yet.",
+                "a reason that is only the step has nothing to show"
             );
 
             let by_hand = row(&state, "Pi with Kimi");
@@ -3225,6 +3263,51 @@ mod tests {
         }
 
         #[test]
+        fn the_status_line_names_the_architecture_like_the_detected_tags() {
+            let mut w = world();
+            for (arch, label) in [
+                ("aarch64", "arm64"),
+                ("x86_64", "x64"),
+                ("riscv64", "riscv64"),
+            ] {
+                let mut worker = worker("MacBook Pro", &[], &["macos", "arm64"]);
+                worker.arch = arch.into();
+                w.cache.workers.clear();
+                w.cache.workers.insert(worker.id.to_string(), worker);
+                let state = view(&w.cache);
+                assert_eq!(
+                    state.workers[0].status_line,
+                    format!("Online. Windows, {label}, worker 0.1.0."),
+                    "{arch}"
+                );
+            }
+        }
+
+        #[test]
+        fn a_worker_suggests_only_tags_that_it_does_not_have() {
+            let mut w = world();
+            let bigboi = worker("bigboi", &["personal"], &["windows", "x64", "hub"]);
+            let mac = worker("MacBook Pro", &["work"], &["macos", "arm64"]);
+            w.cache.workers.insert(bigboi.id.to_string(), bigboi);
+            w.cache.workers.insert(mac.id.to_string(), mac);
+            let state = view(&w.cache);
+            let bigboi = state
+                .workers
+                .iter()
+                .find(|w| w.name == "bigboi")
+                .expect("worker");
+            // Not its user tag, and not its detected tags (the `hub` tag too).
+            assert_eq!(
+                bigboi.suggested_tags(&state.tags),
+                ["work", "arm64", "macos"]
+            );
+            let everything = state.tags.clone();
+            let mut all_taken = bigboi.clone();
+            all_taken.tags = everything;
+            assert!(all_taken.suggested_tags(&state.tags).is_empty());
+        }
+
+        #[test]
         fn a_channel_shows_its_tags() {
             let mut w = world();
             if let Some(channel) = w.cache.channels.get_mut(&w.sayso.to_string()) {
@@ -3332,6 +3415,54 @@ mod tests {
                 Timestamp::from_millis(NOW),
                 EntityPayload::SignIn(late)
             )));
+            assert!(view(&w.cache).sign_ins.is_empty());
+        }
+
+        #[test]
+        fn a_reload_during_a_sign_in_shows_the_sign_in_from_the_snapshot() {
+            let mut w = world();
+            let running = sign_in(SignInState::NeedsCode {
+                url: "https://claude.ai/oauth".into(),
+            });
+            let ended = sign_in(SignInState::Succeeded { detail: None });
+            let id = running.id.to_string();
+            w.cache.load_snapshot(consort_proto::client_api::Snapshot {
+                seq: 4,
+                sign_ins: vec![running.clone(), ended],
+                ..Default::default()
+            });
+            let state = view(&w.cache);
+            assert_eq!(state.sign_ins.len(), 1, "an ended sign-in does not show");
+            assert_eq!(
+                state.sign_in(&id).map(|s| s.step.clone()),
+                Some(SignInStep::NeedsCode {
+                    url: "https://claude.ai/oauth".into()
+                })
+            );
+            // Its feed entries now update it.
+            let mut next = running;
+            next.state = SignInState::Verifying;
+            assert!(w.cache.apply(FeedEntry::upsert(
+                5,
+                Timestamp::from_millis(NOW),
+                EntityPayload::SignIn(next)
+            )));
+            assert_eq!(
+                view(&w.cache).sign_in(&id).map(|s| s.step.clone()),
+                Some(SignInStep::Verifying)
+            );
+        }
+
+        #[test]
+        fn a_sign_in_that_the_user_closed_stays_closed_after_a_reload() {
+            let mut w = world();
+            let running = sign_in(SignInState::Starting);
+            w.cache.sign_ins_dismissed.insert(running.id.to_string());
+            w.cache.load_snapshot(consort_proto::client_api::Snapshot {
+                seq: 4,
+                sign_ins: vec![running],
+                ..Default::default()
+            });
             assert!(view(&w.cache).sign_ins.is_empty());
         }
 

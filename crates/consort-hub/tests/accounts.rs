@@ -571,6 +571,43 @@ async fn updates_from_the_worker_change_the_record_and_reach_the_feed() {
 }
 
 #[tokio::test]
+async fn a_snapshot_has_the_running_sign_ins_and_not_the_ended_ones() {
+    use consort_proto::client_api::SnapshotScope;
+    let mut world = World::start().await;
+    let running = start_sign_in(&mut world, SignInMethod::ClaudePlan).await;
+    let needs_code = SignInState::NeedsCode {
+        url: "https://claude.ai/oauth".to_owned(),
+    };
+    send_update(&mut world.worker, running.id, needs_code.clone()).await;
+    world
+        .client
+        .wait_feed(sign_in_entry(running.id, |s| *s == needs_code.clone()))
+        .await;
+    let snapshot = world.client.snapshot(SnapshotScope::All).await;
+    assert_eq!(snapshot.sign_ins.len(), 1);
+    assert_eq!(snapshot.sign_ins[0].id, running.id);
+    assert_eq!(snapshot.sign_ins[0].state, needs_code);
+
+    // The sign-in ends, and the next snapshot leaves it out.
+    let done = SignInState::Succeeded { detail: None };
+    send_update(&mut world.worker, running.id, done.clone()).await;
+    world
+        .client
+        .wait_feed(sign_in_entry(running.id, |s| *s == done.clone()))
+        .await;
+    let snapshot = world.client.snapshot(SnapshotScope::All).await;
+    assert!(snapshot.sign_ins.is_empty(), "{:?}", snapshot.sign_ins);
+    // A channel snapshot never has sign-ins.
+    let everything = world.client.everything().await;
+    let channel = world
+        .client
+        .snapshot(SnapshotScope::Channel(everything))
+        .await;
+    assert!(channel.sign_ins.is_empty());
+    world.hub.handle.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn updates_for_unknown_sign_ins_or_from_another_worker_are_ignored() {
     let mut world = World::start().await;
     let mut other = FakeWorker::pair_and_connect(&world.hub).await;

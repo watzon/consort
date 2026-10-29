@@ -356,6 +356,90 @@ async fn a_replacement_coordinator_respects_the_tags_after_a_sign_out() {
 }
 
 #[tokio::test]
+async fn a_new_channel_tag_moves_the_coordinator_off_a_worker_without_it() {
+    let mut world = World::start().await;
+    // A task and the coordinator run on the first worker. It has no tag.
+    let (task_id, task_start) = world.start_task("Fix it.").await;
+    let coordinator = world.coordinator_session.unwrap();
+    let mut other = add_worker(&mut world).await;
+    set_tags(&mut world, other.worker_id, &["work"]).await;
+    let first = world.worker.worker_id;
+    let name = world
+        .client
+        .request(WorkerList {})
+        .await
+        .unwrap()
+        .workers
+        .into_iter()
+        .find(|w| w.id == first)
+        .unwrap()
+        .name;
+
+    world
+        .client
+        .request(ChannelUpdate {
+            tags: Some(tags(&["work"])),
+            ..channel_update(world.everything)
+        })
+        .await
+        .unwrap();
+
+    // The coordinator session ends, and the channel says why.
+    let (request, command) = world.worker.next_command().await;
+    let HubToWorker::SessionStop(stop) = command else {
+        panic!("expected session.stop, got {}", command.type_name());
+    };
+    assert_eq!(stop.session_id, coordinator);
+    world
+        .worker
+        .respond_ok(&request, &serde_json::json!({}))
+        .await;
+    world
+        .wait_notice(
+            None,
+            &[&format!(
+                "The assistant moved off {name} because the channel now needs the tag work."
+            )],
+        )
+        .await;
+    // The task keeps running: it gets no stop, and it stays Working.
+    assert_silent(&mut world.worker, "the worker of the running task").await;
+    let task = world.task(task_id).await;
+    assert_eq!(task.status, TaskStatus::Working, "{task:?}");
+    assert_ne!(task_start.session_id, coordinator);
+
+    // The next message starts a coordinator on the worker with the tag.
+    world.say(world.everything, "hello again").await;
+    let start = other.accept_session_start().await;
+    assert_eq!(start.role, SessionRole::Coordinator);
+    assert!(start.turn.unwrap().text.contains("hello again"));
+    world.hub.handle.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_new_channel_tag_that_the_coordinator_worker_has_changes_nothing() {
+    let mut world = World::start().await;
+    let first = world.worker.worker_id;
+    set_tags(&mut world, first, &["work"]).await;
+    world.start_coordinator("hello").await;
+    world
+        .client
+        .request(ChannelUpdate {
+            tags: Some(tags(&["work"])),
+            ..channel_update(world.everything)
+        })
+        .await
+        .unwrap();
+    assert_silent(&mut world.worker, "the tagged worker").await;
+    let notices = world.notices(None).await;
+    assert!(
+        !notices.iter().any(|n| n.contains("moved off")),
+        "{notices:?}"
+    );
+    world.hub.handle.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn list_workers_shows_the_tags_of_each_worker() {
     let mut world = World::start().await;
     let id = world.worker.worker_id;

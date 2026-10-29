@@ -163,6 +163,10 @@ pub struct Links {
     workers: Mutex<HashMap<WorkerId, std::sync::Arc<WorkerLink>>>,
     next_conn: AtomicU64,
     item_emit: Mutex<HashMap<(SessionId, ItemId), ItemEmit>>,
+    /// The connection that the hub sent the newest `session.turn` of a
+    /// session on. A `reopened` event ends an open turn only when the turn
+    /// went out on an earlier connection. See [`Links::turn_sent_on`].
+    turns_sent: Mutex<HashMap<SessionId, u64>>,
     /// A shorter command timeout for unit tests.
     #[cfg(test)]
     pub(crate) command_timeout: Mutex<Option<Duration>>,
@@ -201,6 +205,28 @@ impl Links {
 
     pub(crate) fn get(&self, worker_id: WorkerId) -> Option<std::sync::Arc<WorkerLink>> {
         self.workers.lock().ok()?.get(&worker_id).cloned()
+    }
+
+    /// Records that the hub sends a `session.turn` of the session on the
+    /// connection `conn_id`.
+    pub(crate) fn record_turn_sent(&self, session_id: SessionId, conn_id: u64) {
+        if let Ok(mut map) = self.turns_sent.lock() {
+            map.insert(session_id, conn_id);
+        }
+    }
+
+    /// The connection that the newest `session.turn` of the session went out
+    /// on, since the hub started. `None` when the hub did not send one in
+    /// this run.
+    pub(crate) fn turn_sent_on(&self, session_id: SessionId) -> Option<u64> {
+        self.turns_sent.lock().ok()?.get(&session_id).copied()
+    }
+
+    /// Forgets the turn record of a session that has ended.
+    pub(crate) fn forget_turn(&self, session_id: SessionId) {
+        if let Ok(mut map) = self.turns_sent.lock() {
+            map.remove(&session_id);
+        }
     }
 
     pub(crate) fn is_online(&self, worker_id: WorkerId) -> bool {

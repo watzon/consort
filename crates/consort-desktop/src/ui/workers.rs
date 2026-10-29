@@ -230,11 +230,9 @@ impl ConsortApp {
                             .id("tag-entry-close")
                             .cursor_pointer()
                             .child(icon("x", t.space.md, c.text_tertiary))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.tag_entry = None;
-                                this.tag_error = None;
-                                cx.notify();
-                            })),
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.close_tag_entry(window, cx)),
+                            ),
                     ),
             );
         } else if w.online {
@@ -274,13 +272,13 @@ impl ConsortApp {
             .child(user);
         if entering {
             // Completions: every worker tag that this worker does not have
-            // yet, that starts with what the user typed.
+            // yet (as a user tag or a detected tag), that starts with what the
+            // user typed. With none, the Choose row stays hidden.
             let typed = self.inputs.tag.read(cx).value().trim().to_lowercase();
-            let completions: Vec<String> = self
-                .state
-                .tags
-                .iter()
-                .filter(|tag| !w.tags.contains(tag) && tag.starts_with(&typed))
+            let completions: Vec<String> = w
+                .suggested_tags(&self.state.tags)
+                .into_iter()
+                .filter(|tag| tag.starts_with(&typed))
                 .take(TAG_COMPLETIONS)
                 .cloned()
                 .collect();

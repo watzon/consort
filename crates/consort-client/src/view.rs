@@ -141,6 +141,16 @@ impl ViewState {
     pub fn selection(&self, key: &str) -> Option<&SelectionView> {
         self.selections.iter().find(|s| s.key() == key)
     }
+
+    /// The provider logo of the account with this label. Accounts with one
+    /// label on several workers are one account, so the first one counts.
+    pub fn account_logo(&self, label: &str) -> Option<&ProviderLogo> {
+        self.workers
+            .iter()
+            .flat_map(|w| w.accounts.iter())
+            .find(|a| a.label == label)
+            .map(|a| &a.logo)
+    }
 }
 
 /// The folder name that a profile folder shows in the Add account dialog:
@@ -1253,6 +1263,16 @@ impl WorkerView {
 
     pub fn account(&self, id: &str) -> Option<&HarnessAccountView> {
         self.accounts.iter().find(|a| a.id == id)
+    }
+
+    /// The tags of `all_tags` that this worker can still get: the ones that it
+    /// has neither as a user tag nor as a detected tag. The order of
+    /// `all_tags` stays.
+    pub fn suggested_tags<'a>(&self, all_tags: &'a [String]) -> Vec<&'a String> {
+        all_tags
+            .iter()
+            .filter(|t| !self.tags.contains(t) && !self.detected_tags.contains(t))
+            .collect()
     }
 }
 

@@ -1,0 +1,5 @@
+# Signed test files and keys must keep their exact bytes on every platform.
+# Without this, Git on Windows can check them out with CRLF line ends, and
+# the signature checks fail.
+crates/consort-tools/tests/fixtures/** -text
+crates/consort-tools/keys/** -text

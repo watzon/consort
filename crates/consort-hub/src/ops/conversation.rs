@@ -311,7 +311,8 @@ impl Hub {
             request.instructions.as_deref().unwrap_or_default(),
         )?;
         let tags_in_request = request.tags.is_some();
-        let channel = self
+        let hub = self.clone();
+        let (channel, fx) = self
             .store
             .write(move |tx| {
                 let before = conversation::channel_or_404(tx.db(), request.channel_id)?;
@@ -368,13 +369,23 @@ impl Hub {
                     channel.tags = normalize_tags(&tags)?;
                 }
                 if channel == before {
-                    return Ok(channel);
+                    return Ok((channel, Default::default()));
                 }
                 channel.updated_at = tx.now();
                 tx.save_channel(&channel)?;
-                Ok(channel)
+                // Work that runs keeps running. The coordinator moves off a
+                // worker that does not have every new tag.
+                let fx = if channel.tags != before.tags {
+                    crate::link::events::move_coordinator_off_unqualified_worker(
+                        &hub, tx, &channel,
+                    )?
+                } else {
+                    Default::default()
+                };
+                Ok((channel, fx))
             })
             .await?;
+        self.run_effects(fx);
         if tags_in_request {
             // Fewer tags can make a worker qualify for work that waits.
             self.retry_waiting_work();

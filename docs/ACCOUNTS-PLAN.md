@@ -50,6 +50,7 @@ Sign-in types:
 
 - `SignInMethod` (snake_case tag): `claude_plan`, `claude_console`, `chatgpt_device`, `chatgpt_browser`, `api_key { variable: String }`, `acp_agent { method_id: String, name: String }`, `terminal { command: String }` (an ACP terminal method that the app cannot run; the app shows the command).
 - `SignIn` is a new feed entity (`EntityKind::SignIn`, `EntityPayload::SignIn`). Fields: `id: SignInId` (prefix `sgn_`), `worker_id`, `account_id`, `method`, `state: SignInState`, `created_at`, `updated_at`, `expires_at`.
+- The snapshot of scope `all` also lists the sign-ins that have not ended, in `sign_ins` (DECISIONS row 314), so a client that loads during a sign-in shows it.
 - `SignInState` (snake_case tag):
   - `starting`
   - `open_url { url }`

@@ -8,7 +8,10 @@ mod app;
 mod assets;
 mod countdown;
 mod drafts;
+mod edit_keys;
 mod fonts;
+#[cfg(test)]
+mod keys_tests;
 mod notice;
 mod read_marker;
 mod ui;

@@ -432,7 +432,7 @@ fn on_reopened(tx: &mut Tx<'_>, ctx: &mut Ctx<'_>) -> Result<()> {
     }
     cancel_harness_requests(tx, ctx)?;
     if ctx.runtime.turn_open {
-        if turn_waits_unsent(tx, ctx.session.id)? {
+        if turn_waits_unsent(tx, ctx.session.id)? || turn_sent_on_this_connection(ctx) {
             return Ok(());
         }
         let text = match ctx.session.role {
@@ -448,6 +448,16 @@ fn on_reopened(tx: &mut Tx<'_>, ctx: &mut Ctx<'_>) -> Result<()> {
         task_turn_ended(tx, ctx, TurnEndReason::Completed, None)?;
     }
     Ok(())
+}
+
+/// True when the hub sent the open turn of the session on the connection
+/// that the worker has now. After a reconnect the hub flushes its queue at
+/// once, so the turn can go out before the worker's `reopened` event is
+/// handled. That turn is new to the restarted worker. Only a turn from an
+/// earlier connection was in flight when the worker restarted.
+fn turn_sent_on_this_connection(ctx: &Ctx<'_>) -> bool {
+    let current = ctx.hub.links.get(ctx.session.worker_id).map(|l| l.conn_id);
+    current.is_some() && ctx.hub.links.turn_sent_on(ctx.session.id) == current
 }
 
 /// True when the open turn of a session is one that the hub has not sent
@@ -497,6 +507,7 @@ pub(crate) fn finish_session(
     state: SessionState,
 ) -> Result<()> {
     let lost = state == SessionState::Lost;
+    ctx.hub.links.forget_turn(ctx.session.id);
     // A session that never left Starting did not start.
     let started = ctx.session.state != SessionState::Starting;
     ctx.session.ended_at.get_or_insert_with(|| tx.now());
@@ -655,7 +666,7 @@ fn account_signed_out(tx: &Tx<'_>, session: &Session) -> Result<bool> {
 /// notice says where to sign in. A sign-in sends a new inventory, and that
 /// starts the coordinator again.
 fn replace_signed_out_coordinator(tx: &mut Tx<'_>, ctx: &mut Ctx<'_>) -> Result<()> {
-    let reason = "The harness account of the session is signed out.";
+    let reason = "The account of the session is signed out.";
     ctx.session.end_reason = Some(reason.to_owned());
     finish_session(tx, ctx, SessionState::Lost)?;
     queue_stop(ctx.hub, tx, &mut ctx.fx, &ctx.session, reason)?;
@@ -1183,6 +1194,63 @@ pub(crate) fn mark_lost_in_tx(
     finish_session(tx, ctx, SessionState::Lost)?;
     queue_stop(hub, tx, &mut ctx.fx, &ctx.session, reason)?;
     ctx.persist(tx)
+}
+
+/// A channel got new tags. When its coordinator session runs on a worker
+/// that does not have every tag now, the hub ends the session, as it does
+/// when the account of the session signs out. The next turn then goes to a
+/// worker that qualifies (placement reads the tags). The channel gets a
+/// notice that says why. Tasks that run keep running: only new work follows
+/// the tags. Returns the work to do after the commit.
+pub(crate) fn move_coordinator_off_unqualified_worker(
+    hub: &Hub,
+    tx: &mut Tx<'_>,
+    channel: &Channel,
+) -> Result<Effects> {
+    let Some(session_id) = coord_store::coordinator(tx.db(), channel.id)?.session_id else {
+        return Ok(Effects::default());
+    };
+    let Some(session) = work::session(tx.db(), session_id)? else {
+        return Ok(Effects::default());
+    };
+    let Some(worker) = crate::store::machine::worker(tx.db(), session.worker_id)? else {
+        return Ok(Effects::default());
+    };
+    let missing: Vec<String> = channel
+        .tags
+        .iter()
+        .filter(|tag| !worker.has_tags(std::slice::from_ref(*tag)))
+        .cloned()
+        .collect();
+    if missing.is_empty() || session.state.is_final() {
+        return Ok(Effects::default());
+    }
+    let mut ctx = Ctx::load(hub, tx, session_id)?;
+    mark_lost_in_tx(
+        hub,
+        tx,
+        &mut ctx,
+        "The channel now needs a tag that this worker does not have.",
+    )?;
+    // The channel gets a new coordinator session on a worker with the tags.
+    // When no worker has them, the start says what to do.
+    ctx.fx.kick(channel.id);
+    let (noun, wanted) = match missing.as_slice() {
+        [only] => ("tag", only.clone()),
+        [init @ .., last] => ("tags", format!("{} and {last}", init.join(", "))),
+        [] => return Ok(ctx.fx),
+    };
+    tx.post_notice(
+        channel.id,
+        None,
+        None,
+        "assistant_moved",
+        &format!(
+            "The assistant moved off {} because the channel now needs the {noun} {wanted}.",
+            worker.name
+        ),
+    )?;
+    Ok(ctx.fx)
 }
 
 /// Marks a session as lost from outside an event batch, for example when a

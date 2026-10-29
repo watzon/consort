@@ -170,6 +170,11 @@ pub struct Snapshot {
     pub routines: Vec<Routine>,
     /// Channel files.
     pub channel_files: Vec<ChannelFile>,
+    /// The sign-ins that have not ended, for the scope `all`. A client that
+    /// loads while a sign-in runs shows it from here, and then follows its
+    /// feed entries. Ended sign-ins are not in the list.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub sign_ins: Vec<SignIn>,
 }
 
 /// `sync.subscribe`. The hub answers `ok`, then sends every feed entry after
@@ -2538,6 +2543,37 @@ mod tests {
         let back: AcpRegistryListResult =
             serde_json::from_value(serde_json::to_value(&list).unwrap()).unwrap();
         assert_eq!(back, list);
+    }
+
+    #[test]
+    fn a_snapshot_with_sign_ins_round_trips_and_an_old_one_has_none() {
+        use crate::model::SignInState;
+        let sign_in = SignIn {
+            id: "sgn_00000000-0000-0000-0000-00000000000a".parse().unwrap(),
+            worker_id: "wrk_00000000-0000-0000-0000-000000000006".parse().unwrap(),
+            account_id: "acc_00000000-0000-0000-0000-000000000009".parse().unwrap(),
+            method: SignInMethod::ClaudePlan,
+            state: SignInState::NeedsCode {
+                url: "https://claude.com/cai/oauth/authorize".into(),
+            },
+            created_at: Timestamp::from_millis(10),
+            updated_at: Timestamp::from_millis(11),
+            expires_at: Timestamp::from_millis(20),
+        };
+        let snapshot = Snapshot {
+            seq: 3,
+            sign_ins: vec![sign_in],
+            ..Snapshot::default()
+        };
+        let value = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(value["sign_ins"][0]["state"]["kind"], "needs_code");
+        assert_eq!(serde_json::from_value::<Snapshot>(value).unwrap(), snapshot);
+        // A snapshot from a hub that does not know sign-ins has none, and one
+        // with none leaves the field out.
+        let old: Snapshot = serde_json::from_value(serde_json::json!({ "seq": 5 })).unwrap();
+        assert!(old.sign_ins.is_empty());
+        let json = serde_json::to_value(&old).unwrap();
+        assert!(json.get("sign_ins").is_none());
     }
 
     #[test]

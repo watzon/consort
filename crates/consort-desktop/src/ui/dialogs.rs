@@ -67,6 +67,17 @@ fn select_box(
     app: &ConsortApp,
     t: &Tokens,
 ) -> gpui_kit::Stateful<Div> {
+    select_box_with_logo(id, value, None, app, t)
+}
+
+/// A select box with the logo of a provider before the value.
+fn select_box_with_logo(
+    id: &'static str,
+    value: String,
+    logo: Option<&consort_client::ProviderLogo>,
+    app: &ConsortApp,
+    t: &Tokens,
+) -> gpui_kit::Stateful<Div> {
     let c = &t.colors;
     focusable(div().id(id), t)
         .relative()
@@ -83,7 +94,19 @@ fn select_box(
         .cursor_pointer()
         .hover(|s| s.border_color(c.text_tertiary))
         .child(app.triggers.track(id))
-        .child(text(value, t.text.ui, c.text_primary))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(t.space.sm)
+                .min_w_0()
+                .children(
+                    logo.map(|logo| {
+                        crate::ui::parts::provider_logo(logo, t.icon.size, c.text_primary)
+                    }),
+                )
+                .child(text(value, t.text.ui, c.text_primary)),
+        )
         .child(icon("chevrons-up-down", t.icon.dense, c.text_secondary))
 }
 
@@ -134,8 +157,20 @@ pub fn tags_note(matching: usize) -> String {
     }
 }
 
+/// The words before the suggested tags. With no tag chosen yet there is
+/// nothing to be "also" with.
+pub fn tag_suggestions_label(chosen: &[String]) -> &'static str {
+    if chosen.is_empty() {
+        "On workers:\u{a0}"
+    } else {
+        "Also on workers:\u{a0}"
+    }
+}
+
 /// The tags to offer after "Also on workers:": the user tags of the
-/// matching workers that are not chosen yet, at most three.
+/// matching workers that are not chosen yet, at most three. With no tag
+/// chosen, every worker matches, so a tag that any worker has can start the
+/// list.
 pub fn tag_suggestions(state: &consort_client::ViewState, chosen: &[String]) -> Vec<String> {
     let mut out: Vec<String> = state
         .workers_with_tags(chosen)
@@ -264,13 +299,17 @@ impl ConsortApp {
             );
         }
         let suggestions = tag_suggestions(&self.state, chosen);
-        if !chosen.is_empty() && !suggestions.is_empty() {
+        if !suggestions.is_empty() {
             let mut also = div()
                 .flex()
                 .items_center()
                 .flex_wrap()
                 .pl(t.space.xs)
-                .child(text("Also on workers:\u{a0}", detail(t), c.text_tertiary));
+                .child(text(
+                    tag_suggestions_label(chosen),
+                    detail(t),
+                    c.text_tertiary,
+                ));
             let last = suggestions.len() - 1;
             for (i, tag) in suggestions.into_iter().enumerate() {
                 let add = tag.clone();
@@ -1069,13 +1108,16 @@ impl ConsortApp {
         }
         let selections = state.selections.clone();
         let current_selection = form.selection.clone();
-        let selection_select = select_box(
+        let chosen = form
+            .selection
+            .as_deref()
+            .and_then(|key| state.selection(key));
+        let selection_select = select_box_with_logo(
             "new-channel-selection",
-            form.selection
-                .as_deref()
-                .and_then(|key| state.selection(key))
+            chosen
                 .map(|s| s.label())
-                .unwrap_or_else(|| "Choose a harness".to_owned()),
+                .unwrap_or_else(|| "Choose an account".to_owned()),
+            chosen.and_then(|s| state.account_logo(&s.account_label)),
             self,
             t,
         )
@@ -1179,14 +1221,14 @@ impl ConsortApp {
             .child(field_block(
                 "Run tasks on",
                 chips,
-                Some("Consort tries these in order, then any online worker with the repo and the harness."),
+                Some("Consort tries these in order, then any online worker with the repo and the account."),
                 t,
             ))
             .child(
                 div()
                     .flex()
                     .gap(t.space.md)
-                    .child(field_block("Default harness for tasks", selection_select, None, t).flex_1())
+                    .child(field_block("Default account for tasks", selection_select, None, t).flex_1())
                     .child(field_block("Workspace", isolation, None, t).w(t.component.workspace_control).flex_none()),
             )
             .child(text(isolation_hint, detail(t), c.text_tertiary))
@@ -1518,5 +1560,47 @@ impl ConsortApp {
             body,
             actions,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use consort_client::{ViewState, WorkerView};
+
+    fn worker(name: &str, tags: &[&str]) -> WorkerView {
+        WorkerView {
+            id: name.to_owned(),
+            name: name.to_owned(),
+            online: true,
+            tags: tags.iter().map(|t| (*t).to_owned()).collect(),
+            ..WorkerView::default()
+        }
+    }
+
+    fn state() -> ViewState {
+        ViewState {
+            workers: vec![
+                worker("bigboi", &["personal", "windows-test"]),
+                worker("MacBook Pro", &["work"]),
+            ],
+            ..ViewState::default()
+        }
+    }
+
+    #[test]
+    fn the_tags_of_the_workers_are_offered_before_any_tag_is_chosen() {
+        let suggestions = tag_suggestions(&state(), &[]);
+        assert_eq!(suggestions, ["personal", "windows-test", "work"]);
+        assert_eq!(tag_suggestions_label(&[]), "On workers:\u{a0}");
+    }
+
+    #[test]
+    fn after_a_choice_only_the_matching_workers_offer_more_tags() {
+        let chosen = vec!["personal".to_owned()];
+        assert_eq!(tag_suggestions(&state(), &chosen), ["windows-test"]);
+        assert_eq!(tag_suggestions_label(&chosen), "Also on workers:\u{a0}");
+        let none_left = vec!["personal".to_owned(), "windows-test".to_owned()];
+        assert!(tag_suggestions(&state(), &none_left).is_empty());
     }
 }

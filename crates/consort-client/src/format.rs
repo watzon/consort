@@ -1,4 +1,4 @@
-//! Labels made from times, in the user's time zone.
+//! Labels made from times, in the user's time zone, and from platform names.
 
 use chrono::{DateTime, Datelike, Local, TimeZone};
 use markdown::{
@@ -8,6 +8,16 @@ use markdown::{
 
 fn local(ms: i64) -> Option<DateTime<Local>> {
     Local.timestamp_millis_opt(ms).single()
+}
+
+/// The architecture as the detected tags name it: `arm64` or `x64`. A worker
+/// reports the Rust names `aarch64` and `x86_64`. Other names stay as they are.
+pub fn arch_label(arch: &str) -> &str {
+    match arch {
+        "aarch64" => "arm64",
+        "x86_64" => "x64",
+        other => other,
+    }
 }
 
 /// "9:12 AM".

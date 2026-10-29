@@ -605,7 +605,9 @@ fn wait_reason(input: &PlacementInput<'_>, rejections: &[Rejection]) -> String {
                     selection.account_label, selection.model
                 )
             } else {
-                "No online worker has a signed-in harness account.".to_owned()
+                "No online worker has a signed-in account. \
+                 Add an account to a worker and sign in to it in Settings > Workers."
+                    .to_owned()
             }
         }
         Stage::Require => {
@@ -618,7 +620,7 @@ fn wait_reason(input: &PlacementInput<'_>, rejections: &[Rejection]) -> String {
                             selection.account_label
                         )
                     }
-                    None => "No online worker with a signed-in harness account".to_owned(),
+                    None => "No online worker with a signed-in account".to_owned(),
                 }
             } else {
                 "No online worker".to_owned()
@@ -708,8 +710,8 @@ fn explain_missing_account(
 ) -> String {
     let Some(selection) = selection else {
         return format!(
-            "{name} has no signed-in harness account with a model. \
-             Sign in to a harness on that machine."
+            "{name} has no signed-in account with a model. \
+             Add an account to {name} and sign in to it in Settings > Workers."
         );
     };
     let label = &selection.account_label;
@@ -720,7 +722,7 @@ fn explain_missing_account(
         .collect();
     if same_label.is_empty() {
         format!(
-            "{name} has no harness account named {label}. \
+            "{name} has no account named {label}. \
              Choose an account that {name} has, or leave the worker empty."
         )
     } else if !same_label.iter().any(|a| a.enabled) {
@@ -734,7 +736,7 @@ fn explain_missing_account(
     {
         format!(
             "The account {label} on {name} is not signed in. \
-             Sign in to the harness on that machine, then try again."
+             Sign in to it in Settings > Workers, then try again."
         )
     } else {
         format!(
@@ -1051,7 +1053,7 @@ mod tests {
         assert_eq!(err.code, ErrorCode::NoMatchingAccount);
         assert_eq!(
             err.message,
-            "mini has no harness account named Claude Personal. \
+            "mini has no account named Claude Personal. \
              Choose an account that mini has, or leave the worker empty."
         );
 
@@ -1095,7 +1097,10 @@ mod tests {
         case.request.worker_id = Some(a.id);
         let err = case.fail();
         assert_eq!(err.code, ErrorCode::NoMatchingAccount);
-        assert!(err.message.contains("Sign in to a harness"), "{err}");
+        assert!(
+            err.message.contains("sign in to it in Settings > Workers"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1790,7 +1795,8 @@ mod tests {
         let case = Case::task(vec![worker("a", vec![signed_out]), worker("b", vec![])]);
         assert_eq!(
             case.wait_reason(),
-            "No online worker has a signed-in harness account."
+            "No online worker has a signed-in account. \
+             Add an account to a worker and sign in to it in Settings > Workers."
         );
     }
 
@@ -1809,7 +1815,8 @@ mod tests {
         let case = Case::coordinator(vec![worker("a", vec![])]);
         assert_eq!(
             case.wait_reason(),
-            "No online worker has a signed-in harness account."
+            "No online worker has a signed-in account. \
+             Add an account to a worker and sign in to it in Settings > Workers."
         );
     }
 
@@ -1950,7 +1957,7 @@ mod tests {
         );
         assert_eq!(
             case.wait_reason(),
-            "No online worker with a signed-in harness account has the tag work."
+            "No online worker with a signed-in account has the tag work."
         );
     }
 

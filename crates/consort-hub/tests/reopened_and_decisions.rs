@@ -172,6 +172,107 @@ async fn reopened_keeps_a_coordinator_turn_that_still_waits_in_the_queue() {
     );
 }
 
+/// After a reconnect the hub flushes its queue at once. The queued turn can
+/// reach the worker before the worker's `reopened` event reaches the hub. A
+/// turn that went out on the new connection is new to the restarted worker,
+/// so `reopened` must not end it. This test makes that order certain: the
+/// worker has the turn before it sends `reopened`.
+#[tokio::test]
+async fn reopened_keeps_a_coordinator_turn_that_went_out_before_it_was_handled() {
+    let mut world = World::start().await;
+    let start = world.start_coordinator("Hello").await;
+    let c = start.session_id;
+    world
+        .worker
+        .send_events(c, vec![turn_ended("t1", TurnEndReason::Completed)])
+        .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let (wid, key, acc) = worker_offline(&mut world).await;
+    world.say(world.everything, "What is on my calendar?").await;
+
+    let mut back = FakeWorker::connect(
+        &world.hub,
+        wid,
+        key,
+        acc,
+        vec![OpenSession {
+            session_id: c,
+            last_seq: 3,
+            state: SessionState::Idle,
+        }],
+    )
+    .await;
+    // The hub sent the turn on this connection, and the worker answered it.
+    let text = next_turn(&mut back, c).await;
+    assert!(text.contains("What is on my calendar?"), "{text}");
+    back.send_batch(c, vec![at(4, SessionEvent::Reopened)])
+        .await;
+    // The turn goes on: it ends in the usual way, with no notice and with
+    // the reply of the assistant.
+    back.send_batch(
+        c,
+        vec![
+            at(5, turn_started("t2")),
+            at(
+                6,
+                assistant_text(c, "Nothing today.", ItemStatus::Completed),
+            ),
+            at(7, turn_ended("t2", TurnEndReason::Completed)),
+        ],
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let notices = world.notices(None).await;
+    assert!(
+        !notices
+            .iter()
+            .any(|n| n.contains("Send your message again")),
+        "{notices:?}"
+    );
+}
+
+/// A turn that was open when the worker restarted went out on an earlier
+/// connection, so `reopened` still ends it and says so.
+#[tokio::test]
+async fn reopened_ends_a_coordinator_turn_that_went_out_on_an_earlier_connection() {
+    let mut world = World::start().await;
+    let start = world.start_coordinator("Hello").await;
+    let c = start.session_id;
+    world
+        .worker
+        .send_events(c, vec![turn_ended("t1", TurnEndReason::Completed)])
+        .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // A second turn goes out on this connection. Its worker never ends it.
+    world.say(world.everything, "What is on my calendar?").await;
+    let text = next_turn(&mut world.worker, c).await;
+    assert!(text.contains("What is on my calendar?"), "{text}");
+    let (wid, key, acc) = worker_offline(&mut world).await;
+
+    let mut back = FakeWorker::connect(
+        &world.hub,
+        wid,
+        key,
+        acc,
+        vec![OpenSession {
+            session_id: c,
+            last_seq: 3,
+            state: SessionState::Active,
+        }],
+    )
+    .await;
+    back.send_batch(c, vec![at(4, SessionEvent::Reopened)])
+        .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let notices = world.notices(None).await;
+    assert!(
+        notices
+            .iter()
+            .any(|n| n.contains("Send your message again")),
+        "{notices:?}"
+    );
+}
+
 #[tokio::test]
 async fn reopened_keeps_a_task_decision_from_ask_decision() {
     let mut world = World::start().await;

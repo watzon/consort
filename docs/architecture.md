@@ -127,6 +127,8 @@ Placement turns a task's model selection and placement request into one worker a
 
 When no online worker has the channel's tags, the work waits, and the reason names the tags, for example "Waiting for an online worker with the tag work. Add the tag in Settings > Workers." Coordinator turns and routine runs follow the same rule as tasks.
 
+When the tags of a channel change, and its coordinator session runs on a worker that does not have every tag now, the hub ends that session as it does when the account of the session signs out. The next turn goes to a worker that has the tags, and the channel gets the notice "The assistant moved off <worker> because the channel now needs the tag <tag>." Tasks that run keep running. Only new work follows the tags.
+
 The coordinator can see the same inventory through `list_workers`, with each worker's tags, so it can reason about placement before it starts a task. "Test this on Windows" becomes `require: { os: "windows" }`. "Use the Home Assistant server" becomes `require: { local_mcp_servers: ["home-assistant"] }`.
 
 Coordinators use the same steps, with the hub's own worker first in the preferred list. If the coordinator's harness account is signed in only on a laptop, the coordinator runs there, and that channel goes quiet when the laptop sleeps. The fix is to sign in to that harness on the hub machine too.

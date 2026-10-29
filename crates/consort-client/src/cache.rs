@@ -150,7 +150,10 @@ impl Cache {
         let pending = std::mem::take(&mut self.pending);
         let failures = std::mem::take(&mut self.send_failures);
         let threads = std::mem::take(&mut self.loaded_threads);
+        let dismissed = std::mem::take(&mut self.sign_ins_dismissed);
         *self = Cache::default();
+        // A sign-in that the user closed stays closed after a reload.
+        self.sign_ins_dismissed = dismissed;
         self.pending = pending;
         self.send_failures = failures;
         // The threads stay marked, so the link loads their replies again.
@@ -351,6 +354,9 @@ impl Cache {
         snapshot
             .decisions
             .retain(|d| !self.changed_after(EntityKind::Decision, &d.id.to_string(), at));
+        snapshot
+            .sign_ins
+            .retain(|s| !self.changed_after(EntityKind::SignIn, &s.id.to_string(), at));
     }
 
     /// Remembers that the feed entry at `seq` changed the entity.
@@ -424,6 +430,14 @@ impl Cache {
         }
         for d in snapshot.decisions {
             self.decisions.insert(d.id.to_string(), d);
+        }
+        // A sign-in that runs now, also one that another client or an earlier
+        // run of this client started. Its feed entries then update it.
+        for s in snapshot.sign_ins {
+            let id = s.id.to_string();
+            if !s.state.is_final() && !self.sign_ins_dismissed.contains(&id) {
+                self.sign_ins.insert(id, s);
+            }
         }
     }
 

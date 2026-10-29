@@ -2235,6 +2235,26 @@ impl ConsortApp {
         window.dispatch_action(action, cx);
     }
 
+    /// Whether the Add tag field of the worker detail in Settings shows.
+    fn tag_field_open(&self) -> bool {
+        self.page == Page::Settings
+            && self.settings_section == SettingsSection::Workers
+            && self.tag_entry.is_some()
+            && self.tag_entry == self.settings_worker
+    }
+
+    /// Closes the Add tag field, with its text and its error.
+    pub fn close_tag_entry(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.tag_entry = None;
+        self.tag_error = None;
+        self.inputs
+            .tag
+            .update(cx, |input, cx| input.set_value("", window, cx));
+        // The focus goes back to the app, so keys do not reach a hidden input.
+        self.focus.focus(window, cx);
+        cx.notify();
+    }
+
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let key = event.keystroke.key.as_str();
         if let Some(menu) = self.menu.as_mut() {
@@ -2258,6 +2278,10 @@ impl ConsortApp {
             if self.dialog.is_some() {
                 self.close_dialog(window, cx);
                 cx.stop_propagation();
+            } else if self.tag_field_open() {
+                // Escape closes the Add tag field of the worker, and only that.
+                self.close_tag_entry(window, cx);
+                cx.stop_propagation();
             } else if self.page == Page::Settings {
                 self.page = Page::Main;
                 self.mark_read(cx);
@@ -2274,6 +2298,14 @@ impl ConsortApp {
         } else {
             modifiers.control
         };
+        // Select all, Copy, Cut, Paste, Undo and Redo go to the focused input
+        // when its own key map did not take the key press.
+        if let Some(edit) = crate::edit_keys::EditKey::from_keystroke(key, command, modifiers.shift)
+        {
+            window.dispatch_action(edit.action(), cx);
+            cx.stop_propagation();
+            return;
+        }
         if key == "k" && command {
             if self.switcher.is_some() {
                 self.close_switcher(window, cx);

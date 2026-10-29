@@ -18,5 +18,9 @@ gpui-kit.workspace = true
 # link policy reads the reference definitions from it.
 markdown.workspace = true
 
+[dev-dependencies]
+# Headless windows and key presses for the view tests.
+gpui = { package = "gpui-pre", version = "=0.3.10", features = ["test-support"] }
+
 [lints]
 workspace = true

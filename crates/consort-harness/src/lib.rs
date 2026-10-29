@@ -407,7 +407,7 @@ pub fn sign_in_hint_for(account: &AccountConfig, message: &str) -> String {
     if !account.profile {
         return sign_in_hint(account.harness, message);
     }
-    let step = "Sign in to this account in Settings > Workers.";
+    let step = consort_proto::model::SIGN_IN_IN_SETTINGS;
     let message = message.trim();
     if message.is_empty() {
         step.to_owned()
