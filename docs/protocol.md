@@ -72,6 +72,12 @@ Each side sends the protocol versions that it supports in `hello`. The hub picks
 | `resync_required` | The client's feed position is older than the oldest kept feed entry |
 | `conflict` | The action does not apply to the entity's current state, for example resolving a task that is `up_next` |
 | `internal` | An unexpected error on the hub. The hub logs the details |
+| `sign_in_failed` | A provider's sign-in flow failed. `message` says why |
+| `tool_install_failed` | The worker could not install or update a managed tool. `message` says why |
+| `invalid_tag` | A tag is not 1 to 32 lowercase letters, digits or `-`. `message` names the tag |
+| `unsupported` | The peer knows the request type but does not carry it out yet. `message` names the type, for example "Not built yet: account.create." |
+
+A reader that gets a code it does not know treats it as `internal` and shows the message.
 
 ## Pairing and authentication
 
@@ -130,6 +136,7 @@ A client that needs the blob endpoints sends `auth.http_token` and gets a bearer
 | `session.events` | `session_id` and `events` (each with `seq`, `at` and `event`) | The ack: `session_id` and `last_seq`, the highest contiguous `seq` that the hub stored |
 | `tool.list` | `session_id` | `tools`: the hub tools for that session's role, each with `name`, `description` and `input_schema`. A session that has ended or is lost gets `conflict` |
 | `tool.call` | `session_id`, `call_id`, `name`, `arguments` | `content` (MCP text blocks, `{"type": "text", "text": ...}`), `is_error`, and optional `structured_content`. A session that has ended or is lost gets an error result with `conflict`. The hub runs at most 16 tool calls of one worker at the same time; more calls wait |
+| `sign_in.update` | `sign_in_id`, `state` (see [Sign-in](#sign-in)) | None. The hub stores the new state and sends a feed upsert of the sign-in |
 
 ### Hub to worker
 
@@ -146,6 +153,19 @@ Every hub command is a request. The envelope `id` of a hub command is its comman
 | `workspace.release` | `task_id`, `delete` (bool) | None. The hub sends it with `delete` true when a task is deleted, when a resolved task is archived, and when its channel is deleted, to each worker that ran the task, after the `session.stop` of the task's session. It does not send it when a task is resolved, because Not done needs the workspace. After a release, the hub refuses Not done and offers Retry, which starts a new session in a new workspace. The hub refuses Retry while a release of the task still waits in a queue |
 | `item.detail` | `session_id`, `item_id` | `sha256`, `size` and `mime` of a blob with the full command output or diff |
 | `inventory.refresh` | Empty | None |
+| `account.create` | `account_id` (the hub chooses it), `harness`, `label`, optional `acp`, `env` | None. The worker makes the profile folder, writes `env` to `env.json` in it, adds the account to `worker.toml`, and sends a new inventory |
+| `account.update` | `account_id`, optional `label`, `env_set`, `env_remove` | None |
+| `account.remove` | `account_id` | None. The worker signs out where it can and deletes the profile folder |
+| `account.sign_out` | `account_id` | None |
+| `sign_in.start` | `sign_in_id`, `account_id`, `method` | None. The worker sends each state as `sign_in.update` |
+| `sign_in.code` | `sign_in_id`, `code` | None. The worker writes the code to the harness and does not store it |
+| `sign_in.cancel` | `sign_in_id` | None |
+| `tools.check` | Empty | None. The result comes in the next inventory |
+| `tools.install` | `tool` | None. The progress comes in the inventory |
+
+The hub never queues the account, sign-in and tool commands for an offline worker. The client request fails with `worker_offline` instead.
+
+`env` and `env_set` are JSON objects of variable names to values, such as `{"ANTHROPIC_API_KEY": "sk-..."}`. The hub passes them through once and never stores or logs them. The `Debug` output of every type that holds them shows only the names. The same is true for the `code` of `sign_in.code`.
 
 The `workspace` object of `session.start` has these fields:
 
@@ -234,12 +254,46 @@ The worker sends a full inventory after `hello` and again when any part changes.
 | Field | Notes |
 |---|---|
 | `hash` | Hash of the rest of the inventory: `fnv1a64:` and 16 hex characters over the JSON of the inventory with an empty `hash`. It detects changes. It is not a security hash |
-| `hostname`, `os`, `arch`, `labels` | |
-| `accounts` | Each harness account: `account_id`, `harness`, `label`, `harness_version`, `auth_state`, `auth_detail`, `models`, `capabilities` and `enabled`. Never a credential |
+| `hostname`, `os`, `arch` | |
+| `tags` | The detected tags (`macos`, `windows`, `linux`, `arm64`, `x64`, `ram-<n>gb`, `cpu-<n>`, `gpu-nvidia`, `gpu-amd`, `gpu-apple`) and the `tags` in `worker.toml`. An older worker sends `labels`, which reads as `tags` |
+| `accounts` | Each harness account: `account_id`, `harness`, `label`, `harness_version`, `auth_state`, `auth_detail`, `models`, `capabilities`, `enabled`, `profile` (true for an account that Consort made, with a profile folder), `email`, `plan`, `secret_names` (the names in `env.json`, never the values) and `sign_in_methods`. Never a credential |
+| `tools` | Each managed tool: `tool`, `version`, `latest`, `state` (`missing`, `installing`, `ready`, `update_available` or `failed`) and `detail`. `tool` is `node`, `claude-code`, `claude-agent-acp`, `codex`, `opencode`, `gemini-cli` or `acp:<registry id>` |
 | `local_mcp_servers` | Each server's `name`, `description` and tool names. Never a URL with a secret, and never a credential |
 | `checkouts` | Each checkout's `repo_url`, `path` and `managed` flag |
 | `policy` | `max_approval_mode`, `allowed_roots` and `allow_shell` |
 | `load` | `active_sessions` |
+
+### Sign-in
+
+A sign-in is one run of a provider's sign-in flow for one account. The user starts it from a client with `sign_in.start`. The hub makes a `SignIn` record (ID prefix `sgn_`) in the `starting` state, returns it, and sends `sign_in.start` to the worker. Each `sign_in.update` from the worker becomes a feed upsert of the record.
+
+`method` has a `kind` and the fields for that kind:
+
+| Kind | Fields | Flow |
+|---|---|---|
+| `claude_plan` | | `claude auth login --claudeai`. The user opens a URL and pastes a code |
+| `claude_console` | | `claude auth login --console`. The same flow |
+| `chatgpt_device` | | Codex device code. The user enters a code on a page |
+| `chatgpt_browser` | | Codex browser sign-in on the worker machine |
+| `api_key` | `variable` | No flow. The key arrives in `env` of `account.create` or `env_set` of `account.update` |
+| `acp_agent` | `method_id`, `name` | ACP `authenticate` with that method |
+| `terminal` | `command` | The app cannot run it. The app shows the command, and the user runs it on the worker |
+
+`state` has a `kind` and the fields for that kind:
+
+| Kind | Fields | What the client shows |
+|---|---|---|
+| `starting` | | A spinner |
+| `open_url` | `url` | Open sign-in page |
+| `device_code` | `url`, `user_code` | The code in large type, Open sign-in page and Copy code |
+| `needs_code` | `url` | Open sign-in page, Copy link, a code field and Send code. The client sends the code with `sign_in.submit_code` |
+| `verifying` | | A spinner |
+| `succeeded` | optional `detail` | "Signed in as" the detail, and Done |
+| `failed` | `message` | The message and Try again |
+| `cancelled` | | |
+| `expired` | | No update came for 15 minutes |
+
+`succeeded`, `failed`, `cancelled` and `expired` are final. The hub deletes a sign-in one day after its last update.
 
 ### Blobs
 
@@ -272,7 +326,7 @@ The hub gives each session the tools for its role. Each tool's `input_schema` is
 | `memory_list` | optional `scope` | Paths, hashes and update times |
 | `memory_read` | optional `scope`, `path` | `content` and `sha256` |
 | `files_list` | optional `prefix` | Channel file paths, sizes and hashes |
-| `list_workers` | None | Each worker's ID, name, OS, state, labels, account labels with their models, local MCP server names and repo checkouts |
+| `list_workers` | None | Each worker's ID, name, OS, state, tags, account labels with their models, local MCP server names and repo checkouts |
 | `ask_decision` | `question`, `options` (2 to 4, each with `label` and `consequence`), optional `recommended_index`, `context` and `allow_free_text` | `decision_id`. The answer arrives as input to a later turn |
 | `search` | `query`, optional `channel_id` | Matching messages, memory notes and tasks |
 
@@ -384,13 +438,21 @@ A client that does not know these fields shows the preview, which ends with a no
 | Memory | `memory.list`, `memory.read`, `memory.write`, `memory.delete`, `memory.history` |
 | Channel files | `files.list`, `files.put` (after a blob upload), `files.move`, `files.delete` |
 | Routines | `routine.create`, `routine.update`, `routine.delete`, `routine.run_now`, `routine.runs` |
-| Workers | `worker.list`, `worker.pairing_code`, `worker.rename`, `worker.set_labels`, `worker.set_paused`, `worker.revoke`, `worker.refresh_inventory` |
+| Workers | `worker.list`, `worker.pairing_code`, `worker.rename`, `worker.set_tags` (with `worker_id` and `tags`), `worker.set_paused`, `worker.revoke`, `worker.refresh_inventory`, `worker.tools_check` (with `worker_id`), `worker.tool_install` (with `worker_id` and `tool`) |
+| Accounts | `account.create` (with `worker_id`, `harness`, `label`, optional `acp`, `env`; the result has `account_id`), `account.update` (with `worker_id`, `account_id`, optional `label`, `env_set`, `env_remove`), `account.remove` and `account.sign_out` (with `worker_id` and `account_id`), `acp_registry.list` (the result has `agents`, each with `id`, `name`, `description`, `version`, `icon_url` and `supported`) |
+| Sign-in | `sign_in.start` (with `worker_id`, `account_id` and `method`; the result has `sign_in`), `sign_in.submit_code` (with `sign_in_id` and `code`), `sign_in.cancel` (with `sign_in_id`) |
 | Clients | `client.pairing_code`, `client.list`, `client.revoke`, `client.push_register` |
 | Auth | `auth.http_token` |
 
 `message.send` with a `client_message_id` that the hub already stored returns the stored message. A client can retry a send without making a duplicate.
 
 In `channel.update` and `task.update`, a field that is left out does not change. For a field that can be cleared, such as `icon` or `start_at`, `null` clears it. `channel.update` also takes `allowed_local_mcp_servers`, the list of local MCP servers that a task from the assistant may use. The hub trims the names, drops copies, and refuses `hub` and names with `__`.
+
+`channel.create` and `channel.update` take `tags`. `worker.set_tags` replaces the user tags of a worker. The hub trims each tag, drops repeats, and refuses a tag that is not 1 to 32 lowercase letters, digits or `-` with `invalid_tag`. A channel's tags are requirements: a coordinator turn, a task or a routine run of the channel runs only on a worker that has every tag, from its user tags or its inventory tags. This is added to any `require.tags` of a task. `worker.set_labels` and the `labels` fields are gone; a `labels` field in an old body still reads as `tags`.
+
+The `acp` of `account.create` has a `kind`: `registry` with `id`, or `command` with `program` and `args`. `acp_registry.list` reads the ACP registry (`https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json`), which the hub caches for one hour. An agent is `supported` when it has a distribution that the worker can install for at least one platform: `binary` with a SHA-256, or `npx`.
+
+Account, sign-in and tool requests fail with `worker_offline` when the worker is offline. Until the hub and the worker carry them out, they fail with `unsupported`.
 
 `task.retry` works for a Failed task, and for a task in Ready for review or Resolved whose session has ended. `task.reopen` (Not done) fails with `conflict` when archive deleted the workspace of the task. Retry is the way on then.
 

@@ -7,6 +7,7 @@ use std::sync::Mutex;
 use consort_proto::client_api::*;
 use consort_proto::frame::Empty;
 use consort_proto::ids::{ClientId, WorkerId};
+use consort_proto::model::normalize_tags;
 
 use crate::error::{HubError, Result};
 use crate::hub::{Caller, Hub};
@@ -140,27 +141,18 @@ impl Hub {
         Ok(WorkerResult { worker })
     }
 
-    pub(crate) async fn worker_set_labels(
+    pub(crate) async fn worker_set_tags(
         &self,
         _caller: &Caller,
-        request: WorkerSetLabels,
+        request: WorkerSetTags,
     ) -> Result<WorkerResult> {
-        let mut labels: Vec<String> = Vec::new();
-        for label in &request.labels {
-            let label = label.trim();
-            if label.is_empty() || label.chars().count() > 60 {
-                return Err(HubError::invalid("A label needs 1 to 60 characters."));
-            }
-            if !labels.iter().any(|l| l == label) {
-                labels.push(label.to_owned());
-            }
-        }
+        let tags = normalize_tags(&request.tags)?;
         let worker = self
             .store
             .write(move |tx| {
                 let mut worker = machine::worker_or_404(tx.db(), request.worker_id)?;
-                if worker.labels != labels {
-                    worker.labels = labels;
+                if worker.tags != tags {
+                    worker.tags = tags;
                     tx.save_worker(&worker)?;
                 }
                 Ok(worker)

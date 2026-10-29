@@ -388,6 +388,7 @@ pub(crate) mod testing {
             archived_at: archived.then_some(now),
             created_at: now,
             updated_at: now,
+            tags: Vec::new(),
         };
         let saved = channel.clone();
         hub.store

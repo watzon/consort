@@ -76,6 +76,10 @@ pub struct Channel {
     pub allowed_local_mcp_servers: Vec<String>,
     /// Whether the channel has its own memory.
     pub memory_enabled: bool,
+    /// Tags that a worker must all have to run work from this channel:
+    /// coordinator turns, tasks and routine runs.
+    #[serde(default)]
+    pub tags: Vec<String>,
     /// When the channel was archived.
     pub archived_at: Option<Timestamp>,
     /// When the channel was created.

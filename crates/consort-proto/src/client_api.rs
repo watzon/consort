@@ -25,14 +25,15 @@ use serde_json::Value;
 use crate::auth::{AuthHttpToken, ClientHello, ClientHelloResult, HttpToken, PairingCode};
 use crate::frame::{Empty, message_family};
 use crate::ids::{
-    ApprovalId, ChannelId, ClientId, DecisionId, GroupId, ItemId, MessageId, RepoId, RoutineId,
-    SessionId, TaskId, WorkerId,
+    AccountId, ApprovalId, ChannelId, ClientId, DecisionId, GroupId, ItemId, MessageId, RepoId,
+    RoutineId, SessionId, SignInId, TaskId, WorkerId,
 };
 use crate::model::{
-    Approval, ApprovalMode, BlobRef, Channel, ChannelFile, Client, Decision, DecisionAnswer,
-    ExpectedHash, Group, Isolation, MemoryNote, MemoryScope, Message, ModelSelection,
-    PlacementRequest, PushProvider, ReadMarker, Repo, Routine, RoutineAction, RoutineRun,
-    RoutineSchedule, SessionItem, Sha256Hash, Task, Worker, memory_note_entity_id,
+    AcpAccountSpec, AcpRegistryAgent, Approval, ApprovalMode, BlobRef, Channel, ChannelFile,
+    Client, Decision, DecisionAnswer, ExpectedHash, Group, Isolation, MemoryNote, MemoryScope,
+    Message, ModelSelection, PlacementRequest, PushProvider, ReadMarker, Repo, Routine,
+    RoutineAction, RoutineRun, RoutineSchedule, SecretEnv, SessionItem, Sha256Hash, SignIn,
+    SignInMethod, Task, ToolId, Worker, memory_note_entity_id,
 };
 use crate::time::Timestamp;
 use crate::tools::{FilesListResult, MemoryListResult, RoutineResult, SearchResult};
@@ -216,6 +217,8 @@ pub enum EntityKind {
     Worker,
     /// [`Client`].
     Client,
+    /// [`SignIn`].
+    SignIn,
 }
 
 /// The full client view of an entity after a write.
@@ -250,6 +253,8 @@ pub enum EntityPayload {
     Worker(Worker),
     /// A client.
     Client(Client),
+    /// A sign-in.
+    SignIn(SignIn),
 }
 
 impl EntityPayload {
@@ -270,6 +275,7 @@ impl EntityPayload {
             Self::Routine(_) => EntityKind::Routine,
             Self::Worker(_) => EntityKind::Worker,
             Self::Client(_) => EntityKind::Client,
+            Self::SignIn(_) => EntityKind::SignIn,
         }
     }
 
@@ -296,6 +302,7 @@ impl EntityPayload {
             Self::Routine(e) => e.id.to_string(),
             Self::Worker(e) => e.id.to_string(),
             Self::Client(e) => e.id.to_string(),
+            Self::SignIn(e) => e.id.to_string(),
         }
     }
 
@@ -320,7 +327,8 @@ impl EntityPayload {
             | Self::Repo(_)
             | Self::SessionItem(_)
             | Self::Worker(_)
-            | Self::Client(_) => None,
+            | Self::Client(_)
+            | Self::SignIn(_) => None,
         }
     }
 }
@@ -523,6 +531,10 @@ pub struct ChannelCreate {
     /// Whether the channel has its own memory. Empty means true.
     #[serde(default)]
     pub memory_enabled: Option<bool>,
+    /// The channel's tags. Work from the channel runs only on a worker with
+    /// every tag.
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 /// `channel.update`. Fields that are left out do not change. For the fields
@@ -587,6 +599,9 @@ pub struct ChannelUpdate {
     /// Turn channel memory on or off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_enabled: Option<bool>,
+    /// The new tags. An empty list removes every tag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tags: Option<Vec<String>>,
 }
 
 impl ChannelUpdate {
@@ -608,6 +623,7 @@ impl ChannelUpdate {
             default_approval_mode: None,
             allowed_local_mcp_servers: None,
             memory_enabled: None,
+            tags: None,
         }
     }
 }
@@ -1239,13 +1255,16 @@ pub struct WorkerRename {
     pub name: String,
 }
 
-/// `worker.set_labels`: replace the user's labels on a worker.
+/// `worker.set_tags`: replace the user tags on a worker. The hub checks
+/// each tag (see [`crate::model::validate_tag`]) and answers `invalid_tag`
+/// for a bad one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WorkerSetLabels {
+pub struct WorkerSetTags {
     /// The worker.
     pub worker_id: WorkerId,
-    /// The labels.
-    pub labels: Vec<String>,
+    /// The user tags.
+    #[serde(alias = "labels")]
+    pub tags: Vec<String>,
 }
 
 /// `worker.set_paused`: **Pause** or resume a worker. Placement skips a
@@ -1277,6 +1296,154 @@ pub struct WorkerRevoke {
 pub struct WorkerRefreshInventory {
     /// The worker.
     pub worker_id: WorkerId,
+}
+
+/// `worker.tools_check`: the worker checks for tool updates now. The result
+/// comes in the next inventory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerToolsCheck {
+    /// The worker.
+    pub worker_id: WorkerId,
+}
+
+/// `worker.tool_install`: install or update one managed tool on a worker.
+/// The progress comes in the inventory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerToolInstall {
+    /// The worker.
+    pub worker_id: WorkerId,
+    /// The tool.
+    pub tool: ToolId,
+}
+
+// Accounts and sign-in ---------------------------------------------------
+
+/// `account.create`: make an account with its own profile folder on a
+/// worker. Fails with `worker_offline` when the worker is offline.
+///
+/// `Debug` shows the names in `env`, never the values.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountCreate {
+    /// The worker.
+    pub worker_id: WorkerId,
+    /// The harness: `claude`, `codex`, `opencode`, `gemini` or `acp`.
+    pub harness: String,
+    /// The account name, for example "Claude Personal".
+    pub label: String,
+    /// The ACP agent, for an `acp` account.
+    #[serde(default)]
+    pub acp: Option<AcpAccountSpec>,
+    /// Secret variables, such as an API key. The worker writes them to
+    /// `env.json` in the profile folder. The hub does not store them.
+    #[serde(default)]
+    pub env: SecretEnv,
+}
+
+/// The response to `account.create`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountCreateResult {
+    /// The new account.
+    pub account_id: AccountId,
+}
+
+/// `account.update`: rename an account or change its secret variables.
+///
+/// `Debug` shows the names in `env_set`, never the values.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountUpdate {
+    /// The worker.
+    pub worker_id: WorkerId,
+    /// The account.
+    pub account_id: AccountId,
+    /// The new name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Secret variables to add or replace.
+    #[serde(default)]
+    pub env_set: SecretEnv,
+    /// Secret variables to remove, by name.
+    #[serde(default)]
+    pub env_remove: Vec<String>,
+}
+
+/// `account.remove`: the worker signs out where it can and deletes the
+/// profile folder.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountRemove {
+    /// The worker.
+    pub worker_id: WorkerId,
+    /// The account.
+    pub account_id: AccountId,
+}
+
+/// `account.sign_out`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountSignOut {
+    /// The worker.
+    pub worker_id: WorkerId,
+    /// The account.
+    pub account_id: AccountId,
+}
+
+/// `sign_in.start`: start a provider's sign-in flow for an account. The hub
+/// answers with the new sign-in. Each state change comes as a feed upsert
+/// of the sign-in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignInStart {
+    /// The worker.
+    pub worker_id: WorkerId,
+    /// The account.
+    pub account_id: AccountId,
+    /// The method, one of the account's `sign_in_methods`.
+    pub method: SignInMethod,
+}
+
+/// The response to `sign_in.start`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignInResult {
+    /// The sign-in.
+    pub sign_in: SignIn,
+}
+
+/// `sign_in.submit_code`: the code that the sign-in page showed, for a
+/// sign-in in `needs_code`. The worker writes it to the harness. Nobody
+/// stores it.
+///
+/// `Debug` does not show the code.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignInSubmitCode {
+    /// The sign-in.
+    pub sign_in_id: SignInId,
+    /// The code.
+    pub code: String,
+}
+
+impl fmt::Debug for SignInSubmitCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SignInSubmitCode")
+            .field("sign_in_id", &self.sign_in_id)
+            .field("code", &crate::model::Redacted)
+            .finish()
+    }
+}
+
+/// `sign_in.cancel`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignInCancel {
+    /// The sign-in.
+    pub sign_in_id: SignInId,
+}
+
+/// `acp_registry.list`: the agents in the ACP registry. The hub caches the
+/// registry for one hour.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcpRegistryList {}
+
+/// The response to `acp_registry.list`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AcpRegistryListResult {
+    /// The agents.
+    pub agents: Vec<AcpRegistryAgent>,
 }
 
 /// `client.pairing_code`: the data for the pairing QR code.
@@ -1424,14 +1591,34 @@ message_family! {
         WorkerPairingCode("worker.pairing_code", WorkerPairingCode => PairingCodeResult),
         /// Rename a worker.
         WorkerRename("worker.rename", WorkerRename => WorkerResult),
-        /// Set a worker's labels.
-        WorkerSetLabels("worker.set_labels", WorkerSetLabels => WorkerResult),
+        /// Set a worker's user tags.
+        WorkerSetTags("worker.set_tags", WorkerSetTags => WorkerResult),
         /// Pause or resume a worker.
         WorkerSetPaused("worker.set_paused", WorkerSetPaused => WorkerResult),
         /// Remove a worker.
         WorkerRevoke("worker.revoke", WorkerRevoke => Empty),
         /// Ask a worker for a new inventory.
         WorkerRefreshInventory("worker.refresh_inventory", WorkerRefreshInventory => Empty),
+        /// Check a worker's managed tools for updates now.
+        WorkerToolsCheck("worker.tools_check", WorkerToolsCheck => Empty),
+        /// Install or update one managed tool on a worker.
+        WorkerToolInstall("worker.tool_install", WorkerToolInstall => Empty),
+        /// Make an account on a worker.
+        AccountCreate("account.create", AccountCreate => AccountCreateResult),
+        /// Rename an account or change its secret variables.
+        AccountUpdate("account.update", AccountUpdate => Empty),
+        /// Remove an account and its profile folder.
+        AccountRemove("account.remove", AccountRemove => Empty),
+        /// Sign an account out.
+        AccountSignOut("account.sign_out", AccountSignOut => Empty),
+        /// Start a sign-in.
+        SignInStart("sign_in.start", SignInStart => SignInResult),
+        /// Send the code of a sign-in.
+        SignInSubmitCode("sign_in.submit_code", SignInSubmitCode => Empty),
+        /// Cancel a sign-in.
+        SignInCancel("sign_in.cancel", SignInCancel => Empty),
+        /// List the ACP registry agents.
+        AcpRegistryList("acp_registry.list", AcpRegistryList => AcpRegistryListResult),
         /// Make a client pairing code.
         ClientPairingCode("client.pairing_code", ClientPairingCode => ClientPairingCodeResult),
         /// List clients.
@@ -1734,6 +1921,8 @@ mod tests {
         let rtn: RoutineId = "rtn_00000000-0000-0000-0000-000000000005".parse().unwrap();
         let wrk: WorkerId = "wrk_00000000-0000-0000-0000-000000000006".parse().unwrap();
         let grp: GroupId = "grp_00000000-0000-0000-0000-000000000007".parse().unwrap();
+        let acc: AccountId = "acc_00000000-0000-0000-0000-000000000009".parse().unwrap();
+        let sgn: SignInId = "sgn_00000000-0000-0000-0000-00000000000a".parse().unwrap();
         let hash: Sha256Hash = "a".repeat(64).parse().unwrap();
         vec![
             ClientHello {
@@ -1764,6 +1953,7 @@ mod tests {
                 default_isolation: Some(Isolation::Worktree),
                 default_approval_mode: None,
                 memory_enabled: None,
+                tags: vec!["work".into()],
             }
             .into(),
             ChannelUpdate {
@@ -1986,9 +2176,9 @@ mod tests {
                 name: "bigboi".into(),
             }
             .into(),
-            WorkerSetLabels {
+            WorkerSetTags {
                 worker_id: wrk,
-                labels: vec!["gpu".into()],
+                tags: vec!["gpu".into()],
             }
             .into(),
             WorkerSetPaused {
@@ -1998,6 +2188,51 @@ mod tests {
             .into(),
             WorkerRevoke { worker_id: wrk }.into(),
             WorkerRefreshInventory { worker_id: wrk }.into(),
+            WorkerToolsCheck { worker_id: wrk }.into(),
+            WorkerToolInstall {
+                worker_id: wrk,
+                tool: ToolId::claude_code(),
+            }
+            .into(),
+            AccountCreate {
+                worker_id: wrk,
+                harness: "acp".into(),
+                label: "Goose".into(),
+                acp: Some(AcpAccountSpec::Registry { id: "goose".into() }),
+                env: [("GOOSE_API_KEY", "secret")].into_iter().collect(),
+            }
+            .into(),
+            AccountUpdate {
+                worker_id: wrk,
+                account_id: acc,
+                label: Some("Claude Work".into()),
+                env_set: [("ANTHROPIC_API_KEY", "sk")].into_iter().collect(),
+                env_remove: vec!["OLD".into()],
+            }
+            .into(),
+            AccountRemove {
+                worker_id: wrk,
+                account_id: acc,
+            }
+            .into(),
+            AccountSignOut {
+                worker_id: wrk,
+                account_id: acc,
+            }
+            .into(),
+            SignInStart {
+                worker_id: wrk,
+                account_id: acc,
+                method: SignInMethod::ClaudePlan,
+            }
+            .into(),
+            SignInSubmitCode {
+                sign_in_id: sgn,
+                code: "abc#def".into(),
+            }
+            .into(),
+            SignInCancel { sign_in_id: sgn }.into(),
+            AcpRegistryList {}.into(),
             ClientPairingCode {}.into(),
             ClientList {}.into(),
             ClientRevoke {
@@ -2082,9 +2317,19 @@ mod tests {
             "worker.list",
             "worker.pairing_code",
             "worker.rename",
-            "worker.set_labels",
+            "worker.set_tags",
             "worker.revoke",
             "worker.refresh_inventory",
+            "worker.tools_check",
+            "worker.tool_install",
+            "account.create",
+            "account.update",
+            "account.remove",
+            "account.sign_out",
+            "sign_in.start",
+            "sign_in.submit_code",
+            "sign_in.cancel",
+            "acp_registry.list",
             "client.pairing_code",
             "client.list",
             "client.revoke",
@@ -2139,6 +2384,7 @@ mod tests {
             default_approval_mode: ApprovalMode::Ask,
             allowed_local_mcp_servers: vec!["home-assistant".into()],
             memory_enabled: true,
+            tags: vec!["work".into()],
             archived_at: None,
             created_at: Timestamp::from_millis(0),
             updated_at: Timestamp::from_millis(0),
@@ -2175,6 +2421,7 @@ mod tests {
             default_approval_mode: ApprovalMode::Ask,
             allowed_local_mcp_servers: vec!["home-assistant".into()],
             memory_enabled: true,
+            tags: vec!["work".into()],
             archived_at: None,
             created_at: Timestamp::from_millis(0),
             updated_at: Timestamp::from_millis(0),
@@ -2184,9 +2431,146 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("allowed_local_mcp_servers");
+        value.as_object_mut().unwrap().remove("tags");
         let old: Channel = serde_json::from_value(value).unwrap();
         assert!(old.allowed_local_mcp_servers.is_empty());
+        assert!(old.tags.is_empty());
         let update = serde_json::to_value(ChannelUpdate::new(chn())).unwrap();
         assert!(update.get("allowed_local_mcp_servers").is_none());
+        assert!(update.get("tags").is_none());
+    }
+
+    #[test]
+    fn worker_set_tags_reads_old_labels() {
+        let old: WorkerSetTags = serde_json::from_value(json!({
+            "worker_id": "wrk_00000000-0000-0000-0000-000000000006",
+            "labels": ["gpu"]
+        }))
+        .unwrap();
+        assert_eq!(old.tags, ["gpu"]);
+        assert!(serde_json::to_value(&old).unwrap().get("labels").is_none());
+    }
+
+    /// AGENTS.md and the plan: secret values and sign-in codes never show
+    /// in `Debug` output, also through the request enum.
+    #[test]
+    fn debug_hides_secrets() {
+        let wrk: WorkerId = "wrk_00000000-0000-0000-0000-000000000006".parse().unwrap();
+        let acc = AccountId::new();
+        let create = AccountCreate {
+            worker_id: wrk,
+            harness: "claude".into(),
+            label: "Claude API".into(),
+            acp: None,
+            env: [("ANTHROPIC_API_KEY", "sk-ant-very-secret")]
+                .into_iter()
+                .collect(),
+        };
+        let update = AccountUpdate {
+            worker_id: wrk,
+            account_id: acc,
+            label: None,
+            env_set: [("OPENAI_API_KEY", "sk-openai-secret")]
+                .into_iter()
+                .collect(),
+            env_remove: vec![],
+        };
+        let code = SignInSubmitCode {
+            sign_in_id: SignInId::new(),
+            code: "pasted-code-123".into(),
+        };
+        let texts = [
+            format!("{create:?}"),
+            format!("{:?}", ClientRequest::from(create.clone())),
+            format!("{update:?}"),
+            format!("{:?}", ClientRequest::from(update)),
+            format!("{code:?}"),
+            format!("{:?}", ClientRequest::from(code)),
+            format!("{create:#?}"),
+        ];
+        for text in &texts {
+            for secret in ["sk-ant-very-secret", "sk-openai-secret", "pasted-code-123"] {
+                assert!(!text.contains(secret), "{text}");
+            }
+        }
+        assert!(texts[0].contains("ANTHROPIC_API_KEY"), "{}", texts[0]);
+        assert!(texts[0].contains("Claude API"), "{}", texts[0]);
+        assert!(texts[2].contains("OPENAI_API_KEY"), "{}", texts[2]);
+        // The wire still carries the values.
+        let value = serde_json::to_value(&create).unwrap();
+        assert_eq!(value["env"]["ANTHROPIC_API_KEY"], "sk-ant-very-secret");
+    }
+
+    #[test]
+    fn account_requests_read_minimal_bodies() {
+        let create: AccountCreate = serde_json::from_value(json!({
+            "worker_id": "wrk_00000000-0000-0000-0000-000000000006",
+            "harness": "claude",
+            "label": "Claude Personal"
+        }))
+        .unwrap();
+        assert!(create.env.is_empty());
+        assert_eq!(create.acp, None);
+        let update: AccountUpdate = serde_json::from_value(json!({
+            "worker_id": "wrk_00000000-0000-0000-0000-000000000006",
+            "account_id": "acc_00000000-0000-0000-0000-000000000009"
+        }))
+        .unwrap();
+        assert_eq!(update.label, None);
+        assert!(update.env_set.is_empty() && update.env_remove.is_empty());
+        let result = AccountCreateResult {
+            account_id: "acc_00000000-0000-0000-0000-000000000009".parse().unwrap(),
+        };
+        assert_eq!(
+            serde_json::to_value(&result).unwrap(),
+            json!({"account_id": "acc_00000000-0000-0000-0000-000000000009"})
+        );
+        let list = AcpRegistryListResult {
+            agents: vec![AcpRegistryAgent {
+                id: "goose".into(),
+                name: "Goose".into(),
+                description: String::new(),
+                version: "1.0.0".into(),
+                icon_url: None,
+                supported: false,
+            }],
+        };
+        let back: AcpRegistryListResult =
+            serde_json::from_value(serde_json::to_value(&list).unwrap()).unwrap();
+        assert_eq!(back, list);
+    }
+
+    #[test]
+    fn sign_in_feed_entry_round_trips() {
+        use crate::model::{SIGN_IN_IDLE_EXPIRY_MS, SignInState};
+        let sign_in = SignIn {
+            id: "sgn_00000000-0000-0000-0000-00000000000a".parse().unwrap(),
+            worker_id: "wrk_00000000-0000-0000-0000-000000000006".parse().unwrap(),
+            account_id: "acc_00000000-0000-0000-0000-000000000009".parse().unwrap(),
+            method: SignInMethod::ChatgptDevice,
+            state: SignInState::DeviceCode {
+                url: "https://auth.openai.com/device".into(),
+                user_code: "ABCD-EFGH".into(),
+            },
+            created_at: Timestamp::from_millis(10),
+            updated_at: Timestamp::from_millis(10),
+            expires_at: Timestamp::from_millis(10 + SIGN_IN_IDLE_EXPIRY_MS),
+        };
+        let payload = EntityPayload::SignIn(sign_in.clone());
+        assert_eq!(payload.kind(), EntityKind::SignIn);
+        assert_eq!(payload.channel_id(), None);
+        assert_eq!(
+            payload.entity_id(),
+            "sgn_00000000-0000-0000-0000-00000000000a"
+        );
+        let entry = FeedEntry::upsert(7, Timestamp::from_millis(10), payload);
+        let value = serde_json::to_value(&entry).unwrap();
+        assert_eq!(value["entity"], "sign_in");
+        assert_eq!(value["payload"]["state"]["kind"], "device_code");
+        assert_eq!(serde_json::from_value::<FeedEntry>(value).unwrap(), entry);
+        let result = SignInResult { sign_in };
+        let back: SignInResult =
+            serde_json::from_value(serde_json::to_value(&result).unwrap()).unwrap();
+        assert_eq!(back, result);
     }
 }

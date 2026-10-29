@@ -64,7 +64,25 @@ Four rules keep the adapters honest:
 
 ## Harness accounts
 
-The user configures harness accounts in `worker.toml` (see [data-model.md](data-model.md#worker-local-state)). Each account has a `home` and an optional `shadow_home`. A shadow home is a folder that links to the shared home for everything except the login files. So two accounts of one harness share settings, skills and history, and each keeps its own login. T3 Code does this for Codex with symlinks. Each harness keeps its login in a different place, so each adapter knows which files to keep private:
+In the UI a harness is a **provider**, and a harness account is an **account**. Accounts belong to a worker. The user makes them in Settings > Workers, with `account.create` (see [protocol.md](protocol.md#requests)). One provider can have several accounts on one worker. A new worker has no accounts, and the worker does not pick up a login that already exists on the machine.
+
+### Profile folders
+
+Each account that Consort makes has its own profile folder, `<consort home>/profiles/<account id>/`. The worker writes it to `worker.toml` as `{ id, harness, label, profile = true }`, plus `acp` for an ACP agent. The profile folder holds the harness's own config and login, and `env.json` with the account's secret variables. The worker derives each harness's home settings from the profile folder:
+
+| Harness | Settings |
+|---|---|
+| Claude Code | `CLAUDE_CONFIG_DIR=<profile>/claude` |
+| Codex | `CODEX_HOME=<profile>/codex`, with `cli_auth_credentials_store = "file"` |
+| Gemini CLI | `GEMINI_CLI_HOME=<profile>/gemini` |
+| OpenCode | `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME` and `XDG_CACHE_HOME` under `<profile>/xdg/` |
+| ACP agents | `HOME` stays as it is. Only the env is set |
+
+The worker merges `env.json` into the session env after the profile variables. It writes `env.json` with mode 0600 on Unix. The inventory reports the variable names (`secret_names`), never the values.
+
+### Accounts in worker.toml
+
+A user can still write an account in `worker.toml` by hand (see [data-model.md](data-model.md#worker-local-state)). Such an account has a `home` and an optional `shadow_home`. A shadow home is a folder that links to the shared home for everything except the login files. So two accounts of one harness share settings, skills and history, and each keeps its own login. T3 Code does this for Codex with symlinks. Each harness keeps its login in a different place, so each adapter knows which files to keep private:
 
 | Harness | Home setting | Private files |
 |---|---|---|
@@ -78,7 +96,21 @@ The worker never reads the private files. It only reports `auth_state`, which ea
 
 A session can find out that the login is gone before the next probe. When a turn fails for that reason, the adapter sends a `signed_out` error event. When the open of a session fails for that reason (`auth_required` in ACP), the adapter returns `HarnessError::SignedOut`, and the worker sends the same event. In both cases the event has the step to sign in, and the worker marks the account signed out in its inventory at once, so placement stops choosing it.
 
-The user signs in on the worker machine, with the harness's own command. The client shows the sign-in state and the command to run. Anthropic's terms require the sign-in to go through Anthropic's own flow, so the app never asks for a Claude credential.
+### Sign-in
+
+The user signs in from a client, through the harness's own sign-in flow on the worker (`sign_in.start`, see [protocol.md](protocol.md#sign-in)). Anthropic's terms require the sign-in to go through Anthropic's own flow, so the app never asks for a Claude password or token. ADR 0010 has the credential rules.
+
+| Method | How the worker runs it |
+|---|---|
+| `claude_plan`, `claude_console` | The managed `claude auth login --claudeai` (or `--console`) in a pseudo-terminal with the profile env, `DISABLE_AUTOUPDATER=1`, and a `BROWSER` setting that keeps it from opening a browser on the worker. The worker sends `needs_code` with the URL, then writes the code from `sign_in.code` and a newline. Success is exit code 0 and `loggedIn` from `claude auth status --json` |
+| `chatgpt_device`, `chatgpt_browser` | `codex app-server` with the profile `CODEX_HOME`, then `account/login/start` with `chatgptDeviceCode` (`device_code`) or `chatgpt` (`open_url`), and a wait for `account/login/completed`. One browser sign-in per worker at a time, because the callback port is fixed |
+| `api_key` | No flow. The key arrives in `env`. The probe checks it |
+| `acp_agent` | `authenticate` with the method ID, on a short-lived agent process with the profile env |
+| `terminal` | The client shows the command. The user runs it on the worker |
+
+Sign out: Claude runs `claude auth logout`. Codex calls `account/logout`. An API key account deletes the key from `env.json`. An ACP agent calls `logout` if the agent has it. `account.remove` signs out where it can and deletes the profile folder.
+
+For Claude, the probe uses `claude auth status --json` (email, plan, expired) before the ACP probe, and the inventory reports `email` and `plan`.
 
 ## How each path gives a session the hub tools
 
@@ -207,7 +239,19 @@ So that a stop signal reaches only the worker:
 
 ## Install harnesses
 
-The worker finds harnesses on `PATH` or at the `binary` path of each account. For ACP Registry agents, the worker can also install the agent from its registry entry into the worker's tools folder, after the user asks for it in a client. The registry gives `npx`, `uvx` or binary launch recipes, and binary archives come with a SHA-256 hash that the worker checks.
+Each worker downloads and updates its own copy of each harness CLI, as a managed tool in `<consort home>/tools/<tool>/<version>/`. It does not use a global install. The `consort-tools` crate owns the downloads, the checks, the install layout and the launch specs. The worker launches every harness through it, and installs a missing tool first. While a tool installs, the account status says so, for example "Installing Claude Code".
+
+| Tool | Source | Check | Launch |
+|---|---|---|---|
+| `node` | Node 24 LTS from `nodejs.org/dist` (`unofficial-builds.nodejs.org` on musl Linux) | `SHASUMS256.txt` | |
+| `claude-code` | `downloads.claude.ai/claude-code-releases/<version>/<platform>/claude`, version from `stable` | SHA-256 from `manifest.json`, and the signature of `manifest.json` | `claude` |
+| `claude-agent-acp` | npm, with the managed Node | npm | `node .../dist/index.js`, with `CLAUDE_CODE_EXECUTABLE` set to the managed `claude` |
+| `codex` | GitHub release `rust-v<version>`, `codex-package-<triple>.tar.gz` | `codex-package_SHA256SUMS` | `codex app-server` |
+| `opencode` | The `opencode-v2` entry of the ACP registry | SHA-256 from the registry | `opencode acp` |
+| `gemini-cli` | npm, with the managed Node | npm | `node .../bundle/gemini.js --acp` |
+| `acp:<id>` | An ACP registry agent: `binary` with a SHA-256, or `npx` | SHA-256. A `binary` without one is refused. `uvx` is not supported | From the registry |
+
+An install goes to a temporary folder next to the target, is checked, and is then renamed, so a failed install leaves nothing. The previous version stays until the new one is ready. The worker checks for updates once a day and on `tools.check`, and never updates a tool while a session uses it. Self-updates are off: `DISABLE_AUTOUPDATER=1` for Claude Code, `check_for_update_on_startup = false` for Codex, `OPENCODE_DISABLE_AUTOUPDATE=true` for OpenCode, and `general.enableAutoUpdate: false` for Gemini CLI. OpenCode version 2 is the supported line.
 
 ## Tests
 

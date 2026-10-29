@@ -39,6 +39,7 @@ fn channel_named(name: &str) -> ChannelCreate {
         default_isolation: None,
         default_approval_mode: None,
         memory_enabled: None,
+        tags: Vec::new(),
     }
 }
 

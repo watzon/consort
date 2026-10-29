@@ -173,6 +173,7 @@ async fn a_channel_filter_hides_the_entries_of_other_channels() {
             default_isolation: None,
             default_approval_mode: None,
             memory_enabled: None,
+            tags: Vec::new(),
         })
         .await
         .unwrap()

@@ -119,9 +119,10 @@ enum WorkerCommand {
         /// The worker name. The default is the host name.
         #[arg(long)]
         name: Option<String>,
-        /// A label for placement. Repeat it for more labels.
-        #[arg(long = "label")]
-        labels: Vec<String>,
+        /// A tag for placement, such as gpu. Repeat it for more tags.
+        /// `--label` is an older name for it.
+        #[arg(long = "tag", alias = "label")]
+        tags: Vec<String>,
         /// The worker folder.
         #[arg(long, env = "CONSORT_WORKER_DIR")]
         config_dir: Option<PathBuf>,
@@ -526,7 +527,7 @@ async fn run_dev(args: DevArgs) -> Result<()> {
     println!("Hub URL: {}", hub.public_url());
     println!("Client setup code: {setup}");
     println!(
-        "Worker {} (label `hub`) uses {}.",
+        "Worker {} (tag `hub`) uses {}.",
         worker.worker_id(),
         worker_dir.display()
     );
@@ -561,7 +562,7 @@ async fn main() -> Result<()> {
                 hub_url,
                 code,
                 name,
-                labels,
+                tags,
                 config_dir,
             } => {
                 let dir = worker_dir(config_dir)?;
@@ -569,7 +570,7 @@ async fn main() -> Result<()> {
                     eprintln!("Warning: {warning}");
                 }
                 let code = pairing_code(code, &mut std::io::stdin().lock())?;
-                let id = consort_worker::pair(&hub_url, &code, &dir, name, labels).await?;
+                let id = consort_worker::pair(&hub_url, &code, &dir, name, tags).await?;
                 println!(
                     "Paired as worker {id}. The configuration is in {}.",
                     dir.display()
@@ -602,19 +603,19 @@ mod tests {
             "http://h:7600",
             "--code",
             "ABCD-EFGH",
-            "--label",
+            "--tag",
             "a",
             "--label",
             "b",
         ])
         .unwrap();
         let Command::Worker {
-            command: WorkerCommand::Pair { labels, code, .. },
+            command: WorkerCommand::Pair { tags, code, .. },
         } = cli.command
         else {
             panic!("expected worker pair")
         };
-        assert_eq!(labels, vec!["a", "b"]);
+        assert_eq!(tags, vec!["a", "b"]);
         assert_eq!(code.as_deref(), Some("ABCD-EFGH"));
         // The code can come from the environment or a prompt instead.
         let cli = Cli::try_parse_from(["consort", "worker", "pair", "http://h:7600"]).unwrap();

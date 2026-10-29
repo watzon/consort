@@ -912,7 +912,7 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                         None => format!("Offline. {os_label}, {}, worker {}.", w.arch, w.version),
                     }
                 },
-                labels: w.labels.clone(),
+                tags: w.tags.clone(),
                 accounts,
                 policy: PolicyView {
                     max_approval_mode: policy
@@ -1178,6 +1178,7 @@ mod tests {
             archived_at: None,
             created_at: Timestamp::from_millis(NOW - 100_000),
             updated_at: Timestamp::from_millis(NOW - 100_000),
+            tags: Vec::new(),
         }
     }
 
@@ -1861,7 +1862,7 @@ mod tests {
             public_key: consort_proto::auth::PublicKey::from_bytes([1; 32]),
             version: "0.1.0".into(),
             protocol_version: 1,
-            labels: vec![],
+            tags: vec![],
             paused: false,
             state: consort_proto::model::WorkerState::Online,
             last_seen_at: None,

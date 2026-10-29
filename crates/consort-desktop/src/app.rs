@@ -95,7 +95,7 @@ pub enum Dialog {
     RenameChannel(String),
     Instructions(String),
     RenameWorker(String),
-    EditLabels(String),
+    EditTags(String),
     /// A small dialog that names a new group. With a channel ID, the channel
     /// moves into the group once it exists.
     NewGroup(Option<String>),
@@ -1374,13 +1374,13 @@ impl ConsortApp {
                 self.set_field(Field::Name, &name, window, cx);
                 focus_input(&self.inputs.name, window, cx);
             }
-            Dialog::EditLabels(id) => {
-                let labels = self
+            Dialog::EditTags(id) => {
+                let tags = self
                     .state
                     .worker(id)
-                    .map(|w| w.labels.join(", "))
+                    .map(|w| w.tags.join(", "))
                     .unwrap_or_default();
-                self.set_field(Field::Name, &labels, window, cx);
+                self.set_field(Field::Name, &tags, window, cx);
                 focus_input(&self.inputs.name, window, cx);
             }
             Dialog::Instructions(id) => {
@@ -1923,7 +1923,7 @@ impl ConsortApp {
                 self.open_dialog(Dialog::ConfirmDeleteChannel(id), window, cx)
             }
             MenuAction::RenameWorker(id) => self.open_dialog(Dialog::RenameWorker(id), window, cx),
-            MenuAction::EditLabels(id) => self.open_dialog(Dialog::EditLabels(id), window, cx),
+            MenuAction::EditTags(id) => self.open_dialog(Dialog::EditTags(id), window, cx),
             MenuAction::PauseWorker(worker_id, paused) => self.spawn_command(cx, async move {
                 client
                     .run(consort_client::Command::SetWorkerPaused { worker_id, paused })

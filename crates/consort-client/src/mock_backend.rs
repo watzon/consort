@@ -402,8 +402,8 @@ impl MockBackend {
                 }
                 worker_mut(&mut state, &worker_id)?.name = name;
             }
-            Command::SetWorkerLabels { worker_id, labels } => {
-                worker_mut(&mut state, &worker_id)?.labels = labels;
+            Command::SetWorkerTags { worker_id, tags } => {
+                worker_mut(&mut state, &worker_id)?.tags = tags;
             }
             Command::SetWorkerPaused { worker_id, paused } => {
                 worker_mut(&mut state, &worker_id)?.paused = paused;

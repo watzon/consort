@@ -174,13 +174,18 @@ async fn run_worker(hub: Hub, mut socket: WebSocket, peer_ip: IpAddr) {
                 handle_request(&hub, worker_id, &link, request).await;
             }
             Ok(Frame::Response(response)) => link.resolve(&response.re, response.result),
-            Ok(Frame::Event(event)) => {
-                if let Ok(WorkerToHub::Inventory(inventory)) = event.decode::<WorkerToHub>()
-                    && let Err(err) = hub.update_inventory(worker_id, inventory).await
-                {
-                    tracing::warn!(error = %err, "could not store an inventory");
+            Ok(Frame::Event(event)) => match event.decode::<WorkerToHub>() {
+                Ok(WorkerToHub::Inventory(inventory)) => {
+                    if let Err(err) = hub.update_inventory(worker_id, inventory).await {
+                        tracing::warn!(error = %err, "could not store an inventory");
+                    }
                 }
-            }
+                Ok(WorkerToHub::SignInUpdate(update)) => {
+                    // Sign-ins are not built yet (docs/ACCOUNTS-PLAN.md).
+                    tracing::debug!(sign_in_id = %update.sign_in_id, "a worker sent a sign-in update, which this hub ignores");
+                }
+                _ => {}
+            },
             Err(err) => {
                 tracing::debug!(error = %err, "a worker sent a bad frame");
                 break;
@@ -240,6 +245,10 @@ async fn handle_request(
             }
             .await;
             reply(link, &request, result);
+        }
+        WorkerToHub::SignInUpdate(_) => {
+            link.outbox
+                .send_frame(&request.respond_error(ErrorBody::not_built("sign_in.update")));
         }
         WorkerToHub::ToolCall(call) => {
             // A tool call can take long, so it must not block other frames.

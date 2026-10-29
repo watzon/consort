@@ -16,11 +16,12 @@ use serde_json::Value;
 use crate::auth::{WorkerHello, WorkerHelloResult};
 use crate::frame::{Empty, message_family};
 use crate::ids::{
-    AccountId, ChannelId, ItemId, NativeRef, RepoId, RequestId, SessionId, TaskId, TurnId,
+    AccountId, ChannelId, ItemId, NativeRef, RepoId, RequestId, SessionId, SignInId, TaskId, TurnId,
 };
 use crate::model::{
-    ApprovalDetails, ApprovalMode, BlobRef, FileRef, Inventory, Isolation, ModelOptions,
-    RequestOption, SessionItem, SessionRole, SessionState, Sha256Hash, Usage, ValidationError,
+    AcpAccountSpec, ApprovalDetails, ApprovalMode, BlobRef, FileRef, Inventory, Isolation,
+    ModelOptions, RequestOption, SecretEnv, SessionItem, SessionRole, SessionState, Sha256Hash,
+    SignInMethod, SignInState, ToolId, Usage, ValidationError,
 };
 use crate::time::Timestamp;
 use crate::tools::{ToolCallResult, ToolDefinition};
@@ -291,6 +292,17 @@ pub struct ToolCall {
     pub arguments: Value,
 }
 
+/// `sign_in.update`: the new state of a sign-in that the hub started with
+/// `sign_in.start`. An event, with no response. The hub makes a feed upsert
+/// of the sign-in.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignInUpdate {
+    /// The sign-in.
+    pub sign_in_id: SignInId,
+    /// The new state.
+    pub state: SignInState,
+}
+
 message_family! {
     /// Everything that a worker sends to the hub after authentication.
     pub enum WorkerToHub {
@@ -304,6 +316,8 @@ message_family! {
         ToolList("tool.list", ToolList => ToolListResult),
         /// A hub tool call.
         ToolCall("tool.call", ToolCall => ToolCallResult),
+        /// A sign-in changed. No response.
+        SignInUpdate("sign_in.update", SignInUpdate),
     }
 }
 
@@ -517,6 +531,113 @@ pub struct ItemDetailResult {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InventoryRefresh {}
 
+/// `account.create`: make an account with its own profile folder. The hub
+/// chooses the account ID. The worker writes `env` to `env.json` in the
+/// profile folder, adds the account to `worker.toml`, and sends a new
+/// inventory.
+///
+/// `Debug` shows the names in `env`, never the values.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountCreateCommand {
+    /// The new account.
+    pub account_id: AccountId,
+    /// The harness: `claude`, `codex`, `opencode`, `gemini` or `acp`.
+    pub harness: String,
+    /// The account name.
+    pub label: String,
+    /// The ACP agent, for an `acp` account.
+    #[serde(default)]
+    pub acp: Option<AcpAccountSpec>,
+    /// Secret variables, such as an API key.
+    #[serde(default)]
+    pub env: SecretEnv,
+}
+
+/// `account.update`: rename an account or change its secret variables.
+///
+/// `Debug` shows the names in `env_set`, never the values.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountUpdateCommand {
+    /// The account.
+    pub account_id: AccountId,
+    /// The new name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Secret variables to add or replace.
+    #[serde(default)]
+    pub env_set: SecretEnv,
+    /// Secret variables to remove, by name.
+    #[serde(default)]
+    pub env_remove: Vec<String>,
+}
+
+/// `account.remove`: sign out where possible and delete the profile folder.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountRemoveCommand {
+    /// The account.
+    pub account_id: AccountId,
+}
+
+/// `account.sign_out`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountSignOutCommand {
+    /// The account.
+    pub account_id: AccountId,
+}
+
+/// `sign_in.start`: run a sign-in flow. The worker reports each state with
+/// a `sign_in.update` event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignInStartCommand {
+    /// The sign-in that the hub made.
+    pub sign_in_id: SignInId,
+    /// The account.
+    pub account_id: AccountId,
+    /// The method.
+    pub method: SignInMethod,
+}
+
+/// `sign_in.code`: the code that the user pasted, for a sign-in in
+/// `needs_code`. The worker writes it to the harness and does not store it.
+///
+/// `Debug` does not show the code.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignInCodeCommand {
+    /// The sign-in.
+    pub sign_in_id: SignInId,
+    /// The code.
+    pub code: String,
+}
+
+impl std::fmt::Debug for SignInCodeCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SignInCodeCommand")
+            .field("sign_in_id", &self.sign_in_id)
+            .field("code", &crate::model::Redacted)
+            .finish()
+    }
+}
+
+/// `sign_in.cancel`: stop a sign-in flow.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignInCancelCommand {
+    /// The sign-in.
+    pub sign_in_id: SignInId,
+}
+
+/// `tools.check`: check the managed tools for updates now. The result comes
+/// in the next inventory.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolsCheck {}
+
+/// `tools.install`: install or update one managed tool. The progress comes
+/// in the inventory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolsInstall {
+    /// The tool.
+    pub tool: ToolId,
+}
+
 message_family! {
     /// The hub commands to a worker. Each is a request.
     pub enum HubToWorker {
@@ -538,6 +659,24 @@ message_family! {
         ItemDetail("item.detail", ItemDetail => ItemDetailResult),
         /// Send a new inventory.
         InventoryRefresh("inventory.refresh", InventoryRefresh => Empty),
+        /// Make an account.
+        AccountCreate("account.create", AccountCreateCommand => Empty),
+        /// Rename an account or change its secret variables.
+        AccountUpdate("account.update", AccountUpdateCommand => Empty),
+        /// Remove an account.
+        AccountRemove("account.remove", AccountRemoveCommand => Empty),
+        /// Sign an account out.
+        AccountSignOut("account.sign_out", AccountSignOutCommand => Empty),
+        /// Start a sign-in flow.
+        SignInStart("sign_in.start", SignInStartCommand => Empty),
+        /// Send the code of a sign-in.
+        SignInCode("sign_in.code", SignInCodeCommand => Empty),
+        /// Cancel a sign-in flow.
+        SignInCancel("sign_in.cancel", SignInCancelCommand => Empty),
+        /// Check the managed tools for updates.
+        ToolsCheck("tools.check", ToolsCheck => Empty),
+        /// Install or update a managed tool.
+        ToolsInstall("tools.install", ToolsInstall => Empty),
     }
 }
 
@@ -552,7 +691,17 @@ impl HubToWorker {
             Self::SessionRespond(c) => Some(c.session_id),
             Self::SessionStop(c) => Some(c.session_id),
             Self::ItemDetail(c) => Some(c.session_id),
-            Self::WorkspaceRelease(_) | Self::InventoryRefresh(_) => None,
+            Self::WorkspaceRelease(_)
+            | Self::InventoryRefresh(_)
+            | Self::AccountCreate(_)
+            | Self::AccountUpdate(_)
+            | Self::AccountRemove(_)
+            | Self::AccountSignOut(_)
+            | Self::SignInStart(_)
+            | Self::SignInCode(_)
+            | Self::SignInCancel(_)
+            | Self::ToolsCheck(_)
+            | Self::ToolsInstall(_) => None,
         }
     }
 }
@@ -754,12 +903,13 @@ mod tests {
                 hostname: "mbp".into(),
                 os: crate::model::Os::Macos,
                 arch: "aarch64".into(),
-                labels: vec![],
+                tags: vec!["macos".into()],
                 accounts: vec![],
                 local_mcp_servers: vec![],
                 checkouts: vec![],
                 policy: WorkerPolicy::default(),
                 load: Default::default(),
+                tools: vec![],
             }
             .with_hash()
             .into(),
@@ -771,7 +921,15 @@ mod tests {
                 arguments: json!({"body": "Halfway."}),
             }
             .into(),
+            SignInUpdate {
+                sign_in_id: "sgn_00000000-0000-0000-0000-000000000002".parse().unwrap(),
+                state: SignInState::NeedsCode {
+                    url: "https://claude.ai/oauth/authorize".into(),
+                },
+            }
+            .into(),
         ];
+        assert_eq!(messages.len(), WorkerToHub::TYPES.len() - 1);
         for message in messages {
             let frame = Frame::family_request(FrameId::generate(), &message).unwrap();
             let Frame::Request(req) = Frame::parse(&frame.to_text().unwrap()).unwrap() else {
@@ -781,6 +939,77 @@ mod tests {
             assert_eq!(req.decode::<WorkerToHub>().unwrap(), message);
         }
         assert!(WorkerToHub::TYPES.contains(&"tool.call"));
+    }
+
+    #[test]
+    fn sign_in_update_is_an_event() {
+        let update = SignInUpdate {
+            sign_in_id: "sgn_00000000-0000-0000-0000-000000000002".parse().unwrap(),
+            state: SignInState::Succeeded {
+                detail: Some("chris@example.com".into()),
+            },
+        };
+        let frame = Frame::family_event(&WorkerToHub::from(update.clone())).unwrap();
+        let text = frame.to_text().unwrap();
+        let value: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            value,
+            json!({"v": 1, "type": "sign_in.update", "body": {
+                "sign_in_id": "sgn_00000000-0000-0000-0000-000000000002",
+                "state": {"kind": "succeeded", "detail": "chris@example.com"}
+            }})
+        );
+        let Frame::Event(event) = Frame::parse(&text).unwrap() else {
+            panic!("expected an event");
+        };
+        assert_eq!(
+            event.decode::<WorkerToHub>().unwrap(),
+            WorkerToHub::SignInUpdate(update)
+        );
+    }
+
+    #[test]
+    fn account_commands_hide_secrets_in_debug() {
+        let create = AccountCreateCommand {
+            account_id: AccountId::new(),
+            harness: "codex".into(),
+            label: "Codex API".into(),
+            acp: None,
+            env: [("OPENAI_API_KEY", "sk-proj-secret")].into_iter().collect(),
+        };
+        let update = AccountUpdateCommand {
+            account_id: AccountId::new(),
+            label: None,
+            env_set: [("OPENAI_API_KEY", "sk-proj-other")].into_iter().collect(),
+            env_remove: vec![],
+        };
+        let code = SignInCodeCommand {
+            sign_in_id: SignInId::new(),
+            code: "the-pasted-code".into(),
+        };
+        let texts = [
+            format!("{create:?}"),
+            format!("{:?}", HubToWorker::from(create.clone())),
+            format!("{update:?}"),
+            format!("{:?}", HubToWorker::from(update)),
+            format!("{code:?}"),
+            format!("{:?}", HubToWorker::from(code.clone())),
+        ];
+        for text in &texts {
+            for secret in ["sk-proj-secret", "sk-proj-other", "the-pasted-code"] {
+                assert!(!text.contains(secret), "{text}");
+            }
+        }
+        assert!(texts[0].contains("OPENAI_API_KEY"), "{}", texts[0]);
+        // The wire still carries the values.
+        assert_eq!(
+            serde_json::to_value(&create).unwrap()["env"]["OPENAI_API_KEY"],
+            "sk-proj-secret"
+        );
+        assert_eq!(
+            serde_json::to_value(&code).unwrap()["code"],
+            "the-pasted-code"
+        );
     }
 
     #[test]
@@ -854,9 +1083,78 @@ mod tests {
             }
             .into(),
             InventoryRefresh {}.into(),
+            AccountCreateCommand {
+                account_id: AccountId::new(),
+                harness: "acp".into(),
+                label: "My agent".into(),
+                acp: Some(AcpAccountSpec::Command {
+                    program: "my-agent".into(),
+                    args: vec!["--acp".into()],
+                }),
+                env: SecretEnv::new(),
+            }
+            .into(),
+            AccountUpdateCommand {
+                account_id: AccountId::new(),
+                label: Some("Renamed".into()),
+                env_set: [("KEY", "v")].into_iter().collect(),
+                env_remove: vec!["OLD".into()],
+            }
+            .into(),
+            AccountRemoveCommand {
+                account_id: AccountId::new(),
+            }
+            .into(),
+            AccountSignOutCommand {
+                account_id: AccountId::new(),
+            }
+            .into(),
+            SignInStartCommand {
+                sign_in_id: SignInId::new(),
+                account_id: AccountId::new(),
+                method: SignInMethod::AcpAgent {
+                    method_id: "oauth".into(),
+                    name: "Sign in".into(),
+                },
+            }
+            .into(),
+            SignInCodeCommand {
+                sign_in_id: SignInId::new(),
+                code: "code".into(),
+            }
+            .into(),
+            SignInCancelCommand {
+                sign_in_id: SignInId::new(),
+            }
+            .into(),
+            ToolsCheck {}.into(),
+            ToolsInstall {
+                tool: ToolId::acp("goose"),
+            }
+            .into(),
         ];
         assert_eq!(commands.len(), HubToWorker::TYPES.len());
+        for command in &commands {
+            assert_eq!(
+                command.session_id().is_some(),
+                matches!(
+                    command,
+                    HubToWorker::SessionStart(_)
+                        | HubToWorker::SessionTurn(_)
+                        | HubToWorker::SessionSteer(_)
+                        | HubToWorker::SessionInterrupt(_)
+                        | HubToWorker::SessionRespond(_)
+                        | HubToWorker::SessionStop(_)
+                        | HubToWorker::ItemDetail(_)
+                )
+            );
+        }
         for command in commands {
+            let frame = Frame::family_request(FrameId::generate(), &command).unwrap();
+            let Frame::Request(req) = Frame::parse(&frame.to_text().unwrap()).unwrap() else {
+                panic!("expected a request");
+            };
+            assert_eq!(req.kind, command.type_name());
             let frame = Frame::family_request(FrameId::generate(), &command).unwrap();
             let Frame::Request(req) = Frame::parse(&frame.to_text().unwrap()).unwrap() else {
                 panic!("expected a request");

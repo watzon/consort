@@ -120,12 +120,14 @@ Placement turns a task's model selection and placement request into one worker a
 
 1. If the request names a worker, use it. If that worker is offline, keep the task in `up_next` with the reason. If the worker cannot satisfy the request, fail with the reason.
 2. Collect the online workers that have a signed-in harness account with the selected label and model.
-3. Remove the workers that fail the `require` constraints (OS, labels, local MCP servers) or whose policy forbids the requested approval mode or the needed folders.
+3. Remove the workers that fail the `require` constraints (OS, tags, local MCP servers) or whose policy forbids the requested approval mode or the needed folders. A worker must also have every tag of the channel. Its tags are its user tags and the tags in its inventory.
 4. Prefer workers that already have a checkout of the task's repos.
 5. Prefer the channel's `preferred_workers`, in order.
 6. Prefer the worker with the fewest active sessions.
 
-The coordinator can see the same inventory through `list_workers`, so it can reason about placement before it starts a task. "Test this on Windows" becomes `require: { os: "windows" }`. "Use the Home Assistant server" becomes `require: { local_mcp_servers: ["home-assistant"] }`.
+When no online worker has the channel's tags, the work waits, and the reason names the tags, for example "Waiting for an online worker with the tag work. Add the tag in Settings > Workers." Coordinator turns and routine runs follow the same rule as tasks.
+
+The coordinator can see the same inventory through `list_workers`, with each worker's tags, so it can reason about placement before it starts a task. "Test this on Windows" becomes `require: { os: "windows" }`. "Use the Home Assistant server" becomes `require: { local_mcp_servers: ["home-assistant"] }`.
 
 Coordinators use the same steps, with the hub's own worker first in the preferred list. If the coordinator's harness account is signed in only on a laptop, the coordinator runs there, and that channel goes quiet when the laptop sleeps. The fix is to sign in to that harness on the hub machine too.
 
@@ -186,7 +188,8 @@ One Cargo workspace:
 |---|---|
 | `proto` | Wire types for the client API, the worker link and the hub tools. No I/O |
 | `harness` | The `Harness` and `HarnessSession` traits and the adapters, one feature per adapter |
-| `worker` | The worker daemon: hub link, spool, workspaces, local MCP endpoint, inventory |
+| `worker` | The worker daemon: hub link, spool, workspaces, local MCP endpoint, inventory, accounts and their profile folders, sign-in flows |
+| `tools` | Managed tools: downloads, checks, install layout and launch specs. No hub I/O |
 | `hub` | The hub server: HTTP and WebSocket (axum), SQLite store, feed, scheduler, coordinator queues, placement, hub tools, push |
 | `client-core` | The shared client logic |
 | `client-ffi` | UniFFI bindings over `client-core`, for mobile |
@@ -200,7 +203,7 @@ The binary name `app` is a placeholder until the product has a name.
 
 **Hub.** One binary and one data folder (`hub.db` and `blobs/`). It serves HTTPS itself with automatic certificates, or it sits behind a reverse proxy such as Caddy. It runs as a systemd service. To run a worker on the same machine, start a second service with `app worker` that points at `https://localhost`. Back up `hub.db` with SQLite's online backup, or stream it with Litestream.
 
-**Worker.** One binary for each OS. The worker must run as the logged-in user, not as a system account, because harness logins live in the user's profile:
+**Worker.** One binary for each OS. The worker must run as the logged-in user, not as a system account, because harness logins live in the profile folders in the user's Consort home (`~/.consort`, or `CONSORT_HOME`), next to the managed tools. The service for each OS:
 
 | OS | Service |
 |---|---|
@@ -212,13 +215,13 @@ The binary name `app` is a placeholder until the product has a name.
 
 The hub can tell any worker to run a harness, and a harness can run commands. So the hub is the most valuable target in the system, and the design limits what a stolen hub can do:
 
-- **Model credentials never reach the hub.** They stay in each harness's own files on each worker. The hub has nothing to leak for Anthropic, OpenAI or Fireworks.
+- **Model credentials do not stay on the hub.** Subscription logins stay in each account's profile folder on the worker, in the harness's own files or keychain entry, and Consort never reads them. An API key goes once from the app through the hub to the worker, which writes it to `env.json` in the profile folder. The hub never stores or logs it. The code that the user pastes during a Claude sign-in goes the same way to the stdin of `claude auth login`, and nobody stores it. See ADR 0010.
 - **Workers set the limits.** Worker policy caps the approval mode, the folders and shell access. The hub cannot raise a worker's limits.
 - **Keys, not passwords.** Workers and clients prove their identity with Ed25519 keys made during pairing. Pairing codes are single use and expire after 10 minutes. The user can revoke any worker or client.
 - **Local tokens stay local.** The bearer token for a session's MCP endpoint exists only on that worker, and the endpoint listens only on 127.0.0.1.
 - **Push stays small.** Push payloads hold IDs and titles, not message text, unless the user turns on previews.
 
-Anthropic's terms allow a user to sign in to the unmodified Claude Code binary with their own plan. Workers do exactly that, on the user's own machines. Before a public release, ask Anthropic to confirm that a hub that starts those sessions remotely is acceptable.
+Anthropic's terms allow a user to sign in to the unmodified Claude Code binary with their own plan. Workers do exactly that, on the user's own machines, and the user starts the sign-in from the app. Before a public release, ask Anthropic to confirm that a hub that starts those sessions remotely is acceptable.
 
 ## Open questions to test first
 

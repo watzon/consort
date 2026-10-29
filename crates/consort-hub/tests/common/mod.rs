@@ -383,7 +383,7 @@ pub fn inventory(account_id: AccountId) -> Inventory {
         hostname: "fake-host".to_owned(),
         os: Os::Macos,
         arch: "aarch64".to_owned(),
-        labels: vec!["hub".to_owned()],
+        tags: vec!["hub".to_owned()],
         accounts: vec![HarnessAccount {
             account_id,
             harness: "claude".to_owned(),
@@ -403,6 +403,11 @@ pub fn inventory(account_id: AccountId) -> Inventory {
                 ..Capabilities::default()
             },
             enabled: true,
+            profile: false,
+            email: None,
+            plan: None,
+            secret_names: Vec::new(),
+            sign_in_methods: Vec::new(),
         }],
         local_mcp_servers: Vec::new(),
         checkouts: Vec::new(),
@@ -412,6 +417,7 @@ pub fn inventory(account_id: AccountId) -> Inventory {
             allow_shell: true,
         },
         load: WorkerLoad::default(),
+        tools: Vec::new(),
     }
     .with_hash()
 }

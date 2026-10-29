@@ -10,6 +10,7 @@ use consort_proto::frame::Empty;
 use consort_proto::ids::{ChannelId, GroupId, MessageId, RepoId};
 use consort_proto::model::{
     Author, Channel, ChannelKind, Group, Message, MessageKind, Reaction, ReadMarker, Repo,
+    normalize_tags,
 };
 use consort_proto::status::Actor;
 use consort_proto::tools::SearchResult;
@@ -255,6 +256,7 @@ impl Hub {
     ) -> Result<ChannelResult> {
         let name = clean_name("channel", &request.name)?;
         check_channel_text(&request.purpose, &request.instructions)?;
+        let tags = normalize_tags(&request.tags)?;
         let channel = self
             .store
             .write(move |tx| {
@@ -287,6 +289,7 @@ impl Hub {
                     default_approval_mode: request.default_approval_mode.unwrap_or_default(),
                     allowed_local_mcp_servers: Vec::new(),
                     memory_enabled: request.memory_enabled.unwrap_or(true),
+                    tags,
                     archived_at: None,
                     created_at: now,
                     updated_at: now,
@@ -359,6 +362,9 @@ impl Hub {
                 }
                 if let Some(enabled) = request.memory_enabled {
                     channel.memory_enabled = enabled;
+                }
+                if let Some(tags) = request.tags {
+                    channel.tags = normalize_tags(&tags)?;
                 }
                 if channel == before {
                     return Ok(channel);
@@ -976,6 +982,7 @@ mod tests {
             default_isolation: None,
             default_approval_mode: None,
             memory_enabled: None,
+            tags: Vec::new(),
         }
     }
 

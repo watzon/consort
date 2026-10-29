@@ -623,7 +623,7 @@ mod tests {
             public_key: consort_proto::auth::PublicKey::from_bytes([1; 32]),
             version: String::new(),
             protocol_version: 1,
-            labels: Vec::new(),
+            tags: Vec::new(),
             paused: false,
             state: WorkerState::Online,
             last_seen_at: None,

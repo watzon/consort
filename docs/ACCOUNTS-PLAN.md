@@ -22,7 +22,7 @@ Status: approved by the user on 2026-10-29. The Paper designs are on the Desktop
 - **Tag**: a short name on a worker, such as `work` or `gpu`. User tags are set in the app. Detected tags come from the worker: `macos`, `windows`, `linux`, `arm64`, `x64`, `ram-<n>gb`, `cpu-<n>`, `gpu-nvidia`, `gpu-amd`, `gpu-apple`. A channel's tags are requirements. Tag text: lowercase letters, digits and `-`, 1 to 32 characters.
 - **Sign-in**: one run of a provider's sign-in flow for one account, started from the app.
 
-## Credentials (update ADR 0004, add ADR 0009)
+## Credentials (update ADR 0004, add ADR 0010)
 
 - Subscription logins (Claude plan, Claude Console, ChatGPT) stay in the profile folder on the worker, in the harness's own files or keychain entry. Consort never reads them.
 - API keys and other secret variables travel once from the app through the hub to the worker, inside `account.create` or `account.update`. The worker writes them to `env.json` in the profile folder (mode 0600 on Unix). The hub never stores them and never logs them. Inventory reports only variable names, never values.
@@ -80,6 +80,16 @@ Worker link:
 - Worker to hub event: `sign_in.update { sign_in_id, state }`. Inventory events stay as they are and now carry tools and the new account fields.
 
 New error codes: `sign_in_failed`, `tool_install_failed`, `invalid_tag`. `worker_offline` already exists. Account requests to an offline worker fail with it.
+
+Step 1 notes (the Rust names, as built; see `docs/DECISIONS.md` rows 260 to 269):
+
+- ADR 0009 was taken by "Themes change color only", so the new ADR is 0010.
+- `env` and `env_set` are `SecretEnv`, a newtype over `BTreeMap<String, String>` with the same JSON shape. Its `Debug` shows names only. `SignInSubmitCode` and the worker's `SignInCodeCommand` hide `code` in `Debug`.
+- `SignInMethod`, `SignInState` and `AcpAccountSpec` are tagged with a `kind` field. `succeeded { detail }` has `detail: Option<String>`.
+- Client results: `account.create` gives `AccountCreateResult { account_id }`, `sign_in.start` gives `SignInResult { sign_in }`, `acp_registry.list` gives `AcpRegistryListResult { agents }`. The rest give `Empty`.
+- Worker link bodies: `AccountCreateCommand { account_id, harness, label, acp, env }` (the hub chooses the account ID), `AccountUpdateCommand`, `AccountRemoveCommand`, `AccountSignOutCommand`, `SignInStartCommand`, `SignInCodeCommand`, `SignInCancelCommand`, `ToolsCheck {}`, `ToolsInstall { tool }`. Each answers `Empty`. The event is `SignInUpdate { sign_in_id, state }`.
+- Tag helpers in `consort_proto::model`: `validate_tag`, `is_valid_tag`, `normalize_tags` (trim, check, drop repeats) and `InvalidTag`, which maps to `invalid_tag`. Tags are ASCII only.
+- `ErrorBody::not_built(type)` makes the `unsupported` error. Constants: `SIGN_IN_IDLE_EXPIRY_MS`, `SIGN_IN_RETENTION_MS`, `TAG_MAX_CHARS`.
 
 ## Hub (`consort-hub`)
 
@@ -164,12 +174,16 @@ Build the four Paper screens. Use the logos in `crates/consort-desktop/assets/pr
   - `verifying`: a spinner.
   - `succeeded`: "Signed in as <detail>" and "Done".
   - `failed`: the message and "Try again".
-- New channel dialog and channel settings: a tag picker (several tags allowed) that lists every worker tag. Show the channel's tags as chips in the channel header.
+- New channel dialog and channel settings: a "Worker tags" field above "Run tasks on". It follows the Paper artboard "New channel dialog with tags":
+  - Each selected tag is a removable chip. "Add tag" opens a menu of every worker tag.
+  - Unused tags appear after "Also on workers:", and a click adds one.
+  - The note under the field reads "All work in this channel runs only on workers that have every tag here. N workers match." When no worker matches, it says so and suggests tagging a worker.
+  - Show the channel's tags as chips in the channel header.
 - Remove every "set in worker.toml" notice that the new UI replaces.
 - Fix the existing model selection bug: the client sends the model name where the proto wants the model id, and drops options. Keep the id in the selection list and display the name.
 
 ## Order and owners
 
-1. Contract: proto changes, renames across crates so the workspace compiles, docs (`CONTEXT.md`, ADR 0009, ADR 0004 note, `protocol.md`, `data-model.md`, `harness-adapters.md`, `architecture.md`). New hub requests return a clear `unsupported` error until step 2 lands.
+1. Contract: proto changes, renames across crates so the workspace compiles, docs (`CONTEXT.md`, ADR 0010, ADR 0004 note, `protocol.md`, `data-model.md`, `harness-adapters.md`, `architecture.md`). New hub requests return a clear `unsupported` error until step 2 lands.
 2. In parallel, with disjoint crates: `consort-tools`, hub, worker and harness, client and desktop.
 3. Integration and a real end-to-end run on the Mac (and bigboi if possible), then a review cycle.

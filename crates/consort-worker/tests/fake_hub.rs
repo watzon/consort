@@ -73,7 +73,7 @@ async fn pair_connect_run_a_session_and_resend_after_reconnect() {
     // Configure one account that the fake harness serves.
     let mut toml = WorkerToml::load(dir.path()).unwrap();
     assert_eq!(toml.worker_id, Some(worker_id));
-    assert_eq!(toml.labels, vec!["ci".to_owned()]);
+    assert_eq!(toml.tags, vec!["ci".to_owned()]);
     toml.auto_discover = false;
     let account = AccountConfig::default_for(HarnessKind::ClaudeCode);
     let account_id = account.id;
@@ -135,7 +135,7 @@ async fn pair_connect_run_a_session_and_resend_after_reconnect() {
     assert_eq!(inventory.accounts[0].label, "Claude Code");
     assert_eq!(inventory.accounts[0].harness, "claude");
     assert_eq!(inventory.accounts[0].models[0].id, "fake-model");
-    assert_eq!(inventory.labels, vec!["ci".to_owned()]);
+    assert_eq!(inventory.tags, vec!["ci".to_owned()]);
     assert_eq!(inventory.hash, inventory.compute_hash());
 
     // Start a session with a first turn.

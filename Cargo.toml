@@ -69,5 +69,13 @@ croner = "4"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 chrono-tz = "0.10"
 
+# Managed tools (added by the tools agent)
+consort-tools = { path = "crates/consort-tools", default-features = false }
+pgp = { version = "=0.21.0", default-features = false }
+tar = "0.4.46"
+flate2 = "1.1.10"
+bzip2 = "0.6.1"
+zip = { version = "9.1.3", default-features = false, features = ["deflate-flate2"] }
+
 [profile.dev.package."*"]
 opt-level = 1

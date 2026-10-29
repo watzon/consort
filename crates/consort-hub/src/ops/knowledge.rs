@@ -305,6 +305,7 @@ mod tests {
                 default_isolation: None,
                 default_approval_mode: None,
                 memory_enabled: None,
+                tags: Vec::new(),
             },
         )
         .await

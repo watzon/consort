@@ -255,7 +255,7 @@ impl Hub {
                     public_key: request.public_key,
                     version: String::new(),
                     protocol_version: 0,
-                    labels: Vec::new(),
+                    tags: Vec::new(),
                     paused: false,
                     state: WorkerState::Offline,
                     last_seen_at: None,

@@ -254,6 +254,7 @@ async fn a_brief_or_channel_text_over_its_limit_is_refused() {
         default_isolation: None,
         default_approval_mode: None,
         memory_enabled: None,
+        tags: Vec::new(),
     };
     let purpose = client.request(channel(5 * 1024, 0)).await.unwrap_err();
     assert_eq!(purpose.code, ErrorCode::Invalid);

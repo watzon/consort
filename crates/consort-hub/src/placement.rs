@@ -199,7 +199,7 @@ fn place_on_best_worker(
     let best = match input.subject {
         Subject::Coordinator => candidates.into_iter().min_by_key(|c| {
             (
-                !c.worker.all_labels().contains(&"hub"),
+                !c.worker.all_tags().contains(&"hub"),
                 preferred_rank(input, c.worker.id),
                 session_count(input, c),
                 c.index,
@@ -421,7 +421,7 @@ fn harness_rank(account: &HarnessAccount) -> usize {
 fn meets_require(require: &PlacementRequire, worker: &Worker, inventory: &Inventory) -> bool {
     require.is_satisfied_by(
         worker.os,
-        worker.all_labels(),
+        worker.all_tags(),
         inventory
             .local_mcp_servers
             .iter()
@@ -686,19 +686,19 @@ fn explain_missing_account(
 }
 
 /// Describes the `require` constraints, for example
-/// `is a Windows machine and has the label gpu`.
+/// `is a Windows machine and has the tag gpu`.
 fn describe_require(require: &PlacementRequire) -> String {
     let mut parts = Vec::new();
     if let Some(os) = require.os {
         parts.push(format!("is {}", os_name(os)));
     }
-    if !require.labels.is_empty() {
-        let noun = if require.labels.len() == 1 {
-            "label"
+    if !require.tags.is_empty() {
+        let noun = if require.tags.len() == 1 {
+            "tag"
         } else {
-            "labels"
+            "tags"
         };
-        parts.push(format!("has the {noun} {}", join_list(&require.labels)));
+        parts.push(format!("has the {noun} {}", join_list(&require.tags)));
     }
     if !require.local_mcp_servers.is_empty() {
         let noun = if require.local_mcp_servers.len() == 1 {
@@ -770,6 +770,11 @@ mod tests {
                 .collect(),
             capabilities: Capabilities::default(),
             enabled: true,
+            profile: false,
+            email: None,
+            plan: None,
+            secret_names: Vec::new(),
+            sign_in_methods: Vec::new(),
         }
     }
 
@@ -788,7 +793,7 @@ mod tests {
             public_key: PublicKey::from_bytes([1; 32]),
             version: "0.1.0".to_owned(),
             protocol_version: 1,
-            labels: Vec::new(),
+            tags: Vec::new(),
             paused: false,
             state: WorkerState::Online,
             last_seen_at: None,
@@ -797,12 +802,13 @@ mod tests {
                 hostname: format!("{name}.local"),
                 os: Os::Macos,
                 arch: "aarch64".to_owned(),
-                labels: Vec::new(),
+                tags: Vec::new(),
                 accounts,
                 local_mcp_servers: Vec::new(),
                 checkouts: Vec::new(),
                 policy: WorkerPolicy::default(),
                 load: WorkerLoad::default(),
+                tools: Vec::new(),
             }),
             paired_at: Timestamp::from_millis(0),
             revoked_at: None,
@@ -1291,35 +1297,35 @@ mod tests {
     }
 
     #[test]
-    fn require_filters_by_labels_from_the_user_or_the_inventory() {
+    fn require_filters_by_tags_from_the_user_or_the_inventory() {
         let plain = worker("plain", vec![claude()]);
         let mut user_label = worker("user", vec![claude()]);
-        user_label.labels = vec!["gpu".to_owned()];
+        user_label.tags = vec!["gpu".to_owned()];
         let mut inv_label = worker("inv", vec![claude()]);
-        inventory(&mut inv_label).labels = vec!["gpu".to_owned(), "big".to_owned()];
+        inventory(&mut inv_label).tags = vec!["gpu".to_owned(), "big".to_owned()];
 
         let mut case = Case::task(vec![plain.clone(), user_label, inv_label.clone()]);
         case.request.require = Some(PlacementRequire {
-            labels: vec!["gpu".to_owned()],
+            tags: vec!["gpu".to_owned()],
             ..PlacementRequire::default()
         });
         assert_eq!(case.chosen(), "user");
 
-        // Both labels needed: only the inventory worker has both.
+        // Both tags needed: only the inventory worker has both.
         case.request.require = Some(PlacementRequire {
-            labels: vec!["gpu".to_owned(), "big".to_owned()],
+            tags: vec!["gpu".to_owned(), "big".to_owned()],
             ..PlacementRequire::default()
         });
         assert_eq!(case.chosen(), "inv");
 
         let mut none = Case::task(vec![plain]);
         none.request.require = Some(PlacementRequire {
-            labels: vec!["gpu".to_owned(), "big".to_owned()],
+            tags: vec!["gpu".to_owned(), "big".to_owned()],
             ..PlacementRequire::default()
         });
         assert_eq!(
             none.wait_reason(),
-            "No online worker has the labels gpu and big."
+            "No online worker has the tags gpu and big."
         );
     }
 
@@ -1350,12 +1356,12 @@ mod tests {
         let mut case = Case::task(vec![worker("mini", vec![claude()])]);
         case.request.require = Some(PlacementRequire {
             os: Some(Os::Linux),
-            labels: vec!["gpu".to_owned(), "big".to_owned(), "fast".to_owned()],
+            tags: vec!["gpu".to_owned(), "big".to_owned(), "fast".to_owned()],
             local_mcp_servers: vec!["a".to_owned(), "b".to_owned()],
         });
         assert_eq!(
             case.wait_reason(),
-            "No online worker is a Linux machine and has the labels gpu, big and fast \
+            "No online worker is a Linux machine and has the tags gpu, big and fast \
              and has the local MCP servers a and b."
         );
     }
@@ -1382,7 +1388,7 @@ mod tests {
     fn coordinator_prefers_the_hub_labelled_worker() {
         let a = worker("laptop", vec![claude()]);
         let mut hub = worker("hub-box", vec![claude()]);
-        hub.labels = vec!["hub".to_owned()];
+        hub.tags = vec!["hub".to_owned()];
         let mut case = Case::coordinator(vec![a.clone(), hub]);
         case.preferred = vec![a.id];
         assert_eq!(case.chosen(), "hub-box");
@@ -1392,7 +1398,7 @@ mod tests {
     fn hub_label_can_come_from_the_inventory() {
         let a = worker("laptop", vec![claude()]);
         let mut hub = worker("hub-box", vec![claude()]);
-        inventory(&mut hub).labels = vec!["hub".to_owned()];
+        inventory(&mut hub).tags = vec!["hub".to_owned()];
         let case = Case::coordinator(vec![a, hub]);
         assert_eq!(case.chosen(), "hub-box");
     }

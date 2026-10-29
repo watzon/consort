@@ -90,7 +90,7 @@ pub async fn pair(
     code: &str,
     config_dir: &Path,
     name: Option<String>,
-    labels: Vec<String>,
+    tags: Vec<String>,
 ) -> Result<WorkerId, WorkerError> {
     let code: PairingCode = code
         .parse()
@@ -113,9 +113,9 @@ pub async fn pair(
     if name.is_some() {
         toml.name = name;
     }
-    for label in labels {
-        if !toml.labels.contains(&label) {
-            toml.labels.push(label);
+    for tag in tags {
+        if !toml.tags.contains(&tag) {
+            toml.tags.push(tag);
         }
     }
     toml.discover_accounts(&harness_installed);

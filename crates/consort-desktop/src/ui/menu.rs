@@ -46,7 +46,7 @@ pub enum MenuAction {
     UnarchiveChannel(String),
     DeleteChannel(String),
     RenameWorker(String),
-    EditLabels(String),
+    EditTags(String),
     PauseWorker(String, bool),
     RemoveWorker(String),
     /// Cut, Copy, Paste or Select all in one of the message boxes.
@@ -75,13 +75,13 @@ pub enum EditOp {
 }
 
 /// The menu of a worker row, in the sidebar and in Settings: Rename, Edit
-/// labels, Pause (Resume when it is paused) and Remove. Every surface that
+/// tags, Pause (Resume when it is paused) and Remove. Every surface that
 /// shows a worker builds its menu here, so they never differ.
 pub fn worker_menu(worker_id: &str, paused: bool) -> Vec<MenuItem> {
     let id = worker_id.to_owned();
     vec![
         MenuItem::new("Rename", MenuAction::RenameWorker(id.clone())),
-        MenuItem::new("Edit labels", MenuAction::EditLabels(id.clone())),
+        MenuItem::new("Edit tags", MenuAction::EditTags(id.clone())),
         MenuItem::new(
             if paused { "Resume" } else { "Pause" },
             MenuAction::PauseWorker(id.clone(), !paused),
@@ -401,20 +401,14 @@ mod tests {
         items.iter().map(|i| i.label.as_ref()).collect()
     }
 
-    /// AGENTS.md: a worker row has Rename, Edit labels, Pause and Remove.
+    /// AGENTS.md: a worker row has Rename, Edit tags, Pause and Remove.
     /// The Settings list rows and the "more" menu lacked some of them.
     #[test]
     fn every_worker_menu_has_the_same_items_in_the_same_order() {
         let running = worker_menu("wrk_1", false);
-        assert_eq!(
-            labels(&running),
-            ["Rename", "Edit labels", "Pause", "Remove"]
-        );
+        assert_eq!(labels(&running), ["Rename", "Edit tags", "Pause", "Remove"]);
         let paused = worker_menu("wrk_1", true);
-        assert_eq!(
-            labels(&paused),
-            ["Rename", "Edit labels", "Resume", "Remove"]
-        );
+        assert_eq!(labels(&paused), ["Rename", "Edit tags", "Resume", "Remove"]);
         // Pause pauses a running worker, and Resume resumes a paused one.
         assert_eq!(
             running[2].action,
@@ -426,7 +420,7 @@ mod tests {
         );
         assert!(running[3].danger && running[3].separator_before);
         assert!(running.iter().all(|i| !matches!(&i.action,
-            MenuAction::RenameWorker(id) | MenuAction::EditLabels(id) | MenuAction::RemoveWorker(id)
+            MenuAction::RenameWorker(id) | MenuAction::EditTags(id) | MenuAction::RemoveWorker(id)
             | MenuAction::PauseWorker(id, _) if id != "wrk_1")));
     }
 

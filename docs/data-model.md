@@ -9,13 +9,17 @@ This page lists the entities that the hub, the workers and the clients store, wi
 | Hub | `hub.db` (SQLite, WAL mode) | Every entity on this page except the worker-local state |
 | Hub | `blobs/` | Attachments, channel files and artifacts, named by SHA-256 |
 | Hub | FTS5 tables in `hub.db` | Search index over messages, memory notes and task titles |
-| Worker | `worker.toml` | Hub URL, labels, worker policy, harness accounts, local MCP servers, checkouts |
+| Worker | `worker.toml` | Hub URL, tags, worker policy, harness accounts, local MCP servers, checkouts |
 | Worker | `worker.db` (SQLite) | Event spool, processed command IDs, local session registry |
 | Worker | `workspaces/` | Worktrees and clones that the worker made for tasks |
+| Worker | `<consort home>/profiles/<account id>/` | The profile folder of each account: the harness's own config and login, and `env.json` with the secret variables (mode 0600 on Unix) |
+| Worker | `<consort home>/tools/<tool>/<version>/` | The managed tools that the worker installed |
 | Worker | Each harness's own files | Raw session transcripts and harness logins. The worker never copies these to the hub |
 | Client | `cache.db` (SQLite) | A partial copy of hub entities and the last feed sequence number |
 
-The hub is the source of truth for everything except harness logins and raw transcripts. A session's native state on a worker is a cache that the hub can rebuild from the timeline and memory.
+The Consort home is `~/.consort` (`%USERPROFILE%\.consort` on Windows). `CONSORT_HOME` overrides it. `consort dev` sets it to `<data>/home` unless `CONSORT_HOME` is set.
+
+The hub is the source of truth for everything except harness logins, secret variables and raw transcripts. A session's native state on a worker is a cache that the hub can rebuild from the timeline and memory.
 
 On Unix the hub data folder and `blobs/` have mode 0700, and `hub.db` with its `-wal` and `-shm` files has mode 0600, also when they exist already. The hub writes each blob with mode 0600.
 
@@ -39,6 +43,7 @@ Every ID is a UUIDv7 string with a type prefix, for example `tsk_0192f0c4-...`. 
 | `wrk_` | Worker |
 | `acc_` | Harness account (unique per worker) |
 | `cli_` | Client |
+| `sgn_` | Sign-in |
 
 All timestamps are UTC, stored as Unix milliseconds. Hub tool arguments also accept RFC 3339 strings, because models write those more reliably.
 
@@ -75,6 +80,7 @@ Turn IDs, harness request IDs and native references are opaque strings that the 
 | `default_approval_mode` | `ask`, `auto_edits`, `auto` or `full_access` | Also the most that a task that the assistant starts gets |
 | `allowed_local_mcp_servers` | list of text | The local MCP servers, by name, that a task that the assistant starts may use. Empty by default. A task that the user starts is not limited by it |
 | `memory_enabled` | bool | |
+| `tags` | list of text | Requirements. A coordinator turn, a task or a routine run of the channel runs only on a worker that has every tag. Empty by default |
 | `archived_at` | timestamp, optional | |
 | `created_at`, `updated_at` | timestamp | |
 
@@ -153,7 +159,7 @@ A placement request has these fields:
 | Field | Type | Notes |
 |---|---|---|
 | `worker_id` | ID, optional | A fixed worker. Placement fails clearly if it cannot use this worker |
-| `require` | object, optional | Constraints: `os`, `labels`, `local_mcp_servers` |
+| `require` | object, optional | Constraints: `os`, `tags`, `local_mcp_servers`. The channel's tags apply too |
 | `repos` | list of repo IDs | Defaults to the channel repos |
 | `isolation` | isolation | Defaults to the channel value |
 
@@ -347,7 +353,7 @@ An artifact is a channel file with a `task_id`. Tasks publish artifacts under `a
 | `arch` | text | |
 | `public_key` | Ed25519 public key | |
 | `version`, `protocol_version` | text, integer | |
-| `labels` | list of text | Labels that the user set in a client, for example `gpu` or `windows-test`. Placement matches a label from this list or from the inventory, which has the labels from `worker.toml` |
+| `tags` | list of text | User tags, set in a client, for example `work` or `gpu`. Placement matches a tag from this list or from the inventory, which has the detected tags and the tags from `worker.toml`. Stored JSON from before the rename has `labels`, which reads as `tags` |
 | `paused` | bool | Set by the user. Placement skips a paused worker. Running sessions continue |
 | `state` | `online` or `offline` | |
 | `last_seen_at` | timestamp | |
@@ -356,19 +362,42 @@ An artifact is a channel file with a `task_id`. Tasks publish artifacts under `a
 
 ### Harness account
 
-The worker owns the account configuration and the login. The hub stores only what the worker reports in its inventory.
+The worker owns the account configuration and the login. The hub stores only what the worker reports in its inventory. The user makes, renames and removes accounts from a client (`account.create`, `account.update`, `account.remove`). An account that Consort made has its own profile folder, so two accounts of one provider on one worker never share a login. A new worker has no accounts. Accounts that a user wrote in `worker.toml` by hand still load.
 
 | Field | Type | Notes |
 |---|---|---|
 | `worker_id`, `account_id` | ID | |
 | `harness` | text | |
-| `label` | text | For example "Claude Personal". Two workers with the same label share one login |
+| `label` | text | For example "Claude Personal". Accounts with the same label on different workers count as one account for a model selection |
 | `harness_version` | text | |
 | `auth_state` | `signed_in`, `signed_out`, `error` or `unknown` | |
 | `auth_detail` | text, optional | A detail such as the plan name, or the command to sign in |
 | `models` | list | Each model has an ID, a name and option descriptors (select or boolean) |
 | `capabilities` | object | `steer`, `resume`, `fork`, `images`, `plan_mode`, `usage`, `mcp_http` and the approval modes it supports |
 | `enabled` | bool | |
+| `profile` | bool | True for an account that Consort made, with a profile folder |
+| `email`, `plan` | text, optional | Who is signed in and on which plan, when the harness tells |
+| `secret_names` | list of text | The names of the variables in `env.json`. Never the values |
+| `sign_in_methods` | list | The methods that a client may offer. See [protocol.md](protocol.md#sign-in) |
+
+### Sign-in
+
+One run of a provider's sign-in flow for one account. A feed entity with no channel. The hub stores it in the `sign_ins` table (`id`, `worker_id`, `data`).
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | ID | `sgn_` |
+| `worker_id`, `account_id` | ID | |
+| `method` | object | `kind` and its fields. See [protocol.md](protocol.md#sign-in) |
+| `state` | object | `kind` and its fields: `starting`, `open_url`, `device_code`, `needs_code`, `verifying`, `succeeded`, `failed`, `cancelled` or `expired` |
+| `created_at`, `updated_at` | timestamp | |
+| `expires_at` | timestamp | 15 minutes after the last update. Then the state is `expired` |
+
+The hub deletes a sign-in one day after its last update. A sign-in never holds a code or a secret.
+
+### Managed tool
+
+A value in the inventory, not a row: `tool`, `version`, `latest`, `state` and `detail`. See [protocol.md](protocol.md#inventory).
 
 ### Model selection
 
@@ -408,7 +437,7 @@ Every write on the hub adds one feed entry in the same database transaction. Cli
 | `seq` | integer | Increases by one for each entry, across the whole hub |
 | `at` | timestamp | |
 | `channel_id` | ID, optional | Lets a client filter by channel |
-| `entity` | text | `channel`, `group`, `repo`, `message`, `read_marker`, `task`, `session_item`, `approval`, `decision`, `memory_note`, `channel_file`, `routine`, `worker` or `client` |
+| `entity` | text | `channel`, `group`, `repo`, `message`, `read_marker`, `task`, `session_item`, `approval`, `decision`, `memory_note`, `channel_file`, `routine`, `worker`, `client` or `sign_in` |
 | `entity_id` | text | The entity's ID. A memory note uses `<scope>:<path>`, a channel file `<channel-id>:<path>`, a read marker `<channel-id>` or `<channel-id>:<thread-root-id>`, and a session item `<session-id>:<item-id>` |
 | `op` | `upsert` or `delete` | |
 | `payload` | JSON | The full client view of the entity after the write. `null` for `delete` |
@@ -422,7 +451,7 @@ The hub merges updates to the same session item that arrive within 250 ms into o
 ```toml
 hub_url = "https://hub.example.com"
 name = "bigboi"
-labels = ["windows-test", "gpu"]
+tags = ["windows-test", "gpu"]
 
 [policy]
 allowed_roots = ["C:/Users/chris/Code"]
@@ -439,6 +468,13 @@ shadow_home = "~/.local/share/app/homes/codex-personal"
 args = []
 env = {}
 enabled = true
+
+# An account that Consort made. Its home folders are in the profile folder.
+[[accounts]]
+id = "acc_0192f0c5-..."
+harness = "claude"
+label = "Claude Personal"
+profile = true
 
 [[local_mcp_servers]]
 name = "home-assistant"

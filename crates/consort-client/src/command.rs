@@ -131,9 +131,9 @@ pub enum Command {
         worker_id: String,
         name: String,
     },
-    SetWorkerLabels {
+    SetWorkerTags {
         worker_id: String,
-        labels: Vec<String>,
+        tags: Vec<String>,
     },
     SetWorkerPaused {
         worker_id: String,

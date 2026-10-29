@@ -78,6 +78,12 @@ impl From<ValidationError> for HubError {
     }
 }
 
+impl From<consort_proto::model::InvalidTag> for HubError {
+    fn from(err: consort_proto::model::InvalidTag) -> Self {
+        Self::Api(err.into())
+    }
+}
+
 impl From<TransitionError> for HubError {
     fn from(err: TransitionError) -> Self {
         Self::Api(err.into())

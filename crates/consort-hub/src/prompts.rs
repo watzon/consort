@@ -181,6 +181,7 @@ mod tests {
             archived_at: None,
             created_at: Timestamp::EPOCH,
             updated_at: Timestamp::EPOCH,
+            tags: Vec::new(),
         }
     }
 

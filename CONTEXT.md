@@ -38,6 +38,18 @@ _Avoid_: permissions, ACL, sandbox
 An MCP server that a worker can reach on its own network but the hub cannot.
 _Avoid_: LAN server, private connector
 
+**Tag**:
+A short name on a worker, such as `work` or `gpu`, made of 1 to 32 lowercase letters, digits and `-`. The user sets user tags in the app. The worker reports detected tags, such as `macos`, `arm64`, `ram-32gb`, `cpu-12` or `gpu-apple`. A channel's tags are requirements: all work from the channel runs only on workers that have every tag of the channel.
+_Avoid_: label, group, pool
+
+**Consort home**:
+The folder on a worker that holds the profile folders and the managed tools: `~/.consort` (`%USERPROFILE%\.consort` on Windows), or the folder in `CONSORT_HOME`.
+_Avoid_: data folder, app folder
+
+**Managed tool**:
+A CLI or runtime, such as Claude Code or Node.js, that a worker downloads, checks and updates itself in `<consort home>/tools/<tool>/<version>/`, in place of a global install.
+_Avoid_: dependency, global install, binary
+
 ## Conversation
 
 **Everything**:
@@ -121,16 +133,28 @@ _Avoid_: sandboxing, mode
 ## Harnesses and models
 
 **Harness**:
-An agent program that runs a model in a loop with tools, such as Claude Code, Codex, Pi or OpenCode.
-_Avoid_: provider, engine, runtime, CLI
+An agent program that runs a model in a loop with tools, such as Claude Code, Codex, Pi or OpenCode. Code uses this word.
+_Avoid_: engine, runtime, CLI
+
+**Provider**:
+The UI word for a harness that Consort can install and run: Claude Code, Codex, OpenCode, Gemini CLI, an agent from the ACP registry, or a custom ACP command. The UI shows each provider with its logo.
+_Avoid_: provider for a model company (say model provider), vendor, engine
 
 **Harness account**:
-One harness with one login and its settings on one worker, such as "Codex Personal" on the MacBook Pro.
-_Avoid_: provider, provider instance, instance, profile
+One login to one harness on one worker, with its own profile folder, such as "Codex Personal" on the MacBook Pro. The UI calls it an **account**. Accounts with the same name on different workers count as one account for a model selection.
+_Avoid_: provider instance, instance, profile
+
+**Profile folder**:
+The folder of one account on its worker, `<consort home>/profiles/<account id>/`. It holds the harness's own config and login, and `env.json` with the account's secret variables.
+_Avoid_: home, shadow home (for a new account), config dir
+
+**Sign-in**:
+One run of a provider's sign-in flow for one account, which the user starts from the app.
+_Avoid_: login (for the flow), auth, OAuth
 
 **Model provider**:
 The company that serves a model, such as Anthropic, OpenAI or Fireworks.
-_Avoid_: provider (alone), vendor, backend
+_Avoid_: provider (alone, which means a harness), vendor, backend
 
 **Model selection**:
 A harness account label, a model and its options, such as "Claude Personal, Opus 5.5, high effort".

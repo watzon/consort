@@ -150,9 +150,10 @@ pub struct WorkerToml {
     /// The display name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    /// Labels for placement.
-    #[serde(default)]
-    pub labels: Vec<String>,
+    /// Tags for placement, added to the detected tags. Older files call
+    /// this `labels`.
+    #[serde(default, alias = "labels")]
+    pub tags: Vec<String>,
     /// Add an account for each installed harness that has none.
     #[serde(default = "default_true")]
     pub auto_discover: bool,
@@ -266,7 +267,7 @@ mod tests {
         let text = r#"
 hub_url = "https://hub.example.com"
 name = "bigboi"
-labels = ["windows-test", "gpu"]
+tags = ["windows-test", "gpu"]
 
 [policy]
 allowed_roots = ["C:/Users/chris/Code"]
@@ -297,7 +298,11 @@ path = "C:/Users/chris/Code/sayso"
         assert_eq!(config.policy.max_approval_mode, ApprovalMode::AutoEdits);
         assert_eq!(config.accounts[0].harness, HarnessKind::Codex);
         assert_eq!(config.accounts[0].label, "Codex Personal");
+        assert_eq!(config.tags, ["windows-test", "gpu"]);
         assert!(config.auto_discover);
+        // A file from before the rename still loads its labels as tags.
+        let old: WorkerToml = toml::from_str(r#"labels = ["gpu"]"#).unwrap();
+        assert_eq!(old.tags, ["gpu"]);
         assert_eq!(config.local_mcp_servers[0].name, "home-assistant");
         assert_eq!(config.checkout_infos()[0].path, "C:/Users/chris/Code/sayso");
     }

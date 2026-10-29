@@ -37,6 +37,17 @@ pub enum ErrorCode {
     Conflict,
     /// An unexpected error on the hub. The hub logs the details.
     Internal,
+    /// A provider's sign-in flow failed. The message says why.
+    SignInFailed,
+    /// A worker could not install or update a managed tool. The message
+    /// says why.
+    ToolInstallFailed,
+    /// A tag is not 1 to 32 lowercase letters, digits or `-`. The message
+    /// names the tag.
+    InvalidTag,
+    /// The peer does not support this request yet. The message names the
+    /// request type.
+    Unsupported,
     /// A code that this version does not know. A newer peer sent it. Treat it
     /// like [`ErrorCode::Internal`] and show the message.
     Unknown,
@@ -44,7 +55,7 @@ pub enum ErrorCode {
 
 impl ErrorCode {
     /// Every known code, in the order of protocol.md.
-    pub const ALL: [ErrorCode; 12] = [
+    pub const ALL: [ErrorCode; 16] = [
         Self::Unauthorized,
         Self::ProtocolMismatch,
         Self::Invalid,
@@ -57,6 +68,10 @@ impl ErrorCode {
         Self::ResyncRequired,
         Self::Conflict,
         Self::Internal,
+        Self::SignInFailed,
+        Self::ToolInstallFailed,
+        Self::InvalidTag,
+        Self::Unsupported,
     ];
 
     /// The wire string, for example `worker_offline`.
@@ -74,6 +89,10 @@ impl ErrorCode {
             Self::ResyncRequired => "resync_required",
             Self::Conflict => "conflict",
             Self::Internal => "internal",
+            Self::SignInFailed => "sign_in_failed",
+            Self::ToolInstallFailed => "tool_install_failed",
+            Self::InvalidTag => "invalid_tag",
+            Self::Unsupported => "unsupported",
             Self::Unknown => "unknown",
         }
     }
@@ -82,11 +101,13 @@ impl ErrorCode {
     pub const fn http_status(self) -> u16 {
         match self {
             Self::Unauthorized => 401,
-            Self::ProtocolMismatch | Self::Invalid => 400,
+            Self::ProtocolMismatch | Self::Invalid | Self::InvalidTag => 400,
             Self::NotFound | Self::WorkerUnknown => 404,
             Self::StaleWrite | Self::Conflict | Self::ResyncRequired => 409,
             Self::PolicyDenied => 403,
             Self::WorkerOffline | Self::NoMatchingAccount => 503,
+            Self::SignInFailed | Self::ToolInstallFailed => 502,
+            Self::Unsupported => 501,
             Self::Internal | Self::Unknown => 500,
         }
     }
@@ -163,6 +184,17 @@ impl ErrorBody {
         Self::new(ErrorCode::Unauthorized, message)
     }
 
+    /// An `unsupported` error for a request type that this peer accepts but
+    /// does not carry out yet, for example `account.create`.
+    pub fn not_built(request_type: &str) -> Self {
+        Self::new(
+            ErrorCode::Unsupported,
+            format!(
+                "Not built yet: {request_type}. Update the hub and the worker, then try again."
+            ),
+        )
+    }
+
     /// An `internal` error. Do not put internal details in the message.
     pub fn internal() -> Self {
         Self::new(
@@ -210,6 +242,22 @@ mod tests {
             serde_json::json!({"code": "worker_offline", "message": "bigboi is offline."})
         );
         assert_eq!(body.to_string(), "worker_offline: bigboi is offline.");
+    }
+
+    #[test]
+    fn new_codes_have_their_wire_strings() {
+        for (code, text) in [
+            (ErrorCode::SignInFailed, "sign_in_failed"),
+            (ErrorCode::ToolInstallFailed, "tool_install_failed"),
+            (ErrorCode::InvalidTag, "invalid_tag"),
+            (ErrorCode::Unsupported, "unsupported"),
+        ] {
+            assert_eq!(serde_json::to_value(code).unwrap(), text);
+            assert_eq!(text.parse::<ErrorCode>().unwrap(), code);
+        }
+        let body = ErrorBody::not_built("account.create");
+        assert_eq!(body.code, ErrorCode::Unsupported);
+        assert!(body.message.starts_with("Not built yet: account.create."));
     }
 
     #[test]

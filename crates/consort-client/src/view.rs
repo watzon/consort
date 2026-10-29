@@ -772,7 +772,8 @@ pub struct WorkerView {
     pub list_detail: String,
     /// The status line in the Settings detail.
     pub status_line: String,
-    pub labels: Vec<String>,
+    /// The user tags, set in a client.
+    pub tags: Vec<String>,
     pub accounts: Vec<HarnessAccountView>,
     pub policy: PolicyView,
 }

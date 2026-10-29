@@ -387,7 +387,8 @@ pub struct StartTaskArgs {
     /// Run on this worker only.
     #[serde(default)]
     pub worker_id: Option<WorkerId>,
-    /// Constraints on the worker: `os`, `labels`, `local_mcp_servers`.
+    /// Constraints on the worker: `os`, `tags`, `local_mcp_servers`. The
+    /// channel's tags apply too.
     #[serde(default)]
     pub require: Option<PlacementRequire>,
     /// The repos for the workspace. Leave it out for the channel's repos.
@@ -638,7 +639,7 @@ hub_tools! {
         "List the channel files with their paths, sizes and hashes."),
     /// `list_workers`.
     ListWorkers("list_workers", NoArgs, EVERY_SESSION,
-        "List the workers with their operating system, state, labels, harness accounts and models, local MCP servers and repo checkouts. Use this before you choose where a task runs."),
+        "List the workers with their operating system, state, tags, harness accounts and models, local MCP servers and repo checkouts. Use this before you choose where a task runs."),
     /// `ask_decision`.
     AskDecision("ask_decision", AskDecisionArgs, EVERY_SESSION,
         "Ask the user a question with two to four options. Each option has a label and its consequence. This does not wait: end your turn. The answer arrives as input to a later turn."),
@@ -863,8 +864,9 @@ pub struct WorkerSummary {
     pub state: WorkerState,
     /// Whether the user paused it.
     pub paused: bool,
-    /// The user's labels and the inventory labels.
-    pub labels: Vec<String>,
+    /// The user tags and the inventory tags.
+    #[serde(alias = "labels")]
+    pub tags: Vec<String>,
     /// The enabled harness accounts.
     pub accounts: Vec<AccountSummary>,
     /// The local MCP server names.
@@ -883,7 +885,7 @@ impl WorkerSummary {
             os: worker.os,
             state: worker.state,
             paused: worker.paused,
-            labels: worker.all_labels().into_iter().map(str::to_owned).collect(),
+            tags: worker.all_tags().into_iter().map(str::to_owned).collect(),
             accounts: inventory
                 .map(|inv| {
                     inv.accounts

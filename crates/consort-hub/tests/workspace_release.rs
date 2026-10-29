@@ -94,6 +94,7 @@ async fn deleting_a_channel_releases_the_workspaces_of_its_tasks() {
             default_isolation: None,
             default_approval_mode: None,
             memory_enabled: None,
+            tags: Vec::new(),
         })
         .await
         .unwrap()

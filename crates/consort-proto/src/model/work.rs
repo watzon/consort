@@ -67,35 +67,36 @@ pub struct PlacementRequire {
     /// The worker's operating system.
     #[serde(default)]
     pub os: Option<Os>,
-    /// Labels that the worker must have, for example `gpu`.
-    #[serde(default)]
-    pub labels: Vec<String>,
+    /// Tags that the worker must have, for example `gpu`. Older peers send
+    /// this as `labels`.
+    #[serde(default, alias = "labels")]
+    pub tags: Vec<String>,
     /// Local MCP servers that the worker must have, by name.
     #[serde(default)]
     pub local_mcp_servers: Vec<String>,
 }
 
 impl PlacementRequire {
-    /// Whether a worker with this OS, these labels and these local MCP
-    /// server names meets every constraint.
+    /// Whether a worker with this OS, these tags and these local MCP server
+    /// names meets every constraint.
     pub fn is_satisfied_by<'a>(
         &self,
         os: Os,
-        labels: impl IntoIterator<Item = &'a str> + Clone,
+        tags: impl IntoIterator<Item = &'a str> + Clone,
         local_mcp_servers: impl IntoIterator<Item = &'a str> + Clone,
     ) -> bool {
         if self.os.is_some_and(|wanted| wanted != os) {
             return false;
         }
-        let has_labels = self
-            .labels
+        let has_tags = self
+            .tags
             .iter()
-            .all(|wanted| labels.clone().into_iter().any(|l| l == wanted));
+            .all(|wanted| tags.clone().into_iter().any(|t| t == wanted));
         let has_servers = self
             .local_mcp_servers
             .iter()
             .all(|wanted| local_mcp_servers.clone().into_iter().any(|s| s == wanted));
-        has_labels && has_servers
+        has_tags && has_servers
     }
 }
 
@@ -214,7 +215,7 @@ mod tests {
     fn require_matching() {
         let req = PlacementRequire {
             os: Some(Os::Windows),
-            labels: vec!["gpu".into()],
+            tags: vec!["gpu".into()],
             local_mcp_servers: vec!["home-assistant".into()],
         };
         assert!(req.is_satisfied_by(Os::Windows, ["gpu", "windows-test"], ["home-assistant"]));
@@ -222,5 +223,15 @@ mod tests {
         assert!(!req.is_satisfied_by(Os::Windows, ["windows-test"], ["home-assistant"]));
         assert!(!req.is_satisfied_by(Os::Windows, ["gpu"], []));
         assert!(PlacementRequire::default().is_satisfied_by(Os::Macos, [], []));
+    }
+
+    #[test]
+    fn require_reads_old_labels() {
+        let old: PlacementRequire =
+            serde_json::from_value(serde_json::json!({"labels": ["gpu"]})).unwrap();
+        assert_eq!(old.tags, ["gpu"]);
+        let value = serde_json::to_value(&old).unwrap();
+        assert_eq!(value["tags"], serde_json::json!(["gpu"]));
+        assert!(value.get("labels").is_none());
     }
 }

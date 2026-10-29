@@ -385,7 +385,7 @@ async fn revoking_a_worker_closes_its_connection_and_it_cannot_return() {
 }
 
 #[tokio::test]
-async fn labels_rename_and_a_state_change_reach_the_client() {
+async fn tags_rename_and_a_state_change_reach_the_client() {
     let mut world = World::start().await;
     let id = world.worker.worker_id;
     world
@@ -398,16 +398,26 @@ async fn labels_rename_and_a_state_change_reach_the_client() {
         .unwrap();
     world
         .client
-        .request(consort_proto::client_api::WorkerSetLabels {
+        .request(consort_proto::client_api::WorkerSetTags {
             worker_id: id,
-            labels: vec!["gpu".to_owned(), " gpu ".to_owned()],
+            tags: vec!["gpu".to_owned(), " gpu ".to_owned()],
         })
         .await
         .unwrap();
+    // A tag that breaks the tag rule is refused with `invalid_tag`.
+    let refused = world
+        .client
+        .request(consort_proto::client_api::WorkerSetTags {
+            worker_id: id,
+            tags: vec!["GPU box".to_owned()],
+        })
+        .await
+        .unwrap_err();
+    assert!(format!("{refused:?}").contains("InvalidTag"), "{refused:?}");
     let list: WorkerListResult = world.client.request(WorkerList {}).await.unwrap();
     let worker = list.workers.iter().find(|w| w.id == id).unwrap();
     assert_eq!(worker.name, "MacBook");
-    assert_eq!(worker.labels, vec!["gpu".to_owned()]);
+    assert_eq!(worker.tags, vec!["gpu".to_owned()]);
     wait_worker_state(&mut world, WorkerState::Online).await;
     world.hub.handle.shutdown().await.unwrap();
 }

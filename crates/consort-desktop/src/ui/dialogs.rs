@@ -1,4 +1,4 @@
-//! Dialogs: New channel, Add worker, Rename, Instructions, labels and the
+//! Dialogs: New channel, Add worker, Rename, Instructions, tags and the
 //! confirmations. 520 to 560 px wide, `xl` corners, `shadow.float`, over the
 //! scrim.
 
@@ -380,7 +380,7 @@ impl ConsortApp {
                     }),
                 )
             }
-            Dialog::EditLabels(id) => {
+            Dialog::EditTags(id) => {
                 let id = id.clone();
                 let focused = self
                     .inputs
@@ -389,17 +389,19 @@ impl ConsortApp {
                     .focus_handle(cx)
                     .is_focused(window);
                 (
-                    "Edit labels".to_owned(),
-                    "Tasks can ask for a worker with a label, such as gpu.".to_owned(),
+                    "Edit tags".to_owned(),
+                    "Channels and tasks can ask for a worker with a tag, such as gpu.".to_owned(),
                     t.layout.dialog_width,
                     field_block(
-                        "Labels",
+                        "Tags",
                         input_box(&self.inputs.name, focused, t),
-                        Some("Separate labels with commas."),
+                        Some(
+                            "Separate tags with commas. Use lowercase letters, digits and hyphens.",
+                        ),
                         t,
                     ),
-                    self.dialog_actions("Save labels", t, cx, move |this, window, cx| {
-                        let labels: Vec<String> = this
+                    self.dialog_actions("Save tags", t, cx, move |this, window, cx| {
+                        let tags: Vec<String> = this
                             .field(Field::Name, cx)
                             .split(',')
                             .map(|l| l.trim().to_owned())
@@ -408,7 +410,7 @@ impl ConsortApp {
                         let client = this.client.clone();
                         let id = id.clone();
                         this.submit_dialog(
-                            async move { client.set_worker_labels(id, labels).await },
+                            async move { client.set_worker_tags(id, tags).await },
                             window,
                             cx,
                         );

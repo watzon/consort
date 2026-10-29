@@ -9,7 +9,9 @@ use std::time::Duration;
 use consort_harness::{AccountConfig, AccountStatus, Harness, HarnessKind};
 use consort_proto::auth::{OpenSession, Signature, WorkerHello, WorkerHelloResult};
 use consort_proto::error::{ErrorBody, ErrorCode};
-use consort_proto::frame::{Frame, FrameId, RequestFrame, SUPPORTED_PROTOCOL_VERSIONS};
+use consort_proto::frame::{
+    Frame, FrameId, MessageFamily, RequestFrame, SUPPORTED_PROTOCOL_VERSIONS,
+};
 use consort_proto::ids::{AccountId, SessionId, WorkerId};
 use consort_proto::model::{
     AuthState, Capabilities, HarnessAccount, Inventory, LocalMcpServerInfo, Os, SessionState,
@@ -457,6 +459,20 @@ impl Core {
                     core.finish_command(&id, Ok(json!({})));
                 });
             }
+            // Accounts, sign-in and managed tools: the contract is in place,
+            // the handlers come next (docs/ACCOUNTS-PLAN.md).
+            HubToWorker::AccountCreate(_)
+            | HubToWorker::AccountUpdate(_)
+            | HubToWorker::AccountRemove(_)
+            | HubToWorker::AccountSignOut(_)
+            | HubToWorker::SignInStart(_)
+            | HubToWorker::SignInCode(_)
+            | HubToWorker::SignInCancel(_)
+            | HubToWorker::ToolsCheck(_)
+            | HubToWorker::ToolsInstall(_) => {
+                let request_type = command.type_name();
+                self.finish_command(&id, Err(ErrorBody::not_built(request_type)));
+            }
             HubToWorker::ItemDetail(_) => {
                 self.finish_command(
                     &id,
@@ -665,6 +681,11 @@ impl Core {
                     models: status.map(|s| s.models.clone()).unwrap_or_default(),
                     capabilities,
                     enabled,
+                    profile: false,
+                    email: None,
+                    plan: None,
+                    secret_names: Vec::new(),
+                    sign_in_methods: Vec::new(),
                 }
             })
             .collect();
@@ -674,7 +695,7 @@ impl Core {
             hostname: gethostname::gethostname().to_string_lossy().into_owned(),
             os: Os::from_std_os(std::env::consts::OS).unwrap_or(Os::Linux),
             arch: std::env::consts::ARCH.to_owned(),
-            labels: config.labels.clone(),
+            tags: config.tags.clone(),
             accounts,
             local_mcp_servers: config
                 .local_mcp_servers
@@ -691,6 +712,7 @@ impl Core {
             load: WorkerLoad {
                 active_sessions: active,
             },
+            tools: Vec::new(),
         }
         .with_hash()
     }

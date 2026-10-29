@@ -929,7 +929,16 @@ impl Runtime {
             | HubToWorker::SessionSteer(_)
             | HubToWorker::WorkspaceRelease(_)
             | HubToWorker::ItemDetail(_)
-            | HubToWorker::InventoryRefresh(_) => (Err(ErrorBody::internal()), false),
+            | HubToWorker::InventoryRefresh(_)
+            | HubToWorker::AccountCreate(_)
+            | HubToWorker::AccountUpdate(_)
+            | HubToWorker::AccountRemove(_)
+            | HubToWorker::AccountSignOut(_)
+            | HubToWorker::SignInStart(_)
+            | HubToWorker::SignInCode(_)
+            | HubToWorker::SignInCancel(_)
+            | HubToWorker::ToolsCheck(_)
+            | HubToWorker::ToolsInstall(_) => (Err(ErrorBody::internal()), false),
         }
     }
 

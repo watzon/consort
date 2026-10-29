@@ -195,6 +195,11 @@ define_id!(
     /// A client (`cli_`).
     ClientId, "cli_"
 );
+define_id!(
+    /// One run of a provider's sign-in flow for one harness account
+    /// (`sgn_`).
+    SignInId, "sgn_"
+);
 
 macro_rules! define_text_id {
     ($(#[$meta:meta])* $name:ident) => {
@@ -304,17 +309,19 @@ mod tests {
             WorkerId::new().to_string(),
             AccountId::new().to_string(),
             ClientId::new().to_string(),
+            SignInId::new().to_string(),
         ];
         let prefixes: Vec<&str> = ids.iter().map(|s| &s[..4]).collect();
         assert_eq!(
             prefixes,
             [
                 "grp_", "chn_", "msg_", "tsk_", "ses_", "itm_", "apr_", "dec_", "rep_", "cko_",
-                "rtn_", "wrk_", "acc_", "cli_"
+                "rtn_", "wrk_", "acc_", "cli_", "sgn_"
             ]
         );
         assert!(ids[0].parse::<GroupId>().is_ok());
         assert!(ids[13].parse::<ClientId>().is_ok());
+        assert!(ids[14].parse::<SignInId>().is_ok());
     }
 
     #[test]

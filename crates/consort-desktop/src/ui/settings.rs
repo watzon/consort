@@ -576,7 +576,7 @@ impl ConsortApp {
                     this.settings_worker = Some(id.clone());
                     cx.notify();
                 }))
-                // The same menu as the sidebar row: Rename, Edit labels,
+                // The same menu as the sidebar row: Rename, Edit tags,
                 // Pause and Remove.
                 .on_mouse_down(
                     MouseButton::Right,
@@ -658,13 +658,13 @@ impl ConsortApp {
         let c = &t.colors;
         let id = w.id.clone();
         let paused = w.paused;
-        let mut labels = div()
+        let mut tags = div()
             .flex()
             .flex_wrap()
             .items_center()
             .gap(t.space.xs + t.space.xxs);
-        for label in &w.labels {
-            labels = labels.child(
+        for tag in &w.tags {
+            tags = tags.child(
                 div()
                     .py(t.space.xxs)
                     .px(t.space.sm)
@@ -673,21 +673,21 @@ impl ConsortApp {
                     .border_color(c.border_strong)
                     .type_style(detail(t))
                     .text_color(c.text_secondary)
-                    .child(label.clone()),
+                    .child(tag.clone()),
             );
         }
-        let labels_id = w.id.clone();
-        labels = labels.child(
+        let tags_id = w.id.clone();
+        tags = tags.child(
             div()
-                .id("add-label")
+                .id("add-tag")
                 .pl(t.space.sm)
                 .type_style(detail(t))
                 .text_color(c.text_tertiary)
                 .cursor_pointer()
                 .hover(|s| s.text_color(c.text_primary))
-                .child("Add label")
+                .child("Add tag")
                 .on_click(cx.listener(move |this, _, window, cx| {
-                    this.open_dialog(Dialog::EditLabels(labels_id.clone()), window, cx)
+                    this.open_dialog(Dialog::EditTags(tags_id.clone()), window, cx)
                 })),
         );
         let card = |t: &Tokens| {
@@ -996,7 +996,7 @@ impl ConsortApp {
                                         c.text_secondary,
                                     )),
                             )
-                            .child(labels),
+                            .child(tags),
                     )
                     .child(section_block(
                         "Harness accounts",

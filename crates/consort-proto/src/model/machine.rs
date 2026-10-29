@@ -3,7 +3,9 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::account::SignInMethod;
 use super::common::Os;
+use super::tool::ToolStatus;
 use super::work::ApprovalMode;
 use crate::auth::PublicKey;
 use crate::ids::{AccountId, CheckoutId, ClientId, RepoId, WorkerId};
@@ -38,10 +40,10 @@ pub struct Worker {
     pub version: String,
     /// The protocol version agreed in `hello`.
     pub protocol_version: u32,
-    /// Labels that the user set in a client. Placement matches a label from
-    /// this list or from the inventory.
-    #[serde(default)]
-    pub labels: Vec<String>,
+    /// User tags, set in a client. Placement matches a tag from this list or
+    /// from the inventory. Old stored workers have this as `labels`.
+    #[serde(default, alias = "labels")]
+    pub tags: Vec<String>,
     /// Whether the user paused the worker. Placement skips a paused worker.
     #[serde(default)]
     pub paused: bool,
@@ -58,16 +60,23 @@ pub struct Worker {
 }
 
 impl Worker {
-    /// Every label: the user's labels and the inventory labels, without
+    /// Every tag: the user tags and the inventory tags, sorted, without
     /// repeats.
-    pub fn all_labels(&self) -> Vec<&str> {
-        let mut labels: Vec<&str> = self.labels.iter().map(String::as_str).collect();
+    pub fn all_tags(&self) -> Vec<&str> {
+        let mut tags: Vec<&str> = self.tags.iter().map(String::as_str).collect();
         if let Some(inventory) = &self.inventory {
-            labels.extend(inventory.labels.iter().map(String::as_str));
+            tags.extend(inventory.tags.iter().map(String::as_str));
         }
-        labels.sort_unstable();
-        labels.dedup();
-        labels
+        tags.sort_unstable();
+        tags.dedup();
+        tags
+    }
+
+    /// Whether the worker has every tag in `required`, from the user tags or
+    /// the inventory tags.
+    pub fn has_tags<S: AsRef<str>>(&self, required: &[S]) -> bool {
+        let tags = self.all_tags();
+        required.iter().all(|t| tags.contains(&t.as_ref()))
     }
 }
 
@@ -77,7 +86,7 @@ impl Worker {
 pub enum AuthState {
     /// Signed in.
     SignedIn,
-    /// Signed out. The user signs in on the worker machine.
+    /// Signed out. The user signs in from a client.
     SignedOut,
     /// The harness reported an error.
     Error,
@@ -203,6 +212,24 @@ pub struct HarnessAccount {
     pub capabilities: Capabilities,
     /// Whether the user enabled the account in `worker.toml`.
     pub enabled: bool,
+    /// True for an account that Consort created, with its own profile
+    /// folder. False for an account that a user wrote in `worker.toml` by
+    /// hand.
+    #[serde(default)]
+    pub profile: bool,
+    /// The signed-in email address, when the harness tells.
+    #[serde(default)]
+    pub email: Option<String>,
+    /// The plan name, such as "Max", when the harness tells.
+    #[serde(default)]
+    pub plan: Option<String>,
+    /// The names of the secret variables in the profile's `env.json`. Never
+    /// the values.
+    #[serde(default)]
+    pub secret_names: Vec<String>,
+    /// The sign-in methods that a client may offer for this account.
+    #[serde(default)]
+    pub sign_in_methods: Vec<SignInMethod>,
 }
 
 impl HarnessAccount {
@@ -268,8 +295,8 @@ pub struct WorkerLoad {
     pub active_sessions: u32,
 }
 
-/// What a worker has: its harness accounts, local MCP servers, checkouts,
-/// policy and load. The worker sends a full inventory after `hello` and again
+/// What a worker has: its tags, harness accounts, managed tools, local MCP
+/// servers, checkouts, policy and load. The worker sends a full inventory after `hello` and again
 /// when any part changes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Inventory {
@@ -282,9 +309,10 @@ pub struct Inventory {
     pub os: Os,
     /// The CPU architecture.
     pub arch: String,
-    /// Labels from `worker.toml`.
-    #[serde(default)]
-    pub labels: Vec<String>,
+    /// Detected tags (such as `macos`, `arm64` or `ram-32gb`) and the tags in
+    /// `worker.toml`. Old inventories have this as `labels`.
+    #[serde(default, alias = "labels")]
+    pub tags: Vec<String>,
     /// The harness accounts.
     #[serde(default)]
     pub accounts: Vec<HarnessAccount>,
@@ -299,6 +327,9 @@ pub struct Inventory {
     /// The load.
     #[serde(default)]
     pub load: WorkerLoad,
+    /// The managed tools.
+    #[serde(default)]
+    pub tools: Vec<ToolStatus>,
 }
 
 /// FNV-1a, 64 bit. A change detector, not a security hash.
@@ -425,6 +456,7 @@ pub struct Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::{ToolId, ToolState};
 
     fn account(label: &str, auth_state: AuthState) -> HarnessAccount {
         HarnessAccount {
@@ -453,6 +485,16 @@ mod tests {
                 ..Capabilities::default()
             },
             enabled: true,
+            profile: true,
+            email: Some("chris@example.com".into()),
+            plan: Some("Max".into()),
+            secret_names: vec!["ANTHROPIC_API_KEY".into()],
+            sign_in_methods: vec![
+                SignInMethod::ClaudePlan,
+                SignInMethod::ApiKey {
+                    variable: "ANTHROPIC_API_KEY".into(),
+                },
+            ],
         }
     }
 
@@ -462,7 +504,7 @@ mod tests {
             hostname: "bigboi".into(),
             os: Os::Windows,
             arch: "x86_64".into(),
-            labels: vec!["gpu".into()],
+            tags: vec!["gpu".into()],
             accounts: vec![
                 account("Claude Work", AuthState::SignedOut),
                 account("Claude Personal", AuthState::SignedIn),
@@ -475,6 +517,13 @@ mod tests {
             }],
             policy: WorkerPolicy::default(),
             load: WorkerLoad { active_sessions: 2 },
+            tools: vec![ToolStatus {
+                tool: ToolId::claude_code(),
+                version: Some("2.1.0".into()),
+                latest: None,
+                state: ToolState::Ready,
+                detail: None,
+            }],
         }
     }
 
@@ -489,6 +538,101 @@ mod tests {
         assert_ne!(b.compute_hash(), a.hash);
         let round: Inventory = serde_json::from_value(serde_json::to_value(&a).unwrap()).unwrap();
         assert_eq!(round, a);
+    }
+
+    fn worker(tags: &[&str], inventory_tags: Option<&[&str]>) -> Worker {
+        Worker {
+            id: WorkerId::new(),
+            name: "bigboi".into(),
+            hostname: "bigboi".into(),
+            os: Os::Windows,
+            arch: "x86_64".into(),
+            public_key: PublicKey::from_bytes([7; 32]),
+            version: "0.1.0".into(),
+            protocol_version: 1,
+            tags: tags.iter().map(|t| (*t).to_owned()).collect(),
+            paused: false,
+            state: WorkerState::Online,
+            last_seen_at: None,
+            inventory: inventory_tags.map(|t| Inventory {
+                tags: t.iter().map(|t| (*t).to_owned()).collect(),
+                ..inventory()
+            }),
+            paired_at: Timestamp::from_millis(1),
+            revoked_at: None,
+        }
+    }
+
+    #[test]
+    fn all_tags_merges_user_and_inventory_tags() {
+        let w = worker(&["work", "gpu"], Some(&["gpu", "windows", "x64"]));
+        assert_eq!(w.all_tags(), ["gpu", "windows", "work", "x64"]);
+        assert!(w.has_tags(&["work", "x64"]));
+        assert!(!w.has_tags(&["work", "linux"]));
+        assert!(w.has_tags::<&str>(&[]));
+        let bare = worker(&["work"], None);
+        assert_eq!(bare.all_tags(), ["work"]);
+    }
+
+    /// Stored JSON from before the rename still loads: `labels` reads as
+    /// `tags`, and an inventory without the new fields reads with defaults.
+    #[test]
+    fn old_labels_json_loads_as_tags() {
+        let mut value = serde_json::to_value(worker(&["work"], Some(&["gpu"]))).unwrap();
+        let obj = value.as_object_mut().unwrap();
+        let tags = obj.remove("tags").unwrap();
+        obj.insert("labels".into(), tags);
+        let inv = obj.get_mut("inventory").unwrap().as_object_mut().unwrap();
+        let inv_tags = inv.remove("tags").unwrap();
+        inv.insert("labels".into(), inv_tags);
+        inv.remove("tools");
+        for account in inv.get_mut("accounts").unwrap().as_array_mut().unwrap() {
+            let account = account.as_object_mut().unwrap();
+            for key in [
+                "profile",
+                "email",
+                "plan",
+                "secret_names",
+                "sign_in_methods",
+            ] {
+                account.remove(key);
+            }
+        }
+        let old: Worker = serde_json::from_value(value).unwrap();
+        assert_eq!(old.tags, ["work"]);
+        let inv = old.inventory.unwrap();
+        assert_eq!(inv.tags, ["gpu"]);
+        assert!(inv.tools.is_empty());
+        let account = &inv.accounts[0];
+        assert!(!account.profile);
+        assert_eq!(account.email, None);
+        assert!(account.sign_in_methods.is_empty());
+        // The new name is what goes out.
+        let out = serde_json::to_value(worker(&["work"], None)).unwrap();
+        assert!(out.get("labels").is_none());
+        assert_eq!(out["tags"], serde_json::json!(["work"]));
+    }
+
+    #[test]
+    fn new_account_fields_round_trip() {
+        let a = account("Claude Personal", AuthState::SignedIn);
+        let value = serde_json::to_value(&a).unwrap();
+        assert_eq!(value["profile"], true);
+        assert_eq!(value["email"], "chris@example.com");
+        assert_eq!(value["plan"], "Max");
+        assert_eq!(
+            value["secret_names"],
+            serde_json::json!(["ANTHROPIC_API_KEY"])
+        );
+        assert_eq!(
+            value["sign_in_methods"],
+            serde_json::json!([{"kind": "claude_plan"}, {"kind": "api_key", "variable": "ANTHROPIC_API_KEY"}])
+        );
+        assert_eq!(serde_json::from_value::<HarnessAccount>(value).unwrap(), a);
+        let inv = inventory();
+        let value = serde_json::to_value(&inv).unwrap();
+        assert_eq!(value["tools"][0]["tool"], "claude-code");
+        assert_eq!(serde_json::from_value::<Inventory>(value).unwrap(), inv);
     }
 
     #[test]

@@ -8,15 +8,23 @@
 //! empty. Unknown fields are ignored, so an older peer can read a newer
 //! entity.
 
+mod account;
 mod common;
 mod conversation;
 mod knowledge;
 mod machine;
 mod routine;
 mod session;
+mod tag;
+mod tool;
 mod waiting;
 mod work;
 
+pub(crate) use account::Redacted;
+pub use account::{
+    AcpAccountSpec, AcpRegistryAgent, SIGN_IN_IDLE_EXPIRY_MS, SIGN_IN_RETENTION_MS, SecretEnv,
+    SignIn, SignInMethod, SignInState,
+};
 pub use common::{
     BlobRef, HashParseError, ModelOptions, ModelSelection, OptionValue, Os, Sha256Hash,
     ValidationError, validate_relative_path,
@@ -45,6 +53,8 @@ pub use session::{
     PlanStepStatus, ReasoningPayload, Session, SessionItem, SessionRole, SessionState,
     SubagentPayload, ToolCallPayload, Usage, WebSearchPayload, tail_of,
 };
+pub use tag::{InvalidTag, TAG_MAX_CHARS, is_valid_tag, normalize_tags, validate_tag};
+pub use tool::{ToolId, ToolState, ToolStatus};
 pub use waiting::{
     Approval, ApprovalDetails, ApprovalKind, ApprovalStatus, DECISION_CONSEQUENCE_MAX_CHARS,
     DECISION_LABEL_MAX_CHARS, DECISION_MAX_OPTIONS, DECISION_MIN_OPTIONS,

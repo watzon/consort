@@ -174,6 +174,7 @@ fn seed(hub: &mut Hub) {
         archived_at: None,
         created_at: ts(now - 10_000),
         updated_at: ts(now - 10_000),
+        tags: Vec::new(),
     });
     hub.messages.push(Message {
         id: card,

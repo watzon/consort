@@ -7,7 +7,7 @@ use consort_proto::{
         ChannelArchive, ChannelCreate, ChannelDelete, ChannelMove, ChannelUpdate,
         DecisionAnswerRequest, GroupCreate, GroupUpdate, MessageDelete, MessageEdit, MessageList,
         ReadMark, TaskArchive, TaskInterrupt, TaskReopen, TaskResolve, TaskRetry,
-        WorkerPairingCode, WorkerRename, WorkerRevoke, WorkerSetLabels, WorkerSetPaused,
+        WorkerPairingCode, WorkerRename, WorkerRevoke, WorkerSetPaused, WorkerSetTags,
     },
     ids::{ChannelId, GroupId},
     model::{DecisionAnswer, ModelSelection, RequestOptionKind},
@@ -176,6 +176,7 @@ async fn run(shared: Arc<Shared>, command: Command) -> Result<(), ClientError> {
                     }),
                     default_approval_mode: None,
                     memory_enabled: None,
+                    tags: Vec::new(),
                 })
                 .await?;
             if !new.preferred_workers.is_empty() {
@@ -507,11 +508,11 @@ async fn run(shared: Arc<Shared>, command: Command) -> Result<(), ClientError> {
                 })
                 .await?;
         }
-        Command::SetWorkerLabels { worker_id, labels } => {
+        Command::SetWorkerTags { worker_id, tags } => {
             shared
-                .call(WorkerSetLabels {
+                .call(WorkerSetTags {
                     worker_id: parse(&worker_id, "worker")?,
-                    labels,
+                    tags,
                 })
                 .await?;
         }

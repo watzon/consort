@@ -397,13 +397,12 @@ impl Client {
         self.run(Command::RenameWorker { worker_id, name }).await
     }
 
-    pub async fn set_worker_labels(
+    pub async fn set_worker_tags(
         &self,
         worker_id: String,
-        labels: Vec<String>,
+        tags: Vec<String>,
     ) -> Result<(), ClientError> {
-        self.run(Command::SetWorkerLabels { worker_id, labels })
-            .await
+        self.run(Command::SetWorkerTags { worker_id, tags }).await
     }
 }
 

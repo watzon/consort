@@ -50,7 +50,7 @@ These come from the user's experience with GPUI. Follow them in every view.
    - A code or command block: Copy code.
    - A task card or task row: Open thread, Resolve (Ready for review only) or Not done (resolved only), Retry (failed only), Stop (working only), Archive (failed or resolved only), Copy task ID.
    - A channel row: Rename, Instructions, Change icon, Move to group, Archive, Delete.
-   - A worker row: Rename, Edit labels, Pause, Remove.
+   - A worker row: Rename, Edit tags, Pause, Remove.
    - The composer: Cut, Copy, Paste, Select all.
 3. **The chat never has a hard edge.** The top and bottom of the timeline fade into the canvas, so text never stops at a sharp line. GPUI has no blur filter for elements, so use layered gradients from the canvas color to transparent (about 24 px at the top and 32 px above the composer).
 4. **Dropdowns flip.** Any menu, popover or select that can run past the window edge opens downward when there is room and upward when there is not. Use GPUI's anchored positioning with anchor switching, not a fixed offset.

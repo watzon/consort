@@ -223,7 +223,7 @@ fn worker(
     sidebar: &str,
     list: &str,
     status: &str,
-    labels: &[&str],
+    tags: &[&str],
     accounts: Vec<HarnessAccountView>,
     policy: PolicyView,
 ) -> WorkerView {
@@ -236,7 +236,7 @@ fn worker(
         sidebar_detail: sidebar.into(),
         list_detail: list.into(),
         status_line: status.into(),
-        labels: labels.iter().map(|l| (*l).to_owned()).collect(),
+        tags: tags.iter().map(|t| (*t).to_owned()).collect(),
         accounts,
         policy,
     }
