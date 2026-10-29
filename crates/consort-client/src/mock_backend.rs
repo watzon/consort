@@ -132,6 +132,7 @@ impl MockBackend {
                     channel_id: channel_id_new,
                     items: Vec::new(),
                     has_older: false,
+                    loaded: true,
                 });
             }
             Command::UpdateChannel {

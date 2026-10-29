@@ -264,7 +264,7 @@ impl ConsortApp {
                         .child(
                             line(name, t.text.ui, c.text_primary)
                                 .flex_none()
-                                .max_w(t.layout.panel_width * 0.6),
+                                .max_w(t.layout.switcher_name_max),
                         )
                         .child(line(detail_text, t.text.ui, quiet).flex_1())
                         .on_click(cx.listener(move |this, _, window, cx| {
@@ -296,7 +296,7 @@ impl ConsortApp {
             .occlude()
             .flex()
             .flex_col()
-            .w(t.layout.panel_width + t.space.xxl * 5.0)
+            .w(t.layout.switcher_width)
             .bg(c.surface_raised)
             .border(t.border_width)
             .border_color(c.border_strong)
@@ -342,7 +342,7 @@ impl ConsortApp {
             .flex()
             .items_start()
             .justify_center()
-            .pt(t.space.page * 2.0)
+            .pt(t.layout.switcher_top)
             .bg(c.scrim)
             .on_mouse_down(
                 MouseButton::Left,

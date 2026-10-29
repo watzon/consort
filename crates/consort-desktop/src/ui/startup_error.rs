@@ -45,8 +45,8 @@ impl Render for StartupError {
                 div()
                     .flex()
                     .items_center()
-                    .gap(t.text.heading.size * 0.35)
-                    .child(glyph("mark", t.text.heading.size * 1.2, mark_color))
+                    .gap(t.component.brand_gap)
+                    .child(glyph("mark", t.component.brand_mark, mark_color))
                     .child(
                         div()
                             .text_size(t.text.heading.size)

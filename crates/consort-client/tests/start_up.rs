@@ -48,3 +48,42 @@ fn no_files_means_not_paired() {
         Client::start_with(Some(Store::new(dir.path())), ClientOptions::desktop()).unwrap();
     assert_eq!(client.state().connection, Connection::NotPaired);
 }
+
+fn write_saved(dir: &std::path::Path, hub_url: &str) {
+    let config = CONFIG.replace("http://127.0.0.1:1", hub_url);
+    std::fs::write(dir.join("client.json"), config).unwrap();
+    std::fs::write(dir.join("client.key"), "11".repeat(32)).unwrap();
+}
+
+/// Finding 4a of review cycle 2: the `http` rule ran only when the user
+/// paired. A saved `client.json` with `http` to a public host was used as it
+/// was. The saved URL gets the same checks as a typed one.
+#[test]
+fn a_saved_http_url_to_a_public_host_is_refused_with_a_next_step() {
+    let dir = tempfile::tempdir().unwrap();
+    write_saved(dir.path(), "http://me:secret@hub.example.com/v1/client");
+    let client =
+        Client::start_with(Some(Store::new(dir.path())), ClientOptions::desktop()).unwrap();
+    let reason = refused_reason(&client);
+    assert!(reason.contains("hub.example.com"), "{reason}");
+    assert!(reason.contains("https"), "{reason}");
+    assert!(reason.contains("Pair this app again"), "{reason}");
+    assert!(
+        !reason.contains("secret"),
+        "no saved secret in the text: {reason}"
+    );
+}
+
+/// A saved URL with a path and a password works, but only as its origin.
+#[test]
+fn a_saved_url_with_a_path_and_a_password_is_cut_to_its_origin() {
+    let dir = tempfile::tempdir().unwrap();
+    write_saved(dir.path(), "http://me:secret@127.0.0.1:1/v1/client?x=1");
+    let client =
+        Client::start_with(Some(Store::new(dir.path())), ClientOptions::desktop()).unwrap();
+    assert!(
+        !matches!(client.state().connection, Connection::Refused { .. }),
+        "{:?}",
+        client.state().connection
+    );
+}

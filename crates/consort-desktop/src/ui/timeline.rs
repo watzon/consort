@@ -29,6 +29,9 @@ use crate::{
     },
 };
 
+/// What the timeline says when the open channel did not load.
+const UNLOADED_TEXT: &str = "Cannot load this channel. Retrying.";
+
 /// What a right click on a message offers. A message that is still on its
 /// way to the hub has a made-up ID, so it offers only what works on its text:
 /// no Reply in thread, Edit or Delete.
@@ -311,7 +314,10 @@ impl ConsortApp {
         // while the reader is scrolled up.
         let at_end = empty || self.timeline.is_scrolled_to_end().unwrap_or(true);
         let fade_bottom = t.space.xxl;
-        let body = if empty {
+        let unloaded = self.channel_unloaded();
+        let body = if empty && unloaded {
+            self.render_unloaded_timeline(t).into_any_element()
+        } else if empty {
             self.render_empty_timeline(t).into_any_element()
         } else {
             let gap = t.space.xl;
@@ -343,6 +349,27 @@ impl ConsortApp {
             .min_h_0()
             .w_full()
             .child(body)
+            // A channel with messages that did not load shows what it has, and
+            // says that the rest is missing.
+            .when(unloaded && !empty, |d| {
+                d.child(
+                    div()
+                        .absolute()
+                        .top(t.space.sm)
+                        .left_0()
+                        .right_0()
+                        .flex()
+                        .justify_center()
+                        .child(
+                            div()
+                                .py(t.space.xs + t.space.xxs)
+                                .px(t.space.md)
+                                .rounded(t.radius.md)
+                                .bg(c.surface_raised)
+                                .child(text(UNLOADED_TEXT, t.text.ui, c.text_secondary)),
+                        ),
+                )
+            })
             // The chat never has a hard edge: it fades into the canvas at the
             // top, and above the composer.
             .child(
@@ -374,6 +401,25 @@ impl ConsortApp {
                 )
             })
             .into_any_element()
+    }
+
+    /// A channel that did not load shows no messages, which does not mean it
+    /// has none. It says so, and the client asks the hub again by itself.
+    fn render_unloaded_timeline(&self, t: &Tokens) -> Div {
+        let c = &t.colors;
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap(t.space.xs)
+            .child(text(UNLOADED_TEXT, t.text.title, c.text_primary))
+            .child(text(
+                "Messages show here when it loads.",
+                t.text.body,
+                c.text_secondary,
+            ))
     }
 
     fn render_empty_timeline(&self, t: &Tokens) -> Div {
@@ -456,7 +502,54 @@ impl ConsortApp {
                     t,
                 )
             }
+            TimelineItem::Notice(notice) => self.render_notice_line(&notice, t, cx),
         }
+    }
+
+    /// A system notice: one quiet line in the column of the message text,
+    /// with no speaker. The text is selectable. The hub writes the kind and
+    /// the text; only the text shows.
+    fn render_notice_line(
+        &self,
+        notice: &consort_client::NoticeView,
+        t: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let c = &t.colors;
+        let copy = notice.text.clone();
+        div()
+            .id(SharedString::from(format!("notice-{}", notice.message_id)))
+            .flex()
+            .items_baseline()
+            .gap(t.space.sm)
+            .when(!self.narrow, |d| d.pl(t.layout.speaker_gutter + t.space.lg))
+            .child(
+                selectable(
+                    SharedString::from(format!("notice-line-{}", notice.message_id)),
+                    notice.text.clone(),
+                    t.text.ui,
+                    c.text_tertiary,
+                )
+                .min_w_0(),
+            )
+            .child(text(
+                notice.time_label.clone(),
+                t.text.caption,
+                c.text_tertiary,
+            ))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    open_context_menu(
+                        this,
+                        event,
+                        vec![MenuItem::new("Copy text", MenuAction::Copy(copy.clone()))],
+                        window,
+                        cx,
+                    )
+                }),
+            )
+            .into_any_element()
     }
 
     /// One timeline row: the speaker in the gutter at 600 px and wider, or on
@@ -902,7 +995,8 @@ impl ConsortApp {
                 );
         } else {
             // The newest update, as clean text of at most three lines: a
-            // review summary is Markdown with paragraphs and code.
+            // review summary is Markdown with paragraphs and code, and each
+            // block is a line of its own.
             let summary = match &card.approval {
                 Some(a) => a
                     .answer
@@ -915,15 +1009,19 @@ impl ConsortApp {
                     .unwrap_or_default(),
             };
             if !summary.is_empty() {
+                // The text is selectable: it holds the reason for a failed
+                // task or the review summary, and the user may copy it.
                 body = body.child(
-                    div()
-                        .pl(inset)
-                        .min_w_0()
-                        .type_style(t.text.ui)
-                        .text_color(c.text_secondary)
-                        .line_clamp(3)
-                        .text_ellipsis()
-                        .child(summary),
+                    selectable(
+                        SharedString::from(format!("card-latest-{}", card.message_id)),
+                        summary,
+                        t.text.ui,
+                        c.text_secondary,
+                    )
+                    .pl(inset)
+                    .min_w_0()
+                    .line_clamp(3)
+                    .text_ellipsis(),
                 );
             }
             // The actions sit in one row at the bottom, as on an approval:

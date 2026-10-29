@@ -14,7 +14,7 @@ use consort_proto::{
         SyncSnapshot, SyncSubscribe,
     },
     error::{ErrorBody, ErrorCode},
-    frame::{EventFrame, Frame, Request, SUPPORTED_PROTOCOL_VERSIONS},
+    frame::{EventFrame, Frame, FrameError, Request, SUPPORTED_PROTOCOL_VERSIONS},
     ids::{ChannelId, FrameId, MessageId},
     model::Message,
 };
@@ -24,8 +24,11 @@ use serde_json::Value;
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
-use super::{Failure, Outgoing, Reply, Shared, is_transport, url::ws_url};
-use crate::{store::Identity, view::Connection};
+use super::{
+    Failure, Outgoing, Reply, Shared, is_transport,
+    url::{addr_is_private, plain_http_name, resolve_private, ws_url},
+};
+use crate::{ClientError, store::Identity, view::Connection};
 
 /// Why a session on the link ended.
 pub(super) enum SessionEnd {
@@ -86,6 +89,16 @@ async fn send_ws(ws: &mut Ws, message: WsMessage, limit: Duration) -> Result<(),
 async fn send_frame(ws: &mut Ws, frame: &Frame, limit: Duration) -> Result<(), SessionEnd> {
     let text = frame.to_text().map_err(|e| lost(e.to_string()))?;
     send_ws(ws, WsMessage::text(text), limit).await
+}
+
+/// The answer for a request that cannot be written as a frame, such as one
+/// that is larger than a frame may be. The problem is in this one request,
+/// not in the link, so the request fails by itself and the link stays up.
+/// Sending it again would fail again.
+fn encode_failure(err: &FrameError) -> ErrorBody {
+    ErrorBody::invalid(format!(
+        "The request is too large to send ({err}). Shorten the text, then try again"
+    ))
 }
 
 /// One request during the handshake, before the main loop runs. The whole
@@ -202,6 +215,47 @@ impl ThreadPager {
     }
 }
 
+/// Opens the WebSocket. Plain `http` to a host name (`hub.local`,
+/// `localhost`) passes the URL rule by its spelling only. For such a name,
+/// the client looks it up, refuses it when it points to a public address,
+/// connects to the addresses it checked, and checks the peer address again
+/// on the open connection. Nothing is sent before these checks. Any other
+/// hub URL connects as it is.
+async fn open(hub_url: &str, ws_url: String) -> Result<Ws, SessionEnd> {
+    let Some((host, port)) = plain_http_name(hub_url) else {
+        let (ws, _) = tokio_tungstenite::connect_async(ws_url)
+            .await
+            .map_err(|e| lost(format!("The connection failed: {e}")))?;
+        return Ok(ws);
+    };
+    let addrs = resolve_private(&host, port, hub_url)
+        .await
+        .map_err(|err| match err {
+            // The name points to a public address. The hub URL is not safe,
+            // so the client stops and asks for a new pairing.
+            ClientError::InvalidUrl(detail) => SessionEnd::Refused(format!(
+                "Consort did not connect to the hub, because {detail}. Pair this app again with an address that uses https"
+            )),
+            other => lost(other.to_string()),
+        })?;
+    let stream = tokio::net::TcpStream::connect(&addrs[..])
+        .await
+        .map_err(|e| lost(format!("The connection failed: {e}")))?;
+    let peer = stream
+        .peer_addr()
+        .map_err(|e| lost(format!("The connection failed: {e}")))?;
+    if !addr_is_private(peer.ip()) {
+        return Err(SessionEnd::Refused(format!(
+            "Consort did not connect to the hub, because {host} connected to {}, which is not on this machine or a private network. Pair this app again with an address that uses https",
+            peer.ip()
+        )));
+    }
+    let (ws, _) = tokio_tungstenite::client_async_tls(ws_url, stream)
+        .await
+        .map_err(|e| lost(format!("The connection failed: {e}")))?;
+    Ok(ws)
+}
+
 /// Signs in, loads or catches up the data, and then runs the live loop until
 /// the link ends. `online_since` is set when the link reaches Online.
 async fn session(
@@ -211,15 +265,18 @@ async fn session(
 ) -> Result<(), SessionEnd> {
     let limits = shared.options.timeouts;
     let url = ws_url(&identity.config.hub_url).map_err(|e| lost(e.to_string()))?;
-    let (mut ws, _) = tokio::time::timeout(limits.connect, tokio_tungstenite::connect_async(url))
+    let mut ws = tokio::time::timeout(limits.connect, open(&identity.config.hub_url, url))
         .await
         .map_err(|_| {
             lost(format!(
                 "The hub did not answer in {}.",
                 seconds(limits.connect)
             ))
-        })?
-        .map_err(|e| lost(format!("The connection failed: {e}")))?;
+        })??;
+    // A restart request from an earlier link is over.
+    shared
+        .restart
+        .store(false, std::sync::atomic::Ordering::Release);
 
     // auth.challenge, then auth.response.
     let challenge = match tokio::time::timeout(limits.handshake, read_frame(&mut ws))
@@ -303,7 +360,15 @@ async fn session(
             }
             outgoing = rx.recv() => {
                 let Some(outgoing) = outgoing else { break Ok(()) };
-                match send_frame(&mut ws, &outgoing.frame, limits.call).await {
+                let text = match outgoing.frame.to_text() {
+                    Ok(text) => text,
+                    Err(err) => {
+                        // Only this request fails. The link stays up.
+                        let _ = outgoing.reply.send(Err(Failure::Remote(encode_failure(&err))));
+                        continue;
+                    }
+                };
+                match send_ws(&mut ws, WsMessage::text(text), limits.call).await {
                     Ok(()) => {
                         waiting.insert(outgoing.id, Waiting {
                             kind: outgoing.kind,
@@ -319,6 +384,9 @@ async fn session(
             }
             _ = tick.tick() => {
                 let now = Instant::now();
+                if shared.restart.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                    break Err(lost("Consort could not load all the changes from the hub. It connects again to load the data"));
+                }
                 if now.duration_since(last_seen) > limits.idle {
                     break Err(lost(format!("The hub has been silent for {}.", seconds(limits.idle))));
                 }
@@ -578,10 +646,14 @@ fn recover(shared: &Arc<Shared>, seq: u64, channel_id: Option<ChannelId>) {
                 shared.publish();
             }
             Err(err) => {
-                tracing::warn!(error = %err, "cannot load the data of a skipped change, so the next connection loads a snapshot");
+                tracing::warn!(error = %err, "cannot load the data of a skipped change, so the client connects again and loads a snapshot");
+                // The cache misses a change. Nothing else retries this while
+                // the link stays up, so end the link: the next connection
+                // sees that the cache is not loaded and loads everything.
                 if let Ok(mut cache) = shared.cache.lock() {
                     cache.loaded = false;
                 }
+                shared.restart_link();
             }
         }
     });

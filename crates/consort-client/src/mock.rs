@@ -520,6 +520,7 @@ fn timelines() -> Vec<TimelineView> {
         TimelineView {
             channel_id: EVERYTHING.into(),
             has_older: true,
+            loaded: true,
             items: vec![
                 day("day_everything_today", "Today"),
                 brief,
@@ -552,6 +553,7 @@ fn timelines() -> Vec<TimelineView> {
         TimelineView {
             channel_id: SAYSO.into(),
             has_older: true,
+            loaded: true,
             items: vec![
                 day("day_sayso_yesterday", "Yesterday"),
                 card(
@@ -601,6 +603,7 @@ fn timelines() -> Vec<TimelineView> {
         TimelineView {
             channel_id: LUCY.into(),
             has_older: true,
+            loaded: true,
             items: vec![
                 day("day_lucy_today", "Today"),
                 message(
@@ -634,6 +637,7 @@ fn timelines() -> Vec<TimelineView> {
         TimelineView {
             channel_id: EXT4.into(),
             has_older: false,
+            loaded: true,
             items: vec![
                 day("day_ext4_today", "Today"),
                 message(
@@ -660,6 +664,7 @@ fn timelines() -> Vec<TimelineView> {
         TimelineView {
             channel_id: HOMELAB.into(),
             has_older: true,
+            loaded: true,
             items: vec![
                 day("day_homelab_today", "Today"),
                 message(
@@ -684,6 +689,7 @@ fn timelines() -> Vec<TimelineView> {
         TimelineView {
             channel_id: LIGHTS.into(),
             has_older: false,
+            loaded: true,
             items: vec![
                 day("day_lights_today", "Today"),
                 message(
@@ -740,6 +746,7 @@ fn threads() -> Vec<TaskThreadView> {
             title: String::new(),
             status: TaskStatus::NeedsInput,
             status_detail: waiting_detail(1, 1),
+            reason: None,
             placement: placement(
                 "bigboi",
                 "Windows",
@@ -840,6 +847,9 @@ fn threads() -> Vec<TaskThreadView> {
         },
         TaskThreadView {
             task_id: T_EXT4.into(),
+            reason: Some(
+                "Code signing failed: no identity matches `Developer ID Application`. Install the certificate on the MacBook Pro, then retry.".to_owned(),
+            ),
             placement: placement(
                 "MacBook Pro",
                 "macOS",

@@ -49,25 +49,65 @@ pub fn age_label(ms: i64, now_ms: i64) -> String {
     }
 }
 
-/// Markdown as one run of plain text, for a short summary on a card: code
-/// blocks, headings and list marks go, links keep their words, and every
-/// blank line and line break becomes one space. The card clamps it.
+/// Markdown as plain text for a short summary on a card, one block to a
+/// line. Headings and list marks go, emphasis and code marks go, and a link
+/// keeps its words. A paragraph is one line, even when the source wraps it.
+/// A heading, a list item, a quote, and each line of a code block (fenced or
+/// indented) is a line of its own, so the lines of a code block never run
+/// together with the text around them. The card clamps the lines.
 pub fn card_summary(markdown: &str) -> String {
-    let mut out = String::new();
+    let mut lines: Vec<String> = Vec::new();
+    let mut paragraph = String::new();
     let mut in_fence = false;
-    for line in markdown.lines() {
-        let trimmed = line.trim();
+    let mut in_indented_code = false;
+    let mut after_blank = true;
+    fn flush(paragraph: &mut String, lines: &mut Vec<String>) {
+        let text = paragraph.split_whitespace().collect::<Vec<_>>().join(" ");
+        if !text.is_empty() {
+            lines.push(text);
+        }
+        paragraph.clear();
+    }
+    for raw in markdown.lines() {
+        let trimmed = raw.trim();
         if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            flush(&mut paragraph, &mut lines);
             in_fence = !in_fence;
             continue;
         }
-        if in_fence || trimmed.is_empty() {
+        if in_fence {
+            // Code is text as it is: no marks come off.
+            if !trimmed.is_empty() {
+                lines.push(trimmed.to_owned());
+            }
             continue;
         }
-        let mut text = trimmed.trim_start_matches('#').trim_start();
+        if trimmed.is_empty() {
+            flush(&mut paragraph, &mut lines);
+            in_indented_code = false;
+            after_blank = true;
+            continue;
+        }
+        let indented = raw.starts_with("    ") || raw.starts_with('\t');
+        if indented && (after_blank || in_indented_code) {
+            flush(&mut paragraph, &mut lines);
+            in_indented_code = true;
+            after_blank = false;
+            lines.push(trimmed.to_owned());
+            continue;
+        }
+        in_indented_code = false;
+        after_blank = false;
+        let mut text = trimmed;
+        let mut new_block = false;
+        if text.starts_with('#') {
+            text = text.trim_start_matches('#').trim_start();
+            new_block = true;
+        }
         for mark in ["- ", "* ", "+ ", "> "] {
             if let Some(rest) = text.strip_prefix(mark) {
                 text = rest;
+                new_block = true;
             }
         }
         if let Some((number, rest)) = text.split_once(". ")
@@ -75,13 +115,22 @@ pub fn card_summary(markdown: &str) -> String {
             && number.chars().all(|c| c.is_ascii_digit())
         {
             text = rest;
+            new_block = true;
         }
-        if !out.is_empty() {
-            out.push(' ');
+        if new_block {
+            flush(&mut paragraph, &mut lines);
         }
-        out.push_str(&strip_marks(text));
+        if !paragraph.is_empty() {
+            paragraph.push(' ');
+        }
+        paragraph.push_str(&strip_marks(text));
+        if new_block {
+            // A heading or a list item is a line by itself.
+            flush(&mut paragraph, &mut lines);
+        }
     }
-    out.split_whitespace().collect::<Vec<_>>().join(" ")
+    flush(&mut paragraph, &mut lines);
+    lines.join("\n")
 }
 
 /// Inline Markdown without its marks: emphasis and code marks go, and a
@@ -142,17 +191,48 @@ mod tests {
     }
 
     #[test]
-    fn card_summaries_are_clean_text() {
+    fn card_summaries_are_clean_text_with_one_block_to_a_line() {
         let md = "Wrote **hello.txt** in the workspace.\n\n```sh\ncat hello.txt\n```\n\n- It says [hi](https://x.y).\n- Tests pass.";
         assert_eq!(
             card_summary(md),
-            "Wrote hello.txt in the workspace. It says hi. Tests pass."
+            "Wrote hello.txt in the workspace.\ncat hello.txt\nIt says hi.\nTests pass."
         );
-        assert_eq!(card_summary("## Done\n1. One"), "Done One");
+        assert_eq!(card_summary("## Done\n1. One"), "Done\nOne");
         assert_eq!(
             card_summary("Edit `rules/new_members.toml`, _not_ __this__."),
             "Edit rules/new_members.toml, not this."
         );
+        assert_eq!(card_summary("  \n\n"), "");
+    }
+
+    /// Finding 16 of review cycle 2: "...were changed. uname -s date -u %Y"
+    /// ran the lines of a code block together with the text before it.
+    #[test]
+    fn the_lines_of_a_code_block_do_not_run_together() {
+        let indented =
+            "Three files were changed.\n\n    uname -s\n    date -u +%Y\n\nNo other files changed.";
+        assert_eq!(
+            card_summary(indented),
+            "Three files were changed.\nuname -s\ndate -u +%Y\nNo other files changed."
+        );
+        let fenced = "Three files were changed.\n```\nuname -s\ndate -u +%Y\n```\nDone.";
+        assert_eq!(
+            card_summary(fenced),
+            "Three files were changed.\nuname -s\ndate -u +%Y\nDone."
+        );
+        // Marks in code stay: they are not Markdown there.
+        assert_eq!(card_summary("```\nls *_x\n```"), "ls *_x");
+    }
+
+    #[test]
+    fn a_paragraph_that_wraps_in_the_source_stays_one_line() {
+        let md = "The first line of the\nsame paragraph.\n\nA second paragraph.";
+        assert_eq!(
+            card_summary(md),
+            "The first line of the same paragraph.\nA second paragraph."
+        );
+        // An indented line inside a paragraph is not code.
+        assert_eq!(card_summary("Text\n    still text"), "Text still text");
     }
 
     #[test]

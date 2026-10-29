@@ -4,6 +4,8 @@
 
 use std::collections::HashSet;
 
+use consort_client::ClientError;
+
 /// The commands that run now, by key. A key that runs blocks a second
 /// submit, so a double click or a double Enter sends once.
 #[derive(Debug, Default)]
@@ -41,6 +43,46 @@ pub fn failure_message(error: &str, kept: &str) -> String {
         format!("{error} {kept}")
     } else {
         format!("{error}. {kept}")
+    }
+}
+
+/// What a failed command says it kept, so the message can tell the user.
+#[derive(Clone, Copy, Debug)]
+pub enum Kept {
+    /// The user's text is still in its box, such as "Your message is still
+    /// in the box."
+    Draft(&'static str),
+    /// A request still waits for the user's answer, such as "The request
+    /// still waits for your answer."
+    Request(&'static str),
+}
+
+impl Kept {
+    /// The message for a command that failed. When the hub says that a
+    /// request is closed or gone (`conflict`, `not_found`), the request does
+    /// not wait any more, so the message is the hub's own text and nothing
+    /// that says otherwise.
+    pub fn failure(&self, err: &ClientError) -> String {
+        match (self, err) {
+            (Kept::Request(_), ClientError::Hub { code, message })
+                if code == "conflict" || code == "not_found" =>
+            {
+                message.trim().to_owned()
+            }
+            (Kept::Draft(kept) | Kept::Request(kept), err) => {
+                failure_message(&err.to_string(), kept)
+            }
+        }
+    }
+}
+
+/// Adds `text` to the end of a draft, after a blank line. A draft that is
+/// empty becomes the text. Nothing in the draft is lost.
+pub fn append_text(draft: &str, text: &str) -> String {
+    if draft.trim().is_empty() {
+        text.to_owned()
+    } else {
+        format!("{}\n\n{text}", draft.trim_end())
     }
 }
 
@@ -99,6 +141,54 @@ mod tests {
         assert_eq!(
             failure_message("The hub said no.", "Your edit is still in the box."),
             "The hub said no. Your edit is still in the box."
+        );
+    }
+
+    fn hub(code: &str, message: &str) -> ClientError {
+        ClientError::Hub {
+            code: code.into(),
+            message: message.into(),
+        }
+    }
+
+    /// Finding 13 of review cycle 2: after the hub said that a request was
+    /// closed, the app added "The request still waits for your answer."
+    #[test]
+    fn a_closed_request_shows_only_the_hub_text() {
+        let kept = Kept::Request("The request still waits for your answer.");
+        for code in ["conflict", "not_found"] {
+            let text = kept.failure(&hub(code, "This approval was already answered or closed."));
+            assert_eq!(text, "This approval was already answered or closed.");
+            assert!(!text.contains("still waits"));
+        }
+        // Another error leaves the request open, and the text says so.
+        assert_eq!(
+            kept.failure(&hub("internal", "The hub failed.")),
+            "The hub failed. The request still waits for your answer."
+        );
+        assert!(
+            kept.failure(&ClientError::NotConnected)
+                .ends_with("The request still waits for your answer.")
+        );
+    }
+
+    #[test]
+    fn a_draft_always_says_it_is_still_in_the_box() {
+        let kept = Kept::Draft("Your message is still in the box.");
+        // A missing channel does not remove the draft.
+        assert_eq!(
+            kept.failure(&hub("not_found", "That channel does not exist.")),
+            "That channel does not exist. Your message is still in the box."
+        );
+    }
+
+    #[test]
+    fn restored_text_goes_after_the_draft() {
+        assert_eq!(append_text("", "Lost words"), "Lost words");
+        assert_eq!(append_text("  \n", "Lost words"), "Lost words");
+        assert_eq!(
+            append_text("New draft\n\n", "Lost words"),
+            "New draft\n\nLost words"
         );
     }
 

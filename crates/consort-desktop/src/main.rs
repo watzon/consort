@@ -23,8 +23,8 @@ actions!(consort, [Quit]);
 
 /// Command line options. `--screen` opens one of the designed screens, for
 /// screenshots and reviews: everything, sayso, tasks, thread, settings,
-/// workers, new-channel, add-worker, worker-added, review, new-folder,
-/// onboarding. `--light` and `--dark` set
+/// workers, new-channel, add-worker, worker-added, review, failed, error,
+/// new-folder, onboarding. `--light` and `--dark` set
 /// the mode, and `--theme <name>` the theme.
 #[derive(Clone, Debug, Default)]
 pub struct Args {

@@ -72,9 +72,18 @@ async fn run(shared: Arc<Shared>, command: Command) -> Result<(), ClientError> {
                 *i = Some(identity);
             }
             if let Ok(mut cache) = shared.cache.lock() {
-                *cache = Cache::default();
+                // Messages for the old hub do not go to the new one. The
+                // user keeps their text as failed sends, and can send them
+                // again.
+                cache.fail_pending(
+                    "This message did not go out, because you paired this app with a hub again.",
+                );
+                let failures = std::mem::take(&mut cache.send_failures);
+                *cache = Cache {
+                    send_failures: failures,
+                    ..Cache::default()
+                };
             }
-            // Messages for the old hub do not go to the new one.
             shared.defer_waiters();
             shared.set_connection(Connection::Connecting);
             shared.wake.notify_one();
@@ -118,6 +127,9 @@ async fn run(shared: Arc<Shared>, command: Command) -> Result<(), ClientError> {
             return queue_send(&shared, pending).await;
         }
         Command::EditMessage { message_id, body } => {
+            // Refuse a body that the hub would refuse. The caller keeps its
+            // draft.
+            crate::limits::check_message_body(&body)?;
             shared
                 .call(MessageEdit {
                     message_id: parse(&message_id, "message")?,
@@ -234,7 +246,7 @@ async fn run(shared: Arc<Shared>, command: Command) -> Result<(), ClientError> {
         }
         Command::MarkRead { channel_id } => {
             let channel: ChannelId = parse(&channel_id, "channel")?;
-            let (last, marked) = shared
+            let (loaded, last, marked) = shared
                 .cache
                 .lock()
                 .ok()
@@ -253,36 +265,42 @@ async fn run(shared: Arc<Shared>, command: Command) -> Result<(), ClientError> {
                         .read_markers
                         .get(&channel_id)
                         .map(|m| m.last_read_message_id);
-                    (last, marked)
+                    (c.channels_loaded.contains(&channel_id), last, marked)
                 })
                 .unwrap_or_default();
+            // A channel that never loaded shows no messages. The newest one
+            // that a live entry brings is not the newest the user has seen,
+            // so nothing is marked until the channel has loaded.
+            if !loaded {
+                return Err(ClientError::Other(
+                    "This channel has not loaded yet, so Consort cannot mark it as read. Consort tries to load it again".into(),
+                ));
+            }
             // Nothing to do when the newest message is read already.
             if let Some(last) = last
                 && marked != Some(last)
             {
-                // A read marker is a nicety: offline, it waits for the next open.
-                let sent = shared
+                // A failure is the caller's to see, so it can try again. The
+                // marker stays where it was until the hub takes the new one.
+                shared
                     .call(ReadMark {
                         channel_id: channel,
                         thread_root_id: None,
                         last_read_message_id: last,
                     })
-                    .await
-                    .is_ok();
-                if sent {
-                    // Show it at once. The feed repeats it later.
-                    if let Ok(mut cache) = shared.cache.lock() {
-                        cache.read_markers.insert(
-                            channel_id.clone(),
-                            consort_proto::model::ReadMarker {
-                                channel_id: channel,
-                                thread_root_id: None,
-                                last_read_message_id: last,
-                            },
-                        );
-                    }
-                    shared.publish();
+                    .await?;
+                // Show it at once. The feed repeats it later.
+                if let Ok(mut cache) = shared.cache.lock() {
+                    cache.read_markers.insert(
+                        channel_id.clone(),
+                        consort_proto::model::ReadMarker {
+                            channel_id: channel,
+                            thread_root_id: None,
+                            last_read_message_id: last,
+                        },
+                    );
                 }
+                shared.publish();
             }
         }
         Command::LoadThread { task_id } => {
@@ -386,19 +404,25 @@ async fn run(shared: Arc<Shared>, command: Command) -> Result<(), ClientError> {
                 .and_then(|c| c.approvals.get(&approval_id).cloned())
                 .and_then(|a| option_for(&a, choice))
                 .ok_or_else(|| invalid("This approval has no such answer. It may have closed."))?;
-            shared
+            let answered = shared
                 .call(consort_proto::client_api::ApprovalAnswer {
                     approval_id: parse(&approval_id, "approval")?,
                     option_id,
                 })
-                .await?;
+                .await;
+            if let Err(err) = answered {
+                if is_closed_reply(&err) {
+                    close_approval(&shared, &approval_id);
+                }
+                return Err(err);
+            }
         }
         Command::AnswerDecision {
             decision_id,
             option,
             text,
         } => {
-            shared
+            let answered = shared
                 .call(DecisionAnswerRequest {
                     decision_id: parse(&decision_id, "decision")?,
                     answer: DecisionAnswer {
@@ -406,7 +430,13 @@ async fn run(shared: Arc<Shared>, command: Command) -> Result<(), ClientError> {
                         text,
                     },
                 })
-                .await?;
+                .await;
+            if let Err(err) = answered {
+                if is_closed_reply(&err) {
+                    close_decision(&shared, &decision_id);
+                }
+                return Err(err);
+            }
         }
         Command::DismissSendFailure { id } => {
             if let Ok(mut cache) = shared.cache.lock() {
@@ -468,6 +498,42 @@ async fn run(shared: Arc<Shared>, command: Command) -> Result<(), ClientError> {
         }
     }
     Ok(())
+}
+
+/// True for the answers that say a request is closed or gone: `conflict`
+/// (answered or closed already) and `not_found`.
+fn is_closed_reply(err: &ClientError) -> bool {
+    matches!(err, ClientError::Hub { code, .. } if code == "conflict" || code == "not_found")
+}
+
+/// The hub says an approval is closed. A snapshot holds only pending
+/// approvals, so the cache cannot learn more than this from a reload. If the
+/// cache still shows the approval as pending, it drops it: the card then
+/// shows as closed, and the answer comes from the feed if it arrives. An
+/// approval that the feed already updated stays as it is.
+fn close_approval(shared: &Shared, approval_id: &str) {
+    if let Ok(mut cache) = shared.cache.lock()
+        && cache
+            .approvals
+            .get(approval_id)
+            .is_some_and(|a| a.status == consort_proto::model::ApprovalStatus::Pending)
+    {
+        cache.approvals.remove(approval_id);
+    }
+    shared.publish();
+}
+
+/// The same for a decision. See [`close_approval`].
+fn close_decision(shared: &Shared, decision_id: &str) {
+    if let Ok(mut cache) = shared.cache.lock()
+        && cache
+            .decisions
+            .get(decision_id)
+            .is_some_and(|d| d.status == consort_proto::model::DecisionStatus::Pending)
+    {
+        cache.decisions.remove(decision_id);
+    }
+    shared.publish();
 }
 
 /// The size of one page of older timeline messages.

@@ -1,6 +1,6 @@
 //! The hub URL: what the user types, and the address the client keeps.
 
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use consort_proto::auth::CLIENT_WS_PATH;
 use url::{Host, Url};
@@ -40,6 +40,89 @@ fn ipv6_is_private(ip: Ipv6Addr) -> bool {
         || (first & 0xfe00) == 0xfc00
         // fe80::/10: link-local addresses.
         || (first & 0xffc0) == 0xfe80
+}
+
+/// True for an address on this machine or on a private network. These are
+/// the only places where plain `http` is allowed.
+pub(super) fn addr_is_private(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => ipv4_is_private(ip),
+        IpAddr::V6(ip) => ipv6_is_private(ip),
+    }
+}
+
+/// The host name and port of a hub that is reached over plain `http` by a
+/// name, such as `localhost`, `*.localhost` or `hub.local`. The rule for
+/// `http` lets such a name pass by its spelling only, so the client checks
+/// where the name points before it sends anything. `None` for `https` and
+/// for an address, which need no check.
+pub(super) fn plain_http_name(hub_url: &str) -> Option<(String, u16)> {
+    let url = Url::parse(hub_url).ok()?;
+    if url.scheme() != "http" {
+        return None;
+    }
+    let Some(Host::Domain(name)) = url.host() else {
+        return None;
+    };
+    let port = url.port_or_known_default()?;
+    Some((name.to_owned(), port))
+}
+
+/// Refuses a name that points anywhere but this machine or a private
+/// network. Every address counts: a name with one public address is public.
+pub(super) fn check_private(host: &str, addrs: &[SocketAddr]) -> Result<(), ClientError> {
+    match addrs.iter().find(|a| !addr_is_private(a.ip())) {
+        Some(public) => Err(ClientError::InvalidUrl(format!(
+            "{host} points to {}, which is not on this machine or a private network, and plain http is only for those. Use https",
+            public.ip()
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// Looks up a host name that is reached over plain `http`, and checks the
+/// addresses. The caller connects to these addresses and no others, so the
+/// name cannot point somewhere else between the check and the connection.
+pub(super) async fn resolve_private(
+    host: &str,
+    port: u16,
+    hub_url: &str,
+) -> Result<Vec<SocketAddr>, ClientError> {
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|_| ClientError::Unreachable {
+            url: hub_url.to_owned(),
+        })?
+        .collect();
+    if addrs.is_empty() {
+        return Err(ClientError::Unreachable {
+            url: hub_url.to_owned(),
+        });
+    }
+    check_private(host, &addrs)?;
+    Ok(addrs)
+}
+
+/// The hub URL that a saved identity holds, checked by the same rules as a
+/// URL that the user types now. A file from an older version, or one that
+/// someone edited, may hold `http` to a public host, a path or a
+/// `user:password@` part. The answer is the URL to use, or a reason that
+/// says what is wrong and what to do.
+pub(super) fn checked_saved_url(saved: &str) -> Result<String, String> {
+    normalize_hub_url(saved).map_err(|err| {
+        let detail = match err {
+            ClientError::InvalidUrl(detail) => detail,
+            other => other.to_string(),
+        };
+        // The saved address may hold a secret, so only its host is shown.
+        let shown = Url::parse(saved)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_owned))
+            .unwrap_or_else(|| "the saved address".to_owned());
+        format!(
+            "Consort will not use the saved hub address ({shown}), because {detail}. Pair this app again with a hub address that uses https"
+        )
+    })
 }
 
 /// The hub URL as the user typed it, reduced to its origin: the scheme, the
@@ -194,6 +277,81 @@ mod tests {
         assert_eq!(ok("http://127.0.0.1:80"), "http://127.0.0.1");
         let kept = ok("user:pw@hub.example.com/path?q=1");
         assert!(!kept.contains("pw") && !kept.contains("path") && !kept.contains('?'));
+    }
+
+    #[test]
+    fn a_saved_url_follows_the_rules_of_a_typed_one() {
+        // A path and a password are cut, as they are at pairing.
+        assert_eq!(
+            checked_saved_url("http://me:pw@192.168.1.5:7600/v1/client").unwrap(),
+            "http://192.168.1.5:7600"
+        );
+        assert_eq!(
+            checked_saved_url("https://hub.example.com/x").unwrap(),
+            "https://hub.example.com"
+        );
+    }
+
+    #[test]
+    fn a_saved_http_url_to_a_public_host_is_refused_with_a_next_step() {
+        let reason = checked_saved_url("http://me:secret@hub.example.com/path").unwrap_err();
+        assert!(reason.contains("hub.example.com"), "{reason}");
+        assert!(reason.contains("Pair this app again"), "{reason}");
+        assert!(reason.contains("https"), "{reason}");
+        assert!(
+            !reason.contains("secret"),
+            "never show a saved secret: {reason}"
+        );
+        assert!(
+            checked_saved_url("")
+                .unwrap_err()
+                .contains("Pair this app again")
+        );
+        assert!(checked_saved_url("ftp://x").is_err());
+    }
+
+    #[test]
+    fn only_plain_http_to_a_name_needs_a_lookup() {
+        assert_eq!(
+            plain_http_name("http://hub.local:7600"),
+            Some(("hub.local".to_owned(), 7600))
+        );
+        assert_eq!(
+            plain_http_name("http://localhost"),
+            Some(("localhost".to_owned(), 80))
+        );
+        assert_eq!(plain_http_name("https://hub.local"), None);
+        assert_eq!(plain_http_name("http://192.168.1.5:7600"), None);
+        assert_eq!(plain_http_name("http://[::1]:7600"), None);
+    }
+
+    #[test]
+    fn a_name_that_points_to_a_public_address_is_refused() {
+        let addr = |text: &str| -> SocketAddr { text.parse().unwrap() };
+        assert!(check_private("hub.local", &[addr("192.168.1.5:80")]).is_ok());
+        assert!(check_private("localhost", &[addr("127.0.0.1:80"), addr("[::1]:80")]).is_ok());
+        let err = check_private("evil.local", &[addr("203.0.113.9:80")])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("evil.local") && err.contains("203.0.113.9"),
+            "{err}"
+        );
+        assert!(err.contains("https"), "{err}");
+        // One public address among private ones is enough to refuse.
+        assert!(check_private("mixed.local", &[addr("10.0.0.2:80"), addr("8.8.8.8:80")]).is_err());
+    }
+
+    #[tokio::test]
+    async fn localhost_resolves_to_this_machine() {
+        let addrs = resolve_private("localhost", 7600, "http://localhost:7600")
+            .await
+            .unwrap();
+        assert!(
+            addrs
+                .iter()
+                .all(|a| a.ip().is_loopback() && a.port() == 7600)
+        );
     }
 
     #[test]

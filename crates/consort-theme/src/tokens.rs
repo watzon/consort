@@ -215,6 +215,8 @@ pub struct Motion {
     pub fast: Duration,
     pub normal: Duration,
     pub slow: Duration,
+    /// One turn of the spinner on a working task.
+    pub spin: Duration,
     pub ease_enter: [f32; 4],
     pub ease_exit: [f32; 4],
 }
@@ -233,6 +235,21 @@ pub struct Layout {
     pub wide_timeline: Pixels,
     /// How far a virtual list lays out rows beyond its edges.
     pub list_overdraw: Pixels,
+    /// The usual dialog: rename, labels and the confirmations.
+    pub dialog_width: Pixels,
+    /// The wide dialogs: New channel and Instructions.
+    pub dialog_wide: Pixels,
+    /// The Add worker dialog.
+    pub dialog_worker: Pixels,
+    /// The channel switcher.
+    pub switcher_width: Pixels,
+    /// The space above the switcher.
+    pub switcher_top: Pixels,
+    /// The longest a channel name grows in a switcher row.
+    pub switcher_name_max: Pixels,
+    /// The tallest a block of error text grows: a toast, or the reason in a
+    /// task thread. Its text scrolls past this.
+    pub error_text_max_height: Pixels,
 }
 
 /// Opacities of dimmed parts, as shares of full color.
@@ -266,6 +283,9 @@ pub struct Components {
     pub state_dot: Pixels,
     pub worker_row_pad_y: Pixels,
     pub switch_inset: Pixels,
+    pub notes_min_height: Pixels,
+    pub brand_mark: Pixels,
+    pub brand_gap: Pixels,
     pub theme_preview: ThemePreview,
 }
 
@@ -305,6 +325,9 @@ impl Components {
             state_dot: px(c.state_dot),
             worker_row_pad_y: px(c.worker_row_pad_y),
             switch_inset: px(c.switch_inset),
+            notes_min_height: px(c.notes_min_height),
+            brand_mark: px(c.brand_mark),
+            brand_gap: px(c.brand_gap),
             theme_preview: ThemePreview {
                 bar: px(p.bar),
                 bar_gap: px(p.bar_gap),
@@ -414,6 +437,7 @@ impl Tokens {
                 fast: Duration::from_millis(s.motion.fast_ms),
                 normal: Duration::from_millis(s.motion.normal_ms),
                 slow: Duration::from_millis(s.motion.slow_ms),
+                spin: Duration::from_millis(s.motion.spin_ms),
                 ease_enter: s.motion.ease_enter,
                 ease_exit: s.motion.ease_exit,
             },
@@ -429,6 +453,13 @@ impl Tokens {
                 ),
                 wide_timeline: px(s.layout.wide_timeline),
                 list_overdraw: px(s.layout.list_overdraw),
+                dialog_width: px(s.layout.dialog_width),
+                dialog_wide: px(s.layout.dialog_wide),
+                dialog_worker: px(s.layout.dialog_worker),
+                switcher_width: px(s.layout.switcher_width),
+                switcher_top: px(s.layout.switcher_top),
+                switcher_name_max: px(s.layout.switcher_name_max),
+                error_text_max_height: px(s.layout.error_text_max_height),
             },
             opacity: Opacity {
                 answered_dim: s.opacity.answered_dim,
@@ -519,6 +550,14 @@ mod tests {
         assert_eq!(t.layout.default_window, (px(1440.0), px(900.0)));
         assert_eq!(t.layout.wide_timeline, px(600.0));
         assert_eq!(t.layout.list_overdraw, px(400.0));
+        assert_eq!(t.layout.dialog_width, px(528.0));
+        assert_eq!(t.layout.dialog_wide, px(560.0));
+        assert_eq!(t.layout.dialog_worker, px(536.0));
+        assert_eq!(t.layout.switcher_width, px(560.0));
+        assert_eq!(t.layout.switcher_top, px(96.0));
+        assert_eq!(t.layout.switcher_name_max, px(240.0));
+        assert_eq!(t.layout.error_text_max_height, px(240.0));
+        assert_eq!(t.motion.spin, Duration::from_millis(1200));
     }
 
     #[test]
@@ -530,6 +569,9 @@ mod tests {
         assert_eq!(t.component.settings_label, px(160.0));
         assert_eq!(t.component.theme_row, px(632.0));
         assert_eq!(t.component.button_pad_y, px(5.0));
+        assert_eq!(t.component.notes_min_height, px(192.0));
+        assert_eq!(t.component.brand_mark, px(26.0));
+        assert_eq!(t.component.brand_gap, px(8.0));
         assert_eq!(t.component.theme_preview.sidebar_item, px(20.0));
         assert_eq!(t.component.theme_preview.button_radius, px(2.0));
     }

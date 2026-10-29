@@ -309,6 +309,23 @@ fn decision_view(d: &model::Decision) -> DecisionView {
     }
 }
 
+/// The kind and the text of a notice message. The hub writes the body as
+/// the JSON `{"kind": "...", "text": "..."}` (DECISIONS row 66). A body that
+/// does not have a text is shown as it is, with an empty kind, so no
+/// notice is lost.
+pub fn notice_parts(body: &str) -> (String, String) {
+    #[derive(serde::Deserialize)]
+    struct Parsed {
+        #[serde(default)]
+        kind: String,
+        text: String,
+    }
+    match serde_json::from_str::<Parsed>(body) {
+        Ok(parsed) if !parsed.text.trim().is_empty() => (parsed.kind, parsed.text),
+        _ => (String::new(), body.to_owned()),
+    }
+}
+
 fn speaker(m: &model::Message) -> Speaker {
     match m.author {
         Author::User => Speaker::You,
@@ -515,7 +532,8 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
         for m in &messages {
             let at = m.created_at.as_millis();
             let after_marker = marker_at.is_none_or(|at| (m.created_at, m.id) > at);
-            if after_marker && m.author != Author::User {
+            // A system notice is not something to read: it never counts.
+            if after_marker && m.author != Author::User && m.kind != MessageKind::Notice {
                 count += 1;
             }
             push_day(&mut items, at);
@@ -587,6 +605,14 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                     time_label: format::time_label(at),
                     decision,
                 }));
+            } else if m.kind == MessageKind::Notice {
+                let (kind, text) = notice_parts(&m.body);
+                items.push(TimelineItem::Notice(NoticeView {
+                    message_id: m.id.to_string(),
+                    time_label: format::time_label(at),
+                    kind,
+                    text,
+                }));
             } else {
                 items.push(TimelineItem::Message(MessageView {
                     id: m.id.to_string(),
@@ -625,6 +651,7 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
             channel_id: channel.id.clone(),
             items,
             has_older: cache.has_older.get(&channel.id).copied().unwrap_or(false),
+            loaded: cache.channels_loaded.contains(&channel.id),
         });
     }
 
@@ -658,6 +685,10 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                     }
                     None => PostBody::Decision(closed_decision(m)),
                 }),
+                MessageKind::Notice => {
+                    let (kind, text) = notice_parts(&m.body);
+                    Some(PostBody::Notice { kind, text })
+                }
                 _ => Some(PostBody::Text(m.body.clone())),
             };
             if let Some(body) = body {
@@ -746,6 +777,10 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
             title: task.title.clone(),
             status: task_status(task.status),
             status_detail: waiting_detail(decisions, approvals),
+            reason: match task_status(task.status) {
+                TaskStatus::Failed | TaskStatus::UpNext => task.status_reason.clone(),
+                _ => None,
+            },
             placement: worker.map(|w| PlacementView {
                 worker_name: w.name.clone(),
                 worker_os: os(w.os).label().to_owned(),
@@ -905,6 +940,10 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
             .map(|f| SendFailureView {
                 id: f.id.clone(),
                 channel_id: f.channel_id.clone(),
+                task_id: f
+                    .thread_root_id
+                    .as_ref()
+                    .and_then(|root| task_by_card.get(root).map(|t| t.id.to_string())),
                 channel_name: cache
                     .channels
                     .get(&f.channel_id)
@@ -912,7 +951,7 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                     .unwrap_or_default(),
                 body: f.body.clone(),
                 message: format!(
-                    "{} Copy your text, then send it again.",
+                    "{} Put your text back in the message box, then send it again.",
                     sentence(&f.message)
                 ),
             })
@@ -982,7 +1021,7 @@ fn account_detail(
 
 /// The text as a sentence: a period goes on the end only when the text
 /// does not already end with punctuation.
-fn sentence(text: &str) -> String {
+pub(crate) fn sentence(text: &str) -> String {
     let text = text.trim_end();
     let stop = text
         .trim_end_matches(['`', '"', '\'', ')', ']'])
@@ -2119,5 +2158,167 @@ mod tests {
         let state = view(&w.cache);
         assert!(state.thread(&w.task.to_string()).is_none());
         assert!(state.task(&w.task.to_string()).is_none());
+    }
+
+    fn notice(w: &World, root: Option<MessageId>, body: &str, at: i64) -> Message {
+        let mut m = message(
+            MessageId::new(),
+            w.sayso,
+            Author::System,
+            MessageKind::Notice,
+            root,
+            at,
+        );
+        m.body = body.to_owned();
+        m
+    }
+
+    /// Finding 3 of review cycle 2: a notice body is JSON, and the timeline
+    /// showed it raw as Markdown under "Consort".
+    #[test]
+    fn a_notice_shows_its_text_and_kind_and_is_not_unread() {
+        let mut w = world();
+        let before = view(&w.cache).sidebar.groups[0].channels[0].unread;
+        let n = notice(
+            &w,
+            None,
+            r#"{"kind":"turn_failed","text":"The turn failed. Try again."}"#,
+            NOW - 10_000,
+        );
+        w.cache.messages.insert(n.id.to_string(), n.clone());
+        let state = view(&w.cache);
+        let timeline = state.timeline(&w.sayso.to_string()).expect("timeline");
+        let found = timeline
+            .items
+            .iter()
+            .find_map(|i| match i {
+                TimelineItem::Notice(n) => Some(n),
+                _ => None,
+            })
+            .expect("a notice item");
+        assert_eq!(found.kind, "turn_failed");
+        assert_eq!(found.text, "The turn failed. Try again.");
+        assert_eq!(found.message_id, n.id.to_string());
+        assert!(
+            !timeline
+                .items
+                .iter()
+                .any(|i| matches!(i, TimelineItem::Message(m) if m.body.contains("turn_failed"))),
+            "no raw JSON in a message"
+        );
+        assert_eq!(
+            state.sidebar.groups[0].channels[0].unread, before,
+            "a notice is not an unread message"
+        );
+    }
+
+    #[test]
+    fn a_notice_that_does_not_parse_shows_its_raw_body() {
+        assert_eq!(
+            notice_parts("The assistant is not available."),
+            (String::new(), "The assistant is not available.".to_owned())
+        );
+        // JSON with no text, or with an empty text, is shown as it is too.
+        assert_eq!(
+            notice_parts(r#"{"kind":"x"}"#),
+            (String::new(), r#"{"kind":"x"}"#.to_owned())
+        );
+        assert_eq!(
+            notice_parts(r#"{"kind":"x","text":"  "}"#),
+            (String::new(), r#"{"kind":"x","text":"  "}"#.to_owned())
+        );
+        // An unknown extra field does not matter.
+        assert_eq!(
+            notice_parts(r#"{"kind":"message_not_sent","text":"Not sent.","future":1}"#),
+            ("message_not_sent".to_owned(), "Not sent.".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_notice_in_a_thread_is_a_notice_post() {
+        let mut w = world();
+        let n = notice(
+            &w,
+            Some(w.card),
+            r#"{"kind":"answer_not_delivered","text":"Your answer did not reach the task."}"#,
+            NOW - 5_000,
+        );
+        w.cache.messages.insert(n.id.to_string(), n);
+        let state = view(&w.cache);
+        let thread = state.thread(&w.task.to_string()).expect("thread");
+        let post = thread.posts.last().expect("a post");
+        assert_eq!(post.speaker, Speaker::System);
+        assert_eq!(
+            post.bodies,
+            vec![PostBody::Notice {
+                kind: "answer_not_delivered".into(),
+                text: "Your answer did not reach the task.".into(),
+            }]
+        );
+    }
+
+    /// Finding 7 of review cycle 2: a channel that never loaded showed as
+    /// empty, and the first live message looked like the newest one.
+    #[test]
+    fn a_timeline_is_loaded_only_after_its_channel_snapshot() {
+        let mut w = world();
+        let id = w.sayso.to_string();
+        assert!(!view(&w.cache).timeline(&id).expect("timeline").loaded);
+        w.cache.channels_loaded.insert(id.clone());
+        assert!(view(&w.cache).timeline(&id).expect("timeline").loaded);
+        assert!(
+            !view(&w.cache)
+                .timeline(&w.everything.to_string())
+                .expect("timeline")
+                .loaded
+        );
+    }
+
+    /// Finding 9 of review cycle 2: the reason of a Failed or Up next task
+    /// was only in the card.
+    #[test]
+    fn a_failed_or_up_next_task_has_its_reason_in_the_thread() {
+        let mut w = world();
+        let reason = "Code signing failed: no identity matches `Developer ID`. Install the certificate, then retry.";
+        let id = w.task.to_string();
+        for (status, expected) in [
+            (PS::Failed, Some(reason)),
+            (PS::UpNext, Some(reason)),
+            (PS::Working, None),
+            (PS::Review, None),
+        ] {
+            if let Some(t) = w.cache.tasks.get_mut(&id) {
+                t.status = status;
+                t.status_reason = Some(reason.to_owned());
+            }
+            let state = view(&w.cache);
+            assert_eq!(
+                state.thread(&id).expect("thread").reason.as_deref(),
+                expected,
+                "{status:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_send_failure_names_its_task_and_says_what_to_do() {
+        let mut w = world();
+        w.cache.send_failures.push(crate::cache::SendFailure {
+            id: "c-9".into(),
+            channel_id: w.sayso.to_string(),
+            thread_root_id: Some(w.card.to_string()),
+            body: "Please retry".into(),
+            message: "That task does not exist".into(),
+        });
+        let state = view(&w.cache);
+        let failure = &state.send_failures[0];
+        assert_eq!(
+            failure.task_id.as_deref(),
+            Some(w.task.to_string().as_str())
+        );
+        assert_eq!(failure.channel_name, "sayso");
+        assert_eq!(failure.body, "Please retry");
+        assert!(failure.message.starts_with("That task does not exist."));
+        assert!(failure.message.contains("Put your text back"));
     }
 }

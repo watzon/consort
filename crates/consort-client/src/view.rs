@@ -23,8 +23,10 @@ pub struct ViewState {
     pub selections: Vec<String>,
     /// Set while the Add worker dialog waits for a pairing code.
     pub worker_pairing: Option<PairingCodeView>,
-    /// Messages that waited in the outbox and that the hub then refused.
-    /// The text is here so the user can copy it. Dismiss one with
+    /// Messages that waited in the outbox and that the hub then refused, or
+    /// that could not go to the hub they were written for. The text is here
+    /// so the user can copy it or put it back in the message box. A failure
+    /// stays until the user dismisses it with
     /// [`crate::Command::DismissSendFailure`].
     pub send_failures: Vec<SendFailureView>,
 }
@@ -35,6 +37,9 @@ pub struct SendFailureView {
     /// The `client_message_id` of the message.
     pub id: String,
     pub channel_id: String,
+    /// The task whose thread the message was a reply in. `None` for a
+    /// message in the timeline.
+    pub task_id: Option<String>,
     pub channel_name: String,
     /// The text that the user wrote.
     pub body: String,
@@ -51,6 +56,22 @@ impl ViewState {
         self.channels
             .iter()
             .find(|c| c.kind == ChannelKind::Everything)
+    }
+
+    /// The unread count of a channel, from the sidebar. 0 for a channel
+    /// that is not there.
+    pub fn unread(&self, channel_id: &str) -> u32 {
+        if self.sidebar.everything.id == channel_id {
+            return self.sidebar.everything.unread;
+        }
+        self.sidebar
+            .groups
+            .iter()
+            .flat_map(|g| g.channels.iter())
+            .chain(self.sidebar.ungrouped.iter())
+            .find(|c| c.id == channel_id)
+            .map(|c| c.unread)
+            .unwrap_or(0)
     }
 
     pub fn timeline(&self, channel_id: &str) -> Option<&TimelineView> {
@@ -248,6 +269,10 @@ pub struct TimelineView {
     pub items: Vec<TimelineItem>,
     /// Older messages exist on the hub.
     pub has_older: bool,
+    /// The newest messages of the channel are in the cache. A channel that
+    /// is not loaded shows no messages, which does not mean it has none.
+    /// Nothing may be marked read while this is false.
+    pub loaded: bool,
 }
 
 // Items live in one Vec per channel, so a large variant costs little, and a
@@ -262,6 +287,9 @@ pub enum TimelineItem {
     Approval(ApprovalCardView),
     /// A decision in the timeline itself, from the channel coordinator.
     Decision(DecisionCardView),
+    /// A system notice, such as "The assistant is not available". It is a
+    /// quiet line, not a message from anyone.
+    Notice(NoticeView),
 }
 
 impl TimelineItem {
@@ -273,8 +301,21 @@ impl TimelineItem {
             TimelineItem::TaskCard(c) => &c.message_id,
             TimelineItem::Approval(r) => &r.message_id,
             TimelineItem::Decision(r) => &r.message_id,
+            TimelineItem::Notice(n) => &n.message_id,
         }
     }
+}
+
+/// A system notice in a timeline. The hub sends the body as JSON with a
+/// kind and a text (DECISIONS row 66). A body that is not that JSON is
+/// shown as it is, with an empty kind.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct NoticeView {
+    pub message_id: String,
+    pub time_label: String,
+    /// The kind, such as `turn_failed`. Empty when the body did not parse.
+    pub kind: String,
+    pub text: String,
 }
 
 /// An approval that the coordinator posted in the timeline.
@@ -542,6 +583,11 @@ pub enum PostBody {
     },
     Approval(ApprovalView),
     Decision(DecisionView),
+    /// A system notice. The kind is empty when the body did not parse.
+    Notice {
+        kind: String,
+        text: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -561,6 +607,9 @@ pub struct TaskThreadView {
     pub status: TaskStatus,
     /// Such as "1 decision, 1 approval".
     pub status_detail: String,
+    /// Why a Failed or Up next task is in that status, in full, such as the
+    /// error text from the worker. `None` for other statuses.
+    pub reason: Option<String>,
     pub placement: Option<PlacementView>,
     pub posts: Vec<ThreadPost>,
 }

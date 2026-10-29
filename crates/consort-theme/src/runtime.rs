@@ -87,10 +87,30 @@ pub struct SavedChoice {
     pub text_size: TextSize,
 }
 
-/// The file that holds the choice: `<config dir>/consort/appearance.json`.
+/// The Consort config folder: `$CONSORT_CONFIG_DIR` when it is set, else
+/// `<config dir>/consort`. The client keeps its files in the same folder
+/// (`Store::default_location` in `consort-client`), so a run with its own
+/// `CONSORT_CONFIG_DIR` never touches the files of the real app.
+pub fn config_dir() -> Option<PathBuf> {
+    config_dir_from(std::env::var_os("CONSORT_CONFIG_DIR"), || {
+        directories::BaseDirs::new().map(|dirs| dirs.config_dir().to_path_buf())
+    })
+}
+
+fn config_dir_from(
+    env: Option<std::ffi::OsString>,
+    base: impl FnOnce() -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    match env {
+        Some(dir) => Some(PathBuf::from(dir)),
+        None => base().map(|dir| dir.join("consort")),
+    }
+}
+
+/// The file that holds the choice: `appearance.json` in the config folder
+/// (see [`config_dir`]).
 pub fn choice_path() -> Option<PathBuf> {
-    directories::BaseDirs::new()
-        .map(|dirs| dirs.config_dir().join("consort").join("appearance.json"))
+    config_dir().map(|dir| dir.join("appearance.json"))
 }
 
 /// Reads the saved choice. A missing or damaged file gives the defaults, so a
@@ -108,11 +128,30 @@ pub fn write_choice(path: &Path, choice: &SavedChoice) -> std::io::Result<()> {
         std::fs::create_dir_all(dir)?;
     }
     let text = serde_json::to_string_pretty(choice).map_err(std::io::Error::other)?;
-    let temp = path.with_extension("json.tmp");
+    // Each write has its own temporary file, so two quick writes never
+    // write into the same file or rename it from under each other.
+    let temp = temp_path(path);
     std::fs::write(&temp, text)?;
     std::fs::rename(&temp, path).inspect_err(|_| {
         let _ = std::fs::remove_file(&temp);
     })
+}
+
+/// A temporary file name next to `path` that no other write uses: the process
+/// ID, a counter and the time.
+fn temp_path(path: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    path.with_file_name(format!("{name}.{}.{n}.{nanos}.tmp", std::process::id()))
 }
 
 /// Reads every `.json` file in `dir`. Files that fail a check are returned
@@ -474,7 +513,67 @@ mod tests {
         };
         write_choice(&path, &choice).expect("writes");
         assert_eq!(read_choice(&path), choice);
-        assert!(!path.with_extension("json.tmp").exists(), "no temp file");
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("reads the folder")
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "no temp file: {leftovers:?}");
+    }
+
+    /// Finding 15c of review cycle 2: every write used `appearance.json.tmp`,
+    /// so two quick writes raced on one file.
+    #[test]
+    fn quick_writes_use_their_own_temporary_files_and_end_with_a_whole_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("appearance.json");
+        let names: std::collections::HashSet<_> = (0..50).map(|_| temp_path(&path)).collect();
+        assert_eq!(names.len(), 50, "no two writes share a temp name");
+        assert!(names.iter().all(|n| n.parent() == path.parent()));
+        let threads: Vec<_> = (0..8)
+            .map(|i| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for j in 0..20 {
+                        let choice = SavedChoice {
+                            theme: Some(format!("Theme {i}-{j}")),
+                            appearance: Appearance::Dark,
+                            text_size: TextSize::Default,
+                        };
+                        write_choice(&path, &choice).expect("writes");
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().expect("a writer thread");
+        }
+        // The file reads as one whole choice, not a mix of two.
+        let saved = read_choice(&path);
+        assert!(saved.theme.is_some_and(|t| t.starts_with("Theme ")));
+        let leftovers = std::fs::read_dir(dir.path())
+            .expect("reads the folder")
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .count();
+        assert_eq!(leftovers, 0);
+    }
+
+    /// Finding 15b of review cycle 2: a test run wrote the real
+    /// `appearance.json`, because the path ignored `CONSORT_CONFIG_DIR`.
+    #[test]
+    fn the_config_folder_follows_consort_config_dir_like_the_client() {
+        let base = || Some(PathBuf::from("/home/me/.config"));
+        assert_eq!(
+            config_dir_from(Some("/tmp/e2e".into()), base),
+            Some(PathBuf::from("/tmp/e2e"))
+        );
+        assert_eq!(
+            config_dir_from(None, base),
+            Some(PathBuf::from("/home/me/.config/consort"))
+        );
+        assert_eq!(config_dir_from(None, || None), None);
     }
 
     #[test]

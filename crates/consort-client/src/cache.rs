@@ -2,7 +2,7 @@
 //! and the feed position. In memory for now; a SQLite cache can replace it
 //! behind the same methods.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use consort_proto::{
     client_api::{EntityKind, EntityPayload, FeedChange, FeedEntry, Snapshot},
@@ -33,6 +33,9 @@ pub struct SendFailure {
     /// The `client_message_id` of the message.
     pub id: String,
     pub channel_id: String,
+    /// The card message of the task thread that the message was a reply in,
+    /// or `None` for a message in the timeline.
+    pub thread_root_id: Option<String>,
     pub body: String,
     /// What the hub said, with a next step.
     pub message: String,
@@ -92,7 +95,15 @@ pub struct Cache {
     pub channels_loaded: BTreeSet<String>,
     /// The card message IDs of the task threads whose replies are loaded.
     pub loaded_threads: BTreeSet<String>,
+    /// The `seq` of the newest feed entry that changed or deleted an entity,
+    /// by kind and ID. A snapshot that was read before that `seq` must not
+    /// overwrite the entity. See [`Cache::merge_entities`].
+    pub touched: HashMap<(EntityKind, String), u64>,
 }
+
+/// A feed entry older than this many `seq` steps is forgotten by `touched`.
+/// A snapshot read that long ago is not in flight any more.
+const TOUCHED_WINDOW: u64 = 20_000;
 
 fn marker_key(marker: &ReadMarker) -> String {
     match marker.thread_root_id {
@@ -120,6 +131,22 @@ impl Cache {
     /// Marks the first load as done.
     pub fn finish_load(&mut self) {
         self.loaded = true;
+    }
+
+    /// Moves every message that waits for the hub to the failed sends, with
+    /// `reason` as the text that says what happened. The user keeps the text
+    /// and can send it again. Used when the messages cannot go to the hub
+    /// they were written for, such as after pairing with another hub.
+    pub fn fail_pending(&mut self, reason: &str) {
+        for p in std::mem::take(&mut self.pending) {
+            self.send_failures.push(SendFailure {
+                id: p.client_message_id,
+                channel_id: p.channel_id,
+                thread_root_id: p.thread_root_id,
+                body: p.body,
+                message: reason.to_owned(),
+            });
+        }
     }
 
     /// Moves the feed position past an entry that the hub or the client could
@@ -209,13 +236,74 @@ impl Cache {
         removed
     }
 
-    /// Adds the entities of a channel snapshot or a page of messages, and
-    /// keeps the feed position. Feed entries after the `all` snapshot replay
-    /// over them in order, so a change that arrives meanwhile is not lost.
-    pub fn merge_entities(&mut self, snapshot: Snapshot) {
+    /// Adds the entities of a channel snapshot, and keeps the feed position.
+    /// Feed entries after the `all` snapshot replay over them in order, so a
+    /// change that arrives meanwhile is not lost.
+    ///
+    /// The snapshot may be older than the cache: the hub read it at its
+    /// `seq`, and feed entries above that `seq` may have arrived before the
+    /// answer did. Those entries are newer than the snapshot, so an entity
+    /// that one of them changed or deleted keeps the cache's version. The
+    /// rest of the snapshot is merged.
+    pub fn merge_entities(&mut self, mut snapshot: Snapshot) {
         let seq = self.seq;
+        if snapshot.seq < seq {
+            self.drop_newer_than(&mut snapshot);
+        }
         self.merge_snapshot(snapshot);
         self.seq = seq;
+    }
+
+    /// True when a feed entry above `seq` changed or deleted the entity.
+    fn changed_after(&self, kind: EntityKind, id: &str, seq: u64) -> bool {
+        self.touched
+            .get(&(kind, id.to_owned()))
+            .is_some_and(|at| *at > seq)
+    }
+
+    /// Takes out of `snapshot` the entities that the feed changed after the
+    /// snapshot was read.
+    fn drop_newer_than(&self, snapshot: &mut Snapshot) {
+        let at = snapshot.seq;
+        snapshot
+            .groups
+            .retain(|g| !self.changed_after(EntityKind::Group, &g.id.to_string(), at));
+        snapshot
+            .channels
+            .retain(|c| !self.changed_after(EntityKind::Channel, &c.id.to_string(), at));
+        snapshot
+            .repos
+            .retain(|r| !self.changed_after(EntityKind::Repo, &r.id.to_string(), at));
+        snapshot
+            .workers
+            .retain(|w| !self.changed_after(EntityKind::Worker, &w.id.to_string(), at));
+        snapshot
+            .read_markers
+            .retain(|m| !self.changed_after(EntityKind::ReadMarker, &marker_key(m), at));
+        snapshot
+            .messages
+            .retain(|m| !self.changed_after(EntityKind::Message, &m.id.to_string(), at));
+        snapshot
+            .tasks
+            .retain(|t| !self.changed_after(EntityKind::Task, &t.id.to_string(), at));
+        snapshot
+            .approvals
+            .retain(|a| !self.changed_after(EntityKind::Approval, &a.id.to_string(), at));
+        snapshot
+            .decisions
+            .retain(|d| !self.changed_after(EntityKind::Decision, &d.id.to_string(), at));
+    }
+
+    /// Remembers that the feed entry at `seq` changed the entity.
+    fn touch(&mut self, kind: EntityKind, id: String, seq: u64) {
+        if seq == 0 {
+            return;
+        }
+        self.touched.insert((kind, id), seq);
+        if self.touched.len() > 2 * TOUCHED_WINDOW as usize {
+            let floor = self.seq.saturating_sub(TOUCHED_WINDOW);
+            self.touched.retain(|_, at| *at > floor);
+        }
     }
 
     /// Adds a page of messages, as from `message.list`.
@@ -284,6 +372,11 @@ impl Cache {
             return false;
         }
         self.seq = self.seq.max(entry.seq);
+        // A session item is not in any snapshot, and it changes often.
+        let kind = entry.change.kind();
+        if kind != EntityKind::SessionItem {
+            self.touch(kind, entry.entity_id.clone(), entry.seq);
+        }
         match entry.change {
             FeedChange::Upsert(payload) => match payload {
                 EntityPayload::Group(g) => {
@@ -353,5 +446,159 @@ impl Cache {
             }
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use consort_proto::{
+        ids::{ChannelId, GroupId, MessageId},
+        model::{Author, MessageKind},
+        time::Timestamp,
+    };
+
+    use super::*;
+
+    fn group(id: GroupId, name: &str) -> Group {
+        Group {
+            id,
+            name: name.into(),
+            position: 0,
+            collapsed: false,
+        }
+    }
+
+    fn text(id: MessageId, channel: ChannelId, body: &str) -> Message {
+        Message {
+            id,
+            channel_id: channel,
+            thread_root_id: None,
+            author: Author::Assistant,
+            author_session_id: None,
+            author_task_id: None,
+            author_routine_id: None,
+            kind: MessageKind::Text,
+            body: body.into(),
+            attachments: vec![],
+            in_timeline: true,
+            client_message_id: None,
+            reply_count: 0,
+            last_reply_at: None,
+            reactions: vec![],
+            edited_at: None,
+            deleted_at: None,
+            created_at: Timestamp::from_millis(1),
+        }
+    }
+
+    fn upsert(seq: u64, payload: EntityPayload) -> FeedEntry {
+        FeedEntry::upsert(seq, Timestamp::from_millis(0), payload)
+    }
+
+    fn snapshot_at(seq: u64) -> Snapshot {
+        Snapshot {
+            seq,
+            ..Snapshot::default()
+        }
+    }
+
+    /// Finding 5 of review cycle 2: a snapshot read at seq N was merged after
+    /// feed entries above N, and it restored old data.
+    #[test]
+    fn an_older_snapshot_does_not_overwrite_what_the_feed_changed_after_it() {
+        let mut cache = Cache::default();
+        let id = GroupId::new();
+        cache.apply(upsert(10, EntityPayload::Group(group(id, "Old name"))));
+        // The hub reads a snapshot at seq 10. A rename follows at seq 12.
+        let mut snapshot = snapshot_at(10);
+        snapshot.groups.push(group(id, "Old name"));
+        cache.apply(upsert(12, EntityPayload::Group(group(id, "New name"))));
+        cache.merge_entities(snapshot);
+        assert_eq!(cache.groups[&id.to_string()].name, "New name");
+        assert_eq!(cache.seq, 12, "the feed position stays");
+    }
+
+    #[test]
+    fn an_older_snapshot_does_not_bring_back_a_deleted_message() {
+        let mut cache = Cache::default();
+        let channel = ChannelId::new();
+        let keep = MessageId::new();
+        let gone = MessageId::new();
+        let mut snapshot = snapshot_at(20);
+        snapshot.messages = vec![text(keep, channel, "keep"), text(gone, channel, "gone")];
+        // The delete of one message arrives before the snapshot answer.
+        cache.apply(FeedEntry {
+            seq: 22,
+            at: Timestamp::from_millis(0),
+            channel_id: Some(channel),
+            entity_id: gone.to_string(),
+            change: FeedChange::Delete(EntityKind::Message),
+        });
+        cache.merge_entities(snapshot);
+        assert!(cache.messages.contains_key(&keep.to_string()));
+        assert!(
+            !cache.messages.contains_key(&gone.to_string()),
+            "a deleted message stays deleted"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_still_fills_what_the_feed_did_not_touch() {
+        let mut cache = Cache::default();
+        let (touched, other) = (GroupId::new(), GroupId::new());
+        cache.apply(upsert(30, EntityPayload::Group(group(touched, "Live"))));
+        let mut snapshot = snapshot_at(25);
+        snapshot.groups = vec![group(touched, "Stale"), group(other, "From snapshot")];
+        cache.merge_entities(snapshot);
+        assert_eq!(cache.groups[&touched.to_string()].name, "Live");
+        assert_eq!(cache.groups[&other.to_string()].name, "From snapshot");
+    }
+
+    #[test]
+    fn a_snapshot_that_is_newer_than_the_change_wins() {
+        let mut cache = Cache::default();
+        let id = GroupId::new();
+        cache.apply(upsert(10, EntityPayload::Group(group(id, "Before"))));
+        let mut snapshot = snapshot_at(15);
+        snapshot.groups = vec![group(id, "After")];
+        cache.merge_entities(snapshot);
+        assert_eq!(cache.groups[&id.to_string()].name, "After");
+    }
+
+    #[test]
+    fn a_pending_message_moves_to_the_failed_sends_with_its_text() {
+        let mut cache = Cache::default();
+        cache.pending.push(PendingSend {
+            client_message_id: "c-1".into(),
+            channel_id: "chan".into(),
+            thread_root_id: Some("card".into()),
+            body: "Unsent words".into(),
+            created_at: 1,
+        });
+        cache.fail_pending("The message did not go out.");
+        assert!(cache.pending.is_empty());
+        assert_eq!(cache.send_failures.len(), 1);
+        let failure = &cache.send_failures[0];
+        assert_eq!(failure.id, "c-1");
+        assert_eq!(failure.body, "Unsent words");
+        assert_eq!(failure.thread_root_id.as_deref(), Some("card"));
+        assert_eq!(failure.message, "The message did not go out.");
+    }
+
+    #[test]
+    fn the_record_of_touched_entities_stays_small() {
+        let mut cache = Cache::default();
+        let total = 3 * TOUCHED_WINDOW;
+        for seq in 1..=total {
+            cache.apply(upsert(
+                seq,
+                EntityPayload::Group(group(GroupId::new(), "g")),
+            ));
+        }
+        assert!(
+            cache.touched.len() <= 2 * TOUCHED_WINDOW as usize + 1,
+            "{} entries",
+            cache.touched.len()
+        );
     }
 }

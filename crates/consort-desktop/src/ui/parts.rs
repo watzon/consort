@@ -1,8 +1,6 @@
 //! Small parts that every surface uses: icons, status glyphs, buttons and
 //! text styles. Sizes and colors come from the theme tokens only.
 
-use std::time::Duration;
-
 use consort_client::TaskStatus;
 use consort_theme::{Tokens, Type, TypeExt as _};
 use gpui_kit::{
@@ -44,7 +42,7 @@ pub fn status_color(status: TaskStatus, t: &Tokens) -> Hsla {
 }
 
 /// The glyph of a task status. The Working glyph is two layers: a still
-/// ring and an arc that turns once every 1.2 seconds, unless the system asks
+/// ring and an arc that turns once every `motion.spin`, unless the system asks
 /// for less motion.
 pub fn status_glyph(
     id: impl Into<ElementId>,
@@ -69,11 +67,9 @@ pub fn status_glyph(
             let arc: AnyElement = if cx.reduce_motion() {
                 arc.into_any_element()
             } else {
-                arc.with_animation(
-                    id,
-                    Animation::new(Duration::from_millis(1200)).repeat(),
-                    |arc, delta| arc.with_transformation(Transformation::rotate(percentage(delta))),
-                )
+                arc.with_animation(id, Animation::new(t.motion.spin).repeat(), |arc, delta| {
+                    arc.with_transformation(Transformation::rotate(percentage(delta)))
+                })
                 .into_any_element()
             };
             return div()

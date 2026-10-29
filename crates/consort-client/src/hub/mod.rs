@@ -36,6 +36,7 @@ pub use link::backoff;
 pub(crate) use link::{run_link, run_loader};
 pub(crate) use outbox::run_outbox;
 pub use url::normalize_hub_url;
+use url::{plain_http_name, resolve_private};
 
 use crate::{
     ClientError,
@@ -60,6 +61,13 @@ pub struct Timeouts {
     /// How long the link may be silent. The client pings at a third of this,
     /// so a working link is never silent for long.
     pub idle: Duration,
+    /// How long the outbox waits before it sends a message again after an
+    /// answer that does not say what happened.
+    pub retry: Duration,
+    /// How often the view state refreshes the labels that follow the clock,
+    /// such as "Now" and "Today". The client also refreshes them at each
+    /// full minute.
+    pub clock: Duration,
 }
 
 impl Default for Timeouts {
@@ -69,6 +77,8 @@ impl Default for Timeouts {
             handshake: Duration::from_secs(20),
             call: Duration::from_secs(30),
             idle: Duration::from_secs(60),
+            retry: Duration::from_secs(2),
+            clock: Duration::from_secs(60),
         }
     }
 }
@@ -140,6 +150,9 @@ pub(crate) struct Shared {
     publish: watch::Sender<Arc<ViewState>>,
     /// Reconnect now.
     wake: Notify,
+    /// The live link must end, so the next link loads the data again. The
+    /// link reads this flag at its next tick.
+    restart: std::sync::atomic::AtomicBool,
     /// The view state may have changed.
     publish_wake: Notify,
     /// The outbox may have a message to send, or the link came up.
@@ -163,7 +176,17 @@ impl Shared {
         // new files.
         let (identity, refused) = match &store {
             Some(store) => match store.load() {
-                Ok(identity) => (identity, None),
+                // The saved hub URL gets the same checks as a typed one. A
+                // file from an older version, or an edited file, may hold
+                // `http` to a public host, a path or a password.
+                Ok(Some(mut identity)) => match url::checked_saved_url(&identity.config.hub_url) {
+                    Ok(hub_url) => {
+                        identity.config.hub_url = hub_url;
+                        (Some(identity), None)
+                    }
+                    Err(reason) => (None, Some(reason)),
+                },
+                Ok(None) => (None, None),
                 Err(ClientError::Storage { path, message }) => (
                     None,
                     Some(format!(
@@ -197,6 +220,7 @@ impl Shared {
             link: Mutex::new(None),
             publish,
             wake: Notify::new(),
+            restart: std::sync::atomic::AtomicBool::new(false),
             publish_wake: Notify::new(),
             outbox_wake: Notify::new(),
             loader_wake: Notify::new(),
@@ -272,6 +296,13 @@ impl Shared {
         }
     }
 
+    /// Ends the live link, so the client connects again and loads the data
+    /// again. Use it when the cache is known to miss a change.
+    pub(crate) fn restart_link(&self) {
+        self.restart
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
     fn identity(&self) -> Option<Identity> {
         self.identity.lock().ok().and_then(|i| i.clone())
     }
@@ -341,11 +372,25 @@ fn is_transport(err: &ClientError) -> bool {
     matches!(err, ClientError::NotConnected | ClientError::TimedOut)
 }
 
-/// Sends the view state at most every [`PUBLISH_INTERVAL`].
+/// How long until the next full minute, plus a margin so the clock has
+/// passed the minute when the labels are made. At most `clock`.
+fn until_next_minute(now_ms: i64, clock: Duration) -> Duration {
+    let into_minute = now_ms.rem_euclid(60_000) as u64;
+    Duration::from_millis(60_000 - into_minute + 50).min(clock)
+}
+
+/// Sends the view state at most every [`PUBLISH_INTERVAL`]. It also makes a
+/// new state at each full minute (at most `Timeouts::clock` apart), because
+/// labels such as "Now", "2 min" and "Today" follow the clock. Without this,
+/// they stay as they were until something else changes.
 pub(crate) async fn run_publisher(shared: Arc<Shared>) {
     let mut last: Option<tokio::time::Instant> = None;
     loop {
-        shared.publish_wake.notified().await;
+        let tick = until_next_minute(format::now_ms(), shared.options.timeouts.clock);
+        tokio::select! {
+            _ = shared.publish_wake.notified() => {}
+            _ = tokio::time::sleep(tick) => {}
+        }
         if let Some(last) = last {
             let wait = PUBLISH_INTERVAL.saturating_sub(last.elapsed());
             if !wait.is_zero() {
@@ -374,8 +419,19 @@ pub async fn pair(
         name: options.name.clone(),
         kind: options.kind,
     };
-    let http = reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
+        // A redirect could send the pairing code to another address. The
+        // hub answers the pairing itself.
+        .redirect(reqwest::redirect::Policy::none());
+    // Plain `http` to a name (`hub.local`, `localhost`) passes the URL rule by
+    // its spelling. Look the name up, refuse it when it points to a public
+    // address, and connect to the addresses that were checked.
+    if let Some((host, port)) = plain_http_name(&hub_url) {
+        let addrs = resolve_private(&host, port, &hub_url).await?;
+        builder = builder.resolve_to_addrs(&host, &addrs);
+    }
+    let http = builder
         .build()
         .map_err(|e| ClientError::Other(e.to_string()))?;
     let response = http
@@ -387,6 +443,11 @@ pub async fn pair(
             url: hub_url.clone(),
         })?;
     let status = response.status();
+    if status.is_redirection() {
+        return Err(ClientError::Other(format!(
+            "The hub at {hub_url} answered with a redirect. Consort does not follow it, because the pairing code would go to another address. Enter the final address of the hub, then try again"
+        )));
+    }
     let text = response
         .text()
         .await
@@ -421,4 +482,28 @@ pub async fn pair(
         },
         key,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_clock_tick_lands_just_after_a_full_minute() {
+        let clock = Duration::from_secs(60);
+        // 15 s into a minute: wait 45 s and a margin.
+        assert_eq!(
+            until_next_minute(1_800_000_015_000, clock),
+            Duration::from_millis(45_050)
+        );
+        // Exactly on a minute: wait the whole minute, never more.
+        assert_eq!(until_next_minute(1_800_000_000_000, clock), clock);
+        // A test can ask for a shorter tick.
+        assert_eq!(
+            until_next_minute(1_800_000_015_000, Duration::from_millis(100)),
+            Duration::from_millis(100)
+        );
+        // A time before 1970 does not panic.
+        assert!(until_next_minute(-1, clock) <= clock);
+    }
 }

@@ -4,7 +4,10 @@
 //! message leaves the outbox when the hub stores it, or when the hub refuses
 //! it. A link that drops leaves it in place, because the hub may have stored
 //! it already: the next try carries the same `client_message_id`, and the hub
-//! keeps only the first copy. The outbox is also saved on disk (see
+//! keeps only the first copy. An answer that does not say what happened (an
+//! internal error, or a code this version does not know) is not a refusal
+//! either: the hub may have stored the message, so it is sent again with the
+//! same ID, a few times. The outbox is also saved on disk (see
 //! [`crate::store::Store::save_outbox`]).
 
 use std::sync::Arc;
@@ -16,7 +19,19 @@ use super::{Shared, invalid, is_transport};
 use crate::{
     ClientError,
     cache::{PendingSend, SendFailure},
+    reduce::sentence,
 };
+
+/// How many times the outbox sends a message again after an answer that does
+/// not say what happened. After that, the message counts as refused.
+const UNSURE_TRIES: u32 = 4;
+
+/// True for an answer after which the hub may have stored the message: an
+/// unexpected error on the hub, or a code that this version does not know.
+/// Every other code is a decision of the hub, so the refusal is final.
+fn hub_may_have_stored(err: &ClientError) -> bool {
+    matches!(err, ClientError::Hub { code, .. } if code == "internal" || code == "unknown")
+}
 
 /// What happened to a message that a caller queued.
 pub(super) enum SendOutcome {
@@ -84,11 +99,20 @@ impl Shared {
                 .pending
                 .retain(|p| p.client_message_id != pending.client_message_id);
             if report {
+                let mut message = err.to_string();
+                if hub_may_have_stored(err) {
+                    // The hub gave up without a clear answer.
+                    message = format!(
+                        "{} The hub may have stored the message. Look in the channel before you send it again.",
+                        sentence(&message)
+                    );
+                }
                 cache.send_failures.push(SendFailure {
                     id: pending.client_message_id.clone(),
                     channel_id: pending.channel_id.clone(),
+                    thread_root_id: pending.thread_root_id.clone(),
                     body: pending.body.clone(),
-                    message: err.to_string(),
+                    message,
                 });
             }
         }
@@ -104,6 +128,9 @@ pub(super) async fn queue_send(
     shared: &Arc<Shared>,
     pending: PendingSend,
 ) -> Result<(), ClientError> {
+    // A body over the hub's limit never enters the outbox: it would fail
+    // again at every try. The caller keeps its draft.
+    crate::limits::check_message_body(&pending.body)?;
     match shared.enqueue(pending).await {
         Ok(SendOutcome::Failed(err)) => Err(err),
         Ok(SendOutcome::Sent | SendOutcome::Deferred) | Err(_) => Ok(()),
@@ -113,6 +140,9 @@ pub(super) async fn queue_send(
 /// Sends the messages in the outbox, oldest first, for as long as the client
 /// lives.
 pub(crate) async fn run_outbox(shared: Arc<Shared>) {
+    // The message that the last unclear answer was for, and how many unclear
+    // answers it got.
+    let mut unsure: Option<(String, u32)> = None;
     loop {
         let Some(next) = shared.next_to_send() else {
             if !shared.is_online() {
@@ -123,6 +153,7 @@ pub(crate) async fn run_outbox(shared: Arc<Shared>) {
         };
         match send_pending(&shared, &next).await {
             Ok(()) => {
+                unsure = None;
                 if let Some(tx) = shared.take_waiter(&next.client_message_id) {
                     let _ = tx.send(SendOutcome::Sent);
                 }
@@ -134,6 +165,15 @@ pub(crate) async fn run_outbox(shared: Arc<Shared>) {
                 shared.outbox_wake.notified().await;
             }
             Err(err) => {
+                if hub_may_have_stored(&err) && unsure_try(&mut unsure, &next) {
+                    // The caller does not wait for this: the message shows
+                    // as sending, and a final refusal shows as a failed
+                    // send.
+                    shared.defer_waiters();
+                    tokio::time::sleep(shared.options.timeouts.retry).await;
+                    continue;
+                }
+                unsure = None;
                 let waiter = shared.take_waiter(&next.client_message_id);
                 shared.drop_refused(&next, &err, waiter.is_none());
                 if let Some(tx) = waiter {
@@ -144,7 +184,21 @@ pub(crate) async fn run_outbox(shared: Arc<Shared>) {
     }
 }
 
+/// Counts one unclear answer for `message`. True while the message may still
+/// be sent again.
+fn unsure_try(unsure: &mut Option<(String, u32)>, message: &PendingSend) -> bool {
+    let tries = match unsure {
+        Some((id, tries)) if *id == message.client_message_id => *tries + 1,
+        _ => 1,
+    };
+    *unsure = Some((message.client_message_id.clone(), tries));
+    tries < UNSURE_TRIES
+}
+
 async fn send_pending(shared: &Arc<Shared>, p: &PendingSend) -> Result<(), ClientError> {
+    // An outbox file from an older version may hold a body that is too
+    // large. The hub would refuse it, so it fails here with a clear text.
+    crate::limits::check_message_body(&p.body)?;
     let body = MessageSend {
         channel_id: p.channel_id.parse().map_err(|_| {
             invalid("Consort cannot use this channel. Reload the app, then try again")

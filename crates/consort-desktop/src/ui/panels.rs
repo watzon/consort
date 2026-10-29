@@ -417,6 +417,42 @@ impl ConsortApp {
                 .on_click(cx.listener(|this, _, _, cx| this.close_panel(cx))),
             );
 
+        // Why the task failed or waits, in full. The text is selectable so the
+        // user can copy it, and it scrolls when it is long.
+        let reason = thread
+            .as_ref()
+            .and_then(|th| th.reason.clone())
+            .map(|reason| {
+                let body = div()
+                    .id("thread-reason")
+                    .max_h(t.layout.error_text_max_height)
+                    .overflow_y_scroll()
+                    .child(selectable(
+                        SharedString::from(format!("thread-reason-{task_id}")),
+                        reason,
+                        t.text.ui,
+                        c.text_primary,
+                    ));
+                div()
+                    .flex_none()
+                    .py(t.space.md)
+                    .px(t.space.lg)
+                    .border_b(t.border_width)
+                    .border_color(c.border_subtle)
+                    .child(if status == TaskStatus::Failed {
+                        div()
+                            .flex()
+                            .gap(t.space.sm)
+                            .p(t.space.md)
+                            .rounded(t.radius.md)
+                            .bg(c.tint_failed)
+                            .child(icon("circle-alert", t.icon.size, c.status_failed))
+                            .child(body.flex_1().min_w_0())
+                    } else {
+                        div().child(body)
+                    })
+            });
+
         let placement = thread
             .as_ref()
             .and_then(|th| th.placement.clone())
@@ -662,6 +698,7 @@ impl ConsortApp {
 
         frame(t)
             .child(head)
+            .children(reason)
             .children(placement)
             .child(
                 div()
@@ -693,16 +730,23 @@ impl ConsortApp {
     ) -> AnyElement {
         let c = &t.colors;
         let you = post.speaker == Speaker::You;
+        // A system notice has no speaker: it is not a message from anyone.
+        let notice_only = post
+            .bodies
+            .iter()
+            .all(|b| matches!(b, PostBody::Notice { .. }));
         let mut col = div().flex().flex_col().gap(t.space.sm).child(
             div()
                 .flex()
                 .items_baseline()
                 .gap(t.space.sm)
-                .child(text(
-                    post.speaker.label(),
-                    t.text.label,
-                    if you { c.accent_text } else { c.text_secondary },
-                ))
+                .when(!notice_only, |d| {
+                    d.child(text(
+                        post.speaker.label(),
+                        t.text.label,
+                        if you { c.accent_text } else { c.text_secondary },
+                    ))
+                })
                 .child(text(
                     time_text(&post.time_label, post.pending).to_owned(),
                     t.text.caption,
@@ -809,6 +853,14 @@ impl ConsortApp {
                 }
                 PostBody::Approval(approval) => self.render_approval_card(approval, &key, t, cx),
                 PostBody::Decision(decision) => self.render_decision(decision, &key, true, t, cx),
+                // A system notice: quiet, selectable, no speaker of its own.
+                PostBody::Notice { text: notice, .. } => selectable(
+                    SharedString::from(format!("{key}-notice")),
+                    notice.clone(),
+                    t.text.ui,
+                    c.text_tertiary,
+                )
+                .into_any_element(),
             };
             col = col.child(element);
         }

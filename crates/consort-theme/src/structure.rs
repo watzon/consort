@@ -102,6 +102,8 @@ pub struct Motion {
     pub fast_ms: u64,
     pub normal_ms: u64,
     pub slow_ms: u64,
+    /// One turn of the spinner on a working task.
+    pub spin_ms: u64,
     pub ease_enter: [f32; 4],
     pub ease_exit: [f32; 4],
 }
@@ -129,6 +131,21 @@ pub struct Layout {
     pub wide_timeline: f32,
     /// How far, in px, a virtual list lays out rows beyond its edges.
     pub list_overdraw: f32,
+    /// The usual dialog: rename, labels and the confirmations.
+    pub dialog_width: f32,
+    /// The wide dialogs: New channel and Instructions.
+    pub dialog_wide: f32,
+    /// The Add worker dialog.
+    pub dialog_worker: f32,
+    /// The channel switcher.
+    pub switcher_width: f32,
+    /// The space above the switcher.
+    pub switcher_top: f32,
+    /// The longest a channel name grows in a switcher row.
+    pub switcher_name_max: f32,
+    /// The tallest a block of error text grows: a toast, or the reason in a
+    /// task thread. Its text scrolls past this.
+    pub error_text_max_height: f32,
 }
 
 /// Opacities of dimmed parts, as shares of full color.
@@ -180,6 +197,12 @@ pub struct Components {
     pub worker_row_pad_y: f32,
     /// The inset of the switch thumb.
     pub switch_inset: f32,
+    /// The least height of the notes box in the Instructions dialog.
+    pub notes_min_height: f32,
+    /// The mark in the Consort logo on onboarding and the start-up error.
+    pub brand_mark: f32,
+    /// The gap between the mark and the word in the logo.
+    pub brand_gap: f32,
     pub theme_preview: ThemePreview,
 }
 
@@ -245,6 +268,29 @@ mod tests {
         let [min_w, min_h] = s.layout.min_window;
         let [default_w, default_h] = s.layout.default_window;
         assert!(default_w >= min_w && default_h >= min_h);
+    }
+
+    /// Review cycle 2, finding 14: view code had ratios such as
+    /// `panel_width * 1.4`. Each one is a token now, with the value it had.
+    #[test]
+    fn the_sizes_that_were_ratios_in_view_code_are_tokens() {
+        let s = super::structure();
+        let p = s.layout.panel_width;
+        assert_eq!(s.layout.dialog_width, p + s.space.xxl * 4.0);
+        assert!((s.layout.dialog_wide - p * 1.4).abs() < 0.01);
+        assert_eq!(s.layout.dialog_wide, p + s.space.xxl * 5.0);
+        assert_eq!(s.layout.dialog_worker, s.layout.dialog_width + s.space.sm);
+        assert_eq!(s.layout.switcher_width, s.layout.dialog_wide);
+        assert_eq!(s.layout.switcher_top, s.space.page * 2.0);
+        assert!((s.layout.switcher_name_max - p * 0.6).abs() < 0.01);
+        assert_eq!(s.component.notes_min_height, s.space.page * 4.0);
+        assert_eq!(s.motion.spin_ms, 1200);
+        // The logo mark is about 1.2 times and its gap about a third of the
+        // heading size, in whole pixels.
+        assert_eq!(s.component.brand_mark, 26.0);
+        assert_eq!(s.component.brand_gap, 8.0);
+        assert!((s.component.brand_mark / s.type_scale.heading.size - 1.2).abs() < 0.05);
+        assert!(s.layout.error_text_max_height > s.type_scale.ui.line * 3.0);
     }
 
     #[test]

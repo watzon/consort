@@ -21,9 +21,9 @@ use gpui_kit::{
 
 use crate::{
     countdown::{self, RetryCountdown},
-    drafts::{self, InFlight},
+    drafts::{self, InFlight, Kept},
     notice::{INFO_TIMEOUT, NoticeKind, Notices},
-    read_marker::{self, ReadMarker},
+    read_marker::{self, MARK_RETRY, MarkInputs, UNLOADED_GRACE, Unloaded},
     ui::{
         links::LinkAction,
         markdown::TextCache,
@@ -33,6 +33,9 @@ use crate::{
 
 /// The key that guards the open dialog against a second submit.
 const DIALOG_KEY: &str = "dialog";
+
+/// The key that lets one mark-as-read run at a time.
+const MARK_KEY: &str = "mark-read";
 
 /// How often the offline countdown redraws.
 const COUNTDOWN_TICK: Duration = Duration::from_secs(1);
@@ -169,8 +172,13 @@ pub struct ConsortApp {
     /// Counts the dialogs that opened, so a command that ends late can tell
     /// whether its dialog is still the open one.
     dialog_serial: u64,
-    /// The newest message that the app marked as read, by channel.
-    read_marker: ReadMarker,
+    /// How long the open channel has been unloaded while the link is up.
+    unloaded: Unloaded,
+    /// The timeline sits at its live edge (scrolled to the bottom). The
+    /// scroll handler keeps this; a channel change sets it again.
+    timeline_at_end: bool,
+    /// A retry of a failed mark-as-read waits on its timer.
+    mark_retry_waiting: bool,
     /// The window has the focus.
     window_active: bool,
     /// The retry countdown, while the link is offline.
@@ -333,7 +341,9 @@ impl ConsortApp {
             in_flight: InFlight::default(),
             dialog_error: None,
             dialog_serial: 0,
-            read_marker: ReadMarker::default(),
+            unloaded: Unloaded::default(),
+            timeline_at_end: true,
+            mark_retry_waiting: false,
             window_active: window.is_window_active(),
             offline: None,
             offline_ticker: false,
@@ -348,13 +358,20 @@ impl ConsortApp {
         this.update_placeholder(window, cx);
         this.follow_connection(cx);
         this.mark_read(cx);
-        // Reaching the top of the timeline loads older messages.
+        // Reaching the top of the timeline loads older messages. Reaching the
+        // bottom marks the channel read.
         let weak = cx.weak_entity();
         this.timeline.set_scroll_handler(move |event, _, cx| {
-            if event.is_scrolled && event.visible_range.start == 0 {
+            if event.is_scrolled {
                 let weak = weak.clone();
+                let at_top = event.visible_range.start == 0;
                 cx.defer(move |cx| {
-                    let _ = weak.update(cx, |this, cx| this.load_older(cx));
+                    let _ = weak.update(cx, |this, cx| {
+                        if at_top {
+                            this.load_older(cx);
+                        }
+                        this.timeline_scrolled(cx);
+                    });
                 });
             }
         });
@@ -458,13 +475,16 @@ impl ConsortApp {
         }
         self.sync_lists();
         self.report_send_failures(cx);
+        self.track_unloaded(cx);
         self.mark_read(cx);
         cx.notify();
     }
 
     /// Shows the messages that waited in the outbox and that the hub then
-    /// refused. The notice holds the text, so the user can copy it. The
-    /// client forgets the failure once the notice shows.
+    /// refused. Each one is an error notice with the text, and the notice has
+    /// a button that puts the text back in the message box. The client keeps
+    /// the failure until the user dismisses the notice, so a failure that
+    /// the user has not seen is never lost. Errors queue behind each other.
     fn report_send_failures(&mut self, cx: &mut Context<Self>) {
         let fresh: Vec<_> = self
             .state
@@ -473,24 +493,83 @@ impl ConsortApp {
             .filter(|f| self.announced_failures.insert(f.id.clone()))
             .cloned()
             .collect();
-        if fresh.is_empty() {
-            return;
-        }
-        let text = fresh
-            .iter()
-            .map(|f| format!("{}\n{}", f.message, f.body))
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        self.show_error(text, cx);
-        let client = self.client.clone();
-        cx.spawn(async move |_, _| {
-            for failure in fresh {
-                let _ = client
-                    .run(consort_client::Command::DismissSendFailure { id: failure.id })
-                    .await;
+        for failure in fresh {
+            let head = if failure.channel_name.is_empty() {
+                failure.message.clone()
+            } else {
+                format!(
+                    "A message to {} did not go out. {}",
+                    failure.channel_name, failure.message
+                )
+            };
+            if self
+                .notices
+                .show_failure(failure.id, head, failure.body)
+                .is_some()
+            {
+                cx.notify();
             }
-        })
-        .detach();
+        }
+    }
+
+    /// Dismisses the notice on screen. The next error, if one waits, shows.
+    /// A failed send leaves the client with its notice.
+    pub fn dismiss_notice(&mut self, cx: &mut Context<Self>) {
+        if let Some(notice) = self.notices.dismiss()
+            && let Some(id) = notice.failure
+        {
+            let client = self.client.clone();
+            cx.spawn(async move |_, _| {
+                let _ = client
+                    .run(consort_client::Command::DismissSendFailure { id })
+                    .await;
+            })
+            .detach();
+        }
+        cx.notify();
+    }
+
+    /// Puts the text of a failed send back in the message box it came from,
+    /// after what the user has typed since, and dismisses the notice. The
+    /// message box is the reply box of the task thread for a reply, else the
+    /// composer of the channel.
+    pub fn restore_failed_text(
+        &mut self,
+        failure_id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(failure) = self
+            .state
+            .send_failures
+            .iter()
+            .find(|f| f.id == failure_id)
+            .cloned()
+        else {
+            return;
+        };
+        let thread = failure
+            .task_id
+            .clone()
+            .filter(|task| self.state.task(task).is_some());
+        let input = if let Some(task) = thread {
+            if self.state.channel(&failure.channel_id).is_some() {
+                self.open_channel(failure.channel_id.clone(), window, cx);
+            }
+            self.open_thread(task, cx);
+            self.inputs.reply.clone()
+        } else {
+            if self.state.channel(&failure.channel_id).is_some() {
+                self.open_channel(failure.channel_id.clone(), window, cx);
+            }
+            self.inputs.composer.clone()
+        };
+        input.update(cx, |input, cx| {
+            let draft = input.value().to_string();
+            input.set_value(drafts::append_text(&draft, &failure.body), window, cx);
+            input.focus(window, cx);
+        });
+        self.dismiss_notice(cx);
     }
 
     /// Acts on the state of the link: a refused client goes to onboarding
@@ -526,42 +605,96 @@ impl ConsortApp {
         }
     }
 
-    /// Marks the open channel as read when its newest message is one the app
-    /// has not marked yet, the window has the focus and the link is up. A new
-    /// message in the open channel clears its unread count; a state change
-    /// that brings no new message sends nothing.
+    /// Marks the open channel as read when it has unread messages and the
+    /// user can have seen them: the channel is loaded, the window has the
+    /// focus, the timeline sits at its live edge and the link is up. The
+    /// unread count drives this, so a mark that failed is tried again, after
+    /// a short wait, for as long as the messages stay unread.
     pub fn mark_read(&mut self, cx: &mut Context<Self>) {
-        if self.page != Page::Main
-            || !self.window_active
-            || !matches!(self.state.connection, Connection::Online | Connection::Demo)
-        {
-            return;
-        }
-        let newest = self
-            .state
-            .timeline(&self.channel_id)
-            .and_then(read_marker::newest_message)
-            .map(str::to_owned);
-        if !self
-            .read_marker
-            .should_mark(&self.channel_id, newest.as_deref())
-        {
+        let timeline = self.state.timeline(&self.channel_id);
+        let inputs = MarkInputs {
+            on_main_page: self.page == Page::Main,
+            window_active: self.window_active,
+            online: matches!(self.state.connection, Connection::Online | Connection::Demo),
+            loaded: timeline.is_some_and(|t| t.loaded),
+            at_live_edge: self.timeline_at_end,
+            unread: self.state.unread(&self.channel_id),
+            running: self.in_flight.is_running(MARK_KEY),
+        };
+        if !read_marker::should_mark(&inputs) || !self.in_flight.begin(MARK_KEY) {
             return;
         }
         let client = self.client.clone();
         let channel_id = self.channel_id.clone();
         cx.spawn(async move |this, cx| {
             let marked = client
-                .run(consort_client::Command::MarkRead {
-                    channel_id: channel_id.clone(),
-                })
+                .run(consort_client::Command::MarkRead { channel_id })
                 .await;
-            if marked.is_err() {
-                // Try again at the next state change.
-                let _ = this.update(cx, |this, _| this.read_marker.forget(&channel_id));
-            }
+            let _ = this.update(cx, |this, cx| {
+                this.in_flight.finish(MARK_KEY);
+                if marked.is_err() {
+                    this.retry_mark_read_later(cx);
+                } else {
+                    // A message may have come in while the mark ran.
+                    this.mark_read(cx);
+                }
+            });
         })
         .detach();
+    }
+
+    /// Tries to mark the open channel read again after a short wait. One
+    /// timer runs at a time.
+    fn retry_mark_read_later(&mut self, cx: &mut Context<Self>) {
+        if self.mark_retry_waiting {
+            return;
+        }
+        self.mark_retry_waiting = true;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(MARK_RETRY).await;
+            let _ = this.update(cx, |this, cx| {
+                this.mark_retry_waiting = false;
+                this.mark_read(cx);
+            });
+        })
+        .detach();
+    }
+
+    /// The timeline scrolled. Remembers whether it sits at the live edge,
+    /// and marks the channel read when the user reaches the bottom.
+    fn timeline_scrolled(&mut self, cx: &mut Context<Self>) {
+        // A list that cannot scroll, or whose size is not known yet, has
+        // nothing below the view.
+        self.timeline_at_end = self.timeline.is_scrolled_to_end().unwrap_or(true);
+        if self.timeline_at_end {
+            self.mark_read(cx);
+        }
+    }
+
+    /// Notes whether the open channel is loaded. A channel that is not loaded
+    /// for a moment is normal. After a short wait the timeline tells the
+    /// user that it could not load, and a timer redraws it then.
+    fn track_unloaded(&mut self, cx: &mut Context<Self>) {
+        let unloaded = self.state.connection == Connection::Online
+            && self
+                .state
+                .timeline(&self.channel_id)
+                .is_some_and(|t| !t.loaded);
+        if self
+            .unloaded
+            .update(&self.channel_id, unloaded, Instant::now())
+        {
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(UNLOADED_GRACE).await;
+                let _ = this.update(cx, |_, cx| cx.notify());
+            })
+            .detach();
+        }
+    }
+
+    /// True when the timeline must say that the open channel did not load.
+    pub fn channel_unloaded(&self) -> bool {
+        self.unloaded.visible(Instant::now())
     }
 
     /// Keeps the virtual lists in step with the state: appended rows are
@@ -573,12 +706,17 @@ impl ConsortApp {
             .timeline(&self.channel_id)
             .map(|t| t.items.iter().map(|i| i.key().to_owned()).collect())
             .unwrap_or_default();
+        let channel_changed = self.timeline_channel != self.channel_id;
         sync_list(
             &self.timeline,
             &mut self.timeline_keys,
             keys,
-            self.timeline_channel != self.channel_id,
+            channel_changed,
         );
+        if channel_changed {
+            // A list that was reset starts at the live edge.
+            self.timeline_at_end = true;
+        }
         self.timeline_channel = self.channel_id.clone();
         let thread_keys: Vec<String> = match &self.panel {
             Panel::Thread(task_id) => self
@@ -641,6 +779,29 @@ impl ConsortApp {
                 }
             }
             // A task with no repo: the thread says it runs in a new folder.
+            // A failed task: the reason shows in the thread header, in full.
+            "failed" => {
+                let task = self
+                    .state
+                    .tasks
+                    .iter()
+                    .find(|t| t.status == consort_client::TaskStatus::Failed)
+                    .map(|t| (t.channel_id.clone(), t.id.clone()));
+                if let Some((channel, task)) = task {
+                    self.open_channel(channel, window, cx);
+                    self.open_thread(task, cx);
+                }
+            }
+            // A long error and a second one that waits behind it.
+            "error" => {
+                let body = "Please look at the failing build and tell me why it fails. ".repeat(24);
+                let _ = self.notices.show_failure(
+                    "demo".into(),
+                    "A message to sayso did not go out. That channel does not exist. Put your text back in the message box, then send it again.".into(),
+                    body,
+                );
+                self.show_error("The hub did not answer in time.".into(), cx);
+            }
             "new-folder" => {
                 let channel = self
                     .state
@@ -776,7 +937,10 @@ impl ConsortApp {
                         MenuItem::new("Delete", MenuAction::DeleteChannel(id)).danger(),
                     ];
                     let t = Self::tokens(cx);
-                    let at = gpui_kit::point(t.layout.sidebar_width / 2.0, t.space.page * 3.5);
+                    let at = gpui_kit::point(
+                        t.layout.sidebar_width / 2.0,
+                        t.space.page * 3.0 + t.space.xl,
+                    );
                     self.open_menu(OpenMenu::at(at, items), cx);
                 }
             }
@@ -792,6 +956,7 @@ impl ConsortApp {
         self.page = Page::Main;
         self.sync_lists();
         self.update_placeholder(window, cx);
+        self.track_unloaded(cx);
         self.mark_read(cx);
         cx.notify();
     }
@@ -1086,7 +1251,7 @@ impl ConsortApp {
         &mut self,
         key: String,
         command: F,
-        kept: &'static str,
+        kept: Kept,
         on_ok: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -1102,9 +1267,7 @@ impl ConsortApp {
                 this.in_flight.finish(&key);
                 match result {
                     Ok(()) => on_ok(this, window, cx),
-                    Err(err) => {
-                        this.show_error(drafts::failure_message(&err.to_string(), kept), cx)
-                    }
+                    Err(err) => this.show_error(kept.failure(&err), cx),
                 }
                 cx.notify();
             });
@@ -1139,7 +1302,7 @@ impl ConsortApp {
         self.run_guarded(
             "composer".into(),
             async move { client.send_message(channel_id, body).await },
-            "Your message is still in the box.",
+            Kept::Draft("Your message is still in the box."),
             move |_, window, cx| Self::clear_draft_if_sent(&input, &sent, window, cx),
             window,
             cx,
@@ -1160,7 +1323,7 @@ impl ConsortApp {
         self.run_guarded(
             "reply".into(),
             async move { client.reply_to_task(task_id, body).await },
-            "Your reply is still in the box.",
+            Kept::Draft("Your reply is still in the box."),
             move |_, window, cx| Self::clear_draft_if_sent(&input, &sent, window, cx),
             window,
             cx,
@@ -1185,7 +1348,7 @@ impl ConsortApp {
         self.run_guarded(
             format!("edit:{message_id}"),
             async move { client.edit_message(edited, body).await },
-            "Your edit is still in the box.",
+            Kept::Draft("Your edit is still in the box."),
             move |this, window, cx| {
                 if this.editing.as_deref() == Some(message_id.as_str()) {
                     this.cancel_edit(window, cx);
@@ -1215,7 +1378,7 @@ impl ConsortApp {
         self.run_guarded(
             format!("approval:{id}"),
             async move { client.answer_approval(approval_id, choice).await },
-            "The request still waits for your answer.",
+            Kept::Request("The request still waits for your answer."),
             |_, _, _| {},
             window,
             cx,
@@ -1239,7 +1402,7 @@ impl ConsortApp {
         self.run_guarded(
             format!("decision:{id}"),
             async move { client.answer_decision(decision_id, option, text).await },
-            "The decision still waits for your answer.",
+            Kept::Request("The decision still waits for your answer."),
             move |this, window, cx| {
                 if this.decision_writing.as_deref() == Some(id.as_str()) {
                     this.decision_writing = None;

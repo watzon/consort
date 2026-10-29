@@ -115,8 +115,8 @@ impl ConsortApp {
                     .items_center()
                     // The wordmark: the mark is 1.2 times the font size high,
                     // with a gap of 0.35 times the font size.
-                    .gap(t.text.heading.size * 0.35)
-                    .child(glyph("mark", t.text.heading.size * 1.2, mark_color))
+                    .gap(t.component.brand_gap)
+                    .child(glyph("mark", t.component.brand_mark, mark_color))
                     .child(
                         div()
                             .text_size(t.text.heading.size)

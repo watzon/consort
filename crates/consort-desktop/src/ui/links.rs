@@ -121,58 +121,197 @@ pub fn same_address(label: &str, target: &str) -> bool {
 }
 
 /// Decides what to do with a link that the reader clicked in `markdown`.
-/// The text view gives the app only the address, so this finds the words of
-/// the link in the Markdown the view shows.
+/// The text view gives the app only the address, not the link that was
+/// clicked, so this reads every place where the address is a link in the
+/// Markdown. The link opens at once only when each of them shows the address
+/// as its own words:
+///
+/// - an inline link `[label](address)` whose label is the address,
+/// - an autolink `<address>`,
+/// - a bare address in the text.
+///
+/// A mention of the address that is not one of these never counts as the
+/// link showing it. A raw HTML link, a reference link, a link with other
+/// words, and an address in a title or in code make the app ask first. The
+/// same goes for an address that the scan does not find at all.
 pub fn click_action(markdown: &str, target: &str) -> LinkAction {
     let wanted = clean(target);
-    let labels = inline_link_labels(markdown, &wanted);
-    if let Some(label) = labels.iter().find(|l| !same_address(l, &wanted)) {
-        return link_action(Some(label), target);
+    if shows_only_its_own_address(markdown, &wanted) {
+        link_action(Some(&wanted), target)
+    } else {
+        link_action(None, target)
     }
-    if !labels.is_empty() || shows_its_own_address(markdown, &wanted) {
-        return link_action(Some(&wanted), target);
-    }
-    // A reference link, or a form that this scan does not know. Ask first.
-    link_action(None, target)
 }
 
-/// The labels of the inline links `[label](address)` in `markdown` that go
-/// to `target`.
-fn inline_link_labels(markdown: &str, target: &str) -> Vec<String> {
-    let bytes = markdown.as_bytes();
-    let mut labels = Vec::new();
+/// Replaces the bytes `from..to` with spaces. Every range starts and ends at
+/// an ASCII byte, so the text stays valid UTF-8.
+fn blank(bytes: &mut [u8], from: usize, to: usize) {
+    let to = to.min(bytes.len());
+    for b in &mut bytes[from..to] {
+        *b = b' ';
+    }
+}
+
+/// The address of an inline link or an autolink, as a browser reads it.
+fn same_link(address: &str, target: &str) -> bool {
+    let address = clean(address);
+    address == target || Some(address.as_str()) == target.strip_prefix("mailto:")
+}
+
+/// True when `target` is a link in `markdown` only in forms that show the
+/// address as the words of the link, and at least one such link exists.
+fn shows_only_its_own_address(markdown: &str, target: &str) -> bool {
+    if target.is_empty() {
+        return false;
+    }
+    let mut text = markdown.as_bytes().to_vec();
+    let mut shown = 0usize;
+    let mut risky = false;
+
+    // Reference definitions (`[r]: address "title"`). A reference link takes
+    // its address from one, and its words are somewhere else. The address
+    // may sit on the next line.
+    let mut offset = 0;
+    let mut definition_open = false;
+    for line in markdown.split_inclusive('\n') {
+        let body = line.trim_end_matches(['\n', '\r']);
+        let trimmed = body.trim_start();
+        let starts = trimmed.starts_with('[') && trimmed.contains("]:");
+        let after_colon = trimmed.split_once("]:").map(|(_, rest)| rest);
+        let continues = definition_open && !body.trim().is_empty();
+        if starts || continues {
+            let rest = if starts {
+                after_colon.unwrap_or("")
+            } else {
+                body
+            };
+            if rest.contains(target) {
+                risky = true;
+            }
+            definition_open = starts && rest.trim().is_empty();
+            blank(&mut text, offset, offset + body.len());
+        } else if !body.trim().is_empty() {
+            definition_open = false;
+        }
+        offset += line.len();
+    }
+
+    // Angle brackets: an autolink `<address>`, or raw HTML. Any mention of
+    // the address in a tag (an `href`, a `title`, anything) is risky, because
+    // the words of an HTML link are not in the tag.
+    let mut at = 0;
+    while let Some(found) = markdown.as_bytes()[at..].iter().position(|b| *b == b'<') {
+        let open = at + found;
+        at = open + 1;
+        if text.get(open) != Some(&b'<') {
+            continue; // Blanked already.
+        }
+        let rest = &markdown[open + 1..];
+        let next = rest.chars().next();
+        let inner_end = rest.find('>');
+        if let (Some(end), Some(first)) = (inner_end, next) {
+            let inner = &rest[..end];
+            let is_autolink = !inner.is_empty()
+                && !inner.contains(|c: char| c.is_whitespace() || c == '<')
+                && (scheme_of(inner).is_some() || (inner.contains('@') && first != '@'));
+            if is_autolink {
+                if same_link(inner, target) {
+                    shown += 1;
+                }
+                blank(&mut text, open, open + 1 + end + 1);
+                at = open + 1 + end + 1;
+                continue;
+            }
+        }
+        if matches!(next, Some(c) if c.is_ascii_alphabetic() || matches!(c, '/' | '!' | '?')) {
+            let end = if rest.starts_with("!--") {
+                rest.find("-->").map(|i| open + 1 + i + 3)
+            } else {
+                inner_end.map(|i| open + 1 + i + 1)
+            }
+            .unwrap_or(markdown.len());
+            if markdown[open..end].contains(target) {
+                risky = true;
+            }
+            blank(&mut text, open, end);
+            at = end;
+        }
+    }
+
+    // Inline links `[label](address "title")`. The whole link is read, so
+    // the label and the title are not counted as mentions of their own.
     let mut at = 0;
     while let Some(found) = markdown[at..].find("](") {
         let close = at + found;
         at = close + 2;
-        let Some((address, _)) = link_address(&markdown[at..]) else {
+        if text.get(close) != Some(&b']') {
+            continue; // Inside raw HTML or a definition.
+        }
+        let Some((address, used)) = link_address(&markdown[at..]) else {
             continue;
         };
-        if clean(&address) != target {
+        let Some(end) = markdown[at + used..].find(')').map(|i| at + used + i + 1) else {
             continue;
-        }
-        // Walk back to the `[` that matches the `]`.
-        let mut depth = 0usize;
-        let mut open = None;
-        for i in (0..close).rev() {
-            if i > 0 && bytes[i - 1] == b'\\' {
-                continue;
-            }
-            match bytes[i] {
-                b']' => depth += 1,
-                b'[' if depth == 0 => {
-                    open = Some(i);
-                    break;
-                }
-                b'[' => depth -= 1,
-                _ => {}
+        };
+        let Some(open) = label_start(markdown.as_bytes(), close) else {
+            continue;
+        };
+        if same_link(&address, target) {
+            if same_address(&markdown[open + 1..close], target) {
+                shown += 1;
+            } else {
+                risky = true;
             }
         }
-        if let Some(open) = open {
-            labels.push(markdown[open + 1..close].to_owned());
+        blank(&mut text, open, end);
+    }
+
+    // What is left is plain text. A bare address with a boundary on both
+    // sides is a link that shows itself. An address after a character that
+    // can open a destination, an attribute, a label or code is a place that
+    // this scan does not understand, so it asks.
+    let rest = String::from_utf8_lossy(&text).into_owned();
+    let without_scheme = target.strip_prefix("mailto:").unwrap_or(target);
+    let mut wanted = vec![target];
+    if without_scheme != target {
+        wanted.push(without_scheme);
+    }
+    for wanted in wanted {
+        for (at, _) in rest.match_indices(wanted) {
+            let before = rest[..at].chars().next_back();
+            let after = rest[at + wanted.len()..].chars().next();
+            let bare_before =
+                before.is_none_or(|c| c.is_whitespace() || matches!(c, '*' | '_' | '~'));
+            let bare_after = after.is_none_or(|c| {
+                c.is_whitespace()
+                    || matches!(c, '*' | '_' | '~' | '.' | ',' | ';' | ':' | '!' | '?' | ')')
+            });
+            if bare_before && bare_after {
+                shown += 1;
+            } else if before.is_some_and(|c| matches!(c, '(' | '[' | '"' | '\'' | '=' | '<' | '`'))
+            {
+                risky = true;
+            }
         }
     }
-    labels
+    !risky && shown > 0
+}
+
+/// The byte index of the `[` that opens the label that ends at `close`.
+fn label_start(bytes: &[u8], close: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for i in (0..close).rev() {
+        if i > 0 && bytes[i - 1] == b'\\' {
+            continue;
+        }
+        match bytes[i] {
+            b']' => depth += 1,
+            b'[' if depth == 0 => return Some(i),
+            b'[' => depth -= 1,
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Reads the address of an inline link after `](`: plain, or in `<...>`,
@@ -202,37 +341,6 @@ fn link_address(after: &str) -> Option<(String, usize)> {
         }
     }
     (end > 0).then(|| (trimmed[..end].to_owned(), skipped + end))
-}
-
-/// True when `target` stands in `markdown` as its own text: a bare address
-/// or an autolink such as `<https://example.com>`. A reference definition
-/// (`[x]: https://example.com`) does not count, because the words of such a
-/// link are somewhere else.
-fn shows_its_own_address(markdown: &str, target: &str) -> bool {
-    let without_scheme = target.strip_prefix("mailto:").unwrap_or(target);
-    let in_definition = |line: &str| {
-        let line = line.trim_start();
-        line.starts_with('[') && line.contains("]:")
-    };
-    markdown
-        .lines()
-        .filter(|line| !in_definition(line))
-        .any(|line| {
-            [target, without_scheme].iter().any(|wanted| {
-                line.match_indices(wanted).any(|(at, _)| {
-                    let before = line[..at].chars().next_back();
-                    let after = line[at + wanted.len()..].chars().next();
-                    before.is_none_or(|c| c.is_whitespace() || matches!(c, '<' | '*' | '_' | '~'))
-                        && after.is_none_or(|c| {
-                            c.is_whitespace()
-                                || matches!(
-                                    c,
-                                    '>' | '*' | '_' | '~' | '.' | ',' | ';' | ':' | '!' | '?' | ')'
-                                )
-                        })
-                })
-            })
-        })
 }
 
 /// A `file:` URL for a path, with every byte that is not safe percent
@@ -484,6 +592,129 @@ mod tests {
             click_action(md, "https://example.com/x"),
             confirm("https://example.com/x")
         );
+    }
+
+    // The cases of the review probe (review cycle 2, finding 2). Each one
+    // showed a label that is not the address, or no label at all, and gave
+    // Open with no question, because the address stood somewhere else in the
+    // text as its own words.
+    const EVIL: &str = "https://evil.example/login";
+
+    #[test]
+    fn a_raw_html_link_with_a_padded_address_asks_first() {
+        let md =
+            r#"Docs: <a href=" https://evil.example/login ">https://github.com/anthropics</a>"#;
+        assert_eq!(
+            click_action(md, " https://evil.example/login "),
+            confirm(EVIL)
+        );
+        assert_eq!(click_action(md, EVIL), confirm(EVIL));
+    }
+
+    #[test]
+    fn a_raw_html_link_asks_first_even_without_padding() {
+        let md = r#"<a href="https://evil.example/login">https://github.com/anthropics</a>"#;
+        assert_eq!(click_action(md, EVIL), confirm(EVIL));
+        // Even when the words of the HTML link are the address.
+        let same = r#"<a href="https://evil.example/login">https://evil.example/login</a>"#;
+        assert_eq!(click_action(same, EVIL), confirm(EVIL));
+    }
+
+    #[test]
+    fn a_title_attribute_with_the_address_does_not_make_it_show_itself() {
+        let md =
+            r#"<a href="https://evil.example/login" title=" https://evil.example/login ">Docs</a>"#;
+        assert_eq!(click_action(md, EVIL), confirm(EVIL));
+    }
+
+    #[test]
+    fn a_reference_link_whose_label_is_another_address_asks_first() {
+        let md = "[https://github.com/anthropics][r]\n\n[r]: https://evil.example/login";
+        assert_eq!(click_action(md, EVIL), confirm(EVIL));
+    }
+
+    #[test]
+    fn a_decoy_line_does_not_make_a_reference_link_show_itself() {
+        let md = "[https://github.com/anthropics][r]\n\nIf it fails, copy https://evil.example/login\n\n[r]: https://evil.example/login";
+        assert_eq!(click_action(md, EVIL), confirm(EVIL));
+        // The definition may put its address on the next line.
+        let wrapped =
+            "[Docs][r]\n\nCopy https://evil.example/login\n\n[r]:\n    https://evil.example/login";
+        assert_eq!(click_action(wrapped, EVIL), confirm(EVIL));
+    }
+
+    #[test]
+    fn an_inline_link_with_another_address_as_its_words_asks_first() {
+        let md = "[https://github.com/anthropics](https://evil.example/login)";
+        assert_eq!(click_action(md, EVIL), confirm(EVIL));
+        // A bare mention of the address in the same message does not help.
+        let decoy = format!("{md}\n\nCopy https://evil.example/login");
+        assert_eq!(click_action(&decoy, EVIL), confirm(EVIL));
+    }
+
+    #[test]
+    fn a_mention_in_code_or_in_a_title_does_not_count() {
+        let md = "[Docs](https://evil.example/login \"https://evil.example/login\")";
+        assert_eq!(click_action(md, EVIL), confirm(EVIL));
+        let code =
+            "Run `https://evil.example/login` and read [the docs](https://evil.example/login).";
+        assert_eq!(click_action(code, EVIL), confirm(EVIL));
+        // An address that the scan does not find asks too.
+        assert_eq!(click_action("No link here.", EVIL), confirm(EVIL));
+        assert_eq!(click_action("", EVIL), confirm(EVIL));
+    }
+
+    #[test]
+    fn links_that_show_their_own_address_still_open_at_once() {
+        // Inline, autolink and bare, alone or together.
+        let inline = "[https://evil.example/login](https://evil.example/login)";
+        assert_eq!(click_action(inline, EVIL), open(EVIL));
+        assert_eq!(
+            click_action("<https://evil.example/login>", EVIL),
+            open(EVIL)
+        );
+        assert_eq!(
+            click_action("Go to https://evil.example/login now", EVIL),
+            open(EVIL)
+        );
+        let all = "[https://evil.example/login](https://evil.example/login \"A title\")\n\n<https://evil.example/login>\n\nOr **https://evil.example/login**.";
+        assert_eq!(click_action(all, EVIL), open(EVIL));
+        // A shortened label for the same address.
+        assert_eq!(
+            click_action("[evil.example/login](https://evil.example/login)", EVIL),
+            open(EVIL)
+        );
+    }
+
+    #[test]
+    fn one_link_that_hides_its_address_makes_every_link_to_it_ask() {
+        let md = "https://evil.example/login and [click here](https://evil.example/login)";
+        assert_eq!(click_action(md, EVIL), confirm(EVIL));
+        let html = "<https://evil.example/login> and <a href=\"https://evil.example/login\">go</a>";
+        assert_eq!(click_action(html, EVIL), confirm(EVIL));
+    }
+
+    #[test]
+    fn another_address_in_the_message_does_not_matter() {
+        let md = "[the docs](https://good.example/docs) and https://evil.example/login";
+        assert_eq!(click_action(md, EVIL), open(EVIL));
+        assert_eq!(
+            click_action(md, "https://good.example/docs"),
+            confirm("https://good.example/docs")
+        );
+        // A longer address that starts with this one is another address.
+        let longer = "https://evil.example/login/reset and [x](https://evil.example/login)";
+        assert_eq!(click_action(longer, EVIL), confirm(EVIL));
+        let only_longer = "See https://evil.example/login/reset";
+        assert_eq!(click_action(only_longer, EVIL), confirm(EVIL));
+    }
+
+    #[test]
+    fn non_ascii_text_around_a_link_does_not_break_the_scan() {
+        let md = "Voil\u{e0} \u{2192} <a href=\"https://evil.example/login\">caf\u{e9}</a> \u{1F600} done";
+        assert_eq!(click_action(md, EVIL), confirm(EVIL));
+        let ok = "Voil\u{e0} https://evil.example/login \u{1F600}";
+        assert_eq!(click_action(ok, EVIL), open(EVIL));
     }
 
     #[test]

@@ -83,10 +83,45 @@ fn select_box(
 
 impl ConsortApp {
     /// The toast at the bottom. Its text is selectable. An error has a mark
-    /// and stays until the user dismisses it. An info notice times out.
+    /// and stays until the user dismisses it. An info notice times out. The
+    /// text scrolls when it is long, so the close button never leaves the
+    /// window. A message that the hub refused has a button that puts its text
+    /// back in the message box. More errors wait behind this one.
     pub fn render_notice(&self, notice: Notice, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
         let c = &t.colors;
         let is_error = notice.kind == NoticeKind::Error;
+        let waiting = self.notices.waiting();
+        let failure = notice.failure.clone();
+        let serial = notice.serial;
+        let text_block = div()
+            .id(SharedString::from(format!("notice-scroll-{serial}")))
+            .flex()
+            .flex_col()
+            .gap(t.space.sm)
+            .flex_1()
+            .min_w_0()
+            .max_h(t.layout.error_text_max_height)
+            .overflow_y_scroll()
+            .child(selectable(
+                SharedString::from(format!("notice-text-{serial}")),
+                notice.message,
+                t.text.ui,
+                c.text_primary,
+            ))
+            .when_some(notice.detail, |d, body| {
+                d.child(
+                    div()
+                        .p(t.space.sm)
+                        .rounded(t.radius.md)
+                        .bg(c.surface_card)
+                        .child(selectable(
+                            SharedString::from(format!("notice-detail-{serial}")),
+                            body,
+                            t.text.ui,
+                            c.text_secondary,
+                        )),
+                )
+            });
         div()
             .absolute()
             .bottom(t.space.xl)
@@ -94,12 +129,14 @@ impl ConsortApp {
             .right_0()
             .flex()
             .justify_center()
+            .px(t.space.xl)
             .child(
                 div()
                     .id("notice")
                     .flex()
-                    .items_center()
+                    .flex_col()
                     .gap(t.space.sm)
+                    .w_full()
                     .max_w(t.layout.timeline_max_width)
                     .py(t.space.sm)
                     .pl(t.space.md)
@@ -113,33 +150,68 @@ impl ConsortApp {
                     })
                     .rounded(t.radius.lg)
                     .shadow(t.shadow_float())
-                    .when(is_error, |d| {
-                        d.child(icon("circle-alert", t.icon.size, c.status_failed))
-                    })
                     .child(
-                        selectable(
-                            SharedString::from(format!("notice-text-{}", notice.serial)),
-                            notice.message,
-                            t.text.ui,
-                            c.text_primary,
-                        )
-                        .min_w_0(),
+                        div()
+                            .flex()
+                            .items_start()
+                            .gap(t.space.sm)
+                            .when(is_error, |d| {
+                                d.child(div().flex_none().pt(t.space.xxs).child(icon(
+                                    "circle-alert",
+                                    t.icon.size,
+                                    c.status_failed,
+                                )))
+                            })
+                            .child(text_block)
+                            .child(
+                                icon_button(
+                                    "notice-close",
+                                    "x",
+                                    t.space.xl,
+                                    t.icon.dense,
+                                    c.text_secondary,
+                                    c.hover_raised,
+                                    t,
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| this.dismiss_notice(cx))),
+                            ),
                     )
-                    .child(
-                        icon_button(
-                            "notice-close",
-                            "x",
-                            t.space.xl,
-                            t.icon.dense,
-                            c.text_secondary,
-                            c.hover_raised,
-                            t,
+                    .when(failure.is_some() || waiting > 0, |d| {
+                        d.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(t.space.md)
+                                .pr(t.space.sm)
+                                .when_some(failure, |d, id| {
+                                    d.child(
+                                        button(
+                                            "notice-restore",
+                                            "Put text back in the box",
+                                            ButtonKind::Secondary,
+                                            t,
+                                        )
+                                        .on_click(
+                                            cx.listener(move |this, _, window, cx| {
+                                                this.restore_failed_text(&id, window, cx)
+                                            }),
+                                        ),
+                                    )
+                                })
+                                .child(div().flex_1())
+                                .when(waiting > 0, |d| {
+                                    d.child(text(
+                                        if waiting == 1 {
+                                            "1 more error waits".to_owned()
+                                        } else {
+                                            format!("{waiting} more errors wait")
+                                        },
+                                        detail(t),
+                                        c.text_tertiary,
+                                    ))
+                                }),
                         )
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.notices.dismiss();
-                            cx.notify();
-                        })),
-                    ),
+                    }),
             )
             .into_any_element()
     }
@@ -166,7 +238,7 @@ impl ConsortApp {
                 (
                     "Rename channel".to_owned(),
                     "The name shows in the sidebar and in Everything.".to_owned(),
-                    t.layout.panel_width + t.space.xxl * 4.0,
+                    t.layout.dialog_width,
                     field_block("Name", input_box(&self.inputs.name, focused, t), None, t),
                     self.dialog_actions("Rename", t, cx, move |this, window, cx| {
                         let name = this.field(Field::Name, cx);
@@ -205,9 +277,9 @@ impl ConsortApp {
                 (
                     format!("Instructions for {name}"),
                     "Standing guidance that Consort reads before every turn in this channel. Write it in Markdown.".to_owned(),
-                    t.layout.panel_width * 1.4,
+                    t.layout.dialog_wide,
                     div()
-                        .min_h(t.space.page * 4.0)
+                        .min_h(t.component.notes_min_height)
                         .py(t.space.sm)
                         .px(t.space.md)
                         .bg(c.surface_card)
@@ -245,7 +317,7 @@ impl ConsortApp {
                 (
                     "Rename worker".to_owned(),
                     "The name shows in the sidebar, on task cards and in Settings.".to_owned(),
-                    t.layout.panel_width + t.space.xxl * 4.0,
+                    t.layout.dialog_width,
                     field_block("Name", input_box(&self.inputs.name, focused, t), None, t),
                     self.dialog_actions("Rename", t, cx, move |this, window, cx| {
                         let name = this.field(Field::Name, cx);
@@ -275,7 +347,7 @@ impl ConsortApp {
                 (
                     "Edit labels".to_owned(),
                     "Tasks can ask for a worker with a label, such as gpu.".to_owned(),
-                    t.layout.panel_width + t.space.xxl * 4.0,
+                    t.layout.dialog_width,
                     field_block(
                         "Labels",
                         input_box(&self.inputs.name, focused, t),
@@ -309,7 +381,7 @@ impl ConsortApp {
                 (
                     format!("Delete {name}?"),
                     "Consort deletes its messages, tasks, memory and files. You cannot undo this. To keep them, archive the channel instead.".to_owned(),
-                    t.layout.panel_width + t.space.xxl * 4.0,
+                    t.layout.dialog_width,
                     div(),
                     self.dialog_actions_kind("Delete channel", ButtonKind::Danger, t, cx, move |this, window, cx| {
                         let client = this.client.clone();
@@ -332,7 +404,7 @@ impl ConsortApp {
                 (
                     format!("Remove {name}?"),
                     "The hub stops trusting this worker. Its tasks fail, and it must pair again to come back.".to_owned(),
-                    t.layout.panel_width + t.space.xxl * 4.0,
+                    t.layout.dialog_width,
                     div(),
                     self.dialog_actions_kind("Remove worker", ButtonKind::Danger, t, cx, move |this, window, cx| {
                         let client = this.client.clone();
@@ -354,7 +426,7 @@ impl ConsortApp {
                     "Open this link?".to_owned(),
                     "The words of this link do not match where it goes. It goes to this address."
                         .to_owned(),
-                    t.layout.panel_width + t.space.xxl * 4.0,
+                    t.layout.dialog_width,
                     div()
                         .p(t.space.md)
                         .bg(c.surface_card)
@@ -751,7 +823,7 @@ impl ConsortApp {
             "New channel".to_owned(),
             "A channel keeps one subject together: its memory, tasks, routines, files and repos."
                 .to_owned(),
-            t.layout.panel_width + t.space.xxl * 5.0,
+            t.layout.dialog_wide,
             body,
             actions,
         )
@@ -1026,7 +1098,7 @@ impl ConsortApp {
         (
             "Add a worker".to_owned(),
             "A worker runs tasks on its own machine. It connects out to the hub, so the machine needs no open ports.".to_owned(),
-            t.layout.panel_width + t.space.xxl * 4.0 + t.space.sm,
+            t.layout.dialog_worker,
             body,
             actions,
         )
