@@ -77,11 +77,82 @@ pub fn open_connection(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
+/// Creates a folder and its parents. On Unix the folder gets mode 0700, also
+/// when it exists already, so only the user can read what the hub keeps in
+/// it. Parents that exist keep their mode.
+pub(crate) fn create_private_dir(path: &Path) -> Result<()> {
+    let context = |err: std::io::Error| {
+        HubError::Startup(format!(
+            "could not make the folder {} private: {err}. Check that you own it.",
+            path.display()
+        ))
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)
+            .map_err(context)?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(context)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(path).map_err(context)
+    }
+}
+
+/// Gives the database file mode 0600 on Unix before SQLite opens it, or
+/// creates it with that mode. SQLite gives new `-wal` and `-shm` files the
+/// mode of the database file. Old ones get the mode here too.
+fn make_database_private(db_path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let context = |path: &Path, err: std::io::Error| {
+            HubError::Startup(format!(
+                "could not make {} private: {err}. Check that you own it.",
+                path.display()
+            ))
+        };
+        if db_path.exists() {
+            std::fs::set_permissions(db_path, std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| context(db_path, e))?;
+        } else {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .open(db_path)
+                .map_err(|e| context(db_path, e))?;
+        }
+        for suffix in ["-wal", "-shm"] {
+            let mut name = db_path.as_os_str().to_owned();
+            name.push(suffix);
+            let path = PathBuf::from(name);
+            if path.exists() {
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                    .map_err(|e| context(&path, e))?;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = db_path;
+    Ok(())
+}
+
 /// Opens the database, applies migrations and returns the connection. The
 /// `create_setup_code` function uses this to work while a hub runs.
+///
+/// On Unix the data folder gets mode 0700 and `hub.db` mode 0600, also when
+/// they exist already.
 pub fn open_and_migrate(data_dir: &Path) -> Result<Connection> {
-    std::fs::create_dir_all(data_dir)?;
-    let mut conn = open_connection(&data_dir.join("hub.db"))?;
+    create_private_dir(data_dir)?;
+    let db_path = data_dir.join("hub.db");
+    make_database_private(&db_path)?;
+    let mut conn = open_connection(&db_path)?;
     migrations::migrate(&mut conn)?;
     Ok(conn)
 }
@@ -90,7 +161,7 @@ impl Store {
     pub fn open(data_dir: &Path) -> Result<Self> {
         let conn = open_and_migrate(data_dir)?;
         let blobs_dir = data_dir.join("blobs");
-        std::fs::create_dir_all(&blobs_dir)?;
+        create_private_dir(&blobs_dir)?;
         let (jobs, receiver) = mpsc::channel::<Job>();
         thread::Builder::new()
             .name("hub-db-writer".to_owned())
@@ -196,6 +267,18 @@ impl Inner {
             pool.push(conn);
         }
     }
+}
+
+/// Runs `f` in a write transaction on a connection that this process opened
+/// itself, for a command on the hub machine that runs beside a hub. The
+/// feed entries land in the database, so clients get them when they catch
+/// up. A running hub does not send them live. It reads the change in its
+/// maintenance loop and sends the entity again.
+pub(crate) fn write_direct<T>(
+    conn: &mut Connection,
+    f: impl FnOnce(&mut Tx<'_>) -> Result<T>,
+) -> Result<T> {
+    run_write(conn, f).map(|(value, _)| value)
 }
 
 fn run_write<T>(

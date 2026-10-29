@@ -52,6 +52,14 @@ impl ClientRegistry {
         }
     }
 
+    /// The clients that have a live connection.
+    pub fn connected_clients(&self) -> std::collections::HashSet<ClientId> {
+        self.connections
+            .lock()
+            .map(|connections| connections.values().map(|(id, _)| *id).collect())
+            .unwrap_or_default()
+    }
+
     /// Closes every connection of a client and forgets its tokens.
     pub fn disconnect(&self, client: ClientId) {
         if let Ok(mut tokens) = self.tokens.lock() {

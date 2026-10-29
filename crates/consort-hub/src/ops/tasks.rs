@@ -506,6 +506,13 @@ impl Hub {
             .store
             .write(move |tx| {
                 let mut task = work::task_or_404(tx.db(), id)?;
+                // Not done needs the session and the workspace. Archive
+                // deleted the workspace, so the task can only start again.
+                if task.status == TaskStatus::Resolved && work::task_workspace_released(tx.db(), id)? {
+                    return Err(HubError::conflict(
+                        "The workspace of this task was deleted when the task was archived, so it cannot go back to Ready for review. Retry the task to run it again in a new workspace.",
+                    ));
+                }
                 if transition(tx, &mut task, TaskStatus::Review, Actor::User, None, None)? {
                     tx.save_task(&task)?;
                 }
@@ -524,9 +531,14 @@ impl Hub {
         Ok(TaskResult { task })
     }
 
-    /// Sends a failed task back to Up next and places it again. The old
-    /// session may still run on its worker (a failed turn does not end it),
-    /// so the hub ends it and the worker gets `session.stop`.
+    /// Sends a task back to Up next and places it again with a new session.
+    ///
+    /// A failed task can always retry. A task in Ready for review or
+    /// Resolved can retry only when its session has ended, because then
+    /// nothing else can move it on. The old session may still run on its
+    /// worker (a failed turn does not end it), so the hub ends it and the
+    /// worker gets `session.stop`. Open questions of the old session are
+    /// closed: the new session starts from the brief.
     pub(crate) async fn retry_task(&self, id: TaskId, actor: Actor) -> Result<Task> {
         let hub = self.clone();
         let fx = self
@@ -539,12 +551,39 @@ impl Hub {
                 if task.status != TaskStatus::UpNext {
                     task.status.check_transition(TaskStatus::UpNext, actor)?;
                 }
-                // The old session ends first, while the task is still
-                // Failed, so ending it does not change the task.
+                if task.archived_at.is_some() {
+                    return Err(HubError::conflict(
+                        "The task is archived. Restore it first, then retry it.",
+                    ));
+                }
+                if matches!(task.status, TaskStatus::Review | TaskStatus::Resolved) {
+                    let session_open = match task.current_session_id {
+                        Some(s) => work::session(tx.db(), s)?.is_some_and(|s| !s.state.is_final()),
+                        None => false,
+                    };
+                    if session_open {
+                        return Err(HubError::conflict(
+                            "The session of this task still runs, and a retry would end it. Send the task a message to go on with the same session.",
+                        ));
+                    }
+                }
+                // The worker deletes the old workspace first. A new session
+                // in the same folder could lose its files to that delete.
+                if work::task_release_queued(tx.db(), id)? {
+                    return Err(HubError::conflict(
+                        "A worker has not deleted the old workspace of this task yet. Retry the task when that worker is online.",
+                    ));
+                }
+                // The old session ends first, while the task is still in its
+                // old status, so ending it does not change the task.
                 let fx = match task.current_session_id {
                     Some(old) => end_session_by_hub(&hub, tx, old, "The task was retried.")?,
                     None => Effects::default(),
                 };
+                for mut decision in work::pending_decisions_of_task(tx.db(), id)? {
+                    decision.status = consort_proto::model::DecisionStatus::Canceled;
+                    tx.save_decision(&decision)?;
+                }
                 let mut task = work::task_or_404(tx.db(), id)?;
                 if transition(tx, &mut task, TaskStatus::UpNext, actor, None, None)? {
                     task.current_session_id = None;
@@ -552,6 +591,7 @@ impl Hub {
                     task.review_summary = None;
                     tx.save_task(&task)?;
                 }
+                tx.set_task_workspace_released(id, false)?;
                 Ok(fx)
             })
             .await?;
@@ -814,6 +854,7 @@ pub(crate) fn release_task(
     reason: &str,
 ) -> Result<Effects> {
     let mut fx = Effects::default();
+    tx.set_task_workspace_released(task.id, true)?;
     let sessions = work::sessions_of_task(tx.db(), task.id)?;
     for session in &sessions {
         if !session.state.is_final() {
@@ -934,6 +975,71 @@ mod tests {
         let task = hub
             .store
             .read(move |conn| work::task_or_404(conn, task.id))
+            .await
+            .unwrap();
+        assert_eq!(task.status, TaskStatus::Working);
+    }
+
+    /// Review 3, finding 10: an answer moved the task to Working but kept an
+    /// old `active_at`, so the quiet-turn check could fail it at once.
+    #[tokio::test]
+    async fn an_answer_after_a_long_wait_does_not_fail_the_task_at_once() {
+        use consort_proto::ids::ApprovalId;
+        use consort_proto::model::{
+            Approval, ApprovalDetails, ApprovalStatus, RequestOption, RequestOptionKind,
+        };
+        let (hub, _dir) = crate::hub::test_hub().await;
+        let (task, session) = crate::hub::test_task_session(&hub).await;
+        // The session went quiet 10 s ago, and its worker is online.
+        let _rx = quiet_session(&hub, &session, Duration::from_secs(60)).await;
+        let approval_id = ApprovalId::new();
+        let (task_id, session_id) = (task.id, session.id);
+        hub.store
+            .write(move |tx| {
+                let mut task = work::task_or_404(tx.db(), task_id)?;
+                task.status = TaskStatus::NeedsInput;
+                tx.save_task(&task)?;
+                tx.save_approval(&Approval {
+                    id: approval_id,
+                    channel_id: task.channel_id,
+                    session_id,
+                    task_id: Some(task_id),
+                    message_id: task.card_message_id,
+                    request_id: "req-1".into(),
+                    summary: "Run tests".to_owned(),
+                    details: ApprovalDetails::Command {
+                        command: "cargo test".to_owned(),
+                        cwd: None,
+                    },
+                    options: vec![RequestOption {
+                        id: "allow".to_owned(),
+                        label: "Allow once".to_owned(),
+                        kind: RequestOptionKind::AllowOnce,
+                        description: None,
+                    }],
+                    status: ApprovalStatus::Pending,
+                    answer_option_id: None,
+                    answered_at: None,
+                    answered_by_client_id: None,
+                    created_at: tx.now(),
+                })
+            })
+            .await
+            .unwrap();
+        hub.approval_answer(
+            &Caller::Hub,
+            ApprovalAnswer {
+                approval_id,
+                option_id: "allow".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+        // The wait for the user does not count.
+        hub.expire_quiet_task_turns(1_000).await.unwrap();
+        let task = hub
+            .store
+            .read(move |conn| work::task_or_404(conn, task_id))
             .await
             .unwrap();
         assert_eq!(task.status, TaskStatus::Working);

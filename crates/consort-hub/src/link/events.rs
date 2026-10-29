@@ -51,6 +51,9 @@ pub(crate) struct Effects {
     pub start_failed: Vec<ChannelId>,
     /// Channels whose coordinator session started.
     pub start_ok: Vec<ChannelId>,
+    /// Channels whose coordinator turn the worker refused. They try again
+    /// after the start backoff.
+    pub turn_refused: Vec<ChannelId>,
 }
 
 impl Effects {
@@ -77,6 +80,7 @@ impl Effects {
         self.items_done.extend(other.items_done);
         self.start_failed.extend(other.start_failed);
         self.start_ok.extend(other.start_ok);
+        self.turn_refused.extend(other.turn_refused);
     }
 }
 
@@ -132,6 +136,35 @@ impl<'h> Ctx<'h> {
             task.status_reason = Some(cut_text(&reason, crate::limits::NOTICE_TEXT_MAX_BYTES));
             self.task_dirty = true;
         }
+    }
+
+    /// Reads the task again from the database, for code that must see
+    /// changes from other code in this transaction. A change in this
+    /// context that is not saved yet is saved first, so it is not lost.
+    fn reload_task(&mut self, tx: &mut Tx<'_>) -> Result<()> {
+        self.with_task_row(tx, |_, _| Ok(()))
+    }
+
+    /// Saves a changed task now and reads it again after `f`, for code that
+    /// changes the task row itself, such as [`resume_if_nothing_waits`].
+    /// Without this, `persist` would write the older copy over the change.
+    fn with_task_row(
+        &mut self,
+        tx: &mut Tx<'_>,
+        f: impl FnOnce(&mut Tx<'_>, consort_proto::ids::TaskId) -> Result<()>,
+    ) -> Result<()> {
+        let Some(task_id) = self.task.as_ref().map(|t| t.id) else {
+            return Ok(());
+        };
+        if self.task_dirty
+            && let Some(task) = &self.task
+        {
+            tx.save_task(task)?;
+            self.task_dirty = false;
+        }
+        f(tx, task_id)?;
+        self.task = work::task(tx.db(), task_id)?;
+        Ok(())
     }
 
     /// True when this session runs the task now: the task names it as its
@@ -219,6 +252,13 @@ impl Hub {
         }
         for channel in fx.start_failed {
             self.coordinators.start_failed(channel);
+        }
+        for channel in fx.turn_refused {
+            // The worker refused the turn, so the events wait in the queue.
+            // Try again after the start backoff. A `turn.ended` of the
+            // session kicks the channel sooner.
+            self.coordinators.start_failed(channel);
+            self.retry_coordinator_later(channel);
         }
         for channel in fx.kick {
             self.kick_coordinator(channel);
@@ -381,13 +421,20 @@ fn on_state(tx: &mut Tx<'_>, ctx: &mut Ctx<'_>, state: SessionState) -> Result<(
 }
 
 /// The worker restarted and opened the session again. The old harness
-/// process is gone, so its open turn and its requests are gone too.
+/// process is gone, so its open turn and its harness requests are gone too.
+///
+/// A turn whose `session.turn` still waits in the queue is not lost: the
+/// worker never got it, and the hub sends it after this event. That turn
+/// stays open, and a coordinator keeps the events of the turn.
 fn on_reopened(tx: &mut Tx<'_>, ctx: &mut Ctx<'_>) -> Result<()> {
     if ctx.session.state.is_final() {
         return Ok(());
     }
-    cancel_pending_requests(tx, ctx.session.id)?;
+    cancel_harness_requests(tx, ctx)?;
     if ctx.runtime.turn_open {
+        if turn_waits_unsent(tx, ctx.session.id)? {
+            return Ok(());
+        }
         let text = match ctx.session.role {
             SessionRole::Coordinator => {
                 "The worker restarted before the assistant finished. Send your message again."
@@ -395,21 +442,50 @@ fn on_reopened(tx: &mut Tx<'_>, ctx: &mut Ctx<'_>) -> Result<()> {
             SessionRole::Task => "The worker restarted during this turn. Retry the task.",
         };
         on_turn_ended(tx, ctx, TurnEndReason::Failed, Some(text))?;
+    } else if ctx.session.role == SessionRole::Task && ctx.drives_task() {
+        // A canceled request can leave the task in Working with no turn.
+        // The session waits now, as after the end of a turn.
+        task_turn_ended(tx, ctx, TurnEndReason::Completed, None)?;
     }
     Ok(())
 }
 
-/// Cancels the approvals and decisions that wait on a session. Nobody can
-/// answer them once the harness request is gone.
-fn cancel_pending_requests(tx: &mut Tx<'_>, session_id: SessionId) -> Result<()> {
-    let (approvals, decisions) = work::pending_for_session(tx.db(), session_id)?;
+/// True when the open turn of a session is one that the hub has not sent
+/// yet: its `session.turn` is still in the queue and never went out. The
+/// hub never sends a second `session.turn` while a turn is open, so a
+/// queued one is the one that opened the turn.
+fn turn_waits_unsent(tx: &Tx<'_>, session_id: SessionId) -> Result<bool> {
+    Ok(
+        crate::store::machine::commands_for_session(tx.db(), session_id)?
+            .iter()
+            .any(|(command, sent)| command.kind == "session.turn" && !sent),
+    )
+}
+
+/// Cancels the approvals and the decisions of a session that wait on a
+/// harness request. Nobody can answer them once the request is gone.
+/// Decisions from `ask_decision` stay: they need no harness request, and
+/// their answer is input to a later turn (or, for a coordinator, to the
+/// channel queue). A task with nothing left to wait for goes back to
+/// Working.
+fn cancel_harness_requests(tx: &mut Tx<'_>, ctx: &mut Ctx<'_>) -> Result<()> {
+    let (approvals, decisions) = work::pending_for_session(tx.db(), ctx.session.id)?;
+    let mut canceled = false;
     for mut approval in approvals {
         approval.status = ApprovalStatus::Canceled;
         tx.save_approval(&approval)?;
+        canceled = true;
     }
     for mut decision in decisions {
+        if decision.request_id.is_none() {
+            continue;
+        }
         decision.status = DecisionStatus::Canceled;
         tx.save_decision(&decision)?;
+        canceled = true;
+    }
+    if canceled && ctx.drives_task() {
+        ctx.with_task_row(tx, |tx, task_id| resume_if_nothing_waits(tx, Some(task_id)))?;
     }
     Ok(())
 }
@@ -423,15 +499,16 @@ pub(crate) fn finish_session(
     let lost = state == SessionState::Lost;
     // A session that never left Starting did not start.
     let started = ctx.session.state != SessionState::Starting;
-    ctx.session.state = state;
     ctx.session.ended_at.get_or_insert_with(|| tx.now());
     if ctx.session.end_reason.is_none() {
         ctx.session.end_reason = Some(if lost { "lost" } else { "ended" }.to_owned());
     }
+    // Nobody can answer a harness request of a session that is gone. This
+    // runs while the session still drives its task, so a task with nothing
+    // left to wait for goes back to Working first.
+    cancel_harness_requests(tx, ctx)?;
+    ctx.session.state = state;
     ctx.runtime.turn_open = false;
-
-    // Nobody can answer a request of a session that is gone.
-    cancel_pending_requests(tx, ctx.session.id)?;
 
     match ctx.session.role {
         SessionRole::Coordinator => release_coordinator(tx, ctx, started)?,
@@ -451,6 +528,18 @@ pub(crate) fn finish_session(
                     "The session ended before the task finished. Retry the task."
                 };
                 ctx.move_task(tx, TaskStatus::Failed, Some(reason.to_owned()), None)?;
+            } else if current
+                && let Some(task) = ctx.task.as_mut()
+                && task.status == TaskStatus::Review
+            {
+                // The task stays Ready for review, but it cannot take a
+                // message any more. Retry starts a new session.
+                task.status_reason = Some(
+                    "The session of this task ended, so it cannot take a message. Retry the task to work on it again."
+                        .to_owned(),
+                );
+                task.updated_at = tx.now();
+                ctx.task_dirty = true;
             }
         }
     }
@@ -458,17 +547,30 @@ pub(crate) fn finish_session(
 }
 
 /// The coordinator row stops pointing at a session that is gone. Events of an
-/// open turn go back to the front of the queue. The channel gets a new
-/// session at once only when this one had started: a start that failed
-/// would fail again at once. The next wake event, or a worker that comes
-/// online, starts it then, after the backoff in `Coordinators`.
+/// open turn go back to the front of the queue, but only when the turn
+/// called no hub tool. A turn that called one may have acted already, for
+/// example posted a reply or started a task. A new session must not do that
+/// again, so the events go, and the channel gets a notice. The channel gets
+/// a new session at once only when this one had started: a start that
+/// failed would fail again at once. The next wake event, or a worker that
+/// comes online, starts it then, after the backoff in `Coordinators`.
 fn release_coordinator(tx: &mut Tx<'_>, ctx: &mut Ctx<'_>, started: bool) -> Result<()> {
     let mut row = coord_store::coordinator(tx.db(), ctx.channel.id)?;
     if row.session_id != Some(ctx.session.id) {
         return Ok(());
     }
     if row.turn_open && !row.turn_events.is_empty() {
-        tx.requeue_wakes_first(ctx.channel.id, &row.turn_events)?;
+        if ctx.runtime.tools_called.is_empty() {
+            tx.requeue_wakes_first(ctx.channel.id, &row.turn_events)?;
+        } else {
+            tx.post_notice(
+                ctx.channel.id,
+                None,
+                None,
+                "turn_failed",
+                "The assistant stopped before it finished. It had already started to act, so the hub does not give it the same messages again. Check what it did, and send your message again if something is missing.",
+            )?;
+        }
     }
     row.session_id = None;
     row.turn_open = false;
@@ -778,17 +880,9 @@ fn close_request(
     if !ctx.drives_task() {
         return Ok(());
     }
-    if let Some(task) = ctx.task.as_mut() {
-        // Reload: the status may have changed in this batch.
-        if let Some(fresh) = work::task(tx.db(), task.id)? {
-            *task = fresh;
-        }
-        resume_if_nothing_waits(tx, Some(task.id))?;
-        if let Some(fresh) = work::task(tx.db(), task.id)? {
-            *task = fresh;
-        }
-    }
-    Ok(())
+    // The status may have changed earlier in this batch. The helper saves
+    // that change before it reads the task again.
+    ctx.with_task_row(tx, |tx, task_id| resume_if_nothing_waits(tx, Some(task_id)))
 }
 
 fn on_turn_ended(
@@ -798,6 +892,7 @@ fn on_turn_ended(
     error: Option<&str>,
 ) -> Result<()> {
     ctx.runtime.turn_open = false;
+    ctx.runtime.turn_from_review = false;
     match ctx.session.role {
         SessionRole::Coordinator => coordinator_turn_ended(tx, ctx, reason, error),
         SessionRole::Task => task_turn_ended(tx, ctx, reason, error),
@@ -811,7 +906,14 @@ fn coordinator_turn_ended(
     error: Option<&str>,
 ) -> Result<()> {
     let mut row = coord_store::coordinator(tx.db(), ctx.channel.id)?;
-    if row.session_id != Some(ctx.session.id) || !row.turn_open {
+    if row.session_id != Some(ctx.session.id) {
+        return Ok(());
+    }
+    if !row.turn_open {
+        // A turn that the hub did not open ended, for example the one that
+        // made the worker refuse the hub's turn. The session is free now,
+        // so the events that wait can go.
+        ctx.fx.kick(ctx.channel.id);
         return Ok(());
     }
     // A failed turn on an account that the worker reports as signed out
@@ -880,10 +982,10 @@ fn task_turn_ended(
     let Some(task_id) = ctx.task.as_ref().map(|t| t.id) else {
         return Ok(());
     };
-    // Reload: an earlier event in this batch may have changed the task.
-    if let Some(fresh) = work::task(tx.db(), task_id)? {
-        ctx.task = Some(fresh);
-    }
+    // Reload: other code in this transaction may have changed the task. A
+    // change of an earlier event in this batch, for example a request that
+    // moved the task to Needs input, is saved first.
+    ctx.reload_task(tx)?;
     // The turn of an older session, for example one that a retry replaced,
     // must not move the task or take its inbox.
     if !ctx.drives_task() {
@@ -921,12 +1023,19 @@ fn task_turn_ended(
             }),
         )?;
         ctx.runtime.turn_open = true;
+        ctx.runtime.turn_from_review = false;
         ctx.runtime.active_at = Some(tx.now());
         ctx.fx.pump(ctx.session.worker_id);
         return Ok(());
     }
 
-    if status == TaskStatus::Working && work::pending_count_for_task(tx.db(), task_id)? == 0 {
+    if work::pending_count_for_task(tx.db(), task_id)? == 0 {
+        if status == TaskStatus::NeedsInput {
+            // The last request closed in a way that did not move the task,
+            // for example an answer that the harness no longer took.
+            // Nothing waits now, so the task goes on as after any turn.
+            ctx.move_task(tx, TaskStatus::Working, None, None)?;
+        }
         let last = ctx
             .runtime
             .last_assistant_text
@@ -1215,6 +1324,108 @@ mod tests {
             queued_kinds(&hub, &session).await,
             ["session.start", "session.stop"]
         );
+    }
+
+    /// Review 3, finding 2: a turn that ended while the task was in Needs
+    /// input with nothing pending left the task there for ever.
+    #[tokio::test]
+    async fn a_turn_that_ends_in_needs_input_with_nothing_pending_goes_to_review() {
+        let (hub, _dir) = crate::hub::test_hub().await;
+        let (task, session) = crate::hub::test_task_session(&hub).await;
+        let task_id = task.id;
+        hub.store
+            .write(move |tx| {
+                let mut task = work::task_or_404(tx.db(), task_id)?;
+                task.status = TaskStatus::NeedsInput;
+                tx.save_task(&task)
+            })
+            .await
+            .unwrap();
+        hub.ingest_events(
+            session.worker_id,
+            SessionEvents {
+                session_id: session.id,
+                events: vec![SequencedEvent {
+                    seq: 1,
+                    at: consort_proto::time::Timestamp::now(),
+                    event: SessionEvent::TurnEnded {
+                        turn_id: "t1".into(),
+                        reason: TurnEndReason::Completed,
+                        error: None,
+                    },
+                }],
+            },
+        )
+        .await
+        .unwrap();
+        let task = hub
+            .store
+            .read(move |conn| work::task_or_404(conn, task_id))
+            .await
+            .unwrap();
+        assert_eq!(task.status, TaskStatus::Review);
+    }
+
+    /// Review 3, finding 4: a channel delete queued `session.stop` and left
+    /// the `session.start` that never went out, so the worker still
+    /// started a coordinator for a channel that no longer existed.
+    #[tokio::test]
+    async fn deleting_a_channel_drops_a_coordinator_start_that_never_went_out() {
+        use consort_proto::client_api::{ChannelCreate, ChannelDelete};
+        let (hub, _dir) = crate::hub::test_hub().await;
+        let channel = hub
+            .channel_create(
+                &crate::hub::Caller::Hub,
+                ChannelCreate {
+                    name: "Work".to_owned(),
+                    purpose: String::new(),
+                    instructions: String::new(),
+                    icon: None,
+                    color: None,
+                    group_id: None,
+                    coordinator_selection: None,
+                    task_selection: None,
+                    repo_ids: Vec::new(),
+                    default_isolation: None,
+                    default_approval_mode: None,
+                    memory_enabled: None,
+                },
+            )
+            .await
+            .unwrap()
+            .channel;
+        let (_, task_session) = crate::hub::test_task_session(&hub).await;
+        let mut session = task_session.clone();
+        session.id = SessionId::new();
+        session.role = SessionRole::Coordinator;
+        session.channel_id = channel.id;
+        session.task_id = None;
+        session.state = SessionState::Starting;
+        let stored = session.clone();
+        hub.store
+            .write(move |tx| {
+                tx.save_session(&stored)?;
+                tx.save_coordinator(&crate::store::coordinator::CoordinatorRow {
+                    channel_id: stored.channel_id,
+                    session_id: Some(stored.id),
+                    turn_open: true,
+                    turn_started_at: Some(tx.now()),
+                    turn_events: Vec::new(),
+                })?;
+                tx.queue_command(stored.worker_id, &start(&stored))?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        hub.channel_delete(
+            &crate::hub::Caller::Hub,
+            ChannelDelete {
+                channel_id: channel.id,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(queued_kinds(&hub, &session).await.is_empty());
     }
 
     #[tokio::test]

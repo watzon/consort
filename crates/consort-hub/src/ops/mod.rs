@@ -4,7 +4,7 @@ mod conversation;
 pub(crate) mod flow;
 pub(crate) mod hooks;
 mod knowledge;
-mod machines;
+pub(crate) mod machines;
 mod routines;
 mod sync;
 mod tasks;

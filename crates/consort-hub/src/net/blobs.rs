@@ -145,7 +145,8 @@ pub(crate) async fn put_blob(
 /// Writes the body to `temp` and checks its size and its hash on the way.
 /// Returns the size.
 async fn receive(body: Body, temp: &std::path::Path, expected: &Sha256Hash) -> Result<usize> {
-    let mut file = tokio::fs::File::create(temp).await?;
+    // Only the user can read a blob. The rename keeps the mode.
+    let mut file = crate::util::create_private_file(temp).await?;
     let mut hasher = Sha256::new();
     let mut size = 0_usize;
     let mut stream = body.into_data_stream();

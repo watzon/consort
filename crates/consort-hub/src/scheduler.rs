@@ -383,6 +383,7 @@ pub(crate) mod testing {
             repo_ids: Vec::new(),
             default_isolation: Isolation::Worktree,
             default_approval_mode: ApprovalMode::Ask,
+            allowed_local_mcp_servers: Vec::new(),
             memory_enabled: true,
             archived_at: archived.then_some(now),
             created_at: now,

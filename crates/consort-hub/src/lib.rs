@@ -9,10 +9,12 @@
 //! tailnet.
 //!
 //! The public API is [`serve`], [`create_setup_code`], [`HubConfig`],
-//! [`HubHandle`] and [`HubError`].
+//! [`HubHandle`], [`HubError`], and the [`admin`] commands that list and
+//! remove clients and workers from the hub machine.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod admin;
 mod api;
 mod coordinator;
 mod error;
@@ -41,7 +43,7 @@ use tokio::task::JoinHandle;
 pub use error::{HubError, Result};
 
 use crate::hub::Hub;
-use crate::store::machine::{self, PairingKind};
+use crate::store::machine::{self, Origin, PairingKind};
 
 /// How to start a hub.
 #[derive(Debug, Clone)]
@@ -78,6 +80,7 @@ pub fn create_setup_code(data_dir: &Path) -> Result<String> {
         &code,
         Timestamp::now(),
         PAIRING_CODE_TTL_MS,
+        Origin::HubMachine,
     )?;
     Ok(code.to_string())
 }
@@ -117,7 +120,9 @@ pub async fn serve(config: HubConfig) -> Result<HubHandle> {
     if has_client {
         hub.setup.mark_paired();
     } else {
-        let (code, expires_at) = hub.new_pairing_code(PairingKind::Client).await?;
+        let (code, expires_at) = hub
+            .new_pairing_code(PairingKind::Client, Origin::HubMachine)
+            .await?;
         tracing::info!(
             "Setup code: {code}. Enter it in the app to pair the first client. It works once and expires in 10 minutes."
         );
@@ -164,7 +169,10 @@ impl HubHandle {
 
     /// Makes a single-use worker pairing code that is valid for 10 minutes.
     pub async fn new_worker_pairing_code(&self) -> Result<String> {
-        let (code, _) = self.hub.new_pairing_code(PairingKind::Worker).await?;
+        let (code, _) = self
+            .hub
+            .new_pairing_code(PairingKind::Worker, Origin::HubMachine)
+            .await?;
         Ok(code.to_string())
     }
 

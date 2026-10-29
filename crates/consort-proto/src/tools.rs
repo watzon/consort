@@ -1027,6 +1027,11 @@ pub struct StartTaskResult {
     pub status: TaskStatus,
     /// Why it is in that status, for example no worker fits yet.
     pub status_reason: Option<String>,
+    /// What the hub changed in the request, because the channel does not
+    /// allow it, for example a lower approval mode. Empty when nothing
+    /// changed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
 }
 
 /// How `message_task` delivered a message.
@@ -1092,6 +1097,10 @@ pub struct RoutineListResult {
 pub struct RoutineResult {
     /// The routine after the change.
     pub routine: Routine,
+    /// What the hub changed in the action of the routine, because the
+    /// channel does not allow it. Empty when nothing changed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
 }
 
 /// Task counts by status, for `list_channels`.

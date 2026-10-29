@@ -51,6 +51,40 @@ fn clean_name(what: &str, name: &str) -> Result<String> {
     Ok(name.to_owned())
 }
 
+/// The most local MCP servers that a channel can allow.
+const ALLOWED_SERVERS_MAX: usize = 32;
+/// The longest name of a local MCP server.
+const SERVER_NAME_MAX_CHARS: usize = 64;
+
+/// Trims the names of local MCP servers that a channel allows, drops the
+/// copies, and checks each name. The worker refuses the name `hub` and a
+/// name with `__`, so the channel refuses them too.
+fn clean_server_names(names: &[String]) -> Result<Vec<String>> {
+    if names.len() > ALLOWED_SERVERS_MAX {
+        return Err(HubError::invalid(format!(
+            "A channel can allow at most {ALLOWED_SERVERS_MAX} local MCP servers. Remove some."
+        )));
+    }
+    let mut out: Vec<String> = Vec::new();
+    for name in names {
+        let name = name.trim();
+        if name.is_empty() || name.chars().count() > SERVER_NAME_MAX_CHARS {
+            return Err(HubError::invalid(format!(
+                "A local MCP server name needs 1 to {SERVER_NAME_MAX_CHARS} characters."
+            )));
+        }
+        if name.eq_ignore_ascii_case("hub") || name.contains("__") {
+            return Err(HubError::invalid(format!(
+                "The local MCP server name `{name}` cannot be used. Consort keeps `hub` for the hub tools, and a name cannot contain `__`."
+            )));
+        }
+        if !out.iter().any(|n| n == name) {
+            out.push(name.to_owned());
+        }
+    }
+    Ok(out)
+}
+
 /// The purpose and the instructions go into every system prompt of the
 /// channel, so both have a size limit.
 fn check_channel_text(purpose: &str, instructions: &str) -> Result<()> {
@@ -251,6 +285,7 @@ impl Hub {
                     repo_ids: request.repo_ids,
                     default_isolation: request.default_isolation.unwrap_or_default(),
                     default_approval_mode: request.default_approval_mode.unwrap_or_default(),
+                    allowed_local_mcp_servers: Vec::new(),
                     memory_enabled: request.memory_enabled.unwrap_or(true),
                     archived_at: None,
                     created_at: now,
@@ -319,6 +354,9 @@ impl Hub {
                 if let Some(mode) = request.default_approval_mode {
                     channel.default_approval_mode = mode;
                 }
+                if let Some(servers) = request.allowed_local_mcp_servers {
+                    channel.allowed_local_mcp_servers = clean_server_names(&servers)?;
+                }
                 if let Some(enabled) = request.memory_enabled {
                     channel.memory_enabled = enabled;
                 }
@@ -371,22 +409,41 @@ impl Hub {
         request: ChannelDelete,
     ) -> Result<Empty> {
         let channel_id = request.channel_id;
-        let channel = self
+        let hub = self.clone();
+        // One transaction: the sessions end, the workers get `session.stop`
+        // and `workspace.release`, and the channel goes. A `session.start`
+        // that never went out is deleted, so it cannot start a session for
+        // a channel that no longer exists.
+        let fx = self
             .store
-            .read(move |conn| conversation::channel_or_404(conn, channel_id))
-            .await?;
-        if channel.is_everything() {
-            return Err(HubError::conflict(
-                "The Everything channel cannot be deleted.",
-            ));
-        }
-        self.stop_channel_sessions(channel_id).await?;
-        self.store
             .write(move |tx| {
-                conversation::channel_or_404(tx.db(), channel_id)?;
-                tx.purge_channel(channel_id)
+                let channel = conversation::channel_or_404(tx.db(), channel_id)?;
+                if channel.is_everything() {
+                    return Err(HubError::conflict(
+                        "The Everything channel cannot be deleted.",
+                    ));
+                }
+                let reason = "The channel was removed.";
+                let mut fx = crate::link::events::Effects::default();
+                for task in work::tasks_in_channel(tx.db(), channel_id, true)? {
+                    // An archived task that was released has no session and
+                    // no workspace left.
+                    if work::task_workspace_released(tx.db(), task.id)? {
+                        continue;
+                    }
+                    fx.merge(super::tasks::release_task(&hub, tx, &task, reason)?);
+                }
+                // The coordinator sessions. Task sessions ended above.
+                for session in work::open_sessions_of_channel(tx.db(), channel_id)? {
+                    fx.merge(crate::link::events::end_session_by_hub(
+                        &hub, tx, session.id, reason,
+                    )?);
+                }
+                tx.purge_channel(channel_id)?;
+                Ok(fx)
             })
             .await?;
+        self.run_effects(fx);
         Ok(Empty {})
     }
 

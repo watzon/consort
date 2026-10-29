@@ -17,6 +17,8 @@ This page lists the entities that the hub, the workers and the clients store, wi
 
 The hub is the source of truth for everything except harness logins and raw transcripts. A session's native state on a worker is a cache that the hub can rebuild from the timeline and memory.
 
+On Unix the hub data folder and `blobs/` have mode 0700, and `hub.db` with its `-wal` and `-shm` files has mode 0600, also when they exist already. The hub writes each blob with mode 0600.
+
 ## Identifiers
 
 Every ID is a UUIDv7 string with a type prefix, for example `tsk_0192f0c4-...`. UUIDv7 sorts by creation time. The UUID part is lowercase and hyphenated. Readers check the prefix. They accept any UUID version, so test fixtures can use fixed IDs.
@@ -69,8 +71,9 @@ Turn IDs, harness request IDs and native references are opaque strings that the 
 | `task_selection` | model selection | Default for new tasks in this channel |
 | `preferred_workers` | list of worker IDs | Ordered. Placement tries these first |
 | `repo_ids` | list of repo IDs | The `channel_repos` join, in order. Part of the client view |
-| `default_isolation` | `in_place`, `worktree` or `clone` | |
-| `default_approval_mode` | `ask`, `auto_edits`, `auto` or `full_access` | |
+| `default_isolation` | `in_place`, `worktree` or `clone` | A task that the assistant starts runs in place only when this is `in_place` |
+| `default_approval_mode` | `ask`, `auto_edits`, `auto` or `full_access` | Also the most that a task that the assistant starts gets |
+| `allowed_local_mcp_servers` | list of text | The local MCP servers, by name, that a task that the assistant starts may use. Empty by default. A task that the user starts is not limited by it |
 | `memory_enabled` | bool | |
 | `archived_at` | timestamp, optional | |
 | `created_at`, `updated_at` | timestamp | |
@@ -176,14 +179,17 @@ Allowed transitions:
 | `up_next` | `working` | Placement found a worker and the session started |
 | `working` | `needs_input` | An approval or a decision opened |
 | `needs_input` | `working` | The last pending approval or decision closed |
-| `working` | `review` | The turn ended with nothing pending, or the task called `submit_for_review` |
+| `working` | `review` | The turn ended with nothing pending, or the task called `submit_for_review`. Also when the worker refused the turn of a message that moved the task from `review` |
 | `review` | `working` | The user or the coordinator sent the task a message |
 | `review` | `resolved` | The user resolved the task. No session can do this |
-| `resolved` | `review` | The user chose **Not done** |
+| `resolved` | `review` | The user chose **Not done**. The hub refuses it when archive deleted the workspace of the task |
 | `up_next`, `working`, `needs_input`, `review` | `failed` | The session was lost and cannot resume, the harness failed, or the fixed worker was removed |
 | `failed` | `up_next` | The user or the coordinator chose retry |
+| `review`, `resolved` | `up_next` | The user or the coordinator chose retry after the session of the task ended. The hub refuses it while the session runs |
 
 A task whose worker goes offline stays in its current status. The task card shows the worker as offline. The worker keeps the session running and sends the buffered events when it reconnects.
+
+A turn that ends while the task is in `needs_input` and nothing waits moves the task on as any turn end does: to `working`, and then to `review` when nothing else comes. The hub keeps hub-only records next to a task: when it asked the workers to delete the workspace, and whether the open turn came from `review`.
 
 ### Session
 
@@ -389,6 +395,9 @@ A model selection is a value, not a row: `account_label`, `model` and `options`.
 | `public_key` | Ed25519 public key | |
 | `push` | object, optional | Provider (`apns`, `fcm` or `expo`) and token. The client view has only `push_provider`. The token stays on the hub |
 | `paired_at`, `last_seen_at`, `revoked_at` | timestamp | |
+| `paired_by`, `revoked_by` | text, optional | Hub only, not in the client view. A client ID, or `hub` for the hub machine. `paired_by` is who made the pairing code that the client used. `consort hub client list` shows both |
+
+A worker has the same `paired_by` and `revoked_by`. Each pairing code records who made it in `created_by`. When a client is removed, the codes that it made and that are not used yet are deleted.
 
 ## Feed
 
@@ -444,7 +453,7 @@ path = "C:/Users/chris/Code/sayso"
 `worker.db` holds:
 
 - `spool`: session ID, sequence number, event and an acknowledged flag. The worker keeps events until the hub acknowledges them.
-- `processed_commands`: command ID, result and time, kept for 24 hours so that a repeated command runs once.
+- `processed_commands`: command ID, result and time, kept for 8 days (the 7 days that the hub keeps a queued command, and one more day) so that a repeated command runs once.
 - `sessions`: the local registry of sessions with their native references and workspace paths.
 - `harness_processes`: the process group of each harness that the worker started on Unix, with the start time of its leader. At the next start, the worker stops only the recorded groups whose start time still matches.
 

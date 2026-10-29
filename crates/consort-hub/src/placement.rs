@@ -731,7 +731,7 @@ fn os_name(os: Os) -> &'static str {
     }
 }
 
-fn mode_name(mode: ApprovalMode) -> &'static str {
+pub(crate) fn mode_name(mode: ApprovalMode) -> &'static str {
     match mode {
         ApprovalMode::Ask => "Ask",
         ApprovalMode::AutoEdits => "Auto edits",

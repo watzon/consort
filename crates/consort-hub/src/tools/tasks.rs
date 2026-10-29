@@ -2,8 +2,8 @@
 
 use consort_proto::ids::{DecisionId, TaskId};
 use consort_proto::model::{
-    Author, ChannelFile, Decision, DecisionStatus, MessageKind, PlacementRequest, TaskCreator,
-    artifact_path, validate_decision,
+    ApprovalMode, Author, Channel, ChannelFile, Decision, DecisionStatus, Isolation, MessageKind,
+    PlacementRequest, TaskCreator, artifact_path, validate_decision,
 };
 use consort_proto::status::{Actor, TaskStatus};
 use consort_proto::tools::*;
@@ -31,6 +31,93 @@ fn own_task(
     work::task(conn, id)?
         .filter(|t| t.channel_id == ctx.channel.id)
         .ok_or_else(|| HubError::not_found("This channel has no task with this ID."))
+}
+
+/// What [`limit_to_channel`] changed, in two forms: for the coordinator in
+/// the tool result, and for the user in the task thread.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct Limited {
+    pub for_assistant: Vec<String>,
+    pub for_user: Vec<String>,
+}
+
+impl Limited {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.for_assistant.is_empty()
+    }
+}
+
+fn isolation_name(isolation: Isolation) -> &'static str {
+    match isolation {
+        Isolation::InPlace => "in place",
+        Isolation::Worktree => "in a worktree",
+        Isolation::Clone => "in a fresh clone",
+    }
+}
+
+/// Lowers what the assistant asks for a task to what the channel allows.
+/// Text in a web page, a file or a message can steer a coordinator, so the
+/// channel settings that the user chose are the limit:
+///
+/// - the approval mode is at most the default approval mode of the channel,
+/// - the isolation is in place only when the default isolation of the
+///   channel is in place,
+/// - the task gets only the local MCP servers that the channel allows.
+///
+/// The hub does not refuse the task. It runs with less, and the result
+/// says what changed, so the coordinator can tell the user. A task that
+/// the user starts from a client is not limited.
+pub(crate) fn limit_to_channel(
+    channel: &Channel,
+    placement: &mut PlacementRequest,
+    approval_mode: &mut Option<ApprovalMode>,
+) -> Limited {
+    let mut limited = Limited::default();
+    let allowed_mode = channel.default_approval_mode;
+    if let Some(mode) = *approval_mode
+        && mode > allowed_mode
+    {
+        let (asked, allowed) = (
+            crate::placement::mode_name(mode),
+            crate::placement::mode_name(allowed_mode),
+        );
+        limited.for_assistant.push(format!(
+            "This channel allows at most the approval mode {allowed} for a task that you start, so the task runs in {allowed}, not in {asked}. If the task needs more, ask the user to start it, or to raise the default approval mode of the channel."
+        ));
+        limited.for_user.push(format!(
+            "The assistant asked for the approval mode {asked}. This channel allows at most {allowed}, so the task runs in {allowed}."
+        ));
+        *approval_mode = Some(allowed_mode);
+    }
+    if placement.isolation == Some(Isolation::InPlace)
+        && channel.default_isolation != Isolation::InPlace
+    {
+        let instead = isolation_name(channel.default_isolation);
+        limited.for_assistant.push(format!(
+            "This channel does not let a task that you start run in place, so the task runs {instead}. If it must change the user's own checkout, ask the user to start it, or to set the default isolation of the channel to in place."
+        ));
+        limited.for_user.push(format!(
+            "The assistant asked to run the task in place. This channel does not allow that for the assistant, so the task runs {instead}."
+        ));
+        placement.isolation = Some(channel.default_isolation);
+    }
+    if let Some(require) = placement.require.as_mut() {
+        let (kept, refused): (Vec<String>, Vec<String>) =
+            std::mem::take(&mut require.local_mcp_servers)
+                .into_iter()
+                .partition(|name| channel.allowed_local_mcp_servers.contains(name));
+        require.local_mcp_servers = kept;
+        if !refused.is_empty() {
+            let names = refused.join(", ");
+            limited.for_assistant.push(format!(
+                "This channel does not let a task that you start use the local MCP servers {names}, so the task runs without them. If it needs them, ask the user to add them to the allowed local MCP servers of the channel, or to start the task."
+            ));
+            limited.for_user.push(format!(
+                "The assistant asked for the local MCP servers {names}. This channel does not allow them for the assistant, so the task runs without them."
+            ));
+        }
+    }
+    limited
 }
 
 fn session_task(ctx: &ToolCtx) -> Result<&consort_proto::model::Task> {
@@ -129,28 +216,63 @@ impl Hub {
         ctx: &ToolCtx,
         args: StartTaskArgs,
     ) -> Result<Value> {
+        // Read the channel again: the user may have changed its limits
+        // since the session started.
+        let channel_id = ctx.channel.id;
+        let channel = self
+            .store
+            .read(move |conn| conversation::channel_or_404(conn, channel_id))
+            .await?;
+        let mut placement = PlacementRequest {
+            worker_id: args.worker_id,
+            require: args.require,
+            repos: args.repos,
+            isolation: args.isolation,
+        };
+        let mut approval_mode = args.approval_mode;
+        let limited = limit_to_channel(&channel, &mut placement, &mut approval_mode);
+        if !limited.is_empty() {
+            tracing::info!(channel_id = %channel_id, session_id = %ctx.session.id, "a coordinator asked for more than the channel allows, so the hub lowered the task");
+        }
         let task = self
             .create_task(NewTask {
-                channel_id: ctx.channel.id,
+                channel_id,
                 title: args.title,
                 brief: args.brief,
                 model_selection: args.model_selection,
-                placement: PlacementRequest {
-                    worker_id: args.worker_id,
-                    require: args.require,
-                    repos: args.repos,
-                    isolation: args.isolation,
-                },
-                approval_mode: args.approval_mode,
+                placement,
+                approval_mode,
                 start_at: args.start_at,
                 created_by: TaskCreator::Assistant,
                 routine_id: None,
             })
             .await?;
+        if !limited.is_empty() {
+            // The user sees it in the task thread too, not only the
+            // coordinator that the text may steer.
+            let text = format!(
+                "{} To allow more, change the settings of the channel.",
+                limited.for_user.join(" ")
+            );
+            let thread = task.clone();
+            self.store
+                .write(move |tx| {
+                    tx.post_notice(
+                        thread.channel_id,
+                        Some(thread.card_message_id),
+                        Some(thread.id),
+                        "task_limited",
+                        &text,
+                    )
+                    .map(|_| ())
+                })
+                .await?;
+        }
         to_value(&StartTaskResult {
             task_id: task.id,
             status: task.status,
             status_reason: task.status_reason,
+            notes: limited.for_assistant,
         })
     }
 

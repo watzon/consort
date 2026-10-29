@@ -23,6 +23,7 @@ use crate::link::Links;
 use crate::net::clients::ClientRegistry;
 use crate::net::pairing::PairingLimiter;
 use crate::net::ws::HandshakeSlots;
+use crate::ops::machines::RevokeWatch;
 use crate::store::{Store, conversation};
 
 pub const HUB_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -115,6 +116,7 @@ pub struct HubInner {
     pub coordinators: Coordinators,
     pub pairing_limiter: PairingLimiter,
     pub handshakes: HandshakeSlots,
+    pub revokes: RevokeWatch,
     pub shutdown: CancellationToken,
 }
 
@@ -145,6 +147,7 @@ impl Hub {
             coordinators: Coordinators::default(),
             pairing_limiter: PairingLimiter::default(),
             handshakes: HandshakeSlots::default(),
+            revokes: RevokeWatch::default(),
             shutdown: CancellationToken::new(),
         }));
         hub.bootstrap().await?;
@@ -174,6 +177,7 @@ impl Hub {
                         repo_ids: Vec::new(),
                         default_isolation: Isolation::Worktree,
                         default_approval_mode: ApprovalMode::Ask,
+                        allowed_local_mcp_servers: Vec::new(),
                         memory_enabled: true,
                         archived_at: None,
                         created_at: now,

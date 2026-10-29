@@ -10,7 +10,7 @@ use consort_proto::model::{
 use consort_proto::status::{Actor, TaskStatus};
 use consort_proto::worker_link::{SessionRespond, SessionStartResult, SessionSteer};
 
-use super::events::{Ctx, Effects, finish_session, mark_lost_in_tx};
+use super::events::{Ctx, Effects, finish_session, mark_lost_in_tx, queue_stop};
 use crate::error::{HubError, Result};
 use crate::hub::{HUB_VERSION, Hub};
 use crate::ops::flow::{deliver_without_steer, transition};
@@ -336,6 +336,13 @@ pub(crate) fn session_start_failed_tx(
     if !ctx.session.state.is_final() {
         finish_session(tx, &mut ctx, SessionState::Lost)?;
     }
+    if error.code == ErrorCode::Conflict {
+        // The worker has a session with this ID but no stored result, for
+        // example after a resent start. The harness may still run, so it
+        // must stop.
+        let reason = "The session could not start, so the hub stopped it.";
+        queue_stop(hub, tx, &mut ctx.fx, &ctx.session, reason)?;
+    }
     if session.role == SessionRole::Coordinator {
         // Do not kick: a start that fails would fail again at once. The
         // channel waits longer before each new try.
@@ -358,6 +365,12 @@ pub(crate) fn session_start_failed_tx(
 }
 
 /// The worker refused a `session.turn`.
+///
+/// No turn runs then. A coordinator puts the events of the turn back in the
+/// queue and tries again after the start backoff, or at once when the
+/// session ends a turn. A task that the hub moved from Ready for review for
+/// this turn goes back to Ready for review. Any other task that waits in
+/// Working fails with Retry, because nothing would move it again.
 pub(crate) fn turn_command_failed_tx(
     hub: &Hub,
     tx: &mut Tx<'_>,
@@ -373,6 +386,12 @@ pub(crate) fn turn_command_failed_tx(
         mark_lost_in_tx(hub, tx, &mut ctx, &error.message)?;
         return Ok(ctx.fx);
     }
+    let mut fx = Effects::default();
+    let mut runtime = work::session_runtime(tx.db(), session_id)?;
+    let from_review = runtime.turn_from_review;
+    runtime.turn_open = false;
+    runtime.turn_from_review = false;
+    tx.save_session_runtime(session_id, &runtime)?;
     match session.role {
         SessionRole::Coordinator => {
             let mut row = coord_store::coordinator(tx.db(), session.channel_id)?;
@@ -381,6 +400,7 @@ pub(crate) fn turn_command_failed_tx(
                     tx.requeue_wakes_first(session.channel_id, &row.turn_events)?;
                 }
                 row.turn_open = false;
+                row.turn_started_at = None;
                 row.turn_events.clear();
                 tx.save_coordinator(&row)?;
                 tx.post_notice(
@@ -388,31 +408,54 @@ pub(crate) fn turn_command_failed_tx(
                     None,
                     None,
                     "assistant_unavailable",
-                    &format!("The assistant did not take your message: {}", error.message),
+                    &format!(
+                        "The assistant did not take your message: {} The hub tries again soon.",
+                        error.message
+                    ),
                 )?;
+                fx.turn_refused.push(session.channel_id);
             }
         }
         SessionRole::Task => {
-            if let Some(task) = session
+            let Some(mut task) = session
                 .task_id
                 .map(|t| work::task(tx.db(), t))
                 .transpose()?
                 .flatten()
-            {
-                tx.post_notice(
-                    task.channel_id,
-                    Some(task.card_message_id),
-                    Some(task.id),
-                    "message_not_sent",
-                    &format!("The task did not take the message: {}", error.message),
-                )?;
+            else {
+                return Ok(fx);
+            };
+            tx.post_notice(
+                task.channel_id,
+                Some(task.card_message_id),
+                Some(task.id),
+                "message_not_sent",
+                &format!("The task did not take the message: {}", error.message),
+            )?;
+            let current = task.current_session_id == Some(session_id) && !session.state.is_final();
+            if current && task.status == TaskStatus::Working {
+                let (to, reason) = if from_review {
+                    (
+                        TaskStatus::Review,
+                        "The task did not take your last message. Send it again.".to_owned(),
+                    )
+                } else {
+                    (
+                        TaskStatus::Failed,
+                        format!(
+                            "The worker did not start the next turn of the task: {} Retry the task.",
+                            error.message
+                        ),
+                    )
+                };
+                if transition(tx, &mut task, to, Actor::System, Some(reason), None)? {
+                    tx.save_task(&task)?;
+                    fx.kick.push(task.channel_id);
+                }
             }
         }
     }
-    let mut runtime = work::session_runtime(tx.db(), session_id)?;
-    runtime.turn_open = false;
-    tx.save_session_runtime(session_id, &runtime)?;
-    Ok(Effects::default())
+    Ok(fx)
 }
 
 /// The worker refused a `session.steer`, for example because the turn

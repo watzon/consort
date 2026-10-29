@@ -374,16 +374,7 @@ impl Hub {
         // No healthy session: place a new one. After failed starts, the
         // channel waits first. A run at the end of the wait takes the events
         // that came in the meantime.
-        if let Some((wait, schedule)) = self.coordinators.start_wait(channel_id, Instant::now()) {
-            if schedule {
-                tracing::info!(channel_id = %channel_id, wait_ms = wait.as_millis(), "the coordinator failed to start before, so the hub waits before it tries again");
-                let hub = self.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(wait).await;
-                    hub.coordinators.retry_ran(channel_id);
-                    hub.kick_coordinator(channel_id);
-                });
-            }
+        if self.retry_coordinator_later(channel_id) {
             return Ok(());
         }
         let selection = inputs
@@ -502,6 +493,26 @@ impl Hub {
             self.pump_worker(worker_id);
         }
         Ok(())
+    }
+
+    /// After failed starts or refused turns, schedules one run of the
+    /// coordinator of a channel at the end of the backoff. Returns true
+    /// while the channel must wait.
+    pub(crate) fn retry_coordinator_later(&self, channel_id: ChannelId) -> bool {
+        let Some((wait, schedule)) = self.coordinators.start_wait(channel_id, Instant::now())
+        else {
+            return false;
+        };
+        if schedule {
+            tracing::info!(channel_id = %channel_id, wait_ms = wait.as_millis(), "the coordinator failed before, so the hub waits before it tries again");
+            let hub = self.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(wait).await;
+                hub.coordinators.retry_ran(channel_id);
+                hub.kick_coordinator(channel_id);
+            });
+        }
+        true
     }
 
     /// The `<context>` block and the channel files for a new session.
@@ -661,8 +672,12 @@ impl Hub {
     /// Closes a coordinator turn that has run too long. Call it from the
     /// maintenance loop. The session is then lost, and the next wake event
     /// starts a new one.
+    ///
+    /// Only the time that the worker is online counts, as for task turns:
+    /// the events of an offline worker wait in its spool, and the turn may
+    /// have acted already.
     pub(crate) async fn expire_stuck_turns(&self, max_age_ms: i64) -> Result<()> {
-        let stuck = self
+        let candidates = self
             .store
             .read(move |conn| {
                 let now = consort_proto::time::Timestamp::now().as_millis();
@@ -674,14 +689,25 @@ impl Hub {
                         .is_some_and(|t| now - t.as_millis() > max_age_ms)
                         && let Some(session_id) = row.session_id
                     {
-                        out.push(session_id);
+                        let worker = work::session(conn, session_id)?.map(|s| s.worker_id);
+                        out.push((session_id, worker));
                     }
                 }
                 Ok(out)
             })
             .await?;
+        let max_age = Duration::from_millis(u64::try_from(max_age_ms).unwrap_or(0));
+        let stuck = candidates.into_iter().filter_map(|(session_id, worker)| {
+            // A row whose session is gone has no worker to wait for.
+            let online_long_enough = worker.is_none_or(|worker| {
+                self.links
+                    .get(worker)
+                    .is_some_and(|l| !l.outbox.is_closed() && l.connected_at.elapsed() > max_age)
+            });
+            online_long_enough.then_some(session_id)
+        });
         // One session that fails does not stop the others.
-        for session_id in stuck {
+        for session_id in stuck.collect::<Vec<_>>() {
             tracing::warn!(session_id = %session_id, "a coordinator turn ran for too long, so the hub replaces the session");
             if let Err(err) = self
                 .mark_session_lost(session_id, "The turn ran for too long.")
@@ -774,6 +800,114 @@ mod tests {
         assert!(cut.starts_with("<b><b>"));
     }
 
+    /// Registers a link for `worker` that connected `online_for` ago. Keep
+    /// the receiver, so the link stays open.
+    fn link_for(
+        hub: &Hub,
+        worker: WorkerId,
+        online_for: Duration,
+    ) -> tokio::sync::mpsc::Receiver<String> {
+        let (outbox, rx) = crate::net::ws::Outbox::new(tokio_util::sync::CancellationToken::new());
+        let mut link = crate::link::WorkerLink::new(hub.links.next_conn_id(), worker, outbox);
+        link.connected_at = Instant::now().checked_sub(online_for).unwrap();
+        hub.links.register(Arc::new(link));
+        rx
+    }
+
+    /// A coordinator session with a turn that opened 10 s ago.
+    async fn session_with_old_turn(hub: &Hub) -> Session {
+        let everything = hub
+            .store
+            .read(conversation::everything_channel)
+            .await
+            .unwrap();
+        let session = Session {
+            id: SessionId::new(),
+            role: SessionRole::Coordinator,
+            channel_id: everything.id,
+            task_id: None,
+            worker_id: WorkerId::new(),
+            account_id: AccountId::new(),
+            harness: "fake".to_owned(),
+            model: "fake-1".to_owned(),
+            options: ModelOptions::new(),
+            workspace_path: String::new(),
+            native_ref: None,
+            state: SessionState::Active,
+            last_seq: 0,
+            usage: Usage::default(),
+            started_at: Timestamp::now(),
+            ended_at: None,
+            end_reason: None,
+        };
+        let stored = session.clone();
+        let old = Timestamp::now().plus_millis(-10_000);
+        hub.store
+            .write(move |tx| {
+                tx.save_session(&stored)?;
+                tx.save_coordinator(&CoordinatorRow {
+                    channel_id: stored.channel_id,
+                    session_id: Some(stored.id),
+                    turn_open: true,
+                    turn_started_at: Some(old),
+                    turn_events: Vec::new(),
+                })
+            })
+            .await
+            .unwrap();
+        session
+    }
+
+    /// Review 3, finding 6: the coordinator expiry counted the time that
+    /// the worker was offline, while its events waited in the spool.
+    #[tokio::test]
+    async fn a_long_coordinator_turn_of_a_worker_that_just_came_back_waits() {
+        let (hub, _dir) = crate::hub::test_hub().await;
+        let session = session_with_old_turn(&hub).await;
+        let state = |hub: &Hub| {
+            let (hub, id) = (hub.clone(), session.id);
+            async move {
+                hub.store
+                    .read(move |conn| work::session_or_404(conn, id))
+                    .await
+                    .unwrap()
+                    .state
+            }
+        };
+        // Offline: the turn waits.
+        hub.expire_stuck_turns(1_000).await.unwrap();
+        assert_eq!(state(&hub).await, SessionState::Active);
+        // Online again just now: the turn still waits.
+        let _rx = link_for(&hub, session.worker_id, Duration::ZERO);
+        hub.expire_stuck_turns(1_000).await.unwrap();
+        assert_eq!(state(&hub).await, SessionState::Active);
+        // Online for longer than the limit: the hub replaces the session.
+        let _rx2 = link_for(&hub, session.worker_id, Duration::from_secs(60));
+        hub.expire_stuck_turns(1_000).await.unwrap();
+        assert_eq!(state(&hub).await, SessionState::Lost);
+    }
+
+    /// Review 3, finding 3: a refused coordinator turn waited for the next
+    /// wake event. It now runs again after the start backoff.
+    #[tokio::test]
+    async fn a_refused_coordinator_turn_runs_again_after_the_start_backoff() {
+        let (hub, _dir) = crate::hub::test_hub().await;
+        let channel = ChannelId::new();
+        hub.run_effects(Effects {
+            turn_refused: vec![channel],
+            ..Effects::default()
+        });
+        let (wait, schedule) = hub
+            .coordinators
+            .start_wait(channel, Instant::now())
+            .expect("the channel waits");
+        assert!(wait <= START_BACKOFF_FIRST, "{wait:?}");
+        assert!(
+            !schedule,
+            "a run at the end of the wait is scheduled already"
+        );
+    }
+
     #[tokio::test]
     async fn one_stuck_turn_that_fails_does_not_stop_the_others() {
         let (hub, _dir) = crate::hub::test_hub().await;
@@ -802,6 +936,7 @@ mod tests {
             end_reason: None,
         };
         let good = session.id;
+        let _rx = link_for(&hub, session.worker_id, Duration::from_secs(60));
         let old = Timestamp::now().plus_millis(-10_000);
         hub.store
             .write(move |tx| {

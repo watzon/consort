@@ -90,6 +90,17 @@ Workers and clients pair the same way, and both prove their identity with an Ed2
 
 The first client uses the setup code that the hub prints on its first start. To pair a later client, a paired client shows a QR code that holds the hub URL and a new pairing code. The new client then follows the worker steps with `POST /v1/pair/client`, with `code`, `public_key`, `name` and `kind` (`desktop`, `ios` or `android`). The hub returns the `client_id`.
 
+### Who made a code, and removing a client or a worker
+
+The hub records who made each pairing code: a client, or the hub machine (the setup code, `consort hub setup-code` and the dev mode). It also records who made the code that each client and worker paired with, and who removed it. A client can remove another client with `client.revoke`. When a client is removed, the codes that it made and that are not used yet stop working.
+
+A stolen client key could remove every other client. So the hub machine has its own commands, which work on the data folder while the hub runs:
+
+- `consort hub client list` and `consort hub worker list` show each client or worker with its ID, who paired it, when it was last seen, and who removed it.
+- `consort hub client revoke <id>` and `consort hub worker revoke <id>` remove one. A running hub reads the change within 2 seconds. It closes the connection of the client or the worker, ends the open sessions of a removed worker, and sends the entity in the feed again. A hub that is stopped does this when it starts.
+
+To recover from a stolen client: remove that client on the hub machine, then make a new setup code with `consort hub setup-code`.
+
 ### Connect
 
 1. The worker opens `wss://<hub>/v1/worker`. A client opens `wss://<hub>/v1/client`.
@@ -122,7 +133,7 @@ A client that needs the blob endpoints sends `auth.http_token` and gets a bearer
 
 ### Hub to worker
 
-Every hub command is a request. The envelope `id` of a hub command is its command ID. The worker stores the result of each command ID for 24 hours. If the same command arrives again, the worker returns the stored result and does not run the command again. A command whose result is "None" in this table gets `ok` with an empty body.
+Every hub command is a request. The envelope `id` of a hub command is its command ID. The worker stores the result of each command ID for 8 days: the 7 days that the hub keeps a queued command, and one more day. If the same command arrives again, the worker returns the stored result and does not run the command again. A command whose result is "None" in this table gets `ok` with an empty body.
 
 | Type | Body | Result |
 |---|---|---|
@@ -132,7 +143,7 @@ Every hub command is a request. The envelope `id` of a hub command is its comman
 | `session.interrupt` | `session_id` | None |
 | `session.respond` | `session_id`, `request_id`, `answer` (`option_id` and, for a question, `text`) | None. `not_found` means that the harness has closed the request already: the hub shows the approval or decision as `canceled`, posts a notice, and lets `turn.ended` or the session state decide the task status. Any other refusal fails a task that waits on the answer, with Retry |
 | `session.stop` | `session_id`, `reason` | None |
-| `workspace.release` | `task_id`, `delete` (bool) | None. The hub sends it with `delete` true when a task is deleted, and when a resolved task is archived, to each worker that ran the task, after the `session.stop` of the task's session. It does not send it when a task is resolved, because Not done needs the workspace |
+| `workspace.release` | `task_id`, `delete` (bool) | None. The hub sends it with `delete` true when a task is deleted, when a resolved task is archived, and when its channel is deleted, to each worker that ran the task, after the `session.stop` of the task's session. It does not send it when a task is resolved, because Not done needs the workspace. After a release, the hub refuses Not done and offers Retry, which starts a new session in a new workspace. The hub refuses Retry while a release of the task still waits in a queue |
 | `item.detail` | `session_id`, `item_id` | `sha256`, `size` and `mime` of a blob with the full command output or diff |
 | `inventory.refresh` | Empty | None |
 
@@ -163,7 +174,7 @@ The `event` field of a session event is one of these objects:
 | `request.closed` | `request_id`, `outcome` | `allowed`, `denied`, `answered`, `canceled` or `expired` |
 | `usage` | `input_tokens`, `output_tokens`, `cached_tokens`, optional `cost_usd` | Totals for the session |
 | `turn.ended` | `turn_id`, `reason` (`completed`, `interrupted` or `failed`), optional `error` | |
-| `reopened` | | The worker opened the session again after the worker restarted. The hub cancels the session's pending approvals and decisions and ends an open turn as failed |
+| `reopened` | | The worker opened the session again after the worker restarted. The hub cancels the session's pending approvals and the decisions that came from a harness question. Decisions from `ask_decision` stay. The hub ends an open turn as failed, but not a turn whose `session.turn` has not gone out yet: the worker never got that turn, so the hub keeps it open and sends it |
 | `error` | `code`, `message` | |
 
 The worker answers an approval request for a tool of the `hub` MCP server itself, with the allow-once option, and does not send it, but only when the tool is in the session's last `tool.list` result. Any other approval, also one that claims the server `hub`, goes to the hub like any other approval. The hub checks its own tools. The name `hub` is kept for this server: the worker refuses a local MCP server whose name is `hub` in any case or contains `__`.
@@ -181,7 +192,7 @@ The `code` of an `error` event is one of these:
 | `start_failed` | Worker | The session could not start: the harness did not open, or the first turn failed. The state `lost` follows, and `session.start` gets an error |
 | `resume_failed` | Worker | After a worker restart, the worker could not open the session again. The state `lost` follows |
 | `harness_unresponsive` | Adapter | A turn did not end 30 s after an interrupt, or a request did not get an answer in time. The worker stopped the harness and reports the session lost |
-| `signed_out` | Adapter | A turn failed because the harness login is gone. The message says how to sign in again |
+| `signed_out` | Adapter | A turn failed, or the session could not open, because the harness login is gone. The message says how to sign in again. When the session could not open, the worker also puts the sign-in step in the `session.start` error, and the event can reach the hub after that error. The hub marks the account signed out in both cases |
 | `option_failed` | ACP adapter | The harness refused a model option, for example the model or the effort. The session goes on with the harness default |
 | `elicitation_declined` | Codex adapter | An MCP server asked for input. The worker declined it, because Consort does not support MCP elicitation yet |
 | `codex_error` | Codex adapter | Codex reported an error that it will not retry |
@@ -192,7 +203,7 @@ The `code` of an `error` event is one of these:
 
 The hub stores each `error` event as a failed item of the session. After `signed_out`, the hub also marks the account `signed_out` in the stored inventory of the worker, so placement does not choose it until the next inventory from the worker. A coordinator session on that account ends as `lost`: its turn's events go back to the queue, and placement starts a new session on another signed-in account. When no account fits, the channel gets a notice that names the account and the worker to sign in on, and the events wait for the next inventory. A failed coordinator turn on an account that the inventory shows as signed out has the same result.
 
-The `details` of an approval request has a `kind` and the fields for that kind: `command` (`command`, `cwd`), `file_change` (`paths`), `tool` (`server`, `tool`, `arguments`), `network` (`target`) or `other` (`text`). The `details` of a question has `question`, `context` and `allow_free_text`. Each option has `id`, `label`, `kind` (`allow_once`, `allow_always`, `deny_once`, `deny_always` or `choice`) and an optional `description`.
+The `details` of an approval request has a `kind` and the fields for that kind: `command` (`command`, `cwd`), `file_change` (`paths`), `tool` (`server`, `tool`, `arguments`), `network` (`target`) or `other` (`text`). Every `command` approval has its `cwd`. A Codex network approval comes as `command` details, with the command and its folder, and its summary names the host, for example "Run `git fetch` with network access to github.com". The `details` of a question has `question`, `context` and `allow_free_text`. Each option has `id`, `label`, `kind` (`allow_once`, `allow_always`, `deny_once`, `deny_always` or `choice`) and an optional `description`.
 
 The hub makes an approval for an approval request. It makes a decision with a `request_id` for a question, and it sends the answer back with `session.respond`, not as a new turn.
 
@@ -206,7 +217,11 @@ The hub makes an approval for an approval request. It makes a decision with a `r
 - When the hub ends a session that the worker can still run, it sends `session.stop`. For example: the hub marks a session `lost`, or the user retries a failed task. The hub deletes the other queued commands of that session first. Only a command that is in flight stays. When the session's `session.start` never went out, the hub deletes it and sends no `session.stop`, because the worker does not know the session.
 - Events of a session that has ended on the hub, or that is not the current session of its task (for example the old session of a retried task), are stored, but they do not change the task: a `turn.ended` does not move it and does not take its inbox, and a `request.opened` makes no approval or decision. A coordinator session that is not the current one of its channel opens no request either.
 - When the worker refuses a `session.steer`, the hub gives the text to the task in another way: while the hub sees the turn as open, the text waits in the task inbox; when the turn is closed, the text starts a new turn and a task in Ready for review goes back to Working. When the task cannot take it (it failed, or its session ended), the task thread gets a `message_not_sent` notice.
-- A task turn that sends no event for 2 hours while its worker is online fails the task with Retry, and the hub marks the session `lost`. A coordinator turn that runs for more than 2 hours makes the hub replace the session.
+- A task turn that sends no event for 2 hours while its worker is online fails the task with Retry, and the hub marks the session `lost`. The time that a task waits in Needs input does not count: an answer starts the 2 hours again. A coordinator turn that runs for more than 2 hours while its worker is online makes the hub replace the session. The time that the worker is offline does not count, because its events wait in the spool.
+- When a coordinator session ends in the middle of a turn (it is lost, the harness does not answer, or the turn expired), the events of the turn go back to the queue only when the turn called no hub tool. A turn that called one may have acted already, for example started a task, so a new session must not get the same events. The channel then gets a `turn_failed` notice that asks the user to check what the assistant did and to send the message again if something is missing.
+- When the worker refuses a `session.turn` of a task, no turn runs. A task that the message moved from Ready for review goes back to Ready for review, with a reason that asks the user to send the message again. Any other task in Working fails with Retry. When the worker refuses a coordinator turn, its events go back to the queue. The hub tries again after the start backoff below, or at once when the session sends a `turn.ended`, because the session is free then.
+- When the worker answers `session.start` with `conflict`, the worker has a session with that ID but no stored result. The hub marks the session `lost` and sends `session.stop`, so the harness does not keep running.
+- A task in Ready for review whose session ends stays in Ready for review, with a reason that says that it cannot take a message. Retry starts a new session, from Ready for review or Resolved, when the session of the task has ended. The open decisions of the old session are canceled then.
 - After a coordinator session fails to start, the channel waits before it starts a new one: 10 s after the first failure, then twice as long after each new failure, at most 10 minutes. A session that never became active does not start a new one by itself; the next wake event or a worker that comes online does.
 - While a task session has an open turn, a new message for the task steers the turn (when the worker is online and the harness can steer) or waits for the turn to end. The hub never sends a second `session.turn` while a turn is open, also not to an offline worker.
 - A coordinator turn holds as many queued events as fit in 512 KiB. The other events wait for the next turn. An event that alone does not fit is cut, with a note that names `fetch_thread` and the message ID. Task inbox messages split over turns in the same way.
@@ -275,13 +290,21 @@ The hub gives each session the tools for its role. Each tool's `input_schema` is
 | `memory_write` | `path`, `content`, `expected_sha256` or `"not_exists"` | New `sha256`, or `stale_write` |
 | `memory_delete` | `path`, `expected_sha256` | |
 | `files_write` | `path`, `content` | Text files only |
-| `start_task` | `title`, `brief`, optional `model_selection`, `worker_id`, `require`, `repos`, `isolation`, `approval_mode` and `start_at` (RFC 3339) | `task_id`, `status` and optional `status_reason` |
+| `start_task` | `title`, `brief`, optional `model_selection`, `worker_id`, `require`, `repos`, `isolation`, `approval_mode` and `start_at` (RFC 3339) | `task_id`, `status`, optional `status_reason`, and `notes` when the hub lowered the request (see below) |
 | `message_task` | `task_id`, `body` | Starts a turn, or steers the running turn when the harness can steer. `delivery` is `turn`, `steer` or `queued` |
 | `list_tasks` | optional `status` | Tasks in this channel. A brief or review summary longer than 1 KiB is cut to a preview |
 | `read_task` | `task_id`, optional `since_item_id`, `before_item_id` and `limit` | The full task, a page of its session items (oldest first) and `has_more`. The task and the items take at most 320 KiB. Without `since_item_id`, the page has the newest items, or the newest ones older than `before_item_id`, and `has_more` says that older items exist. With `since_item_id`, the page has the oldest items after it, and `has_more` says that newer items exist. The default `limit` is 50, and the limit is 200 |
 | `interrupt_task`, `retry_task` | `task_id` | |
-| `routine_list`, `routine_create`, `routine_update`, `routine_delete` | Routine fields | |
+| `routine_list`, `routine_create`, `routine_update`, `routine_delete` | Routine fields | `routine_create` and `routine_update` give `routine`, and `notes` when the hub lowered the placement of a `start_task` action |
 | `suggest_memory` | `note`, `reason` | Channel coordinators only. Sends the note to the Everything coordinator as a global memory suggestion |
+
+Text in a web page, a file or a message can steer a coordinator. So a task that a coordinator starts, with `start_task` or with a `start_task` routine, gets at most what its channel allows:
+
+- The approval mode is at most the channel's `default_approval_mode`.
+- The isolation is `in_place` only when the channel's `default_isolation` is `in_place`. Otherwise the task uses the channel's default isolation.
+- `require.local_mcp_servers` keeps only the servers in the channel's `allowed_local_mcp_servers`. The default list is empty.
+
+The hub does not refuse the task. It runs with less, the tool result lists each change in `notes`, and the task thread gets a `task_limited` notice, so the user sees it too. A task that the user starts from a client has no such limits.
 
 The Everything coordinator also has these tools:
 
@@ -367,7 +390,9 @@ A client that does not know these fields shows the preview, which ends with a no
 
 `message.send` with a `client_message_id` that the hub already stored returns the stored message. A client can retry a send without making a duplicate.
 
-In `channel.update` and `task.update`, a field that is left out does not change. For a field that can be cleared, such as `icon` or `start_at`, `null` clears it.
+In `channel.update` and `task.update`, a field that is left out does not change. For a field that can be cleared, such as `icon` or `start_at`, `null` clears it. `channel.update` also takes `allowed_local_mcp_servers`, the list of local MCP servers that a task from the assistant may use. The hub trims the names, drops copies, and refuses `hub` and names with `__`.
+
+`task.retry` works for a Failed task, and for a task in Ready for review or Resolved whose session has ended. `task.reopen` (Not done) fails with `conflict` when archive deleted the workspace of the task. Retry is the way on then.
 
 ### Push notifications
 

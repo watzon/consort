@@ -5,15 +5,39 @@
 //! client.
 
 use consort_proto::client_api::RoutineUpdate;
+use consort_proto::model::RoutineAction;
 use consort_proto::tools::{
     NoArgs, OkResult, RoutineCreateArgs, RoutineDeleteArgs, RoutineListResult, RoutineResult,
     RoutineUpdateArgs,
 };
 use serde_json::Value;
 
+use super::tasks::limit_to_channel;
 use crate::error::Result;
 use crate::hub::{Hub, ToolCtx};
-use crate::store::routines;
+use crate::store::{conversation, routines};
+
+impl Hub {
+    /// Lowers the placement of a `start_task` action to what the channel
+    /// allows for the assistant, as `start_task` does. The task of the
+    /// routine takes the approval mode of the channel when it runs.
+    async fn limit_routine_action(
+        &self,
+        ctx: &ToolCtx,
+        action: &mut RoutineAction,
+    ) -> Result<Vec<String>> {
+        let RoutineAction::StartTask { placement, .. } = action else {
+            return Ok(Vec::new());
+        };
+        let channel_id = ctx.channel.id;
+        let channel = self
+            .store
+            .read(move |conn| conversation::channel_or_404(conn, channel_id))
+            .await?;
+        let mut no_mode = None;
+        Ok(limit_to_channel(&channel, placement, &mut no_mode).for_assistant)
+    }
+}
 
 impl Hub {
     pub(crate) async fn tool_routine_list(&self, ctx: &ToolCtx, _args: NoArgs) -> Result<Value> {
@@ -30,17 +54,19 @@ impl Hub {
         ctx: &ToolCtx,
         args: RoutineCreateArgs,
     ) -> Result<Value> {
+        let mut action = args.action;
+        let notes = self.limit_routine_action(ctx, &mut action).await?;
         let routine = self
             .create_routine_in(
                 ctx.channel.id,
                 args.name,
                 args.schedule,
                 args.prompt,
-                args.action,
+                action,
                 args.enabled.unwrap_or(true),
             )
             .await?;
-        Ok(serde_json::to_value(RoutineResult { routine })?)
+        Ok(serde_json::to_value(RoutineResult { routine, notes })?)
     }
 
     pub(crate) async fn tool_routine_update(
@@ -48,16 +74,21 @@ impl Hub {
         ctx: &ToolCtx,
         args: RoutineUpdateArgs,
     ) -> Result<Value> {
+        let mut action = args.action;
+        let notes = match action.as_mut() {
+            Some(action) => self.limit_routine_action(ctx, action).await?,
+            None => Vec::new(),
+        };
         let update = RoutineUpdate {
             routine_id: args.routine_id,
             name: args.name,
             schedule: args.schedule,
             prompt: args.prompt,
-            action: args.action,
+            action,
             enabled: args.enabled,
         };
         let routine = self.update_routine_in(Some(ctx.channel.id), update).await?;
-        Ok(serde_json::to_value(RoutineResult { routine })?)
+        Ok(serde_json::to_value(RoutineResult { routine, notes })?)
     }
 
     pub(crate) async fn tool_routine_delete(

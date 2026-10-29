@@ -176,6 +176,7 @@ mod tests {
             repo_ids: vec![],
             default_isolation: Isolation::Worktree,
             default_approval_mode: ApprovalMode::Ask,
+            allowed_local_mcp_servers: Vec::new(),
             memory_enabled: true,
             archived_at: None,
             created_at: Timestamp::EPOCH,

@@ -43,7 +43,10 @@ impl Hub {
                 request.enabled,
             )
             .await?;
-        Ok(RoutineResult { routine })
+        Ok(RoutineResult {
+            routine,
+            notes: Vec::new(),
+        })
     }
 
     pub(crate) async fn routine_update(
@@ -52,7 +55,10 @@ impl Hub {
         request: RoutineUpdate,
     ) -> Result<RoutineResult> {
         let routine = self.update_routine_in(None, request).await?;
-        Ok(RoutineResult { routine })
+        Ok(RoutineResult {
+            routine,
+            notes: Vec::new(),
+        })
     }
 
     pub(crate) async fn routine_delete(

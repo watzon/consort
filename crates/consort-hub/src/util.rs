@@ -42,6 +42,16 @@ pub fn random_token() -> String {
     hex_encode(&random_bytes::<32>())
 }
 
+/// Opens a new file for writing that only the user can read: mode 0600 on
+/// Unix. A file that exists is cut to zero bytes.
+pub async fn create_private_file(path: &std::path::Path) -> std::io::Result<tokio::fs::File> {
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    options.open(path).await
+}
+
 /// Cuts text to at most `max_chars` characters and adds an ellipsis.
 pub fn truncate_chars(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {

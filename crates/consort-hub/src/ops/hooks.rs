@@ -5,9 +5,7 @@ use consort_proto::ids::{ChannelId, RoutineId};
 use consort_proto::model::{ApprovalMode, ModelSelection, PlacementRequest, TaskCreator};
 use consort_proto::time::Timestamp;
 
-use crate::error::Result;
 use crate::hub::Hub;
-use consort_proto::worker_link::{HubToWorker, SessionStop};
 
 /// The input of [`Hub::create_task`].
 #[derive(Debug, Clone)]
@@ -29,42 +27,5 @@ impl Hub {
     /// It never blocks and never fails.
     pub(crate) fn kick_coordinator(&self, channel_id: ChannelId) {
         self.coordinators.kick(self, channel_id);
-    }
-
-    /// Stops every session of a channel. Call it before you delete the
-    /// channel. The stop commands wait in the queue when a worker is offline.
-    pub(crate) async fn stop_channel_sessions(&self, channel_id: ChannelId) -> Result<()> {
-        let workers = self
-            .store
-            .write(move |tx| {
-                let sessions: Vec<_> = {
-                    let mut stmt = tx.db().prepare(
-                        "SELECT data FROM sessions WHERE channel_id = ?1 AND state NOT IN ('ended', 'lost')",
-                    )?;
-                    let rows = stmt.query_map([channel_id.to_string()], |row| row.get::<_, String>(0))?;
-                    let mut out = Vec::new();
-                    for row in rows {
-                        out.push(serde_json::from_str::<consort_proto::model::Session>(&row?)?);
-                    }
-                    out
-                };
-                let mut workers = Vec::new();
-                for session in sessions {
-                    tx.queue_command(
-                        session.worker_id,
-                        &HubToWorker::SessionStop(SessionStop {
-                            session_id: session.id,
-                            reason: "The channel was removed.".to_owned(),
-                        }),
-                    )?;
-                    workers.push(session.worker_id);
-                }
-                Ok(workers)
-            })
-            .await?;
-        for worker_id in workers {
-            self.pump_worker(worker_id);
-        }
-        Ok(())
     }
 }

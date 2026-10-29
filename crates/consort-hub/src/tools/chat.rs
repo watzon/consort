@@ -17,6 +17,7 @@ use consort_proto::tools::*;
 use consort_proto::turn_input::WakeEvent;
 use rusqlite::Connection;
 use serde_json::Value;
+use tokio::io::AsyncWriteExt;
 
 use crate::api::to_value;
 use crate::error::{HubError, Result};
@@ -220,10 +221,15 @@ async fn store_blob(blobs_dir: &Path, hash: &Sha256Hash, bytes: &[u8]) -> Result
         return Ok(());
     }
     let temp = blobs_dir.join(format!(".{hash}.{}.tmp", hex_encode(&random_bytes::<8>())));
-    let written = match tokio::fs::write(&temp, bytes).await {
-        Ok(()) => tokio::fs::rename(&temp, &target).await,
-        Err(err) => Err(err),
-    };
+    let written = async {
+        // Only the user can read a blob. The rename keeps the mode.
+        let mut file = crate::util::create_private_file(&temp).await?;
+        file.write_all(bytes).await?;
+        file.flush().await?;
+        drop(file);
+        tokio::fs::rename(&temp, &target).await
+    }
+    .await;
     if let Err(err) = written {
         // Best effort: the temp file may not exist.
         let _ = tokio::fs::remove_file(&temp).await;

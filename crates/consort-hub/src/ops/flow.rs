@@ -172,7 +172,7 @@ fn deliver(
     let session = work::session_or_404(tx.db(), session_id)?;
     if session.role != SessionRole::Task || session.state.is_final() {
         return Err(HubError::conflict(
-            "The session of this task has ended, so it cannot take a message. Start a new task for this work.",
+            "The session of this task has ended, so it cannot take a message. Retry the task to start a new session, then send the message.",
         ));
     }
     let mut runtime = work::session_runtime(tx.db(), session_id)?;
@@ -214,6 +214,8 @@ fn deliver(
             &HubToWorker::SessionTurn(SessionTurn { session_id, turn }),
         )?;
         runtime.turn_open = true;
+        // A refused turn sends the task back where it came from.
+        runtime.turn_from_review = status_changed;
         runtime.active_at = Some(tx.now());
         if online {
             MessageDelivery::Turn

@@ -162,6 +162,10 @@ impl Hub {
 /// When the last waiting approval or decision of a task closes, the task
 /// goes from Needs input back to Working. Working does not wake a
 /// coordinator, so the caller has nothing more to do.
+///
+/// The time with the user does not count for the quiet-turn check, so the
+/// session's `active_at` starts again now. Without this, an answer after
+/// more than 2 hours would let the check fail the task at once.
 pub(crate) fn resume_if_nothing_waits(
     tx: &mut crate::store::Tx<'_>,
     task_id: Option<consort_proto::ids::TaskId>,
@@ -181,6 +185,11 @@ pub(crate) fn resume_if_nothing_waits(
             None,
         )?;
         tx.save_task(&task)?;
+        if let Some(session_id) = task.current_session_id {
+            let mut runtime = work::session_runtime(tx.db(), session_id)?;
+            runtime.active_at = Some(tx.now());
+            tx.save_session_runtime(session_id, &runtime)?;
+        }
     }
     Ok(())
 }

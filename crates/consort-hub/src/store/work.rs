@@ -84,7 +84,45 @@ pub fn task_by_session(conn: &Connection, session_id: SessionId) -> Result<Optio
     )
 }
 
+/// Whether the hub asked the workers to delete the workspace of a task, for
+/// example when the user archived it after it was resolved.
+pub fn task_workspace_released(conn: &Connection, task_id: TaskId) -> Result<bool> {
+    let at: Option<Option<i64>> = conn
+        .query_row(
+            "SELECT workspace_released_at FROM tasks WHERE id = ?1",
+            [task_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(at.flatten().is_some())
+}
+
+/// Whether a `workspace.release` for a task still waits in the queue of a
+/// worker.
+pub fn task_release_queued(conn: &Connection, task_id: TaskId) -> Result<bool> {
+    let found: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM commands WHERE kind = 'workspace.release'
+             AND json_extract(body, '$.task_id') = ?1 LIMIT 1",
+            [task_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(found.is_some())
+}
+
 impl Tx<'_> {
+    /// Records that the workspace of a task was released, or clears the
+    /// record. The task row in the feed does not change.
+    pub fn set_task_workspace_released(&mut self, task_id: TaskId, released: bool) -> Result<()> {
+        let at = released.then(|| self.now().as_millis());
+        self.db().execute(
+            "UPDATE tasks SET workspace_released_at = ?2 WHERE id = ?1",
+            params![task_id.to_string(), at],
+        )?;
+        Ok(())
+    }
+
     pub fn save_task(&mut self, task: &Task) -> Result<()> {
         self.db().execute(
             "INSERT INTO tasks (id, channel_id, status, card_id, session_id, start_at, archived_at, data)
@@ -240,6 +278,15 @@ pub fn task_sessions_with_open_turn(conn: &Connection) -> Result<Vec<(Session, S
     Ok(out)
 }
 
+/// Sessions of a channel that are not ended or lost, oldest first.
+pub fn open_sessions_of_channel(conn: &Connection, channel_id: ChannelId) -> Result<Vec<Session>> {
+    list_docs(
+        conn,
+        "SELECT data FROM sessions WHERE channel_id = ?1 AND state NOT IN ('ended', 'lost') ORDER BY rowid",
+        [channel_id.to_string()],
+    )
+}
+
 /// Sessions of a task, oldest first.
 pub fn sessions_of_task(conn: &Connection, task_id: TaskId) -> Result<Vec<Session>> {
     list_docs(
@@ -267,35 +314,39 @@ pub struct SessionRuntime {
     /// The last sign of life of the session: an event batch, or a turn that
     /// the hub opened. The stuck-turn check of task sessions reads it.
     pub active_at: Option<Timestamp>,
+    /// True while the open turn is one that the hub opened when it moved the
+    /// task from Ready for review back to Working. A refused turn then moves
+    /// the task back to Ready for review.
+    pub turn_from_review: bool,
 }
 
 pub fn session_runtime(conn: &Connection, id: SessionId) -> Result<SessionRuntime> {
     let row = conn
         .query_row(
-            "SELECT turn_id, turn_open, last_assistant_text, tools_called, review_summary, prompt_fingerprint, active_at
+            "SELECT turn_id, turn_open, last_assistant_text, tools_called, review_summary, prompt_fingerprint, active_at, turn_from_review
              FROM session_runtime WHERE session_id = ?1",
             [id.to_string()],
             |row| {
                 Ok((
-                    row.get::<_, Option<String>>(0)?,
-                    row.get::<_, bool>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, Option<String>>(4)?,
-                    row.get::<_, Option<String>>(5)?,
-                    row.get::<_, Option<i64>>(6)?,
+                    (
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, bool>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, String>(3)?,
+                    ),
+                    (
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<i64>>(6)?,
+                        row.get::<_, bool>(7)?,
+                    ),
                 ))
             },
         )
         .optional()?;
     let Some((
-        turn_id,
-        turn_open,
-        last_assistant_text,
-        tools_called,
-        review_summary,
-        prompt_fingerprint,
-        active_at,
+        (turn_id, turn_open, last_assistant_text, tools_called),
+        (review_summary, prompt_fingerprint, active_at, turn_from_review),
     )) = row
     else {
         return Ok(SessionRuntime::default());
@@ -308,6 +359,7 @@ pub fn session_runtime(conn: &Connection, id: SessionId) -> Result<SessionRuntim
         review_summary,
         prompt_fingerprint,
         active_at: active_at.map(Timestamp::from_millis),
+        turn_from_review,
     })
 }
 
@@ -339,12 +391,13 @@ impl Tx<'_> {
 
     pub fn save_session_runtime(&mut self, id: SessionId, runtime: &SessionRuntime) -> Result<()> {
         self.db().execute(
-            "INSERT INTO session_runtime (session_id, turn_id, turn_open, last_assistant_text, tools_called, review_summary, prompt_fingerprint, active_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "INSERT INTO session_runtime (session_id, turn_id, turn_open, last_assistant_text, tools_called, review_summary, prompt_fingerprint, active_at, turn_from_review)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(session_id) DO UPDATE SET turn_id = excluded.turn_id,
                 turn_open = excluded.turn_open, last_assistant_text = excluded.last_assistant_text,
                 tools_called = excluded.tools_called, review_summary = excluded.review_summary,
-                prompt_fingerprint = excluded.prompt_fingerprint, active_at = excluded.active_at",
+                prompt_fingerprint = excluded.prompt_fingerprint, active_at = excluded.active_at,
+                turn_from_review = excluded.turn_from_review",
             params![
                 id.to_string(),
                 runtime.turn_id.as_ref().map(|t| t.as_str().to_owned()),
@@ -353,7 +406,8 @@ impl Tx<'_> {
                 serde_json::to_string(&runtime.tools_called)?,
                 runtime.review_summary,
                 runtime.prompt_fingerprint,
-                runtime.active_at.map(|t| t.as_millis())
+                runtime.active_at.map(|t| t.as_millis()),
+                runtime.turn_from_review
             ],
         )?;
         Ok(())
@@ -610,6 +664,15 @@ pub fn pending_for_session(
             [&key],
         )?,
     ))
+}
+
+/// Pending decisions of one task, from any of its sessions.
+pub fn pending_decisions_of_task(conn: &Connection, task_id: TaskId) -> Result<Vec<Decision>> {
+    list_docs(
+        conn,
+        "SELECT data FROM decisions WHERE task_id = ?1 AND status = 'pending' ORDER BY rowid",
+        [task_id.to_string()],
+    )
 }
 
 impl Tx<'_> {

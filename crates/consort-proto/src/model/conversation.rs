@@ -66,8 +66,14 @@ pub struct Channel {
     pub repo_ids: Vec<RepoId>,
     /// The default isolation for new tasks.
     pub default_isolation: Isolation,
-    /// The default approval mode for new tasks.
+    /// The default approval mode for new tasks. It is also the most that the
+    /// assistant can give a task that it starts.
     pub default_approval_mode: ApprovalMode,
+    /// The local MCP servers, by name, that a task that the assistant starts
+    /// may use. The default is none. A task that the user starts is not
+    /// limited by this list.
+    #[serde(default)]
+    pub allowed_local_mcp_servers: Vec<String>,
     /// Whether the channel has its own memory.
     pub memory_enabled: bool,
     /// When the channel was archived.

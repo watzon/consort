@@ -149,8 +149,9 @@ impl TaskStatus {
             // The session was lost, the harness failed, or the fixed worker
             // was removed.
             (UpNext | Working | NeedsInput | Review, Failed) => &[System],
-            // Retry.
-            (Failed, UpNext) => &[User, Coordinator],
+            // Retry. From Ready for review and Resolved, the hub allows it
+            // only when the session of the task has ended.
+            (Failed | Review | Resolved, UpNext) => &[User, Coordinator],
             _ => &[],
         }
     }
@@ -279,6 +280,9 @@ mod tests {
         (NeedsInput, Failed, &[System]),
         (Review, Failed, &[System]),
         (Failed, UpNext, &[User, Coordinator]),
+        // Retry after the session of the task ended. The hub checks that.
+        (Review, UpNext, &[User, Coordinator]),
+        (Resolved, UpNext, &[User, Coordinator]),
     ];
 
     #[test]

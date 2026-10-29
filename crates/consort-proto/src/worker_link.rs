@@ -36,8 +36,14 @@ pub const OUTPUT_DELTA_INTERVAL_MS: u64 = 250;
 pub const PING_INTERVAL_SECS: u64 = 20;
 /// The hub marks a worker offline after this many seconds with no frames.
 pub const OFFLINE_AFTER_SECS: u64 = 60;
-/// How long the worker keeps a command result, in milliseconds (24 hours).
-pub const COMMAND_RESULT_TTL_MS: i64 = 24 * 60 * 60 * 1_000;
+/// How long the worker keeps a command result, in milliseconds (8 days):
+/// the 7 days that the hub keeps a queued command
+/// ([`QUEUED_COMMAND_TTL_MS`]), and one more day. So a command that the hub
+/// sends again always finds its stored result and never runs twice.
+pub const COMMAND_RESULT_TTL_MS: i64 = QUEUED_COMMAND_TTL_MS + 24 * 60 * 60 * 1_000;
+
+// A stored result must outlive every resend of its command.
+const _: () = assert!(COMMAND_RESULT_TTL_MS > QUEUED_COMMAND_TTL_MS);
 /// How long the hub keeps a queued command for an offline worker, in
 /// milliseconds (7 days).
 pub const QUEUED_COMMAND_TTL_MS: i64 = 7 * 24 * 60 * 60 * 1_000;

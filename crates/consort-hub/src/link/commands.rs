@@ -338,6 +338,17 @@ fn apply_command_result(
             tracing::warn!(kind = other.type_name(), %error, "a worker refused a command");
             Ok(Effects::default())
         }
+        (HubToWorker::SessionTurn(turn), Ok(_)) => {
+            // A coordinator turn that the worker took ends the backoff of
+            // refused turns.
+            let mut fx = Effects::default();
+            if let Some(session) = crate::store::work::session(tx.db(), turn.session_id)?
+                && session.role == consort_proto::model::SessionRole::Coordinator
+            {
+                fx.start_ok.push(session.channel_id);
+            }
+            Ok(fx)
+        }
         (_, Ok(_)) => Ok(Effects::default()),
     }
 }

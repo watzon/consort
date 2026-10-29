@@ -68,6 +68,41 @@ enum HubCommand {
         #[arg(long)]
         data: Option<PathBuf>,
     },
+    /// List or remove the clients of the hub. Works while the hub runs.
+    ///
+    /// Use it when a client key is lost or stolen: remove that client
+    /// first, then make a new setup code. Removing a client also cancels
+    /// the pairing codes that it made.
+    Client {
+        #[command(subcommand)]
+        command: PairedCommand,
+    },
+    /// List or remove the workers of the hub. Works while the hub runs.
+    Worker {
+        #[command(subcommand)]
+        command: PairedCommand,
+    },
+}
+
+/// What to do with the paired clients or workers.
+#[derive(Subcommand)]
+enum PairedCommand {
+    /// Show each one with its ID, who paired it and whether it was removed.
+    List {
+        /// The data folder of the hub.
+        #[arg(long)]
+        data: Option<PathBuf>,
+    },
+    /// Remove one by its ID. It can no longer connect. A running hub
+    /// closes its connection within a few seconds.
+    Revoke {
+        /// The ID from `list`, for example cli_0192f0c4-... or
+        /// wrk_0192f0c4-....
+        id: String,
+        /// The data folder of the hub.
+        #[arg(long)]
+        data: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -254,16 +289,149 @@ fn pairing_code(given: Option<String>, input: &mut dyn BufRead) -> Result<String
     Ok(code.to_owned())
 }
 
+/// The text for who paired or removed a client or a worker.
+fn origin_text(origin: Option<consort_hub::admin::Origin>) -> String {
+    origin.map_or_else(|| "unknown".to_owned(), |o| o.to_string())
+}
+
+/// One line per client, with what the user needs to choose one to remove.
+fn client_lines(records: &[consort_hub::admin::ClientRecord]) -> Vec<String> {
+    records
+        .iter()
+        .map(|r| {
+            let c = &r.client;
+            let kind = match c.kind {
+                consort_proto::model::ClientKind::Desktop => "desktop",
+                consort_proto::model::ClientKind::Ios => "iOS",
+                consort_proto::model::ClientKind::Android => "Android",
+            };
+            let mut line = format!(
+                "{}  {}  ({kind})  paired {} by {}",
+                c.id,
+                c.name,
+                c.paired_at,
+                origin_text(r.paired_by)
+            );
+            match c.last_seen_at {
+                Some(at) => line.push_str(&format!(", last seen {at}")),
+                None => line.push_str(", never connected"),
+            }
+            if let Some(at) = c.revoked_at {
+                line.push_str(&format!(", removed {at} by {}", origin_text(r.revoked_by)));
+            }
+            line
+        })
+        .collect()
+}
+
+/// One line per worker, with what the user needs to choose one to remove.
+fn worker_lines(records: &[consort_hub::admin::WorkerRecord]) -> Vec<String> {
+    records
+        .iter()
+        .map(|r| {
+            let w = &r.worker;
+            let mut line = format!(
+                "{}  {}  (host {})  paired {} by {}",
+                w.id,
+                w.name,
+                w.hostname,
+                w.paired_at,
+                origin_text(r.paired_by)
+            );
+            match w.last_seen_at {
+                Some(at) => line.push_str(&format!(", last seen {at}")),
+                None => line.push_str(", never connected"),
+            }
+            if let Some(at) = w.revoked_at {
+                line.push_str(&format!(", removed {at} by {}", origin_text(r.revoked_by)));
+            }
+            line
+        })
+        .collect()
+}
+
+/// A hub error as one line. Its source repeats the same text.
+fn one_line(err: consort_hub::HubError) -> anyhow::Error {
+    anyhow::anyhow!("{err}")
+}
+
+fn hub_data(given: Option<PathBuf>, fallback: Option<PathBuf>) -> Result<PathBuf> {
+    match given.or(fallback) {
+        Some(d) => Ok(d),
+        None => default_hub_dir(),
+    }
+}
+
+/// Runs `consort hub client ...` or `consort hub worker ...`.
+fn run_paired(clients: bool, command: PairedCommand, fallback: Option<PathBuf>) -> Result<()> {
+    let what = if clients { "client" } else { "worker" };
+    match command {
+        PairedCommand::List { data } => {
+            let data = hub_data(data, fallback)?;
+            let lines = if clients {
+                client_lines(
+                    &consort_hub::admin::list_clients(&data)
+                        .map_err(one_line)
+                        .context("could not read the clients")?,
+                )
+            } else {
+                worker_lines(
+                    &consort_hub::admin::list_workers(&data)
+                        .map_err(one_line)
+                        .context("could not read the workers")?,
+                )
+            };
+            if lines.is_empty() {
+                println!("The hub has no {what}s.");
+            }
+            for line in lines {
+                println!("{line}");
+            }
+        }
+        PairedCommand::Revoke { id, data } => {
+            let data = hub_data(data, fallback)?;
+            let removed = if clients {
+                let id = id.trim().parse().with_context(|| {
+                    format!("{id} is not a client ID. Copy an ID from `consort hub client list`")
+                })?;
+                consort_hub::admin::revoke_client(&data, id)
+                    .map_err(one_line)
+                    .context("could not remove the client")?
+            } else {
+                let id = id.trim().parse().with_context(|| {
+                    format!("{id} is not a worker ID. Copy an ID from `consort hub worker list`")
+                })?;
+                consort_hub::admin::revoke_worker(&data, id)
+                    .map_err(one_line)
+                    .context("could not remove the worker")?
+            };
+            if removed.already {
+                println!("The {what} {} was removed already.", removed.name);
+            } else {
+                println!("Removed the {what} {}.", removed.name);
+                println!("A running hub closes its connection within a few seconds.");
+            }
+            if clients {
+                println!("To pair a client again, run `consort hub setup-code`.");
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn run_hub(args: HubArgs) -> Result<()> {
-    if let Some(HubCommand::SetupCode { data }) = args.command {
-        let data = match data.or(args.data) {
-            Some(d) => d,
-            None => default_hub_dir()?,
-        };
-        let code = consort_hub::create_setup_code(&data).context("could not make a setup code")?;
-        println!("Client setup code: {code}");
-        println!("It works once and is valid for 10 minutes.");
-        return Ok(());
+    match args.command {
+        Some(HubCommand::SetupCode { data }) => {
+            let data = hub_data(data, args.data)?;
+            let code =
+                consort_hub::create_setup_code(&data).context("could not make a setup code")?;
+            println!("Client setup code: {code}");
+            println!("It works once and is valid for 10 minutes.");
+            return Ok(());
+        }
+        Some(HubCommand::Client { command }) => return run_paired(true, command, args.data),
+        Some(HubCommand::Worker { command }) => return run_paired(false, command, args.data),
+        None => {}
     }
     let data = match args.data {
         Some(d) => d,
@@ -465,6 +633,33 @@ mod tests {
                 ..
             })
         ));
+        let cli =
+            Cli::try_parse_from(["consort", "hub", "client", "list", "--data", "/tmp/x"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Hub(HubArgs {
+                command: Some(HubCommand::Client {
+                    command: PairedCommand::List { .. }
+                }),
+                ..
+            })
+        ));
+        let cli = Cli::try_parse_from(["consort", "hub", "worker", "revoke", "wrk_1"]).unwrap();
+        let Command::Hub(HubArgs {
+            command:
+                Some(HubCommand::Worker {
+                    command: PairedCommand::Revoke { id, .. },
+                }),
+            ..
+        }) = cli.command
+        else {
+            panic!("expected hub worker revoke")
+        };
+        assert_eq!(id, "wrk_1");
+        assert!(
+            Cli::try_parse_from(["consort", "hub", "client", "revoke"]).is_err(),
+            "revoke needs an ID"
+        );
         let cli = Cli::try_parse_from(["consort", "hub"]).unwrap();
         let Command::Hub(args) = cli.command else {
             panic!("expected hub")

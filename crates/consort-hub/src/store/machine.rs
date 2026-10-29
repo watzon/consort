@@ -13,6 +13,51 @@ use super::{Tx, get_doc, list_docs, to_doc};
 use crate::error::{HubError, Result};
 use crate::util::pairing_code_hash;
 
+/// Who made a pairing code, or who removed a client or a worker: a paired
+/// client, or a command on the hub machine (`consort hub ...`, the setup
+/// code at the first start, or the dev mode).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Origin {
+    /// A paired client, through the client API.
+    Client(ClientId),
+    /// A command on the hub machine.
+    HubMachine,
+}
+
+/// The stored text of [`Origin::HubMachine`].
+const HUB_MACHINE: &str = "hub";
+
+impl Origin {
+    fn as_text(self) -> String {
+        match self {
+            Self::Client(id) => id.to_string(),
+            Self::HubMachine => HUB_MACHINE.to_owned(),
+        }
+    }
+
+    fn from_text(text: &str) -> Option<Self> {
+        if text == HUB_MACHINE {
+            return Some(Self::HubMachine);
+        }
+        text.parse().ok().map(Self::Client)
+    }
+}
+
+impl std::fmt::Display for Origin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Client(id) => write!(f, "{id}"),
+            Self::HubMachine => f.write_str("the hub machine"),
+        }
+    }
+}
+
+/// Reads an optional origin column. Text that is not an origin reads as
+/// unknown.
+fn origin_column(text: Option<String>) -> Option<Origin> {
+    text.as_deref().and_then(Origin::from_text)
+}
+
 // Workers ----------------------------------------------------------------
 
 pub fn worker(conn: &Connection, id: WorkerId) -> Result<Option<Worker>> {
@@ -37,7 +82,86 @@ pub fn workers(conn: &Connection) -> Result<Vec<Worker>> {
     list_docs(conn, "SELECT data FROM workers ORDER BY rowid", [])
 }
 
+/// The IDs of the workers that were removed.
+pub fn revoked_worker_ids(conn: &Connection) -> Result<Vec<WorkerId>> {
+    let mut stmt =
+        conn.prepare_cached("SELECT id FROM workers WHERE revoked_at IS NOT NULL ORDER BY rowid")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?.parse()?);
+    }
+    Ok(out)
+}
+
+/// A worker with who paired it and who removed it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkerRecord {
+    pub worker: Worker,
+    /// Who made the pairing code that the worker used. Empty when the hub
+    /// does not know, for a worker that paired before the hub recorded it.
+    pub paired_by: Option<Origin>,
+    /// Who removed the worker. Empty while it is paired, or when the hub
+    /// does not know.
+    pub revoked_by: Option<Origin>,
+}
+
+/// Every worker with its records, revoked ones included, in pairing order.
+pub fn worker_records(conn: &Connection) -> Result<Vec<WorkerRecord>> {
+    let mut stmt =
+        conn.prepare_cached("SELECT data, paired_by, revoked_by FROM workers ORDER BY rowid")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, Option<String>>(2)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (data, paired_by, revoked_by) = row?;
+        out.push(WorkerRecord {
+            worker: super::parse_doc(&data)?,
+            paired_by: origin_column(paired_by),
+            revoked_by: origin_column(revoked_by),
+        });
+    }
+    Ok(out)
+}
+
 impl Tx<'_> {
+    /// Records who made the pairing code that a new worker used.
+    pub fn set_worker_paired_by(&mut self, id: WorkerId, by: Option<Origin>) -> Result<()> {
+        self.db().execute(
+            "UPDATE workers SET paired_by = ?2 WHERE id = ?1",
+            params![id.to_string(), by.map(Origin::as_text)],
+        )?;
+        Ok(())
+    }
+
+    /// Removes a worker: it can no longer connect, and its queued commands
+    /// go, because nothing can reach it. Returns the worker, and whether it
+    /// was paired until now. The caller ends the open sessions of the
+    /// worker and closes its link.
+    pub fn revoke_worker(&mut self, id: WorkerId, by: Origin) -> Result<(Worker, bool)> {
+        let mut worker = worker_or_404(self.db(), id)?;
+        let newly = worker.revoked_at.is_none();
+        if newly {
+            worker.revoked_at = Some(self.now());
+            worker.state = WorkerState::Offline;
+            self.save_worker(&worker)?;
+            self.db().execute(
+                "UPDATE workers SET revoked_by = ?2 WHERE id = ?1",
+                params![id.to_string(), by.as_text()],
+            )?;
+        }
+        self.db().execute(
+            "DELETE FROM commands WHERE worker_id = ?1",
+            [id.to_string()],
+        )?;
+        Ok((worker, newly))
+    }
+
     pub fn save_worker(&mut self, worker: &Worker) -> Result<()> {
         self.db().execute(
             "INSERT INTO workers (id, revoked_at, data) VALUES (?1, ?2, ?3)
@@ -108,7 +232,89 @@ pub fn client_push(conn: &Connection, id: ClientId) -> Result<Option<(PushProvid
     Ok(Some((provider, token)))
 }
 
+/// The IDs of the clients that were removed.
+pub fn revoked_client_ids(conn: &Connection) -> Result<Vec<ClientId>> {
+    let mut stmt =
+        conn.prepare_cached("SELECT id FROM clients WHERE revoked_at IS NOT NULL ORDER BY rowid")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?.parse()?);
+    }
+    Ok(out)
+}
+
+/// A client with who paired it and who removed it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClientRecord {
+    pub client: Client,
+    /// Who made the pairing code that the client used. Empty when the hub
+    /// does not know, for a client that paired before the hub recorded it.
+    pub paired_by: Option<Origin>,
+    /// Who removed the client. Empty while it is paired, or when the hub
+    /// does not know.
+    pub revoked_by: Option<Origin>,
+}
+
+/// Every client with its records, revoked ones included, in pairing order.
+pub fn client_records(conn: &Connection) -> Result<Vec<ClientRecord>> {
+    let mut stmt =
+        conn.prepare_cached("SELECT data, paired_by, revoked_by FROM clients ORDER BY rowid")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, Option<String>>(2)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (data, paired_by, revoked_by) = row?;
+        out.push(ClientRecord {
+            client: super::parse_doc(&data)?,
+            paired_by: origin_column(paired_by),
+            revoked_by: origin_column(revoked_by),
+        });
+    }
+    Ok(out)
+}
+
 impl Tx<'_> {
+    /// Records who made the pairing code that a new client used.
+    pub fn set_client_paired_by(&mut self, id: ClientId, by: Option<Origin>) -> Result<()> {
+        self.db().execute(
+            "UPDATE clients SET paired_by = ?2 WHERE id = ?1",
+            params![id.to_string(), by.map(Origin::as_text)],
+        )?;
+        Ok(())
+    }
+
+    /// Removes a client and cancels the pairing codes that it made and that
+    /// were not used yet. Returns the client, and whether it was paired
+    /// until now. The caller closes its connections.
+    pub fn revoke_client(&mut self, id: ClientId, by: Origin) -> Result<(Client, bool)> {
+        let mut client = client(self.db(), id)?.ok_or_else(|| {
+            HubError::not_found(format!(
+                "No client has the ID {id}. Check the ID in the list of clients."
+            ))
+        })?;
+        let newly = client.revoked_at.is_none();
+        if newly {
+            client.revoked_at = Some(self.now());
+            self.save_client(&client)?;
+            self.db().execute(
+                "UPDATE clients SET revoked_by = ?2 WHERE id = ?1",
+                params![id.to_string(), by.as_text()],
+            )?;
+        }
+        // Also when it was removed before version 3 recorded the codes.
+        self.db().execute(
+            "DELETE FROM pairing_codes WHERE created_by = ?1 AND used_at IS NULL",
+            [Origin::Client(id).as_text()],
+        )?;
+        Ok((client, newly))
+    }
+
     pub fn save_client(&mut self, client: &Client) -> Result<()> {
         self.db().execute(
             "INSERT INTO clients (id, revoked_at, data) VALUES (?1, ?2, ?3)
@@ -154,21 +360,46 @@ impl PairingKind {
     }
 }
 
-/// Stores the hash of a pairing code. Works on any connection, so
-/// `create_setup_code` can run beside a hub.
+/// Stores the hash of a pairing code, with who made it. Works on any
+/// connection, so `create_setup_code` can run beside a hub.
 pub fn insert_pairing_code(
     conn: &Connection,
     kind: PairingKind,
     code: &PairingCode,
     now: Timestamp,
     ttl_ms: i64,
+    created_by: Origin,
 ) -> Result<Timestamp> {
     let expires = now.plus_millis(ttl_ms);
     conn.execute(
-        "INSERT INTO pairing_codes (code_hash, kind, created_at, expires_at) VALUES (?1, ?2, ?3, ?4)",
-        params![pairing_code_hash(code), kind.as_str(), now.as_millis(), expires.as_millis()],
+        "INSERT INTO pairing_codes (code_hash, kind, created_at, expires_at, created_by)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![
+            pairing_code_hash(code),
+            kind.as_str(),
+            now.as_millis(),
+            expires.as_millis(),
+            created_by.as_text()
+        ],
     )?;
     Ok(expires)
+}
+
+/// Who made a pairing code. Empty for an unknown code, or a code from
+/// before the hub recorded it.
+pub fn pairing_code_origin(
+    conn: &Connection,
+    kind: PairingKind,
+    code: &PairingCode,
+) -> Result<Option<Origin>> {
+    let text: Option<Option<String>> = conn
+        .query_row(
+            "SELECT created_by FROM pairing_codes WHERE code_hash = ?1 AND kind = ?2",
+            params![pairing_code_hash(code), kind.as_str()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(origin_column(text.flatten()))
 }
 
 /// Whether a pairing code can be used now. It only reads, so the hub can
@@ -400,6 +631,7 @@ mod tests {
                     &stored,
                     issued,
                     PAIRING_CODE_TTL_MS,
+                    Origin::HubMachine,
                 )
                 .map(|_| ())
             })

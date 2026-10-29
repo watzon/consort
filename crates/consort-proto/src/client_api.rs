@@ -580,6 +580,10 @@ pub struct ChannelUpdate {
     /// The new default approval mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_approval_mode: Option<ApprovalMode>,
+    /// The new list of local MCP servers that a task that the assistant
+    /// starts may use. An empty list allows none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_local_mcp_servers: Option<Vec<String>>,
     /// Turn channel memory on or off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_enabled: Option<bool>,
@@ -602,6 +606,7 @@ impl ChannelUpdate {
             repo_ids: None,
             default_isolation: None,
             default_approval_mode: None,
+            allowed_local_mcp_servers: None,
             memory_enabled: None,
         }
     }
@@ -2132,6 +2137,7 @@ mod tests {
             repo_ids: vec![],
             default_isolation: Isolation::Worktree,
             default_approval_mode: ApprovalMode::Ask,
+            allowed_local_mcp_servers: vec!["home-assistant".into()],
             memory_enabled: true,
             archived_at: None,
             created_at: Timestamp::from_millis(0),
@@ -2145,5 +2151,42 @@ mod tests {
         let back: FeedEntry =
             serde_json::from_str(&serde_json::to_string(&entry).unwrap()).unwrap();
         assert_eq!(back, entry);
+    }
+
+    /// A channel from a hub before `allowed_local_mcp_servers` allows none,
+    /// and an update that leaves the list out does not send it.
+    #[test]
+    fn an_old_channel_payload_allows_no_local_mcp_server() {
+        let mut value = serde_json::to_value(Channel {
+            id: chn(),
+            kind: ChannelKind::Standard,
+            name: "Home".into(),
+            icon: None,
+            color: None,
+            group_id: None,
+            position: 0,
+            purpose: String::new(),
+            instructions: String::new(),
+            coordinator_selection: None,
+            task_selection: None,
+            preferred_workers: vec![],
+            repo_ids: vec![],
+            default_isolation: Isolation::Worktree,
+            default_approval_mode: ApprovalMode::Ask,
+            allowed_local_mcp_servers: vec!["home-assistant".into()],
+            memory_enabled: true,
+            archived_at: None,
+            created_at: Timestamp::from_millis(0),
+            updated_at: Timestamp::from_millis(0),
+        })
+        .unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("allowed_local_mcp_servers");
+        let old: Channel = serde_json::from_value(value).unwrap();
+        assert!(old.allowed_local_mcp_servers.is_empty());
+        let update = serde_json::to_value(ChannelUpdate::new(chn())).unwrap();
+        assert!(update.get("allowed_local_mcp_servers").is_none());
     }
 }

@@ -72,12 +72,13 @@ impl HandshakeSlots {
     pub(crate) fn try_take(&self, ip: IpAddr) -> Option<HandshakeSlot> {
         let address = crate::net::pairing::limit_key(ip);
         let mut map = self.by_address.lock().ok()?;
-        let count = map.entry(address).or_insert(0);
-        if *count >= MAX_PENDING_HANDSHAKES_PER_ADDRESS {
+        if map.get(&address).copied().unwrap_or(0) >= MAX_PENDING_HANDSHAKES_PER_ADDRESS {
             return None;
         }
+        // The global slot comes first. A refused address must not leave an
+        // entry in the map, because only a slot that drops removes one.
         let permit = self.all.clone().try_acquire_owned().ok()?;
-        *count += 1;
+        *map.entry(address).or_insert(0) += 1;
         Some(HandshakeSlot {
             _all: permit,
             address,
@@ -450,6 +451,31 @@ mod tests {
         assert!(slots.try_take("203.0.113.9".parse().unwrap()).is_some());
         // Refused tries did not leave counts behind.
         assert!(slots.by_address.lock().unwrap().len() <= 1);
+    }
+
+    /// Review 3, S8: while the 64 slots were full, each refused new address
+    /// stayed in the map with a count of zero, and nothing removed it.
+    #[test]
+    fn a_refused_address_leaves_no_entry_while_every_slot_is_taken() {
+        let slots = HandshakeSlots::default();
+        // Four addresses hold the 64 slots, 16 each.
+        let held: Vec<_> = (0..MAX_PENDING_HANDSHAKES)
+            .map(|i| {
+                let last = u8::try_from(i / MAX_PENDING_HANDSHAKES_PER_ADDRESS).unwrap();
+                slots.try_take(IpAddr::from([198, 51, 100, last])).unwrap()
+            })
+            .collect();
+        let holders = MAX_PENDING_HANDSHAKES / MAX_PENDING_HANDSHAKES_PER_ADDRESS;
+        // Then many connections from other IPv6 /64 networks are refused.
+        for i in 0..1_000_u32 {
+            let ip: IpAddr = format!("2001:db8:{:x}:{:x}::1", i >> 16, i & 0xffff)
+                .parse()
+                .unwrap();
+            assert!(slots.try_take(ip).is_none());
+        }
+        assert_eq!(slots.by_address.lock().unwrap().len(), holders);
+        drop(held);
+        assert!(slots.by_address.lock().unwrap().is_empty());
     }
 
     #[test]

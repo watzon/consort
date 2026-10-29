@@ -1,5 +1,6 @@
-//! Periodic work: due tasks, the feed retention, stuck coordinator turns,
-//! quiet task turns and expired commands.
+//! Periodic work: due tasks, revokes from the hub machine, the feed
+//! retention, stuck coordinator turns, quiet task turns and expired
+//! commands.
 
 use std::time::Duration;
 
@@ -8,6 +9,9 @@ use tokio::task::JoinHandle;
 use crate::hub::Hub;
 
 const STUCK_TURN_MS: i64 = 2 * 60 * 60 * 1000;
+/// How often, in seconds, the hub reads the revokes that a command on the
+/// hub machine wrote.
+const REVOKE_CHECK_TICKS: u64 = 2;
 
 pub(crate) fn spawn(hub: &Hub) -> JoinHandle<()> {
     let hub = hub.clone();
@@ -23,6 +27,13 @@ pub(crate) fn spawn(hub: &Hub) -> JoinHandle<()> {
             ticks += 1;
             if let Err(err) = hub.start_due_tasks().await {
                 tracing::warn!(error = %err, "could not start due tasks");
+            }
+            // The first tick, then every 2 s: clients and workers that
+            // `consort hub client revoke` or `worker revoke` removed.
+            if ticks % REVOKE_CHECK_TICKS == 1
+                && let Err(err) = hub.apply_revokes_from_disk().await
+            {
+                tracing::warn!(error = %err, "could not check for removed clients and workers");
             }
             if ticks.is_multiple_of(60) {
                 if let Err(err) = hub.expire_stuck_turns(STUCK_TURN_MS).await {

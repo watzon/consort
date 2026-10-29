@@ -22,7 +22,7 @@ use serde::de::DeserializeOwned;
 
 use crate::error::{HubError, Result};
 use crate::hub::Hub;
-use crate::store::machine::{self, PairingKind};
+use crate::store::machine::{self, Origin, PairingKind};
 use crate::util::random_pairing_code;
 
 /// Attempts from one address in one window.
@@ -187,17 +187,26 @@ fn bad_code() -> HubError {
 }
 
 impl Hub {
-    /// Makes a single-use pairing code that is valid for 10 minutes.
+    /// Makes a single-use pairing code that is valid for 10 minutes, and
+    /// records who made it. Removing that client cancels the code.
     pub(crate) async fn new_pairing_code(
         &self,
         kind: PairingKind,
+        created_by: Origin,
     ) -> Result<(PairingCode, Timestamp)> {
         let code = random_pairing_code();
         let stored = code.clone();
         let expires = self
             .store
             .write(move |tx| {
-                machine::insert_pairing_code(tx.db(), kind, &stored, tx.now(), PAIRING_CODE_TTL_MS)
+                machine::insert_pairing_code(
+                    tx.db(),
+                    kind,
+                    &stored,
+                    tx.now(),
+                    PAIRING_CODE_TTL_MS,
+                    created_by,
+                )
             })
             .await?;
         Ok((code, expires))
@@ -222,6 +231,8 @@ impl Hub {
         let id = self
             .store
             .write(move |tx| {
+                let origin =
+                    machine::pairing_code_origin(tx.db(), PairingKind::Worker, &request.code)?;
                 if !machine::consume_pairing_code(
                     tx.db(),
                     PairingKind::Worker,
@@ -253,6 +264,7 @@ impl Hub {
                     revoked_at: None,
                 };
                 tx.save_worker(&worker)?;
+                tx.set_worker_paired_by(worker.id, origin)?;
                 Ok(worker.id)
             })
             .await?;
@@ -268,6 +280,8 @@ impl Hub {
         let id = self
             .store
             .write(move |tx| {
+                let origin =
+                    machine::pairing_code_origin(tx.db(), PairingKind::Client, &request.code)?;
                 if !machine::consume_pairing_code(
                     tx.db(),
                     PairingKind::Client,
@@ -287,6 +301,7 @@ impl Hub {
                     revoked_at: None,
                 };
                 tx.save_client(&client)?;
+                tx.set_client_paired_by(client.id, origin)?;
                 Ok(client.id)
             })
             .await?;
