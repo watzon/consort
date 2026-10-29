@@ -1,0 +1,750 @@
+//! Session events: how the hub turns what a session does into its own
+//! state. One batch runs in one transaction, so the stored `last_seq`, the
+//! items, the task status and the feed always agree.
+
+use std::time::Instant;
+
+use consort_proto::ids::{ApprovalId, ChannelId, DecisionId, ItemId, SessionId, WorkerId};
+use consort_proto::model::{
+    Approval, ApprovalStatus, Author, COMMAND_OUTPUT_TAIL_BYTES, Channel, Decision, DecisionOption,
+    DecisionStatus, ErrorPayload, ItemPayload, ItemStatus, MessageKind, Session, SessionItem,
+    SessionRole, SessionState, Task, tail_of,
+};
+use consort_proto::status::{Actor, TaskStatus};
+use consort_proto::tools::HubTool;
+use consort_proto::turn_input::WakeEvent;
+use consort_proto::worker_link::{
+    HubToWorker, RequestBody, RequestOpened, RequestOutcome, SequencedEvent, SessionEvent,
+    SessionEvents, SessionEventsAck, SessionTurn, TurnEndReason, TurnInput, contiguous_seq,
+};
+
+use super::EmitNow;
+use crate::error::{HubError, Result};
+use crate::hub::Hub;
+use crate::ops::flow::transition;
+use crate::ops::waiting::resume_if_nothing_waits;
+use crate::store::Tx;
+use crate::store::conversation::{self, NewMessage};
+use crate::store::coordinator as coord_store;
+use crate::store::work::{self, SessionRuntime};
+use crate::util::truncate_chars;
+
+/// Work to do after the transaction commits.
+#[derive(Default)]
+pub(crate) struct Effects {
+    pub kick: Vec<ChannelId>,
+    pub pump: Vec<WorkerId>,
+    pub flush_items: Vec<(SessionId, ItemId, ChannelId, std::time::Duration)>,
+    pub items_done: Vec<(SessionId, ItemId)>,
+}
+
+impl Effects {
+    fn kick(&mut self, channel: ChannelId) {
+        if !self.kick.contains(&channel) {
+            self.kick.push(channel);
+        }
+    }
+
+    fn pump(&mut self, worker: WorkerId) {
+        if !self.pump.contains(&worker) {
+            self.pump.push(worker);
+        }
+    }
+
+    pub(crate) fn merge(&mut self, other: Effects) {
+        for c in other.kick {
+            self.kick(c);
+        }
+        for w in other.pump {
+            self.pump(w);
+        }
+        self.flush_items.extend(other.flush_items);
+        self.items_done.extend(other.items_done);
+    }
+}
+
+/// The state that event handlers change. `persist` writes what changed.
+pub(crate) struct Ctx<'h> {
+    pub hub: &'h Hub,
+    pub session: Session,
+    pub channel: Channel,
+    pub task: Option<Task>,
+    pub runtime: SessionRuntime,
+    pub fx: Effects,
+    task_dirty: bool,
+}
+
+impl<'h> Ctx<'h> {
+    pub(crate) fn load(hub: &'h Hub, tx: &Tx<'_>, session_id: SessionId) -> Result<Self> {
+        let session = work::session_or_404(tx.db(), session_id)?;
+        let channel = conversation::channel_or_404(tx.db(), session.channel_id)?;
+        let task = match (session.role, session.task_id) {
+            (SessionRole::Task, Some(id)) => work::task(tx.db(), id)?,
+            _ => None,
+        };
+        let runtime = work::session_runtime(tx.db(), session_id)?;
+        Ok(Self {
+            hub,
+            session,
+            channel,
+            task,
+            runtime,
+            fx: Effects::default(),
+            task_dirty: false,
+        })
+    }
+
+    pub(crate) fn persist(&mut self, tx: &mut Tx<'_>) -> Result<()> {
+        tx.save_session(&self.session)?;
+        tx.save_session_runtime(self.session.id, &self.runtime)?;
+        if self.task_dirty
+            && let Some(task) = &self.task
+        {
+            tx.save_task(task)?;
+        }
+        self.task_dirty = false;
+        Ok(())
+    }
+
+    /// Moves the task of this session, if it has one.
+    fn move_task(
+        &mut self,
+        tx: &mut Tx<'_>,
+        to: TaskStatus,
+        reason: Option<String>,
+        wake_text: Option<String>,
+    ) -> Result<()> {
+        let Some(task) = self.task.as_mut() else {
+            return Ok(());
+        };
+        match transition(tx, task, to, Actor::System, reason, wake_text) {
+            Ok(changed) => {
+                if changed {
+                    self.task_dirty = true;
+                    if to.wakes_coordinator() {
+                        self.fx.kick(task.channel_id);
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, task_id = %task.id, "ignored a status change that the rules do not allow");
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Hub {
+    /// Stores a batch of session events and returns the ack.
+    pub(crate) async fn ingest_events(
+        &self,
+        worker_id: WorkerId,
+        batch: SessionEvents,
+    ) -> Result<SessionEventsAck> {
+        let session_id = batch.session_id;
+        let hub = self.clone();
+        let (last_seq, fx) = self
+            .store
+            .write(move |tx| apply_batch(&hub, tx, worker_id, batch))
+            .await?;
+        self.run_effects(fx);
+        Ok(SessionEventsAck {
+            session_id,
+            last_seq,
+        })
+    }
+
+    pub(crate) fn run_effects(&self, fx: Effects) {
+        for (session, item) in fx.items_done {
+            self.links.item_done(session, item);
+        }
+        for channel in fx.kick {
+            self.kick_coordinator(channel);
+        }
+        for worker in fx.pump {
+            self.pump_worker(worker);
+        }
+        for (session, item, channel, delay) in fx.flush_items {
+            let hub = self.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                let result = hub
+                    .store
+                    .write(move |tx| {
+                        if let Some(item) = work::session_item(tx.db(), session, item)? {
+                            tx.emit_item(&item, channel)?;
+                        }
+                        Ok(())
+                    })
+                    .await;
+                if let Err(err) = result {
+                    tracing::warn!(error = %err, "could not emit a merged item update");
+                }
+                hub.links.item_flushed(session, item, Instant::now());
+            });
+        }
+    }
+
+    /// Records that a coordinator session called a hub tool in its open turn.
+    pub(crate) async fn note_tool_call(
+        &self,
+        ctx: &crate::hub::ToolCtx,
+        tool: HubTool,
+    ) -> Result<()> {
+        if ctx.session.role != SessionRole::Coordinator {
+            return Ok(());
+        }
+        let session_id = ctx.session.id;
+        self.store
+            .write(move |tx| {
+                let mut runtime = work::session_runtime(tx.db(), session_id)?;
+                runtime.tools_called.push(tool.name().to_owned());
+                tx.save_session_runtime(session_id, &runtime)
+            })
+            .await
+    }
+}
+
+fn apply_batch(
+    hub: &Hub,
+    tx: &mut Tx<'_>,
+    worker_id: WorkerId,
+    batch: SessionEvents,
+) -> Result<(u64, Effects)> {
+    let session = work::session(tx.db(), batch.session_id)?
+        .filter(|s| s.worker_id == worker_id)
+        .ok_or_else(|| HubError::not_found("The hub does not know this session. Stop it."))?;
+    let stored = session.last_seq;
+    let new_last = contiguous_seq(stored, &batch.events);
+    if new_last == stored {
+        return Ok((stored, Effects::default()));
+    }
+    let mut events: Vec<&SequencedEvent> = batch
+        .events
+        .iter()
+        .filter(|e| e.seq > stored && e.seq <= new_last)
+        .collect();
+    events.sort_by_key(|e| e.seq);
+    events.dedup_by_key(|e| e.seq);
+
+    let mut ctx = Ctx::load(hub, tx, batch.session_id)?;
+    // Only the newest copy of an item in a batch matters.
+    let last_item_index: std::collections::HashMap<ItemId, usize> = events
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| match &e.event {
+            SessionEvent::Item(item) => Some((item.id, i)),
+            _ => None,
+        })
+        .collect();
+    for (index, event) in events.iter().enumerate() {
+        if let SessionEvent::Item(item) = &event.event
+            && last_item_index.get(&item.id) != Some(&index)
+        {
+            continue;
+        }
+        apply_event(tx, &mut ctx, &event.event)?;
+    }
+    ctx.session.last_seq = new_last;
+    ctx.persist(tx)?;
+    Ok((new_last, ctx.fx))
+}
+
+fn apply_event(tx: &mut Tx<'_>, ctx: &mut Ctx<'_>, event: &SessionEvent) -> Result<()> {
+    match event {
+        SessionEvent::State { state } => on_state(tx, ctx, *state),
+        SessionEvent::NativeRef { native_ref } => {
+            ctx.session.native_ref = Some(native_ref.clone());
+            Ok(())
+        }
+        SessionEvent::TurnStarted { turn_id } => {
+            ctx.runtime.turn_id = Some(turn_id.clone());
+            ctx.runtime.turn_open = true;
+            ctx.runtime.last_assistant_text = None;
+            if matches!(
+                ctx.session.state,
+                SessionState::Starting | SessionState::Idle
+            ) {
+                ctx.session.state = SessionState::Active;
+            }
+            Ok(())
+        }
+        SessionEvent::Item(item) => on_item(tx, ctx, item.clone()),
+        SessionEvent::OutputDelta { item_id, text } => on_delta(tx, ctx, *item_id, text),
+        SessionEvent::RequestOpened(opened) => open_request(tx, ctx, opened),
+        SessionEvent::RequestClosed {
+            request_id,
+            outcome,
+        } => close_request(tx, ctx, request_id, *outcome),
+        SessionEvent::Usage(usage) => {
+            ctx.session.usage = usage.clone();
+            Ok(())
+        }
+        SessionEvent::TurnEnded { reason, error, .. } => {
+            on_turn_ended(tx, ctx, *reason, error.as_deref())
+        }
+        SessionEvent::Error { code, message } => {
+            let item = SessionItem {
+                id: ItemId::new(),
+                session_id: ctx.session.id,
+                turn_id: ctx.runtime.turn_id.clone().unwrap_or_else(|| "".into()),
+                payload: ItemPayload::Error(ErrorPayload {
+                    message: message.clone(),
+                    code: Some(code.clone()),
+                }),
+                status: ItemStatus::Failed,
+                created_at: tx.now(),
+                updated_at: tx.now(),
+            };
+            tx.save_item(&item, ctx.channel.id)
+        }
+    }
+}
+
+fn on_state(tx: &mut Tx<'_>, ctx: &mut Ctx<'_>, state: SessionState) -> Result<()> {
+    if ctx.session.state.is_final() {
+        return Ok(());
+    }
+    ctx.session.state = state;
+    if state.is_final() {
+        finish_session(tx, ctx, state)?;
+    }
+    Ok(())
+}
+
+/// Called when a session ended or was lost, whoever noticed it.
+pub(crate) fn finish_session(
+    tx: &mut Tx<'_>,
+    ctx: &mut Ctx<'_>,
+    state: SessionState,
+) -> Result<()> {
+    let lost = state == SessionState::Lost;
+    ctx.session.state = state;
+    ctx.session.ended_at.get_or_insert_with(|| tx.now());
+    if ctx.session.end_reason.is_none() {
+        ctx.session.end_reason = Some(if lost { "lost" } else { "ended" }.to_owned());
+    }
+    ctx.runtime.turn_open = false;
+
+    // Nobody can answer a request of a session that is gone.
+    let (approvals, decisions) = work::pending_for_session(tx.db(), ctx.session.id)?;
+    for mut approval in approvals {
+        approval.status = ApprovalStatus::Canceled;
+        tx.save_approval(&approval)?;
+    }
+    for mut decision in decisions {
+        decision.status = DecisionStatus::Canceled;
+        tx.save_decision(&decision)?;
+    }
+
+    match ctx.session.role {
+        SessionRole::Coordinator => release_coordinator(tx, ctx)?,
+        SessionRole::Task => {
+            let current = ctx
+                .task
+                .as_ref()
+                .is_some_and(|t| t.current_session_id == Some(ctx.session.id));
+            let running = ctx
+                .task
+                .as_ref()
+                .is_some_and(|t| matches!(t.status, TaskStatus::Working | TaskStatus::NeedsInput));
+            if current && running {
+                let reason = if lost {
+                    "The session was lost. Retry the task."
+                } else {
+                    "The session ended before the task finished. Retry the task."
+                };
+                ctx.move_task(tx, TaskStatus::Failed, Some(reason.to_owned()), None)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The coordinator row stops pointing at a session that is gone. Events of an
+/// open turn go back to the front of the queue.
+fn release_coordinator(tx: &mut Tx<'_>, ctx: &mut Ctx<'_>) -> Result<()> {
+    let mut row = coord_store::coordinator(tx.db(), ctx.channel.id)?;
+    if row.session_id != Some(ctx.session.id) {
+        return Ok(());
+    }
+    if row.turn_open && !row.turn_events.is_empty() {
+        tx.requeue_wakes_first(ctx.channel.id, &row.turn_events)?;
+    }
+    row.session_id = None;
+    row.turn_open = false;
+    row.turn_started_at = None;
+    row.turn_events.clear();
+    tx.save_coordinator(&row)?;
+    ctx.fx.kick(ctx.channel.id);
+    Ok(())
+}
+
+fn on_item(tx: &mut Tx<'_>, ctx: &mut Ctx<'_>, mut item: SessionItem) -> Result<()> {
+    item.session_id = ctx.session.id;
+    match &mut item.payload {
+        ItemPayload::AssistantMessage(message) => {
+            ctx.runtime.last_assistant_text = Some(message.text.clone());
+        }
+        ItemPayload::Command(command) => {
+            let (tail, cut) = tail_of(&command.output, COMMAND_OUTPUT_TAIL_BYTES);
+            if cut {
+                command.output = tail.to_owned();
+                command.output_truncated = true;
+            }
+        }
+        _ => {}
+    }
+    tx.save_item_row(&item)?;
+    emit_item(tx, ctx, &item)
+}
+
+fn on_delta(tx: &mut Tx<'_>, ctx: &mut Ctx<'_>, item_id: ItemId, text: &str) -> Result<()> {
+    let Some(mut item) = work::session_item(tx.db(), ctx.session.id, item_id)? else {
+        tracing::debug!(item_id = %item_id, "output arrived for an item that the hub does not have");
+        return Ok(());
+    };
+    if let ItemPayload::Command(command) = &mut item.payload {
+        command.append_output(text);
+        item.updated_at = tx.now();
+        tx.save_item_row(&item)?;
+        emit_item(tx, ctx, &item)?;
+    }
+    Ok(())
+}
+
+/// Emits a feed entry for an item now, or later when the item changed less
+/// than 250 ms ago. Later updates in the window merge into one entry.
+fn emit_item(tx: &mut Tx<'_>, ctx: &mut Ctx<'_>, item: &SessionItem) -> Result<()> {
+    let channel = ctx.channel.id;
+    if item.status != ItemStatus::InProgress {
+        ctx.fx.items_done.push((item.session_id, item.id));
+        return tx.emit_item(item, channel);
+    }
+    match ctx
+        .hub
+        .links
+        .item_emit_decision(item.session_id, item.id, Instant::now())
+    {
+        EmitNow::Yes => tx.emit_item(item, channel),
+        EmitNow::Later(delay) => {
+            ctx.fx
+                .flush_items
+                .push((item.session_id, item.id, channel, delay));
+            Ok(())
+        }
+        EmitNow::Scheduled => Ok(()),
+    }
+}
+
+fn open_request(tx: &mut Tx<'_>, ctx: &mut Ctx<'_>, opened: &RequestOpened) -> Result<()> {
+    let session_id = ctx.session.id;
+    if work::approval_by_request(tx.db(), session_id, &opened.request_id)?
+        .is_some_and(|a| a.status == ApprovalStatus::Pending)
+        || work::decision_by_request(tx.db(), session_id, &opened.request_id)?
+            .is_some_and(|d| d.status == DecisionStatus::Pending)
+    {
+        return Ok(());
+    }
+    let (kind, body) = match &opened.body {
+        RequestBody::Approval(_) => (MessageKind::Approval, opened.summary.clone()),
+        RequestBody::Question(q) => (MessageKind::Decision, q.question.clone()),
+    };
+    let card = match &ctx.task {
+        Some(task) => {
+            tx.post_in_task_thread(task, Some(&ctx.session), Author::Assistant, kind, &body)?
+        }
+        None => {
+            let mut new = NewMessage::new(ctx.channel.id, Author::Assistant, kind, body);
+            new.author_session_id = Some(session_id);
+            tx.insert_message(new)?
+        }
+    };
+    let task_id = ctx.task.as_ref().map(|t| t.id);
+    let now = tx.now();
+    match &opened.body {
+        RequestBody::Approval(details) => {
+            tx.save_approval(&Approval {
+                id: ApprovalId::new(),
+                channel_id: ctx.channel.id,
+                session_id,
+                task_id,
+                message_id: card.id,
+                request_id: opened.request_id.clone(),
+                summary: opened.summary.clone(),
+                details: details.clone(),
+                options: opened.options.clone(),
+                status: ApprovalStatus::Pending,
+                answer_option_id: None,
+                answered_at: None,
+                answered_by_client_id: None,
+                created_at: now,
+            })?;
+        }
+        RequestBody::Question(question) => {
+            tx.save_decision(&Decision {
+                id: DecisionId::new(),
+                channel_id: ctx.channel.id,
+                task_id,
+                session_id,
+                message_id: card.id,
+                request_id: Some(opened.request_id.clone()),
+                question: question.question.clone(),
+                context: question.context.clone(),
+                options: opened
+                    .options
+                    .iter()
+                    .map(|o| DecisionOption {
+                        label: o.label.clone(),
+                        consequence: o.description.clone().unwrap_or_default(),
+                        id: Some(o.id.clone()),
+                    })
+                    .collect(),
+                recommended_index: None,
+                allow_free_text: question.allow_free_text,
+                status: DecisionStatus::Pending,
+                answer: None,
+                answered_at: None,
+                created_at: now,
+            })?;
+        }
+    }
+    let wake_text = format!("Waiting for the user: {}", opened.summary);
+    ctx.move_task(
+        tx,
+        TaskStatus::NeedsInput,
+        Some(opened.summary.clone()),
+        Some(wake_text),
+    )
+}
+
+fn close_request(
+    tx: &mut Tx<'_>,
+    ctx: &mut Ctx<'_>,
+    request_id: &consort_proto::ids::RequestId,
+    outcome: RequestOutcome,
+) -> Result<()> {
+    let session_id = ctx.session.id;
+    if let Some(mut approval) = work::approval_by_request(tx.db(), session_id, request_id)?
+        && approval.status == ApprovalStatus::Pending
+    {
+        approval.status = match outcome {
+            RequestOutcome::Allowed | RequestOutcome::Answered => ApprovalStatus::Allowed,
+            RequestOutcome::Denied => ApprovalStatus::Denied,
+            RequestOutcome::Canceled => ApprovalStatus::Canceled,
+            RequestOutcome::Expired => ApprovalStatus::Expired,
+        };
+        tx.save_approval(&approval)?;
+    } else if let Some(mut decision) = work::decision_by_request(tx.db(), session_id, request_id)?
+        && decision.status == DecisionStatus::Pending
+    {
+        decision.status = match outcome {
+            RequestOutcome::Answered | RequestOutcome::Allowed | RequestOutcome::Denied => {
+                DecisionStatus::Answered
+            }
+            RequestOutcome::Canceled => DecisionStatus::Canceled,
+            RequestOutcome::Expired => DecisionStatus::Expired,
+        };
+        tx.save_decision(&decision)?;
+    }
+    if let Some(task) = ctx.task.as_mut() {
+        // Reload: the status may have changed in this batch.
+        if let Some(fresh) = work::task(tx.db(), task.id)? {
+            *task = fresh;
+        }
+        resume_if_nothing_waits(tx, Some(task.id))?;
+        if let Some(fresh) = work::task(tx.db(), task.id)? {
+            *task = fresh;
+        }
+    }
+    Ok(())
+}
+
+fn on_turn_ended(
+    tx: &mut Tx<'_>,
+    ctx: &mut Ctx<'_>,
+    reason: TurnEndReason,
+    error: Option<&str>,
+) -> Result<()> {
+    ctx.runtime.turn_open = false;
+    match ctx.session.role {
+        SessionRole::Coordinator => coordinator_turn_ended(tx, ctx, reason, error),
+        SessionRole::Task => task_turn_ended(tx, ctx, reason, error),
+    }
+}
+
+fn coordinator_turn_ended(
+    tx: &mut Tx<'_>,
+    ctx: &mut Ctx<'_>,
+    reason: TurnEndReason,
+    error: Option<&str>,
+) -> Result<()> {
+    let mut row = coord_store::coordinator(tx.db(), ctx.channel.id)?;
+    if row.session_id != Some(ctx.session.id) || !row.turn_open {
+        return Ok(());
+    }
+    // Which thread did the turn answer? One user message in a thread means a
+    // reply in that thread.
+    let thread = {
+        let threads: Vec<_> = row
+            .turn_events
+            .iter()
+            .filter_map(|e| match e {
+                WakeEvent::UserMessage { thread, .. } => Some(*thread),
+                _ => None,
+            })
+            .collect();
+        match threads.as_slice() {
+            [Some(root)] => Some(*root),
+            _ => None,
+        }
+    };
+    let called = ctx
+        .runtime
+        .tools_called
+        .iter()
+        .filter_map(|name| HubTool::from_name(name));
+    if reason == TurnEndReason::Completed && consort_proto::tools::needs_fallback_post(called) {
+        let text = ctx
+            .runtime
+            .last_assistant_text
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty());
+        if let Some(text) = text {
+            let mut new =
+                NewMessage::new(ctx.channel.id, Author::Assistant, MessageKind::Text, text);
+            new.author_session_id = Some(ctx.session.id);
+            new.thread_root_id = thread;
+            tx.insert_message(new)?;
+        }
+    }
+    if reason == TurnEndReason::Failed {
+        let text = error.unwrap_or("The assistant stopped with an error. Send your message again.");
+        tx.post_notice(ctx.channel.id, None, None, "turn_failed", text)?;
+    }
+    row.turn_open = false;
+    row.turn_started_at = None;
+    row.turn_events.clear();
+    tx.save_coordinator(&row)?;
+    ctx.fx.kick(ctx.channel.id);
+    Ok(())
+}
+
+fn task_turn_ended(
+    tx: &mut Tx<'_>,
+    ctx: &mut Ctx<'_>,
+    reason: TurnEndReason,
+    error: Option<&str>,
+) -> Result<()> {
+    let Some(task_id) = ctx.task.as_ref().map(|t| t.id) else {
+        return Ok(());
+    };
+    // Reload: an earlier event in this batch may have changed the task.
+    if let Some(fresh) = work::task(tx.db(), task_id)? {
+        ctx.task = Some(fresh);
+    }
+    let status = ctx.task.as_ref().map_or(TaskStatus::Resolved, |t| t.status);
+    if !matches!(status, TaskStatus::Working | TaskStatus::NeedsInput) {
+        ctx.runtime.review_summary = None;
+        return Ok(());
+    }
+    if reason == TurnEndReason::Failed {
+        let text = error
+            .unwrap_or("The turn failed. Retry the task.")
+            .to_owned();
+        ctx.runtime.review_summary = None;
+        return ctx.move_task(tx, TaskStatus::Failed, Some(text), None);
+    }
+
+    // Messages that waited for the turn to end start the next turn.
+    let inbox = work::task_inbox(tx.db(), task_id)?;
+    if !inbox.is_empty() && !ctx.session.state.is_final() {
+        let text = inbox
+            .iter()
+            .map(|(_, t)| t.as_str())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        tx.clear_task_inbox(task_id)?;
+        tx.queue_command(
+            ctx.session.worker_id,
+            &HubToWorker::SessionTurn(SessionTurn {
+                session_id: ctx.session.id,
+                turn: TurnInput {
+                    text,
+                    attachments: Vec::new(),
+                },
+            }),
+        )?;
+        ctx.runtime.turn_open = true;
+        ctx.fx.pump(ctx.session.worker_id);
+        return Ok(());
+    }
+
+    if status == TaskStatus::Working && work::pending_count_for_task(tx.db(), task_id)? == 0 {
+        let last = ctx
+            .runtime
+            .last_assistant_text
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(|t| truncate_chars(t, 2000));
+        let (summary, reason_text) = match reason {
+            TurnEndReason::Interrupted => (
+                last.unwrap_or_else(|| "The turn was stopped before it finished.".to_owned()),
+                Some("Stopped before it finished.".to_owned()),
+            ),
+            _ => (
+                ctx.runtime
+                    .review_summary
+                    .clone()
+                    .or(last)
+                    .unwrap_or_else(|| "The task finished its turn.".to_owned()),
+                None,
+            ),
+        };
+        if let Some(task) = ctx.task.as_mut() {
+            task.review_summary = Some(summary.clone());
+        }
+        ctx.move_task(tx, TaskStatus::Review, reason_text, Some(summary))?;
+        // The summary changed even if the status did not.
+        ctx.task_dirty = true;
+    }
+    ctx.runtime.review_summary = None;
+    Ok(())
+}
+
+/// Marks a session as lost from outside an event batch, for example when a
+/// worker no longer has it.
+impl Hub {
+    pub(crate) async fn mark_session_lost(
+        &self,
+        session_id: SessionId,
+        reason: &str,
+    ) -> Result<()> {
+        let hub = self.clone();
+        let reason = reason.to_owned();
+        let fx = self
+            .store
+            .write(move |tx| {
+                let mut ctx = Ctx::load(&hub, tx, session_id)?;
+                if ctx.session.state.is_final() {
+                    return Ok(Effects::default());
+                }
+                ctx.session.end_reason = Some(reason);
+                finish_session(tx, &mut ctx, SessionState::Lost)?;
+                ctx.persist(tx)?;
+                Ok(ctx.fx)
+            })
+            .await?;
+        self.run_effects(fx);
+        Ok(())
+    }
+
+    /// The sessions of a worker that the hub thinks are open.
+    pub(crate) async fn open_sessions_of(&self, worker_id: WorkerId) -> Result<Vec<Session>> {
+        self.store
+            .read(move |conn| work::open_sessions_of_worker(conn, worker_id))
+            .await
+    }
+}

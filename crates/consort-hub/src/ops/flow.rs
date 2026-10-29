@@ -1,0 +1,225 @@
+//! Task flow helpers that run inside a transaction: notices, thread posts,
+//! status transitions and message delivery to a task session.
+
+use consort_proto::ids::{ChannelId, MessageId, TaskId, WorkerId};
+use consort_proto::model::{Author, Message, MessageKind, Session, SessionRole, Task};
+use consort_proto::status::{Actor, TaskStatus};
+use consort_proto::tools::MessageDelivery;
+use consort_proto::turn_input::WakeEvent;
+use consort_proto::worker_link::{HubToWorker, SessionSteer, SessionTurn, TurnInput};
+
+use crate::error::{HubError, Result};
+use crate::hub::Hub;
+use crate::store::conversation::NewMessage;
+use crate::store::{Tx, machine, work};
+
+/// The body of a notice message: a JSON object with a `kind`.
+pub(crate) fn notice_body(kind: &str, text: &str) -> String {
+    serde_json::json!({ "kind": kind, "text": text }).to_string()
+}
+
+impl Tx<'_> {
+    /// Posts a system notice, in a thread when `thread_root` is set.
+    pub fn post_notice(
+        &mut self,
+        channel_id: ChannelId,
+        thread_root: Option<MessageId>,
+        task_id: Option<TaskId>,
+        kind: &str,
+        text: &str,
+    ) -> Result<Message> {
+        let mut new = NewMessage::new(
+            channel_id,
+            Author::System,
+            MessageKind::Notice,
+            notice_body(kind, text),
+        );
+        new.thread_root_id = thread_root;
+        new.author_task_id = task_id;
+        self.insert_message(new)
+    }
+
+    /// Posts in the thread of a task card.
+    pub fn post_in_task_thread(
+        &mut self,
+        task: &Task,
+        session: Option<&Session>,
+        author: Author,
+        kind: MessageKind,
+        body: &str,
+    ) -> Result<Message> {
+        let mut new = NewMessage::new(task.channel_id, author, kind, body);
+        new.thread_root_id = Some(task.card_message_id);
+        new.author_task_id = Some(task.id);
+        new.author_session_id = session.map(|s| s.id);
+        self.insert_message(new)
+    }
+}
+
+/// Moves a task to a new status if the state machine allows it for `actor`.
+/// Returns whether the status changed. Queues a wake event for the channel
+/// coordinator when the new status wakes it; the caller must then kick the
+/// coordinator after the commit.
+pub(crate) fn transition(
+    tx: &mut Tx<'_>,
+    task: &mut Task,
+    to: TaskStatus,
+    actor: Actor,
+    reason: Option<String>,
+    wake_text: Option<String>,
+) -> Result<bool> {
+    if task.status == to {
+        if reason.is_some() && task.status_reason != reason {
+            task.status_reason = reason;
+            task.updated_at = tx.now();
+        }
+        return Ok(false);
+    }
+    task.status.check_transition(to, actor)?;
+    let now = tx.now();
+    task.status = to;
+    task.status_reason = reason;
+    task.updated_at = now;
+    task.resolved_at = (to == TaskStatus::Resolved).then_some(now);
+    if to.wakes_coordinator() {
+        let text = wake_text
+            .or_else(|| task.status_reason.clone())
+            .or_else(|| task.review_summary.clone())
+            .unwrap_or_else(|| to.label().to_owned());
+        tx.queue_wake(
+            task.channel_id,
+            &WakeEvent::TaskUpdate {
+                task: task.id,
+                title: task.title.clone(),
+                status: to,
+                text,
+            },
+        )?;
+    }
+    Ok(true)
+}
+
+/// What a delivery did, for the caller to finish after the commit.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Delivered {
+    pub delivery: MessageDelivery,
+    pub worker_id: WorkerId,
+    pub status_changed: bool,
+}
+
+/// Queues text for the session of a task: a new turn, a steering message, or
+/// a place in the inbox when the harness cannot steer. Moves a task under
+/// review back to Working. The caller pumps the worker and kicks the
+/// coordinator after the commit.
+pub(crate) fn deliver_in_tx(
+    hub: &Hub,
+    tx: &mut Tx<'_>,
+    task_id: TaskId,
+    text: &str,
+    actor: Actor,
+) -> Result<Delivered> {
+    let mut task = work::task_or_404(tx.db(), task_id)?;
+    match task.status {
+        TaskStatus::Scheduled | TaskStatus::UpNext => {
+            return Err(HubError::conflict(
+                "The task has not started yet. Wait until it runs, then send the message.",
+            ));
+        }
+        TaskStatus::Failed => {
+            return Err(HubError::conflict(
+                "The task failed. Retry it first, then send the message.",
+            ));
+        }
+        TaskStatus::Resolved => {
+            return Err(HubError::conflict(
+                "The task is resolved. Mark it as not done first.",
+            ));
+        }
+        TaskStatus::Working | TaskStatus::NeedsInput | TaskStatus::Review => {}
+    }
+    let session_id = task
+        .current_session_id
+        .ok_or_else(|| HubError::conflict("The task has no session. Retry it first."))?;
+    let session = work::session_or_404(tx.db(), session_id)?;
+    if session.role != SessionRole::Task || session.state.is_final() {
+        return Err(HubError::conflict(
+            "The session of this task has ended, so it cannot take a message. Start a new task for this work.",
+        ));
+    }
+    let mut runtime = work::session_runtime(tx.db(), session_id)?;
+    let status_changed = if task.status == TaskStatus::Review {
+        transition(tx, &mut task, TaskStatus::Working, actor, None, None)?
+    } else {
+        false
+    };
+
+    let steer = machine::worker(tx.db(), session.worker_id)?
+        .and_then(|w| w.inventory)
+        .and_then(|inv| {
+            inv.account(session.account_id)
+                .map(|a| a.capabilities.steer)
+        })
+        .unwrap_or(false);
+    let turn = TurnInput {
+        text: text.to_owned(),
+        attachments: Vec::new(),
+    };
+    let online = hub.links.is_online(session.worker_id);
+    let delivery = if !online {
+        tx.queue_command(
+            session.worker_id,
+            &HubToWorker::SessionTurn(SessionTurn { session_id, turn }),
+        )?;
+        runtime.turn_open = true;
+        MessageDelivery::Queued
+    } else if runtime.turn_open && steer {
+        tx.queue_command(
+            session.worker_id,
+            &HubToWorker::SessionSteer(SessionSteer { session_id, turn }),
+        )?;
+        MessageDelivery::Steer
+    } else if runtime.turn_open {
+        tx.push_task_inbox(task_id, text)?;
+        MessageDelivery::Queued
+    } else {
+        tx.queue_command(
+            session.worker_id,
+            &HubToWorker::SessionTurn(SessionTurn { session_id, turn }),
+        )?;
+        runtime.turn_open = true;
+        MessageDelivery::Turn
+    };
+    tx.save_session_runtime(session_id, &runtime)?;
+    task.updated_at = tx.now();
+    tx.save_task(&task)?;
+    Ok(Delivered {
+        delivery,
+        worker_id: session.worker_id,
+        status_changed,
+    })
+}
+
+impl Hub {
+    /// Sends text to the session of a task. See [`deliver_in_tx`].
+    pub(crate) async fn deliver_to_task(
+        &self,
+        task_id: TaskId,
+        text: String,
+        actor: Actor,
+    ) -> Result<MessageDelivery> {
+        let hub = self.clone();
+        let (delivered, channel) = self
+            .store
+            .write(move |tx| {
+                let delivered = deliver_in_tx(&hub, tx, task_id, &text, actor)?;
+                let task = work::task_or_404(tx.db(), task_id)?;
+                Ok((delivered, task.channel_id))
+            })
+            .await?;
+        self.pump_worker(delivered.worker_id);
+        if delivered.status_changed {
+            self.kick_coordinator(channel);
+        }
+        Ok(delivered.delivery)
+    }
+}

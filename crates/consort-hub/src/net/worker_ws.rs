@@ -1,0 +1,264 @@
+//! The worker WebSocket.
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use axum::extract::ws::{Message, WebSocket};
+use axum::extract::{State, WebSocketUpgrade};
+use axum::response::Response;
+use consort_proto::auth::{PeerId, WorkerHello};
+use consort_proto::error::{ErrorBody, ErrorCode};
+use consort_proto::frame::{
+    Empty, Frame, FrameId, RequestFrame, SUPPORTED_PROTOCOL_VERSIONS, negotiate_version,
+};
+use consort_proto::ids::WorkerId;
+use consort_proto::worker_link::{
+    HubToWorker, OFFLINE_AFTER_SECS, SessionStop, ToolList, ToolListResult, WorkerToHub,
+};
+use futures_util::StreamExt;
+
+use super::ws::{
+    Outbox, PeerKind, WS_MAX_FRAME, fail, fail_protocol, handshake, send_frame, write_loop,
+};
+use crate::error::{HubError, Result};
+use crate::hub::Hub;
+use crate::link::WorkerLink;
+
+pub(crate) async fn worker_ws(State(hub): State<Hub>, upgrade: WebSocketUpgrade) -> Response {
+    upgrade
+        .max_message_size(WS_MAX_FRAME)
+        .max_frame_size(WS_MAX_FRAME)
+        .on_upgrade(move |socket| run_worker(hub, socket))
+}
+
+async fn run_worker(hub: Hub, mut socket: WebSocket) {
+    let Some(auth) = handshake(&hub, &mut socket, PeerKind::Worker).await else {
+        return;
+    };
+    let PeerId::Worker(worker_id) = auth.peer else {
+        return;
+    };
+    let hello: WorkerHello = match auth.hello.decode_as() {
+        Ok(hello) => hello,
+        Err(err) => {
+            fail(
+                &mut socket,
+                &auth.hello,
+                err.to_error_body(),
+                1002,
+                "bad hello",
+            )
+            .await;
+            return;
+        }
+    };
+    if hello.worker_id != worker_id {
+        let error =
+            ErrorBody::unauthorized("The hello names another worker. Pair this machine again.");
+        fail(&mut socket, &auth.hello, error, 1008, "unauthorized").await;
+        return;
+    }
+    let Some(version) = negotiate_version(SUPPORTED_PROTOCOL_VERSIONS, &hello.protocol_versions)
+    else {
+        fail_protocol(&mut socket, &auth.hello).await;
+        return;
+    };
+    let (result, unknown) = match hub.worker_hello(worker_id, hello, version).await {
+        Ok(pair) => pair,
+        Err(err) => {
+            fail(
+                &mut socket,
+                &auth.hello,
+                err.to_error_body(),
+                1011,
+                "internal",
+            )
+            .await;
+            return;
+        }
+    };
+    let Ok(reply) = auth.hello.respond_ok(&result) else {
+        return;
+    };
+    if !send_frame(&mut socket, &reply).await {
+        let _ = hub.worker_went_offline(worker_id).await;
+        return;
+    }
+
+    let cancel = hub.shutdown.child_token();
+    let (outbox, rx) = Outbox::new(cancel.clone());
+    let (sink, mut stream) = socket.split();
+    let writer = tokio::spawn(write_loop(sink, rx, cancel.clone()));
+    let link = Arc::new(WorkerLink::new(
+        hub.links.next_conn_id(),
+        worker_id,
+        outbox.clone(),
+    ));
+    if let Some(old) = hub.links.register(link.clone()) {
+        // A new connection replaces an old one that did not close cleanly.
+        old.outbox.close();
+        old.fail_pending();
+    }
+    tracing::info!(worker_id = %worker_id, "a worker connected");
+
+    // The worker reported sessions that the hub does not know.
+    for session_id in unknown {
+        let hub = hub.clone();
+        let link = link.clone();
+        tokio::spawn(async move {
+            let command = HubToWorker::SessionStop(SessionStop {
+                session_id,
+                reason: "The hub does not know this session.".to_owned(),
+            });
+            if let Ok(Frame::Request(request)) =
+                Frame::family_request(FrameId::generate(), &command)
+            {
+                let _ = link
+                    .call(
+                        request.id,
+                        request.kind,
+                        request.body,
+                        Duration::from_secs(60),
+                    )
+                    .await;
+            }
+            let _ = hub;
+        });
+    }
+    hub.worker_came_online(worker_id);
+
+    let idle = Duration::from_secs(OFFLINE_AFTER_SECS);
+    loop {
+        let next = tokio::select! {
+            () = cancel.cancelled() => break,
+            next = tokio::time::timeout(idle, stream.next()) => next,
+        };
+        let message = match next {
+            Ok(Some(Ok(message))) => message,
+            Ok(_) => break,
+            Err(_) => {
+                tracing::warn!(worker_id = %worker_id, "a worker sent nothing for 60 seconds, so it is offline");
+                break;
+            }
+        };
+        let text = match message {
+            Message::Text(text) => text,
+            Message::Close(_) | Message::Binary(_) => break,
+            Message::Ping(_) | Message::Pong(_) => continue,
+        };
+        match Frame::parse(text.as_str()) {
+            Ok(Frame::Request(request)) => {
+                handle_request(&hub, worker_id, &link, request).await;
+            }
+            Ok(Frame::Response(response)) => link.resolve(&response.re, response.result),
+            Ok(Frame::Event(event)) => {
+                if let Ok(WorkerToHub::Inventory(inventory)) = event.decode::<WorkerToHub>()
+                    && let Err(err) = hub.update_inventory(worker_id, inventory).await
+                {
+                    tracing::warn!(error = %err, "could not store an inventory");
+                }
+            }
+            Err(err) => {
+                tracing::debug!(error = %err, "a worker sent a bad frame");
+                break;
+            }
+        }
+    }
+
+    cancel.cancel();
+    link.fail_pending();
+    if hub.links.remove(worker_id, link.conn_id) {
+        if let Err(err) = hub.worker_went_offline(worker_id).await {
+            tracing::warn!(error = %err, "could not mark a worker offline");
+        }
+        tracing::info!(worker_id = %worker_id, "a worker disconnected");
+    }
+    let _ = writer.await;
+}
+
+async fn handle_request(
+    hub: &Hub,
+    worker_id: WorkerId,
+    link: &Arc<WorkerLink>,
+    request: RequestFrame,
+) {
+    let decoded: WorkerToHub = match request.decode() {
+        Ok(decoded) => decoded,
+        Err(err) => {
+            link.outbox
+                .send_frame(&request.respond_error(err.to_error_body()));
+            return;
+        }
+    };
+    match decoded {
+        WorkerToHub::Hello(_) => {
+            link.outbox
+                .send_frame(&request.respond_error(ErrorBody::conflict(
+                    "The hello was already sent on this connection.",
+                )));
+        }
+        WorkerToHub::Inventory(inventory) => {
+            let result = hub
+                .update_inventory(worker_id, inventory)
+                .await
+                .map(|()| Empty {});
+            reply(link, &request, result);
+        }
+        WorkerToHub::SessionEvents(batch) => {
+            let result = hub.ingest_events(worker_id, batch).await;
+            reply(link, &request, result);
+        }
+        WorkerToHub::ToolList(ToolList { session_id }) => {
+            let result = async {
+                check_session_owner(hub, worker_id, session_id).await?;
+                Ok(ToolListResult {
+                    tools: hub.tool_definitions(session_id).await?,
+                })
+            }
+            .await;
+            reply(link, &request, result);
+        }
+        WorkerToHub::ToolCall(call) => {
+            // A tool call can take long, so it must not block other frames.
+            let hub = hub.clone();
+            let link = link.clone();
+            tokio::spawn(async move {
+                let result = match check_session_owner(&hub, worker_id, call.session_id).await {
+                    Ok(()) => Ok(hub
+                        .call_tool(call.session_id, &call.name, call.arguments)
+                        .await),
+                    Err(err) => Err(err),
+                };
+                reply(&link, &request, result);
+            });
+        }
+    }
+}
+
+async fn check_session_owner(
+    hub: &Hub,
+    worker_id: WorkerId,
+    session_id: consort_proto::ids::SessionId,
+) -> Result<()> {
+    let owner = hub
+        .store
+        .read(move |conn| crate::store::work::session(conn, session_id))
+        .await?;
+    match owner {
+        Some(session) if session.worker_id == worker_id => Ok(()),
+        _ => Err(HubError::new(
+            ErrorCode::NotFound,
+            "The hub does not know this session for this worker.",
+        )),
+    }
+}
+
+fn reply<T: serde::Serialize>(link: &WorkerLink, request: &RequestFrame, result: Result<T>) {
+    let frame = match result {
+        Ok(value) => request
+            .respond_ok(&value)
+            .unwrap_or_else(|err| request.respond_error(err.to_error_body())),
+        Err(err) => request.respond_error(err.to_error_body()),
+    };
+    link.outbox.send_frame(&frame);
+}

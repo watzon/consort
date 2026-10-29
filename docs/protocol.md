@@ -66,7 +66,7 @@ Workers and clients pair the same way, and both prove their identity with an Ed2
 2. On the new machine, the user runs `app worker pair https://hub.example.com --code ABCD-EFGH`.
 3. The worker makes an Ed25519 key pair. The private key stays in the OS keychain, or in a file with mode 0600 when no keychain is available.
 4. The worker sends `POST /v1/pair/worker` with `code`, `public_key`, `hostname`, `os`, `arch` and an optional `name`. Public keys, signatures and nonces are lowercase hex on the wire.
-5. The hub checks the code, stores the worker, and returns the `worker_id`. An HTTP error has the body `{"error": {"code", "message"}}`.
+5. The hub checks the code, stores the worker, and returns the `worker_id`. An HTTP error has the body `{"error": {"code", "message"}}`. The hub allows 10 pairing requests per minute from one IP address. After that, it answers HTTP 429 with the code `policy_denied`.
 6. The worker writes `hub_url` and its ID to `worker.toml`.
 
 ### Pair a client
@@ -274,7 +274,7 @@ The client API uses the same frames, errors and authentication as the worker lin
 
 | Type | Body | Result |
 |---|---|---|
-| `sync.snapshot` | `scope`: `all` or a channel ID | The entities in that scope and the current feed `seq`. For `all`: every group, channel, repo, worker and read marker, every task that is not archived, the pending approvals and decisions, and every routine. For a channel: the channel, its newest 50 timeline messages, its tasks that are not archived, its pending approvals and decisions, its routines and its channel files |
+| `sync.snapshot` | `scope`: `all` or a channel ID | The entities in that scope and the current feed `seq`. For `all`: every group, channel, repo, worker and read marker, every task that is not archived, the pending approvals and decisions, and every routine. For a channel: the channel, its newest 50 timeline messages (oldest first), its tasks that are not archived, its pending approvals and decisions, its routines and its channel files |
 | `sync.subscribe` | `after_seq`, optional `channel_ids` | `ok`. The hub then sends `feed` messages |
 | `feed` (from the hub) | `seq`, `at`, `channel_id`, `entity`, `entity_id`, `op` and `payload` | None. `payload` is `null` for `delete` |
 

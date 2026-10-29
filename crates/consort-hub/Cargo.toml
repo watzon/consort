@@ -4,8 +4,32 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
+description = "The Consort hub server: SQLite store, feed, pairing, coordinators, placement, hub tools and routines."
 
 [lints]
 workspace = true
 
 [dependencies]
+consort-proto = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures-util = { workspace = true }
+axum = { workspace = true, features = ["ws"] }
+rusqlite = { workspace = true }
+sha2 = { workspace = true }
+ed25519-dalek = { workspace = true }
+rand = { workspace = true }
+tracing = { workspace = true }
+croner = { workspace = true }
+chrono = { workspace = true }
+chrono-tz = { workspace = true }
+
+[dev-dependencies]
+tokio-tungstenite = { workspace = true }
+tempfile = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

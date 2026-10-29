@@ -1,0 +1,323 @@
+//! The client WebSocket: handshake, requests, snapshots and the feed.
+
+use std::collections::HashSet;
+use std::time::Duration;
+
+use axum::extract::ws::{Message, WebSocket};
+use axum::extract::{State, WebSocketUpgrade};
+use axum::response::Response;
+use consort_proto::auth::{ClientHello, ClientHelloResult, PeerId};
+use consort_proto::client_api::{
+    ClientRequest, FeedEntry, HubToClient, SyncSnapshot, SyncSubscribe,
+};
+use consort_proto::error::{ErrorBody, ErrorCode};
+use consort_proto::frame::{
+    Empty, Frame, RequestFrame, SUPPORTED_PROTOCOL_VERSIONS, negotiate_version,
+};
+use consort_proto::ids::{ChannelId, ClientId};
+use futures_util::StreamExt;
+use tokio::task::JoinHandle;
+
+use super::ws::{
+    Outbox, PeerKind, WS_MAX_FRAME, fail, fail_protocol, handshake, send_frame, write_loop,
+};
+use crate::api;
+use crate::error::{HubError, Result};
+use crate::hub::{Caller, HUB_VERSION, Hub};
+use crate::store::feed;
+
+/// Any frame, including a pong, resets this timer. The hub pings every 30 s.
+const CLIENT_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+const BACKLOG_BATCH: usize = 500;
+
+pub(crate) async fn client_ws(State(hub): State<Hub>, upgrade: WebSocketUpgrade) -> Response {
+    upgrade
+        .max_message_size(WS_MAX_FRAME)
+        .max_frame_size(WS_MAX_FRAME)
+        .on_upgrade(move |socket| run_client(hub, socket))
+}
+
+async fn run_client(hub: Hub, mut socket: WebSocket) {
+    let Some(auth) = handshake(&hub, &mut socket, PeerKind::Client).await else {
+        return;
+    };
+    let PeerId::Client(client_id) = auth.peer else {
+        return;
+    };
+    let hello: ClientHello = match auth.hello.decode_as() {
+        Ok(hello) => hello,
+        Err(err) => {
+            fail(
+                &mut socket,
+                &auth.hello,
+                err.to_error_body(),
+                1002,
+                "bad hello",
+            )
+            .await;
+            return;
+        }
+    };
+    if hello.client_id != client_id {
+        let error = ErrorBody::unauthorized("The hello names another client. Pair this app again.");
+        fail(&mut socket, &auth.hello, error, 1008, "unauthorized").await;
+        return;
+    }
+    let Some(version) = negotiate_version(SUPPORTED_PROTOCOL_VERSIONS, &hello.protocol_versions)
+    else {
+        fail_protocol(&mut socket, &auth.hello).await;
+        return;
+    };
+    let feed_seq = match hub.store.read(feed::head_seq).await {
+        Ok(seq) => seq,
+        Err(err) => {
+            fail(
+                &mut socket,
+                &auth.hello,
+                err.to_error_body(),
+                1011,
+                "internal",
+            )
+            .await;
+            return;
+        }
+    };
+    let result = ClientHelloResult {
+        protocol_version: version,
+        hub_version: HUB_VERSION.to_owned(),
+        feed_seq,
+    };
+    let Ok(reply) = auth.hello.respond_ok(&result) else {
+        return;
+    };
+    if !send_frame(&mut socket, &reply).await {
+        return;
+    }
+    if let Err(err) = hub.touch_client(client_id).await {
+        tracing::warn!(error = %err, "could not record that a client connected");
+    }
+
+    let cancel = hub.shutdown.child_token();
+    let (outbox, rx) = Outbox::new(cancel.clone());
+    let (sink, mut stream) = socket.split();
+    let writer = tokio::spawn(write_loop(sink, rx, cancel.clone()));
+    let connection = hub.clients.register(client_id, cancel.clone());
+    tracing::debug!(client_id = %client_id, "a client connected");
+
+    let mut forwarder: Option<JoinHandle<()>> = None;
+    loop {
+        let next = tokio::select! {
+            () = cancel.cancelled() => break,
+            next = tokio::time::timeout(CLIENT_IDLE_TIMEOUT, stream.next()) => next,
+        };
+        let message = match next {
+            Ok(Some(Ok(message))) => message,
+            _ => break,
+        };
+        let text = match message {
+            Message::Text(text) => text,
+            Message::Close(_) => break,
+            Message::Ping(_) | Message::Pong(_) => continue,
+            Message::Binary(_) => break,
+        };
+        match Frame::parse(text.as_str()) {
+            Ok(Frame::Request(request)) => {
+                handle_request(&hub, client_id, &outbox, &mut forwarder, request).await;
+            }
+            Ok(_) => {}
+            Err(err) => {
+                tracing::debug!(error = %err, "a client sent a bad frame");
+                outbox.close();
+                break;
+            }
+        }
+    }
+
+    if let Some(handle) = forwarder {
+        handle.abort();
+    }
+    cancel.cancel();
+    hub.clients.unregister(connection);
+    let _ = writer.await;
+    tracing::debug!(client_id = %client_id, "a client disconnected");
+}
+
+async fn handle_request(
+    hub: &Hub,
+    client_id: ClientId,
+    outbox: &Outbox,
+    forwarder: &mut Option<JoinHandle<()>>,
+    request: RequestFrame,
+) {
+    let decoded: ClientRequest = match request.decode() {
+        Ok(decoded) => decoded,
+        Err(err) => {
+            outbox.send_frame(&request.respond_error(err.to_error_body()));
+            return;
+        }
+    };
+    match decoded {
+        ClientRequest::SyncSubscribe(subscribe) => {
+            match prepare_subscription(hub, &subscribe).await {
+                Ok(()) => {
+                    // The response goes into the outbox before the forwarder
+                    // starts, so the client sees `ok` before the first feed entry.
+                    if let Ok(ok) = request.respond_ok(&Empty {}) {
+                        outbox.send_frame(&ok);
+                    }
+                    if let Some(old) = forwarder.take() {
+                        old.abort();
+                    }
+                    *forwarder = Some(spawn_forwarder(hub.clone(), outbox.clone(), subscribe));
+                }
+                Err(err) => {
+                    outbox.send_frame(&request.respond_error(err.to_error_body()));
+                }
+            }
+        }
+        ClientRequest::TaskItemDetail(_) => {
+            // This request waits for a worker, so it must not block the others.
+            let hub = hub.clone();
+            let outbox = outbox.clone();
+            tokio::spawn(async move {
+                let result = api::dispatch(&hub, Caller::Client(client_id), decoded).await;
+                reply(&outbox, &request, result);
+            });
+        }
+        other => {
+            let result = match other {
+                ClientRequest::Hello(_) => Err(HubError::conflict(
+                    "The hello was already sent on this connection.",
+                )),
+                ClientRequest::SyncSnapshot(SyncSnapshot { scope }) => hub
+                    .snapshot(scope)
+                    .await
+                    .and_then(|snapshot| Ok(serde_json::to_value(&snapshot)?)),
+                ClientRequest::AuthHttpToken(_) => hub
+                    .store
+                    .read(move |conn| crate::store::machine::client(conn, client_id))
+                    .await
+                    .and_then(|client| match client {
+                        Some(client) if client.revoked_at.is_none() => {
+                            let token = hub.clients.issue_token(client_id, hub.now());
+                            Ok(serde_json::to_value(&token)?)
+                        }
+                        _ => Err(HubError::unauthorized("This client was revoked.")),
+                    }),
+                other => api::dispatch(hub, Caller::Client(client_id), other).await,
+            };
+            reply(outbox, &request, result);
+        }
+    }
+}
+
+fn reply(outbox: &Outbox, request: &RequestFrame, result: Result<serde_json::Value>) {
+    let frame = match result {
+        Ok(value) => request
+            .respond_ok(&value)
+            .unwrap_or_else(|err| request.respond_error(err.to_error_body())),
+        Err(err) => request.respond_error(err.to_error_body()),
+    };
+    outbox.send_frame(&frame);
+}
+
+/// Checks the position before the hub says `ok`.
+async fn prepare_subscription(hub: &Hub, subscribe: &SyncSubscribe) -> Result<()> {
+    let (head, floor) = hub
+        .store
+        .read(|conn| Ok((feed::head_seq(conn)?, feed::floor_seq(conn)?)))
+        .await?;
+    if subscribe.after_seq < floor || subscribe.after_seq > head {
+        return Err(HubError::new(
+            ErrorCode::ResyncRequired,
+            "Your position in the feed is not available any more. Reload the snapshot, then subscribe again.",
+        ));
+    }
+    Ok(())
+}
+
+fn spawn_forwarder(hub: Hub, outbox: Outbox, subscribe: SyncSubscribe) -> JoinHandle<()> {
+    let filter: Option<HashSet<ChannelId>> =
+        subscribe.channel_ids.map(|ids| ids.into_iter().collect());
+    let after_seq = subscribe.after_seq;
+    tokio::spawn(async move {
+        // Subscribe to live entries first, so none falls between the backlog
+        // read and the live stream.
+        let mut live = hub.store.subscribe();
+        let mut last = after_seq;
+        if !catch_up(&hub, &outbox, filter.as_ref(), &mut last).await {
+            return;
+        }
+        loop {
+            match live.recv().await {
+                Ok(entry) => {
+                    if entry.seq <= last {
+                        continue;
+                    }
+                    last = entry.seq;
+                    if passes(filter.as_ref(), &entry) && !send_entry(&outbox, &entry) {
+                        return;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    if !catch_up(&hub, &outbox, filter.as_ref(), &mut last).await {
+                        return;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            }
+        }
+    })
+}
+
+/// Sends every stored entry after `last`. Returns false when the connection
+/// is gone or the read failed.
+async fn catch_up(
+    hub: &Hub,
+    outbox: &Outbox,
+    filter: Option<&HashSet<ChannelId>>,
+    last: &mut u64,
+) -> bool {
+    loop {
+        let from = *last;
+        let batch = match hub
+            .store
+            .read(move |conn| feed::entries_after(conn, from, BACKLOG_BATCH))
+            .await
+        {
+            Ok(batch) => batch,
+            Err(err) => {
+                tracing::warn!(error = %err, "could not read the feed backlog");
+                outbox.close();
+                return false;
+            }
+        };
+        let done = batch.len() < BACKLOG_BATCH;
+        for entry in batch {
+            *last = entry.seq;
+            if passes(filter, &entry) && !send_entry(outbox, &entry) {
+                return false;
+            }
+        }
+        if done {
+            return true;
+        }
+    }
+}
+
+fn passes(filter: Option<&HashSet<ChannelId>>, entry: &FeedEntry) -> bool {
+    match (filter, entry.channel_id) {
+        (Some(set), Some(channel)) => set.contains(&channel),
+        _ => true,
+    }
+}
+
+fn send_entry(outbox: &Outbox, entry: &FeedEntry) -> bool {
+    match Frame::family_event(&HubToClient::Feed(entry.clone())) {
+        Ok(frame) => outbox.send_frame(&frame),
+        Err(err) => {
+            tracing::warn!(error = %err, "could not encode a feed entry");
+            true
+        }
+    }
+}
