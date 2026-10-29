@@ -171,6 +171,12 @@ impl Hub {
                     worker.last_seen_at = Some(tx.now());
                     tx.save_worker(&worker)?;
                 }
+                // A sign-in flow runs on the worker. Without the link, no
+                // update can reach the hub, so the sign-in ends.
+                tx.fail_sign_ins_of_worker(
+                    worker_id,
+                    crate::ops::accounts::SIGN_IN_WORKER_OFFLINE,
+                )?;
                 Ok(())
             })
             .await

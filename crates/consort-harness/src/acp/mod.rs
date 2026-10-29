@@ -39,7 +39,7 @@ use crate::process::{self, ProcessSpec, StderrTail, resolve_program};
 use crate::{
     AccountConfig, AccountStatus, Answer, EVENT_CHANNEL_CAPACITY, EventReceiver, Harness,
     HarnessError, HarnessKind, HarnessSession, McpServerSpec, SIGNED_OUT_ERROR_CODE, SessionSpec,
-    SteerFuture, sign_in_hint, steer_ready, turn_text,
+    SignInMethod, SteerFuture, sign_in_hint, sign_in_hint_for, steer_ready, turn_text,
 };
 use mapper::{AcpMapper, stop_reason};
 
@@ -103,19 +103,14 @@ impl AcpHarness {
     }
 }
 
-/// How to launch an agent.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Launch {
-    /// The program.
-    pub program: PathBuf,
-    /// The arguments.
-    pub args: Vec<String>,
-    /// Extra environment variables.
-    pub env: BTreeMap<String, String>,
-}
+pub use crate::Launch;
 
 /// The launch recipe for an account. `resolve` finds a program on `PATH`;
 /// tests pass a fake.
+///
+/// An account with a `binary` runs that program. Otherwise the managed tool
+/// in `account.runtime.launch` runs, when the worker set one. Without
+/// either, the adapter looks for the harness on `PATH`.
 pub fn launch_recipe(
     kind: HarnessKind,
     account: &AccountConfig,
@@ -128,10 +123,16 @@ pub fn launch_recipe(
         resolve(name).ok_or_else(|| HarnessError::Spawn(format!("`{name}` is not on PATH")))
     };
     let mut env = BTreeMap::new();
+    let managed = account.managed_launch();
+    if let Some(launch) = managed {
+        env.extend(launch.env.clone());
+    }
     let (program, mut args) = match kind {
         HarnessKind::ClaudeCode => {
             if account.binary.is_some() {
                 (explicit("claude-agent-acp")?, Vec::new())
+            } else if let Some(launch) = managed {
+                (launch.program.clone(), launch.args.clone())
             } else if let Some(npx) = resolve("npx") {
                 (npx, vec!["-y".to_owned(), CLAUDE_AGENT_ACP.to_owned()])
             } else if let Some(bunx) = resolve("bunx") {
@@ -156,28 +157,38 @@ pub fn launch_recipe(
                     env.insert(key.to_owned(), "1".to_owned());
                 }
             }
-            (explicit("opencode")?, vec!["acp".to_owned()])
+            match managed {
+                // The managed launch is `opencode acp` already.
+                Some(launch) => (launch.program.clone(), launch.args.clone()),
+                None => (explicit("opencode")?, vec!["acp".to_owned()]),
+            }
         }
         // Gemini CLI 0.46.0 loads the `.gemini/settings.json` of the session
         // folder only when the user trusts that folder (or turns folder trust
         // off). It has no switch to skip the file in a trusted folder, so the
         // adapter cannot stop it. An untrusted folder also forces Gemini's
         // `default` mode. See docs/harness-adapters.md.
-        HarnessKind::GeminiCli => (
-            explicit("gemini")?,
-            vec![
-                "--experimental-acp".to_owned(),
-                "--approval-mode".to_owned(),
-                gemini_mode(mode).to_owned(),
-            ],
-        ),
-        HarnessKind::Acp => {
-            let Some(binary) = account.binary.as_deref() else {
-                return Err(HarnessError::Spawn(
-                    "an ACP agent account needs `binary` in worker.toml".to_owned(),
-                ));
+        HarnessKind::GeminiCli => {
+            let (program, mut args) = match managed {
+                // The managed launch has `--acp` already (Gemini CLI 0.66.0).
+                Some(launch) => (launch.program.clone(), launch.args.clone()),
+                None => (explicit("gemini")?, vec!["--experimental-acp".to_owned()]),
             };
-            (explicit(binary)?, Vec::new())
+            args.push("--approval-mode".to_owned());
+            args.push(gemini_mode(mode).to_owned());
+            (program, args)
+        }
+        HarnessKind::Acp => {
+            if let Some(launch) = managed {
+                (launch.program.clone(), launch.args.clone())
+            } else {
+                let Some(binary) = account.binary.as_deref() else {
+                    return Err(HarnessError::Spawn(
+                        "an ACP agent account needs `binary` in worker.toml".to_owned(),
+                    ));
+                };
+                (explicit(binary)?, Vec::new())
+            }
         }
         HarnessKind::Codex | HarnessKind::Pi => {
             return Err(HarnessError::Unsupported("run through the ACP adapter"));
@@ -667,7 +678,13 @@ struct Actor {
     stderr: StderrTail,
     /// The session is a probe, not a session for the hub.
     probe: bool,
+    /// Gets the `initialize` result, so a probe can read the agent's auth
+    /// methods also when the session does not open.
+    init: InitSlot,
 }
+
+/// The `initialize` result of an agent, once it answered.
+type InitSlot = std::sync::Arc<std::sync::Mutex<Option<Value>>>;
 
 impl Actor {
     async fn emit(&self, event: SessionEvent) {
@@ -709,6 +726,9 @@ impl Actor {
             ))
         })?
         .map_err(|e| protocol_error(&e))?;
+        if let Ok(mut slot) = self.init.lock() {
+            *slot = Some(init.clone());
+        }
         let agent_caps = init
             .get("agentCapabilities")
             .cloned()
@@ -1418,7 +1438,7 @@ pub fn agent_process_spec(
         program: launch.program,
         args: launch.args,
         env,
-        env_remove: Vec::new(),
+        env_remove: account.runtime.env_remove.clone(),
         cwd: Some(spec.runtime_dir.clone()),
         watcher: spec.process_watcher.clone(),
     })
@@ -1431,6 +1451,7 @@ async fn start(
     account: &AccountConfig,
     spec: SessionSpec,
     probe: bool,
+    init: InitSlot,
 ) -> Result<(AcpSession, EventReceiver, Ready), HarnessError> {
     let mut child = process::spawn(&agent_process_spec(kind, account, &spec, &resolve_program)?)?;
     let stdin = child
@@ -1440,7 +1461,7 @@ async fn start(
         .take_stdout()
         .ok_or_else(|| HarnessError::Spawn("no stdout".to_owned()))?;
     let stderr = child.stderr_handle();
-    connect_for(kind, spec, stdin, stdout, Some(child), stderr, probe).await
+    connect_with_init(kind, spec, stdin, stdout, Some(child), stderr, probe, init).await
 }
 
 /// Runs the ACP client over any byte streams. `start` passes the stdio of
@@ -1466,6 +1487,7 @@ where
 /// The connection task owns the agent process. Until the session is open,
 /// a guard aborts the task when this future drops, for example when the
 /// probe limit runs out, so the agent does not keep running.
+#[cfg(test)]
 async fn connect_for<W, R>(
     kind: HarnessKind,
     spec: SessionSpec,
@@ -1474,6 +1496,26 @@ async fn connect_for<W, R>(
     child: Option<process::HarnessProcess>,
     stderr: StderrTail,
     probe: bool,
+) -> Result<(AcpSession, EventReceiver, Ready), HarnessError>
+where
+    W: tokio::io::AsyncWrite + Send + Unpin + 'static,
+    R: tokio::io::AsyncRead + Send + Unpin + 'static,
+{
+    let init = InitSlot::default();
+    connect_with_init(kind, spec, stdin, stdout, child, stderr, probe, init).await
+}
+
+/// [`connect_for`] that also stores the `initialize` result in `init`.
+#[allow(clippy::too_many_arguments)]
+async fn connect_with_init<W, R>(
+    kind: HarnessKind,
+    spec: SessionSpec,
+    stdin: W,
+    stdout: R,
+    child: Option<process::HarnessProcess>,
+    stderr: StderrTail,
+    probe: bool,
+    init: InitSlot,
 ) -> Result<(AcpSession, EventReceiver, Ready), HarnessError>
 where
     W: tokio::io::AsyncWrite + Send + Unpin + 'static,
@@ -1491,6 +1533,7 @@ where
         events: event_tx,
         stderr: stderr.clone(),
         probe,
+        init,
     };
     let notify_tx = incoming_tx.clone();
     let request_tx = incoming_tx;
@@ -1584,16 +1627,38 @@ impl Harness for AcpHarness {
         static_capabilities(self.kind)
     }
 
+    fn managed_tool(&self, account: &AccountConfig) -> Option<crate::ToolId> {
+        account.managed_tool()
+    }
+
     async fn probe(&self, account: &AccountConfig) -> AccountStatus {
         let caps = static_capabilities(self.kind);
-        if let Err(err) = launch_recipe(
+        let launch = match launch_recipe(
             self.kind,
             account,
             ApprovalMode::Ask,
             true,
             &resolve_program,
         ) {
-            return AccountStatus::unknown(err.to_string(), caps);
+            Ok(launch) => launch,
+            Err(err) => return AccountStatus::unknown(err.to_string(), caps),
+        };
+        // Claude Code tells its sign-in state itself. When it says that
+        // nobody is signed in, the ACP probe would only fail.
+        let claude = if self.kind == HarnessKind::ClaudeCode {
+            crate::signin::claude::status_for(account).await
+        } else {
+            None
+        };
+        if let Some(status) = &claude
+            && !status.logged_in
+        {
+            return AccountStatus {
+                auth_state: AuthState::SignedOut,
+                auth_detail: Some(sign_in_hint_for(account, "Not signed in")),
+                capabilities: caps,
+                ..AccountStatus::default()
+            };
         }
         let dir = std::env::temp_dir().join(format!("consort-probe-{}", uuid::Uuid::now_v7()));
         if let Err(err) = std::fs::create_dir_all(&dir) {
@@ -1613,11 +1678,15 @@ impl Harness for AcpHarness {
             resume: None,
             process_watcher: None,
         };
+        let init = InitSlot::default();
         // When the limit runs out, the start future drops, and its guard
         // stops the agent.
-        let result =
-            tokio::time::timeout(PROBE_TIMEOUT, start(self.kind, account, spec, true)).await;
-        let status = match result {
+        let result = tokio::time::timeout(
+            PROBE_TIMEOUT,
+            start(self.kind, account, spec, true, init.clone()),
+        )
+        .await;
+        let mut status = match result {
             Ok(Ok((session, _events, ready))) => {
                 let _ = Box::new(session).close().await;
                 let mut capabilities = static_capabilities(self.kind);
@@ -1636,31 +1705,45 @@ impl Harness for AcpHarness {
                     harness_version: ready.agent_version,
                     auth_state: AuthState::SignedIn,
                     auth_detail: ready.auth_label.or_else(|| {
-                        (self.kind == HarnessKind::OpenCode).then(|| {
+                        (self.kind == HarnessKind::OpenCode && !account.profile).then(|| {
                             "OpenCode signs in per model provider. Run `opencode auth list` to see which ones.".to_owned()
                         })
                     }),
                     models: models_from_config(&ready.config_options),
                     capabilities,
+                    ..AccountStatus::default()
                 }
             }
             Ok(Err(HarnessError::SignedOut(message))) => AccountStatus {
-                harness_version: None,
                 auth_state: AuthState::SignedOut,
-                auth_detail: Some(sign_in_hint(self.kind, &message)),
-                models: Vec::new(),
+                auth_detail: Some(sign_in_hint_for(account, &message)),
                 capabilities: caps,
+                ..AccountStatus::default()
             },
             Ok(Err(err)) => AccountStatus {
-                harness_version: None,
                 auth_state: AuthState::Error,
                 auth_detail: Some(err.to_string()),
-                models: Vec::new(),
                 capabilities: caps,
+                ..AccountStatus::default()
             },
             Err(_) => AccountStatus::unknown("The probe timed out.", caps),
         };
         let _ = std::fs::remove_dir_all(&dir);
+        if let Some(init) = init.lock().ok().and_then(|slot| slot.clone()) {
+            if status.harness_version.is_none() {
+                status.harness_version = init
+                    .get("agentInfo")
+                    .and_then(|i| i.get("version"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+            }
+            status.sign_in_methods =
+                sign_in_methods_from_init(&init, &command_text(&launch.program, &launch.args));
+        }
+        if let Some(claude) = claude {
+            status.plan = claude.plan();
+            status.email = claude.email;
+        }
         status
     }
 
@@ -1670,7 +1753,7 @@ impl Harness for AcpHarness {
         spec: SessionSpec,
     ) -> Result<(Box<dyn HarnessSession>, EventReceiver), HarnessError> {
         let (session, events) = open_with_fallback(self.kind, spec, |spec| {
-            start(self.kind, account, spec, false)
+            start(self.kind, account, spec, false, InitSlot::default())
         })
         .await?;
         Ok((Box::new(session), events))
@@ -1790,6 +1873,236 @@ impl HarnessSession for AcpSession {
         }
         Ok(())
     }
+}
+
+/// A command line to show to the user: the program and its arguments,
+/// with spaces between them.
+fn command_text(program: &Path, args: &[String]) -> String {
+    let mut parts = vec![program.to_string_lossy().into_owned()];
+    parts.extend(args.iter().cloned());
+    parts.join(" ")
+}
+
+/// The sign-in methods in the `authMethods` of an ACP `initialize` result.
+///
+/// - A method with no `type`, or `type: "agent"`, is an `acp_agent` method:
+///   the worker runs `authenticate` with its ID.
+/// - `type: "terminal"` is a `terminal` method. The app cannot run it, so it
+///   shows the command: `program` and the method's `args`.
+/// - `type: "env_var"` is an `api_key` method for its variable.
+pub fn sign_in_methods_from_init(init: &Value, program: &str) -> Vec<SignInMethod> {
+    let Some(methods) = init.get("authMethods").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for method in methods {
+        let Some(id) = method.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let name = method
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or(id)
+            .to_owned();
+        match method
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("agent")
+        {
+            "agent" => out.push(SignInMethod::AcpAgent {
+                method_id: id.to_owned(),
+                name,
+            }),
+            "terminal" => {
+                let args: Vec<String> = method
+                    .get("args")
+                    .and_then(Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_owned)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let mut parts = vec![program.to_owned()];
+                parts.extend(args);
+                out.push(SignInMethod::Terminal {
+                    command: parts.join(" "),
+                });
+            }
+            "env_var" => {
+                let variable = method.get("varName").and_then(Value::as_str).or_else(|| {
+                    method
+                        .get("vars")
+                        .and_then(Value::as_array)
+                        .and_then(|v| v.first())
+                        .and_then(|v| v.get("name"))
+                        .and_then(Value::as_str)
+                });
+                if let Some(variable) = variable {
+                    out.push(SignInMethod::ApiKey {
+                        variable: variable.to_owned(),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Whether an agent offers `logout`, from its `initialize` result.
+pub fn offers_logout(init: &Value) -> bool {
+    init.get("agentCapabilities")
+        .and_then(|c| c.get("auth"))
+        .and_then(|a| a.get("logout"))
+        .is_some_and(|l| !l.is_null())
+}
+
+/// How long `authenticate` may take. An agent method can open a browser on
+/// the worker and wait for the user.
+const AUTHENTICATE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// How long `logout` may take.
+const LOGOUT_TIMEOUT: Duration = Duration::from_secs(30);
+
+enum AuthOp {
+    Authenticate(String),
+    Logout,
+}
+
+/// Runs `authenticate` with an auth method of the agent, on a short-lived
+/// agent process with the account's environment.
+pub async fn authenticate(
+    kind: HarnessKind,
+    account: &AccountConfig,
+    method_id: &str,
+) -> Result<(), HarnessError> {
+    auth_op(kind, account, AuthOp::Authenticate(method_id.to_owned()))
+        .await
+        .map(|_| ())
+}
+
+/// Runs `logout` on a short-lived agent process, when the agent offers it.
+/// Returns whether the agent offers it.
+pub async fn logout(kind: HarnessKind, account: &AccountConfig) -> Result<bool, HarnessError> {
+    auth_op(kind, account, AuthOp::Logout).await
+}
+
+async fn auth_op(
+    kind: HarnessKind,
+    account: &AccountConfig,
+    op: AuthOp,
+) -> Result<bool, HarnessError> {
+    let dir = std::env::temp_dir().join(format!("consort-auth-{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir_all(&dir)?;
+    let spec = SessionSpec {
+        session_id: consort_proto::ids::SessionId::new(),
+        workspace: dir.clone(),
+        runtime_dir: dir.clone(),
+        model: String::new(),
+        options: Default::default(),
+        approval_mode: ApprovalMode::Ask,
+        allow_shell: true,
+        system_prompt_append: String::new(),
+        mcp_servers: Vec::new(),
+        env: BTreeMap::new(),
+        resume: None,
+        process_watcher: None,
+    };
+    let result = auth_op_in(kind, account, &spec, op).await;
+    let _ = std::fs::remove_dir_all(&dir);
+    result
+}
+
+async fn auth_op_in(
+    kind: HarnessKind,
+    account: &AccountConfig,
+    spec: &SessionSpec,
+    op: AuthOp,
+) -> Result<bool, HarnessError> {
+    let limit = match op {
+        AuthOp::Authenticate(_) => AUTHENTICATE_TIMEOUT,
+        AuthOp::Logout => LOGOUT_TIMEOUT,
+    };
+    let mut child = process::spawn(&agent_process_spec(kind, account, spec, &resolve_program)?)?;
+    let stdin = child
+        .take_stdin()
+        .ok_or_else(|| HarnessError::Spawn("no stdin".to_owned()))?;
+    let stdout = child
+        .take_stdout()
+        .ok_or_else(|| HarnessError::Spawn("no stdout".to_owned()))?;
+    let stderr = child.stderr_handle();
+    let (tx, rx) = oneshot::channel::<Result<bool, HarnessError>>();
+    let task = AbortOnDrop(Some(tokio::spawn(async move {
+        let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
+        let result = Client
+            .builder()
+            .connect_with(transport, async move |cx: ConnectionTo<Agent>| {
+                let result = async {
+                    let init = tokio::time::timeout(
+                        INITIALIZE_TIMEOUT,
+                        request(
+                            &cx,
+                            "initialize",
+                            json!({
+                                "protocolVersion": 1,
+                                "clientCapabilities": {
+                                    "fs": {"readTextFile": false, "writeTextFile": false},
+                                    "terminal": false
+                                },
+                                "clientInfo": {"name": "consort", "title": "Consort", "version": env!("CARGO_PKG_VERSION")}
+                            }),
+                        ),
+                    )
+                    .await
+                    .map_err(|_| {
+                        HarnessError::Timeout("the agent did not answer `initialize`".to_owned())
+                    })?
+                    .map_err(|e| HarnessError::Protocol(e.to_string()))?;
+                    match op {
+                        AuthOp::Authenticate(method_id) => {
+                            request(&cx, "authenticate", json!({"methodId": method_id}))
+                                .await
+                                .map_err(|e| HarnessError::Protocol(e.message.clone()))?;
+                            Ok(true)
+                        }
+                        AuthOp::Logout => {
+                            if !offers_logout(&init) {
+                                return Ok(false);
+                            }
+                            request(&cx, "logout", json!({}))
+                                .await
+                                .map_err(|e| HarnessError::Protocol(e.message.clone()))?;
+                            Ok(true)
+                        }
+                    }
+                }
+                .await;
+                let _ = tx.send(result);
+                Ok(())
+            })
+            .await;
+        if let Err(err) = result {
+            tracing::debug!(error = %err, "ACP auth connection ended with an error");
+        }
+    })));
+    let result = match tokio::time::timeout(limit, rx).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(_)) => {
+            let tail = stderr.get();
+            Err(HarnessError::Spawn(if tail.is_empty() {
+                "the agent exited before it answered".to_owned()
+            } else {
+                format!("the agent exited before it answered: {tail}")
+            }))
+        }
+        Err(_) => Err(HarnessError::Timeout(
+            "the agent did not finish the sign-in in time".to_owned(),
+        )),
+    };
+    drop(task);
+    child.shutdown(Duration::from_secs(2)).await;
+    result
 }
 
 #[cfg(test)]

@@ -4,22 +4,31 @@ use std::sync::Arc;
 
 use consort_proto::{
     client_api::{
+        AccountCreate, AccountRemove, AccountSignOut, AccountUpdate, AcpRegistryList,
         ChannelArchive, ChannelCreate, ChannelDelete, ChannelMove, ChannelUpdate,
         DecisionAnswerRequest, GroupCreate, GroupUpdate, MessageDelete, MessageEdit, MessageList,
-        ReadMark, TaskArchive, TaskInterrupt, TaskReopen, TaskResolve, TaskRetry,
-        WorkerPairingCode, WorkerRename, WorkerRevoke, WorkerSetPaused, WorkerSetTags,
+        ReadMark, SignInCancel, SignInStart, SignInSubmitCode, TaskArchive, TaskInterrupt,
+        TaskReopen, TaskResolve, TaskRetry, WorkerPairingCode, WorkerRename, WorkerRevoke,
+        WorkerSetPaused, WorkerSetTags, WorkerToolInstall, WorkerToolsCheck,
     },
     ids::{ChannelId, GroupId},
-    model::{DecisionAnswer, ModelSelection, RequestOptionKind},
+    model::{
+        AcpAccountSpec, DecisionAnswer, ModelSelection, OptionValue, RequestOptionKind,
+        SignInMethod, ToolId,
+    },
 };
-use tokio::sync::{oneshot, watch};
+use futures_util::StreamExt as _;
+use tokio::sync::watch;
 
 use super::{Shared, invalid, link::ThreadPager, outbox::queue_send, pair};
 use crate::{
-    Backend, ClientError, Command,
+    AcpSpec, Backend, ClientError, Command, CommandOutput,
     cache::{Cache, PendingSend},
     format,
-    view::{ApprovalChoice, Connection, PairingCodeView, ViewState},
+    view::{
+        ApprovalChoice, Connection, PairingCodeView, RegistryLoad, SelectionOption, SelectionView,
+        SignInChoice, ViewState,
+    },
 };
 
 /// The hub backend: every command runs as its own task, so one command that
@@ -32,7 +41,7 @@ impl Backend for HubBackend {
     fn handle(
         &mut self,
         command: Command,
-        reply: oneshot::Sender<Result<(), ClientError>>,
+        reply: crate::Reply,
         _publish: &watch::Sender<Arc<ViewState>>,
     ) {
         let shared = self.shared.clone();
@@ -50,18 +59,29 @@ fn parse<T: std::str::FromStr>(id: &str, what: &str) -> Result<T, ClientError> {
     })
 }
 
-fn selection(label: &Option<String>) -> Option<ModelSelection> {
-    label.as_ref().map(|l| {
-        let (account, model) = l.split_once(", ").unwrap_or((l.as_str(), ""));
-        ModelSelection {
-            account_label: account.to_owned(),
-            model: model.to_owned(),
-            options: Default::default(),
-        }
+/// A model selection for the hub: the account label, the model ID (not
+/// its name) and the options, as the selection holds them.
+pub(crate) fn selection(view: &Option<SelectionView>) -> Option<ModelSelection> {
+    view.as_ref().map(|s| ModelSelection {
+        account_label: s.account_label.clone(),
+        model: s.model_id.clone(),
+        options: s
+            .options
+            .iter()
+            .map(|(id, value)| {
+                (
+                    id.clone(),
+                    match value {
+                        SelectionOption::Bool(b) => OptionValue::Bool(*b),
+                        SelectionOption::Text(t) => OptionValue::Text(t.clone()),
+                    },
+                )
+            })
+            .collect(),
     })
 }
 
-async fn run(shared: Arc<Shared>, command: Command) -> Result<(), ClientError> {
+async fn run(shared: Arc<Shared>, command: Command) -> Result<CommandOutput, ClientError> {
     match command {
         Command::Pair { hub_url, code } => {
             let identity = pair(&hub_url, &code, &shared.options).await?;
@@ -103,7 +123,9 @@ async fn run(shared: Arc<Shared>, command: Command) -> Result<(), ClientError> {
                 body,
                 created_at: format::now_ms(),
             };
-            return queue_send(&shared, pending).await;
+            return queue_send(&shared, pending)
+                .await
+                .map(|()| CommandOutput::Done);
         }
         Command::ReplyToTask {
             task_id,
@@ -127,7 +149,9 @@ async fn run(shared: Arc<Shared>, command: Command) -> Result<(), ClientError> {
                 body,
                 created_at: format::now_ms(),
             };
-            return queue_send(&shared, pending).await;
+            return queue_send(&shared, pending)
+                .await
+                .map(|()| CommandOutput::Done);
         }
         Command::EditMessage { message_id, body } => {
             // Refuse a body that the hub would refuse. The caller keeps its
@@ -176,7 +200,7 @@ async fn run(shared: Arc<Shared>, command: Command) -> Result<(), ClientError> {
                     }),
                     default_approval_mode: None,
                     memory_enabled: None,
-                    tags: Vec::new(),
+                    tags: new.tags,
                 })
                 .await?;
             if !new.preferred_workers.is_empty() {
@@ -210,6 +234,9 @@ async fn run(shared: Arc<Shared>, command: Command) -> Result<(), ClientError> {
             }
             if let Some(icon) = changes.icon {
                 patch["icon"] = icon.into();
+            }
+            if let Some(tags) = changes.tags {
+                patch["tags"] = tags.into();
             }
             if patch.as_object().is_some_and(|o| o.len() > 1) {
                 let update: ChannelUpdate =
@@ -349,7 +376,11 @@ async fn run(shared: Arc<Shared>, command: Command) -> Result<(), ClientError> {
                 shared.publish();
             }
         }
-        Command::LoadThread { task_id } => return load_thread(&shared, &task_id).await,
+        Command::LoadThread { task_id } => {
+            return load_thread(&shared, &task_id)
+                .await
+                .map(|()| CommandOutput::Done);
+        }
         Command::LoadOlder { channel_id } => {
             let (more, oldest) = shared
                 .cache
@@ -531,8 +562,275 @@ async fn run(shared: Arc<Shared>, command: Command) -> Result<(), ClientError> {
                 })
                 .await?;
         }
+        Command::CreateAccount(new) => {
+            let label = new.label.trim().to_owned();
+            if label.is_empty() {
+                return Err(invalid("Enter a name for the account."));
+            }
+            let created = shared
+                .call(AccountCreate {
+                    worker_id: parse(&new.worker_id, "worker")?,
+                    harness: new.harness,
+                    label,
+                    acp: new.acp.map(|spec| match spec {
+                        AcpSpec::Registry { id } => AcpAccountSpec::Registry { id },
+                        AcpSpec::Command { program, args } => {
+                            AcpAccountSpec::Command { program, args }
+                        }
+                    }),
+                    env: new.env,
+                })
+                .await?;
+            return Ok(CommandOutput::AccountCreated(
+                created.account_id.to_string(),
+            ));
+        }
+        Command::UpdateAccount {
+            worker_id,
+            account_id,
+            label,
+            env_set,
+            env_remove,
+        } => {
+            let label = label.map(|l| l.trim().to_owned());
+            if label.as_deref() == Some("") {
+                return Err(invalid("Enter a name for the account."));
+            }
+            shared
+                .call(AccountUpdate {
+                    worker_id: parse(&worker_id, "worker")?,
+                    account_id: parse(&account_id, "account")?,
+                    label,
+                    env_set,
+                    env_remove,
+                })
+                .await?;
+        }
+        Command::RemoveAccount {
+            worker_id,
+            account_id,
+        } => {
+            shared
+                .call(AccountRemove {
+                    worker_id: parse(&worker_id, "worker")?,
+                    account_id: parse(&account_id, "account")?,
+                })
+                .await?;
+        }
+        Command::SignOutAccount {
+            worker_id,
+            account_id,
+        } => {
+            shared
+                .call(AccountSignOut {
+                    worker_id: parse(&worker_id, "worker")?,
+                    account_id: parse(&account_id, "account")?,
+                })
+                .await?;
+        }
+        Command::StartSignIn {
+            worker_id,
+            account_id,
+            method,
+        } => {
+            let started = shared
+                .call(SignInStart {
+                    worker_id: parse(&worker_id, "worker")?,
+                    account_id: parse(&account_id, "account")?,
+                    method: sign_in_method(&method),
+                })
+                .await?;
+            let id = started.sign_in.id.to_string();
+            if let Ok(mut cache) = shared.cache.lock() {
+                // A feed entry may have come first with a newer state.
+                let newer = cache
+                    .sign_ins
+                    .get(&id)
+                    .is_some_and(|s| s.updated_at > started.sign_in.updated_at);
+                if !newer {
+                    cache.sign_ins.insert(id.clone(), started.sign_in);
+                }
+            }
+            shared.publish();
+            return Ok(CommandOutput::SignInStarted(id));
+        }
+        Command::SubmitSignInCode { sign_in_id, code } => {
+            let code = code.0.trim().to_owned();
+            if code.is_empty() {
+                return Err(invalid("Paste the code that the sign-in page shows."));
+            }
+            shared
+                .call(SignInSubmitCode {
+                    sign_in_id: parse(&sign_in_id, "sign-in")?,
+                    code,
+                })
+                .await?;
+        }
+        Command::CancelSignIn { sign_in_id } => {
+            shared
+                .call(SignInCancel {
+                    sign_in_id: parse(&sign_in_id, "sign-in")?,
+                })
+                .await?;
+        }
+        Command::DismissSignIn { sign_in_id } => {
+            if let Ok(mut cache) = shared.cache.lock() {
+                cache.sign_ins.remove(&sign_in_id);
+                cache.sign_ins_dismissed.insert(sign_in_id);
+            }
+            shared.publish();
+        }
+        Command::CheckTools { worker_id } => {
+            shared
+                .call(WorkerToolsCheck {
+                    worker_id: parse(&worker_id, "worker")?,
+                })
+                .await?;
+        }
+        Command::InstallTool { worker_id, tool } => {
+            shared
+                .call(WorkerToolInstall {
+                    worker_id: parse(&worker_id, "worker")?,
+                    tool: ToolId::new(tool),
+                })
+                .await?;
+        }
+        Command::LoadAcpRegistry => load_registry(&shared).await?,
     }
+    Ok(CommandOutput::Done)
+}
+
+/// A sign-in method as the proto names it.
+pub(crate) fn sign_in_method(choice: &SignInChoice) -> SignInMethod {
+    match choice {
+        SignInChoice::ClaudePlan => SignInMethod::ClaudePlan,
+        SignInChoice::ClaudeConsole => SignInMethod::ClaudeConsole,
+        SignInChoice::ChatgptDevice => SignInMethod::ChatgptDevice,
+        SignInChoice::ChatgptBrowser => SignInMethod::ChatgptBrowser,
+        SignInChoice::ApiKey { variable } => SignInMethod::ApiKey {
+            variable: variable.clone(),
+        },
+        SignInChoice::AcpAgent { method_id, name } => SignInMethod::AcpAgent {
+            method_id: method_id.clone(),
+            name: name.clone(),
+        },
+        SignInChoice::Terminal { command } => SignInMethod::Terminal {
+            command: command.clone(),
+        },
+    }
+}
+
+/// The largest icon that the client loads for a registry agent.
+const ICON_MAX_BYTES: usize = 64 * 1024;
+/// How many icons load at once.
+const ICON_LOADS: usize = 6;
+
+/// Loads the ACP registry from the hub, then the icons of its agents. A
+/// second call while a load runs, or after a load that worked, does
+/// nothing. A failed load can be tried again.
+async fn load_registry(shared: &Arc<Shared>) -> Result<(), ClientError> {
+    let start = shared.cache.lock().is_ok_and(|mut c| {
+        if matches!(
+            c.acp_registry_load,
+            RegistryLoad::Loading | RegistryLoad::Loaded
+        ) {
+            return false;
+        }
+        c.acp_registry_load = RegistryLoad::Loading;
+        true
+    });
+    if !start {
+        return Ok(());
+    }
+    shared.publish();
+    let result = shared.call(AcpRegistryList {}).await;
+    let agents = match result {
+        Ok(list) => list.agents,
+        Err(err) => {
+            if let Ok(mut c) = shared.cache.lock() {
+                c.acp_registry_load =
+                    RegistryLoad::Failed(format!("Consort cannot load the ACP registry. {err}."));
+            }
+            shared.publish();
+            return Err(err);
+        }
+    };
+    let icons: Vec<(String, String)> = agents
+        .iter()
+        .filter_map(|a| a.icon_url.clone().map(|url| (a.id.clone(), url)))
+        .collect();
+    if let Ok(mut c) = shared.cache.lock() {
+        c.acp_registry = agents;
+        c.acp_registry_load = RegistryLoad::Loaded;
+    }
+    shared.publish();
+    // The icons load in the background. An agent whose icon does not load
+    // keeps a neutral glyph.
+    let shared = shared.clone();
+    tokio::spawn(async move {
+        let client = match reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::limited(3))
+            .build()
+        {
+            Ok(client) => client,
+            Err(err) => {
+                tracing::warn!(error = %err, "cannot make the icon client");
+                return;
+            }
+        };
+        futures_util::stream::iter(icons)
+            .for_each_concurrent(ICON_LOADS, |(id, url)| {
+                let client = client.clone();
+                let shared = shared.clone();
+                async move {
+                    match load_icon(&client, &url).await {
+                        Some(svg) => {
+                            if let Ok(mut c) = shared.cache.lock() {
+                                c.acp_icons.insert(id, svg);
+                            }
+                            shared.publish();
+                        }
+                        None => tracing::debug!(%url, "the icon of a registry agent did not load"),
+                    }
+                }
+            })
+            .await;
+    });
     Ok(())
+}
+
+/// Loads one registry icon: an `https` URL that gives an SVG of at most
+/// [`ICON_MAX_BYTES`]. Anything else gives `None`.
+async fn load_icon(client: &reqwest::Client, url: &str) -> Option<String> {
+    let parsed = url::Url::parse(url).ok()?;
+    if parsed.scheme() != "https" {
+        return None;
+    }
+    let response = client.get(parsed).send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    if response
+        .content_length()
+        .is_some_and(|len| len > ICON_MAX_BYTES as u64)
+    {
+        return None;
+    }
+    let bytes = response.bytes().await.ok()?;
+    checked_svg(&bytes)
+}
+
+/// The text of an SVG icon, or `None` when the bytes are too large or are
+/// not an SVG document.
+pub(crate) fn checked_svg(bytes: &[u8]) -> Option<String> {
+    if bytes.len() > ICON_MAX_BYTES {
+        return None;
+    }
+    let text = std::str::from_utf8(bytes).ok()?;
+    let head = text.trim_start_matches('\u{feff}').trim_start();
+    let is_svg = head.starts_with("<svg") || (head.starts_with("<?xml") && head.contains("<svg"));
+    is_svg.then(|| text.to_owned())
 }
 
 /// The name of a group as the hub stores it: trimmed.
@@ -682,4 +980,74 @@ pub(crate) fn option_for(
             .find(|o| o.kind == *kind)
             .map(|o| o.id.clone())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_selection_sends_the_model_id_and_its_options() {
+        let view = SelectionView {
+            account_label: "Claude Personal".into(),
+            model_id: "claude-opus-5-5".into(),
+            model_name: "Opus 5.5".into(),
+            options: vec![
+                ("effort".into(), SelectionOption::Text("high".into())),
+                ("thinking".into(), SelectionOption::Bool(true)),
+            ],
+        };
+        let sent = selection(&Some(view)).expect("selection");
+        assert_eq!(sent.account_label, "Claude Personal");
+        assert_eq!(sent.model, "claude-opus-5-5", "the ID, not the name");
+        assert_eq!(
+            sent.options.get("effort"),
+            Some(&OptionValue::Text("high".into()))
+        );
+        assert_eq!(sent.options.get("thinking"), Some(&OptionValue::Bool(true)));
+        assert_eq!(selection(&None), None);
+    }
+
+    #[test]
+    fn every_sign_in_choice_maps_back_to_its_method() {
+        let methods = [
+            SignInMethod::ClaudePlan,
+            SignInMethod::ClaudeConsole,
+            SignInMethod::ChatgptDevice,
+            SignInMethod::ChatgptBrowser,
+            SignInMethod::ApiKey {
+                variable: "OPENAI_API_KEY".into(),
+            },
+            SignInMethod::AcpAgent {
+                method_id: "oauth".into(),
+                name: "Google account".into(),
+            },
+            SignInMethod::Terminal {
+                command: "goose configure".into(),
+            },
+        ];
+        for method in methods {
+            let choice = crate::reduce::sign_in_choice(&method);
+            assert_eq!(sign_in_method(&choice), method);
+        }
+    }
+
+    #[test]
+    fn only_a_small_svg_counts_as_an_icon() {
+        assert!(checked_svg(b"<svg xmlns='http://www.w3.org/2000/svg'></svg>").is_some());
+        assert!(checked_svg(b"<?xml version='1.0'?>\n<svg></svg>").is_some());
+        assert!(checked_svg(b"<html><svg></svg></html>").is_none());
+        assert!(checked_svg(&[0xff, 0xfe]).is_none());
+        let big = format!("<svg>{}</svg>", "a".repeat(ICON_MAX_BYTES));
+        assert!(checked_svg(big.as_bytes()).is_none());
+    }
+
+    #[test]
+    fn a_sign_in_code_never_shows_in_debug_output() {
+        let command = Command::SubmitSignInCode {
+            sign_in_id: "sgn_1".into(),
+            code: crate::SecretText("secret-code".into()),
+        };
+        assert!(!format!("{command:?}").contains("secret-code"));
+    }
 }

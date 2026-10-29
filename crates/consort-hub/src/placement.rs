@@ -10,8 +10,10 @@
 //! 2. A request that names a worker uses only that worker. The result is a
 //!    placement, a wait, or a failure that says what to change.
 //! 3. Otherwise the candidates are the online workers that are not paused.
+//!    When the channel has tags, only workers that have every tag count.
 //! 4. Each candidate must pass three checks: a usable harness account, the
-//!    `require` constraints, and the worker policy.
+//!    `require` constraints (with the channel tags added), and the worker
+//!    policy.
 //! 5. The remaining candidates are ranked. The first one wins.
 //!
 //! When no candidate remains, the result is a wait. The reason names the
@@ -53,6 +55,9 @@ pub(crate) struct PlacementInput<'a> {
     pub approval_mode: ApprovalMode,
     /// The channel's preferred workers, in order.
     pub preferred_workers: &'a [WorkerId],
+    /// The tags of the channel. A worker qualifies only if it has every one
+    /// of them, on top of any `require.tags`.
+    pub channel_tags: &'a [String],
     /// The repos of the session (already defaulted from the channel). Empty
     /// for coordinators.
     pub repos: &'a [Repo],
@@ -162,6 +167,9 @@ fn place_on_best_worker(
     input: &PlacementInput<'_>,
     live: &[(usize, &Worker)],
 ) -> Result<Placement, PlacementError> {
+    if let Some(reason) = channel_tag_wait(input, live) {
+        return Err(PlacementError::Wait(reason));
+    }
     let online: Vec<&(usize, &Worker)> = live
         .iter()
         .filter(|(_, worker)| worker.state == WorkerState::Online)
@@ -306,7 +314,7 @@ fn evaluate<'a>(
 ) -> Result<Candidate<'a>, Rejection> {
     let (account, model, options) = choose_account(inventory, input.selection, input.approval_mode)
         .map_err(Rejection::Account)?;
-    if let Some(require) = &input.request.require
+    if let Some(require) = &effective_require(input)
         && !meets_require(require, worker, inventory)
     {
         return Err(Rejection::Require);
@@ -416,6 +424,62 @@ fn harness_rank(account: &HarnessAccount) -> usize {
     } else {
         LABEL_ORDER.len()
     }
+}
+
+/// The constraints of the request with the channel tags added. `None` when
+/// the request has none and the channel has no tags.
+fn effective_require(input: &PlacementInput<'_>) -> Option<PlacementRequire> {
+    if input.channel_tags.is_empty() {
+        return input.request.require.clone();
+    }
+    let mut require = input.request.require.clone().unwrap_or_default();
+    for tag in input.channel_tags {
+        if !require.tags.contains(tag) {
+            require.tags.push(tag.clone());
+        }
+    }
+    Some(require)
+}
+
+/// The reason to wait when the channel has tags and no online worker that
+/// is not paused has every one of them. `None` when such a worker exists.
+///
+/// If no worker at all has the tags, the reason says so and points to the
+/// place where the user adds a tag to a worker.
+fn channel_tag_wait(input: &PlacementInput<'_>, live: &[(usize, &Worker)]) -> Option<String> {
+    if input.channel_tags.is_empty() {
+        return None;
+    }
+    let tagged: Vec<&Worker> = live
+        .iter()
+        .map(|(_, worker)| *worker)
+        .filter(|worker| worker.has_tags(input.channel_tags))
+        .collect();
+    if tagged
+        .iter()
+        .any(|worker| worker.state == WorkerState::Online && !worker.paused)
+    {
+        return None;
+    }
+    let noun = if input.channel_tags.len() == 1 {
+        "tag"
+    } else {
+        "tags"
+    };
+    let wanted = join_list(input.channel_tags);
+    Some(if tagged.is_empty() {
+        format!(
+            "Waiting for an online worker with the {noun} {wanted}. \
+             Add the {noun} to a worker in Settings > Workers."
+        )
+    } else if tagged.iter().all(|worker| worker.paused) {
+        format!(
+            "Waiting for an online worker with the {noun} {wanted}. \
+             Every worker with the {noun} is paused."
+        )
+    } else {
+        format!("Waiting for an online worker with the {noun} {wanted}.")
+    })
 }
 
 fn meets_require(require: &PlacementRequire, worker: &Worker, inventory: &Inventory) -> bool {
@@ -559,9 +623,7 @@ fn wait_reason(input: &PlacementInput<'_>, rejections: &[Rejection]) -> String {
             } else {
                 "No online worker".to_owned()
             };
-            let wanted = input
-                .request
-                .require
+            let wanted = effective_require(input)
                 .as_ref()
                 .map(describe_require)
                 .unwrap_or_default();
@@ -614,9 +676,7 @@ impl Rejection {
                 ),
             ),
             Self::Require => {
-                let wanted = input
-                    .request
-                    .require
+                let wanted = effective_require(input)
                     .as_ref()
                     .map(describe_require)
                     .unwrap_or_default();
@@ -848,6 +908,7 @@ mod tests {
         request: PlacementRequest,
         approval_mode: ApprovalMode,
         preferred: Vec<WorkerId>,
+        channel_tags: Vec<String>,
         repos: Vec<Repo>,
         isolation: Isolation,
     }
@@ -862,6 +923,7 @@ mod tests {
                 request: PlacementRequest::default(),
                 approval_mode: ApprovalMode::Ask,
                 preferred: Vec::new(),
+                channel_tags: Vec::new(),
                 repos: Vec::new(),
                 isolation: Isolation::Worktree,
             }
@@ -892,6 +954,7 @@ mod tests {
                 request: &self.request,
                 approval_mode: self.approval_mode,
                 preferred_workers: &self.preferred,
+                channel_tags: &self.channel_tags,
                 repos: &self.repos,
                 isolation: self.isolation,
             })
@@ -1747,6 +1810,162 @@ mod tests {
         assert_eq!(
             case.wait_reason(),
             "No online worker has a signed-in harness account."
+        );
+    }
+
+    // Channel tags ----------------------------------------------------------
+
+    fn tagged(name: &str, tags: &[&str]) -> Worker {
+        let mut worker = worker(name, vec![claude()]);
+        worker.tags = tags.iter().map(|t| (*t).to_owned()).collect();
+        worker
+    }
+
+    fn with_channel_tags(mut case: Case, tags: &[&str]) -> Case {
+        case.channel_tags = tags.iter().map(|t| (*t).to_owned()).collect();
+        case
+    }
+
+    #[test]
+    fn channel_tags_limit_a_task_to_workers_with_every_tag() {
+        // The untagged worker comes first and has no load, so without the
+        // tag it would win.
+        let mut busy = tagged("busy", &["work"]);
+        busy.paired_at = Timestamp::from_millis(5);
+        let case = with_channel_tags(
+            Case::task(vec![worker("plain", vec![claude()]), busy]),
+            &["work"],
+        );
+        assert_eq!(case.chosen(), "busy");
+    }
+
+    #[test]
+    fn channel_tags_need_every_tag_and_read_the_inventory_tags_too() {
+        let work_only = tagged("work-only", &["work"]);
+        let mut both = tagged("both", &["work"]);
+        inventory(&mut both).tags = vec!["gpu-apple".to_owned()];
+        let case = with_channel_tags(Case::task(vec![work_only, both]), &["work", "gpu-apple"]);
+        assert_eq!(case.chosen(), "both");
+    }
+
+    #[test]
+    fn channel_tags_add_to_the_tags_of_the_request() {
+        let work_only = tagged("work-only", &["work"]);
+        let gpu_only = tagged("gpu-only", &["gpu"]);
+        let both = tagged("both", &["work", "gpu"]);
+        let mut case = with_channel_tags(Case::task(vec![work_only, gpu_only, both]), &["work"]);
+        case.request.require = Some(PlacementRequire {
+            tags: vec!["gpu".to_owned()],
+            ..PlacementRequire::default()
+        });
+        assert_eq!(case.chosen(), "both");
+    }
+
+    #[test]
+    fn channel_tags_apply_to_a_coordinator() {
+        let mut hub = worker("hub", vec![claude()]);
+        hub.tags = vec!["hub".to_owned()];
+        let case = with_channel_tags(
+            Case::coordinator(vec![hub, tagged("work", &["work"])]),
+            &["work"],
+        );
+        // The hub tag ranks first for a coordinator, but not without the
+        // channel tag.
+        assert_eq!(case.chosen(), "work");
+    }
+
+    #[test]
+    fn a_channel_without_tags_places_as_before() {
+        let case = with_channel_tags(Case::task(vec![worker("a", vec![claude()])]), &[]);
+        assert_eq!(case.chosen(), "a");
+    }
+
+    #[test]
+    fn work_waits_when_no_worker_has_the_channel_tags() {
+        let case = with_channel_tags(Case::task(vec![worker("a", vec![claude()])]), &["work"]);
+        assert_eq!(
+            case.wait_reason(),
+            "Waiting for an online worker with the tag work. \
+             Add the tag to a worker in Settings > Workers."
+        );
+        let case = with_channel_tags(
+            Case::coordinator(vec![worker("a", vec![claude()])]),
+            &["work", "gpu"],
+        );
+        assert_eq!(
+            case.wait_reason(),
+            "Waiting for an online worker with the tags work and gpu. \
+             Add the tags to a worker in Settings > Workers."
+        );
+    }
+
+    #[test]
+    fn work_waits_when_the_tagged_worker_is_offline() {
+        let mut away = tagged("away", &["work"]);
+        away.state = WorkerState::Offline;
+        let case = with_channel_tags(
+            Case::task(vec![worker("plain", vec![claude()]), away]),
+            &["work"],
+        );
+        // The reason does not tell the user to add the tag: a worker has it.
+        assert_eq!(
+            case.wait_reason(),
+            "Waiting for an online worker with the tag work."
+        );
+    }
+
+    #[test]
+    fn work_waits_when_the_tagged_worker_is_paused() {
+        let mut paused = tagged("paused", &["work"]);
+        paused.paused = true;
+        let case = with_channel_tags(
+            Case::task(vec![worker("plain", vec![claude()]), paused]),
+            &["work"],
+        );
+        assert_eq!(
+            case.wait_reason(),
+            "Waiting for an online worker with the tag work. \
+             Every worker with the tag is paused."
+        );
+    }
+
+    #[test]
+    fn a_removed_worker_does_not_count_as_having_the_tag() {
+        let mut gone = tagged("gone", &["work"]);
+        gone.revoked_at = Some(Timestamp::from_millis(1));
+        let case = with_channel_tags(Case::task(vec![gone]), &["work"]);
+        assert!(case.wait_reason().contains("Settings > Workers"));
+    }
+
+    #[test]
+    fn the_tagged_worker_without_an_account_gives_the_account_reason() {
+        let no_account = {
+            let mut w = worker("tagged", vec![]);
+            w.tags = vec!["work".to_owned()];
+            w
+        };
+        let case = with_channel_tags(
+            Case::task(vec![no_account, worker("plain", vec![claude()])]),
+            &["work"],
+        );
+        assert_eq!(
+            case.wait_reason(),
+            "No online worker with a signed-in harness account has the tag work."
+        );
+    }
+
+    #[test]
+    fn a_named_worker_without_the_channel_tags_fails_and_says_so() {
+        let plain = worker("plain", vec![claude()]);
+        let id = plain.id;
+        let mut case = with_channel_tags(Case::task(vec![plain]), &["work"]);
+        case.request.worker_id = Some(id);
+        let error = case.fail();
+        assert_eq!(error.code, ErrorCode::Invalid);
+        assert!(
+            error.message.contains("has the tag work"),
+            "{}",
+            error.message
         );
     }
 

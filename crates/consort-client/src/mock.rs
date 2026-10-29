@@ -55,8 +55,9 @@ fn channel(id: &str, name: &str, purpose: &str, icon: &str, group: Option<&str>)
         coordinator_account: Some(text("Claude Personal")),
         repos: Vec::new(),
         preferred_workers: Vec::new(),
-        task_selection: Some(text("Claude Personal, Opus 5.5")),
+        task_selection: Some(selection("Claude Personal", "claude-opus-5-5", "Opus 5.5")),
         default_isolation: Isolation::Worktree,
+        tags: Vec::new(),
     }
 }
 
@@ -198,20 +199,146 @@ fn card(
     })
 }
 
+/// A model selection with no options.
+fn selection(account: &str, model_id: &str, model_name: &str) -> SelectionView {
+    SelectionView {
+        account_label: account.into(),
+        model_id: model_id.into(),
+        model_name: model_name.into(),
+        options: Vec::new(),
+    }
+}
+
+/// The icons of three ACP registry agents, as the registry serves them.
+pub const AMP_ICON: &str = include_str!("../fixtures/acp-icons/amp-acp.svg");
+pub const GOOSE_ICON: &str = include_str!("../fixtures/acp-icons/goose.svg");
+pub const AUGGIE_ICON: &str = include_str!("../fixtures/acp-icons/auggie.svg");
+
+/// The sign-in methods that a worker offers for a new account of a
+/// harness, as the mock answers them.
+pub fn sign_in_methods(harness: &str) -> Vec<SignInChoice> {
+    let key = |variable: &str| SignInChoice::ApiKey {
+        variable: variable.into(),
+    };
+    match harness {
+        "claude" => vec![
+            SignInChoice::ClaudePlan,
+            SignInChoice::ClaudeConsole,
+            key("ANTHROPIC_API_KEY"),
+        ],
+        "codex" => vec![
+            SignInChoice::ChatgptDevice,
+            SignInChoice::ChatgptBrowser,
+            key("OPENAI_API_KEY"),
+        ],
+        "opencode" => vec![key("FIREWORKS_API_KEY"), key("OPENROUTER_API_KEY")],
+        "gemini" => vec![
+            SignInChoice::AcpAgent {
+                method_id: "oauth-personal".into(),
+                name: "Google account".into(),
+            },
+            key("GEMINI_API_KEY"),
+        ],
+        "acp" => vec![SignInChoice::Terminal {
+            command: "my-agent login".into(),
+        }],
+        _ => vec![SignInChoice::AcpAgent {
+            method_id: "login".into(),
+            name: "Sign in".into(),
+        }],
+    }
+}
+
 fn account(
     id: &str,
     label: &str,
+    harness: &str,
     detail: &str,
-    code: &[&str],
-    auth: AuthState,
+    status: AccountStatus,
 ) -> HarnessAccountView {
+    let (provider, logo) = provider_of(harness);
+    let logo = match logo {
+        ProviderLogo::Registry { id, .. } if id == "amp-acp" => ProviderLogo::Registry {
+            id,
+            svg: Some(AMP_ICON.into()),
+        },
+        other => other,
+    };
+    let provider = if harness == "acp:amp-acp" {
+        "Amp".to_owned()
+    } else {
+        provider
+    };
+    let methods = sign_in_methods(harness);
+    let secret_names = if status == AccountStatus::Ready {
+        methods
+            .iter()
+            .find_map(|m| match m {
+                SignInChoice::ApiKey { variable } => Some(variable.clone()),
+                _ => None,
+            })
+            .into_iter()
+            .collect()
+    } else {
+        Vec::new()
+    };
     HarnessAccountView {
         id: id.into(),
         label: label.into(),
+        harness: harness.into(),
+        provider,
+        logo,
         detail: detail.into(),
-        detail_code: code.iter().map(|c| (*c).to_owned()).collect(),
-        auth,
+        detail_code: Vec::new(),
+        auth: match status {
+            AccountStatus::SignedIn => AuthState::SignedIn,
+            AccountStatus::Ready => AuthState::KeyFound,
+            AccountStatus::NotSignedIn => AuthState::SignedOut,
+            AccountStatus::Expired | AccountStatus::Error => AuthState::Error,
+            _ => AuthState::Unknown,
+        },
+        status,
+        action: status.action(),
+        sign_in_methods: methods,
+        secret_names,
+        email: None,
     }
+}
+
+fn tool(id: &str, version: Option<&str>, latest: Option<&str>, state: ToolState) -> ToolView {
+    let (name, logo) = provider_of(id);
+    ToolView {
+        id: id.into(),
+        name,
+        logo,
+        version: version.map(Into::into),
+        latest: latest.map(Into::into),
+        state,
+        detail: None,
+    }
+}
+
+/// The tools of a worker with Claude Code and Codex.
+fn tools(worker: &str, codex_update: bool) -> Vec<ToolView> {
+    let mut gemini = tool("gemini-cli", None, None, ToolState::Missing);
+    gemini.detail = Some(format!(
+        "Not installed. {worker} installs it when an account needs it."
+    ));
+    vec![
+        tool("claude-code", Some("2.1.312"), None, ToolState::Ready),
+        if codex_update {
+            tool(
+                "codex",
+                Some("0.164.0"),
+                Some("0.165.0"),
+                ToolState::UpdateAvailable,
+            )
+        } else {
+            tool("codex", Some("0.165.0"), None, ToolState::Ready)
+        },
+        tool("opencode", Some("1.19.5"), None, ToolState::Ready),
+        gemini,
+    ]
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -224,6 +351,7 @@ fn worker(
     list: &str,
     status: &str,
     tags: &[&str],
+    detected: &[&str],
     accounts: Vec<HarnessAccountView>,
     policy: PolicyView,
 ) -> WorkerView {
@@ -237,7 +365,14 @@ fn worker(
         list_detail: list.into(),
         status_line: status.into(),
         tags: tags.iter().map(|t| (*t).to_owned()).collect(),
+        detected_tags: detected.iter().map(|t| (*t).to_owned()).collect(),
         accounts,
+        tools: tools(name, name == "bigboi"),
+        tools_folder: if os == Os::Windows {
+            text(r"%USERPROFILE%\.consort\tools")
+        } else {
+            text("~/.consort/tools")
+        },
         policy,
     }
 }
@@ -256,18 +391,27 @@ fn workers() -> Vec<WorkerView> {
         account(
             id,
             "Claude Personal",
-            "Claude Code 2.1.312 through ACP. Claude Max plan.",
-            &[],
-            AuthState::SignedIn,
+            "claude",
+            "Claude Max plan.",
+            AccountStatus::SignedIn,
         )
     };
     let codex = |id: &str| {
         account(
             id,
             "Codex Personal",
-            "Codex 0.165.0. ChatGPT Pro plan.",
-            &[],
-            AuthState::SignedIn,
+            "codex",
+            "ChatGPT Pro plan.",
+            AccountStatus::SignedIn,
+        )
+    };
+    let fireworks = |id: &str, worker: &str| {
+        account(
+            id,
+            "OpenCode with Fireworks",
+            "opencode",
+            &format!("API key saved on {worker}."),
+            AccountStatus::Ready,
         )
     };
     vec![
@@ -280,15 +424,10 @@ fn workers() -> Vec<WorkerView> {
             "Linux on the hub VPS, 2 accounts",
             "Online. Ubuntu 26.04, x64, worker 0.4.1. Connected since 7:58 AM.",
             &["vps"],
+            &["linux", "x64", "ram-8gb", "cpu-4"],
             vec![
                 claude("acc_hub_claude"),
-                account(
-                    "acc_hub_pi",
-                    "Pi with Kimi K3",
-                    "Pi 0.31.0. API key from FIREWORKS_API_KEY.",
-                    &["FIREWORKS_API_KEY"],
-                    AuthState::KeyFound,
-                ),
+                fireworks("acc_hub_opencode", "hub"),
             ],
             policy(ApprovalMode::Auto, &["/srv/consort"], "bash"),
         ),
@@ -300,17 +439,12 @@ fn workers() -> Vec<WorkerView> {
             "Linux",
             "Linux, 3 accounts, 2 MCP servers",
             "Online. Debian 13, x64, worker 0.4.1. Connected since 7:59 AM.",
-            &["home"],
+            &["personal", "home"],
+            &["linux", "x64", "ram-32gb", "cpu-16"],
             vec![
                 claude("acc_homelab_claude"),
                 codex("acc_homelab_codex"),
-                account(
-                    "acc_homelab_opencode",
-                    "OpenCode with Fireworks",
-                    "OpenCode 2.2.0. API key from FIREWORKS_API_KEY.",
-                    &["FIREWORKS_API_KEY"],
-                    AuthState::KeyFound,
-                ),
+                fireworks("acc_homelab_opencode", "homelab"),
             ],
             policy(ApprovalMode::Auto, &["/home/chris"], "bash"),
         ),
@@ -322,30 +456,25 @@ fn workers() -> Vec<WorkerView> {
             "Windows",
             "Windows, 5 accounts, 1 task running",
             "Online. Windows 11, x64, worker 0.4.1. Connected since 8:02 AM.",
-            &["windows-test", "gpu"],
+            &["personal", "windows-test"],
+            &["windows", "x64", "ram-64gb", "cpu-24", "gpu-nvidia"],
             vec![
-                codex("acc_bigboi_codex"),
-                account(
-                    "acc_bigboi_codex_work",
-                    "Codex Work",
-                    "Codex 0.165.0. ChatGPT Business plan.",
-                    &[],
-                    AuthState::SignedIn,
-                ),
                 claude("acc_bigboi_claude"),
                 account(
-                    "acc_bigboi_opencode",
-                    "OpenCode with Fireworks",
-                    "OpenCode 2.2.0. API key from FIREWORKS_API_KEY.",
-                    &["FIREWORKS_API_KEY"],
-                    AuthState::KeyFound,
+                    "acc_bigboi_claude_work",
+                    "Claude Work",
+                    "claude",
+                    "The login expired on Oct 27. Tasks skip this account until you sign in again.",
+                    AccountStatus::Expired,
                 ),
+                codex("acc_bigboi_codex"),
+                fireworks("acc_bigboi_opencode", "bigboi"),
                 account(
-                    "acc_bigboi_gemini",
-                    "Gemini CLI",
-                    "Gemini CLI through ACP. Run gemini on bigboi to sign in.",
-                    &["gemini"],
-                    AuthState::SignedOut,
+                    "acc_bigboi_amp",
+                    "Amp",
+                    "acp:amp-acp",
+                    "ACP agent from the registry. Not signed in yet.",
+                    AccountStatus::NotSignedIn,
                 ),
             ],
             PolicyView {
@@ -363,24 +492,19 @@ fn workers() -> Vec<WorkerView> {
             "macOS",
             "macOS, 4 accounts",
             "Online. macOS 27, arm64, worker 0.4.1. Connected since 8:10 AM.",
-            &["laptop"],
+            &["personal", "work"],
+            &["macos", "arm64", "ram-36gb", "cpu-12", "gpu-apple"],
             vec![
                 claude("acc_mac_claude"),
                 codex("acc_mac_codex"),
                 account(
-                    "acc_mac_codex_work",
-                    "Codex Work",
-                    "Codex 0.165.0. ChatGPT Business plan.",
-                    &[],
-                    AuthState::SignedIn,
+                    "acc_mac_claude_work",
+                    "Claude Work",
+                    "claude",
+                    "Claude Team plan.",
+                    AccountStatus::SignedIn,
                 ),
-                account(
-                    "acc_mac_pi",
-                    "Pi with Kimi K3",
-                    "Pi 0.31.0. API key from FIREWORKS_API_KEY.",
-                    &["FIREWORKS_API_KEY"],
-                    AuthState::KeyFound,
-                ),
+                fireworks("acc_mac_opencode", "MacBook Pro"),
             ],
             policy(ApprovalMode::Auto, &["/Users/chris/Code"], "zsh"),
         ),
@@ -393,8 +517,56 @@ fn workers() -> Vec<WorkerView> {
             "Offline since 6:12 PM",
             "Offline since 6:12 PM. TrueNAS SCALE, x64, worker 0.4.0.",
             &["storage"],
+            &["linux", "x64", "ram-16gb", "cpu-8"],
             vec![claude("acc_truenas_claude")],
             policy(ApprovalMode::Ask, &["/mnt/tank"], "bash"),
+        ),
+    ]
+}
+
+/// The agents of the ACP registry, as the mock loads them.
+pub fn acp_agents() -> Vec<AcpAgentView> {
+    let agent = |id: &str, name: &str, description: &str, svg: Option<&str>, supported: bool| {
+        AcpAgentView {
+            id: id.into(),
+            name: name.into(),
+            description: description.into(),
+            version: "1.0.0".into(),
+            logo: ProviderLogo::Registry {
+                id: id.into(),
+                svg: svg.map(Into::into),
+            },
+            supported,
+        }
+    };
+    vec![
+        agent(
+            "amp-acp",
+            "Amp",
+            "Sourcegraph's coding agent, through its ACP adapter.",
+            Some(AMP_ICON),
+            true,
+        ),
+        agent(
+            "goose",
+            "Goose",
+            "Block's open source agent. Works with many model providers.",
+            Some(GOOSE_ICON),
+            true,
+        ),
+        agent(
+            "auggie",
+            "Auggie CLI",
+            "Augment Code's agent with its context engine.",
+            Some(AUGGIE_ICON),
+            true,
+        ),
+        agent(
+            "uvx-agent",
+            "Example uvx agent",
+            "An agent that only ships as a Python package.",
+            None,
+            false,
         ),
     ]
 }
@@ -968,7 +1140,8 @@ pub fn view_state() -> ViewState {
             checkouts: text("Checked out on bigboi and MacBook Pro"),
         }];
         sayso.preferred_workers = vec![text("wrk_bigboi"), text("wrk_macbook")];
-        sayso.task_selection = Some(text("Codex Personal, GPT-5.5"));
+        sayso.task_selection = Some(selection("Codex Personal", "gpt-5.5", "GPT-5.5"));
+        sayso.tags = vec![text("personal")];
     }
     let mut state = ViewState {
         connection: Connection::Demo,
@@ -998,13 +1171,16 @@ pub fn view_state() -> ViewState {
         threads: threads(),
         tasks_panel: TasksPanelView::default(),
         workers: workers(),
+        tags: Vec::new(),
         selections: vec![
-            text("Claude Personal, Opus 5.5"),
-            text("Claude Personal, Sonnet 5.5"),
-            text("Codex Personal, GPT-5.5"),
-            text("Codex Work, GPT-5.5"),
-            text("Pi with Kimi K3"),
+            selection("Claude Personal", "claude-opus-5-5", "Opus 5.5"),
+            selection("Claude Personal", "claude-sonnet-5-5", "Sonnet 5.5"),
+            selection("Claude Work", "claude-opus-5-5", "Opus 5.5"),
+            selection("Codex Personal", "gpt-5.5", "GPT-5.5"),
+            selection("OpenCode with Fireworks", "", ""),
         ],
+        sign_ins: Vec::new(),
+        acp_registry: AcpRegistryView::default(),
         worker_pairing: None,
         send_failures: Vec::new(),
     };
@@ -1093,18 +1269,18 @@ pub fn view_state_with_requests() -> ViewState {
     state
 }
 
-/// The mock with the long sign-in error that the Gemini CLI gives, on
-/// bigboi, for `--screen worker-added`.
+/// The mock with a long sign-in error on bigboi, for `--screen
+/// worker-added`.
 pub fn view_state_with_long_detail() -> ViewState {
     let mut state = view_state();
-    if let Some(gemini) = state
+    if let Some(work) = state
         .workers
         .iter_mut()
         .flat_map(|w| w.accounts.iter_mut())
-        .find(|a| a.id == "acc_bigboi_gemini")
+        .find(|a| a.id == "acc_bigboi_claude_work")
     {
-        gemini.detail = text(
-            "Gemini CLI through ACP. This client is no longer supported for Gemini Code Assist for individuals. To continue using Gemini, please migrate to the Antigravity suite of products: https://antigravity.google/docs/migrating-from-gemini-code-assist. Run gemini on bigboi to sign in again.",
+        work.detail = text(
+            "Claude Code could not refresh the login of this account, because the organization changed its sign-in rules on Oct 27. Ask an admin of the organization to allow Claude Code on bigboi, then sign in again. The rules are at https://support.claude.com/en/articles/claude-code-organization-sign-in.",
         );
     }
     state

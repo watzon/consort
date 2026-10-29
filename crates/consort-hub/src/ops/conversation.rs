@@ -310,6 +310,7 @@ impl Hub {
             request.purpose.as_deref().unwrap_or_default(),
             request.instructions.as_deref().unwrap_or_default(),
         )?;
+        let tags_in_request = request.tags.is_some();
         let channel = self
             .store
             .write(move |tx| {
@@ -374,6 +375,10 @@ impl Hub {
                 Ok(channel)
             })
             .await?;
+        if tags_in_request {
+            // Fewer tags can make a worker qualify for work that waits.
+            self.retry_waiting_work();
+        }
         Ok(ChannelResult { channel })
     }
 

@@ -137,6 +137,8 @@ pub struct Layout {
     pub dialog_wide: f32,
     /// The Add worker dialog.
     pub dialog_worker: f32,
+    /// The Add account dialog: the provider grid, the name and the sign-in.
+    pub dialog_account: f32,
     /// The channel switcher.
     pub switcher_width: f32,
     /// The space above the switcher.
@@ -177,8 +179,28 @@ pub struct Components {
     pub worker_list: f32,
     /// The widest a settings detail page grows.
     pub settings_detail_max: f32,
-    /// The sign-in column of a harness account row.
+    /// The status column of an account row: a dot and a word.
     pub account_state: f32,
+    /// The action column of an account row: Sign out, Sign in.
+    pub account_action: f32,
+    /// The version column of a tool row.
+    pub tool_version: f32,
+    /// The state column of a tool row: Up to date, Update to X.
+    pub tool_state: f32,
+    /// A provider logo in a row, a card or a field.
+    pub provider_logo: f32,
+    /// The tile around the icon of an ACP registry agent.
+    pub agent_tile: f32,
+    /// The tallest the ACP registry list grows before it scrolls: three rows.
+    pub agent_list_max: f32,
+    /// The tile around the provider logo in the sign-in step.
+    pub sign_in_tile: f32,
+    /// The provider logo in that tile.
+    pub sign_in_logo: f32,
+    /// The round marker of a numbered step in a sign-in flow.
+    pub step_marker: f32,
+    /// The label column of the Tags and Detected rows of a worker.
+    pub tag_label: f32,
     /// A select in a settings row.
     pub settings_select: f32,
     /// The Group select in the New channel dialog.
@@ -318,7 +340,20 @@ mod tests {
         assert_eq!(c.theme_preview_height, 92.0);
         assert_eq!(c.worker_list, 288.0);
         assert_eq!(c.settings_detail_max, 760.0);
-        assert_eq!(c.account_state, 140.0);
+        assert_eq!(c.account_state, 112.0);
+        assert_eq!(
+            (c.account_action, c.tool_version, c.tool_state),
+            (96.0, 112.0, 150.0)
+        );
+        assert_eq!(
+            (c.provider_logo, c.agent_tile, c.agent_list_max),
+            (18.0, 32.0, 152.0)
+        );
+        assert_eq!(
+            (c.sign_in_tile, c.sign_in_logo, c.step_marker),
+            (40.0, 22.0, 22.0)
+        );
+        assert_eq!(c.tag_label, 92.0);
         assert_eq!(c.settings_select, 160.0);
         assert_eq!(c.group_select, 200.0);
         assert_eq!(c.workspace_control, 230.0);

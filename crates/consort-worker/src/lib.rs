@@ -10,6 +10,9 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+mod accounts;
+#[cfg(test)]
+mod accounts_tests;
 pub mod bridge;
 pub mod cap;
 pub mod config;
@@ -19,8 +22,12 @@ pub mod http;
 pub mod identity;
 pub mod link;
 pub mod mcp;
+pub mod profile;
 mod sessions;
+mod signin;
 pub mod store;
+pub mod tags;
+pub mod tools;
 pub mod workspace;
 
 use std::path::{Path, PathBuf};
@@ -36,9 +43,7 @@ pub use crate::core::{Harnesses, default_harnesses};
 pub use crate::error::WorkerError;
 pub use crate::sessions::Coalescer;
 
-use crate::config::{
-    DB_FILE, KEY_FILE, LOCK_FILE, WorkerToml, create_private_dir, harness_installed,
-};
+use crate::config::{DB_FILE, KEY_FILE, LOCK_FILE, WorkerToml, create_private_dir};
 use crate::core::Core;
 use crate::identity::Identity;
 use crate::link::Link;
@@ -74,9 +79,26 @@ pub struct WorkerConfig {
     /// The folder with `worker.toml`, the key, `worker.db` and
     /// `workspaces/`.
     pub config_dir: PathBuf,
+    /// The Consort home, with the profile folders and the managed tools.
+    /// `None` means [`profile::consort_home`]: `CONSORT_HOME`, else
+    /// `~/.consort`.
+    pub consort_home: Option<PathBuf>,
+    /// Whether the worker checks its managed tools for updates once a day.
+    /// Tests turn it off, so they make no network request.
+    pub check_tool_updates: bool,
 }
 
 impl WorkerConfig {
+    /// The settings for a config folder, with the default Consort home and
+    /// the daily update check.
+    pub fn new(config_dir: PathBuf) -> Self {
+        Self {
+            config_dir,
+            consort_home: None,
+            check_tool_updates: true,
+        }
+    }
+
     /// The default folder: the platform's config folder plus `consort/worker`.
     pub fn default_dir() -> Option<PathBuf> {
         directories::ProjectDirs::from("", "", "consort").map(|d| d.config_dir().join("worker"))
@@ -118,7 +140,6 @@ pub async fn pair(
             toml.tags.push(tag);
         }
     }
-    toml.discover_accounts(&harness_installed);
     toml.save(config_dir)?;
     Ok(worker_id)
 }
@@ -173,6 +194,7 @@ impl WorkerHandle {
     /// session lost.
     pub async fn shutdown(self) -> Result<(), WorkerError> {
         self.core.stopping.send_replace(true);
+        self.core.cancel_all_sign_ins();
         let _ = self.shutdown.send(true);
         let handles: Vec<_> = {
             let mut sessions = match self.core.sessions.lock() {
@@ -224,7 +246,7 @@ pub async fn run_with(
     harnesses: Harnesses,
 ) -> Result<WorkerHandle, WorkerError> {
     let dir = config.config_dir;
-    let mut toml = WorkerToml::load(&dir)?;
+    let toml = WorkerToml::load(&dir)?;
     let (Some(hub_url), Some(worker_id)) = (toml.hub_url.clone(), toml.worker_id) else {
         return Err(WorkerError::NotPaired);
     };
@@ -238,9 +260,30 @@ pub async fn run_with(
     // One worker per folder. A second worker would kill the first one's
     // harness groups below, and both would write the same spool.
     let lock = lock_config_dir(&dir)?;
-    if toml.discover_accounts(&harness_installed) {
-        toml.save(&dir)?;
+    if toml.auto_discover.is_some() {
+        tracing::info!(
+            "worker.toml has `auto_discover`, which this build ignores: a worker no longer adds accounts by itself. Add accounts in Settings > Workers"
+        );
     }
+    let consort_home = match config.consort_home {
+        Some(home) => home,
+        None => profile::consort_home().ok_or_else(|| {
+            WorkerError::Config(format!(
+                "could not find the home folder; set {}",
+                profile::HOME_VAR
+            ))
+        })?,
+    };
+    create_private_dir(&consort_home)
+        .map_err(|e| WorkerError::io(format!("could not create {}", consort_home.display()), e))?;
+    let tools = tools::Tools::new(
+        consort_home.join(profile::TOOLS_DIR),
+        config.check_tool_updates,
+    )
+    .map_err(|e| WorkerError::Config(format!("could not open the managed tools: {e}")))?;
+    let detected_tags = tokio::task::spawn_blocking(tags::detected_tags)
+        .await
+        .unwrap_or_default();
     let key_path = dir.join(KEY_FILE);
     if !key_path.exists() {
         return Err(WorkerError::NotPaired);
@@ -286,6 +329,11 @@ pub async fn run_with(
         inflight: Mutex::new(Default::default()),
         stopping: watch::channel(false).0,
         lock: Mutex::new(Some(lock)),
+        consort_home,
+        tools: Arc::new(tools),
+        sign_ins: Mutex::new(Default::default()),
+        browser_sign_in: tokio::sync::Mutex::new(()),
+        detected_tags,
     });
 
     // Resume the sessions that were open when the worker stopped.
@@ -299,7 +347,11 @@ pub async fn run_with(
             shutdown_rx.clone(),
         )),
         tokio::spawn(crate::core::spool_loop(core.clone(), shutdown_rx.clone())),
-        tokio::spawn(crate::core::inventory_loop(core.clone(), shutdown_rx)),
+        tokio::spawn(crate::core::inventory_loop(
+            core.clone(),
+            shutdown_rx.clone(),
+        )),
+        tokio::spawn(crate::accounts::tools_loop(core.clone(), shutdown_rx)),
     ];
     Ok(WorkerHandle {
         worker_id,

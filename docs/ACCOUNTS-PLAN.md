@@ -16,7 +16,7 @@ Status: approved by the user on 2026-10-29. The Paper designs are on the Desktop
 
 - **Provider**: the UI word for a harness that Consort can install and run: Claude Code, Codex, OpenCode, Gemini CLI, an agent from the ACP registry, or a custom ACP command. Code keeps the word `harness`.
 - **Account** (code: harness account): one login to one provider on one worker, with its own profile folder. Accounts with the same name on different workers count as one account for a model selection.
-- **Profile folder**: `<consort home>/profiles/<account id>/`. It holds the harness's own config and login, and `env.json` for secret variables.
+- **Profile folder**: `<consort home>/profiles/<name>/`. The worker chooses the name from the account name when it makes the account: the name in lowercase, each run of characters other than `a` to `z` and `0` to `9` as one `-`, no `-` at the start or the end, at most 48 characters, and `account` when nothing is left. "Claude Work" gives `claude-work`. When that folder exists or another account uses the name, the worker adds `-2`, `-3` and so on. The name is stored in `worker.toml` (`profile_dir`), so a rename of the account does not move the folder. It holds the harness's own config and login, and `env.json` for secret variables. (Changed on 2026-10-29 from `<account id>`, see `docs/DECISIONS.md`.)
 - **Consort home**: `~/.consort` (`%USERPROFILE%\.consort` on Windows). `CONSORT_HOME` overrides it. `consort dev` and `scripts/dev.sh` set it to a folder inside the dev data.
 - **Managed tool**: a CLI or runtime that the worker installs in `<consort home>/tools/<tool>/<version>/`.
 - **Tag**: a short name on a worker, such as `work` or `gpu`. User tags are set in the app. Detected tags come from the worker: `macos`, `windows`, `linux`, `arm64`, `x64`, `ram-<n>gb`, `cpu-<n>`, `gpu-nvidia`, `gpu-amd`, `gpu-apple`. A channel's tags are requirements. Tag text: lowercase letters, digits and `-`, 1 to 32 characters.
@@ -133,7 +133,7 @@ impl ToolStore {
 ## Worker and harness (`consort-worker`, `consort-harness`, `consort-cli`)
 
 - Consort home: resolve once at start (`CONSORT_HOME`, else `~/.consort`). `consort dev` sets it to `<data>/home` unless `CONSORT_HOME` is set.
-- Accounts in `worker.toml`: a created account is written as `{ id, harness, label, profile = true }`, plus `acp` for ACP agents. Its home folders are derived from the profile folder:
+- Accounts in `worker.toml`: a created account is written as `{ id, harness, label, profile = true, profile_dir }`, plus `acp` for ACP agents. In the inventory, an ACP registry agent has the harness `acp:<registry id>` and a custom ACP command has `acp:custom`. Its home folders are derived from the profile folder:
   - Claude: `CLAUDE_CONFIG_DIR=<profile>/claude`.
   - Codex: `CODEX_HOME=<profile>/codex`, with `cli_auth_credentials_store = "file"`.
   - Gemini: `GEMINI_CLI_HOME=<profile>/gemini`.

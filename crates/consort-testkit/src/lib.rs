@@ -96,6 +96,10 @@ pub struct FakeRecord {
     pub interrupts: usize,
     /// How many sessions closed.
     pub closed: usize,
+    /// The account of every probe, with its runtime settings.
+    pub probed: Vec<AccountConfig>,
+    /// The account of every `open`, with its runtime settings.
+    pub opened_accounts: Vec<AccountConfig>,
 }
 
 /// How [`FakeHarness::open`] fails, after [`FakeHarness::set_open_failure`].
@@ -128,6 +132,9 @@ pub struct FakeHarness {
     /// The capabilities of a session, when they differ from the adapter's,
     /// as when an adapter has to start a session in a lower mode.
     pub session_capabilities: Option<Capabilities>,
+    /// When set, the fake asks for the managed tool of its accounts, like a
+    /// real adapter. Off by default, so a worker test installs nothing.
+    pub uses_managed_tools: bool,
 }
 
 impl FakeHarness {
@@ -150,6 +157,7 @@ impl FakeHarness {
             fail_turn: false,
             steer_delay: Duration::ZERO,
             session_capabilities: None,
+            uses_managed_tools: false,
         }
     }
 
@@ -206,19 +214,31 @@ impl Harness for FakeHarness {
         self.capabilities.clone()
     }
 
-    async fn probe(&self, _account: &AccountConfig) -> AccountStatus {
+    fn managed_tool(&self, account: &AccountConfig) -> Option<consort_harness::ToolId> {
+        if self.uses_managed_tools {
+            account.managed_tool()
+        } else {
+            None
+        }
+    }
+
+    async fn probe(&self, account: &AccountConfig) -> AccountStatus {
+        if let Ok(mut record) = self.record.lock() {
+            record.probed.push(account.clone());
+        }
         AccountStatus {
             harness_version: Some("0.0.0-fake".to_owned()),
             auth_state: AuthState::SignedIn,
             auth_detail: Some("Fake account".to_owned()),
             models: vec![Self::model()],
             capabilities: self.capabilities.clone(),
+            ..AccountStatus::default()
         }
     }
 
     async fn open(
         &self,
-        _account: &AccountConfig,
+        account: &AccountConfig,
         spec: SessionSpec,
     ) -> Result<(Box<dyn HarnessSession>, EventReceiver), HarnessError> {
         if spec.resume.is_some() && self.fail_resume {
@@ -236,6 +256,7 @@ impl Harness for FakeHarness {
         }
         if let Ok(mut record) = self.record.lock() {
             record.opened.push(spec.clone());
+            record.opened_accounts.push(account.clone());
         }
         let (events, rx) = mpsc::channel(256);
         let native = spec
@@ -521,6 +542,76 @@ impl HarnessSession for FakeSession {
             .await;
         Ok(())
     }
+}
+
+/// The code that the fake `claude` accepts in `auth login`.
+pub const FAKE_CLAUDE_GOOD_CODE: &str = "good-code-123";
+
+/// The sign-in URL that the fake `claude` prints.
+pub const FAKE_CLAUDE_URL: &str =
+    "https://claude.example/oauth/authorize?code=true&client_id=fake&state=abc";
+
+/// Writes a fake `claude` program to `dir` and returns its path. It is a
+/// POSIX shell script that acts like Claude Code 2.1.312 for the commands
+/// that the worker runs:
+///
+/// - `auth login --claudeai|--console`: writes its arguments and the values
+///   of `BROWSER` and `DISABLE_AUTOUPDATER` to `$CLAUDE_CONFIG_DIR/fake-login`,
+///   prints the URL wrapped in terminal codes, and reads a code. With
+///   [`FAKE_CLAUDE_GOOD_CODE`] it marks the folder signed in and exits 0.
+///   Else it prints "Login failed: ..." and exits 1.
+/// - `auth status --json`: prints the JSON of Claude Code, signed in when
+///   the folder has the mark. It exits 1 when nobody is signed in.
+/// - `auth logout`: removes the mark.
+///
+/// The mark is the file `fake-signed-in`. It holds no credential.
+#[cfg(unix)]
+pub fn write_fake_claude(dir: &std::path::Path) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let script = format!(
+        r#"#!/bin/sh
+home="${{CLAUDE_CONFIG_DIR:-.}}"
+mkdir -p "$home"
+case "$1 $2" in
+  "auth login")
+    printf '%s|BROWSER=%s|DISABLE_AUTOUPDATER=%s\n' "$3" "$BROWSER" "$DISABLE_AUTOUPDATER" > "$home/fake-login"
+    printf 'Opening browser to sign in...\r\n'
+    printf 'If the browser did not open, visit: \033]8;;{url}\007\033[94m{url}\033[39m\033]8;;\007\r\n'
+    printf 'Paste code here if prompted > '
+    read code
+    if [ "$code" = "{good}" ]; then
+      touch "$home/fake-signed-in"
+      printf 'Login successful.\r\n'
+      exit 0
+    fi
+    printf "\033[31mLogin failed: That code was not accepted.\033[0m\r\n"
+    exit 1
+    ;;
+  "auth status")
+    if [ -f "$home/fake-signed-in" ]; then
+      printf '{{"loggedIn": true, "authMethod": "claude.ai", "email": "fake@example.com", "subscriptionType": "max"}}\n'
+      exit 0
+    fi
+    printf '{{"loggedIn": false, "authMethod": "none"}}\n'
+    exit 1
+    ;;
+  "auth logout")
+    rm -f "$home/fake-signed-in"
+    printf 'Successfully logged out.\n'
+    exit 0
+    ;;
+esac
+echo "fake claude: unknown command $*" >&2
+exit 2
+"#,
+        url = FAKE_CLAUDE_URL,
+        good = FAKE_CLAUDE_GOOD_CODE,
+    );
+    let path = dir.join("claude");
+    std::fs::write(&path, script).expect("write the fake claude");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+        .expect("make the fake claude executable");
+    path
 }
 
 #[cfg(test)]

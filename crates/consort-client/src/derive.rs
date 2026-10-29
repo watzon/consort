@@ -16,6 +16,24 @@ pub fn refresh(state: &mut ViewState) {
     sync_cards(state);
     state.tasks_panel = tasks_panel(state);
     state.sidebar = sidebar(state);
+    state.tags = all_tags(&state.workers);
+}
+
+/// Every worker tag, each once: the user tags of all workers first, then
+/// the detected tags, each part sorted.
+pub fn all_tags(workers: &[crate::view::WorkerView]) -> Vec<String> {
+    let mut user: Vec<String> = workers.iter().flat_map(|w| w.tags.clone()).collect();
+    user.sort();
+    user.dedup();
+    let mut detected: Vec<String> = workers
+        .iter()
+        .flat_map(|w| w.detected_tags.clone())
+        .filter(|t| !user.contains(t))
+        .collect();
+    detected.sort();
+    detected.dedup();
+    user.extend(detected);
+    user
 }
 
 /// The line under a task title in the Tasks panel.

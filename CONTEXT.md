@@ -145,7 +145,7 @@ One login to one harness on one worker, with its own profile folder, such as "Co
 _Avoid_: provider instance, instance, profile
 
 **Profile folder**:
-The folder of one account on its worker, `<consort home>/profiles/<account id>/`. It holds the harness's own config and login, and `env.json` with the account's secret variables.
+The folder of one account on its worker, `<consort home>/profiles/<name>/`, where the name comes from the account name when the account is made (`Claude Work` gives `claude-work`) and does not change on a rename. It holds the harness's own config and login, and `env.json` with the account's secret variables.
 _Avoid_: home, shadow home (for a new account), config dir
 
 **Sign-in**:

@@ -1,14 +1,14 @@
 //! Small parts that every surface uses: icons, status glyphs, buttons and
 //! text styles. Sizes and colors come from the theme tokens only.
 
-use consort_client::TaskStatus;
+use consort_client::{ProviderLogo, TaskStatus};
 use consort_theme::{Tokens, Type, TypeExt as _};
 use std::{cell::Cell, time::Duration};
 
 use gpui_kit::{
     AnyElement, App, Div, ElementId, Global, Hsla, InteractiveElement, IntoElement, ParentElement,
     Pixels, SharedString, Stateful, StatefulInteractiveElement as _, Styled, Svg, Transformation,
-    base::SelectableText, div, percentage, prelude::FluentBuilder as _, svg,
+    base::SelectableText, div, img, percentage, prelude::FluentBuilder as _, svg,
 };
 
 /// A Lucide icon from `assets/icons`.
@@ -27,6 +27,71 @@ pub fn glyph(name: &str, size: Pixels, color: Hsla) -> Svg {
         .size(size)
         .flex_none()
         .text_color(color)
+}
+
+/// The logo of a provider. Claude Code and Gemini CLI keep their own
+/// colors. Codex, OpenCode and the ACP registry icons draw in `tint`, like
+/// an icon. A provider with no logo (or a registry icon that has not
+/// loaded) gets the neutral bot glyph, so a provider never shows as text
+/// alone.
+pub fn provider_logo(logo: &ProviderLogo, size: Pixels, tint: Hsla) -> AnyElement {
+    match logo {
+        ProviderLogo::ClaudeCode => img("providers/claude-code.svg")
+            .size(size)
+            .flex_none()
+            .into_any_element(),
+        ProviderLogo::GeminiCli => img("providers/gemini-cli.svg")
+            .size(size)
+            .flex_none()
+            .into_any_element(),
+        ProviderLogo::Codex => mono_logo("providers/codex.svg".into(), size, tint),
+        ProviderLogo::OpenCode => mono_logo("providers/opencode.svg".into(), size, tint),
+        ProviderLogo::Registry { id, svg: Some(svg) } => {
+            mono_logo(crate::assets::remote_icon(id, svg), size, tint)
+        }
+        ProviderLogo::Registry { svg: None, .. } | ProviderLogo::Generic => {
+            icon("bot", size, tint).into_any_element()
+        }
+    }
+}
+
+fn mono_logo(path: SharedString, size: Pixels, tint: Hsla) -> AnyElement {
+    svg()
+        .path(path)
+        .size(size)
+        .flex_none()
+        .text_color(tint)
+        .into_any_element()
+}
+
+/// A worker tag as a small chip: `label` text, `sm` corners. A tag that a
+/// channel requires (`strong`) is in the accent, the way the designs mark
+/// the tags that decide where work runs.
+pub fn tag_chip(tag: &str, strong: bool, t: &Tokens) -> Div {
+    let c = &t.colors;
+    div()
+        .flex()
+        .flex_none()
+        .items_center()
+        .gap(t.space.xs)
+        .py(t.space.xxs)
+        .pl(t.space.sm)
+        .pr(t.space.sm)
+        .rounded(t.radius.sm)
+        .border(t.border_width)
+        .when(strong, |d| d.bg(c.tint_accent).border_color(c.accent_text))
+        .when(!strong, |d| d.border_color(c.border_strong))
+        .child(
+            div()
+                .type_style(if strong { t.text.label } else { detail(t) })
+                .text_color(if strong {
+                    c.accent_text
+                } else {
+                    c.text_secondary
+                })
+                .whitespace_nowrap()
+                .child(tag.to_owned()),
+        )
 }
 
 /// The color of a status glyph.
@@ -222,6 +287,9 @@ pub enum ButtonKind {
     Quiet,
     /// Text only, in `status.failed`.
     Danger,
+    /// `status.failed` fill: the confirm button of a dialog that destroys
+    /// something.
+    DangerFill,
 }
 
 /// Makes a control reachable by the keyboard. It joins the Tab order, Enter
@@ -283,6 +351,14 @@ pub fn button(
             .py(pad)
             .text_color(c.status_failed)
             .hover(|s| s.bg(c.tint_failed)),
+        ButtonKind::DangerFill => {
+            let fill = c.status_failed;
+            let dim = t.opacity.danger_hover;
+            base.py(pad)
+                .bg(fill)
+                .text_color(c.on_failed)
+                .hover(move |s| s.bg(fill).opacity(dim))
+        }
     }
 }
 

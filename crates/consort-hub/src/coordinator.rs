@@ -390,6 +390,7 @@ impl Hub {
             request: &request,
             approval_mode: inputs.channel.default_approval_mode,
             preferred_workers: &inputs.channel.preferred_workers,
+            channel_tags: &inputs.channel.tags,
             repos: &[],
             isolation: Isolation::Worktree,
         });

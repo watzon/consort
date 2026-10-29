@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 consort-proto = { workspace = true }
 consort-harness = { workspace = true }
+consort-tools = { workspace = true, features = ["install"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -37,4 +38,5 @@ gethostname = { workspace = true }
 
 [dev-dependencies]
 consort-testkit = { workspace = true }
+tracing-subscriber = { workspace = true }
 tempfile = { workspace = true }

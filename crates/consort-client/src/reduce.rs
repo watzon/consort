@@ -7,7 +7,8 @@ use consort_proto::{
     ids::{MessageId, TaskId},
     model::{
         self, ApprovalDetails, ApprovalStatus, AuthState as ProtoAuth, Author, ChannelKind as PK,
-        DecisionStatus, MessageKind, RequestOptionKind, WorkerState,
+        DecisionStatus, MessageKind, RequestOptionKind, ToolId, ToolState as ToolStateProto,
+        WorkerState,
     },
     status::TaskStatus as PS,
 };
@@ -56,11 +57,301 @@ fn approval_mode(mode: model::ApprovalMode) -> ApprovalMode {
     }
 }
 
-fn selection_label(s: &model::ModelSelection) -> String {
-    if s.model.is_empty() {
-        s.account_label.clone()
+/// The name of a model, from the inventory of any worker with an account of
+/// this label. The ID when no worker reports it.
+fn model_name(cache: &Cache, account_label: &str, model_id: &str) -> String {
+    cache
+        .workers
+        .values()
+        .filter_map(|w| w.inventory.as_ref())
+        .flat_map(|i| i.accounts.iter())
+        .filter(|a| a.label == account_label)
+        .flat_map(|a| a.models.iter())
+        .find(|m| m.id == model_id)
+        .map(|m| m.name.clone())
+        .unwrap_or_else(|| model_id.to_owned())
+}
+
+/// A model selection as the view shows it, with the model ID and the
+/// options kept for the hub.
+pub fn selection_view(cache: &Cache, s: &model::ModelSelection) -> SelectionView {
+    SelectionView {
+        account_label: s.account_label.clone(),
+        model_id: s.model.clone(),
+        model_name: model_name(cache, &s.account_label, &s.model),
+        options: s
+            .options
+            .iter()
+            .map(|(id, value)| {
+                (
+                    id.clone(),
+                    match value {
+                        model::OptionValue::Bool(b) => SelectionOption::Bool(*b),
+                        model::OptionValue::Text(t) => SelectionOption::Text(t.clone()),
+                    },
+                )
+            })
+            .collect(),
+    }
+}
+
+/// A sign-in method as the view names it.
+pub fn sign_in_choice(method: &model::SignInMethod) -> SignInChoice {
+    match method {
+        model::SignInMethod::ClaudePlan => SignInChoice::ClaudePlan,
+        model::SignInMethod::ClaudeConsole => SignInChoice::ClaudeConsole,
+        model::SignInMethod::ChatgptDevice => SignInChoice::ChatgptDevice,
+        model::SignInMethod::ChatgptBrowser => SignInChoice::ChatgptBrowser,
+        model::SignInMethod::ApiKey { variable } => SignInChoice::ApiKey {
+            variable: variable.clone(),
+        },
+        model::SignInMethod::AcpAgent { method_id, name } => SignInChoice::AcpAgent {
+            method_id: method_id.clone(),
+            name: name.clone(),
+        },
+        model::SignInMethod::Terminal { command } => SignInChoice::Terminal {
+            command: command.clone(),
+        },
+    }
+}
+
+/// The step of a sign-in as the view shows it.
+pub fn sign_in_step(state: &model::SignInState) -> SignInStep {
+    match state {
+        model::SignInState::Starting => SignInStep::Starting,
+        model::SignInState::OpenUrl { url } => SignInStep::OpenUrl { url: url.clone() },
+        model::SignInState::DeviceCode { url, user_code } => SignInStep::DeviceCode {
+            url: url.clone(),
+            user_code: user_code.clone(),
+        },
+        model::SignInState::NeedsCode { url } => SignInStep::NeedsCode { url: url.clone() },
+        model::SignInState::Verifying => SignInStep::Verifying,
+        model::SignInState::Succeeded { detail } => SignInStep::Succeeded {
+            detail: detail.clone(),
+        },
+        model::SignInState::Failed { message } => SignInStep::Failed {
+            message: message.clone(),
+        },
+        model::SignInState::Cancelled => SignInStep::Cancelled,
+        model::SignInState::Expired => SignInStep::Expired,
+    }
+}
+
+/// The managed tool that runs a harness.
+fn tool_of_harness(harness: &str) -> Option<String> {
+    match harness {
+        "claude" => Some(ToolId::CLAUDE_CODE.to_owned()),
+        "codex" => Some(ToolId::CODEX.to_owned()),
+        "opencode" => Some(ToolId::OPENCODE.to_owned()),
+        "gemini" => Some(ToolId::GEMINI_CLI.to_owned()),
+        other => other
+            .strip_prefix("acp:")
+            .filter(|id| !id.is_empty())
+            .map(|id| ToolId::acp(id).to_string()),
+    }
+}
+
+/// The logo of a provider, with the icon of a registry agent when the
+/// client has it.
+fn with_icon(logo: ProviderLogo, cache: &Cache) -> ProviderLogo {
+    match logo {
+        ProviderLogo::Registry { id, .. } => ProviderLogo::Registry {
+            svg: cache.acp_icons.get(&id).cloned(),
+            id,
+        },
+        other => other,
+    }
+}
+
+/// The name of an ACP registry agent, when the client has the registry.
+fn registry_name(cache: &Cache, id: &str) -> Option<String> {
+    cache
+        .acp_registry
+        .iter()
+        .find(|a| a.id == id)
+        .map(|a| a.name.clone())
+}
+
+/// A plan as a sentence: "Claude Max" becomes "Claude Max plan."
+fn plan_sentence(plan: &str) -> String {
+    let plan = plan.trim();
+    if plan.to_lowercase().ends_with("plan") || plan.ends_with('.') {
+        sentence(plan)
     } else {
-        format!("{}, {}", s.account_label, s.model)
+        format!("{plan} plan.")
+    }
+}
+
+/// One account row: its status, the line under its name and its action.
+fn account_view(
+    cache: &Cache,
+    worker: &model::Worker,
+    tools: &[model::ToolStatus],
+    a: &model::HarnessAccount,
+) -> HarnessAccountView {
+    let (mut provider, logo) = provider_of(&a.harness);
+    if let ProviderLogo::Registry { id, .. } = &logo
+        && let Some(name) = registry_name(cache, id)
+    {
+        provider = name;
+    }
+    let installing = tool_of_harness(&a.harness).is_some_and(|tool| {
+        tools
+            .iter()
+            .any(|t| t.tool.as_str() == tool && t.state == ToolStateProto::Installing)
+    });
+    let auth_detail = a
+        .auth_detail
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty());
+    let has_key = !a.secret_names.is_empty();
+    let (status, text) = if installing {
+        (AccountStatus::Installing, format!("Installing {provider}."))
+    } else {
+        match a.auth_state {
+            ProtoAuth::SignedIn if has_key && a.plan.is_none() && a.email.is_none() => (
+                AccountStatus::Ready,
+                format!("API key saved on {}.", worker.name),
+            ),
+            ProtoAuth::SignedIn => (
+                AccountStatus::SignedIn,
+                match (&a.plan, &a.email, auth_detail) {
+                    (Some(plan), _, _) => plan_sentence(plan),
+                    (None, Some(email), _) => format!("Signed in as {email}."),
+                    (None, None, Some(detail)) => sentence(detail),
+                    (None, None, None) => {
+                        account_detail(&provider, a.harness_version.as_deref(), None).0
+                    }
+                },
+            ),
+            ProtoAuth::SignedOut => (
+                AccountStatus::NotSignedIn,
+                match auth_detail {
+                    Some(detail) => sentence(detail),
+                    None if matches!(logo, ProviderLogo::Registry { .. }) => {
+                        "ACP agent from the registry. Not signed in yet.".to_owned()
+                    }
+                    None => "Not signed in yet.".to_owned(),
+                },
+            ),
+            ProtoAuth::Error => (
+                if auth_detail.is_some_and(|d| d.to_lowercase().contains("expired")) {
+                    AccountStatus::Expired
+                } else {
+                    AccountStatus::Error
+                },
+                match auth_detail {
+                    Some(detail) => sentence(detail),
+                    None => "The worker could not check the login. Sign in again.".to_owned(),
+                },
+            ),
+            ProtoAuth::Unknown => (
+                AccountStatus::Unknown,
+                account_detail(&provider, a.harness_version.as_deref(), auth_detail).0,
+            ),
+        }
+    };
+    let (detail, detail_code) = account_detail_code(&text);
+    let methods: Vec<SignInChoice> = a.sign_in_methods.iter().map(sign_in_choice).collect();
+    let action = match status.action() {
+        // Signing in needs a method from the worker. An account written by
+        // hand in worker.toml may have none.
+        AccountAction::SignIn | AccountAction::SignInAgain if methods.is_empty() => {
+            AccountAction::None
+        }
+        action => action,
+    };
+    HarnessAccountView {
+        id: a.account_id.to_string(),
+        label: a.label.clone(),
+        harness: a.harness.clone(),
+        provider,
+        logo: with_icon(logo, cache),
+        detail,
+        detail_code,
+        auth: match a.auth_state {
+            ProtoAuth::SignedIn => AuthState::SignedIn,
+            ProtoAuth::SignedOut => AuthState::SignedOut,
+            ProtoAuth::Error => AuthState::Error,
+            ProtoAuth::Unknown => AuthState::Unknown,
+        },
+        status,
+        action,
+        sign_in_methods: methods,
+        secret_names: a.secret_names.clone(),
+        email: a.email.clone(),
+    }
+}
+
+/// The rank of a tool in the Installed tools list: the providers first,
+/// then the registry agents, then the tools that only support them.
+fn tool_rank(tool: &str) -> (u8, String) {
+    let rank = match tool {
+        ToolId::CLAUDE_CODE => 0,
+        ToolId::CODEX => 1,
+        ToolId::OPENCODE => 2,
+        ToolId::GEMINI_CLI => 3,
+        ToolId::NODE => 5,
+        ToolId::CLAUDE_AGENT_ACP => 6,
+        _ => 4,
+    };
+    (rank, tool.to_owned())
+}
+
+/// One row of the Installed tools list.
+fn tool_view(cache: &Cache, worker_name: &str, t: &model::ToolStatus) -> ToolView {
+    let id = t.tool.as_str();
+    let (name, logo) = match id {
+        ToolId::NODE => ("Node.js".to_owned(), ProviderLogo::Generic),
+        ToolId::CLAUDE_AGENT_ACP => (
+            "Claude Code ACP adapter".to_owned(),
+            ProviderLogo::ClaudeCode,
+        ),
+        other => {
+            let (name, logo) = provider_of(other);
+            match t.tool.acp_registry_id() {
+                Some(registry) => (
+                    registry_name(cache, registry).unwrap_or(name),
+                    ProviderLogo::Registry {
+                        id: registry.to_owned(),
+                        svg: None,
+                    },
+                ),
+                None => (name, logo),
+            }
+        }
+    };
+    let state = match t.state {
+        ToolStateProto::Missing => ToolState::Missing,
+        ToolStateProto::Installing => ToolState::Installing,
+        ToolStateProto::Ready => ToolState::Ready,
+        ToolStateProto::UpdateAvailable => ToolState::UpdateAvailable,
+        ToolStateProto::Failed => ToolState::Failed,
+    };
+    let given = t
+        .detail
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty())
+        .map(sentence);
+    let detail = match state {
+        ToolState::Missing => Some(given.unwrap_or_else(|| {
+            format!("Not installed. {worker_name} installs it when an account needs it.")
+        })),
+        ToolState::Failed => Some(given.unwrap_or_else(|| {
+            "The last install failed. Try again, or check the worker log.".to_owned()
+        })),
+        _ => given,
+    };
+    ToolView {
+        id: id.to_owned(),
+        name,
+        logo: with_icon(logo, cache),
+        version: t.version.clone(),
+        latest: t.latest.clone(),
+        state,
+        detail,
     }
 }
 
@@ -411,8 +702,9 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                 coordinator_account: account,
                 repos: Vec::new(),
                 preferred_workers: c.preferred_workers.iter().map(|w| w.to_string()).collect(),
-                task_selection: c.task_selection.as_ref().map(selection_label),
+                task_selection: c.task_selection.as_ref().map(|s| selection_view(cache, s)),
                 default_isolation: isolation(c.default_isolation),
+                tags: c.tags.clone(),
             }
         })
         .collect();
@@ -834,34 +1126,35 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
         .filter(|w| w.revoked_at.is_none())
         .map(|w| {
             let online = w.state == WorkerState::Online;
+            let tools: &[model::ToolStatus] = w
+                .inventory
+                .as_ref()
+                .map(|inv| inv.tools.as_slice())
+                .unwrap_or_default();
             let accounts: Vec<HarnessAccountView> = w
                 .inventory
                 .as_ref()
                 .map(|inv| {
                     inv.accounts
                         .iter()
-                        .map(|a| {
-                            let (detail, detail_code) = account_detail(
-                                &a.harness.to_string(),
-                                a.harness_version.as_deref(),
-                                a.auth_detail.as_deref(),
-                            );
-                            HarnessAccountView {
-                                id: a.account_id.to_string(),
-                                label: a.label.clone(),
-                                detail,
-                                detail_code,
-                                auth: match a.auth_state {
-                                    ProtoAuth::SignedIn => AuthState::SignedIn,
-                                    ProtoAuth::SignedOut => AuthState::SignedOut,
-                                    ProtoAuth::Error => AuthState::Error,
-                                    ProtoAuth::Unknown => AuthState::Unknown,
-                                },
-                            }
-                        })
+                        .map(|a| account_view(cache, w, tools, a))
                         .collect()
                 })
                 .unwrap_or_default();
+            let mut tool_rows: Vec<&model::ToolStatus> = tools.iter().collect();
+            tool_rows.sort_by_key(|t| tool_rank(t.tool.as_str()));
+            let tool_views: Vec<ToolView> = tool_rows
+                .into_iter()
+                .map(|t| tool_view(cache, &w.name, t))
+                .collect();
+            let mut detected_tags: Vec<String> = w
+                .inventory
+                .iter()
+                .flat_map(|i| i.tags.iter())
+                .filter(|t| !w.tags.contains(t))
+                .cloned()
+                .collect();
+            detected_tags.dedup();
             let running = cache
                 .tasks
                 .values()
@@ -913,7 +1206,14 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                     }
                 },
                 tags: w.tags.clone(),
+                detected_tags,
                 accounts,
+                tools: tool_views,
+                tools_folder: if w.os == model::Os::Windows {
+                    r"%USERPROFILE%\.consort\tools".to_owned()
+                } else {
+                    "~/.consort/tools".to_owned()
+                },
                 policy: PolicyView {
                     max_approval_mode: policy
                         .map(|p| approval_mode(p.max_approval_mode))
@@ -932,20 +1232,65 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
         .collect();
     workers.sort_by_key(|w| (!w.online, w.name.to_lowercase()));
 
-    let mut selections: Vec<String> = Vec::new();
+    // The model ID stays in each selection, and the name is for the eye.
+    let mut selections: Vec<SelectionView> = Vec::new();
+    let mut push = |s: SelectionView| {
+        if !selections.iter().any(|x| x.key() == s.key()) {
+            selections.push(s);
+        }
+    };
     for w in cache.workers.values() {
         for a in w.inventory.iter().flat_map(|i| i.accounts.iter()) {
             for m in &a.models {
-                let label = format!("{}, {}", a.label, m.name);
-                if !selections.contains(&label) {
-                    selections.push(label);
-                }
+                push(SelectionView {
+                    account_label: a.label.clone(),
+                    model_id: m.id.clone(),
+                    model_name: m.name.clone(),
+                    options: Vec::new(),
+                });
             }
-            if a.models.is_empty() && !selections.contains(&a.label) {
-                selections.push(a.label.clone());
+            if a.models.is_empty() {
+                push(SelectionView {
+                    account_label: a.label.clone(),
+                    ..SelectionView::default()
+                });
             }
         }
     }
+    let mut sign_ins: Vec<&model::SignIn> = cache
+        .sign_ins
+        .values()
+        .filter(|s| !cache.sign_ins_dismissed.contains(&s.id.to_string()))
+        .collect();
+    sign_ins.sort_by_key(|s| s.created_at);
+    let sign_ins: Vec<SignInView> = sign_ins
+        .into_iter()
+        .map(|s| SignInView {
+            id: s.id.to_string(),
+            worker_id: s.worker_id.to_string(),
+            account_id: s.account_id.to_string(),
+            method: Some(sign_in_choice(&s.method)),
+            step: sign_in_step(&s.state),
+        })
+        .collect();
+    let acp_registry = AcpRegistryView {
+        load: cache.acp_registry_load.clone(),
+        agents: cache
+            .acp_registry
+            .iter()
+            .map(|a| AcpAgentView {
+                id: a.id.clone(),
+                name: a.name.clone(),
+                description: a.description.clone(),
+                version: a.version.clone(),
+                logo: ProviderLogo::Registry {
+                    id: a.id.clone(),
+                    svg: cache.acp_icons.get(&a.id).cloned(),
+                },
+                supported: a.supported,
+            })
+            .collect(),
+    };
 
     let mut state = ViewState {
         connection,
@@ -965,7 +1310,10 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
         threads,
         tasks_panel: TasksPanelView::default(),
         workers,
+        tags: Vec::new(),
         selections,
+        sign_ins,
+        acp_registry,
         worker_pairing: None,
         send_failures: cache
             .send_failures
@@ -1052,6 +1400,19 @@ fn account_detail(
     (plain, code)
 }
 
+/// Splits the words in backticks out of a detail line, as code words.
+fn account_detail_code(text: &str) -> (String, Vec<String>) {
+    let mut plain = String::with_capacity(text.len());
+    let mut code = Vec::new();
+    for (i, part) in text.split('`').enumerate() {
+        if i % 2 == 1 && !part.is_empty() {
+            code.push(part.to_owned());
+        }
+        plain.push_str(part);
+    }
+    (plain, code)
+}
+
 /// The text as a sentence: a period goes on the end only when the text
 /// does not already end with punctuation.
 pub(crate) fn sentence(text: &str) -> String {
@@ -1078,7 +1439,7 @@ fn task_harness(cache: &Cache, task: &model::Task, worker: &model::Worker) -> St
         .or(channel.and_then(|c| c.task_selection.as_ref()))
         .or(everything.and_then(|c| c.task_selection.as_ref()));
     if let Some(selection) = chosen {
-        return selection_label(selection);
+        return selection_view(cache, selection).label();
     }
     if task.current_session_id.is_some() {
         let signed_in: Vec<&model::HarnessAccount> = worker
@@ -2624,5 +2985,383 @@ mod tests {
         assert!(shown.message.starts_with("The channel was deleted."));
         assert!(shown.message.contains("Put your text back"));
         assert_eq!(shown.body, "A long message that the user wrote offline");
+    }
+
+    mod accounts {
+        use consort_proto::{
+            ids::{AccountId, SignInId, WorkerId},
+            model::{
+                AcpRegistryAgent, AuthState as PA, Capabilities, HarnessAccount, Inventory,
+                ModelInfo, ModelSelection, OptionValue, Os as POs, SignIn, SignInMethod,
+                SignInState, ToolStatus, WorkerPolicy,
+            },
+        };
+
+        use super::*;
+
+        fn account(label: &str, harness: &str, auth: PA) -> HarnessAccount {
+            HarnessAccount {
+                account_id: AccountId::new(),
+                harness: harness.into(),
+                label: label.into(),
+                harness_version: Some("2.1.312".into()),
+                auth_state: auth,
+                auth_detail: None,
+                models: vec![],
+                capabilities: Capabilities::default(),
+                enabled: true,
+                profile: true,
+                email: None,
+                plan: None,
+                secret_names: vec![],
+                sign_in_methods: vec![],
+            }
+        }
+
+        fn worker(name: &str, user: &[&str], detected: &[&str]) -> model::Worker {
+            model::Worker {
+                id: WorkerId::new(),
+                name: name.into(),
+                hostname: name.into(),
+                os: POs::Windows,
+                arch: "x64".into(),
+                public_key: consort_proto::auth::PublicKey::from_bytes([1; 32]),
+                version: "0.1.0".into(),
+                protocol_version: 1,
+                tags: user.iter().map(|t| (*t).to_owned()).collect(),
+                paused: false,
+                state: WorkerState::Online,
+                last_seen_at: None,
+                inventory: Some(Inventory {
+                    hash: String::new(),
+                    hostname: name.into(),
+                    os: POs::Windows,
+                    arch: "x64".into(),
+                    tags: detected.iter().map(|t| (*t).to_owned()).collect(),
+                    accounts: vec![],
+                    local_mcp_servers: vec![],
+                    checkouts: vec![],
+                    policy: WorkerPolicy::default(),
+                    load: Default::default(),
+                    tools: vec![],
+                }),
+                paired_at: Timestamp::from_millis(NOW),
+                revoked_at: None,
+            }
+        }
+
+        fn inventory(w: &mut model::Worker) -> &mut Inventory {
+            w.inventory.as_mut().expect("inventory")
+        }
+
+        fn row<'a>(state: &'a ViewState, label: &str) -> &'a HarnessAccountView {
+            state
+                .workers
+                .iter()
+                .flat_map(|w| w.accounts.iter())
+                .find(|a| a.label == label)
+                .expect("account row")
+        }
+
+        #[test]
+        fn account_rows_show_the_plan_or_the_problem_and_one_action() {
+            let mut w = world();
+            let mut bigboi = worker("bigboi", &["personal"], &["windows"]);
+            let mut personal = account("Claude Personal", "claude", PA::SignedIn);
+            personal.plan = Some("Claude Max".into());
+            personal.sign_in_methods = vec![SignInMethod::ClaudePlan];
+            let mut work = account("Claude Work", "claude", PA::Error);
+            work.auth_detail = Some("The login expired on Oct 27".into());
+            work.sign_in_methods = vec![SignInMethod::ClaudePlan];
+            let mut fireworks = account("OpenCode with Fireworks", "opencode", PA::SignedIn);
+            fireworks.secret_names = vec!["FIREWORKS_API_KEY".into()];
+            let mut amp = account("Amp", "acp:amp-acp", PA::SignedOut);
+            amp.sign_in_methods = vec![SignInMethod::Terminal {
+                command: "amp login".into(),
+            }];
+            // An account written by hand in worker.toml offers no method.
+            let by_hand = account("Pi with Kimi", "pi", PA::SignedOut);
+            inventory(&mut bigboi).accounts = vec![personal, work, fireworks, amp, by_hand];
+            w.cache.workers.insert(bigboi.id.to_string(), bigboi);
+            let state = view(&w.cache);
+
+            let personal = row(&state, "Claude Personal");
+            assert_eq!(personal.logo, ProviderLogo::ClaudeCode);
+            assert_eq!(personal.detail, "Claude Max plan.");
+            assert_eq!(personal.status, AccountStatus::SignedIn);
+            assert_eq!(personal.action, AccountAction::SignOut);
+
+            let work = row(&state, "Claude Work");
+            assert_eq!(work.status, AccountStatus::Expired);
+            assert_eq!(work.action, AccountAction::SignInAgain);
+            assert_eq!(work.detail, "The login expired on Oct 27.");
+
+            let fireworks = row(&state, "OpenCode with Fireworks");
+            assert_eq!(fireworks.status, AccountStatus::Ready);
+            assert_eq!(fireworks.detail, "API key saved on bigboi.");
+            assert_eq!(fireworks.action, AccountAction::None);
+
+            let amp = row(&state, "Amp");
+            assert_eq!(amp.status, AccountStatus::NotSignedIn);
+            assert_eq!(amp.action, AccountAction::SignIn);
+            assert_eq!(
+                amp.detail,
+                "ACP agent from the registry. Not signed in yet."
+            );
+            assert!(
+                matches!(&amp.logo, ProviderLogo::Registry { id, svg: None } if id == "amp-acp")
+            );
+
+            let by_hand = row(&state, "Pi with Kimi");
+            assert_eq!(
+                by_hand.action,
+                AccountAction::None,
+                "no method to sign in from the app"
+            );
+        }
+
+        #[test]
+        fn an_account_whose_tool_installs_says_so() {
+            let mut w = world();
+            let mut bigboi = worker("bigboi", &[], &[]);
+            inventory(&mut bigboi).accounts = vec![account("Gemini", "gemini", PA::SignedOut)];
+            inventory(&mut bigboi).tools = vec![ToolStatus {
+                tool: ToolId::gemini_cli(),
+                version: None,
+                latest: Some("0.66.0".into()),
+                state: ToolStateProto::Installing,
+                detail: None,
+            }];
+            w.cache.workers.insert(bigboi.id.to_string(), bigboi);
+            let state = view(&w.cache);
+            let gemini = row(&state, "Gemini");
+            assert_eq!(gemini.status, AccountStatus::Installing);
+            assert_eq!(gemini.detail, "Installing Gemini CLI.");
+        }
+
+        #[test]
+        fn tools_list_the_providers_first_with_their_state() {
+            let mut w = world();
+            let mut bigboi = worker("bigboi", &[], &[]);
+            let tool = |id: &str, version: Option<&str>, latest: Option<&str>, state| ToolStatus {
+                tool: ToolId::new(id),
+                version: version.map(Into::into),
+                latest: latest.map(Into::into),
+                state,
+                detail: None,
+            };
+            inventory(&mut bigboi).tools = vec![
+                tool("node", Some("24.11.0"), None, ToolStateProto::Ready),
+                tool("gemini-cli", None, None, ToolStateProto::Missing),
+                tool(
+                    "codex",
+                    Some("0.164.0"),
+                    Some("0.165.0"),
+                    ToolStateProto::UpdateAvailable,
+                ),
+                tool("claude-code", Some("2.1.312"), None, ToolStateProto::Ready),
+            ];
+            w.cache.workers.insert(bigboi.id.to_string(), bigboi);
+            let state = view(&w.cache);
+            let tools = &state.workers[0].tools;
+            let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+            assert_eq!(names, ["Claude Code", "Codex", "Gemini CLI", "Node.js"]);
+            assert_eq!(tools[0].action_label(), "Up to date");
+            assert_eq!(tools[1].action_label(), "Update to 0.165.0");
+            assert!(tools[1].can_install());
+            assert_eq!(tools[2].action_label(), "Install now");
+            assert_eq!(
+                tools[2].detail.as_deref(),
+                Some("Not installed. bigboi installs it when an account needs it.")
+            );
+            assert_eq!(
+                state.workers[0].tools_folder,
+                r"%USERPROFILE%\.consort\tools"
+            );
+        }
+
+        #[test]
+        fn tags_list_user_tags_first_and_detected_tags_apart() {
+            let mut w = world();
+            let bigboi = worker(
+                "bigboi",
+                &["windows-test", "personal"],
+                &["windows", "personal", "gpu-nvidia"],
+            );
+            let mac = worker("MacBook Pro", &["work"], &["macos", "arm64"]);
+            w.cache.workers.insert(bigboi.id.to_string(), bigboi);
+            w.cache.workers.insert(mac.id.to_string(), mac);
+            let state = view(&w.cache);
+            assert_eq!(
+                state.tags,
+                [
+                    "personal",
+                    "windows-test",
+                    "work",
+                    "arm64",
+                    "gpu-nvidia",
+                    "macos",
+                    "windows"
+                ]
+            );
+            let bigboi = state
+                .workers
+                .iter()
+                .find(|w| w.name == "bigboi")
+                .expect("worker");
+            assert_eq!(
+                bigboi.detected_tags,
+                ["windows", "gpu-nvidia"],
+                "a user tag is not repeated"
+            );
+            let wanted = vec!["personal".to_owned(), "gpu-nvidia".to_owned()];
+            let names: Vec<&str> = state
+                .workers_with_tags(&wanted)
+                .iter()
+                .map(|w| w.name.as_str())
+                .collect();
+            assert_eq!(names, ["bigboi"]);
+            assert_eq!(state.workers_with_tags(&[]).len(), 2);
+        }
+
+        #[test]
+        fn a_channel_shows_its_tags() {
+            let mut w = world();
+            if let Some(channel) = w.cache.channels.get_mut(&w.sayso.to_string()) {
+                channel.tags = vec!["work".into()];
+            }
+            let state = view(&w.cache);
+            assert_eq!(
+                state.channel(&w.sayso.to_string()).map(|c| c.tags.clone()),
+                Some(vec!["work".to_owned()])
+            );
+        }
+
+        #[test]
+        fn selections_keep_the_model_id_and_show_the_name() {
+            let mut w = world();
+            let mut bigboi = worker("bigboi", &[], &[]);
+            let mut claude = account("Claude Personal", "claude", PA::SignedIn);
+            claude.models = vec![ModelInfo {
+                id: "claude-opus-5-5".into(),
+                name: "Opus 5.5".into(),
+                options: vec![],
+            }];
+            inventory(&mut bigboi).accounts = vec![claude];
+            w.cache.workers.insert(bigboi.id.to_string(), bigboi);
+            if let Some(channel) = w.cache.channels.get_mut(&w.sayso.to_string()) {
+                channel.task_selection = Some(ModelSelection {
+                    account_label: "Claude Personal".into(),
+                    model: "claude-opus-5-5".into(),
+                    options: [("effort".to_owned(), OptionValue::Text("high".into()))]
+                        .into_iter()
+                        .collect(),
+                });
+            }
+            let state = view(&w.cache);
+            let first = &state.selections[0];
+            assert_eq!(first.model_id, "claude-opus-5-5");
+            assert_eq!(first.label(), "Claude Personal, Opus 5.5");
+            let chosen = state
+                .channel(&w.sayso.to_string())
+                .and_then(|c| c.task_selection.clone())
+                .expect("selection");
+            assert_eq!(chosen.label(), "Claude Personal, Opus 5.5");
+            assert_eq!(chosen.model_id, "claude-opus-5-5");
+            assert_eq!(
+                chosen.options,
+                [("effort".to_owned(), SelectionOption::Text("high".into()))]
+            );
+            assert_eq!(state.selection(&chosen.key()), Some(first));
+        }
+
+        fn sign_in(state: SignInState) -> SignIn {
+            SignIn {
+                id: SignInId::new(),
+                worker_id: WorkerId::new(),
+                account_id: AccountId::new(),
+                method: SignInMethod::ClaudePlan,
+                state,
+                created_at: Timestamp::from_millis(NOW),
+                updated_at: Timestamp::from_millis(NOW),
+                expires_at: Timestamp::from_millis(NOW + 1),
+            }
+        }
+
+        #[test]
+        fn only_sign_ins_that_this_client_started_follow_the_feed() {
+            let mut w = world();
+            let other = sign_in(SignInState::Starting);
+            assert!(
+                !w.cache.apply(FeedEntry::upsert(
+                    1,
+                    Timestamp::from_millis(NOW),
+                    EntityPayload::SignIn(other)
+                )),
+                "a sign-in from another client does not show"
+            );
+            let mine = sign_in(SignInState::Starting);
+            let id = mine.id.to_string();
+            w.cache.sign_ins.insert(id.clone(), mine.clone());
+            let mut next = mine.clone();
+            next.state = SignInState::NeedsCode {
+                url: "https://claude.ai/oauth".into(),
+            };
+            assert!(w.cache.apply(FeedEntry::upsert(
+                2,
+                Timestamp::from_millis(NOW),
+                EntityPayload::SignIn(next)
+            )));
+            let state = view(&w.cache);
+            assert_eq!(state.sign_ins.len(), 1);
+            assert_eq!(state.sign_ins[0].method, Some(SignInChoice::ClaudePlan));
+            assert_eq!(
+                state.sign_in(&id).map(|s| s.step.clone()),
+                Some(SignInStep::NeedsCode {
+                    url: "https://claude.ai/oauth".into()
+                })
+            );
+            // A dismissed sign-in leaves, and a late entry does not bring it
+            // back.
+            w.cache.sign_ins.remove(&id);
+            w.cache.sign_ins_dismissed.insert(id.clone());
+            let mut late = mine;
+            late.state = SignInState::Verifying;
+            assert!(!w.cache.apply(FeedEntry::upsert(
+                3,
+                Timestamp::from_millis(NOW),
+                EntityPayload::SignIn(late)
+            )));
+            assert!(view(&w.cache).sign_ins.is_empty());
+        }
+
+        #[test]
+        fn registry_icons_reach_the_agents_and_the_accounts() {
+            let mut w = world();
+            w.cache.acp_registry = vec![AcpRegistryAgent {
+                id: "amp-acp".into(),
+                name: "Amp".into(),
+                description: "An agent.".into(),
+                version: "0.10.0".into(),
+                icon_url: Some("https://cdn.example/amp.svg".into()),
+                supported: true,
+            }];
+            w.cache.acp_registry_load = RegistryLoad::Loaded;
+            w.cache
+                .acp_icons
+                .insert("amp-acp".into(), "<svg></svg>".into());
+            let mut bigboi = worker("bigboi", &[], &[]);
+            inventory(&mut bigboi).accounts = vec![account("Amp", "acp:amp-acp", PA::SignedOut)];
+            w.cache.workers.insert(bigboi.id.to_string(), bigboi);
+            let state = view(&w.cache);
+            let logo = ProviderLogo::Registry {
+                id: "amp-acp".into(),
+                svg: Some("<svg></svg>".into()),
+            };
+            assert_eq!(state.acp_registry.load, RegistryLoad::Loaded);
+            assert_eq!(state.acp_registry.agents[0].logo, logo);
+            assert_eq!(row(&state, "Amp").logo, logo);
+            assert_eq!(row(&state, "Amp").provider, "Amp");
+        }
     }
 }

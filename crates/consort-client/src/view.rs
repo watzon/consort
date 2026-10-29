@@ -22,8 +22,18 @@ pub struct ViewState {
     pub threads: Vec<TaskThreadView>,
     pub tasks_panel: TasksPanelView,
     pub workers: Vec<WorkerView>,
-    /// The harness accounts that tasks can use, as "label, model" choices.
-    pub selections: Vec<String>,
+    /// Every worker tag: the user tags of all workers first, then the
+    /// detected tags, each once and sorted. Tag fields offer these.
+    pub tags: Vec<String>,
+    /// The model selections that tasks can use: an account label and a
+    /// model, with the model ID kept for the hub.
+    pub selections: Vec<SelectionView>,
+    /// The sign-ins that this client started, newest last. A sign-in that
+    /// another client started does not show (see DECISIONS row 269).
+    pub sign_ins: Vec<SignInView>,
+    /// The agents of the ACP registry, for the Add account dialog. The
+    /// client loads them with [`crate::Command::LoadAcpRegistry`].
+    pub acp_registry: AcpRegistryView,
     /// Set while the Add worker dialog waits for a pairing code.
     pub worker_pairing: Option<PairingCodeView>,
     /// Messages that waited in the outbox and that the hub then refused, or
@@ -91,6 +101,115 @@ impl ViewState {
 
     pub fn worker(&self, id: &str) -> Option<&WorkerView> {
         self.workers.iter().find(|w| w.id == id)
+    }
+
+    pub fn sign_in(&self, id: &str) -> Option<&SignInView> {
+        self.sign_ins.iter().find(|s| s.id == id)
+    }
+
+    /// The workers that have every tag in `tags`, user or detected. With no
+    /// tags, every worker matches.
+    pub fn workers_with_tags(&self, tags: &[String]) -> Vec<&WorkerView> {
+        self.workers.iter().filter(|w| w.has_tags(tags)).collect()
+    }
+
+    /// The account names already used for a provider on workers other than
+    /// `worker_id`, each with the workers that use it. The Add account
+    /// dialog offers them, so the same account on several workers gets one
+    /// name.
+    pub fn account_names(&self, harness: &str, worker_id: &str) -> Vec<AccountNameView> {
+        let mut names: Vec<AccountNameView> = Vec::new();
+        for worker in self.workers.iter().filter(|w| w.id != worker_id) {
+            for account in worker.accounts.iter().filter(|a| a.harness == harness) {
+                match names.iter_mut().find(|n| n.label == account.label) {
+                    Some(name) => {
+                        if !name.workers.contains(&worker.name) {
+                            name.workers.push(worker.name.clone());
+                        }
+                    }
+                    None => names.push(AccountNameView {
+                        label: account.label.clone(),
+                        workers: vec![worker.name.clone()],
+                    }),
+                }
+            }
+        }
+        names
+    }
+
+    /// The selection with this key.
+    pub fn selection(&self, key: &str) -> Option<&SelectionView> {
+        self.selections.iter().find(|s| s.key() == key)
+    }
+}
+
+/// The folder name that a profile folder shows in the Add account dialog:
+/// the account name in lowercase, with a `-` between words, such as
+/// `claude-work`. An empty or odd name gives `account`.
+pub fn profile_slug(label: &str) -> String {
+    let mut slug = String::new();
+    for c in label.chars() {
+        if c.is_ascii_alphanumeric() {
+            slug.push(c.to_ascii_lowercase());
+        } else if !slug.is_empty() && !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    // The worker caps the folder name at 48 characters, so the dialog shows
+    // the same name.
+    let slug: String = slug.trim_matches('-').chars().take(48).collect();
+    let slug = slug.trim_end_matches('-');
+    if slug.is_empty() {
+        "account".to_owned()
+    } else {
+        slug.to_owned()
+    }
+}
+
+/// A name that an account of one provider already has on other workers.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AccountNameView {
+    pub label: String,
+    /// The names of the workers that have an account with this name.
+    pub workers: Vec<String>,
+}
+
+/// The value of a model option.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SelectionOption {
+    Bool(bool),
+    Text(String),
+}
+
+/// A model selection: an account label, a model and its options, such as
+/// "Claude Personal, Opus 5.5". The hub needs the model ID, and the user
+/// reads the model name.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SelectionView {
+    pub account_label: String,
+    /// The model ID, as the account reports it. Empty for an account with
+    /// no model list: the harness then uses its default.
+    pub model_id: String,
+    /// The model name to show. The ID when the name is not known.
+    pub model_name: String,
+    /// Option values by option ID, such as `effort`.
+    pub options: Vec<(String, SelectionOption)>,
+}
+
+impl SelectionView {
+    /// The words to show, such as "Claude Personal, Opus 5.5".
+    pub fn label(&self) -> String {
+        if self.model_id.is_empty() {
+            self.account_label.clone()
+        } else {
+            format!("{}, {}", self.account_label, self.model_name)
+        }
+    }
+
+    /// A stable key for a select menu: the account label and the model ID.
+    /// Options are not part of it, so a pick keeps the options it had.
+    pub fn key(&self) -> String {
+        format!("{}\u{1f}{}", self.account_label, self.model_id)
     }
 }
 
@@ -263,8 +382,11 @@ pub struct ChannelView {
     pub coordinator_account: Option<String>,
     pub repos: Vec<RepoView>,
     pub preferred_workers: Vec<String>,
-    pub task_selection: Option<String>,
+    pub task_selection: Option<SelectionView>,
     pub default_isolation: Isolation,
+    /// The worker tags that the channel requires: all work in it runs only
+    /// on workers that have every one of them.
+    pub tags: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -701,16 +823,354 @@ impl AuthState {
     }
 }
 
+/// The logo of a provider. The app draws Claude Code and Gemini CLI in
+/// their own colors, and the others in the text color.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ProviderLogo {
+    ClaudeCode,
+    Codex,
+    OpenCode,
+    GeminiCli,
+    /// An agent from the ACP registry: its registry ID, and its icon (an SVG
+    /// that draws in `currentColor`) once the client has loaded it.
+    Registry {
+        id: String,
+        svg: Option<String>,
+    },
+    /// A provider with no logo of its own: a custom command, or a harness
+    /// that this client does not know. The app draws a neutral glyph.
+    #[default]
+    Generic,
+}
+
+/// The name and the logo of a harness, from its name in the inventory:
+/// `claude`, `codex`, `opencode`, `gemini`, `pi`, `acp` or `acp:<id>`.
+pub fn provider_of(harness: &str) -> (String, ProviderLogo) {
+    match harness {
+        "claude" | "claude-code" => ("Claude Code".into(), ProviderLogo::ClaudeCode),
+        "codex" => ("Codex".into(), ProviderLogo::Codex),
+        "opencode" => ("OpenCode".into(), ProviderLogo::OpenCode),
+        "gemini" | "gemini-cli" => ("Gemini CLI".into(), ProviderLogo::GeminiCli),
+        "pi" => ("Pi".into(), ProviderLogo::Generic),
+        other => match other.strip_prefix("acp:").filter(|id| !id.is_empty()) {
+            Some(id) => (
+                id.to_owned(),
+                ProviderLogo::Registry {
+                    id: id.to_owned(),
+                    svg: None,
+                },
+            ),
+            None => ("ACP agent".into(), ProviderLogo::Generic),
+        },
+    }
+}
+
+/// Where the sign-in of an account is, as the account row shows it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum AccountStatus {
+    SignedIn,
+    /// An API key is saved, so there is nothing to sign in to.
+    Ready,
+    /// The login expired. The user must sign in again.
+    Expired,
+    /// The worker could not check the login.
+    Error,
+    NotSignedIn,
+    /// The worker installs the provider first.
+    Installing,
+    #[default]
+    Unknown,
+}
+
+impl AccountStatus {
+    pub fn label(self) -> &'static str {
+        match self {
+            AccountStatus::SignedIn => "Signed in",
+            AccountStatus::Ready => "Ready",
+            AccountStatus::Expired => "Expired",
+            AccountStatus::Error => "Sign-in error",
+            AccountStatus::NotSignedIn => "Not signed in",
+            AccountStatus::Installing => "Installing",
+            AccountStatus::Unknown => "Not checked",
+        }
+    }
+
+    /// Tasks can use the account.
+    pub fn works(self) -> bool {
+        matches!(self, AccountStatus::SignedIn | AccountStatus::Ready)
+    }
+
+    /// The status is a problem: the dot and the words are in the failed
+    /// color.
+    pub fn is_problem(self) -> bool {
+        matches!(self, AccountStatus::Expired | AccountStatus::Error)
+    }
+
+    /// The one action of an account row in this status.
+    pub fn action(self) -> AccountAction {
+        match self {
+            AccountStatus::SignedIn => AccountAction::SignOut,
+            AccountStatus::Expired | AccountStatus::Error => AccountAction::SignInAgain,
+            AccountStatus::NotSignedIn | AccountStatus::Unknown => AccountAction::SignIn,
+            AccountStatus::Ready | AccountStatus::Installing => AccountAction::None,
+        }
+    }
+}
+
+/// The action button of an account row.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum AccountAction {
+    SignOut,
+    SignIn,
+    SignInAgain,
+    #[default]
+    None,
+}
+
+impl AccountAction {
+    pub fn label(self) -> &'static str {
+        match self {
+            AccountAction::SignOut => "Sign out",
+            AccountAction::SignIn => "Sign in",
+            AccountAction::SignInAgain => "Sign in again",
+            AccountAction::None => "",
+        }
+    }
+}
+
+/// A way to sign in to an account. It mirrors the proto's `SignInMethod`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum SignInChoice {
+    ClaudePlan,
+    ClaudeConsole,
+    ChatgptDevice,
+    ChatgptBrowser,
+    /// An API key in this variable.
+    ApiKey {
+        variable: String,
+    },
+    /// An ACP agent's own method.
+    AcpAgent {
+        method_id: String,
+        name: String,
+    },
+    /// A command that the user runs on the worker.
+    Terminal {
+        command: String,
+    },
+}
+
+impl SignInChoice {
+    /// The name on the method tab.
+    pub fn label(&self) -> String {
+        match self {
+            SignInChoice::ClaudePlan => "Claude plan".into(),
+            SignInChoice::ClaudeConsole => "Console".into(),
+            SignInChoice::ChatgptDevice => "ChatGPT".into(),
+            SignInChoice::ChatgptBrowser => "ChatGPT in a browser".into(),
+            SignInChoice::ApiKey { .. } => "API key".into(),
+            SignInChoice::AcpAgent { name, .. } => name.clone(),
+            SignInChoice::Terminal { .. } => "Terminal".into(),
+        }
+    }
+
+    /// The method has a flow on the worker. An API key has none: the app
+    /// saves the key, and a terminal method is a command for the user.
+    pub fn has_flow(&self) -> bool {
+        !matches!(
+            self,
+            SignInChoice::ApiKey { .. } | SignInChoice::Terminal { .. }
+        )
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct HarnessAccountView {
     pub id: String,
     pub label: String,
-    /// Such as "Codex 0.165.0. ChatGPT Pro plan."
+    /// The harness, as the inventory names it, such as `claude`.
+    pub harness: String,
+    /// The provider name, such as "Claude Code".
+    pub provider: String,
+    pub logo: ProviderLogo,
+    /// The plan or the problem, such as "Claude Max plan." or "API key saved
+    /// on bigboi."
     pub detail: String,
     /// Code to show in mono inside the detail, such as an environment
     /// variable or a command.
     pub detail_code: Vec<String>,
     pub auth: AuthState,
+    pub status: AccountStatus,
+    /// The one action of the row. `None` when the worker offers no way to
+    /// do it from the app.
+    pub action: AccountAction,
+    /// The ways the app may offer to sign in, in the worker's order.
+    pub sign_in_methods: Vec<SignInChoice>,
+    /// The names of the secret variables saved for the account.
+    pub secret_names: Vec<String>,
+    /// Who is signed in, when the harness tells.
+    pub email: Option<String>,
+}
+
+/// Where a managed tool is on a worker.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum ToolState {
+    #[default]
+    Missing,
+    Installing,
+    Ready,
+    UpdateAvailable,
+    Failed,
+}
+
+/// A managed tool on a worker, as the Installed tools list shows it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ToolView {
+    /// The tool ID, such as `claude-code`. The install command takes it.
+    pub id: String,
+    pub name: String,
+    pub logo: ProviderLogo,
+    pub version: Option<String>,
+    /// The newest version that the last check found.
+    pub latest: Option<String>,
+    pub state: ToolState,
+    /// The line under the name: why an install failed, or that the tool is
+    /// not installed yet.
+    pub detail: Option<String>,
+}
+
+impl ToolView {
+    /// The words or the button at the end of the row.
+    pub fn action_label(&self) -> String {
+        match self.state {
+            ToolState::Ready => "Up to date".into(),
+            ToolState::UpdateAvailable => match &self.latest {
+                Some(latest) => format!("Update to {latest}"),
+                None => "Update now".into(),
+            },
+            ToolState::Installing => "Installing".into(),
+            ToolState::Missing => "Install now".into(),
+            ToolState::Failed => "Try again".into(),
+        }
+    }
+
+    /// The end of the row is a button.
+    pub fn can_install(&self) -> bool {
+        matches!(
+            self.state,
+            ToolState::UpdateAvailable | ToolState::Missing | ToolState::Failed
+        )
+    }
+}
+
+/// Where one sign-in flow is. It mirrors the proto's `SignInState`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum SignInStep {
+    #[default]
+    Starting,
+    OpenUrl {
+        url: String,
+    },
+    DeviceCode {
+        url: String,
+        user_code: String,
+    },
+    NeedsCode {
+        url: String,
+    },
+    Verifying,
+    Succeeded {
+        detail: Option<String>,
+    },
+    Failed {
+        message: String,
+    },
+    Cancelled,
+    Expired,
+}
+
+impl SignInStep {
+    /// The flow has ended.
+    pub fn is_final(&self) -> bool {
+        matches!(
+            self,
+            SignInStep::Succeeded { .. }
+                | SignInStep::Failed { .. }
+                | SignInStep::Cancelled
+                | SignInStep::Expired
+        )
+    }
+}
+
+/// One sign-in that this client started.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SignInView {
+    pub id: String,
+    pub worker_id: String,
+    pub account_id: String,
+    pub method: Option<SignInChoice>,
+    pub step: SignInStep,
+}
+
+/// Whether the client has the ACP registry.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum RegistryLoad {
+    #[default]
+    NotLoaded,
+    Loading,
+    Loaded,
+    /// What went wrong and what to do next.
+    Failed(String),
+}
+
+/// An agent of the ACP registry.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AcpAgentView {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub version: String,
+    pub logo: ProviderLogo,
+    /// A worker can install it.
+    pub supported: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct AcpRegistryView {
+    pub load: RegistryLoad,
+    pub agents: Vec<AcpAgentView>,
+}
+
+impl AcpRegistryView {
+    /// The agents whose name, ID or description holds `query`, ignoring
+    /// case. Agents that a worker can install come first.
+    pub fn search(&self, query: &str) -> Vec<&AcpAgentView> {
+        let query = query.trim().to_lowercase();
+        let mut found: Vec<&AcpAgentView> = self
+            .agents
+            .iter()
+            .filter(|a| {
+                query.is_empty()
+                    || a.name.to_lowercase().contains(&query)
+                    || a.id.to_lowercase().contains(&query)
+                    || a.description.to_lowercase().contains(&query)
+            })
+            .collect();
+        found.sort_by_key(|a| !a.supported);
+        found
+    }
+
+    /// The logo of a registry agent, with its icon when it is loaded.
+    pub fn logo(&self, id: &str) -> ProviderLogo {
+        self.agents
+            .iter()
+            .find(|a| a.id == id)
+            .map(|a| a.logo.clone())
+            .unwrap_or(ProviderLogo::Registry {
+                id: id.to_owned(),
+                svg: None,
+            })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -774,8 +1234,26 @@ pub struct WorkerView {
     pub status_line: String,
     /// The user tags, set in a client.
     pub tags: Vec<String>,
+    /// The tags that the worker found itself, such as `macos` or `ram-32gb`.
+    pub detected_tags: Vec<String>,
     pub accounts: Vec<HarnessAccountView>,
+    /// The managed tools, providers first.
+    pub tools: Vec<ToolView>,
+    /// Where the worker keeps its tools, such as `~/.consort/tools`.
+    pub tools_folder: String,
     pub policy: PolicyView,
+}
+
+impl WorkerView {
+    /// The worker has every tag in `tags`, as a user tag or a detected tag.
+    pub fn has_tags(&self, tags: &[String]) -> bool {
+        tags.iter()
+            .all(|t| self.tags.contains(t) || self.detected_tags.contains(t))
+    }
+
+    pub fn account(&self, id: &str) -> Option<&HarnessAccountView> {
+        self.accounts.iter().find(|a| a.id == id)
+    }
 }
 
 /// A pairing code for a new worker.
@@ -784,4 +1262,21 @@ pub struct PairingCodeView {
     pub code: String,
     pub hub_url: String,
     pub expires_at: i64,
+}
+
+#[cfg(test)]
+mod profile_slug_tests {
+    use super::profile_slug;
+
+    /// The worker makes the folder with the same rule
+    /// (`consort-worker/src/profile.rs`), so the dialog shows the real name.
+    #[test]
+    fn the_slug_matches_the_worker_rule() {
+        assert_eq!(profile_slug("Claude Work"), "claude-work");
+        assert_eq!(profile_slug("  --Codex (Personal)!  "), "codex-personal");
+        assert_eq!(profile_slug("***"), "account");
+        let long = "a".repeat(47) + " b";
+        assert_eq!(profile_slug(&long), "a".repeat(47));
+        assert_eq!(profile_slug(&"x".repeat(60)).len(), 48);
+    }
 }

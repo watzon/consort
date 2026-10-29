@@ -241,6 +241,7 @@ pub struct Layout {
     pub dialog_wide: Pixels,
     /// The Add worker dialog.
     pub dialog_worker: Pixels,
+    pub dialog_account: Pixels,
     /// The channel switcher.
     pub switcher_width: Pixels,
     /// The space above the switcher.
@@ -274,6 +275,16 @@ pub struct Components {
     pub worker_list: Pixels,
     pub settings_detail_max: Pixels,
     pub account_state: Pixels,
+    pub account_action: Pixels,
+    pub tool_version: Pixels,
+    pub tool_state: Pixels,
+    pub provider_logo: Pixels,
+    pub agent_tile: Pixels,
+    pub agent_list_max: Pixels,
+    pub sign_in_tile: Pixels,
+    pub sign_in_logo: Pixels,
+    pub step_marker: Pixels,
+    pub tag_label: Pixels,
     pub settings_select: Pixels,
     pub group_select: Pixels,
     pub workspace_control: Pixels,
@@ -318,6 +329,16 @@ impl Components {
             worker_list: px(c.worker_list),
             settings_detail_max: px(c.settings_detail_max),
             account_state: px(c.account_state),
+            account_action: px(c.account_action),
+            tool_version: px(c.tool_version),
+            tool_state: px(c.tool_state),
+            provider_logo: px(c.provider_logo),
+            agent_tile: px(c.agent_tile),
+            agent_list_max: px(c.agent_list_max),
+            sign_in_tile: px(c.sign_in_tile),
+            sign_in_logo: px(c.sign_in_logo),
+            step_marker: px(c.step_marker),
+            tag_label: px(c.tag_label),
             settings_select: px(c.settings_select),
             group_select: px(c.group_select),
             workspace_control: px(c.workspace_control),
@@ -459,6 +480,7 @@ impl Tokens {
                 dialog_width: px(s.layout.dialog_width),
                 dialog_wide: px(s.layout.dialog_wide),
                 dialog_worker: px(s.layout.dialog_worker),
+                dialog_account: px(s.layout.dialog_account),
                 switcher_width: px(s.layout.switcher_width),
                 switcher_top: px(s.layout.switcher_top),
                 switcher_name_max: px(s.layout.switcher_name_max),
@@ -569,6 +591,7 @@ mod tests {
         assert_eq!(t.layout.dialog_width, px(528.0));
         assert_eq!(t.layout.dialog_wide, px(560.0));
         assert_eq!(t.layout.dialog_worker, px(536.0));
+        assert_eq!(t.layout.dialog_account, px(600.0));
         assert_eq!(t.layout.switcher_width, px(560.0));
         assert_eq!(t.layout.switcher_top, px(96.0));
         assert_eq!(t.layout.switcher_name_max, px(240.0));

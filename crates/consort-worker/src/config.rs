@@ -8,7 +8,7 @@
 
 use std::path::{Path, PathBuf};
 
-use consort_harness::{AccountConfig, HarnessKind, process::resolve_program};
+use consort_harness::AccountConfig;
 use consort_proto::ids::WorkerId;
 use consort_proto::model::{ApprovalMode, CheckoutInfo, WorkerPolicy};
 use serde::{Deserialize, Serialize};
@@ -154,9 +154,12 @@ pub struct WorkerToml {
     /// this `labels`.
     #[serde(default, alias = "labels")]
     pub tags: Vec<String>,
-    /// Add an account for each installed harness that has none.
-    #[serde(default = "default_true")]
-    pub auto_discover: bool,
+    /// Deprecated and ignored. Older builds added an account for each
+    /// harness on `PATH`. A worker now has only the accounts that the user
+    /// adds (see docs/DECISIONS.md). The key still reads, so an older file
+    /// loads, and it is not written again.
+    #[serde(default, skip_serializing)]
+    pub auto_discover: Option<bool>,
     /// The worker policy.
     #[serde(default)]
     pub policy: PolicyConfig,
@@ -182,10 +185,7 @@ impl WorkerToml {
         let path = Self::path(config_dir);
         match std::fs::read_to_string(&path) {
             Ok(text) => toml::from_str(&text).map_err(|e| WorkerError::Config(e.to_string())),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Self {
-                auto_discover: true,
-                ..Self::default()
-            }),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(err) => Err(WorkerError::io(
                 format!("could not read {}", path.display()),
                 err,
@@ -220,47 +220,16 @@ impl WorkerToml {
             .collect()
     }
 
-    /// Adds a default account for each installed harness that has no
-    /// account yet. Returns whether anything changed.
-    pub fn discover_accounts(&mut self, installed: &dyn Fn(HarnessKind) -> bool) -> bool {
-        if !self.auto_discover {
-            return false;
-        }
-        let mut changed = false;
-        for kind in HarnessKind::ALL {
-            if kind == HarnessKind::Acp {
-                continue;
-            }
-            if self.accounts.iter().any(|a| a.harness == kind) {
-                continue;
-            }
-            if installed(kind) {
-                self.accounts.push(AccountConfig::default_for(kind));
-                changed = true;
-            }
-        }
-        changed
-    }
-}
-
-/// Whether a harness looks installed on this machine.
-pub fn harness_installed(kind: HarnessKind) -> bool {
-    match kind {
-        // `claude-agent-acp` runs through npx or bunx.
-        HarnessKind::ClaudeCode => {
-            resolve_program("npx").is_some() || resolve_program("bunx").is_some()
-        }
-        HarnessKind::Codex => resolve_program("codex").is_some(),
-        HarnessKind::OpenCode => resolve_program("opencode").is_some(),
-        HarnessKind::GeminiCli => resolve_program("gemini").is_some(),
-        HarnessKind::Pi => resolve_program("pi").is_some(),
-        HarnessKind::Acp => false,
+    /// The account with this ID.
+    pub fn account(&self, id: consort_proto::ids::AccountId) -> Option<&AccountConfig> {
+        self.accounts.iter().find(|a| a.id == id)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use consort_harness::HarnessKind;
 
     #[test]
     fn data_model_example_parses() {
@@ -299,7 +268,7 @@ path = "C:/Users/chris/Code/sayso"
         assert_eq!(config.accounts[0].harness, HarnessKind::Codex);
         assert_eq!(config.accounts[0].label, "Codex Personal");
         assert_eq!(config.tags, ["windows-test", "gpu"]);
-        assert!(config.auto_discover);
+        assert_eq!(config.auto_discover, None);
         // A file from before the rename still loads its labels as tags.
         let old: WorkerToml = toml::from_str(r#"labels = ["gpu"]"#).unwrap();
         assert_eq!(old.tags, ["gpu"]);
@@ -334,14 +303,38 @@ path = "C:/Users/chris/Code/sayso"
     fn save_and_load_round_trip() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = WorkerToml::load(dir.path()).unwrap();
-        assert!(config.auto_discover);
+        assert!(config.accounts.is_empty(), "a new worker has no accounts");
         config.hub_url = Some("http://127.0.0.1:7600".into());
         config.worker_id = Some(WorkerId::new());
-        assert!(config.discover_accounts(&|k| k == HarnessKind::Codex));
-        assert!(!config.discover_accounts(&|k| k == HarnessKind::Codex));
+        let mut account = AccountConfig::default_for(HarnessKind::Codex);
+        account.label = "Codex Personal".into();
+        account.profile = true;
+        config.accounts.push(account);
+        let mut agent = AccountConfig::default_for(HarnessKind::Acp);
+        agent.profile = true;
+        agent.acp = Some(consort_proto::model::AcpAccountSpec::Registry { id: "goose".into() });
+        config.accounts.push(agent);
         config.save(dir.path()).unwrap();
+        let text = std::fs::read_to_string(WorkerToml::path(dir.path())).unwrap();
+        assert!(text.contains("profile = true"), "{text}");
         let back = WorkerToml::load(dir.path()).unwrap();
         assert_eq!(back, config);
-        assert_eq!(back.accounts[0].label, "Codex");
+        assert_eq!(back.accounts[0].label, "Codex Personal");
+    }
+
+    #[test]
+    fn the_old_auto_discover_key_reads_and_is_not_written() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            WorkerToml::path(dir.path()),
+            "auto_discover = true\nname = \"old\"\n",
+        )
+        .unwrap();
+        let config = WorkerToml::load(dir.path()).unwrap();
+        assert_eq!(config.auto_discover, Some(true));
+        assert!(config.accounts.is_empty());
+        config.save(dir.path()).unwrap();
+        let text = std::fs::read_to_string(WorkerToml::path(dir.path())).unwrap();
+        assert!(!text.contains("auto_discover"), "{text}");
     }
 }

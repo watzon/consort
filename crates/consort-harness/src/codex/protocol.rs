@@ -30,6 +30,14 @@ pub mod method {
     pub const TURN_INTERRUPT: &str = "turn/interrupt";
     /// Read the account.
     pub const ACCOUNT_READ: &str = "account/read";
+    /// Start a sign-in.
+    pub const ACCOUNT_LOGIN_START: &str = "account/login/start";
+    /// Cancel a sign-in.
+    pub const ACCOUNT_LOGIN_CANCEL: &str = "account/login/cancel";
+    /// Sign out.
+    pub const ACCOUNT_LOGOUT: &str = "account/logout";
+    /// A sign-in ended (notification).
+    pub const ACCOUNT_LOGIN_COMPLETED: &str = "account/login/completed";
     /// List models.
     pub const MODEL_LIST: &str = "model/list";
 
@@ -642,6 +650,9 @@ pub enum Account {
     /// A ChatGPT login.
     #[serde(rename_all = "camelCase")]
     Chatgpt {
+        /// The signed-in email address.
+        #[serde(default)]
+        email: Option<String>,
         /// The plan, such as `plus`.
         #[serde(default)]
         plan_type: Option<String>,
@@ -665,6 +676,83 @@ pub struct GetAccountResponse {
     /// Whether the model provider needs an OpenAI login.
     #[serde(default)]
     pub requires_openai_auth: bool,
+}
+
+/// `account/login/start` params. Only the kinds that Consort uses.
+#[derive(Clone, Serialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum LoginAccountParams {
+    /// Store an API key in the Codex home.
+    #[serde(rename_all = "camelCase")]
+    ApiKey {
+        /// The key.
+        api_key: String,
+    },
+    /// ChatGPT in a browser, with a callback on this machine.
+    Chatgpt,
+    /// ChatGPT with a device code.
+    ChatgptDeviceCode,
+}
+
+impl std::fmt::Debug for LoginAccountParams {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ApiKey { .. } => f.write_str("ApiKey { api_key: <redacted> }"),
+            Self::Chatgpt => f.write_str("Chatgpt"),
+            Self::ChatgptDeviceCode => f.write_str("ChatgptDeviceCode"),
+        }
+    }
+}
+
+/// The response to `account/login/start`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum LoginAccountResponse {
+    /// The key is stored.
+    ApiKey,
+    /// Open `auth_url` in a browser on this machine.
+    #[serde(rename_all = "camelCase")]
+    Chatgpt {
+        /// The sign-in ID.
+        login_id: String,
+        /// The page to open.
+        auth_url: String,
+    },
+    /// Open `verification_url` and enter `user_code`.
+    #[serde(rename_all = "camelCase")]
+    ChatgptDeviceCode {
+        /// The sign-in ID.
+        login_id: String,
+        /// The page to open.
+        verification_url: String,
+        /// The code to enter on the page.
+        user_code: String,
+    },
+    /// A kind that the adapter does not use.
+    #[serde(other)]
+    Other,
+}
+
+/// `account/login/cancel` params.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CancelLoginAccountParams {
+    /// The sign-in ID.
+    pub login_id: String,
+}
+
+/// The `account/login/completed` notification.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountLoginCompleted {
+    /// The sign-in ID.
+    #[serde(default)]
+    pub login_id: Option<String>,
+    /// Whether the sign-in worked.
+    pub success: bool,
+    /// Why it failed.
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 /// `model/list` params.
@@ -770,7 +858,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            matches!(account.account, Some(Account::Chatgpt { plan_type: Some(p) }) if p == "plus")
+            matches!(account.account, Some(Account::Chatgpt { plan_type: Some(p), .. }) if p == "plus")
         );
     }
 }

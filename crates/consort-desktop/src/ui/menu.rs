@@ -47,6 +47,12 @@ pub enum MenuAction {
     DeleteChannel(String),
     RenameWorker(String),
     EditTags(String),
+    /// The Worker tags dialog of a channel.
+    ChannelTags(String),
+    /// The worker ID and the account ID.
+    RenameAccount(String, String),
+    SignOutAccount(String, String),
+    RemoveAccount(String, String),
     PauseWorker(String, bool),
     RemoveWorker(String),
     /// Cut, Copy, Paste or Select all in one of the message boxes.
@@ -92,13 +98,37 @@ pub fn worker_menu(worker_id: &str, paused: bool) -> Vec<MenuItem> {
     ]
 }
 
-/// The menu of a channel row: Rename, Instructions, Change icon, Move to
-/// group, Archive and Delete.
+/// The menu of an account row in Settings > Workers: Rename, Sign out and
+/// Remove. Sign out is there only for an account that is signed in or has a
+/// saved key.
+pub fn account_menu(worker_id: &str, account_id: &str, can_sign_out: bool) -> Vec<MenuItem> {
+    let (w, a) = (worker_id.to_owned(), account_id.to_owned());
+    let mut items = vec![MenuItem::new(
+        "Rename",
+        MenuAction::RenameAccount(w.clone(), a.clone()),
+    )];
+    if can_sign_out {
+        items.push(MenuItem::new(
+            "Sign out",
+            MenuAction::SignOutAccount(w.clone(), a.clone()),
+        ));
+    }
+    items.push(
+        MenuItem::new("Remove", MenuAction::RemoveAccount(w, a))
+            .danger()
+            .separated(),
+    );
+    items
+}
+
+/// The menu of a channel row: Rename, Instructions, Worker tags, Change
+/// icon, Move to group, Archive and Delete.
 pub fn channel_menu(channel_id: &str) -> Vec<MenuItem> {
     let id = channel_id.to_owned();
     vec![
         MenuItem::new("Rename", MenuAction::RenameChannel(id.clone())),
         MenuItem::new("Instructions", MenuAction::ChannelInstructions(id.clone())),
+        MenuItem::new("Worker tags", MenuAction::ChannelTags(id.clone())),
         MenuItem::new("Change icon", MenuAction::ChangeIcon(id.clone())),
         MenuItem::new("Move to group", MenuAction::MoveToGroup(id.clone())),
         MenuItem::new("Archive", MenuAction::ArchiveChannel(id.clone())).separated(),
@@ -431,6 +461,7 @@ mod tests {
             [
                 "Rename",
                 "Instructions",
+                "Worker tags",
                 "Change icon",
                 "Move to group",
                 "Archive",
@@ -440,6 +471,21 @@ mod tests {
         assert_eq!(
             labels(&archived_channel_menu("chn_1")),
             ["Unarchive", "Delete"]
+        );
+    }
+
+    #[test]
+    fn the_account_menu_keeps_the_names_and_the_order() {
+        let signed_in = account_menu("wrk_1", "acc_1", true);
+        assert_eq!(labels(&signed_in), ["Rename", "Sign out", "Remove"]);
+        assert!(signed_in[2].danger && signed_in[2].separator_before);
+        assert_eq!(
+            signed_in[1].action,
+            MenuAction::SignOutAccount("wrk_1".into(), "acc_1".into())
+        );
+        assert_eq!(
+            labels(&account_menu("wrk_1", "acc_1", false)),
+            ["Rename", "Remove"]
         );
     }
 

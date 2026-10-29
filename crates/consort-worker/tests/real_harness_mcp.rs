@@ -38,17 +38,15 @@ async fn hub_tools_reach_with(kind: HarnessKind, allow_shell: bool) {
         .await
         .unwrap();
     let mut toml = WorkerToml::load(dir.path()).unwrap();
-    toml.auto_discover = false;
     toml.policy.allow_shell = allow_shell;
     let account = AccountConfig::default_for(kind);
     let account_id = account.id;
     toml.accounts = vec![account];
     toml.save(dir.path()).unwrap();
-    let worker = consort_worker::run(WorkerConfig {
-        config_dir: dir.path().to_path_buf(),
-    })
-    .await
-    .unwrap();
+    // The default Consort home keeps the managed tools between runs.
+    let worker = consort_worker::run(WorkerConfig::new(dir.path().to_path_buf()))
+        .await
+        .unwrap();
     hub.wait_connected().await;
 
     let session_id = SessionId::new();

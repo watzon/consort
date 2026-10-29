@@ -696,6 +696,7 @@ fn coordinator_can_start(tx: &Tx<'_>, channel: &Channel) -> Result<bool> {
         request: &request,
         approval_mode: channel.default_approval_mode,
         preferred_workers: &channel.preferred_workers,
+        channel_tags: &channel.tags,
         repos: &[],
         isolation: consort_proto::model::Isolation::Worktree,
     })

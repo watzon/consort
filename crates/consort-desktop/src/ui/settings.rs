@@ -1,12 +1,12 @@
 //! Settings, in the window: Appearance and Workers, and a line for the
 //! sections that come later.
 
-use consort_client::{ApprovalMode, AuthState, ViewState, WorkerView};
+use consort_client::{ApprovalMode, ViewState, WorkerView};
 use consort_theme::{Appearance, Mode, TextSize, ThemeLibrary, Tokens, TypeExt as _};
 use gpui_kit::{
     AnyElement, Context, Div, Hsla, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
-    ParentElement, SharedString, StatefulInteractiveElement as _, Styled, Window,
-    component::text::TextView, div, prelude::FluentBuilder as _, px,
+    ParentElement, SharedString, StatefulInteractiveElement as _, Styled, Window, div,
+    prelude::FluentBuilder as _, px,
 };
 
 use crate::{
@@ -197,8 +197,7 @@ impl ConsortApp {
                             .when(selected, |d| d.font_weight(t.text.ui_strong.weight)),
                         )
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.settings_section = section;
-                            cx.notify();
+                            this.open_settings(section, cx);
                         })),
                 );
             }
@@ -652,44 +651,12 @@ impl ConsortApp {
         &mut self,
         w: &WorkerView,
         t: &Tokens,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let c = &t.colors;
         let id = w.id.clone();
         let paused = w.paused;
-        let mut tags = div()
-            .flex()
-            .flex_wrap()
-            .items_center()
-            .gap(t.space.xs + t.space.xxs);
-        for tag in &w.tags {
-            tags = tags.child(
-                div()
-                    .py(t.space.xxs)
-                    .px(t.space.sm)
-                    .rounded(t.radius.sm)
-                    .border(t.border_width)
-                    .border_color(c.border_strong)
-                    .type_style(detail(t))
-                    .text_color(c.text_secondary)
-                    .child(tag.clone()),
-            );
-        }
-        let tags_id = w.id.clone();
-        tags = tags.child(
-            div()
-                .id("add-tag")
-                .pl(t.space.sm)
-                .type_style(detail(t))
-                .text_color(c.text_tertiary)
-                .cursor_pointer()
-                .hover(|s| s.text_color(c.text_primary))
-                .child("Add tag")
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.open_dialog(Dialog::EditTags(tags_id.clone()), window, cx)
-                })),
-        );
         let card = |t: &Tokens| {
             div()
                 .flex()
@@ -699,102 +666,9 @@ impl ConsortApp {
                 .border_color(t.colors.border_subtle)
                 .bg(t.colors.surface_card)
         };
-        let mut accounts = card(t);
-        let last = w.accounts.len().saturating_sub(1);
-        for (i, account) in w.accounts.iter().enumerate() {
-            let works = account.auth.works();
-            let action = if account.auth == AuthState::SignedOut {
-                "Check again"
-            } else {
-                "Edit"
-            };
-            // The detail is Markdown with the code words in backticks, so the
-            // reader can select and copy them.
-            let detail_source = detail_markdown(&account.detail, &account.detail_code);
-            let detail_state = self.texts.get(
-                &format!("account.{}.{}", w.id, account.id),
-                &detail_source,
-                cx,
-            );
-            // Text from a worker is not trusted: a link in it goes through
-            // the same policy as a link in a message.
-            let weak = cx.weak_entity();
-            let account_detail = div()
-                .w_full()
-                .min_w_0()
-                .type_style(detail(t))
-                .text_color(c.text_tertiary)
-                .child(TextView::new(&detail_state).max_lines(3).on_link_click(
-                    move |url, event, window, cx| {
-                        if !crate::ui::timeline::is_open_click(event) {
-                            return;
-                        }
-                        let action = crate::ui::links::click_action(&detail_source, url);
-                        let _ = weak.update(cx, |this, cx| this.follow_link(action, window, cx));
-                    },
-                ));
-            accounts = accounts.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(t.space.md)
-                    .py(t.space.md)
-                    .px(t.space.lg)
-                    .when(i < last, |d| {
-                        d.border_b(t.border_width).border_color(c.border_subtle)
-                    })
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .flex_1()
-                            .min_w_0()
-                            .child(text(
-                                account.label.clone(),
-                                t.text.ui_strong,
-                                c.text_primary,
-                            ))
-                            .child(account_detail),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(t.space.xs + t.space.xxs)
-                            .w(t.component.account_state)
-                            .flex_none()
-                            .child(worker_dot(
-                                works,
-                                t.component.state_dot,
-                                t.space.sm + t.space.xxs,
-                                t,
-                            ))
-                            .child(text(
-                                account.auth.label(),
-                                detail(t),
-                                if works {
-                                    c.text_secondary
-                                } else {
-                                    c.text_tertiary
-                                },
-                            )),
-                    )
-                    .child(
-                        button(
-                            SharedString::from(format!("account-{}", account.id)),
-                            action,
-                            ButtonKind::Quiet,
-                            t,
-                        )
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.show_notice(
-                                "Harness accounts are set on the worker in worker.toml.".into(),
-                                cx,
-                            )
-                        })),
-                    ),
-            );
-        }
+        let tags = self.worker_tags(w, t, window, cx);
+        let accounts = self.accounts_section(w, t, cx);
+        let tools = self.tools_section(w, t, cx);
         let policy = &w.policy;
         let mode_trigger = self.triggers.clone();
         let current_mode = policy.max_approval_mode;
@@ -998,24 +872,8 @@ impl ConsortApp {
                             )
                             .child(tags),
                     )
-                    .child(section_block(
-                        "Harness accounts",
-                        &format!(
-                            "Each login stays on {}. Consort only sees whether it works.",
-                            w.name
-                        ),
-                        Some((
-                            "Add account",
-                            cx.listener(|this, _, _, cx| {
-                                this.show_notice(
-                                    "Add harness accounts on the worker in worker.toml.".into(),
-                                    cx,
-                                )
-                            }),
-                        )),
-                        accounts,
-                        t,
-                    ))
+                    .child(accounts)
+                    .child(tools)
                     .child(section_block(
                         "Limits",
                         &format!(
@@ -1066,6 +924,16 @@ impl ConsortApp {
             }
             Some(Pick::Selection(selection)) => self.new_channel.selection = Some(selection),
             Some(Pick::Worker(id)) => self.new_channel.workers.push(id),
+            Some(Pick::Tag(tag)) => {
+                let tags = if matches!(self.dialog, Some(Dialog::ChannelTags(_))) {
+                    &mut self.channel_tags
+                } else {
+                    &mut self.new_channel.tags
+                };
+                if !tags.contains(&tag) {
+                    tags.push(tag);
+                }
+            }
             None => self.show_notice(
                 "That choice is not in the list any more. Open the list and choose again.".into(),
                 cx,
@@ -1084,8 +952,11 @@ pub enum Pick {
     NoGroup,
     /// The new channel goes in a group that the dialog makes.
     NewGroup,
+    /// The key of a model selection.
     Selection(String),
     Worker(String),
+    /// A worker tag for a channel.
+    Tag(String),
 }
 
 /// Matches the stable ID of a picked option to the state now. Returns `None`
@@ -1109,10 +980,13 @@ pub fn resolve_pick(
             .find(|group| group.id == option)
             .map(|group| Pick::Group(group.id.clone())),
         "new-channel-selection" => state
-            .selections
+            .selection(option)
+            .map(|selection| Pick::Selection(selection.key())),
+        "channel-tag" => state
+            .tags
             .iter()
-            .find(|selection| *selection == option)
-            .map(|selection| Pick::Selection(selection.clone())),
+            .find(|tag| *tag == option)
+            .map(|tag| Pick::Tag(tag.clone())),
         "new-channel-worker" => state
             .workers
             .iter()
@@ -1214,7 +1088,7 @@ fn limit_row(title: &str, hint: &str, control: AnyElement, border: bool, t: &Tok
 /// An account detail as Markdown: the code words in backticks, which the text
 /// view shows in the mono face without the backticks, and every other mark
 /// escaped, so the detail reads as the worker wrote it.
-fn detail_markdown(detail_text: &str, code: &[String]) -> String {
+pub(crate) fn detail_markdown(detail_text: &str, code: &[String]) -> String {
     let ranges = code_ranges(detail_text, code);
     let mut out = String::new();
     let mut from = 0;
@@ -1440,7 +1314,16 @@ mod tests {
 
     fn state_with_choices() -> ViewState {
         let mut state = consort_client::mock::view_state();
-        state.selections = vec!["Claude Code, Opus".into(), "Codex, GPT".into()];
+        let choice = |account: &str, id: &str, name: &str| consort_client::SelectionView {
+            account_label: account.into(),
+            model_id: id.into(),
+            model_name: name.into(),
+            options: Vec::new(),
+        };
+        state.selections = vec![
+            choice("Claude Code", "claude-opus", "Opus"),
+            choice("Codex", "gpt-5.5", "GPT"),
+        ];
         state
     }
 
@@ -1455,11 +1338,19 @@ mod tests {
             resolve_pick(&state, &[], "new-channel-group", &wanted),
             Some(Pick::Group(wanted))
         );
-        let selection = "Codex, GPT".to_owned();
+        let selection = state.selections[1].key();
         state.selections.reverse();
         assert_eq!(
             resolve_pick(&state, &[], "new-channel-selection", &selection),
             Some(Pick::Selection(selection))
+        );
+        assert_eq!(
+            resolve_pick(&state, &[], "channel-tag", "gpu-nvidia"),
+            Some(Pick::Tag("gpu-nvidia".into()))
+        );
+        assert_eq!(
+            resolve_pick(&state, &[], "channel-tag", "no-such-tag"),
+            None
         );
     }
 

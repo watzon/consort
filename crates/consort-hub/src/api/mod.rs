@@ -7,8 +7,6 @@
 //! body and returns the proto response type.
 
 use consort_proto::client_api::ClientRequest;
-use consort_proto::error::ErrorBody;
-use consort_proto::frame::MessageFamily;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -22,7 +20,6 @@ pub(crate) fn to_value<T: Serialize>(value: &T) -> Result<Value> {
 pub(crate) async fn dispatch(hub: &Hub, caller: Caller, request: ClientRequest) -> Result<Value> {
     use ClientRequest as R;
     let caller = &caller;
-    let request_type = request.type_name();
     match request {
         R::ChannelCreate(r) => to_value(&hub.channel_create(caller, r).await?),
         R::ChannelUpdate(r) => to_value(&hub.channel_update(caller, r).await?),
@@ -79,18 +76,16 @@ pub(crate) async fn dispatch(hub: &Hub, caller: Caller, request: ClientRequest) 
         R::ClientList(r) => to_value(&hub.client_list(caller, r).await?),
         R::ClientRevoke(r) => to_value(&hub.client_revoke(caller, r).await?),
         R::ClientPushRegister(r) => to_value(&hub.client_push_register(caller, r).await?),
-        // Accounts, sign-in, managed tools and the ACP registry: the
-        // contract is in place, the handlers come next (docs/ACCOUNTS-PLAN.md).
-        R::AccountCreate(_)
-        | R::AccountUpdate(_)
-        | R::AccountRemove(_)
-        | R::AccountSignOut(_)
-        | R::SignInStart(_)
-        | R::SignInSubmitCode(_)
-        | R::SignInCancel(_)
-        | R::WorkerToolsCheck(_)
-        | R::WorkerToolInstall(_)
-        | R::AcpRegistryList(_) => Err(HubError::Api(ErrorBody::not_built(request_type))),
+        R::AccountCreate(r) => to_value(&hub.account_create(caller, r).await?),
+        R::AccountUpdate(r) => to_value(&hub.account_update(caller, r).await?),
+        R::AccountRemove(r) => to_value(&hub.account_remove(caller, r).await?),
+        R::AccountSignOut(r) => to_value(&hub.account_sign_out(caller, r).await?),
+        R::SignInStart(r) => to_value(&hub.sign_in_start(caller, r).await?),
+        R::SignInSubmitCode(r) => to_value(&hub.sign_in_submit_code(caller, r).await?),
+        R::SignInCancel(r) => to_value(&hub.sign_in_cancel(caller, r).await?),
+        R::WorkerToolsCheck(r) => to_value(&hub.worker_tools_check(caller, r).await?),
+        R::WorkerToolInstall(r) => to_value(&hub.worker_tool_install(caller, r).await?),
+        R::AcpRegistryList(r) => to_value(&hub.acp_registry_list(caller, r).await?),
         R::Hello(_) | R::SyncSnapshot(_) | R::SyncSubscribe(_) | R::AuthHttpToken(_) => Err(
             HubError::invalid("This request belongs to the connection and cannot be routed."),
         ),

@@ -34,7 +34,9 @@ enum Command {
         #[command(subcommand)]
         command: WorkerCommand,
     },
-    /// Run a hub and a worker in one process, for development.
+    /// Run a hub and a worker in one process, for development. The worker
+    /// keeps its profile folders and managed tools in <data>/home, unless
+    /// CONSORT_HOME is set.
     Dev(DevArgs),
     /// Bridge stdio to a session's local MCP endpoint. The token comes from
     /// CONSORT_MCP_TOKEN.
@@ -462,11 +464,9 @@ async fn run_hub(args: HubArgs) -> Result<()> {
 }
 
 async fn run_worker(config_dir: PathBuf) -> Result<()> {
-    let worker = consort_worker::run(WorkerConfig {
-        config_dir: config_dir.clone(),
-    })
-    .await
-    .with_context(|| format!("could not start the worker in {}", config_dir.display()))?;
+    let worker = consort_worker::run(WorkerConfig::new(config_dir.clone()))
+        .await
+        .with_context(|| format!("could not start the worker in {}", config_dir.display()))?;
     println!("Worker {} runs. Press Ctrl-C to stop.", worker.worker_id());
     wait_for_stop().await;
     worker.shutdown().await?;
@@ -501,6 +501,15 @@ async fn pair_dev_worker(hub: &consort_hub::HubHandle, dir: &Path) -> Result<()>
     Ok(())
 }
 
+/// The Consort home of `consort dev`: `CONSORT_HOME` when it is set, else
+/// `<data>/home`, so a dev run keeps its profiles and tools apart from the
+/// user's own `~/.consort`.
+fn dev_consort_home(data: &Path, env: Option<std::ffi::OsString>) -> PathBuf {
+    env.filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| data.join("home"))
+}
+
 async fn run_dev(args: DevArgs) -> Result<()> {
     let hub = consort_hub::serve(consort_hub::HubConfig {
         data_dir: args.data.clone(),
@@ -511,8 +520,11 @@ async fn run_dev(args: DevArgs) -> Result<()> {
     .context("could not start the hub")?;
     let worker_dir = args.data.join("worker");
     pair_dev_worker(&hub, &worker_dir).await?;
+    let consort_home = dev_consort_home(&args.data, std::env::var_os("CONSORT_HOME"));
     let worker = consort_worker::run(WorkerConfig {
         config_dir: worker_dir.clone(),
+        consort_home: Some(consort_home.clone()),
+        check_tool_updates: true,
     })
     .await?;
     if !worker.wait_connected(Duration::from_secs(10)).await {
@@ -530,6 +542,10 @@ async fn run_dev(args: DevArgs) -> Result<()> {
         "Worker {} (tag `hub`) uses {}.",
         worker.worker_id(),
         worker_dir.display()
+    );
+    println!(
+        "Profile folders and managed tools are in {}.",
+        consort_home.display()
     );
     println!("Press Ctrl-C to stop.");
     wait_for_stop().await;
@@ -669,6 +685,21 @@ mod tests {
         assert!(
             Cli::try_parse_from(["consort", "dev"]).is_err(),
             "dev needs --data"
+        );
+    }
+
+    #[test]
+    fn dev_uses_a_home_inside_the_data_folder() {
+        let data = Path::new("/tmp/dev-data");
+        assert_eq!(dev_consort_home(data, None), data.join("home"));
+        assert_eq!(
+            dev_consort_home(data, Some("".into())),
+            data.join("home"),
+            "an empty variable counts as not set"
+        );
+        assert_eq!(
+            dev_consort_home(data, Some("/custom".into())),
+            PathBuf::from("/custom")
         );
     }
 

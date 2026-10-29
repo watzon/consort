@@ -1,6 +1,6 @@
 //! Periodic work: due tasks, revokes from the hub machine, the feed
 //! retention, stuck coordinator turns, quiet task turns and expired
-//! commands.
+//! commands and idle sign-ins.
 
 use std::time::Duration;
 
@@ -12,6 +12,9 @@ const STUCK_TURN_MS: i64 = 2 * 60 * 60 * 1000;
 /// How often, in seconds, the hub reads the revokes that a command on the
 /// hub machine wrote.
 const REVOKE_CHECK_TICKS: u64 = 2;
+
+/// How often, in seconds, the hub ends the sign-ins that got no update.
+const SIGN_IN_CHECK_TICKS: u64 = 5;
 
 pub(crate) fn spawn(hub: &Hub) -> JoinHandle<()> {
     let hub = hub.clone();
@@ -34,6 +37,11 @@ pub(crate) fn spawn(hub: &Hub) -> JoinHandle<()> {
                 && let Err(err) = hub.apply_revokes_from_disk().await
             {
                 tracing::warn!(error = %err, "could not check for removed clients and workers");
+            }
+            if ticks.is_multiple_of(SIGN_IN_CHECK_TICKS)
+                && let Err(err) = hub.expire_sign_ins().await
+            {
+                tracing::warn!(error = %err, "could not expire sign-ins");
             }
             if ticks.is_multiple_of(60) {
                 if let Err(err) = hub.expire_stuck_turns(STUCK_TURN_MS).await {

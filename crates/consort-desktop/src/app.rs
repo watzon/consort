@@ -103,6 +103,52 @@ pub enum Dialog {
     ConfirmRemoveWorker(String),
     /// A link whose words do not match its address: the address to show.
     ConfirmOpenLink(String),
+    /// Add account, for a worker. The form is in `ConsortApp::add_account`.
+    AddAccount(String),
+    /// Rename an account: the worker ID and the account ID.
+    RenameAccount(String, String),
+    /// Remove an account: the worker ID and the account ID.
+    ConfirmRemoveAccount(String, String),
+    /// The worker tags of a channel.
+    ChannelTags(String),
+}
+
+/// The step of the Add account dialog.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AccountStep {
+    #[default]
+    Provider,
+    Name,
+    SignIn,
+}
+
+/// The provider that the Add account dialog makes an account of.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProviderPick {
+    /// A built-in harness: `claude`, `codex`, `opencode` or `gemini`.
+    Builtin(&'static str),
+    /// An agent from the ACP registry.
+    Registry { id: String, name: String },
+    /// A program that the user names.
+    Command,
+}
+
+/// The state of the Add account dialog that is not in text inputs.
+#[derive(Clone, Debug, Default)]
+pub struct AddAccountForm {
+    pub worker_id: String,
+    pub step: AccountStep,
+    pub provider: Option<ProviderPick>,
+    /// The account, once `account.create` made it.
+    pub account_id: Option<String>,
+    /// The chosen sign-in method, as an index into the account's methods.
+    pub method: usize,
+    /// The running or last sign-in of this dialog.
+    pub sign_in_id: Option<String>,
+    /// An API key was saved in this dialog.
+    pub key_saved: bool,
+    /// The dialog has started the sign-in of the account once, or tried to.
+    pub auto_started: bool,
 }
 
 /// The fields of the New channel dialog that are not text inputs.
@@ -113,8 +159,11 @@ pub struct NewChannelForm {
     /// `group_name` input.
     pub new_group: bool,
     pub workers: Vec<String>,
+    /// The key of the chosen selection (see `SelectionView::key`).
     pub selection: Option<String>,
     pub isolation: Isolation,
+    /// The worker tags that the channel requires.
+    pub tags: Vec<String>,
 }
 
 /// The onboarding form state.
@@ -138,6 +187,19 @@ pub struct Inputs {
     pub setup_code: Entity<InputState>,
     /// The name of a new group in the New channel dialog.
     pub group_name: Entity<InputState>,
+    /// The search of the ACP registry in the Add account dialog.
+    pub agent_search: Entity<InputState>,
+    /// The program and the arguments of a custom command.
+    pub program: Entity<InputState>,
+    pub program_args: Entity<InputState>,
+    /// The name of a new account.
+    pub account_name: Entity<InputState>,
+    /// The code that a sign-in page shows.
+    pub sign_in_code: Entity<InputState>,
+    /// An API key. The field masks it.
+    pub api_key: Entity<InputState>,
+    /// A new tag for a worker.
+    pub tag: Entity<InputState>,
 }
 
 /// What the Enter key does in the open dialog, as the last render set it.
@@ -167,6 +229,13 @@ pub struct ConsortApp {
     /// The IDs of the refused messages that a notice already showed.
     announced_failures: std::collections::HashSet<String>,
     pub new_channel: NewChannelForm,
+    /// The tags in the open Worker tags dialog of a channel.
+    pub channel_tags: Vec<String>,
+    pub add_account: AddAccountForm,
+    /// The worker whose Add tag field is open.
+    pub tag_entry: Option<String>,
+    /// Why the hub refused the last tag: the worker ID and the message.
+    pub tag_error: Option<(String, String)>,
     pub add_worker_os: Os,
     pub decision_writing: Option<String>,
     pub activity_open: Vec<String>,
@@ -276,6 +345,17 @@ impl ConsortApp {
             search: field("Go to a channel or a task", window, cx),
             setup_code: field("ABCD-EFGH", window, cx),
             group_name: field("Name of the new group", window, cx),
+            agent_search: field("Search agents", window, cx),
+            program: field("Program, such as my-agent", window, cx),
+            program_args: field("Arguments, such as --acp", window, cx),
+            account_name: field("Personal or Work", window, cx),
+            sign_in_code: field("Paste code", window, cx),
+            api_key: cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("Paste the key")
+                    .masked(true)
+            }),
+            tag: field("New tag", window, cx),
         };
         let mut subscriptions = Vec::new();
         subscriptions.push(cx.subscribe_in(
@@ -316,6 +396,11 @@ impl ConsortApp {
             &inputs.group_name,
             &inputs.hub_url,
             &inputs.setup_code,
+            &inputs.program,
+            &inputs.program_args,
+            &inputs.account_name,
+            &inputs.sign_in_code,
+            &inputs.api_key,
         ] {
             subscriptions.push(cx.subscribe_in(
                 field,
@@ -323,6 +408,31 @@ impl ConsortApp {
                 |this, _, event: &InputEvent, window, cx| {
                     if let InputEvent::PressEnter { .. } = event {
                         this.submit_on_enter(window, cx);
+                    }
+                },
+            ));
+        }
+        // Enter in the tag field adds the tag. A change hides an old error
+        // and filters the completions.
+        subscriptions.push(cx.subscribe_in(
+            &inputs.tag,
+            window,
+            |this, _, event: &InputEvent, window, cx| match event {
+                InputEvent::PressEnter { .. } => this.add_worker_tag(None, window, cx),
+                InputEvent::Change => {
+                    this.tag_error = None;
+                    cx.notify();
+                }
+                _ => {}
+            },
+        ));
+        for field in [&inputs.agent_search, &inputs.account_name] {
+            subscriptions.push(cx.subscribe_in(
+                field,
+                window,
+                |_, _, event: &InputEvent, _, cx| {
+                    if let InputEvent::Change = event {
+                        cx.notify();
                     }
                 },
             ));
@@ -415,6 +525,10 @@ impl ConsortApp {
             notices: Notices::default(),
             announced_failures: std::collections::HashSet::new(),
             new_channel: NewChannelForm::default(),
+            channel_tags: Vec::new(),
+            add_account: AddAccountForm::default(),
+            tag_entry: None,
+            tag_error: None,
             add_worker_os: Os::Linux,
             decision_writing: None,
             activity_open: Vec::new(),
@@ -505,6 +619,13 @@ impl ConsortApp {
             &self.inputs.setup_code,
             &self.inputs.search,
             &self.inputs.group_name,
+            &self.inputs.agent_search,
+            &self.inputs.program,
+            &self.inputs.program_args,
+            &self.inputs.account_name,
+            &self.inputs.sign_in_code,
+            &self.inputs.api_key,
+            &self.inputs.tag,
         ] {
             let style = style.clone();
             field.update(cx, |s, cx| {
@@ -954,6 +1075,63 @@ impl ConsortApp {
             }
             "settings" => self.open_settings(SettingsSection::Appearance, cx),
             "workers" => self.open_settings(SettingsSection::Workers, cx),
+            // The Add account dialog on bigboi: the provider step, the name
+            // step with a name used on other workers, and the Claude sign-in
+            // that waits for its code.
+            "add-account" | "add-account-name" | "sign-in" => {
+                self.open_settings(SettingsSection::Workers, cx);
+                // The registry must be there before the first frame.
+                let _ = self
+                    .client
+                    .run_blocking(consort_client::Command::LoadAcpRegistry);
+                self.state = self.client.state();
+                let worker = self.settings_worker.clone().unwrap_or_default();
+                match screen {
+                    "add-account" => {
+                        self.open_dialog(Dialog::AddAccount(worker), window, cx);
+                    }
+                    "add-account-name" => {
+                        self.open_dialog(Dialog::AddAccount(worker), window, cx);
+                        self.add_account.step = AccountStep::Name;
+                        self.inputs.account_name.update(cx, |input, cx| {
+                            input.set_value("Claude Work", window, cx);
+                            input.focus(window, cx);
+                        });
+                    }
+                    _ => {
+                        let account = self
+                            .state
+                            .worker(&worker)
+                            .and_then(|w| w.accounts.iter().find(|a| a.label == "Claude Work"))
+                            .map(|a| a.id.clone())
+                            .unwrap_or_default();
+                        self.open_dialog(Dialog::AddAccount(worker.clone()), window, cx);
+                        self.add_account.step = AccountStep::SignIn;
+                        self.add_account.account_id = Some(account.clone());
+                        self.add_account.auto_started = true;
+                        let started =
+                            self.client
+                                .run_blocking(consort_client::Command::StartSignIn {
+                                    worker_id: worker,
+                                    account_id: account,
+                                    method: consort_client::SignInChoice::ClaudePlan,
+                                });
+                        if let Ok(consort_client::CommandOutput::SignInStarted(id)) = started {
+                            self.add_account.sign_in_id = Some(id);
+                        }
+                        self.state = self.client.state();
+                        self.inputs
+                            .sign_in_code
+                            .update(cx, |input, cx| input.focus(window, cx));
+                    }
+                }
+            }
+            "channel-tags" => {
+                if let Some(id) = sayso.clone() {
+                    self.open_channel(id.clone(), window, cx);
+                    self.open_dialog(Dialog::ChannelTags(id), window, cx);
+                }
+            }
             "add-worker" | "worker-added" => {
                 self.open_settings(SettingsSection::Workers, cx);
                 // The window draws its first frame from this state, so the
@@ -992,6 +1170,7 @@ impl ConsortApp {
                     .rev()
                     .map(|w| w.id.clone())
                     .collect();
+                self.new_channel.tags = vec!["personal".to_owned()];
             }
             "onboarding" => self.page = Page::Onboarding,
             "edit" => {
@@ -1032,6 +1211,7 @@ impl ConsortApp {
                     let items = vec![
                         MenuItem::new("Rename", MenuAction::RenameChannel(id.clone())),
                         MenuItem::new("Instructions", MenuAction::ChannelInstructions(id.clone())),
+                        MenuItem::new("Worker tags", MenuAction::ChannelTags(id.clone())),
                         MenuItem::new("Change icon", MenuAction::ChangeIcon(id.clone())),
                         MenuItem::new("Move to group", MenuAction::MoveToGroup(id.clone())),
                         MenuItem::new("Archive", MenuAction::ArchiveChannel(id.clone()))
@@ -1241,6 +1421,13 @@ impl ConsortApp {
                 Connection::Connecting | Connection::Offline { .. }
             )
             || self.dialog == Some(Dialog::AddWorker)
+            || matches!(self.dialog, Some(Dialog::AddAccount(_)))
+            || self
+                .state
+                .workers
+                .iter()
+                .flat_map(|w| w.tools.iter())
+                .any(|t| t.state == consort_client::ToolState::Installing)
     }
 
     /// Starts the timer that turns the Working glyphs. The glyphs turn in
@@ -1322,6 +1509,9 @@ impl ConsortApp {
     pub fn open_settings(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
         self.page = Page::Settings;
         self.settings_section = section;
+        if section == SettingsSection::Workers {
+            self.load_registry_for_logos(cx);
+        }
         if self.settings_worker.is_none() {
             self.settings_worker = self
                 .state
@@ -1334,6 +1524,29 @@ impl ConsortApp {
         cx.notify();
     }
 
+    /// Loads the ACP registry once, when an account of a registry agent
+    /// needs its logo. The client does nothing when it has the registry.
+    pub fn load_registry_for_logos(&mut self, cx: &mut Context<Self>) {
+        let needed = self
+            .state
+            .workers
+            .iter()
+            .flat_map(|w| w.accounts.iter())
+            .any(|a| {
+                matches!(
+                    a.logo,
+                    consort_client::ProviderLogo::Registry { svg: None, .. }
+                )
+            });
+        if needed && self.state.acp_registry.load == consort_client::RegistryLoad::NotLoaded {
+            let client = self.client.clone();
+            cx.spawn(async move |_, _| {
+                let _ = client.load_acp_registry().await;
+            })
+            .detach();
+        }
+    }
+
     pub fn open_dialog(&mut self, dialog: Dialog, window: &mut Window, cx: &mut Context<Self>) {
         self.menu = None;
         self.dialog_error = None;
@@ -1344,8 +1557,9 @@ impl ConsortApp {
                     group_id: self.state.groups.first().map(|g| g.id.clone()),
                     new_group: false,
                     workers: Vec::new(),
-                    selection: self.state.selections.first().cloned(),
+                    selection: self.state.selections.first().map(|s| s.key()),
                     isolation: Isolation::Worktree,
+                    tags: Vec::new(),
                 };
                 self.set_field(Field::Name, "", window, cx);
                 self.set_field(Field::Purpose, "", window, cx);
@@ -1417,8 +1631,45 @@ impl ConsortApp {
                 })
                 .detach();
             }
+            Dialog::AddAccount(worker_id) => {
+                self.add_account = AddAccountForm {
+                    worker_id: worker_id.clone(),
+                    provider: Some(ProviderPick::Builtin("claude")),
+                    ..AddAccountForm::default()
+                };
+                for input in [
+                    &self.inputs.agent_search,
+                    &self.inputs.program,
+                    &self.inputs.program_args,
+                    &self.inputs.account_name,
+                    &self.inputs.sign_in_code,
+                    &self.inputs.api_key,
+                ] {
+                    input.update(cx, |input, cx| input.set_value("", window, cx));
+                }
+                let client = self.client.clone();
+                self.spawn_command(cx, async move { client.load_acp_registry().await });
+            }
+            Dialog::RenameAccount(worker_id, account_id) => {
+                let name = self
+                    .state
+                    .worker(worker_id)
+                    .and_then(|w| w.account(account_id))
+                    .map(|a| a.label.clone())
+                    .unwrap_or_default();
+                self.set_field(Field::Name, &name, window, cx);
+                focus_input(&self.inputs.name, window, cx);
+            }
+            Dialog::ChannelTags(id) => {
+                self.channel_tags = self
+                    .state
+                    .channel(id)
+                    .map(|c| c.tags.clone())
+                    .unwrap_or_default();
+            }
             Dialog::ConfirmDeleteChannel(_)
             | Dialog::ConfirmRemoveWorker(_)
+            | Dialog::ConfirmRemoveAccount(..)
             | Dialog::ConfirmOpenLink(_) => {}
         }
         self.dialog = Some(dialog);
@@ -1426,6 +1677,9 @@ impl ConsortApp {
     }
 
     pub fn close_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(self.dialog, Some(Dialog::AddAccount(_))) {
+            self.end_add_account(cx);
+        }
         if self.dialog == Some(Dialog::AddWorker) {
             let client = self.client.clone();
             self.spawn_command(cx, async move {
@@ -1932,6 +2186,19 @@ impl ConsortApp {
             MenuAction::RemoveWorker(id) => {
                 self.open_dialog(Dialog::ConfirmRemoveWorker(id), window, cx)
             }
+            MenuAction::ChannelTags(id) => self.open_dialog(Dialog::ChannelTags(id), window, cx),
+            MenuAction::RenameAccount(worker_id, account_id) => {
+                self.open_dialog(Dialog::RenameAccount(worker_id, account_id), window, cx)
+            }
+            MenuAction::SignOutAccount(worker_id, account_id) => self
+                .spawn_command(cx, async move {
+                    client.sign_out_account(worker_id, account_id).await
+                }),
+            MenuAction::RemoveAccount(worker_id, account_id) => self.open_dialog(
+                Dialog::ConfirmRemoveAccount(worker_id, account_id),
+                window,
+                cx,
+            ),
             MenuAction::TextEdit(target, op) => self.text_edit(target, op, window, cx),
             MenuAction::Select(id, option) => self.pick_select(id, &option, window, cx),
         }

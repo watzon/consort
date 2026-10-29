@@ -24,14 +24,18 @@ use std::sync::Arc;
 
 use tokio::sync::{mpsc, oneshot, watch};
 
-pub use command::{ChannelChanges, Command, NewChannel};
+pub use command::{
+    AcpSpec, ChannelChanges, Command, CommandOutput, NewAccount, NewChannel, SecretEnv, SecretText,
+};
 pub use error::ClientError;
 pub use store::Drafts;
 pub use view::*;
 
+pub(crate) type Reply = oneshot::Sender<Result<CommandOutput, ClientError>>;
+
 struct Request {
     command: Command,
-    reply: oneshot::Sender<Result<(), ClientError>>,
+    reply: Reply,
 }
 
 /// A handle to the client. Cheap to clone. The background runtime stops when
@@ -86,12 +90,7 @@ impl Subscription {
 /// result on `reply` when it is done, so one slow command never holds up the
 /// next one.
 trait Backend: Send + 'static {
-    fn handle(
-        &mut self,
-        command: Command,
-        reply: oneshot::Sender<Result<(), ClientError>>,
-        publish: &watch::Sender<Arc<ViewState>>,
-    );
+    fn handle(&mut self, command: Command, reply: Reply, publish: &watch::Sender<Arc<ViewState>>);
 }
 
 fn spawn_runtime<F, Fut>(name: &str, run: F) -> Result<RuntimeThread, ClientError>
@@ -208,6 +207,12 @@ impl Client {
 
     /// Sends one command and waits for the backend to finish it.
     pub async fn run(&self, command: Command) -> Result<(), ClientError> {
+        self.run_for(command).await.map(|_| ())
+    }
+
+    /// Sends one command, waits for the backend to finish it, and gives
+    /// back what it made.
+    pub async fn run_for(&self, command: Command) -> Result<CommandOutput, ClientError> {
         let (reply, rx) = oneshot::channel();
         self.requests
             .send(Request { command, reply })
@@ -218,7 +223,7 @@ impl Client {
     /// Sends one command and blocks the calling thread until it is done. For
     /// start-up work before a UI loop runs; never call it on a UI thread that
     /// is drawing.
-    pub fn run_blocking(&self, command: Command) -> Result<(), ClientError> {
+    pub fn run_blocking(&self, command: Command) -> Result<CommandOutput, ClientError> {
         let (reply, rx) = oneshot::channel();
         self.requests
             .send(Request { command, reply })
@@ -403,6 +408,126 @@ impl Client {
         tags: Vec<String>,
     ) -> Result<(), ClientError> {
         self.run(Command::SetWorkerTags { worker_id, tags }).await
+    }
+
+    /// Makes an account on a worker and returns its ID.
+    pub async fn create_account(&self, account: NewAccount) -> Result<String, ClientError> {
+        match self.run_for(Command::CreateAccount(account)).await? {
+            CommandOutput::AccountCreated(id) => Ok(id),
+            _ => Err(ClientError::Other(
+                "The hub did not say which account it made. Open Settings > Workers to find it"
+                    .into(),
+            )),
+        }
+    }
+
+    /// Renames an account. The new name must not be empty.
+    pub async fn rename_account(
+        &self,
+        worker_id: String,
+        account_id: String,
+        label: String,
+    ) -> Result<(), ClientError> {
+        self.run(Command::UpdateAccount {
+            worker_id,
+            account_id,
+            label: Some(label),
+            env_set: SecretEnv::new(),
+            env_remove: Vec::new(),
+        })
+        .await
+    }
+
+    /// Saves secret variables, such as an API key, for an account.
+    pub async fn set_account_secrets(
+        &self,
+        worker_id: String,
+        account_id: String,
+        env_set: SecretEnv,
+    ) -> Result<(), ClientError> {
+        self.run(Command::UpdateAccount {
+            worker_id,
+            account_id,
+            label: None,
+            env_set,
+            env_remove: Vec::new(),
+        })
+        .await
+    }
+
+    pub async fn remove_account(
+        &self,
+        worker_id: String,
+        account_id: String,
+    ) -> Result<(), ClientError> {
+        self.run(Command::RemoveAccount {
+            worker_id,
+            account_id,
+        })
+        .await
+    }
+
+    pub async fn sign_out_account(
+        &self,
+        worker_id: String,
+        account_id: String,
+    ) -> Result<(), ClientError> {
+        self.run(Command::SignOutAccount {
+            worker_id,
+            account_id,
+        })
+        .await
+    }
+
+    /// Starts a sign-in and returns its ID. Its steps show in
+    /// [`ViewState::sign_ins`].
+    pub async fn start_sign_in(
+        &self,
+        worker_id: String,
+        account_id: String,
+        method: SignInChoice,
+    ) -> Result<String, ClientError> {
+        match self
+            .run_for(Command::StartSignIn {
+                worker_id,
+                account_id,
+                method,
+            })
+            .await?
+        {
+            CommandOutput::SignInStarted(id) => Ok(id),
+            _ => Err(ClientError::Other(
+                "The hub did not start the sign-in. Try again".into(),
+            )),
+        }
+    }
+
+    pub async fn submit_sign_in_code(
+        &self,
+        sign_in_id: String,
+        code: String,
+    ) -> Result<(), ClientError> {
+        self.run(Command::SubmitSignInCode {
+            sign_in_id,
+            code: SecretText(code),
+        })
+        .await
+    }
+
+    pub async fn cancel_sign_in(&self, sign_in_id: String) -> Result<(), ClientError> {
+        self.run(Command::CancelSignIn { sign_in_id }).await
+    }
+
+    pub async fn check_tools(&self, worker_id: String) -> Result<(), ClientError> {
+        self.run(Command::CheckTools { worker_id }).await
+    }
+
+    pub async fn install_tool(&self, worker_id: String, tool: String) -> Result<(), ClientError> {
+        self.run(Command::InstallTool { worker_id, tool }).await
+    }
+
+    pub async fn load_acp_registry(&self) -> Result<(), ClientError> {
+        self.run(Command::LoadAcpRegistry).await
     }
 }
 

@@ -68,17 +68,19 @@ In the UI a harness is a **provider**, and a harness account is an **account**. 
 
 ### Profile folders
 
-Each account that Consort makes has its own profile folder, `<consort home>/profiles/<account id>/`. The worker writes it to `worker.toml` as `{ id, harness, label, profile = true }`, plus `acp` for an ACP agent. The profile folder holds the harness's own config and login, and `env.json` with the account's secret variables. The worker derives each harness's home settings from the profile folder:
+Each account that Consort makes has its own profile folder, `<consort home>/profiles/<name>/`. The name comes from the account name when the worker makes the account: lowercase, each run of characters other than `a` to `z` and `0` to `9` as one `-`, no `-` at either end, at most 48 characters, `account` when nothing is left, and `-2`, `-3` and so on when the name is taken. The worker writes the account to `worker.toml` as `{ id, harness, label, profile = true, profile_dir = "<name>" }`, plus `acp` for an ACP agent, so a rename does not move the folder. The Consort home is `~/.consort` (`%USERPROFILE%\.consort` on Windows), or `CONSORT_HOME`. `consort dev` uses `<data>/home` unless `CONSORT_HOME` is set. The profile folder holds the harness's own config and login, and `env.json` with the account's secret variables. The worker derives each harness's home settings from the profile folder:
 
 | Harness | Settings |
 |---|---|
 | Claude Code | `CLAUDE_CONFIG_DIR=<profile>/claude` |
-| Codex | `CODEX_HOME=<profile>/codex`, with `cli_auth_credentials_store = "file"` |
-| Gemini CLI | `GEMINI_CLI_HOME=<profile>/gemini` |
+| Codex | `CODEX_HOME=<profile>/codex`. Its `config.toml` gets `cli_auth_credentials_store = "file"` and `check_for_update_on_startup = false` |
+| Gemini CLI | `GEMINI_CLI_HOME=<profile>/gemini`. Gemini CLI reads `$GEMINI_CLI_HOME/.gemini/settings.json`, which gets `general.enableAutoUpdate: false` |
 | OpenCode | `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME` and `XDG_CACHE_HOME` under `<profile>/xdg/` |
 | ACP agents | `HOME` stays as it is. Only the env is set |
 
-The worker merges `env.json` into the session env after the profile variables. It writes `env.json` with mode 0600 on Unix. The inventory reports the variable names (`secret_names`), never the values.
+The worker merges `env.json` into the session env after the profile variables. It writes `env.json` with mode 0600 on Unix. The inventory reports the variable names (`secret_names`), never the values. The process of a profile account does not get the login variables of the worker's own environment (such as `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `CLAUDE_CONFIG_DIR` and `CODEX_HOME`), so it never uses a login that the machine already has.
+
+In the inventory, an ACP registry agent has the harness `acp:<registry id>`, so a client can show the registry icon. A custom ACP command has `acp:custom`. An `acp` account from `worker.toml` stays `acp`. A new worker has no accounts. The `auto_discover` key of older `worker.toml` files still reads, and the worker ignores it.
 
 ### Accounts in worker.toml
 
@@ -102,15 +104,17 @@ The user signs in from a client, through the harness's own sign-in flow on the w
 
 | Method | How the worker runs it |
 |---|---|
-| `claude_plan`, `claude_console` | The managed `claude auth login --claudeai` (or `--console`) in a pseudo-terminal with the profile env, `DISABLE_AUTOUPDATER=1`, and a `BROWSER` setting that keeps it from opening a browser on the worker. The worker sends `needs_code` with the URL, then writes the code from `sign_in.code` and a newline. Success is exit code 0 and `loggedIn` from `claude auth status --json` |
-| `chatgpt_device`, `chatgpt_browser` | `codex app-server` with the profile `CODEX_HOME`, then `account/login/start` with `chatgptDeviceCode` (`device_code`) or `chatgpt` (`open_url`), and a wait for `account/login/completed`. One browser sign-in per worker at a time, because the callback port is fixed |
-| `api_key` | No flow. The key arrives in `env`. The probe checks it |
+| `claude_plan`, `claude_console` | The managed `claude auth login --claudeai` (or `--console`) in a pseudo-terminal (`portable-pty`, ConPTY on Windows) with the profile env and `DISABLE_AUTOUPDATER=1`. `BROWSER` is a program that does nothing (`true` on Unix, `where.exe` on Windows): Claude Code runs `$BROWSER <url>`, so no browser opens on the worker. The worker strips the terminal codes from the output and sends `needs_code` with the first `https://` URL. It types the code from `sign_in.code` and Enter. Success is exit code 0 and `loggedIn` from `claude auth status --json`. A wrong code makes Claude Code exit with "Login failed: ...", and the sign-in fails with that line. Tested with Claude Code 2.1.312 on macOS |
+| `chatgpt_device`, `chatgpt_browser` | `codex app-server` with the profile `CODEX_HOME`, then `account/login/start` with `chatgptDeviceCode` (`device_code` with `verificationUrl` and `userCode`) or `chatgpt` (`open_url` with `authUrl`), and a wait for the `account/login/completed` of that `loginId`. Cancel calls `account/login/cancel`. One browser sign-in per worker at a time, because the callback port is fixed |
+| `api_key` | No flow of the harness. The key arrives in `env` of `account.create` or `env_set` of `account.update`, before or after `sign_in.start`. The sign-in waits for the key, then probes the account. Codex does not read `OPENAI_API_KEY` from its environment for its account (codex-cli 0.165.0), so for Codex the worker also stores the key with `account/login/start` `apiKey` |
 | `acp_agent` | `authenticate` with the method ID, on a short-lived agent process with the profile env |
 | `terminal` | The client shows the command. The user runs it on the worker |
 
-Sign out: Claude runs `claude auth logout`. Codex calls `account/logout`. An API key account deletes the key from `env.json`. An ACP agent calls `logout` if the agent has it. `account.remove` signs out where it can and deletes the profile folder.
+Sign out: Claude runs `claude auth logout`. Codex calls `account/logout`. An API key account deletes the key from `env.json`. An ACP agent calls `logout` if the agent has it (`agentCapabilities.auth.logout`). `account.remove` stops the sessions of the account (they end as `lost` with `account_removed`), signs out where it can, and deletes the profile folder.
 
-For Claude, the probe uses `claude auth status --json` (email, plan, expired) before the ACP probe, and the inventory reports `email` and `plan`.
+For Claude, the probe uses `claude auth status --json` (`loggedIn`, `authMethod`, `email`, `subscriptionType`) before the ACP probe, and the inventory reports `email` and `plan`. When `loggedIn` is false, the account is signed out and the ACP probe does not run. Claude Code 2.1.312 reports no expiry. For Codex, `account/read` gives the email and the plan. For an ACP agent, the probe turns the `authMethods` of `initialize` into `sign_in_methods`: a method with no `type` or `type: "agent"` is `acp_agent`, `terminal` is `terminal` with the agent's command and the method's `args`, and `env_var` is `api_key`. The worker offers sign-in methods only for profile accounts.
+
+Two `codex app-server` processes that start at the same time on a new, empty `CODEX_HOME` can fail with "failed to initialize sqlite state runtime" (codex-cli 0.165.0). The adapter tries again, at most three times.
 
 ## How each path gives a session the hub tools
 
@@ -251,7 +255,7 @@ Each worker downloads and updates its own copy of each harness CLI, as a managed
 | `gemini-cli` | npm, with the managed Node | npm | `node .../bundle/gemini.js --acp` |
 | `acp:<id>` | An ACP registry agent: `binary` with a SHA-256, or `npx` | SHA-256. A `binary` without one is refused. `uvx` is not supported | From the registry |
 
-An install goes to a temporary folder next to the target, is checked, and is then renamed, so a failed install leaves nothing. The previous version stays until the new one is ready. The worker checks for updates once a day and on `tools.check`, and never updates a tool while a session uses it. Self-updates are off: `DISABLE_AUTOUPDATER=1` for Claude Code, `check_for_update_on_startup = false` for Codex, `OPENCODE_DISABLE_AUTOUPDATE=true` for OpenCode, and `general.enableAutoUpdate: false` for Gemini CLI. OpenCode version 2 is the supported line.
+An install goes to a temporary folder next to the target, is checked, and is then renamed, so a failed install leaves nothing. The previous version stays until the new one is ready. The worker checks for updates once a day and on `tools.check`, and reports them in the inventory. It installs an update only on `tools.install`. It never updates a tool while a session, a probe or a sign-in uses it, or uses a tool that needs it (Node for the npm tools, Claude Code for its ACP adapter): the install waits until the tool is idle, and the tool's `detail` says so. A missing tool installs when a session, a sign-in or a probe needs it. A session waits for the install, and a probe reports "Installing <tool>." and probes again when the install ends. An account with a `binary` in `worker.toml` runs that program and no managed tool. Self-updates are off: `DISABLE_AUTOUPDATER=1` for Claude Code, `check_for_update_on_startup = false` for Codex, `OPENCODE_DISABLE_AUTOUPDATE=true` for OpenCode, and `general.enableAutoUpdate: false` for Gemini CLI. OpenCode version 2 is the supported line.
 
 ## Tests
 

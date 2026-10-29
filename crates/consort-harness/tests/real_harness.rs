@@ -124,3 +124,68 @@ async fn opencode_turn() {
 async fn codex_turn() {
     one_turn(HarnessKind::Codex).await;
 }
+
+/// Runs the real `claude auth login --claudeai` in a pseudo-terminal with a
+/// new, empty `CLAUDE_CONFIG_DIR`, waits for the sign-in URL, and stops the
+/// process without a sign-in. Set `CONSORT_CLAUDE` to the `claude` program,
+/// or have `claude` on PATH. No browser opens: `BROWSER` is a no-op.
+#[tokio::test]
+#[ignore = "needs Claude Code and the network; no sign-in happens"]
+async fn claude_login_shows_a_url_and_waits_for_a_code() {
+    use consort_harness::signin::claude::{ClaudeCommand, ClaudeLogin, LoginKind};
+    let dir = tempfile::tempdir().unwrap();
+    let mut account = AccountConfig::default_for(HarnessKind::ClaudeCode);
+    account.profile = true;
+    account.runtime.env.insert(
+        "CLAUDE_CONFIG_DIR".into(),
+        dir.path().join("claude").to_string_lossy().into_owned(),
+    );
+    account.runtime.env_remove = consort_harness::account::LOGIN_VARIABLES
+        .iter()
+        .map(|v| (*v).to_owned())
+        .collect();
+    let mut command = ClaudeCommand::for_account(&account).unwrap();
+    if let Some(program) = std::env::var_os("CONSORT_CLAUDE") {
+        command.program = program.into();
+    }
+    let status = command.status().await.unwrap();
+    assert!(!status.logged_in, "a new folder has no login");
+    let mut login = ClaudeLogin::start(&command, LoginKind::Plan, dir.path()).unwrap();
+    let url = login.url(Duration::from_secs(60)).await.unwrap();
+    println!("sign-in URL: {}...", &url[..url.len().min(60)]);
+    assert!(url.starts_with("https://"), "{url}");
+    assert!(url.contains("oauth"), "{url}");
+    // It waits for the code: it has not exited after a few seconds.
+    let waited = login.wait(Duration::from_secs(3)).await;
+    assert!(waited.is_err(), "the login waits for a code: {waited:?}");
+    login.kill();
+}
+
+/// Starts a real ChatGPT sign-in by device code in a new, empty
+/// `CODEX_HOME`, checks that Codex gives a URL and a code, and cancels it.
+/// Then it signs out (nothing to sign out) and reads the account. Set
+/// `CONSORT_CODEX` to the `codex` program, or have `codex` on PATH.
+#[tokio::test]
+#[ignore = "needs Codex and the network; no sign-in happens"]
+async fn codex_device_code_sign_in_starts_and_cancels() {
+    use consort_harness::codex::login::{ChatgptLogin, ChatgptStep, logout, read_account};
+    let dir = tempfile::tempdir().unwrap();
+    let mut account = AccountConfig::default_for(HarnessKind::Codex);
+    account.profile = true;
+    account.binary = std::env::var("CONSORT_CODEX").ok();
+    account.runtime.env.insert(
+        "CODEX_HOME".into(),
+        dir.path().to_string_lossy().into_owned(),
+    );
+    let (login, step) = ChatgptLogin::start(&account, true).await.unwrap();
+    let ChatgptStep::DeviceCode { url, user_code } = step else {
+        panic!("{step:?}")
+    };
+    println!("device URL {url}, code length {}", user_code.len());
+    assert!(url.starts_with("https://"));
+    assert!(!user_code.is_empty());
+    login.cancel().await;
+    logout(&account).await.unwrap();
+    let info = read_account(&account).await.unwrap();
+    assert!(info.account.is_none());
+}

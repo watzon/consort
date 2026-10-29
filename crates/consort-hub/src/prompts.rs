@@ -54,6 +54,13 @@ fn channel_section(channel: &Channel, global: &str, own: &str) -> String {
     } else {
         let _ = writeln!(out, "Purpose: {}", channel.purpose.trim());
     }
+    if !channel.tags.is_empty() {
+        let _ = writeln!(
+            out,
+            "Worker tags: {}. All work in this channel (your turns, tasks and routines) runs only on workers that have every one of these tags. A task can ask for more tags in `require`, never for fewer.",
+            channel.tags.join(", ")
+        );
+    }
     if !channel.instructions.trim().is_empty() {
         let _ = writeln!(
             out,
@@ -207,6 +214,46 @@ mod tests {
         assert!(prompt.contains("Never push to main."));
         assert!(prompt.contains("- people/kevin.md: Kevin"));
         assert!(!prompt.contains('\u{2014}'));
+    }
+
+    #[test]
+    fn the_channel_information_lists_the_worker_tags() {
+        let mut tagged = channel();
+        tagged.tags = vec!["work".into(), "gpu".into()];
+        for prompt in [
+            coordinator_system_prompt(&tagged, "", ""),
+            task_system_prompt(&tagged, &task_for_prompt(), "", ""),
+        ] {
+            assert!(prompt.contains("Worker tags: work, gpu."), "{prompt}");
+            assert!(prompt.contains("every one of these tags"), "{prompt}");
+        }
+        // A channel without tags says nothing about them.
+        let plain = coordinator_system_prompt(&channel(), "", "");
+        assert!(!plain.contains("Worker tags"), "{plain}");
+    }
+
+    fn task_for_prompt() -> Task {
+        Task {
+            id: consort_proto::ids::TaskId::new(),
+            channel_id: ChannelId::new(),
+            title: "Build".into(),
+            brief: "Build it.".into(),
+            status: TaskStatus::Working,
+            status_reason: None,
+            created_by: consort_proto::model::TaskCreator::User,
+            card_message_id: MessageId::new(),
+            model_selection: None,
+            placement: consort_proto::model::PlacementRequest::default(),
+            approval_mode: ApprovalMode::Ask,
+            start_at: None,
+            current_session_id: None,
+            worker_id: None,
+            review_summary: None,
+            resolved_at: None,
+            archived_at: None,
+            created_at: Timestamp::EPOCH,
+            updated_at: Timestamp::EPOCH,
+        }
     }
 
     #[test]

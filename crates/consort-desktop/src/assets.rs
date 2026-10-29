@@ -1,12 +1,45 @@
-//! SVG assets in the binary: Lucide icons with a 1.5 px stroke at 16 px, and
-//! Consort's own glyphs from `design/glyphs`. GPUI Kit's icons are the
-//! fallback for its own components.
+//! SVG assets in the binary: Lucide icons with a 1.5 px stroke at 16 px,
+//! Consort's own glyphs from `design/glyphs`, and the provider logos. GPUI
+//! Kit's icons are the fallback for its own components.
+//!
+//! The icons of ACP registry agents are not in the binary. The client loads
+//! them, and the app puts each one here with [`remote_icon`] before it draws
+//! it, so GPUI loads it like any other asset.
 
-use std::borrow::Cow;
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    sync::{Arc, LazyLock, RwLock},
+};
 
 use gpui_kit::{AssetSource, SharedString};
 
-const FILES: [(&str, &[u8]); 47] = [
+/// The icons that the client loaded, by asset path.
+static REMOTE: LazyLock<RwLock<HashMap<String, Arc<[u8]>>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// The asset path of a registry agent's icon. It stores the SVG text the
+/// first time, so a draw can use the path at once.
+pub fn remote_icon(agent_id: &str, svg: &str) -> SharedString {
+    let safe: String = agent_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let path = format!("remote/acp-{safe}.svg");
+    let known = REMOTE.read().is_ok_and(|icons| icons.contains_key(&path));
+    if !known && let Ok(mut icons) = REMOTE.write() {
+        icons.insert(path.clone(), Arc::from(svg.as_bytes()));
+    }
+    path.into()
+}
+
+const FILES: [(&str, &[u8]); 55] = [
     (
         "icons/minus.svg",
         include_bytes!("../assets/icons/minus.svg"),
@@ -134,6 +167,35 @@ const FILES: [(&str, &[u8]); 47] = [
         include_bytes!("../assets/icons/terminal.svg"),
     ),
     ("icons/x.svg", include_bytes!("../assets/icons/x.svg")),
+    ("icons/bot.svg", include_bytes!("../assets/icons/bot.svg")),
+    (
+        "icons/external-link.svg",
+        include_bytes!("../assets/icons/external-link.svg"),
+    ),
+    (
+        "icons/folder.svg",
+        include_bytes!("../assets/icons/folder.svg"),
+    ),
+    (
+        "icons/terminal-square.svg",
+        include_bytes!("../assets/icons/terminal-square.svg"),
+    ),
+    (
+        "providers/claude-code.svg",
+        include_bytes!("../assets/providers/claude-code.svg"),
+    ),
+    (
+        "providers/codex.svg",
+        include_bytes!("../assets/providers/codex.svg"),
+    ),
+    (
+        "providers/gemini-cli.svg",
+        include_bytes!("../assets/providers/gemini-cli.svg"),
+    ),
+    (
+        "providers/opencode.svg",
+        include_bytes!("../assets/providers/opencode.svg"),
+    ),
     (
         "glyphs/brace.svg",
         include_bytes!("../assets/glyphs/brace.svg"),
@@ -183,6 +245,13 @@ impl AssetSource for Assets {
         if let Some((_, bytes)) = FILES.iter().find(|(p, _)| *p == path) {
             return Ok(Some(Cow::Borrowed(*bytes)));
         }
+        if let Some(bytes) = REMOTE
+            .read()
+            .ok()
+            .and_then(|icons| icons.get(path).cloned())
+        {
+            return Ok(Some(Cow::Owned(bytes.to_vec())));
+        }
         gpui_kit::assets::Assets.load(path)
     }
 
@@ -214,6 +283,16 @@ mod tests {
                 .ok()
                 .flatten()
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn a_registry_icon_loads_from_its_path() {
+        let path = remote_icon("amp/acp", "<svg></svg>");
+        assert_eq!(path.as_ref(), "remote/acp-amp_acp.svg");
+        assert_eq!(
+            Assets.load(&path).ok().flatten().as_deref(),
+            Some(b"<svg></svg>".as_slice())
         );
     }
 }

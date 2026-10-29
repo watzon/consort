@@ -41,6 +41,7 @@ pub mod knowledge;
 pub mod machine;
 pub mod migrations;
 pub mod routines;
+pub mod sign_ins;
 pub mod work;
 
 const READER_POOL_SIZE: usize = 8;

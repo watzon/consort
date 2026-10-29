@@ -11,6 +11,7 @@ pub const MIGRATIONS: &[&str] = &[
     include_str!("schema_v1.sql"),
     include_str!("schema_v2.sql"),
     include_str!("schema_v3.sql"),
+    include_str!("schema_v4.sql"),
 ];
 
 pub fn current_version() -> i64 {

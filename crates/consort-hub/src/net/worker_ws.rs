@@ -181,8 +181,9 @@ async fn run_worker(hub: Hub, mut socket: WebSocket, peer_ip: IpAddr) {
                     }
                 }
                 Ok(WorkerToHub::SignInUpdate(update)) => {
-                    // Sign-ins are not built yet (docs/ACCOUNTS-PLAN.md).
-                    tracing::debug!(sign_in_id = %update.sign_in_id, "a worker sent a sign-in update, which this hub ignores");
+                    if let Err(err) = hub.sign_in_update(worker_id, update).await {
+                        tracing::warn!(error = %err, "could not store a sign-in update");
+                    }
                 }
                 _ => {}
             },
@@ -246,9 +247,14 @@ async fn handle_request(
             .await;
             reply(link, &request, result);
         }
-        WorkerToHub::SignInUpdate(_) => {
-            link.outbox
-                .send_frame(&request.respond_error(ErrorBody::not_built("sign_in.update")));
+        WorkerToHub::SignInUpdate(update) => {
+            // `sign_in.update` is an event. A worker that sends it as a
+            // request gets an answer anyway.
+            let result = hub
+                .sign_in_update(worker_id, update)
+                .await
+                .map(|()| Empty {});
+            reply(link, &request, result);
         }
         WorkerToHub::ToolCall(call) => {
             // A tool call can take long, so it must not block other frames.

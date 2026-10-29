@@ -23,6 +23,11 @@ agent-client-protocol = { workspace = true }
 process-wrap = { workspace = true }
 tracing = { workspace = true }
 which = { workspace = true }
+# Types only: the tool IDs that the adapters launch.
+consort-tools = { workspace = true }
+# A pseudo-terminal for `claude auth login`. It also works with Windows
+# ConPTY. Pinned, because the crate changes its API between minor versions.
+portable-pty = "=0.9.0"
 
 # The creation flags for harness processes on Windows. `process-wrap` takes
 # this type, and pins the same version.

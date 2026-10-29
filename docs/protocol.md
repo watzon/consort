@@ -452,7 +452,13 @@ In `channel.update` and `task.update`, a field that is left out does not change.
 
 The `acp` of `account.create` has a `kind`: `registry` with `id`, or `command` with `program` and `args`. `acp_registry.list` reads the ACP registry (`https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json`), which the hub caches for one hour. An agent is `supported` when it has a distribution that the worker can install for at least one platform: `binary` with a SHA-256, or `npx`.
 
-Account, sign-in and tool requests fail with `worker_offline` when the worker is offline. Until the hub and the worker carry them out, they fail with `unsupported`.
+Account, sign-in and tool requests go straight to the worker. The hub answers with the result of the worker. A request for a worker that does not exist or was removed fails with `worker_unknown`. A request for a worker that is offline fails with `worker_offline`. The hub never queues these commands.
+
+The hub makes the `account_id` of `account.create` and sends it to the worker. It checks the label, the harness, the `acp` spec and the names of the variables before it asks the worker, and it fails with `invalid`. It maps a worker error to a client error: `invalid`, `not_found`, `conflict`, `policy_denied`, `no_matching_account`, `sign_in_failed`, `tool_install_failed` and `unsupported` pass through with the message of the worker. `unauthorized`, `protocol_mismatch`, `stale_write`, `resync_required`, `internal` and a code that the hub does not know become `sign_in_failed` for `sign_in.*`, `tool_install_failed` for `worker.tools_check` and `worker.tool_install`, and `internal` for the `account.*` requests. If an error message of the worker repeats a secret value of the request, the hub replaces the value with `<redacted>`.
+
+`sign_in.start` fails with `worker_offline` before the hub stores anything. If the worker refuses the command, the hub sets the sign-in to `failed` with the message of the worker, and returns the error. `sign_in.submit_code` works only while the sign-in is in `needs_code`, and fails with `conflict` in other states. `sign_in.cancel` asks the worker to stop, sets `cancelled`, and does nothing for a sign-in that has ended. A `sign_in.update` for an unknown sign-in, for a sign-in of another worker, or for a sign-in that has ended changes nothing.
+
+The hub ends a sign-in with `expired` when no update comes for 15 minutes (it checks every 5 seconds). When a worker disconnects, each of its sign-ins that has not ended becomes `failed` with "The worker went offline. Start the sign-in again." The hub deletes a sign-in one day after its last update.
 
 `task.retry` works for a Failed task, and for a task in Ready for review or Resolved whose session has ended. `task.reopen` (Not done) fails with `conflict` when archive deleted the workspace of the task. Retry is the way on then.
 

@@ -23,6 +23,7 @@ pub mod codex;
 mod items;
 pub mod process;
 pub mod record;
+pub mod signin;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -31,10 +32,12 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-pub use account::AccountConfig;
+pub use account::{AccountConfig, AccountRuntime};
 pub use consort_proto::ids::{NativeRef, RequestId, SessionId, TurnId};
+pub use consort_proto::model::SignInMethod;
 pub use consort_proto::model::{ApprovalMode, AuthState, Capabilities, ModelInfo, ModelOptions};
 pub use consort_proto::worker_link::{RequestAnswer as Answer, SessionEvent, TurnInput};
+pub use consort_tools::ToolId;
 pub use items::ItemTracker;
 
 /// How many events an adapter may buffer before it waits for the worker.
@@ -107,6 +110,18 @@ impl std::fmt::Display for HarnessKind {
     }
 }
 
+/// How to start a harness program: the program, its arguments, and the
+/// environment variables to add.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Launch {
+    /// The program.
+    pub program: PathBuf,
+    /// The arguments.
+    pub args: Vec<String>,
+    /// Extra environment variables.
+    pub env: BTreeMap<String, String>,
+}
+
 /// What a probe learned about one harness account.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountStatus {
@@ -121,17 +136,39 @@ pub struct AccountStatus {
     pub models: Vec<ModelInfo>,
     /// What sessions of this account can do.
     pub capabilities: Capabilities,
+    /// The signed-in email address, when the harness tells.
+    pub email: Option<String>,
+    /// The plan, such as "Max", when the harness tells.
+    pub plan: Option<String>,
+    /// The sign-in methods that the harness itself reports, such as the
+    /// `authMethods` of an ACP agent. The worker adds the methods that it
+    /// knows for each harness.
+    pub sign_in_methods: Vec<SignInMethod>,
+}
+
+impl Default for AccountStatus {
+    fn default() -> Self {
+        Self {
+            harness_version: None,
+            auth_state: AuthState::Unknown,
+            auth_detail: None,
+            models: Vec::new(),
+            capabilities: Capabilities::default(),
+            email: None,
+            plan: None,
+            sign_in_methods: Vec::new(),
+        }
+    }
 }
 
 impl AccountStatus {
     /// A status for a harness that could not be probed.
     pub fn unknown(detail: impl Into<String>, capabilities: Capabilities) -> Self {
         Self {
-            harness_version: None,
             auth_state: AuthState::Unknown,
             auth_detail: Some(detail.into()),
-            models: Vec::new(),
             capabilities,
+            ..Self::default()
         }
     }
 }
@@ -262,6 +299,14 @@ pub trait Harness: Send + Sync {
     /// harness.
     fn capabilities(&self, account: &AccountConfig) -> Capabilities;
 
+    /// The managed tool that runs this account, or `None` when the adapter
+    /// needs none. The worker installs it and puts its launch in
+    /// `account.runtime.launch` before a probe or an open.
+    fn managed_tool(&self, account: &AccountConfig) -> Option<ToolId> {
+        let _ = account;
+        None
+    }
+
     /// Installed version, sign-in state, models with option descriptors,
     /// capabilities. A probe never reads credential files.
     async fn probe(&self, account: &AccountConfig) -> AccountStatus;
@@ -352,6 +397,24 @@ pub fn sign_in_hint(kind: HarnessKind, message: &str) -> String {
         format!("{message} {command}")
     } else {
         format!("{message}. {command}")
+    }
+}
+
+/// What to tell the user when an account is not signed in. An account that
+/// Consort made signs in from the app. An account from `worker.toml` signs
+/// in with the harness's own command (see [`sign_in_hint`]).
+pub fn sign_in_hint_for(account: &AccountConfig, message: &str) -> String {
+    if !account.profile {
+        return sign_in_hint(account.harness, message);
+    }
+    let step = "Sign in to this account in Settings > Workers.";
+    let message = message.trim();
+    if message.is_empty() {
+        step.to_owned()
+    } else if message.ends_with(['.', '!', '?']) {
+        format!("{message} {step}")
+    } else {
+        format!("{message}. {step}")
     }
 }
 

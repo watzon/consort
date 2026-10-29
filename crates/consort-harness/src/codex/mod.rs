@@ -6,6 +6,7 @@
 //! stdio pipe of the process, and not in its environment, where another
 //! process of the same user could read it.
 
+pub mod login;
 pub mod mapper;
 pub mod protocol;
 pub mod rpc;
@@ -31,7 +32,7 @@ use crate::process::{
 use crate::{
     AccountConfig, AccountStatus, Answer, EVENT_CHANNEL_CAPACITY, EventReceiver, Harness,
     HarnessError, HarnessKind, HarnessSession, McpServerSpec, SessionSpec, SteerFuture,
-    sign_in_hint, steer_ready, turn_text,
+    sign_in_hint_for, steer_ready, turn_text,
 };
 use mapper::CodexMapper;
 use protocol::{
@@ -178,7 +179,44 @@ pub fn models_from_list(models: &[protocol::Model]) -> Vec<ModelInfo> {
         .collect()
 }
 
-fn capitalize(s: &str) -> String {
+/// The sign-in state, email and plan from an `account/read` result. The
+/// models and the capabilities stay empty.
+pub fn account_status(account: &AccountConfig, info: GetAccountResponse) -> AccountStatus {
+    let mut status = AccountStatus::default();
+    let (auth_state, auth_detail) = match info.account {
+        Some(protocol::Account::Chatgpt { email, plan_type }) => {
+            status.plan = plan_type.as_deref().map(capitalize);
+            let detail = match &plan_type {
+                Some(plan) => format!("ChatGPT, {} plan", capitalize(plan)),
+                None => "ChatGPT".to_owned(),
+            };
+            status.email = email;
+            (AuthState::SignedIn, Some(detail))
+        }
+        Some(protocol::Account::ApiKey) => {
+            status.plan = Some("API key".to_owned());
+            (AuthState::SignedIn, Some("API key".to_owned()))
+        }
+        Some(protocol::Account::AmazonBedrock) => {
+            (AuthState::SignedIn, Some("Amazon Bedrock".to_owned()))
+        }
+        Some(protocol::Account::Gcp) => (AuthState::SignedIn, Some("Google Cloud".to_owned())),
+        Some(protocol::Account::Other) => (AuthState::SignedIn, None),
+        None if info.requires_openai_auth => (
+            AuthState::SignedOut,
+            Some(sign_in_hint_for(account, "Not signed in")),
+        ),
+        None => (
+            AuthState::SignedIn,
+            Some("The model provider needs no OpenAI login.".to_owned()),
+        ),
+    };
+    status.auth_state = auth_state;
+    status.auth_detail = auth_detail;
+    status
+}
+
+pub(crate) fn capitalize(s: &str) -> String {
     let mut chars = s.chars();
     match chars.next() {
         Some(first) => first.to_uppercase().chain(chars).collect(),
@@ -186,10 +224,30 @@ fn capitalize(s: &str) -> String {
     }
 }
 
-struct Connection {
-    process: HarnessProcess,
-    client: RpcClient,
-    inbound: mpsc::UnboundedReceiver<Inbound>,
+pub(crate) struct Connection {
+    pub(crate) process: HarnessProcess,
+    pub(crate) client: RpcClient,
+    pub(crate) inbound: mpsc::UnboundedReceiver<Inbound>,
+}
+
+/// The Codex program and its first arguments: the account's `binary`, the
+/// managed tool, or `codex` on `PATH`, with `app-server`. The extra
+/// environment variables of the managed tool come with it.
+pub fn codex_program(
+    account: &AccountConfig,
+    resolve: &dyn Fn(&str) -> Option<std::path::PathBuf>,
+) -> Result<crate::Launch, HarnessError> {
+    if let Some(launch) = account.managed_launch() {
+        return Ok(launch.clone());
+    }
+    let name = account.binary.as_deref().unwrap_or("codex");
+    let program =
+        resolve(name).ok_or_else(|| HarnessError::Spawn(format!("`{name}` is not on PATH")))?;
+    Ok(crate::Launch {
+        program,
+        args: vec!["app-server".to_owned()],
+        env: BTreeMap::new(),
+    })
 }
 
 /// The `codex app-server` process. It starts in `cwd`: the session's
@@ -202,23 +260,51 @@ pub fn app_server_spec(
     watcher: Option<process::WatcherHandle>,
     resolve: &dyn Fn(&str) -> Option<std::path::PathBuf>,
 ) -> Result<ProcessSpec, HarnessError> {
-    let program = resolve(account.binary.as_deref().unwrap_or("codex"))
-        .ok_or_else(|| HarnessError::Spawn("`codex` is not on PATH".to_owned()))?;
+    let launch = codex_program(account, resolve)?;
     let mut env = prepare_home(account)?;
+    env.extend(launch.env);
     env.extend(extra_env);
-    let mut args = vec!["app-server".to_owned()];
+    let mut args = launch.args;
     args.extend(account.args.iter().cloned());
     Ok(ProcessSpec {
-        program,
+        program: launch.program,
         args,
         env,
-        env_remove: Vec::new(),
+        env_remove: account.runtime.env_remove.clone(),
         cwd: Some(cwd.to_path_buf()),
         watcher,
     })
 }
 
-async fn connect(
+/// Whether a failed start of `codex app-server` came from another Codex
+/// process that set up the same new `CODEX_HOME` at the same time. Tested
+/// with codex-cli 0.165.0: two app-servers that start together on an empty
+/// home can fail with "failed to initialize sqlite state runtime". A second
+/// try works.
+pub fn is_state_init_race(err: &HarnessError) -> bool {
+    matches!(err, HarnessError::Spawn(m) if m.contains("failed to initialize") && m.contains("state runtime"))
+}
+
+pub(crate) async fn connect(
+    account: &AccountConfig,
+    cwd: &std::path::Path,
+    extra_env: BTreeMap<String, String>,
+    watcher: Option<process::WatcherHandle>,
+) -> Result<Connection, HarnessError> {
+    let mut tries = 0;
+    loop {
+        tries += 1;
+        match connect_once(account, cwd, extra_env.clone(), watcher.clone()).await {
+            Err(err) if tries < 3 && is_state_init_race(&err) => {
+                tracing::debug!("codex app-server could not set up its home; it tries again");
+                tokio::time::sleep(Duration::from_millis(500 * tries)).await;
+            }
+            result => return result,
+        }
+    }
+}
+
+async fn connect_once(
     account: &AccountConfig,
     cwd: &std::path::Path,
     extra_env: BTreeMap<String, String>,
@@ -286,19 +372,30 @@ impl Harness for CodexHarness {
         codex_capabilities()
     }
 
+    fn managed_tool(&self, account: &AccountConfig) -> Option<crate::ToolId> {
+        account.managed_tool()
+    }
+
     async fn probe(&self, account: &AccountConfig) -> AccountStatus {
         let caps = codex_capabilities();
-        let Some(program) = resolve_program(account.binary.as_deref().unwrap_or("codex")) else {
-            return AccountStatus::unknown("`codex` is not on PATH.", caps);
+        let launch = match codex_program(account, &resolve_program) {
+            Ok(launch) => launch,
+            Err(err) => return AccountStatus::unknown(err.to_string(), caps),
         };
-        let env = match prepare_home(account) {
+        let mut env = match prepare_home(account) {
             Ok(env) => env,
             Err(err) => return AccountStatus::unknown(err.to_string(), caps),
         };
-        let version = run_capture(&program, &["--version"], &env, Duration::from_secs(10))
-            .await
-            .ok()
-            .and_then(|out| parse_version(&out));
+        env.extend(launch.env.clone());
+        let version = run_capture(
+            &launch.program,
+            &["--version"],
+            &env,
+            Duration::from_secs(10),
+        )
+        .await
+        .ok()
+        .and_then(|out| parse_version(&out));
         let dir = std::env::temp_dir();
         let probe = async {
             let mut conn = connect(account, &dir, BTreeMap::new(), None).await?;
@@ -336,54 +433,25 @@ impl Harness for CodexHarness {
         };
         match tokio::time::timeout(PROBE_TIMEOUT, probe).await {
             Ok(Ok((info, models))) => {
-                let (auth_state, auth_detail) = match info.account {
-                    Some(protocol::Account::Chatgpt { plan_type }) => (
-                        AuthState::SignedIn,
-                        Some(match plan_type {
-                            Some(plan) => format!("ChatGPT, {} plan", capitalize(&plan)),
-                            None => "ChatGPT".to_owned(),
-                        }),
-                    ),
-                    Some(protocol::Account::ApiKey) => {
-                        (AuthState::SignedIn, Some("API key".to_owned()))
-                    }
-                    Some(protocol::Account::AmazonBedrock) => {
-                        (AuthState::SignedIn, Some("Amazon Bedrock".to_owned()))
-                    }
-                    Some(protocol::Account::Gcp) => {
-                        (AuthState::SignedIn, Some("Google Cloud".to_owned()))
-                    }
-                    Some(protocol::Account::Other) => (AuthState::SignedIn, None),
-                    None if info.requires_openai_auth => (
-                        AuthState::SignedOut,
-                        Some(sign_in_hint(HarnessKind::Codex, "")),
-                    ),
-                    None => (
-                        AuthState::SignedIn,
-                        Some("The model provider needs no OpenAI login.".to_owned()),
-                    ),
-                };
-                AccountStatus {
-                    harness_version: version,
-                    auth_state,
-                    auth_detail,
-                    models: models_from_list(&models),
-                    capabilities: caps,
-                }
+                let mut status = account_status(account, info);
+                status.harness_version = version;
+                status.models = models_from_list(&models);
+                status.capabilities = caps;
+                status
             }
             Ok(Err(err)) => AccountStatus {
                 harness_version: version,
                 auth_state: AuthState::Error,
                 auth_detail: Some(err.to_string()),
-                models: Vec::new(),
                 capabilities: caps,
+                ..AccountStatus::default()
             },
             Err(_) => AccountStatus {
                 harness_version: version,
                 auth_state: AuthState::Unknown,
                 auth_detail: Some("The probe timed out.".to_owned()),
-                models: Vec::new(),
                 capabilities: caps,
+                ..AccountStatus::default()
             },
         }
     }

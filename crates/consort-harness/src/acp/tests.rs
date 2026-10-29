@@ -1813,3 +1813,113 @@ fn instructions_stay_in_the_budget() {
     assert!(text.len() <= 64 * 1024, "{}", text.len());
     assert!(text.contains("bbbb"));
 }
+
+#[test]
+fn managed_launches_are_used_unless_the_account_names_a_binary() {
+    let nothing = |_: &str| -> Option<PathBuf> { None };
+    let managed = |program: &str, args: &[&str]| crate::Launch {
+        program: PathBuf::from(program),
+        args: args.iter().map(|a| (*a).to_owned()).collect(),
+        env: BTreeMap::from([("PATH".to_owned(), "/tools/node/bin".to_owned())]),
+    };
+
+    let mut claude = AccountConfig::default_for(HarnessKind::ClaudeCode);
+    claude.runtime.launch = Some(managed("/tools/node", &["/tools/acp/dist/index.js"]));
+    let l = launch_recipe(
+        HarnessKind::ClaudeCode,
+        &claude,
+        ApprovalMode::Ask,
+        true,
+        &nothing,
+    )
+    .unwrap();
+    assert_eq!(l.program, PathBuf::from("/tools/node"));
+    assert_eq!(l.args, ["/tools/acp/dist/index.js"]);
+    assert_eq!(l.env["PATH"], "/tools/node/bin");
+
+    let mut gemini = AccountConfig::default_for(HarnessKind::GeminiCli);
+    gemini.runtime.launch = Some(managed("/tools/node", &["gemini.js", "--acp"]));
+    let l = launch_recipe(
+        HarnessKind::GeminiCli,
+        &gemini,
+        ApprovalMode::Auto,
+        true,
+        &nothing,
+    )
+    .unwrap();
+    assert_eq!(
+        l.args,
+        ["gemini.js", "--acp", "--approval-mode", "auto_edit"]
+    );
+
+    let mut opencode = AccountConfig::default_for(HarnessKind::OpenCode);
+    opencode.runtime.launch = Some(managed("/tools/opencode", &["acp"]));
+    let l = launch_recipe(
+        HarnessKind::OpenCode,
+        &opencode,
+        ApprovalMode::Ask,
+        true,
+        &nothing,
+    )
+    .unwrap();
+    assert_eq!(l.program, PathBuf::from("/tools/opencode"));
+    assert_eq!(l.args, ["acp"]);
+    assert!(l.env.contains_key("OPENCODE_CONFIG_CONTENT"));
+
+    let mut agent = AccountConfig::default_for(HarnessKind::Acp);
+    agent.acp = Some(consort_proto::model::AcpAccountSpec::Registry { id: "goose".into() });
+    assert_eq!(
+        agent.managed_tool(),
+        Some(crate::ToolId::Acp("goose".into()))
+    );
+    agent.runtime.launch = Some(managed("/tools/goose", &["acp"]));
+    let l = launch_recipe(HarnessKind::Acp, &agent, ApprovalMode::Ask, true, &nothing).unwrap();
+    assert_eq!(l.program, PathBuf::from("/tools/goose"));
+
+    // A hand-written `binary` wins over the managed tool.
+    let found = |name: &str| -> Option<PathBuf> { Some(PathBuf::from(format!("/bin/{name}"))) };
+    claude.binary = Some("my-claude-acp".into());
+    assert_eq!(claude.managed_tool(), None);
+    let l = launch_recipe(
+        HarnessKind::ClaudeCode,
+        &claude,
+        ApprovalMode::Ask,
+        true,
+        &found,
+    )
+    .unwrap();
+    assert_eq!(l.program, PathBuf::from("/bin/my-claude-acp"));
+    assert!(!l.env.contains_key("PATH"));
+}
+
+#[test]
+fn auth_methods_become_sign_in_methods() {
+    let init = json!({
+        "authMethods": [
+            {"id": "oauth-personal", "name": "Log in with Google"},
+            {"id": "login", "name": "Log in", "type": "terminal", "args": ["--login"]},
+            {"id": "key", "name": "API key", "type": "env_var", "varName": "AGENT_API_KEY"},
+            {"id": "x", "name": "Something new", "type": "future_kind"}
+        ],
+        "agentCapabilities": {"auth": {"logout": {}}}
+    });
+    let methods = sign_in_methods_from_init(&init, "/tools/agent acp");
+    assert_eq!(
+        methods,
+        vec![
+            SignInMethod::AcpAgent {
+                method_id: "oauth-personal".into(),
+                name: "Log in with Google".into()
+            },
+            SignInMethod::Terminal {
+                command: "/tools/agent acp --login".into()
+            },
+            SignInMethod::ApiKey {
+                variable: "AGENT_API_KEY".into()
+            },
+        ]
+    );
+    assert!(offers_logout(&init));
+    assert!(!offers_logout(&json!({"agentCapabilities": {}})));
+    assert!(sign_in_methods_from_init(&json!({}), "x").is_empty());
+}

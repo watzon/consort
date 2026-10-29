@@ -150,6 +150,7 @@ impl Hub {
             request: &task.placement,
             approval_mode: task.approval_mode,
             preferred_workers: &channel.preferred_workers,
+            channel_tags: &channel.tags,
             repos: &repos,
             isolation,
         };

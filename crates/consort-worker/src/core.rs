@@ -9,10 +9,8 @@ use std::time::Duration;
 use consort_harness::{AccountConfig, AccountStatus, Harness, HarnessKind};
 use consort_proto::auth::{OpenSession, Signature, WorkerHello, WorkerHelloResult};
 use consort_proto::error::{ErrorBody, ErrorCode};
-use consort_proto::frame::{
-    Frame, FrameId, MessageFamily, RequestFrame, SUPPORTED_PROTOCOL_VERSIONS,
-};
-use consort_proto::ids::{AccountId, SessionId, WorkerId};
+use consort_proto::frame::{Frame, FrameId, RequestFrame, SUPPORTED_PROTOCOL_VERSIONS};
+use consort_proto::ids::{AccountId, SessionId, SignInId, WorkerId};
 use consort_proto::model::{
     AuthState, Capabilities, HarnessAccount, Inventory, LocalMcpServerInfo, Os, SessionState,
     WorkerLoad,
@@ -23,6 +21,7 @@ use serde_json::{Value, json};
 use tokio::sync::{Notify, mpsc, watch};
 
 use crate::WorkerError;
+use crate::accounts::managed_launch;
 use crate::config::{WORKSPACES_DIR, WorkerToml, local_server_name_problem};
 use crate::identity::Identity;
 use crate::link::{Link, LinkHandler};
@@ -76,6 +75,17 @@ pub(crate) struct Core {
     /// The lock on the config folder, held while the worker runs. `None` in
     /// tests. `WorkerHandle::shutdown` releases it at its end.
     pub lock: Mutex<Option<std::fs::File>>,
+    /// The Consort home, with `profiles/` and `tools/`.
+    pub consort_home: PathBuf,
+    /// The managed tools.
+    pub tools: Arc<crate::tools::Tools>,
+    /// The sign-ins that run now.
+    pub sign_ins: Mutex<HashMap<SignInId, crate::signin::SignInControl>>,
+    /// Held by a ChatGPT browser sign-in. Codex listens for the callback on
+    /// a fixed port, so only one runs at a time.
+    pub browser_sign_in: tokio::sync::Mutex<()>,
+    /// The tags that the worker found about this machine.
+    pub detected_tags: Vec<String>,
 }
 
 /// The answer to a command for a session whose actor has ended.
@@ -459,8 +469,7 @@ impl Core {
                     core.finish_command(&id, Ok(json!({})));
                 });
             }
-            // Accounts, sign-in and managed tools: the contract is in place,
-            // the handlers come next (docs/ACCOUNTS-PLAN.md).
+            // Accounts, sign-in and managed tools (`accounts.rs`).
             HubToWorker::AccountCreate(_)
             | HubToWorker::AccountUpdate(_)
             | HubToWorker::AccountRemove(_)
@@ -470,8 +479,11 @@ impl Core {
             | HubToWorker::SignInCancel(_)
             | HubToWorker::ToolsCheck(_)
             | HubToWorker::ToolsInstall(_) => {
-                let request_type = command.type_name();
-                self.finish_command(&id, Err(ErrorBody::not_built(request_type)));
+                let core = self.clone();
+                tokio::spawn(async move {
+                    let result = core.account_command(command).await;
+                    core.finish_command(&id, result.map(|()| json!({})));
+                });
             }
             HubToWorker::ItemDetail(_) => {
                 self.finish_command(
@@ -602,30 +614,101 @@ impl Core {
 
     // Inventory.
 
-    pub async fn probe_accounts(&self) {
+    /// Probes every enabled account and keeps the results.
+    pub async fn probe_accounts(self: &Arc<Self>) {
         let config = self.config_snapshot();
         let probes = config
             .accounts
             .iter()
             .filter(|a| a.enabled)
-            .map(|account| async move {
-                let status = match self.harnesses.get(&account.harness) {
-                    Some(adapter) => adapter.probe(account).await,
-                    None => AccountStatus::unknown(
-                        format!(
-                            "This build has no adapter for {}.",
-                            account.harness.display_name()
-                        ),
-                        Default::default(),
-                    ),
-                };
-                (account.id, status)
-            });
+            .map(|account| async move { (account.id, self.probe_account(account).await) });
         let results = futures::future::join_all(probes).await;
         let mut statuses = lock(&self.statuses);
         for (id, status) in results {
             statuses.insert(id, status);
         }
+    }
+
+    /// Probes one account. When its managed tool is not installed, the
+    /// probe does not wait: the install starts in the background and probes
+    /// the account when it ends.
+    pub async fn probe_account(self: &Arc<Self>, account: &AccountConfig) -> AccountStatus {
+        let Some(adapter) = self.harnesses.get(&account.harness).cloned() else {
+            return AccountStatus::unknown(
+                format!(
+                    "This build has no adapter for {}.",
+                    account.harness.display_name()
+                ),
+                Default::default(),
+            );
+        };
+        let mut prepared = match self.with_profile(account) {
+            Ok(prepared) => prepared,
+            Err(err) => {
+                return AccountStatus {
+                    auth_state: AuthState::Error,
+                    auth_detail: Some(err.message),
+                    capabilities: adapter.capabilities(account),
+                    ..AccountStatus::default()
+                };
+            }
+        };
+        let mut lease = None;
+        if let Some(tool) = adapter.managed_tool(&prepared) {
+            if self.tools.store().installed(&tool).is_none() {
+                self.install_in_background(account.id, tool.clone());
+                return AccountStatus::unknown(
+                    format!("Installing {}.", crate::tools::tool_name(&tool)),
+                    adapter.capabilities(account),
+                );
+            }
+            match self.tools.store().launch(&tool) {
+                Ok(launch) => prepared.runtime.launch = Some(managed_launch(launch)),
+                Err(err) => {
+                    return AccountStatus {
+                        auth_state: AuthState::Error,
+                        auth_detail: Some(format!(
+                            "Could not start {}: {err}",
+                            crate::tools::tool_name(&tool)
+                        )),
+                        capabilities: adapter.capabilities(account),
+                        ..AccountStatus::default()
+                    };
+                }
+            }
+            lease = Some(self.tools.lease(&tool));
+        }
+        let status = adapter.probe(&prepared).await;
+        drop(lease);
+        status
+    }
+
+    /// Installs the managed tool of an account in the background, then
+    /// probes the account and sends the inventory.
+    fn install_in_background(self: &Arc<Self>, account_id: AccountId, tool: consort_tools::ToolId) {
+        let core = self.clone();
+        tokio::spawn(async move {
+            core.inventory_changed();
+            let result = core.tools.ensure(&tool).await;
+            let config = core.config_snapshot();
+            let Some(account) = config.account(account_id).cloned() else {
+                core.inventory_changed();
+                return;
+            };
+            let status = match result {
+                Ok(_) => core.probe_account(&account).await,
+                Err(err) => AccountStatus {
+                    auth_state: AuthState::Error,
+                    auth_detail: Some(format!(
+                        "Could not install {}: {err}. Try again from Settings > Workers.",
+                        crate::tools::tool_name(&tool)
+                    )),
+                    ..AccountStatus::default()
+                },
+            };
+            lock(&core.statuses).insert(account_id, status);
+            core.send_inventory(false);
+        });
     }
 
     /// Marks an account as signed out, because one of its sessions reported
@@ -634,6 +717,17 @@ impl Core {
     /// on an account that is not signed in. The next probe can set the state
     /// back. Sends the new inventory to the hub at once.
     pub fn mark_signed_out(&self, account_id: AccountId, detail: &str) {
+        let profile = self
+            .config_snapshot()
+            .account(account_id)
+            .is_some_and(|a| a.profile);
+        // A profile account signs in from the app, not with a command on
+        // the worker.
+        let detail = if profile {
+            "Signed out. Sign in to this account in Settings > Workers."
+        } else {
+            detail
+        };
         lock(&self.statuses)
             .entry(account_id)
             .and_modify(|status| {
@@ -641,11 +735,9 @@ impl Core {
                 status.auth_detail = Some(detail.to_owned());
             })
             .or_insert_with(|| AccountStatus {
-                harness_version: None,
                 auth_state: AuthState::SignedOut,
                 auth_detail: Some(detail.to_owned()),
-                models: Vec::new(),
-                capabilities: Default::default(),
+                ..AccountStatus::default()
             });
         self.send_inventory(false);
     }
@@ -664,28 +756,38 @@ impl Core {
                     .unwrap_or_default();
                 let status = statuses.get(&account.id);
                 let enabled = account.enabled && self.harnesses.contains_key(&account.harness);
+                let mut auth_detail = status.and_then(|s| s.auth_detail.clone()).or_else(|| {
+                    (!self.harnesses.contains_key(&account.harness)).then(|| {
+                        format!(
+                            "This build has no adapter for {}.",
+                            account.harness.display_name()
+                        )
+                    })
+                });
+                // While the managed tool installs, the account says so.
+                if let Some(tool) = self
+                    .harnesses
+                    .get(&account.harness)
+                    .and_then(|h| h.managed_tool(account))
+                    && self.tools.installing(&tool)
+                {
+                    auth_detail = Some(format!("Installing {}.", crate::tools::tool_name(&tool)));
+                }
                 HarnessAccount {
                     account_id: account.id,
-                    harness: account.harness.as_str().to_owned(),
+                    harness: crate::accounts::inventory_harness(account),
                     label: account.label.clone(),
                     harness_version: status.and_then(|s| s.harness_version.clone()),
                     auth_state: status.map(|s| s.auth_state).unwrap_or(AuthState::Unknown),
-                    auth_detail: status.and_then(|s| s.auth_detail.clone()).or_else(|| {
-                        (!self.harnesses.contains_key(&account.harness)).then(|| {
-                            format!(
-                                "This build has no adapter for {}.",
-                                account.harness.display_name()
-                            )
-                        })
-                    }),
+                    auth_detail,
                     models: status.map(|s| s.models.clone()).unwrap_or_default(),
                     capabilities,
                     enabled,
-                    profile: false,
-                    email: None,
-                    plan: None,
-                    secret_names: Vec::new(),
-                    sign_in_methods: Vec::new(),
+                    profile: account.profile,
+                    email: status.and_then(|s| s.email.clone()),
+                    plan: status.and_then(|s| s.plan.clone()),
+                    secret_names: self.secret_names(account),
+                    sign_in_methods: crate::accounts::sign_in_methods(account, status),
                 }
             })
             .collect();
@@ -695,7 +797,7 @@ impl Core {
             hostname: gethostname::gethostname().to_string_lossy().into_owned(),
             os: Os::from_std_os(std::env::consts::OS).unwrap_or(Os::Linux),
             arch: std::env::consts::ARCH.to_owned(),
-            tags: config.tags.clone(),
+            tags: self.inventory_tags(&config),
             accounts,
             local_mcp_servers: config
                 .local_mcp_servers
@@ -712,7 +814,7 @@ impl Core {
             load: WorkerLoad {
                 active_sessions: active,
             },
-            tools: Vec::new(),
+            tools: self.tools.statuses(),
         }
         .with_hash()
     }
@@ -822,7 +924,7 @@ pub(crate) async fn inventory_loop(core: Arc<Core>, mut shutdown: watch::Receive
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::bridge::McpHttpClient;
     use crate::store::tests::{record, start};
@@ -832,7 +934,11 @@ mod tests {
     use consort_proto::worker_link::{SessionTurn, TurnInput};
     use consort_testkit::{FakeHarness, FakeOpenFailure, FakeScript, FakeStep};
 
-    fn test_core(dir: &std::path::Path, harnesses: Harnesses, config: WorkerToml) -> Arc<Core> {
+    pub(crate) fn test_core(
+        dir: &std::path::Path,
+        harnesses: Harnesses,
+        config: WorkerToml,
+    ) -> Arc<Core> {
         Arc::new(Core {
             config_dir: dir.to_path_buf(),
             config: RwLock::new(config),
@@ -851,6 +957,13 @@ mod tests {
             inflight: Mutex::new(HashSet::new()),
             stopping: watch::channel(false).0,
             lock: Mutex::new(None),
+            consort_home: dir.join("home"),
+            tools: Arc::new(
+                crate::tools::Tools::new(dir.join("home").join("tools"), false).unwrap(),
+            ),
+            sign_ins: Mutex::new(HashMap::new()),
+            browser_sign_in: tokio::sync::Mutex::new(()),
+            detected_tags: vec!["macos".into(), "arm64".into()],
         })
     }
 
@@ -1584,11 +1697,9 @@ mod tests {
         lock(&core.statuses).insert(
             account_id,
             AccountStatus {
-                harness_version: None,
                 auth_state: AuthState::SignedIn,
-                auth_detail: None,
-                models: vec![],
                 capabilities: all_but_full_access(),
+                ..AccountStatus::default()
             },
         );
         let (tx, _rx) = mpsc::unbounded_channel();

@@ -23,7 +23,12 @@ use crate::{
 };
 
 /// A labelled field.
-fn field_block(label: &str, body: impl IntoElement, hint: Option<&str>, t: &Tokens) -> Div {
+pub(crate) fn field_block(
+    label: &str,
+    body: impl IntoElement,
+    hint: Option<&str>,
+    t: &Tokens,
+) -> Div {
     let c = &t.colors;
     div()
         .flex()
@@ -119,6 +124,32 @@ pub fn group_pick_items(
     items
 }
 
+/// The note under a Worker tags field: what the tags do and how many
+/// workers match, or that none does and what to do.
+pub fn tags_note(matching: usize) -> String {
+    match matching {
+        0 => "No worker has every tag here, so work in this channel waits. Add the tags to a worker in Settings > Workers, or remove a tag.".to_owned(),
+        1 => "All work in this channel runs only on workers that have every tag here. 1 worker matches.".to_owned(),
+        n => format!("All work in this channel runs only on workers that have every tag here. {n} workers match."),
+    }
+}
+
+/// The tags to offer after "Also on workers:": the user tags of the
+/// matching workers that are not chosen yet, at most three.
+pub fn tag_suggestions(state: &consort_client::ViewState, chosen: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = state
+        .workers_with_tags(chosen)
+        .iter()
+        .flat_map(|w| w.tags.iter())
+        .filter(|tag| !chosen.contains(tag))
+        .cloned()
+        .collect();
+    out.sort();
+    out.dedup();
+    out.truncate(3);
+    out
+}
+
 /// The select option that puts the new channel in no group. It is not a
 /// group ID, so it cannot be a group.
 pub const NO_GROUP: &str = "no-group";
@@ -126,6 +157,173 @@ pub const NO_GROUP: &str = "no-group";
 pub const NEW_GROUP: &str = "new-group";
 
 impl ConsortApp {
+    /// The Worker tags field of a channel: the chosen tags as removable
+    /// chips, Add tag (a menu of every worker tag), the tags of the matching
+    /// workers to add with one click, and how many workers match.
+    /// `settings` says which list it edits: the open Worker tags dialog, or
+    /// the New channel form.
+    pub fn tags_field(
+        &self,
+        chosen: &[String],
+        settings: bool,
+        t: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let c = &t.colors;
+        let mut row = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(t.space.xs + t.space.xxs);
+        for tag in chosen {
+            let remove = tag.clone();
+            row = row.child(
+                div()
+                    .id(SharedString::from(format!("channel-tag-{tag}")))
+                    .flex()
+                    .items_center()
+                    .gap(t.space.xs)
+                    .py(t.space.xs)
+                    .pl(t.space.sm + t.space.xxs)
+                    .pr(t.space.xs + t.space.xxs)
+                    .rounded(t.radius.full)
+                    .bg(c.tint_accent)
+                    .border(t.border_width)
+                    .border_color(c.accent_text)
+                    .cursor_pointer()
+                    .child(text(tag.clone(), t.text.ui_strong, c.accent_text))
+                    .child(icon("x", t.space.md, c.accent_text))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        let tags = if settings {
+                            &mut this.channel_tags
+                        } else {
+                            &mut this.new_channel.tags
+                        };
+                        tags.retain(|t| *t != remove);
+                        cx.notify();
+                    })),
+            );
+        }
+        let free: Vec<String> = self
+            .state
+            .tags
+            .iter()
+            .filter(|tag| !chosen.contains(tag))
+            .cloned()
+            .collect();
+        let user_tags: Vec<String> = self
+            .state
+            .workers
+            .iter()
+            .flat_map(|w| w.tags.iter().cloned())
+            .collect();
+        if !free.is_empty() {
+            row = row.child(
+                div()
+                    .id("channel-tag-add")
+                    .relative()
+                    .flex()
+                    .items_center()
+                    .gap(t.space.xs + t.space.xxs)
+                    .py(t.space.xs)
+                    .px(t.space.sm + t.space.xxs)
+                    .rounded(t.radius.full)
+                    .border(t.border_width)
+                    .border_dashed()
+                    .border_color(c.border_strong)
+                    .cursor_pointer()
+                    .hover(|s| s.bg(c.hover_raised))
+                    .child(self.triggers.track("channel-tag-add"))
+                    .child(icon("plus", t.space.md - t.space.xxs, c.text_secondary))
+                    .child(text("Add tag", t.text.ui, c.text_secondary))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(bounds) = this.triggers.get("channel-tag-add") {
+                            // The user tags first, then a line, then the
+                            // tags that the workers found themselves.
+                            let mut items: Vec<MenuItem> = Vec::new();
+                            for tag in &free {
+                                let detected = !user_tags.contains(tag);
+                                let first_detected = detected
+                                    && !items.is_empty()
+                                    && items
+                                        .iter()
+                                        .all(|i| user_tags.iter().any(|u| *u == i.label.as_ref()));
+                                let item = MenuItem::new(
+                                    tag.clone(),
+                                    MenuAction::Select("channel-tag", tag.clone()),
+                                );
+                                items.push(if first_detected {
+                                    item.separated()
+                                } else {
+                                    item
+                                });
+                            }
+                            this.open_menu(OpenMenu::under(bounds, items, false), cx);
+                        }
+                    })),
+            );
+        }
+        let suggestions = tag_suggestions(&self.state, chosen);
+        if !chosen.is_empty() && !suggestions.is_empty() {
+            let mut also = div()
+                .flex()
+                .items_center()
+                .flex_wrap()
+                .pl(t.space.xs)
+                .child(text("Also on workers:\u{a0}", detail(t), c.text_tertiary));
+            let last = suggestions.len() - 1;
+            for (i, tag) in suggestions.into_iter().enumerate() {
+                let add = tag.clone();
+                also = also.child(
+                    div()
+                        .id(SharedString::from(format!("suggest-tag-{tag}")))
+                        .cursor_pointer()
+                        .type_style(detail(t))
+                        .text_color(c.text_tertiary)
+                        .hover(|s| s.text_color(c.text_primary))
+                        .child(if i < last {
+                            format!("{tag},\u{a0}")
+                        } else {
+                            tag
+                        })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let tags = if settings {
+                                &mut this.channel_tags
+                            } else {
+                                &mut this.new_channel.tags
+                            };
+                            if !tags.contains(&add) {
+                                tags.push(add.clone());
+                            }
+                            cx.notify();
+                        })),
+                );
+            }
+            row = row.child(also);
+        }
+        let matching = self.state.workers_with_tags(chosen).len();
+        let note = if chosen.is_empty() {
+            "Add a tag to keep the work of this channel on some workers, such as work or gpu-nvidia.".to_owned()
+        } else {
+            tags_note(matching)
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap(t.space.xs + t.space.xxs)
+            .child(text("Worker tags", t.text.label, c.text_secondary))
+            .child(row)
+            .child(text(
+                note,
+                detail(t),
+                if !chosen.is_empty() && matching == 0 {
+                    c.status_failed
+                } else {
+                    c.text_tertiary
+                },
+            ))
+    }
+
     /// The toast at the bottom. Its text is selectable. An error has a mark
     /// and stays until the user dismisses it. An info notice times out. The
     /// text scrolls when it is long, so the close button never leaves the
@@ -268,7 +466,111 @@ impl ConsortApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let c = &t.colors;
+        let mut lead: Option<AnyElement> = None;
         let (title, description, width, body, actions) = match dialog {
+            Dialog::AddAccount(_) => {
+                let (title, description, width, body, actions, logo) =
+                    self.add_account_dialog(t, window, cx);
+                lead = logo;
+                (title, description, width, body, actions)
+            }
+            Dialog::RenameAccount(worker_id, account_id) => {
+                let (worker_id, account_id) = (worker_id.clone(), account_id.clone());
+                let focused = self
+                    .inputs
+                    .name
+                    .read(cx)
+                    .focus_handle(cx)
+                    .is_focused(window);
+                (
+                    "Rename account".to_owned(),
+                    "Use the same name on every worker where this login is the same account. The hub treats accounts with one name as one.".to_owned(),
+                    t.layout.dialog_width,
+                    field_block("Name", input_box(&self.inputs.name, focused, t), None, t),
+                    self.dialog_actions("Rename", t, cx, move |this, window, cx| {
+                        let name = this.field(Field::Name, cx);
+                        if name.is_empty() {
+                            this.dialog_error = Some("Enter a name for the account.".into());
+                            cx.notify();
+                            return;
+                        }
+                        let client = this.client.clone();
+                        let (w, a) = (worker_id.clone(), account_id.clone());
+                        this.submit_dialog(
+                            async move { client.rename_account(w, a, name).await },
+                            window,
+                            cx,
+                        );
+                    }),
+                )
+            }
+            Dialog::ConfirmRemoveAccount(worker_id, account_id) => {
+                let (worker_id, account_id) = (worker_id.clone(), account_id.clone());
+                let worker = self.state.worker(&worker_id);
+                let worker_name = worker.map(|w| w.name.clone()).unwrap_or_default();
+                let label = worker
+                    .and_then(|w| w.account(&account_id))
+                    .map(|a| a.label.clone())
+                    .unwrap_or_default();
+                (
+                    format!("Remove {label}?"),
+                    format!(
+                        "{worker_name} signs this account out where it can and deletes its profile folder, with the login and any saved key. Tasks that use it stop. You cannot undo this."
+                    ),
+                    t.layout.dialog_width,
+                    div(),
+                    self.dialog_actions_kind(
+                        "Remove account",
+                        ButtonKind::Danger,
+                        t,
+                        cx,
+                        move |this, window, cx| {
+                            let client = this.client.clone();
+                            let (w, a) = (worker_id.clone(), account_id.clone());
+                            this.submit_dialog(
+                                async move { client.remove_account(w, a).await },
+                                window,
+                                cx,
+                            );
+                        },
+                    ),
+                )
+            }
+            Dialog::ChannelTags(id) => {
+                let id = id.clone();
+                let name = self
+                    .state
+                    .channel(&id)
+                    .map(|ch| ch.name.clone())
+                    .unwrap_or_default();
+                let tags = self.channel_tags.clone();
+                (
+                    format!("Worker tags for {name}"),
+                    "Choose the worker tags that this channel requires.".to_owned(),
+                    t.layout.dialog_wide,
+                    self.tags_field(&tags, true, t, cx),
+                    self.dialog_actions("Save tags", t, cx, move |this, window, cx| {
+                        let client = this.client.clone();
+                        let id = id.clone();
+                        let tags = this.channel_tags.clone();
+                        this.submit_dialog(
+                            async move {
+                                client
+                                    .update_channel(
+                                        id,
+                                        ChannelChanges {
+                                            tags: Some(tags),
+                                            ..ChannelChanges::default()
+                                        },
+                                    )
+                                    .await
+                            },
+                            window,
+                            cx,
+                        );
+                    }),
+                )
+            }
             Dialog::NewChannel => self.new_channel_dialog(t, window, cx),
             Dialog::AddWorker => self.add_worker_dialog(t, cx),
             Dialog::RenameChannel(id) => {
@@ -547,6 +849,7 @@ impl ConsortApp {
                     .flex()
                     .items_start()
                     .gap(t.space.md)
+                    .children(lead)
                     .child(
                         div()
                             .flex()
@@ -616,7 +919,6 @@ impl ConsortApp {
     ) -> Div {
         let c = &t.colors;
         let busy = self.dialog_busy();
-        let danger_hover = t.opacity.danger_hover;
         // Enter in a field of the dialog does what the confirm button does.
         // A button that destroys something takes a click, not a key press
         // from a field.
@@ -624,12 +926,14 @@ impl ConsortApp {
         if kind != ButtonKind::Danger {
             self.dialog_confirm.replace(Some(on_confirm.clone()));
         }
-        let confirm = button("dialog-confirm", label.to_owned(), kind, t)
-            .when(kind == ButtonKind::Danger, |b| {
-                b.bg(c.status_failed)
-                    .text_color(c.on_failed)
-                    .hover(|s| s.bg(c.status_failed).opacity(danger_hover))
-            })
+        // A destroying confirm button has the failed fill. The kind sets its
+        // hover once: GPUI refuses a second hover style.
+        let fill = if kind == ButtonKind::Danger {
+            ButtonKind::DangerFill
+        } else {
+            kind
+        };
+        let confirm = button("dialog-confirm", label.to_owned(), fill, t)
             .when(busy, |b| b.opacity(t.opacity.busy))
             .px(t.space.md + t.space.xxs)
             .on_click(cx.listener(move |this, _, window, cx| on_confirm(this, window, cx)));
@@ -768,7 +1072,9 @@ impl ConsortApp {
         let selection_select = select_box(
             "new-channel-selection",
             form.selection
-                .clone()
+                .as_deref()
+                .and_then(|key| state.selection(key))
+                .map(|s| s.label())
                 .unwrap_or_else(|| "Choose a harness".to_owned()),
             self,
             t,
@@ -779,10 +1085,10 @@ impl ConsortApp {
                     .iter()
                     .map(|s| {
                         MenuItem::new(
-                            s.clone(),
-                            MenuAction::Select("new-channel-selection", s.clone()),
+                            s.label(),
+                            MenuAction::Select("new-channel-selection", s.key()),
                         )
-                        .checked(current_selection.as_deref() == Some(s.as_str()))
+                        .checked(current_selection.as_deref() == Some(s.key().as_str()))
                     })
                     .collect();
                 this.open_menu(OpenMenu::under(bounds, items, true), cx);
@@ -869,6 +1175,7 @@ impl ConsortApp {
                 ))
             })
             .child(field_block("Repos", repos, None, t))
+            .child(self.tags_field(&form.tags, false, t, cx))
             .child(field_block(
                 "Run tasks on",
                 chips,
@@ -910,8 +1217,13 @@ impl ConsortApp {
                 new_group,
                 repos: Vec::new(),
                 preferred_workers: form.workers,
-                task_selection: form.selection,
+                task_selection: form
+                    .selection
+                    .as_deref()
+                    .and_then(|key| this.state.selection(key))
+                    .cloned(),
                 isolation: form.isolation,
+                tags: form.tags,
             };
             // The new channel opens as soon as the hub sends it.
             let before = this.state.channels.iter().map(|c| c.id.clone()).collect();
@@ -1134,11 +1446,11 @@ impl ConsortApp {
             ))
             .child(step(
                 "3",
-                "Sign in to your harnesses on that machine",
+                "Add accounts to it",
                 None,
                 Some(
                     text(
-                        "Consort finds Claude Code, Codex, Pi, OpenCode and ACP agents by itself. Their logins stay on the machine.",
+                        "When the worker shows in the list, add its accounts in Settings > Workers. The worker downloads each provider itself, and each login stays in its own profile folder on the machine.",
                         t.text.ui,
                         c.text_secondary,
                     )

@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use consort_harness::approval::effective_mode;
 use consort_harness::{
     AccountConfig, EventReceiver, HarnessError, HarnessSession, McpServerSpec,
-    SIGNED_OUT_ERROR_CODE, SessionSpec, StdioCommand, sign_in_hint,
+    SIGNED_OUT_ERROR_CODE, SessionSpec, StdioCommand, sign_in_hint_for,
 };
 use consort_proto::error::{ErrorBody, ErrorCode};
 use consort_proto::frame::FrameId;
@@ -63,6 +63,8 @@ pub(crate) enum Job {
     HarnessLost,
     /// Close the harness but keep the session for resume.
     Shutdown,
+    /// The account of the session was removed. The session ends as lost.
+    AccountRemoved,
 }
 
 /// A running session actor.
@@ -402,6 +404,8 @@ struct Runtime {
     capabilities: Capabilities,
     mcp: Option<McpEndpoint>,
     pump: Option<tokio::task::JoinHandle<()>>,
+    /// Keeps the managed tool of the session from an update.
+    tool_lease: Option<crate::tools::ToolLease>,
 }
 
 fn harness_body(err: consort_harness::HarnessError) -> ErrorBody {
@@ -504,6 +508,9 @@ impl Runtime {
                     ),
                 )
             })?;
+        // The profile, and the managed tool. A missing tool installs first,
+        // and the session waits for it.
+        let (account, lease) = core.prepare_for_run(&account, adapter.as_ref()).await?;
         // The probed capabilities, when the worker has them: a probe can
         // find that Full access does not work on this machine.
         let capabilities = core.account_capabilities(&account, adapter.as_ref());
@@ -597,6 +604,7 @@ impl Runtime {
                 return Err(self.open_failed(&account, err));
             }
         };
+        self.tool_lease = lease;
         self.capabilities = session.capabilities().clone();
         if !self.capabilities.approval_modes.contains(&mode) {
             // The adapter had to start the session in a lower mode, for
@@ -646,7 +654,7 @@ impl Runtime {
     fn open_failed(&self, account: &AccountConfig, err: HarnessError) -> OpenFailure {
         match err {
             HarnessError::SignedOut(reason) => {
-                let hint = sign_in_hint(account.harness, &reason);
+                let hint = sign_in_hint_for(account, &reason);
                 self.core.mark_signed_out(account.id, &hint);
                 self.core.record_event(
                     self.session_id,
@@ -858,6 +866,7 @@ impl Runtime {
         if let Some(endpoint) = self.mcp.take() {
             endpoint.stop().await;
         }
+        self.tool_lease = None;
     }
 
     /// Runs one command. Returns what to do with the result, and whether
@@ -1000,6 +1009,7 @@ pub(crate) async fn run_session(
         capabilities: Capabilities::default(),
         mcp: None,
         pump: None,
+        tool_lease: None,
     };
     while let Some(job) = jobs.recv().await {
         match job {
@@ -1102,6 +1112,16 @@ pub(crate) async fn run_session(
                 // closes, but the session stays open for the next run.
                 runtime.stop_recording().await;
                 runtime.close_harness().await;
+                break;
+            }
+            Job::AccountRemoved => {
+                tracing::info!(session = %session_id, "the account of the session was removed");
+                runtime.stop_recording().await;
+                runtime.close_harness().await;
+                runtime.lost(
+                    "account_removed",
+                    "The account of this session was removed from the worker.",
+                );
                 break;
             }
         }

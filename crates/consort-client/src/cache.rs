@@ -8,8 +8,8 @@ use consort_proto::{
     client_api::{EntityKind, EntityPayload, FeedChange, FeedEntry, Snapshot},
     ids::{ChannelId, TaskId},
     model::{
-        Approval, Channel, Decision, Group, ItemPayload, Message, MessageKind, ReadMarker, Repo,
-        SessionItem, Task, Worker,
+        AcpRegistryAgent, Approval, Channel, Decision, Group, ItemPayload, Message, MessageKind,
+        ReadMarker, Repo, SessionItem, SignIn, Task, Worker,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -114,6 +114,17 @@ pub struct Cache {
     /// by kind and ID. A snapshot that was read before that `seq` must not
     /// overwrite the entity. See [`Cache::merge_entities`].
     pub touched: HashMap<(EntityKind, String), u64>,
+    /// The sign-ins that this client started, by ID: from the
+    /// `sign_in.start` result, then from their feed entries.
+    pub sign_ins: BTreeMap<String, SignIn>,
+    /// The sign-ins that the user dismissed. A late feed entry does not
+    /// bring them back.
+    pub sign_ins_dismissed: BTreeSet<String>,
+    /// The ACP registry, once loaded, and how its load went.
+    pub acp_registry: Vec<AcpRegistryAgent>,
+    pub acp_registry_load: crate::view::RegistryLoad,
+    /// The icons of registry agents that loaded, as SVG text, by agent ID.
+    pub acp_icons: BTreeMap<String, String>,
 }
 
 /// Why a message that waited for a channel did not go out when the channel
@@ -548,6 +559,15 @@ impl Cache {
                         return false;
                     }
                 }
+                // Only the sign-ins that this client started show. Another
+                // client's sign-in is not this user's flow to follow here.
+                EntityPayload::SignIn(sign_in) => {
+                    let id = sign_in.id.to_string();
+                    if !self.sign_ins.contains_key(&id) || self.sign_ins_dismissed.contains(&id) {
+                        return false;
+                    }
+                    self.sign_ins.insert(id, sign_in);
+                }
                 // Memory notes, files, routines and clients have no view
                 // yet.
                 _ => return false,
@@ -567,6 +587,7 @@ impl Cache {
                     EntityKind::Approval => self.approvals.remove(id).is_some(),
                     EntityKind::Decision => self.decisions.remove(id).is_some(),
                     EntityKind::ReadMarker => self.read_markers.remove(id).is_some(),
+                    EntityKind::SignIn => self.sign_ins.remove(id).is_some(),
                     EntityKind::SessionItem => id.split_once(':').is_some_and(|(session, item)| {
                         let Some(items) = self.session_items.get_mut(session) else {
                             return false;

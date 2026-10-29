@@ -6,10 +6,10 @@ use std::{
     time::Duration,
 };
 
-use tokio::sync::{oneshot, watch};
+use tokio::sync::watch;
 
 use crate::{
-    Backend, ClientError, Command,
+    AcpSpec, Backend, ClientError, Command, CommandOutput,
     derive::{refresh, waiting_detail},
     format,
     view::*,
@@ -18,6 +18,19 @@ use crate::{
 pub(crate) struct MockBackend {
     state: Arc<Mutex<ViewState>>,
     next_id: u64,
+}
+
+/// A change that the mock makes a while after a command, the way a worker
+/// answers later: a sign-in that ends, or an install that finishes.
+type Later = (Duration, Box<dyn FnOnce(&mut ViewState) + Send>);
+
+/// What a command did to the mock.
+#[derive(Default)]
+struct Applied {
+    /// The channel that gets the demo reply.
+    reply_to: Option<String>,
+    output: CommandOutput,
+    later: Vec<Later>,
 }
 
 fn publish_state(state: &Mutex<ViewState>, publish: &watch::Sender<Arc<ViewState>>) {
@@ -44,7 +57,10 @@ impl MockBackend {
         format!("{prefix}_mock_{}", self.next_id)
     }
 
-    fn apply(&mut self, command: Command) -> Result<Option<String>, ClientError> {
+    fn apply(&mut self, command: Command) -> Result<Applied, ClientError> {
+        let mut applied = Applied::default();
+        let new_account_id = self.id("acc");
+        let new_sign_in_id = self.id("sgn");
         let now = format::now_ms();
         let time = format::time_label(now);
         let message_id = self.id("msg");
@@ -153,6 +169,7 @@ impl MockBackend {
                     preferred_workers: new.preferred_workers,
                     task_selection: new.task_selection,
                     default_isolation: new.isolation,
+                    tags: checked_tags(&new.tags)?,
                     ..ChannelView::default()
                 });
                 state.timelines.push(TimelineView {
@@ -185,6 +202,9 @@ impl MockBackend {
                 }
                 if let Some(group) = changes.group_id {
                     channel.group_id = Some(group);
+                }
+                if let Some(tags) = changes.tags {
+                    channel.tags = checked_tags(&tags)?;
                 }
                 let name = channel.name.clone();
                 for task in state
@@ -403,14 +423,334 @@ impl MockBackend {
                 worker_mut(&mut state, &worker_id)?.name = name;
             }
             Command::SetWorkerTags { worker_id, tags } => {
+                let tags = checked_tags(&tags)?;
                 worker_mut(&mut state, &worker_id)?.tags = tags;
             }
             Command::SetWorkerPaused { worker_id, paused } => {
                 worker_mut(&mut state, &worker_id)?.paused = paused;
             }
             Command::RemoveWorker { worker_id } => state.workers.retain(|w| w.id != worker_id),
+            Command::CreateAccount(new) => {
+                let label = new.label.trim().to_owned();
+                if label.is_empty() {
+                    return Err(invalid("Enter a name for the account."));
+                }
+                let worker = online_worker_mut(&mut state, &new.worker_id)?;
+                let harness = match &new.acp {
+                    Some(AcpSpec::Registry { id }) => format!("acp:{id}"),
+                    _ => new.harness.clone(),
+                };
+                let (mut provider, mut logo) = provider_of(&harness);
+                if let ProviderLogo::Registry { id, .. } = &logo
+                    && let Some(agent) = crate::mock::acp_agents().into_iter().find(|a| &a.id == id)
+                {
+                    provider = agent.name;
+                    logo = agent.logo;
+                }
+                let keyed = !new.env.is_empty();
+                let status = if keyed {
+                    AccountStatus::Ready
+                } else {
+                    AccountStatus::NotSignedIn
+                };
+                worker.accounts.push(HarnessAccountView {
+                    id: new_account_id.clone(),
+                    label,
+                    harness: harness.clone(),
+                    provider,
+                    logo,
+                    detail: if keyed {
+                        format!("API key saved on {}.", worker.name)
+                    } else {
+                        "Not signed in yet.".to_owned()
+                    },
+                    detail_code: Vec::new(),
+                    auth: if keyed {
+                        AuthState::KeyFound
+                    } else {
+                        AuthState::SignedOut
+                    },
+                    status,
+                    action: status.action(),
+                    sign_in_methods: crate::mock::sign_in_methods(&harness),
+                    secret_names: new.env.names(),
+                    email: None,
+                });
+                applied.output = CommandOutput::AccountCreated(new_account_id);
+            }
+            Command::UpdateAccount {
+                worker_id,
+                account_id,
+                label,
+                env_set,
+                env_remove,
+            } => {
+                let worker = online_worker_mut(&mut state, &worker_id)?;
+                let worker_name = worker.name.clone();
+                let account = account_mut(worker, &account_id)?;
+                if let Some(label) = label {
+                    let label = label.trim().to_owned();
+                    if label.is_empty() {
+                        return Err(invalid("Enter a name for the account."));
+                    }
+                    account.label = label;
+                }
+                account.secret_names.retain(|n| !env_remove.contains(n));
+                for name in env_set.names() {
+                    if !account.secret_names.contains(&name) {
+                        account.secret_names.push(name);
+                    }
+                }
+                if !env_set.is_empty() {
+                    set_account_status(
+                        account,
+                        AccountStatus::Ready,
+                        format!("API key saved on {worker_name}."),
+                    );
+                }
+            }
+            Command::RemoveAccount {
+                worker_id,
+                account_id,
+            } => {
+                let worker = online_worker_mut(&mut state, &worker_id)?;
+                account_mut(worker, &account_id)?;
+                worker.accounts.retain(|a| a.id != account_id);
+            }
+            Command::SignOutAccount {
+                worker_id,
+                account_id,
+            } => {
+                let worker = online_worker_mut(&mut state, &worker_id)?;
+                let account = account_mut(worker, &account_id)?;
+                account.secret_names.clear();
+                set_account_status(
+                    account,
+                    AccountStatus::NotSignedIn,
+                    "Signed out. Sign in to use this account again.".to_owned(),
+                );
+            }
+            Command::StartSignIn {
+                worker_id,
+                account_id,
+                method,
+            } => {
+                let worker = online_worker_mut(&mut state, &worker_id)?;
+                account_mut(worker, &account_id)?;
+                let step = match &method {
+                    SignInChoice::ClaudePlan | SignInChoice::ClaudeConsole => {
+                        SignInStep::NeedsCode {
+                            url:
+                                "https://claude.ai/oauth/authorize?code=true&client_id=consort-mock"
+                                    .into(),
+                        }
+                    }
+                    SignInChoice::ChatgptDevice => SignInStep::DeviceCode {
+                        url: "https://auth.openai.com/codex/device".into(),
+                        user_code: "KQ7M-4XPD".into(),
+                    },
+                    SignInChoice::ChatgptBrowser | SignInChoice::AcpAgent { .. } => {
+                        SignInStep::OpenUrl {
+                            url: "https://example.com/sign-in".into(),
+                        }
+                    }
+                    SignInChoice::ApiKey { .. } | SignInChoice::Terminal { .. } => {
+                        return Err(invalid(
+                            "This way to sign in has no flow on the worker. Save the key, or run the command on the worker.",
+                        ));
+                    }
+                };
+                let waits_for_page = matches!(
+                    step,
+                    SignInStep::DeviceCode { .. } | SignInStep::OpenUrl { .. }
+                );
+                state.sign_ins.push(SignInView {
+                    id: new_sign_in_id.clone(),
+                    worker_id: worker_id.clone(),
+                    account_id: account_id.clone(),
+                    method: Some(method),
+                    step,
+                });
+                if waits_for_page {
+                    // As if the user signed in on the page.
+                    let id = new_sign_in_id.clone();
+                    applied.later.push((
+                        Duration::from_secs(6),
+                        Box::new(move |state: &mut ViewState| {
+                            finish_sign_in(state, &id, &worker_id, &account_id)
+                        }),
+                    ));
+                }
+                applied.output = CommandOutput::SignInStarted(new_sign_in_id);
+            }
+            Command::SubmitSignInCode { sign_in_id, code } => {
+                let sign_in = state
+                    .sign_ins
+                    .iter_mut()
+                    .find(|s| s.id == sign_in_id)
+                    .ok_or_else(not_found)?;
+                if code.0.trim().is_empty() {
+                    return Err(invalid("Paste the code that the sign-in page shows."));
+                }
+                let wrong = code.0.trim() == "wrong";
+                sign_in.step = SignInStep::Verifying;
+                let (worker_id, account_id) =
+                    (sign_in.worker_id.clone(), sign_in.account_id.clone());
+                applied.later.push((
+                    Duration::from_millis(1_200),
+                    Box::new(move |state: &mut ViewState| {
+                        if wrong {
+                            if let Some(s) = state.sign_ins.iter_mut().find(|s| s.id == sign_in_id) {
+                                s.step = SignInStep::Failed {
+                                    message: "Claude did not accept the code. Open the sign-in page again, copy the new code, then try again.".into(),
+                                };
+                            }
+                        } else {
+                            finish_sign_in(state, &sign_in_id, &worker_id, &account_id);
+                        }
+                    }),
+                ));
+            }
+            Command::CancelSignIn { sign_in_id } => {
+                let sign_in = state
+                    .sign_ins
+                    .iter_mut()
+                    .find(|s| s.id == sign_in_id)
+                    .ok_or_else(not_found)?;
+                if !sign_in.step.is_final() {
+                    sign_in.step = SignInStep::Cancelled;
+                }
+            }
+            Command::DismissSignIn { sign_in_id } => {
+                state.sign_ins.retain(|s| s.id != sign_in_id);
+            }
+            Command::CheckTools { worker_id } => {
+                online_worker_mut(&mut state, &worker_id)?;
+            }
+            Command::InstallTool { worker_id, tool } => {
+                let worker = online_worker_mut(&mut state, &worker_id)?;
+                let row = worker
+                    .tools
+                    .iter_mut()
+                    .find(|t| t.id == tool)
+                    .ok_or_else(not_found)?;
+                row.state = ToolState::Installing;
+                row.detail = None;
+                applied.later.push((
+                    Duration::from_secs(2),
+                    Box::new(move |state: &mut ViewState| {
+                        if let Some(row) = state
+                            .workers
+                            .iter_mut()
+                            .filter(|w| w.id == worker_id)
+                            .flat_map(|w| w.tools.iter_mut())
+                            .find(|t| t.id == tool)
+                        {
+                            row.version = row
+                                .latest
+                                .take()
+                                .or_else(|| row.version.clone())
+                                .or_else(|| Some("1.0.0".into()));
+                            row.state = ToolState::Ready;
+                        }
+                    }),
+                ));
+            }
+            Command::LoadAcpRegistry => {
+                state.acp_registry = AcpRegistryView {
+                    load: RegistryLoad::Loaded,
+                    agents: crate::mock::acp_agents(),
+                };
+            }
         }
-        Ok(reply_to)
+        applied.reply_to = reply_to;
+        Ok(applied)
+    }
+}
+
+fn invalid(message: &str) -> ClientError {
+    ClientError::Hub {
+        code: "invalid".into(),
+        message: message.into(),
+    }
+}
+
+/// Checks tags the way the hub does, with its `invalid_tag` answer.
+fn checked_tags(tags: &[String]) -> Result<Vec<String>, ClientError> {
+    consort_proto::model::normalize_tags(tags).map_err(|err| ClientError::Hub {
+        code: "invalid_tag".into(),
+        message: err.to_string(),
+    })
+}
+
+/// A worker that can take an account command: the hub refuses one for an
+/// offline worker with `worker_offline`.
+fn online_worker_mut<'a>(
+    state: &'a mut ViewState,
+    worker_id: &str,
+) -> Result<&'a mut WorkerView, ClientError> {
+    let worker = worker_mut(state, worker_id)?;
+    if !worker.online {
+        return Err(ClientError::Hub {
+            code: "worker_offline".into(),
+            message: format!(
+                "{} is offline. Try again when it is back online.",
+                worker.name
+            ),
+        });
+    }
+    Ok(worker)
+}
+
+fn account_mut<'a>(
+    worker: &'a mut WorkerView,
+    account_id: &str,
+) -> Result<&'a mut HarnessAccountView, ClientError> {
+    worker
+        .accounts
+        .iter_mut()
+        .find(|a| a.id == account_id)
+        .ok_or_else(not_found)
+}
+
+fn set_account_status(account: &mut HarnessAccountView, status: AccountStatus, detail: String) {
+    account.status = status;
+    account.action = status.action();
+    account.detail = detail;
+    account.detail_code.clear();
+    account.auth = match status {
+        AccountStatus::SignedIn => AuthState::SignedIn,
+        AccountStatus::Ready => AuthState::KeyFound,
+        AccountStatus::NotSignedIn => AuthState::SignedOut,
+        _ => AuthState::Unknown,
+    };
+}
+
+/// Ends a sign-in as a success, and signs its account in.
+fn finish_sign_in(state: &mut ViewState, sign_in_id: &str, worker_id: &str, account_id: &str) {
+    let Some(sign_in) = state.sign_ins.iter_mut().find(|s| s.id == sign_in_id) else {
+        return;
+    };
+    if sign_in.step.is_final() {
+        return;
+    }
+    let email = "chris@example.com";
+    sign_in.step = SignInStep::Succeeded {
+        detail: Some(email.into()),
+    };
+    if let Some(account) = state
+        .workers
+        .iter_mut()
+        .filter(|w| w.id == worker_id)
+        .flat_map(|w| w.accounts.iter_mut())
+        .find(|a| a.id == account_id)
+    {
+        account.email = Some(email.into());
+        set_account_status(
+            account,
+            AccountStatus::SignedIn,
+            format!("Signed in as {email}."),
+        );
     }
 }
 
@@ -520,7 +860,7 @@ impl Backend for MockBackend {
     fn handle(
         &mut self,
         command: Command,
-        reply: oneshot::Sender<Result<(), ClientError>>,
+        reply: crate::Reply,
         publish: &watch::Sender<Arc<ViewState>>,
     ) {
         let _ = reply.send(self.apply_and_publish(command, publish));
@@ -532,9 +872,24 @@ impl MockBackend {
         &mut self,
         command: Command,
         publish: &watch::Sender<Arc<ViewState>>,
-    ) -> Result<(), ClientError> {
-        let reply_to = self.apply(command)?;
+    ) -> Result<CommandOutput, ClientError> {
+        let Applied {
+            reply_to,
+            output,
+            later,
+        } = self.apply(command)?;
         publish_state(&self.state, publish);
+        for (delay, change) in later {
+            let state = self.state.clone();
+            let publish = publish.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                if let Ok(mut s) = state.lock() {
+                    change(&mut s);
+                }
+                publish_state(&state, &publish);
+            });
+        }
         if let Some(channel_id) = reply_to {
             let state = self.state.clone();
             let publish = publish.clone();
@@ -559,7 +914,7 @@ impl MockBackend {
                 publish_state(&state, &publish);
             });
         }
-        Ok(())
+        Ok(output)
     }
 }
 
@@ -767,5 +1122,236 @@ mod pairing_tests {
                     Some("KQ7M-4XPD")
                 );
             });
+    }
+}
+
+#[cfg(test)]
+mod account_tests {
+    use crate::{Client, ClientError, NewAccount, SecretEnv, view::*};
+
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime")
+            .block_on(f)
+    }
+
+    async fn settled(
+        client: &Client,
+        until: impl Fn(&ViewState) -> bool,
+    ) -> std::sync::Arc<ViewState> {
+        let mut sub = client.subscribe();
+        loop {
+            let state = sub.current();
+            if until(&state) {
+                return state;
+            }
+            sub.next().await.expect("state");
+        }
+    }
+
+    #[test]
+    fn a_new_account_signs_in_with_a_code() {
+        let client = Client::mock().expect("mock");
+        block_on(async {
+            let account_id = client
+                .create_account(NewAccount {
+                    worker_id: "wrk_bigboi".into(),
+                    harness: "claude".into(),
+                    label: "Claude Lab".into(),
+                    ..NewAccount::default()
+                })
+                .await
+                .expect("created");
+            let state = client.state();
+            let account = state
+                .worker("wrk_bigboi")
+                .and_then(|w| w.account(&account_id))
+                .expect("account");
+            assert_eq!(account.status, AccountStatus::NotSignedIn);
+            assert_eq!(account.action, AccountAction::SignIn);
+            assert_eq!(account.sign_in_methods[0], SignInChoice::ClaudePlan);
+            let sign_in = client
+                .start_sign_in(
+                    "wrk_bigboi".into(),
+                    account_id.clone(),
+                    SignInChoice::ClaudePlan,
+                )
+                .await
+                .expect("started");
+            assert!(matches!(
+                client.state().sign_in(&sign_in).map(|s| &s.step),
+                Some(SignInStep::NeedsCode { .. })
+            ));
+            client
+                .submit_sign_in_code(sign_in.clone(), "abc".into())
+                .await
+                .expect("sent");
+            let state = settled(&client, |s| {
+                s.sign_in(&sign_in).is_some_and(|s| s.step.is_final())
+            })
+            .await;
+            assert_eq!(
+                state.sign_in(&sign_in).map(|s| s.step.clone()),
+                Some(SignInStep::Succeeded {
+                    detail: Some("chris@example.com".into())
+                })
+            );
+            let account = state
+                .worker("wrk_bigboi")
+                .and_then(|w| w.account(&account_id))
+                .expect("account");
+            assert_eq!(account.status, AccountStatus::SignedIn);
+            assert_eq!(account.action, AccountAction::SignOut);
+        });
+    }
+
+    #[test]
+    fn an_api_key_account_is_ready_and_names_its_worker() {
+        let client = Client::mock().expect("mock");
+        block_on(async {
+            let mut env = SecretEnv::new();
+            env.insert("OPENAI_API_KEY", "sk-secret");
+            let id = client
+                .create_account(NewAccount {
+                    worker_id: "wrk_macbook".into(),
+                    harness: "codex".into(),
+                    label: "Codex API".into(),
+                    acp: None,
+                    env,
+                })
+                .await
+                .expect("created");
+            let state = client.state();
+            let account = state
+                .worker("wrk_macbook")
+                .and_then(|w| w.account(&id))
+                .expect("account");
+            assert_eq!(account.status, AccountStatus::Ready);
+            assert_eq!(account.detail, "API key saved on MacBook Pro.");
+            assert_eq!(account.secret_names, ["OPENAI_API_KEY"]);
+        });
+    }
+
+    #[test]
+    fn an_offline_worker_refuses_account_changes() {
+        let client = Client::mock().expect("mock");
+        let err =
+            block_on(client.sign_out_account("wrk_truenas".into(), "acc_truenas_claude".into()))
+                .expect_err("refused");
+        assert!(matches!(&err, ClientError::Hub { code, .. } if code == "worker_offline"));
+    }
+
+    #[test]
+    fn a_bad_tag_gets_the_invalid_tag_answer() {
+        let client = Client::mock().expect("mock");
+        let err = block_on(client.set_worker_tags("wrk_bigboi".into(), vec!["GPU box".into()]))
+            .expect_err("refused");
+        match err {
+            ClientError::Hub { code, message } => {
+                assert_eq!(code, "invalid_tag");
+                assert!(message.contains("lowercase letters"), "{message}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn names_of_other_workers_are_offered_for_a_new_account() {
+        let state = crate::mock::view_state();
+        let names = state.account_names("claude", "wrk_bigboi");
+        let personal = names
+            .iter()
+            .find(|n| n.label == "Claude Personal")
+            .expect("name");
+        assert_eq!(
+            personal.workers,
+            ["hub", "homelab", "MacBook Pro", "truenas"]
+        );
+        let work = names
+            .iter()
+            .find(|n| n.label == "Claude Work")
+            .expect("name");
+        assert_eq!(work.workers, ["MacBook Pro"]);
+        assert!(
+            names
+                .iter()
+                .all(|n| !n.workers.contains(&"bigboi".to_owned()))
+        );
+        assert_eq!(profile_slug("Claude Work"), "claude-work");
+        assert_eq!(profile_slug("  Ünïcode & co  "), "n-code-co");
+        assert_eq!(profile_slug("!!!"), "account");
+    }
+
+    #[test]
+    fn the_registry_loads_and_a_tool_installs() {
+        let client = Client::mock().expect("mock");
+        block_on(async {
+            client.load_acp_registry().await.expect("loaded");
+            let state = client.state();
+            assert_eq!(state.acp_registry.load, RegistryLoad::Loaded);
+            let found = state.acp_registry.search("goose");
+            assert_eq!(found.len(), 1);
+            assert!(matches!(
+                &found[0].logo,
+                ProviderLogo::Registry { svg: Some(_), .. }
+            ));
+            // The agents that a worker can install come first.
+            assert!(
+                state
+                    .acp_registry
+                    .search("")
+                    .last()
+                    .is_some_and(|a| !a.supported)
+            );
+
+            client
+                .install_tool("wrk_bigboi".into(), "codex".into())
+                .await
+                .expect("started");
+            let tool = |s: &ViewState| {
+                s.worker("wrk_bigboi")
+                    .and_then(|w| w.tools.iter().find(|t| t.id == "codex").cloned())
+                    .expect("tool")
+            };
+            assert_eq!(tool(&client.state()).state, ToolState::Installing);
+            let state = settled(&client, |s| tool(s).state == ToolState::Ready).await;
+            assert_eq!(tool(&state).version.as_deref(), Some("0.165.0"));
+        });
+    }
+
+    #[test]
+    fn a_channel_keeps_its_tags() {
+        let client = Client::mock().expect("mock");
+        block_on(async {
+            client
+                .create_channel(crate::NewChannel {
+                    name: "consort".into(),
+                    tags: vec!["personal".into()],
+                    ..crate::NewChannel::default()
+                })
+                .await
+                .expect("created");
+            let state = client.state();
+            let channel = state
+                .channels
+                .iter()
+                .find(|c| c.name == "consort")
+                .expect("channel");
+            assert_eq!(channel.tags, ["personal"]);
+            assert_eq!(state.workers_with_tags(&channel.tags).len(), 3);
+            let err = client
+                .update_channel(
+                    channel.id.clone(),
+                    crate::ChannelChanges {
+                        tags: Some(vec!["Bad Tag".into()]),
+                        ..crate::ChannelChanges::default()
+                    },
+                )
+                .await
+                .expect_err("refused");
+            assert!(matches!(err, ClientError::Hub { code, .. } if code == "invalid_tag"));
+        });
     }
 }

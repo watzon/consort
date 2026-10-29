@@ -1,7 +1,53 @@
 //! What a client asks for. Each public method of [`crate::Client`] sends one
 //! of these to the backend on the client's own runtime.
 
-use crate::view::{ApprovalChoice, Isolation};
+use std::fmt;
+
+pub use consort_proto::model::SecretEnv;
+
+use crate::view::{ApprovalChoice, Isolation, SelectionView, SignInChoice};
+
+/// A secret text, such as a sign-in code. `Debug` never shows it.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct SecretText(pub String);
+
+impl fmt::Debug for SecretText {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+/// The ACP agent of a new account.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AcpSpec {
+    /// An agent from the ACP registry, by its ID.
+    Registry { id: String },
+    /// A program that the worker runs as it is.
+    Command { program: String, args: Vec<String> },
+}
+
+/// The fields of a new account, from the Add account dialog.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct NewAccount {
+    pub worker_id: String,
+    /// The harness: `claude`, `codex`, `opencode`, `gemini` or `acp`.
+    pub harness: String,
+    pub label: String,
+    pub acp: Option<AcpSpec>,
+    /// Secret variables, such as an API key.
+    pub env: SecretEnv,
+}
+
+/// What a command gives back, for the few commands that make something.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum CommandOutput {
+    #[default]
+    Done,
+    /// `account.create` made an account with this ID.
+    AccountCreated(String),
+    /// `sign_in.start` started a sign-in with this ID.
+    SignInStarted(String),
+}
 
 /// The fields of a new channel, from the New channel dialog.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -11,8 +57,10 @@ pub struct NewChannel {
     pub group_id: Option<String>,
     pub repos: Vec<String>,
     pub preferred_workers: Vec<String>,
-    pub task_selection: Option<String>,
+    pub task_selection: Option<SelectionView>,
     pub isolation: Isolation,
+    /// The worker tags that the channel requires.
+    pub tags: Vec<String>,
     /// The name of a group to make for this channel. When it is set, the
     /// client makes the group first and puts the channel in it, and
     /// `group_id` is not used.
@@ -27,6 +75,9 @@ pub struct ChannelChanges {
     pub instructions: Option<String>,
     pub icon: Option<String>,
     pub group_id: Option<String>,
+    /// The worker tags that the channel requires. `Some(vec![])` removes
+    /// them all.
+    pub tags: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -142,6 +193,56 @@ pub enum Command {
     RemoveWorker {
         worker_id: String,
     },
+    /// Makes an account on a worker. The output is
+    /// [`CommandOutput::AccountCreated`].
+    CreateAccount(NewAccount),
+    /// Renames an account, or sets or removes its secret variables.
+    UpdateAccount {
+        worker_id: String,
+        account_id: String,
+        label: Option<String>,
+        env_set: SecretEnv,
+        env_remove: Vec<String>,
+    },
+    /// Removes an account and its profile folder.
+    RemoveAccount {
+        worker_id: String,
+        account_id: String,
+    },
+    SignOutAccount {
+        worker_id: String,
+        account_id: String,
+    },
+    /// Starts a sign-in. The output is [`CommandOutput::SignInStarted`].
+    StartSignIn {
+        worker_id: String,
+        account_id: String,
+        method: SignInChoice,
+    },
+    /// Sends the code that the sign-in page showed.
+    SubmitSignInCode {
+        sign_in_id: String,
+        code: SecretText,
+    },
+    CancelSignIn {
+        sign_in_id: String,
+    },
+    /// Forgets a sign-in that has ended, so it leaves the view state.
+    DismissSignIn {
+        sign_in_id: String,
+    },
+    /// Asks a worker to check for tool updates now.
+    CheckTools {
+        worker_id: String,
+    },
+    /// Asks a worker to install or update one tool.
+    InstallTool {
+        worker_id: String,
+        tool: String,
+    },
+    /// Loads the ACP registry, and the icons of its agents. It does nothing
+    /// while a load runs or after a load that worked.
+    LoadAcpRegistry,
 }
 
 /// Refuses a channel ID that cannot name a channel. The ID is empty until the

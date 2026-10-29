@@ -25,6 +25,16 @@ use consort_worker::config::WorkerToml;
 use consort_worker::{Harnesses, WorkerConfig};
 use serde_json::json;
 
+/// A worker config with its Consort home in the test folder and no update
+/// check, so the test makes no network request.
+fn test_config(dir: &std::path::Path) -> WorkerConfig {
+    WorkerConfig {
+        config_dir: dir.to_path_buf(),
+        consort_home: Some(dir.join("home")),
+        check_tool_updates: false,
+    }
+}
+
 fn session_start(session_id: SessionId, account_id: AccountId) -> SessionStart {
     SessionStart {
         session_id,
@@ -74,7 +84,6 @@ async fn pair_connect_run_a_session_and_resend_after_reconnect() {
     let mut toml = WorkerToml::load(dir.path()).unwrap();
     assert_eq!(toml.worker_id, Some(worker_id));
     assert_eq!(toml.tags, vec!["ci".to_owned()]);
-    toml.auto_discover = false;
     let account = AccountConfig::default_for(HarnessKind::ClaudeCode);
     let account_id = account.id;
     toml.accounts = vec![account];
@@ -103,14 +112,9 @@ async fn pair_connect_run_a_session_and_resend_after_reconnect() {
         HarnessKind::ClaudeCode,
         Arc::new(fake.clone()) as Arc<dyn Harness>,
     );
-    let worker = consort_worker::run_with(
-        WorkerConfig {
-            config_dir: dir.path().to_path_buf(),
-        },
-        harnesses,
-    )
-    .await
-    .unwrap();
+    let worker = consort_worker::run_with(test_config(dir.path()), harnesses)
+        .await
+        .unwrap();
     assert_eq!(worker.worker_id(), worker_id);
     assert!(worker.wait_connected(Duration::from_secs(10)).await);
     hub.wait_connected().await;
@@ -135,7 +139,24 @@ async fn pair_connect_run_a_session_and_resend_after_reconnect() {
     assert_eq!(inventory.accounts[0].label, "Claude Code");
     assert_eq!(inventory.accounts[0].harness, "claude");
     assert_eq!(inventory.accounts[0].models[0].id, "fake-model");
-    assert_eq!(inventory.tags, vec!["ci".to_owned()]);
+    // The detected tags come first, then the tags of worker.toml.
+    assert_eq!(inventory.tags.last().map(String::as_str), Some("ci"));
+    assert_eq!(
+        inventory.tags[0],
+        match std::env::consts::OS {
+            "macos" => "macos",
+            "windows" => "windows",
+            _ => "linux",
+        }
+    );
+    assert!(inventory.tags.iter().any(|t| t.starts_with("cpu-")));
+    // The managed tools are in the inventory, and a fake harness needs none.
+    assert!(
+        inventory
+            .tools
+            .iter()
+            .any(|t| t.tool.as_str() == "claude-code")
+    );
     assert_eq!(inventory.hash, inventory.compute_hash());
 
     // Start a session with a first turn.
@@ -344,7 +365,6 @@ async fn sessions_resume_after_a_worker_restart() {
         .await
         .unwrap();
     let mut toml = WorkerToml::load(dir.path()).unwrap();
-    toml.auto_discover = false;
     let account = AccountConfig::default_for(HarnessKind::Codex);
     let account_id = account.id;
     toml.accounts = vec![account];
@@ -360,9 +380,7 @@ async fn sessions_resume_after_a_worker_restart() {
         );
         h
     };
-    let config = WorkerConfig {
-        config_dir: dir.path().to_path_buf(),
-    };
+    let config = test_config(dir.path());
     let worker = consort_worker::run_with(config.clone(), harnesses())
         .await
         .unwrap();
@@ -435,7 +453,6 @@ async fn the_worker_allows_hub_tools_without_asking_the_hub() {
         .await
         .unwrap();
     let mut toml = WorkerToml::load(dir.path()).unwrap();
-    toml.auto_discover = false;
     let account = AccountConfig::default_for(HarnessKind::ClaudeCode);
     let account_id = account.id;
     toml.accounts = vec![account];
@@ -470,14 +487,9 @@ async fn the_worker_allows_hub_tools_without_asking_the_hub() {
         HarnessKind::ClaudeCode,
         Arc::new(fake.clone()) as Arc<dyn Harness>,
     );
-    let worker = consort_worker::run_with(
-        WorkerConfig {
-            config_dir: dir.path().to_path_buf(),
-        },
-        harnesses,
-    )
-    .await
-    .unwrap();
+    let worker = consort_worker::run_with(test_config(dir.path()), harnesses)
+        .await
+        .unwrap();
     hub.wait_connected().await;
     let session_id = SessionId::new();
     let mut start = session_start(session_id, account_id);
@@ -582,7 +594,6 @@ async fn a_signed_out_session_makes_the_worker_send_a_signed_out_inventory() {
         .await
         .unwrap();
     let mut toml = WorkerToml::load(dir.path()).unwrap();
-    toml.auto_discover = false;
     let account = AccountConfig::default_for(HarnessKind::ClaudeCode);
     let account_id = account.id;
     toml.accounts = vec![account];
@@ -606,14 +617,9 @@ async fn a_signed_out_session_makes_the_worker_send_a_signed_out_inventory() {
         HarnessKind::ClaudeCode,
         Arc::new(fake.clone()) as Arc<dyn Harness>,
     );
-    let worker = consort_worker::run_with(
-        WorkerConfig {
-            config_dir: dir.path().to_path_buf(),
-        },
-        harnesses,
-    )
-    .await
-    .unwrap();
+    let worker = consort_worker::run_with(test_config(dir.path()), harnesses)
+        .await
+        .unwrap();
     hub.wait_connected().await;
     hub.wait_for("a signed-in inventory", |h| {
         h.state

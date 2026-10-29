@@ -614,6 +614,40 @@ impl FakeWorker {
     }
 }
 
+/// A worker whose connection is closed. It keeps its identity, so it can
+/// connect again as the same worker.
+pub struct AwayWorker {
+    pub worker_id: WorkerId,
+    key: SigningKey,
+    account_id: AccountId,
+}
+
+impl FakeWorker {
+    /// Closes the connection. The hub keeps the worker and its inventory.
+    pub async fn go_away(self) -> AwayWorker {
+        let FakeWorker {
+            peer,
+            worker_id,
+            key,
+            account_id,
+            ..
+        } = self;
+        peer.close().await;
+        AwayWorker {
+            worker_id,
+            key,
+            account_id,
+        }
+    }
+}
+
+impl AwayWorker {
+    /// Connects again with the same identity.
+    pub async fn come_back(self, hub: &TestHub) -> FakeWorker {
+        FakeWorker::connect(hub, self.worker_id, self.key, self.account_id, Vec::new()).await
+    }
+}
+
 /// Polls until `check` returns Some.
 pub async fn eventually<T, F, Fut>(mut check: F) -> T
 where

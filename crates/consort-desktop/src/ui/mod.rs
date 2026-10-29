@@ -1,3 +1,4 @@
+pub mod add_account;
 pub mod dialogs;
 pub mod links;
 pub mod markdown;
@@ -11,3 +12,4 @@ pub mod startup_error;
 pub mod switcher;
 pub mod timeline;
 pub mod window_controls;
+pub mod workers;

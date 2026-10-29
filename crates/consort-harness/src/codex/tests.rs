@@ -733,3 +733,66 @@ mod fake_server {
         ));
     }
 }
+
+#[test]
+fn the_managed_codex_launch_wins_unless_a_binary_is_set() {
+    let mut account = AccountConfig::default_for(HarnessKind::Codex);
+    assert_eq!(account.managed_tool(), Some(crate::ToolId::Codex));
+    account.runtime.launch = Some(crate::Launch {
+        program: "/tools/codex/bin/codex".into(),
+        args: vec!["app-server".into()],
+        env: BTreeMap::from([("PATH".to_owned(), "/tools/codex/codex-path".to_owned())]),
+    });
+    account.runtime.env_remove = vec!["OPENAI_API_KEY".into()];
+    let dir = std::env::temp_dir();
+    let spec = app_server_spec(&account, &dir, BTreeMap::new(), None, &|_| None).unwrap();
+    assert_eq!(
+        spec.program,
+        std::path::PathBuf::from("/tools/codex/bin/codex")
+    );
+    assert_eq!(spec.args, ["app-server"]);
+    assert_eq!(spec.env["PATH"], "/tools/codex/codex-path");
+    assert_eq!(spec.env_remove, ["OPENAI_API_KEY"]);
+
+    account.binary = Some("codex".into());
+    let spec = app_server_spec(&account, &dir, BTreeMap::new(), None, &|name| {
+        Some(std::path::PathBuf::from(format!("/bin/{name}")))
+    })
+    .unwrap();
+    assert_eq!(spec.program, std::path::PathBuf::from("/bin/codex"));
+}
+
+#[test]
+fn account_read_gives_the_email_and_plan() {
+    let mut account = AccountConfig::default_for(HarnessKind::Codex);
+    account.profile = true;
+    let info: GetAccountResponse = serde_json::from_value(json!({
+        "account": {"type": "chatgpt", "email": "a@example.com", "planType": "pro"},
+        "requiresOpenaiAuth": true
+    }))
+    .unwrap();
+    let status = account_status(&account, info);
+    assert_eq!(status.auth_state, AuthState::SignedIn);
+    assert_eq!(status.email.as_deref(), Some("a@example.com"));
+    assert_eq!(status.plan.as_deref(), Some("Pro"));
+    let none: GetAccountResponse =
+        serde_json::from_value(json!({"account": null, "requiresOpenaiAuth": true})).unwrap();
+    let status = account_status(&account, none);
+    assert_eq!(status.auth_state, AuthState::SignedOut);
+    assert!(
+        status.auth_detail.unwrap().contains("Settings > Workers"),
+        "a profile account signs in from the app"
+    );
+}
+
+#[test]
+fn a_state_setup_race_is_recognized() {
+    let race = HarnessError::Spawn(
+        "codex app-server exited: Error: failed to initialize sqlite state runtime under /x: failed to initialize state runtime at /x".into(),
+    );
+    assert!(is_state_init_race(&race));
+    assert!(!is_state_init_race(&HarnessError::Spawn(
+        "codex app-server exited: boom".into()
+    )));
+    assert!(!is_state_init_race(&HarnessError::Closed));
+}

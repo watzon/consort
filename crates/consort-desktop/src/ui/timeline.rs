@@ -207,6 +207,7 @@ impl ConsortApp {
         let channel = state.channel(&self.channel_id);
         let name = channel.map(|c| c.name.clone()).unwrap_or_default();
         let purpose = channel.map(|c| c.purpose.clone()).unwrap_or_default();
+        let tags = channel.map(|c| c.tags.clone()).unwrap_or_default();
         let panel = &state.tasks_panel;
         let pressed = self.panel == Panel::Tasks;
         let tasks_button = focusable(div().id("tasks-button"), t)
@@ -297,6 +298,25 @@ impl ConsortApp {
                     .whitespace_nowrap()
                     .child(name),
             )
+            .when(!tags.is_empty(), |d| {
+                // The channel's worker tags: a click opens the Worker tags
+                // dialog.
+                let id = self.channel_id.clone();
+                let mut chips = div()
+                    .id("channel-tags")
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .gap(t.space.xs)
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_dialog(crate::app::Dialog::ChannelTags(id.clone()), window, cx)
+                    }));
+                for tag in &tags {
+                    chips = chips.child(crate::ui::parts::tag_chip(tag, false, t));
+                }
+                d.child(chips)
+            })
             .child(line(purpose, t.text.ui, c.text_tertiary).flex_1())
             .child(tasks_button)
             .child(new_task)

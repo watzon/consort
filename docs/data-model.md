@@ -12,7 +12,7 @@ This page lists the entities that the hub, the workers and the clients store, wi
 | Worker | `worker.toml` | Hub URL, tags, worker policy, harness accounts, local MCP servers, checkouts |
 | Worker | `worker.db` (SQLite) | Event spool, processed command IDs, local session registry |
 | Worker | `workspaces/` | Worktrees and clones that the worker made for tasks |
-| Worker | `<consort home>/profiles/<account id>/` | The profile folder of each account: the harness's own config and login, and `env.json` with the secret variables (mode 0600 on Unix) |
+| Worker | `<consort home>/profiles/<name>/` | The profile folder of each account, named after the account name when the worker made it (`profile_dir` in `worker.toml`): the harness's own config and login, and `env.json` with the secret variables (mode 0600 on Unix) |
 | Worker | `<consort home>/tools/<tool>/<version>/` | The managed tools that the worker installed |
 | Worker | Each harness's own files | Raw session transcripts and harness logins. The worker never copies these to the hub |
 | Client | `cache.db` (SQLite) | A partial copy of hub entities and the last feed sequence number |
@@ -207,7 +207,7 @@ A turn that ends while the task is in `needs_input` and nothing waits moves the 
 | `task_id` | ID, optional | Set when `role` is `task` |
 | `worker_id` | ID | A session never moves to another worker |
 | `account_id` | ID | Harness account on that worker |
-| `harness` | text | `claude`, `codex`, `pi`, `opencode` or `acp:<agent-id>` |
+| `harness` | text | `claude`, `codex`, `pi`, `opencode`, `gemini`, `acp:<registry id>` for an ACP registry agent, `acp:custom` for a custom ACP command, or `acp` for an ACP account from `worker.toml` |
 | `model`, `options` | text, object | |
 | `workspace_path` | text | Path on the worker |
 | `native_ref` | text, optional | The harness's own session ID, used to resume |
@@ -382,7 +382,7 @@ The worker owns the account configuration and the login. The hub stores only wha
 
 ### Sign-in
 
-One run of a provider's sign-in flow for one account. A feed entity with no channel. The hub stores it in the `sign_ins` table (`id`, `worker_id`, `data`).
+One run of a provider's sign-in flow for one account. A feed entity with no channel. The hub stores it in the `sign_ins` table (`id`, `worker_id`, `updated_at`, `data`). `updated_at` copies `SignIn.updated_at` in Unix milliseconds, so the hub can delete old rows without reading every document.
 
 | Field | Type | Notes |
 |---|---|---|
@@ -469,12 +469,14 @@ args = []
 env = {}
 enabled = true
 
-# An account that Consort made. Its home folders are in the profile folder.
+# An account that Consort made. Its home folders are in the profile folder
+# <consort home>/profiles/claude-personal/.
 [[accounts]]
 id = "acc_0192f0c5-..."
 harness = "claude"
 label = "Claude Personal"
 profile = true
+profile_dir = "claude-personal"
 
 [[local_mcp_servers]]
 name = "home-assistant"

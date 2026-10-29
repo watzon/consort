@@ -10,16 +10,21 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use consort_proto::ids::AccountId;
+use consort_proto::model::AcpAccountSpec;
+use consort_tools::ToolId;
 use serde::{Deserialize, Serialize};
 
-use crate::{HarnessError, HarnessKind};
+use crate::{HarnessError, HarnessKind, Launch};
 
 fn default_true() -> bool {
     true
 }
 
 /// One harness account on this worker.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Debug` shows the names of the environment variables, never their
+/// values, because `env` and the runtime environment can hold secrets.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AccountConfig {
     /// The account ID.
     pub id: AccountId,
@@ -27,7 +32,8 @@ pub struct AccountConfig {
     pub harness: HarnessKind,
     /// The label that the user sees, such as "Codex Personal".
     pub label: String,
-    /// The harness program, when it is not the default on `PATH`.
+    /// The harness program, when it is not the managed tool. An account with
+    /// a `binary` always runs that program.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binary: Option<String>,
     /// The harness's home folder, when it is not the default.
@@ -45,6 +51,71 @@ pub struct AccountConfig {
     /// Whether the worker offers this account to the hub.
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// True for an account that Consort made, with a profile folder in
+    /// `<consort home>/profiles/<account id>/`. The worker derives its home
+    /// folders from the profile folder.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub profile: bool,
+    /// The name of the profile folder in `<consort home>/profiles/`, chosen
+    /// from the label when the account was made, such as `claude-work`. A
+    /// later rename does not move the folder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_dir: Option<String>,
+    /// The ACP agent of an `acp` account that Consort made.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp: Option<AcpAccountSpec>,
+    /// What the worker adds at run time. Never written to `worker.toml`.
+    #[serde(skip)]
+    pub runtime: AccountRuntime,
+}
+
+/// What the worker adds to an account before it gives it to an adapter:
+/// the managed tool launch, the profile variables and the secret variables.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct AccountRuntime {
+    /// How to start the managed tool of the account. An adapter uses it when
+    /// the account has no `binary`.
+    pub launch: Option<Launch>,
+    /// The profile variables, then the secret variables from `env.json`.
+    /// They go after the account's own `env`.
+    pub env: BTreeMap<String, String>,
+    /// Variables to remove from the worker's environment, so a profile
+    /// account does not pick up a login that the machine already has.
+    pub env_remove: Vec<String>,
+}
+
+impl std::fmt::Debug for AccountRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AccountRuntime")
+            .field("launch", &self.launch.as_ref().map(|l| &l.program))
+            .field("env", &self.env.keys().collect::<Vec<_>>())
+            .field("env_remove", &self.env_remove)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for AccountConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AccountConfig")
+            .field("id", &self.id)
+            .field("harness", &self.harness)
+            .field("label", &self.label)
+            .field("binary", &self.binary)
+            .field("home", &self.home)
+            .field("shadow_home", &self.shadow_home)
+            .field("args", &self.args)
+            .field("env", &self.env.keys().collect::<Vec<_>>())
+            .field("enabled", &self.enabled)
+            .field("profile", &self.profile)
+            .field("profile_dir", &self.profile_dir)
+            .field("acp", &self.acp)
+            .field("runtime", &self.runtime)
+            .finish()
+    }
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl AccountConfig {
@@ -61,9 +132,64 @@ impl AccountConfig {
             args: Vec::new(),
             env: BTreeMap::new(),
             enabled: true,
+            profile: false,
+            profile_dir: None,
+            acp: None,
+            runtime: AccountRuntime::default(),
         }
     }
+
+    /// The managed tool that runs this account, or `None` when the account
+    /// names its own `binary` or has no managed tool (Pi, a custom ACP
+    /// command).
+    pub fn managed_tool(&self) -> Option<ToolId> {
+        if self.binary.is_some() {
+            return None;
+        }
+        match self.harness {
+            HarnessKind::ClaudeCode => Some(ToolId::ClaudeAgentAcp),
+            HarnessKind::Codex => Some(ToolId::Codex),
+            HarnessKind::OpenCode => Some(ToolId::OpenCode),
+            HarnessKind::GeminiCli => Some(ToolId::GeminiCli),
+            HarnessKind::Acp => match &self.acp {
+                Some(AcpAccountSpec::Registry { id }) => Some(ToolId::Acp(id.clone())),
+                _ => None,
+            },
+            HarnessKind::Pi => None,
+        }
+    }
+
+    /// The program of the managed launch, when the account uses one.
+    pub fn managed_launch(&self) -> Option<&Launch> {
+        if self.binary.is_some() {
+            return None;
+        }
+        self.runtime.launch.as_ref()
+    }
 }
+
+/// The variables that hold a login or an API key in the environment. The
+/// worker removes them from the environment of a profile account, so the
+/// account uses only its own login and its own `env.json`.
+pub const LOGIN_VARIABLES: &[&str] = &[
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CONFIG_DIR",
+    "OPENAI_API_KEY",
+    "CODEX_API_KEY",
+    "CODEX_HOME",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "GEMINI_CLI_HOME",
+    "OPENROUTER_API_KEY",
+    "FIREWORKS_API_KEY",
+    "XDG_DATA_HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_STATE_HOME",
+    "XDG_CACHE_HOME",
+];
 
 /// The environment variable that sets a harness's home folder.
 pub fn home_variable(kind: HarnessKind) -> Option<&'static str> {
@@ -155,6 +281,7 @@ pub fn prepare_home(account: &AccountConfig) -> Result<BTreeMap<String, String>,
         );
     }
     env.extend(account.env.clone());
+    env.extend(account.runtime.env.clone());
     Ok(env)
 }
 
@@ -375,6 +502,33 @@ home = "~/.codex"
             );
         }
         serde_json::from_value(serde_json::Value::Object(map)).unwrap()
+    }
+
+    #[test]
+    fn debug_shows_variable_names_only() {
+        let mut account = AccountConfig::default_for(HarnessKind::ClaudeCode);
+        account.env.insert("HAND_SECRET".into(), "hunter2".into());
+        account
+            .runtime
+            .env
+            .insert("ANTHROPIC_API_KEY".into(), "sk-ant-secret".into());
+        let debug = format!("{account:?}");
+        assert!(debug.contains("HAND_SECRET") && debug.contains("ANTHROPIC_API_KEY"));
+        assert!(
+            !debug.contains("hunter2") && !debug.contains("sk-ant-secret"),
+            "{debug}"
+        );
+    }
+
+    #[test]
+    fn the_runtime_env_goes_after_the_account_env() {
+        let mut account = AccountConfig::default_for(HarnessKind::ClaudeCode);
+        account.env.insert("A".into(), "hand".into());
+        account.runtime.env.insert("A".into(), "profile".into());
+        account.runtime.env.insert("B".into(), "secret".into());
+        let env = prepare_home(&account).unwrap();
+        assert_eq!(env["A"], "profile");
+        assert_eq!(env["B"], "secret");
     }
 
     #[test]

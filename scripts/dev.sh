@@ -12,6 +12,11 @@
 # there must not find this repo's AGENTS.md or git history. Delete the folder
 # to start again with a new hub.
 #
+# The worker's Consort home (its account profile folders and managed tools)
+# is CONSORT_DEV_DIR/hub/home (`consort dev` uses <data>/home), so a dev run
+# never uses the logins and tools in ~/.consort. Set CONSORT_HOME to use
+# another folder.
+#
 # The first run prints the hub URL and a setup code. Type them in the app
 # once. Later runs connect without them.
 #

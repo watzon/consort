@@ -206,7 +206,37 @@ On a phone:
 - The composer is a pill with `full` corners. The microphone sits at its right end.
 - Lists have no selected row.
 
-Settings use a fixed layout: the settings sidebar, then a label column of 160 px and the controls to its right. Dialogs are 520 to 560 px wide with `xl` corners and `shadow.float`, over a black scrim at 55 percent in dark mode.
+Settings use a fixed layout: the settings sidebar, then a label column of 160 px and the controls to its right. Dialogs are 520 to 560 px wide with `xl` corners and `shadow.float`, over a black scrim at 55 percent in dark mode. The Add account dialog is 600 px wide (`layout.dialog_account`), because its provider grid has two cards in a row.
+
+Settings > Workers uses these sizes from `component` in `structure.json`:
+
+| Token | Size (px) | Use |
+|---|---|---|
+| `tag_label` | 92 | The label column of the Tags and Detected rows |
+| `provider_logo` | 18 | A provider logo in an account row, a tool row or a provider card |
+| `account_state` | 112 | The status column of an account row: a dot and a word |
+| `account_action` | 96 | The action column of an account row: Sign out, Sign in, Sign in again |
+| `tool_version` | 112 | The version column of a tool row, in mono |
+| `tool_state` | 150 | The state column of a tool row: Up to date, Update to X, Install now |
+| `agent_tile` | 32 | The tile around the 16 px icon of an ACP registry agent |
+| `agent_list_max` | 152 | The ACP registry list shows three rows, then scrolls |
+| `sign_in_tile`, `sign_in_logo` | 40, 22 | The logo tile before the title of the sign-in step |
+| `step_marker` | 22 | The round marker of a numbered step in a sign-in flow |
+
+## Provider logos
+
+Every provider shows with its logo, never as text alone. The logos are in `crates/consort-desktop/assets/providers/` (see the NOTICE there).
+
+- Claude Code and Gemini CLI keep their own colors.
+- Codex, OpenCode and the ACP registry icons draw in the color of the text next to them, like an icon. Registry icons are SVGs that draw in `currentColor`. The client loads them from the registry (`https` only, at most 64 KiB, SVG only), and the app draws them like a Lucide icon.
+- A provider with no logo, such as a custom command, or a registry icon that did not load, gets the Lucide `bot` glyph.
+- A provider that is not signed in or not installed shows its logo at 60 percent opacity, with its name in `text.secondary`.
+
+## Worker tags
+
+- A user tag is a chip with `sm` corners and a `border.strong` border, with an x to remove it. A user tag that a channel requires shows in the accent: `tint.accent` ground, `accent.text` border and text. Add tag is a chip with a dashed border.
+- A detected tag is mono caption text on `surface.card`, with no border. The user cannot remove it.
+- In the New channel dialog and the Worker tags dialog of a channel, a chosen tag is an accent pill with `full` corners. Add tag opens a menu of every worker tag: the user tags, a line, then the detected tags. The note under the field says how many workers match, and turns `status.failed` when none does.
 
 ## Corners
 
