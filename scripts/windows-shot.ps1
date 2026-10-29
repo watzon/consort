@@ -1,7 +1,8 @@
 # Starts a program in the interactive desktop session of the current user, waits, and saves a
 # PNG of its main window with PrintWindow (works when the session is locked or idle).
-# Usage (over ssh): powershell -File scripts\windows-shot.ps1 -Exe <path> -Args "<args>" -Out <png> [-Wait 8]
-param([string]$Exe, [string]$Args = "", [string]$Out, [int]$Wait = 8)
+# Usage (over ssh): powershell -File scripts\windows-shot.ps1 -Exe <path> -Args "<args>" -Out <png> [-Wait 8] [-NoLaunch]
+# With -NoLaunch it captures a window of a program that is already running.
+param([string]$Exe, [string]$Args = "", [string]$Out, [int]$Wait = 8, [switch]$NoLaunch)
 $ErrorActionPreference = "Stop"
 $name = [System.IO.Path]::GetFileNameWithoutExtension($Exe)
 $capture = Join-Path $env:TEMP "consort-capture.ps1"
@@ -17,7 +18,7 @@ public static class W {
 }
 '@
 [W]::SetProcessDPIAware() | Out-Null
-Start-Process -FilePath '$Exe' -ArgumentList '$Args'
+$(if ($NoLaunch) { '' } else { "Start-Process -FilePath '$Exe' -ArgumentList '$Args'" })
 Start-Sleep -Seconds $Wait
 `$p = Get-Process -Name '$name' -ErrorAction SilentlyContinue | Where-Object { `$_.MainWindowHandle -ne 0 } | Select-Object -First 1
 if (-not `$p) { 'no window' | Out-File '$Out.txt'; exit 1 }
