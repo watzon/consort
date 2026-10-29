@@ -2,7 +2,7 @@
 //! and the feed position. In memory for now; a SQLite cache can replace it
 //! behind the same methods.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use consort_proto::{
     client_api::{EntityKind, EntityPayload, FeedChange, FeedEntry, Snapshot},
@@ -36,6 +36,11 @@ pub struct Cache {
     pub read_markers: BTreeMap<String, ReadMarker>,
     pub session_items: BTreeMap<String, SessionItem>,
     pub pending: Vec<PendingSend>,
+    /// Channels whose timeline has older messages on the hub than the cache
+    /// holds.
+    pub has_older: BTreeMap<String, bool>,
+    /// The card message IDs of the task threads whose replies are loaded.
+    pub loaded_threads: BTreeSet<String>,
 }
 
 fn marker_key(marker: &ReadMarker) -> String {
@@ -49,10 +54,41 @@ impl Cache {
     /// Replaces everything with a snapshot of scope `all`.
     pub fn load_snapshot(&mut self, snapshot: Snapshot) {
         let pending = std::mem::take(&mut self.pending);
+        let threads = std::mem::take(&mut self.loaded_threads);
         *self = Cache::default();
         self.pending = pending;
+        // The threads stay marked, so the link loads their replies again.
+        self.loaded_threads = threads;
         self.loaded = true;
         self.merge_snapshot(snapshot);
+    }
+
+    /// Adds the entities of a channel snapshot or a page of messages, and
+    /// keeps the feed position. Feed entries after the `all` snapshot replay
+    /// over them in order, so a change that arrives meanwhile is not lost.
+    pub fn merge_entities(&mut self, snapshot: Snapshot) {
+        let seq = self.seq;
+        self.merge_snapshot(snapshot);
+        self.seq = seq;
+    }
+
+    /// Adds a page of messages, as from `message.list`.
+    pub fn merge_messages(&mut self, messages: Vec<consort_proto::model::Message>) {
+        for m in messages {
+            self.insert_message(m);
+        }
+    }
+
+    /// The oldest timeline message of a channel in the cache.
+    pub fn oldest_timeline_message(
+        &self,
+        channel_id: &str,
+    ) -> Option<consort_proto::ids::MessageId> {
+        self.messages
+            .values()
+            .filter(|m| m.channel_id.to_string() == channel_id && m.shows_in_timeline())
+            .min_by_key(|m| (m.created_at, m.id.to_string()))
+            .map(|m| m.id)
     }
 
     /// Adds a snapshot of one channel, or the messages of a page.

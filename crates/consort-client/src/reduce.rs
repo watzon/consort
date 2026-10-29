@@ -85,6 +85,53 @@ fn split_tool_name(name: &str) -> (Option<&str>, &str) {
     }
 }
 
+/// The line of an approval card whose approval row is gone (answered or
+/// canceled before this client loaded it): made from the message body.
+fn closed_summary(body: &str, in_task: bool) -> String {
+    let body = body.trim();
+    if body.starts_with("mcp__") {
+        let (server, tool) = split_tool_name(body);
+        let who = if in_task { "The task" } else { "Consort" };
+        return match server {
+            Some(server) => format!("{who} wanted to use {tool} from {server}"),
+            None => format!("{who} wanted to use {tool}"),
+        };
+    }
+    if body.is_empty() {
+        "A request for your approval".to_owned()
+    } else {
+        body.to_owned()
+    }
+}
+
+fn closed_approval(m: &model::Message) -> ApprovalView {
+    ApprovalView {
+        id: format!("closed-{}", m.id),
+        task_id: m.author_task_id.map(|t| t.to_string()),
+        summary: closed_summary(&m.body, m.author_task_id.is_some()),
+        folder: None,
+        detail: None,
+        choices: Vec::new(),
+        state: RequestState::Closed,
+        answer: None,
+    }
+}
+
+fn closed_decision(m: &model::Message) -> DecisionView {
+    DecisionView {
+        id: format!("closed-{}", m.id),
+        task_id: m.author_task_id.map(|t| t.to_string()),
+        question: m.body.clone(),
+        context: None,
+        options: Vec::new(),
+        recommended: None,
+        allow_free_text: false,
+        state: RequestState::Closed,
+        chosen: None,
+        answer_text: None,
+    }
+}
+
 /// The line on an approval card. A tool approval reads "Consort wants to
 /// use post_message from hub", never a raw `mcp__hub__post_message`.
 fn approval_summary(a: &model::Approval) -> String {
@@ -410,25 +457,33 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                         _ => None,
                     },
                 }));
-            } else if let Some(approval) = (m.kind == MessageKind::Approval)
-                .then(|| cache.approvals.values().find(|a| a.message_id == m.id))
-                .flatten()
-            {
+            } else if m.kind == MessageKind::Approval {
+                // Snapshots hold only pending approvals, so an answered one
+                // may have just its message left.
+                let approval = cache
+                    .approvals
+                    .values()
+                    .find(|a| a.message_id == m.id)
+                    .map(approval_view)
+                    .unwrap_or_else(|| closed_approval(m));
                 items.push(TimelineItem::Approval(ApprovalCardView {
                     message_id: m.id.to_string(),
                     speaker: speaker(m),
                     time_label: format::time_label(at),
-                    approval: approval_view(approval),
+                    approval,
                 }));
-            } else if let Some(decision) = (m.kind == MessageKind::Decision)
-                .then(|| cache.decisions.values().find(|d| d.message_id == m.id))
-                .flatten()
-            {
+            } else if m.kind == MessageKind::Decision {
+                let decision = cache
+                    .decisions
+                    .values()
+                    .find(|d| d.message_id == m.id)
+                    .map(decision_view)
+                    .unwrap_or_else(|| closed_decision(m));
                 items.push(TimelineItem::Decision(DecisionCardView {
                     message_id: m.id.to_string(),
                     speaker: speaker(m),
                     time_label: format::time_label(at),
-                    decision: decision_view(decision),
+                    decision,
                 }));
             } else {
                 items.push(TimelineItem::Message(MessageView {
@@ -467,7 +522,7 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
         timelines.push(TimelineView {
             channel_id: channel.id.clone(),
             items,
-            has_older: messages.len() >= consort_proto::client_api::SNAPSHOT_MESSAGE_LIMIT,
+            has_older: cache.has_older.get(&channel.id).copied().unwrap_or(false),
         });
     }
 
@@ -485,26 +540,28 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
         let (mut decisions, mut approvals) = (0, 0);
         for m in replies {
             let body = match m.kind {
-                MessageKind::Approval => cache
-                    .approvals
-                    .values()
-                    .find(|a| a.message_id == m.id)
-                    .map(|a| {
-                        if a.status == ApprovalStatus::Pending {
-                            approvals += 1;
+                MessageKind::Approval => Some(
+                    match cache.approvals.values().find(|a| a.message_id == m.id) {
+                        Some(a) => {
+                            if a.status == ApprovalStatus::Pending {
+                                approvals += 1;
+                            }
+                            PostBody::Approval(approval_view(a))
                         }
-                        PostBody::Approval(approval_view(a))
-                    }),
-                MessageKind::Decision => cache
-                    .decisions
-                    .values()
-                    .find(|d| d.message_id == m.id)
-                    .map(|d| {
-                        if d.status == DecisionStatus::Pending {
-                            decisions += 1;
+                        None => PostBody::Approval(closed_approval(m)),
+                    },
+                ),
+                MessageKind::Decision => Some(
+                    match cache.decisions.values().find(|d| d.message_id == m.id) {
+                        Some(d) => {
+                            if d.status == DecisionStatus::Pending {
+                                decisions += 1;
+                            }
+                            PostBody::Decision(decision_view(d))
                         }
-                        PostBody::Decision(decision_view(d))
-                    }),
+                        None => PostBody::Decision(closed_decision(m)),
+                    },
+                ),
                 _ => Some(PostBody::Text(m.body.clone())),
             };
             if let Some(body) = body {
@@ -1418,6 +1475,53 @@ mod tests {
             state.sidebar.groups[0].channels[0].status,
             Some(TaskStatus::Working)
         );
+    }
+
+    #[test]
+    fn an_answered_request_with_no_row_shows_as_closed() {
+        let mut w = world();
+        let id = coordinator_approval(&mut w);
+        // After a restart the snapshot holds only pending approvals.
+        w.cache.approvals.remove(&id.to_string());
+        let mut decision = message(
+            MessageId::new(),
+            w.everything,
+            Author::Assistant,
+            MessageKind::Decision,
+            None,
+            NOW,
+        );
+        decision.body = "Ship now?".into();
+        w.cache.messages.insert(decision.id.to_string(), decision);
+        let state = view(&w.cache);
+        let items = &state
+            .timeline(&w.everything.to_string())
+            .expect("timeline")
+            .items;
+        let approval = items
+            .iter()
+            .find_map(|i| match i {
+                TimelineItem::Approval(c) => Some(&c.approval),
+                _ => None,
+            })
+            .expect("a closed approval card");
+        assert_eq!(approval.state, RequestState::Closed);
+        assert_eq!(
+            approval.summary,
+            "Consort wanted to use post_message from hub"
+        );
+        assert!(approval.choices.is_empty());
+        let decision = items
+            .iter()
+            .find_map(|i| match i {
+                TimelineItem::Decision(c) => Some(&c.decision),
+                _ => None,
+            })
+            .expect("a closed decision card");
+        assert_eq!(decision.state, RequestState::Closed);
+        assert_eq!(decision.question, "Ship now?");
+        // Closed requests do not wait for the user.
+        assert_eq!(state.sidebar.everything.status, None);
     }
 
     #[test]

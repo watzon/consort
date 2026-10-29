@@ -295,6 +295,16 @@ impl Client {
         self.run(Command::DeleteChannel { channel_id }).await
     }
 
+    /// Loads the replies of a task's thread when they are not loaded yet.
+    pub async fn load_thread(&self, task_id: String) -> Result<(), ClientError> {
+        self.run(Command::LoadThread { task_id }).await
+    }
+
+    /// Loads the next page of older messages in a channel.
+    pub async fn load_older(&self, channel_id: String) -> Result<(), ClientError> {
+        self.run(Command::LoadOlder { channel_id }).await
+    }
+
     pub async fn resolve_task(&self, task_id: String) -> Result<(), ClientError> {
         self.run(Command::ResolveTask { task_id }).await
     }

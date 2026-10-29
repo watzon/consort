@@ -22,6 +22,16 @@ use crate::{
     },
 };
 
+/// The glyph of an approval or a decision: the fermata while it waits,
+/// the resolved disc once answered, and the quiet ring once it closed.
+fn request_glyph(state: RequestState) -> TaskStatus {
+    match state {
+        RequestState::Pending | RequestState::Sending => TaskStatus::NeedsInput,
+        RequestState::Answered => TaskStatus::Resolved,
+        RequestState::Expired | RequestState::Closed => TaskStatus::UpNext,
+    }
+}
+
 /// The panel frame: 400 px, `surface.sidebar`, a border at the left.
 fn frame(t: &Tokens) -> Div {
     div()
@@ -741,11 +751,7 @@ impl ConsortApp {
                     .gap(t.space.sm + t.space.xxs)
                     .child(status_glyph(
                         SharedString::from(format!("{key}-glyph")),
-                        if answered {
-                            TaskStatus::Resolved
-                        } else {
-                            TaskStatus::NeedsInput
-                        },
+                        request_glyph(approval.state),
                         t.icon.size,
                         t,
                         cx,
@@ -780,6 +786,8 @@ impl ConsortApp {
                 t.text.ui,
                 c.text_secondary,
             ))
+        } else if approval.state == RequestState::Closed {
+            card.child(text("This request is closed.", t.text.ui, c.text_secondary))
         } else {
             card.child(self.render_approval_buttons(approval, t, cx))
         };
@@ -890,7 +898,10 @@ impl ConsortApp {
             );
         }
         let writing = self.decision_writing.as_deref() == Some(decision.id.as_str());
-        let footer: AnyElement = if answered {
+        let closed = matches!(decision.state, RequestState::Closed | RequestState::Expired);
+        let footer: AnyElement = if closed {
+            text("This decision is closed.", t.text.ui, c.text_secondary).into_any_element()
+        } else if answered {
             let answer = decision
                 .chosen
                 .and_then(|i| decision.options.get(i as usize))
@@ -1026,11 +1037,7 @@ impl ConsortApp {
                             .w(t.icon.size)
                             .child(status_glyph(
                                 SharedString::from(format!("{key}-glyph")),
-                                if answered {
-                                    TaskStatus::Resolved
-                                } else {
-                                    TaskStatus::NeedsInput
-                                },
+                                request_glyph(decision.state),
                                 t.icon.size,
                                 t,
                                 cx,

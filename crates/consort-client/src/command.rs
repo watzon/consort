@@ -67,6 +67,14 @@ pub enum Command {
     MarkRead {
         channel_id: String,
     },
+    /// Loads the replies of a task's thread, once.
+    LoadThread {
+        task_id: String,
+    },
+    /// Loads the next page of older messages in a channel's timeline.
+    LoadOlder {
+        channel_id: String,
+    },
     ResolveTask {
         task_id: String,
     },

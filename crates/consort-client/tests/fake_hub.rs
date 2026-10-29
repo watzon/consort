@@ -31,8 +31,9 @@ use consort_proto::{
         PairClientResponse, auth_signing_payload, normalize_origin,
     },
     client_api::{
-        ApprovalAnswer, ApprovalResult, EntityPayload, FeedEntry, MessageResult, MessageSend,
-        Snapshot, SyncSubscribe,
+        ApprovalAnswer, ApprovalResult, EntityPayload, FeedEntry, MessageList, MessageListResult,
+        MessageResult, MessageSend, SNAPSHOT_MESSAGE_LIMIT, Snapshot, SnapshotScope, SyncSnapshot,
+        SyncSubscribe,
     },
     error::{ErrorBody, ErrorCode},
     frame::{Empty, Frame, RequestFrame},
@@ -259,14 +260,67 @@ async fn session(hub: Shared, mut socket: WebSocket) {
                 })
                 .unwrap(),
             "sync.snapshot" => {
+                let body: SyncSnapshot = req.decode_as().unwrap();
                 let h = hub.lock().unwrap();
-                req.respond_ok(&Snapshot {
-                    seq: h.seq,
-                    channels: h.channel.clone().into_iter().collect(),
-                    messages: h.messages.clone(),
-                    tasks: h.task.clone().into_iter().collect(),
-                    approvals: h.approval.clone().into_iter().collect(),
-                    ..Snapshot::default()
+                // As the real hub: scope `all` has no messages. A channel
+                // snapshot has the newest top-level messages of one channel.
+                match body.scope {
+                    SnapshotScope::All => req
+                        .respond_ok(&Snapshot {
+                            seq: h.seq,
+                            channels: h.channel.clone().into_iter().collect(),
+                            tasks: h.task.clone().into_iter().collect(),
+                            approvals: h.approval.clone().into_iter().collect(),
+                            ..Snapshot::default()
+                        })
+                        .unwrap(),
+                    SnapshotScope::Channel(channel_id) => {
+                        let mut top: Vec<Message> = h
+                            .messages
+                            .iter()
+                            .filter(|m| m.channel_id == channel_id && m.thread_root_id.is_none())
+                            .cloned()
+                            .collect();
+                        top.sort_by_key(|m| m.created_at);
+                        let skip = top.len().saturating_sub(SNAPSHOT_MESSAGE_LIMIT);
+                        req.respond_ok(&Snapshot {
+                            seq: h.seq,
+                            messages: top.split_off(skip),
+                            tasks: h.task.clone().into_iter().collect(),
+                            approvals: h.approval.clone().into_iter().collect(),
+                            ..Snapshot::default()
+                        })
+                        .unwrap()
+                    }
+                }
+            }
+            "message.list" => {
+                let body: MessageList = req.decode_as().unwrap();
+                let h = hub.lock().unwrap();
+                let mut page: Vec<Message> = h
+                    .messages
+                    .iter()
+                    .filter(|m| {
+                        m.channel_id == body.channel_id && m.thread_root_id == body.thread_root_id
+                    })
+                    .cloned()
+                    .collect();
+                page.sort_by_key(|m| m.created_at);
+                if let Some(before) = body.before {
+                    let at = h
+                        .messages
+                        .iter()
+                        .find(|m| m.id == before)
+                        .map(|m| m.created_at)
+                        .unwrap();
+                    page.retain(|m| m.created_at < at);
+                }
+                let limit = body.limit.unwrap_or(50) as usize;
+                let has_more = page.len() > limit;
+                let skip = page.len().saturating_sub(limit);
+                req.respond_ok(&MessageListResult {
+                    messages: page.split_off(skip),
+                    has_more,
                 })
                 .unwrap()
             }
@@ -481,8 +535,14 @@ async fn pairs_syncs_sends_answers_and_reconnects() {
     })
     .await;
     assert_eq!(
-        hub.lock().unwrap().sessions[0][..4],
-        ["auth.response", "hello", "sync.snapshot", "sync.subscribe"]
+        hub.lock().unwrap().sessions[0][..5],
+        [
+            "auth.response",
+            "hello",
+            "sync.snapshot",
+            "sync.snapshot",
+            "sync.subscribe"
+        ]
     );
 }
 
@@ -525,7 +585,124 @@ async fn resync_required_reloads_the_snapshot() {
             "hello",
             "sync.subscribe",
             "sync.snapshot",
+            "sync.snapshot",
             "sync.subscribe"
         ]
     );
+}
+
+fn text_message(channel_id: ChannelId, body: &str, at: i64, root: Option<MessageId>) -> Message {
+    Message {
+        id: MessageId::new(),
+        channel_id,
+        thread_root_id: root,
+        author: Author::Assistant,
+        author_session_id: None,
+        author_task_id: None,
+        author_routine_id: None,
+        kind: MessageKind::Text,
+        body: body.into(),
+        attachments: vec![],
+        in_timeline: false,
+        client_message_id: None,
+        reply_count: 0,
+        last_reply_at: None,
+        reactions: vec![],
+        edited_at: None,
+        deleted_at: None,
+        created_at: ts(at),
+    }
+}
+
+fn timeline_bodies(state: &ViewState, channel: &str) -> Vec<String> {
+    state
+        .timeline(channel)
+        .map(|t| {
+            t.items
+                .iter()
+                .filter_map(|i| match i {
+                    TimelineItem::Message(m) => Some(m.body.clone()),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restart_loads_history_threads_and_older_pages() {
+    let (url, hub) = start_hub().await;
+    let (channel_id, card, task_id) = {
+        let mut h = hub.lock().unwrap();
+        let channel_id = h.channel.as_ref().unwrap().id;
+        let card = h.task.as_ref().unwrap().card_message_id;
+        let task_id = h.task.as_ref().unwrap().id;
+        let base = Timestamp::now().as_millis() - 1_000_000;
+        // 60 older timeline messages: more than one channel snapshot holds.
+        for i in 0..60 {
+            let m = text_message(channel_id, &format!("history {i}"), base + i * 1_000, None);
+            h.messages.push(m);
+        }
+        for (i, body) in ["First reply", "Second reply"].iter().enumerate() {
+            let m = text_message(channel_id, body, base + 900_000 + i as i64, Some(card));
+            h.messages.push(m);
+        }
+        (channel_id, card, task_id)
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let first = Client::start_with(Some(Store::new(dir.path())), ClientOptions::desktop()).unwrap();
+    first.pair(url, CODE.into()).await.unwrap();
+    wait_for(&first, "the first sync", |s| {
+        s.connection == Connection::Online
+    })
+    .await;
+    drop(first);
+
+    // A new client with the same identity: the app after a restart.
+    let client =
+        Client::start_with(Some(Store::new(dir.path())), ClientOptions::desktop()).unwrap();
+    let everything = channel_id.to_string();
+    let state = wait_for(&client, "the old messages", |s| {
+        timeline_bodies(s, &everything)
+            .iter()
+            .any(|b| b == "history 59")
+    })
+    .await;
+    let bodies = timeline_bodies(&state, &everything);
+    assert!(
+        !bodies.iter().any(|b| b == "history 0"),
+        "one snapshot holds the newest 50"
+    );
+    assert!(state.timeline(&everything).unwrap().has_older);
+    assert!(
+        !bodies.iter().any(|b| b.ends_with("reply")),
+        "thread replies stay out of the timeline"
+    );
+
+    client.load_older(everything.clone()).await.unwrap();
+    let state = wait_for(&client, "the older page", |s| {
+        timeline_bodies(s, &everything)
+            .iter()
+            .any(|b| b == "history 0")
+    })
+    .await;
+    assert!(!state.timeline(&everything).unwrap().has_older);
+
+    client.load_thread(task_id.to_string()).await.unwrap();
+    let state = wait_for(&client, "the thread replies", |s| {
+        s.thread(&task_id.to_string())
+            .is_some_and(|t| t.posts.len() >= 2)
+    })
+    .await;
+    let thread = state.thread(&task_id.to_string()).unwrap();
+    let texts: Vec<String> = thread
+        .posts
+        .iter()
+        .filter_map(|p| match &p.bodies[0] {
+            consort_client::PostBody::Text(t) => Some(t.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(texts, vec!["First reply", "Second reply"]);
+    let _ = card;
 }

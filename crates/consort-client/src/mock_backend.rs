@@ -203,6 +203,8 @@ impl MockBackend {
                     }
                 }
             }
+            // The mock holds every message already.
+            Command::LoadThread { .. } | Command::LoadOlder { .. } => {}
             Command::ResolveTask { task_id } => {
                 set_status(&mut state, &task_id, TaskStatus::Resolved)?
             }

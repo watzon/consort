@@ -384,6 +384,9 @@ pub enum RequestState {
     Sending,
     Answered,
     Expired,
+    /// Answered or canceled before this client loaded it. Only the message
+    /// is left, so the answer is not known.
+    Closed,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]

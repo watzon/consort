@@ -131,6 +131,8 @@ pub struct ConsortApp {
     pub editing: Option<String>,
     /// The timeline column is narrower than 600 px.
     pub narrow: bool,
+    /// The channel whose older page is loading.
+    pub loading_older: Option<String>,
     /// The open switcher and its selected row.
     pub switcher: Option<usize>,
     pub onboarding: Onboarding,
@@ -267,6 +269,7 @@ impl ConsortApp {
             last_thread: None,
             editing: None,
             narrow: false,
+            loading_older: None,
             switcher: None,
             onboarding: Onboarding::default(),
             triggers: TriggerBounds::default(),
@@ -276,6 +279,16 @@ impl ConsortApp {
         };
         this.sync_lists();
         this.update_placeholder(window, cx);
+        // Reaching the top of the timeline loads older messages.
+        let weak = cx.weak_entity();
+        this.timeline.set_scroll_handler(move |event, _, cx| {
+            if event.is_scrolled && event.visible_range.start == 0 {
+                let weak = weak.clone();
+                cx.defer(move |cx| {
+                    let _ = weak.update(cx, |this, cx| this.load_older(cx));
+                });
+            }
+        });
         this
     }
 
@@ -549,10 +562,38 @@ impl ConsortApp {
     }
 
     pub fn open_thread(&mut self, task_id: String, cx: &mut Context<Self>) {
-        self.panel = Panel::Thread(task_id);
+        self.panel = Panel::Thread(task_id.clone());
         self.decision_writing = None;
         self.sync_lists();
         cx.notify();
+        // Replies come from the hub the first time a thread opens.
+        let client = self.client.clone();
+        self.spawn_command(cx, async move { client.load_thread(task_id).await });
+    }
+
+    /// Loads the next page of older messages when the reader reaches the
+    /// top of a timeline that has more on the hub.
+    pub fn load_older(&mut self, cx: &mut Context<Self>) {
+        let channel_id = self.channel_id.clone();
+        let more = self
+            .state
+            .timeline(&channel_id)
+            .is_some_and(|t| t.has_older);
+        if !more || self.loading_older.as_deref() == Some(channel_id.as_str()) {
+            return;
+        }
+        self.loading_older = Some(channel_id.clone());
+        let client = self.client.clone();
+        cx.spawn(async move |this, cx| {
+            let result = client.load_older(channel_id).await;
+            let _ = this.update(cx, |this, cx| {
+                this.loading_older = None;
+                if let Err(err) = result {
+                    this.show_notice(err.to_string(), cx);
+                }
+            });
+        })
+        .detach();
     }
 
     pub fn close_panel(&mut self, cx: &mut Context<Self>) {
@@ -1065,19 +1106,39 @@ pub const CHANNEL_ICONS: [(&str, &str); 9] = [
     ("terminal", "Terminal"),
 ];
 
+/// Keeps a virtual list in step with its rows. Only the rows between the
+/// common start and the common end are spliced, so new messages at the end
+/// keep the list following them, and an older page at the start keeps the
+/// reader where they are.
 fn sync_list(list: &ListState, current: &mut Vec<String>, keys: Vec<String>, force_reset: bool) {
-    if !force_reset && keys.len() >= current.len() && keys[..current.len()] == current[..] {
-        let added = keys.len() - current.len();
-        if added > 0 {
-            let start = current.len();
-            list.splice(start..start, added);
-        } else {
-            list.remeasure();
-        }
-    } else {
+    if force_reset {
         list.reset(keys.len());
+        *current = keys;
+        return;
+    }
+    let (start, old_end, new_end) = changed_range(current, &keys);
+    if start == old_end && start == new_end {
+        // Same rows: their content may have changed size.
+        list.remeasure();
+    } else {
+        list.splice(start..old_end, new_end - start);
     }
     *current = keys;
+}
+
+/// The rows that differ between `old` and `new`: from the end of their
+/// common start to the start of their common end, in each list.
+fn changed_range(old: &[String], new: &[String]) -> (usize, usize, usize) {
+    let prefix = old.iter().zip(new).take_while(|(a, b)| a == b).count();
+    let max_suffix = old.len().min(new.len()) - prefix;
+    let suffix = old
+        .iter()
+        .rev()
+        .zip(new.iter().rev())
+        .take(max_suffix)
+        .take_while(|(a, b)| a == b)
+        .count();
+    (prefix, old.len() - suffix, new.len() - suffix)
 }
 
 impl Focusable for ConsortApp {
@@ -1141,5 +1202,38 @@ impl Render for ConsortApp {
                     |this: &mut Self, _, cx| this.close_menu(cx),
                 ))
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::changed_range;
+
+    fn keys(list: &[&str]) -> Vec<String> {
+        list.iter().map(|k| (*k).to_owned()).collect()
+    }
+
+    #[test]
+    fn appended_rows_splice_at_the_end() {
+        assert_eq!(
+            changed_range(&keys(&["a", "b"]), &keys(&["a", "b", "c"])),
+            (2, 2, 3)
+        );
+    }
+
+    #[test]
+    fn an_older_page_splices_after_the_day_label() {
+        let old = keys(&["day", "m3", "m4"]);
+        let new = keys(&["day", "m1", "m2", "m3", "m4"]);
+        assert_eq!(changed_range(&old, &new), (1, 1, 3));
+    }
+
+    #[test]
+    fn a_removed_row_and_no_change() {
+        assert_eq!(
+            changed_range(&keys(&["a", "b", "c"]), &keys(&["a", "c"])),
+            (1, 2, 1)
+        );
+        assert_eq!(changed_range(&keys(&["a"]), &keys(&["a"])), (1, 1, 1));
     }
 }

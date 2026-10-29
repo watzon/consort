@@ -433,8 +433,63 @@ async fn session(shared: &Arc<Shared>, identity: &Identity) -> Result<(), Sessio
         .await?
         .map_err(refused_or_lost)?;
         let after = snapshot.seq;
+        let channels: Vec<consort_proto::ids::ChannelId> = snapshot
+            .channels
+            .iter()
+            .filter(|c| c.archived_at.is_none())
+            .map(|c| c.id)
+            .collect();
         if let Ok(mut cache) = shared.cache.lock() {
             cache.load_snapshot(snapshot);
+        }
+        // The `all` snapshot has no messages. Each channel snapshot brings
+        // the newest timeline messages of one channel.
+        for channel_id in channels {
+            let channel = handshake_call(
+                &mut ws,
+                &SyncSnapshot {
+                    scope: SnapshotScope::Channel(channel_id),
+                },
+            )
+            .await?
+            .map_err(refused_or_lost)?;
+            let top_level = channel
+                .messages
+                .iter()
+                .filter(|m| m.thread_root_id.is_none())
+                .count();
+            if let Ok(mut cache) = shared.cache.lock() {
+                cache.has_older.insert(
+                    channel_id.to_string(),
+                    top_level >= consort_proto::client_api::SNAPSHOT_MESSAGE_LIMIT,
+                );
+                cache.merge_entities(channel);
+            }
+        }
+        // Threads that were open before a resync load again.
+        let threads: Vec<(String, String)> = shared
+            .cache
+            .lock()
+            .map(|c| {
+                c.loaded_threads
+                    .iter()
+                    .filter_map(|root| {
+                        c.messages
+                            .get(root)
+                            .map(|m| (m.channel_id.to_string(), root.clone()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (channel_id, root) in threads {
+            if let (Ok(channel_id), Ok(root)) = (channel_id.parse(), root.parse()) {
+                let page = handshake_call(&mut ws, &thread_page(channel_id, root))
+                    .await?
+                    .map_err(refused_or_lost)?;
+                if let Ok(mut cache) = shared.cache.lock() {
+                    cache.merge_messages(page.messages);
+                }
+            }
         }
         handshake_call(
             &mut ws,
@@ -818,6 +873,50 @@ impl HubBackend {
                         .await;
                 }
             }
+            Command::LoadThread { task_id } => {
+                let target = shared.cache.lock().ok().and_then(|c| {
+                    c.tasks.get(&task_id).and_then(|t| {
+                        let root = t.card_message_id.to_string();
+                        (!c.loaded_threads.contains(&root))
+                            .then_some((t.channel_id, t.card_message_id))
+                    })
+                });
+                if let Some((channel_id, root)) = target {
+                    let page = shared.call(thread_page(channel_id, root)).await?;
+                    if let Ok(mut cache) = shared.cache.lock() {
+                        cache.loaded_threads.insert(root.to_string());
+                        cache.merge_messages(page.messages);
+                    }
+                    shared.publish();
+                }
+            }
+            Command::LoadOlder { channel_id } => {
+                let (more, oldest) = shared
+                    .cache
+                    .lock()
+                    .map(|c| {
+                        (
+                            c.has_older.get(&channel_id).copied().unwrap_or(false),
+                            c.oldest_timeline_message(&channel_id),
+                        )
+                    })
+                    .unwrap_or((false, None));
+                if more && let Some(oldest) = oldest {
+                    let page = shared
+                        .call(consort_proto::client_api::MessageList {
+                            channel_id: parse(&channel_id, "channel")?,
+                            thread_root_id: None,
+                            before: Some(oldest),
+                            limit: Some(HISTORY_PAGE),
+                        })
+                        .await?;
+                    if let Ok(mut cache) = shared.cache.lock() {
+                        cache.has_older.insert(channel_id.clone(), page.has_more);
+                        cache.merge_messages(page.messages);
+                    }
+                    shared.publish();
+                }
+            }
             Command::ResolveTask { task_id } => {
                 shared
                     .call(TaskResolve {
@@ -937,6 +1036,23 @@ impl HubBackend {
             }
         }
         Ok(())
+    }
+}
+
+/// The most replies one thread page asks for.
+const THREAD_PAGE: u32 = 200;
+/// The size of one page of older timeline messages.
+const HISTORY_PAGE: u32 = 50;
+
+fn thread_page(
+    channel_id: consort_proto::ids::ChannelId,
+    root: consort_proto::ids::MessageId,
+) -> consort_proto::client_api::MessageList {
+    consort_proto::client_api::MessageList {
+        channel_id,
+        thread_root_id: Some(root),
+        before: None,
+        limit: Some(THREAD_PAGE),
     }
 }
 
