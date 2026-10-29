@@ -10,11 +10,12 @@
 //! they reach their byte budget, and `has_more` is then true.
 
 use consort_proto::frame::MAX_FRAME_BYTES;
+// The message body limit and the measure live in the proto crate, because a
+// client checks the same limit before it sends.
+pub(crate) use consort_proto::frame::{MESSAGE_BODY_MAX_BYTES, json_len};
 
 use crate::error::{HubError, Result};
 
-/// The largest message body.
-pub(crate) const MESSAGE_BODY_MAX_BYTES: usize = 256 * 1024;
 /// The largest task brief, and the largest routine prompt (a routine can
 /// make its prompt the brief of a task). The `all` snapshot holds every open
 /// task, so a brief must stay small. Long input goes in a channel file.
@@ -52,17 +53,6 @@ pub(crate) const SNAPSHOT_MAX_BYTES: usize = MAX_FRAME_BYTES - FRAME_ENVELOPE_BY
 pub(crate) const NOTICE_TEXT_MAX_BYTES: usize = 4 * 1024;
 /// Room in a frame for the envelope and the other fields of a command.
 pub(crate) const FRAME_ENVELOPE_BYTES: usize = 16 * 1024;
-
-/// The number of bytes that `text` takes as a JSON string, without the quotes.
-pub(crate) fn json_len(text: &str) -> usize {
-    text.chars()
-        .map(|c| match c {
-            '"' | '\\' | '\u{08}' | '\u{0C}' | '\n' | '\r' | '\t' => 2,
-            c if u32::from(c) < 0x20 => 6,
-            c => c.len_utf8(),
-        })
-        .sum()
-}
 
 /// Refuses a text that is larger than `max` as a JSON string.
 pub(crate) fn check_text(what: &str, text: &str, max: usize) -> Result<()> {

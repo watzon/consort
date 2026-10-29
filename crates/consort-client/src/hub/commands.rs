@@ -303,39 +303,7 @@ async fn run(shared: Arc<Shared>, command: Command) -> Result<(), ClientError> {
                 shared.publish();
             }
         }
-        Command::LoadThread { task_id } => {
-            // Claim the thread first, so two calls do not load it twice.
-            let target = shared.cache.lock().ok().and_then(|mut c| {
-                let (channel_id, root) = c
-                    .tasks
-                    .get(&task_id)
-                    .map(|t| (t.channel_id, t.card_message_id))?;
-                c.loaded_threads
-                    .insert(root.to_string())
-                    .then_some((channel_id, root))
-            });
-            if let Some((channel_id, root)) = target {
-                let mut pager = ThreadPager::new(channel_id, root);
-                while let Some(request) = pager.next_request() {
-                    match shared.call(request).await {
-                        Ok(page) => {
-                            let messages = pager.accept(page);
-                            if let Ok(mut cache) = shared.cache.lock() {
-                                cache.merge_messages(messages);
-                            }
-                            shared.publish();
-                        }
-                        Err(err) => {
-                            // Let the next open try again.
-                            if let Ok(mut cache) = shared.cache.lock() {
-                                cache.loaded_threads.remove(&root.to_string());
-                            }
-                            return Err(err);
-                        }
-                    }
-                }
-            }
-        }
+        Command::LoadThread { task_id } => return load_thread(&shared, &task_id).await,
         Command::LoadOlder { channel_id } => {
             let (more, oldest) = shared
                 .cache
@@ -361,6 +329,8 @@ async fn run(shared: Arc<Shared>, command: Command) -> Result<(), ClientError> {
                     cache.merge_messages(page.messages);
                 }
                 shared.publish();
+                // An older task card may name a task that no snapshot held.
+                shared.loader_wake.notify_one();
             }
         }
         Command::ResolveTask { task_id } => {
@@ -495,6 +465,65 @@ async fn run(shared: Arc<Shared>, command: Command) -> Result<(), ClientError> {
                     worker_id: parse(&worker_id, "worker")?,
                 })
                 .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Opens the thread of a task: the full task, then the replies. The thread
+/// needs the full brief and review summary, so a task that the cache holds
+/// as a preview, or does not hold while tasks are left out of the snapshot,
+/// comes from the hub with `task.get`.
+async fn load_thread(shared: &Shared, task_id: &str) -> Result<(), ClientError> {
+    let known = shared
+        .cache
+        .lock()
+        .is_ok_and(|c| c.tasks.contains_key(task_id));
+    if known {
+        // The replies need only the card ID, so both loads run together.
+        let (task, replies) = tokio::join!(
+            shared.ensure_full_task(task_id),
+            load_replies(shared, task_id)
+        );
+        return task.and(replies);
+    }
+    // The card of the thread is known only after the task is.
+    shared.ensure_full_task(task_id).await?;
+    load_replies(shared, task_id).await
+}
+
+/// Loads the replies of a task's thread once.
+async fn load_replies(shared: &Shared, task_id: &str) -> Result<(), ClientError> {
+    // Claim the thread first, so two calls do not load it twice.
+    let target = shared.cache.lock().ok().and_then(|mut c| {
+        let (channel_id, root) = c
+            .tasks
+            .get(task_id)
+            .map(|t| (t.channel_id, t.card_message_id))?;
+        c.loaded_threads
+            .insert(root.to_string())
+            .then_some((channel_id, root))
+    });
+    let Some((channel_id, root)) = target else {
+        return Ok(());
+    };
+    let mut pager = ThreadPager::new(channel_id, root);
+    while let Some(request) = pager.next_request() {
+        match shared.call(request).await {
+            Ok(page) => {
+                let messages = pager.accept(page);
+                if let Ok(mut cache) = shared.cache.lock() {
+                    cache.merge_messages(messages);
+                }
+                shared.publish();
+            }
+            Err(err) => {
+                // Let the next open try again.
+                if let Ok(mut cache) = shared.cache.lock() {
+                    cache.loaded_threads.remove(&root.to_string());
+                }
+                return Err(err);
+            }
         }
     }
     Ok(())

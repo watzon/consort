@@ -6,10 +6,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use consort_proto::{
     client_api::{EntityKind, EntityPayload, FeedChange, FeedEntry, Snapshot},
-    ids::ChannelId,
+    ids::{ChannelId, TaskId},
     model::{
-        Approval, Channel, Decision, Group, ItemPayload, Message, ReadMarker, Repo, SessionItem,
-        Task, Worker,
+        Approval, Channel, Decision, Group, ItemPayload, Message, MessageKind, ReadMarker, Repo,
+        SessionItem, Task, Worker,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -78,6 +78,18 @@ pub struct Cache {
     pub workers: BTreeMap<String, Worker>,
     pub messages: BTreeMap<String, Message>,
     pub tasks: BTreeMap<String, Task>,
+    /// The IDs of the cached tasks whose `brief` and `review_summary` are
+    /// previews, because a snapshot cut them (`Snapshot::tasks_cut`). A feed
+    /// entry or `task.get` holds the full task and ends the preview state.
+    /// Lists and task cards may show the preview. The task thread needs the
+    /// full text, so the client asks the hub for it first.
+    pub task_previews: BTreeSet<String>,
+    /// True when a snapshot left out resolved tasks (`Snapshot::tasks_has_more`),
+    /// so a task card can name a task that the cache does not hold.
+    pub tasks_have_more: bool,
+    /// The IDs of tasks that the hub said it does not have. The client does
+    /// not ask for them again.
+    pub tasks_absent: BTreeSet<String>,
     pub approvals: BTreeMap<String, Approval>,
     pub decisions: BTreeMap<String, Decision>,
     pub read_markers: BTreeMap<String, ReadMarker>,
@@ -206,6 +218,8 @@ impl Cache {
             }
             keep
         });
+        let tasks = &self.tasks;
+        self.task_previews.retain(|id| tasks.contains_key(id));
         self.approvals.retain(|_, a| {
             let keep = !in_channel(&a.channel_id);
             if !keep {
@@ -346,8 +360,19 @@ impl Cache {
         for m in snapshot.messages {
             self.insert_message(m);
         }
+        // A task that the snapshot cut is a preview. One that it did not cut
+        // is whole, even when the cache held a preview of it before.
+        self.tasks_have_more |= snapshot.tasks_has_more;
+        let cut: BTreeSet<TaskId> = snapshot.tasks_cut.into_iter().collect();
         for t in snapshot.tasks {
-            self.tasks.insert(t.id.to_string(), t);
+            let id = t.id.to_string();
+            if cut.contains(&t.id) {
+                self.task_previews.insert(id.clone());
+            } else {
+                self.task_previews.remove(&id);
+            }
+            self.tasks_absent.remove(&id);
+            self.tasks.insert(id, t);
         }
         for a in snapshot.approvals {
             self.approvals.insert(a.id.to_string(), a);
@@ -364,6 +389,82 @@ impl Cache {
         self.messages.insert(message.id.to_string(), message);
     }
 
+    /// Stores a task with its full text.
+    fn insert_full_task(&mut self, task: Task) {
+        let id = task.id.to_string();
+        self.task_previews.remove(&id);
+        self.tasks_absent.remove(&id);
+        self.tasks.insert(id, task);
+    }
+
+    /// Adds the answer to `task.get`. `asked_at` is the feed position
+    /// (`seq`) of the cache when the client sent the request, so the hub read
+    /// the task at that position or later. A feed entry above `asked_at` that
+    /// changed or deleted the task is newer than the answer may be, and it
+    /// holds the full task already. Then the answer is dropped, as a snapshot
+    /// is in [`Cache::merge_entities`]. Returns true when the cache took the
+    /// answer.
+    pub fn merge_task(&mut self, task: Task, asked_at: u64) -> bool {
+        if self.changed_after(EntityKind::Task, &task.id.to_string(), asked_at) {
+            return false;
+        }
+        self.insert_full_task(task);
+        true
+    }
+
+    /// Remembers that the hub has no task with this ID, so the client does
+    /// not ask for it again. A task that the cache holds stays.
+    pub fn mark_task_absent(&mut self, task_id: &str) {
+        if !self.tasks.contains_key(task_id) {
+            self.tasks_absent.insert(task_id.to_owned());
+        }
+    }
+
+    /// True when the cache must ask the hub for the task before a view may
+    /// show its full brief and review summary: the cache holds only a
+    /// preview, or the task is not in the cache and a snapshot left tasks
+    /// out, so the hub may know it.
+    pub fn needs_task_fetch(&self, task_id: &str) -> bool {
+        self.task_previews.contains(task_id)
+            || (self.tasks_have_more
+                && !self.tasks.contains_key(task_id)
+                && !self.tasks_absent.contains(task_id))
+    }
+
+    /// The tasks that the client should fetch with `task.get` without a
+    /// user action:
+    /// - a task that a task card names and the cache does not hold, when a
+    ///   snapshot left tasks out (`tasks_have_more`). Without that, a task
+    ///   that is not in the cache does not exist, or its feed entry is on
+    ///   its way,
+    /// - a task whose thread is open and that is a preview again, for
+    ///   example after a snapshot loaded again.
+    pub fn tasks_to_fetch(&self) -> Vec<TaskId> {
+        let mut wanted: BTreeMap<String, TaskId> = BTreeMap::new();
+        for id in &self.task_previews {
+            if let Some(task) = self.tasks.get(id)
+                && self
+                    .loaded_threads
+                    .contains(&task.card_message_id.to_string())
+            {
+                wanted.insert(id.clone(), task.id);
+            }
+        }
+        if self.tasks_have_more {
+            for message in self.messages.values() {
+                if message.kind != MessageKind::TaskCard || message.deleted_at.is_some() {
+                    continue;
+                }
+                if let Some(task_id) = message.author_task_id {
+                    let id = task_id.to_string();
+                    if !self.tasks.contains_key(&id) && !self.tasks_absent.contains(&id) {
+                        wanted.insert(id, task_id);
+                    }
+                }
+            }
+        }
+        wanted.into_values().collect()
+    }
     /// Applies one feed entry. Entries at or below the current `seq` are
     /// ignored, so a replay does no harm. Returns true when the entry changed
     /// the cache.
@@ -392,9 +493,8 @@ impl Cache {
                     self.workers.insert(w.id.to_string(), w);
                 }
                 EntityPayload::Message(m) => self.insert_message(m),
-                EntityPayload::Task(t) => {
-                    self.tasks.insert(t.id.to_string(), t);
-                }
+                // A feed entry always holds the full task.
+                EntityPayload::Task(t) => self.insert_full_task(t),
                 EntityPayload::Approval(a) => {
                     self.approvals.insert(a.id.to_string(), a);
                 }
@@ -426,7 +526,10 @@ impl Cache {
                     EntityKind::Worker => self.workers.remove(id).is_some(),
                     EntityKind::Repo => self.repos.remove(id).is_some(),
                     EntityKind::Message => self.messages.remove(id).is_some(),
-                    EntityKind::Task => self.tasks.remove(id).is_some(),
+                    EntityKind::Task => {
+                        self.task_previews.remove(id);
+                        self.tasks.remove(id).is_some()
+                    }
                     EntityKind::Approval => self.approvals.remove(id).is_some(),
                     EntityKind::Decision => self.decisions.remove(id).is_some(),
                     EntityKind::ReadMarker => self.read_markers.remove(id).is_some(),
@@ -453,11 +556,55 @@ impl Cache {
 mod tests {
     use consort_proto::{
         ids::{ChannelId, GroupId, MessageId},
-        model::{Author, MessageKind},
+        model::{ApprovalMode, Author, MessageKind, PlacementRequest, TaskCreator},
+        status::TaskStatus,
         time::Timestamp,
     };
 
     use super::*;
+
+    fn task(id: TaskId, channel: ChannelId, card: MessageId, brief: &str) -> Task {
+        Task {
+            id,
+            channel_id: channel,
+            title: "A task".into(),
+            brief: brief.into(),
+            status: TaskStatus::Review,
+            status_reason: None,
+            created_by: TaskCreator::Assistant,
+            card_message_id: card,
+            model_selection: None,
+            placement: PlacementRequest::default(),
+            approval_mode: ApprovalMode::Ask,
+            start_at: None,
+            current_session_id: None,
+            worker_id: None,
+            review_summary: None,
+            resolved_at: None,
+            archived_at: None,
+            created_at: Timestamp::from_millis(1),
+            updated_at: Timestamp::from_millis(1),
+        }
+    }
+
+    fn card(id: MessageId, channel: ChannelId, task: TaskId) -> Message {
+        Message {
+            kind: MessageKind::TaskCard,
+            author_task_id: Some(task),
+            ..text(id, channel, "")
+        }
+    }
+
+    /// A cache that holds one task as a preview, as after a snapshot.
+    fn cache_with_preview() -> (Cache, TaskId, ChannelId, MessageId) {
+        let (id, channel, card) = (TaskId::new(), ChannelId::new(), MessageId::new());
+        let mut cache = Cache::default();
+        let mut snapshot = snapshot_at(10);
+        snapshot.tasks = vec![task(id, channel, card, "The start of a long brief")];
+        snapshot.tasks_cut = vec![id];
+        cache.load_snapshot(snapshot);
+        (cache, id, channel, card)
+    }
 
     fn group(id: GroupId, name: &str) -> Group {
         Group {
@@ -583,6 +730,161 @@ mod tests {
         assert_eq!(failure.body, "Unsent words");
         assert_eq!(failure.thread_root_id.as_deref(), Some("card"));
         assert_eq!(failure.message, "The message did not go out.");
+    }
+
+    #[test]
+    fn a_snapshot_marks_the_tasks_it_cut_as_previews() {
+        let (cache, id, channel, card) = cache_with_preview();
+        assert!(cache.task_previews.contains(&id.to_string()));
+        assert!(cache.needs_task_fetch(&id.to_string()));
+        // A later snapshot with the whole task ends the preview state.
+        let mut cache = cache;
+        let mut snapshot = snapshot_at(11);
+        snapshot.tasks = vec![task(id, channel, card, "The whole brief")];
+        cache.merge_entities(snapshot);
+        assert!(cache.task_previews.is_empty());
+        assert!(!cache.needs_task_fetch(&id.to_string()));
+    }
+
+    #[test]
+    fn a_feed_entry_holds_the_full_task_and_ends_the_preview_state() {
+        let (mut cache, id, channel, card) = cache_with_preview();
+        cache.apply(upsert(
+            12,
+            EntityPayload::Task(task(id, channel, card, "The whole brief")),
+        ));
+        assert!(cache.task_previews.is_empty());
+        assert_eq!(cache.tasks[&id.to_string()].brief, "The whole brief");
+    }
+
+    #[test]
+    fn a_deleted_task_and_a_deleted_channel_leave_no_preview_flag() {
+        let (mut cache, id, _, _) = cache_with_preview();
+        cache.apply(FeedEntry {
+            seq: 12,
+            at: Timestamp::from_millis(0),
+            channel_id: None,
+            entity_id: id.to_string(),
+            change: FeedChange::Delete(EntityKind::Task),
+        });
+        assert!(cache.task_previews.is_empty());
+        let (mut cache, _, channel, _) = cache_with_preview();
+        cache.apply(FeedEntry {
+            seq: 12,
+            at: Timestamp::from_millis(0),
+            channel_id: Some(channel),
+            entity_id: channel.to_string(),
+            change: FeedChange::Delete(EntityKind::Channel),
+        });
+        assert!(cache.tasks.is_empty());
+        assert!(cache.task_previews.is_empty());
+    }
+
+    #[test]
+    fn the_answer_to_task_get_replaces_the_preview() {
+        let (mut cache, id, channel, card) = cache_with_preview();
+        let at = cache.seq;
+        assert!(cache.merge_task(task(id, channel, card, "The whole brief"), at));
+        assert_eq!(cache.tasks[&id.to_string()].brief, "The whole brief");
+        assert!(cache.task_previews.is_empty());
+    }
+
+    /// The hub read the task, and a feed entry above the request position
+    /// changed it. The feed entry is newer than the answer may be.
+    #[test]
+    fn an_older_answer_does_not_overwrite_what_the_feed_changed_after_the_request() {
+        let (mut cache, id, channel, card) = cache_with_preview();
+        let asked_at = cache.seq;
+        let mut newer = task(id, channel, card, "The brief after the change");
+        newer.title = "Renamed".into();
+        cache.apply(upsert(asked_at + 2, EntityPayload::Task(newer)));
+        let stale = task(id, channel, card, "The brief before the change");
+        assert!(!cache.merge_task(stale, asked_at));
+        assert_eq!(cache.tasks[&id.to_string()].title, "Renamed");
+        assert_eq!(
+            cache.tasks[&id.to_string()].brief,
+            "The brief after the change"
+        );
+        assert!(cache.task_previews.is_empty());
+    }
+
+    #[test]
+    fn an_answer_does_not_bring_back_a_task_that_the_feed_deleted() {
+        let (mut cache, id, channel, card) = cache_with_preview();
+        let asked_at = cache.seq;
+        cache.apply(FeedEntry {
+            seq: asked_at + 1,
+            at: Timestamp::from_millis(0),
+            channel_id: Some(channel),
+            entity_id: id.to_string(),
+            change: FeedChange::Delete(EntityKind::Task),
+        });
+        assert!(!cache.merge_task(task(id, channel, card, "Whole"), asked_at));
+        assert!(cache.tasks.is_empty());
+    }
+
+    #[test]
+    fn an_answer_is_newer_than_a_feed_entry_from_before_the_request() {
+        let (mut cache, id, channel, card) = cache_with_preview();
+        cache.apply(upsert(
+            20,
+            EntityPayload::Task(task(id, channel, card, "Old")),
+        ));
+        // The client asks after the feed entry, so the answer is as new.
+        assert!(cache.merge_task(task(id, channel, card, "Newer"), cache.seq));
+        assert_eq!(cache.tasks[&id.to_string()].brief, "Newer");
+    }
+
+    #[test]
+    fn a_task_outside_the_snapshot_is_fetched_only_when_the_snapshot_left_tasks_out() {
+        let (channel, outside, card_id) = (ChannelId::new(), TaskId::new(), MessageId::new());
+        let mut cache = Cache::default();
+        let mut snapshot = snapshot_at(5);
+        snapshot.messages = vec![card(card_id, channel, outside)];
+        cache.load_snapshot(snapshot);
+        assert!(cache.tasks_to_fetch().is_empty());
+        assert!(!cache.needs_task_fetch(&outside.to_string()));
+
+        let mut snapshot = snapshot_at(5);
+        snapshot.tasks_has_more = true;
+        cache.merge_entities(snapshot);
+        assert_eq!(cache.tasks_to_fetch(), vec![outside]);
+        assert!(cache.needs_task_fetch(&outside.to_string()));
+
+        // The hub has no such task: nobody asks again.
+        cache.mark_task_absent(&outside.to_string());
+        assert!(cache.tasks_to_fetch().is_empty());
+        assert!(!cache.needs_task_fetch(&outside.to_string()));
+    }
+
+    #[test]
+    fn a_task_that_arrives_ends_the_wish_to_fetch_it() {
+        let (channel, outside, card_id) = (ChannelId::new(), TaskId::new(), MessageId::new());
+        let mut cache = Cache::default();
+        let mut snapshot = snapshot_at(5);
+        snapshot.messages = vec![card(card_id, channel, outside)];
+        snapshot.tasks_has_more = true;
+        cache.load_snapshot(snapshot);
+        assert_eq!(cache.tasks_to_fetch(), vec![outside]);
+        let at = cache.seq;
+        cache.merge_task(task(outside, channel, card_id, "Old work"), at);
+        assert!(cache.tasks_to_fetch().is_empty());
+    }
+
+    #[test]
+    fn a_preview_of_a_task_with_an_open_thread_is_fetched_again_after_a_reload() {
+        let (mut cache, id, channel, card_id) = cache_with_preview();
+        // No thread is open: the preview may stay.
+        assert!(cache.tasks_to_fetch().is_empty());
+        cache.loaded_threads.insert(card_id.to_string());
+        assert_eq!(cache.tasks_to_fetch(), vec![id]);
+        // A reload of the snapshot makes a preview again. The open thread
+        // stays marked, so the task is still wanted.
+        let mut snapshot = snapshot_at(30);
+        snapshot.tasks = vec![task(id, channel, card_id, "Preview")];
+        snapshot.tasks_cut = vec![id];
+        cache.load_snapshot(snapshot);
+        assert_eq!(cache.tasks_to_fetch(), vec![id]);
     }
 
     #[test]

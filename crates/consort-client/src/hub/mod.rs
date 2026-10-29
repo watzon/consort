@@ -20,9 +20,10 @@ use std::{
 
 use consort_proto::{
     auth::{PAIR_CLIENT_PATH, PairClientRequest, PairClientResponse, PairingCode, PublicKey},
+    client_api::TaskGet,
     error::{ErrorBody, ErrorCode},
     frame::{Frame, Request},
-    ids::FrameId,
+    ids::{FrameId, TaskId},
     model::ClientKind,
 };
 use ed25519_dalek::SigningKey;
@@ -345,6 +346,50 @@ impl Shared {
                 "The hub sent a response that this app cannot read: {e}. Update Consort, then try again"
             ))
         })
+    }
+}
+
+impl Shared {
+    /// Asks the hub for the full task (`task.get`) and merges the answer into
+    /// the cache. The answer never overwrites a change that the feed made
+    /// after the request went out, see [`Cache::merge_task`]. A task that
+    /// the hub does not have is remembered, so nobody asks for it again, and
+    /// the error goes to the caller.
+    pub(crate) async fn fetch_task(&self, task_id: TaskId) -> Result<(), ClientError> {
+        let asked_at = self.cache.lock().map(|c| c.seq).unwrap_or(0);
+        match self.call(TaskGet { task_id }).await {
+            Ok(found) => {
+                if let Ok(mut cache) = self.cache.lock() {
+                    cache.merge_task(found.task, asked_at);
+                }
+                self.publish();
+                Ok(())
+            }
+            Err(err) => {
+                if matches!(&err, ClientError::Hub { code, .. } if code == "not_found")
+                    && let Ok(mut cache) = self.cache.lock()
+                {
+                    cache.mark_task_absent(&task_id.to_string());
+                }
+                Err(err)
+            }
+        }
+    }
+
+    /// Fetches the task when the cache holds only a preview of it, or does
+    /// not hold it while a snapshot left tasks out. Does nothing when the
+    /// cache holds the full task. Call it before a view needs the full brief
+    /// or review summary.
+    pub(crate) async fn ensure_full_task(&self, task_id: &str) -> Result<(), ClientError> {
+        let needed = self.cache.lock().is_ok_and(|c| c.needs_task_fetch(task_id));
+        if !needed {
+            return Ok(());
+        }
+        match task_id.parse::<TaskId>() {
+            Ok(id) => self.fetch_task(id).await,
+            // An ID that is not valid names no task on the hub.
+            Err(_) => Ok(()),
+        }
     }
 }
 

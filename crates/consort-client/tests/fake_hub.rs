@@ -22,7 +22,8 @@ use axum::{
     routing::{get, post},
 };
 use consort_client::{
-    ApprovalChoice, Client, ClientError, Command, Connection, TaskStatus, TimelineItem, ViewState,
+    ApprovalChoice, Client, ClientError, Command, Connection, PostBody, TaskCardView, TaskStatus,
+    TimelineItem, ViewState,
     hub::{ClientOptions, Timeouts},
     store::Store,
 };
@@ -34,7 +35,7 @@ use consort_proto::{
     client_api::{
         ApprovalAnswer, ApprovalResult, EntityPayload, FeedEntry, MessageList, MessageListResult,
         MessageResult, MessageSend, SNAPSHOT_MESSAGE_LIMIT, Snapshot, SnapshotScope, SyncSnapshot,
-        SyncSubscribe,
+        SyncSubscribe, TaskGet, TaskResult,
     },
     error::{ErrorBody, ErrorCode},
     frame::{Empty, EventFrame, Frame, RequestFrame},
@@ -97,6 +98,45 @@ struct Hub {
     internal_after_store: usize,
     /// `approval.answer` says the approval is answered already.
     answer_conflict: bool,
+    /// Snapshots cut the brief and the review summary of `task` to a preview
+    /// and name the task in `tasks_cut`, as the real hub does for long text.
+    preview_task: bool,
+    /// A task that no snapshot holds, and that `task.get` knows. When it is
+    /// set, every snapshot says `tasks_has_more`.
+    outside_task: Option<Task>,
+    /// The task ID of every `task.get`, in order.
+    task_gets: Vec<TaskId>,
+    /// The next `task.get` for `task`: the hub changes the task to this one
+    /// and sends the feed entry, and then answers with the task as it was.
+    /// The answer is older than the feed entry that the client got first.
+    task_get_race: Option<Task>,
+}
+
+/// What the real hub writes at the end of a cut text.
+const CUT_MARK: &str = "\n\n[The hub cut this text here, because it is too long.]";
+
+/// A text that is longer than the 1 KiB preview.
+fn long_text(word: &str) -> String {
+    format!("{word} ").repeat(500)
+}
+
+/// The preview of a long text, as the real hub cuts it.
+fn preview_of(text: &str) -> String {
+    format!("{}{CUT_MARK}", &text[..1024 - CUT_MARK.len()])
+}
+
+/// The tasks, `tasks_cut` and `tasks_has_more` of a snapshot.
+fn snapshot_tasks(h: &Hub) -> (Vec<Task>, Vec<TaskId>, bool) {
+    let mut tasks: Vec<Task> = h.task.clone().into_iter().collect();
+    let mut cut = Vec::new();
+    if h.preview_task {
+        for task in &mut tasks {
+            task.brief = preview_of(&task.brief);
+            task.review_summary = task.review_summary.as_deref().map(preview_of);
+            cut.push(task.id);
+        }
+    }
+    (tasks, cut, h.outside_task.is_some())
 }
 
 type Shared = Arc<Mutex<Hub>>;
@@ -311,8 +351,9 @@ async fn session(hub: Shared, mut socket: WebSocket) {
                 // As the real hub: scope `all` has no messages. A channel
                 // snapshot has the newest top-level messages of one channel.
                 match body.scope {
-                    SnapshotScope::All => req
-                        .respond_ok(&Snapshot {
+                    SnapshotScope::All => {
+                        let (tasks, tasks_cut, tasks_has_more) = snapshot_tasks(&h);
+                        req.respond_ok(&Snapshot {
                             seq: h.seq,
                             channels: h
                                 .channel
@@ -320,11 +361,14 @@ async fn session(hub: Shared, mut socket: WebSocket) {
                                 .into_iter()
                                 .chain(h.extra.clone())
                                 .collect(),
-                            tasks: h.task.clone().into_iter().collect(),
+                            tasks,
+                            tasks_cut,
+                            tasks_has_more,
                             approvals: h.approval.clone().into_iter().collect(),
                             ..Snapshot::default()
                         })
-                        .unwrap(),
+                        .unwrap()
+                    }
                     SnapshotScope::Channel(_) if h.fail_channel_snapshots > 0 => {
                         h.fail_channel_snapshots -= 1;
                         req.respond_error(ErrorBody::new(
@@ -343,11 +387,14 @@ async fn session(hub: Shared, mut socket: WebSocket) {
                         top.sort_by_key(|m| m.created_at);
                         let skip = top.len().saturating_sub(SNAPSHOT_MESSAGE_LIMIT);
                         let has_more = h.force_has_more.unwrap_or(skip > 0);
+                        let (tasks, tasks_cut, tasks_has_more) = snapshot_tasks(&h);
                         req.respond_ok(&Snapshot {
                             seq: h.seq,
                             messages: top.split_off(skip),
                             messages_has_more: has_more,
-                            tasks: h.task.clone().into_iter().collect(),
+                            tasks,
+                            tasks_cut,
+                            tasks_has_more,
                             approvals: h.approval.clone().into_iter().collect(),
                             ..Snapshot::default()
                         })
@@ -512,6 +559,39 @@ async fn session(hub: Shared, mut socket: WebSocket) {
                 )
                 .await;
                 event
+            }
+            "task.get" => {
+                let body: TaskGet = req.decode_as().unwrap();
+                let (found, race) = {
+                    let mut h = hub.lock().unwrap();
+                    h.task_gets.push(body.task_id);
+                    let found = h
+                        .task
+                        .iter()
+                        .chain(h.outside_task.iter())
+                        .find(|t| t.id == body.task_id)
+                        .cloned();
+                    (found, h.task_get_race.take())
+                };
+                match found {
+                    None => req.respond_error(ErrorBody::new(
+                        ErrorCode::NotFound,
+                        "That task does not exist.",
+                    )),
+                    Some(task) => {
+                        if let Some(newer) = race {
+                            // The change reaches the client first. The answer
+                            // below still holds the task as it was.
+                            let event = {
+                                let mut h = hub.lock().unwrap();
+                                h.task = Some(newer.clone());
+                                feed(&mut h, EntityPayload::Task(newer))
+                            };
+                            send(&mut socket, event).await;
+                        }
+                        req.respond_ok(&TaskResult { task }).unwrap()
+                    }
+                }
             }
             "read.mark" => {
                 let mark: consort_proto::client_api::ReadMark = req.decode_as().unwrap();
@@ -2070,4 +2150,229 @@ async fn labels_that_follow_the_clock_are_made_again_without_a_change() {
         s.tasks.first().is_some_and(|t| t.age_label == "1 min")
     })
     .await;
+}
+
+// ---------------------------------------------------------------------------
+// Tasks in a snapshot: previews, `task.get` and tasks outside the snapshot.
+
+/// The first task card in the timeline of a channel.
+fn task_card(state: &ViewState, channel: &str) -> Option<TaskCardView> {
+    state.timeline(channel).and_then(|t| {
+        t.items.iter().find_map(|i| match i {
+            TimelineItem::TaskCard(c) => Some(c.clone()),
+            _ => None,
+        })
+    })
+}
+
+/// Makes the task of the fake hub a task in review, with a long brief and a
+/// long review summary that the snapshots cut to previews. Returns the task
+/// ID and the two full texts.
+fn previewed_task(hub: &Shared) -> (TaskId, String, String) {
+    let mut h = hub.lock().unwrap();
+    h.approval = None;
+    h.preview_task = true;
+    let task = h.task.as_mut().unwrap();
+    task.status = PS::Review;
+    task.brief = long_text("brief");
+    task.review_summary = Some(long_text("summary"));
+    (task.id, task.brief.clone(), long_text("summary"))
+}
+
+/// Opening a thread needs the full task. The snapshot holds a preview, so the
+/// client asks the hub for the task once, and the card shows the full text.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn opening_the_thread_of_a_previewed_task_loads_the_full_task() {
+    let (url, hub) = start_hub().await;
+    let (task_id, _brief, summary) = previewed_task(&hub);
+    let dir = tempfile::tempdir().unwrap();
+    let client = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
+    let everything = everything_id(&client);
+
+    // The card keeps the preview. Nothing asked for the full text yet.
+    let state = wait_for(&client, "the card", |s| {
+        task_card(s, &everything).is_some_and(|c| c.latest.is_some())
+    })
+    .await;
+    let preview = task_card(&state, &everything).unwrap().latest.unwrap();
+    assert_eq!(preview, preview_of(&summary));
+    assert!(preview.ends_with(CUT_MARK));
+    assert!(hub.lock().unwrap().task_gets.is_empty());
+
+    client.load_thread(task_id.to_string()).await.unwrap();
+    wait_for(&client, "the full review summary", |s| {
+        task_card(s, &everything).is_some_and(|c| c.latest.as_deref() == Some(summary.as_str()))
+    })
+    .await;
+    let asked = hub.lock().unwrap().task_gets.clone();
+    assert!(!asked.is_empty() && asked.iter().all(|id| *id == task_id));
+
+    // The task is whole now, so another open asks for nothing.
+    client.load_thread(task_id.to_string()).await.unwrap();
+    assert_eq!(hub.lock().unwrap().task_gets, asked);
+}
+
+/// A feed entry always holds the full task. It ends the preview state, so the
+/// thread opens with no `task.get`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_feed_entry_ends_the_preview_of_a_task() {
+    let (url, hub) = start_hub().await;
+    let (task_id, _brief, summary) = previewed_task(&hub);
+    let dir = tempfile::tempdir().unwrap();
+    let client = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
+    let everything = everything_id(&client);
+    wait_for(&client, "the preview on the card", |s| {
+        task_card(s, &everything)
+            .is_some_and(|c| c.latest.as_deref() == Some(preview_of(&summary).as_str()))
+    })
+    .await;
+
+    let frame = {
+        let mut h = hub.lock().unwrap();
+        let task = h.task.clone().unwrap();
+        feed(&mut h, EntityPayload::Task(task))
+    };
+    push(&hub, vec![frame]);
+    wait_for(&client, "the full text from the feed", |s| {
+        task_card(s, &everything).is_some_and(|c| c.latest.as_deref() == Some(summary.as_str()))
+    })
+    .await;
+
+    client.load_thread(task_id.to_string()).await.unwrap();
+    assert!(
+        hub.lock().unwrap().task_gets.is_empty(),
+        "the client asked for a task that it holds in full"
+    );
+}
+
+/// The hub answers `task.get` with the task as it was, after the client got
+/// a feed entry with a newer task. The older answer must not win.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_older_task_get_answer_does_not_overwrite_a_newer_feed_entry() {
+    let (url, hub) = start_hub().await;
+    let (task_id, _brief, _summary) = previewed_task(&hub);
+    {
+        let mut h = hub.lock().unwrap();
+        let mut newer = h.task.clone().unwrap();
+        newer.review_summary = Some("The summary after the change.".into());
+        h.task_get_race = Some(newer);
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let client = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
+    let everything = everything_id(&client);
+    wait_for(&client, "the card", |s| task_card(s, &everything).is_some()).await;
+
+    client.load_thread(task_id.to_string()).await.unwrap();
+    let newer = |s: &ViewState| {
+        task_card(s, &everything)
+            .is_some_and(|c| c.latest.as_deref() == Some("The summary after the change."))
+    };
+    wait_for(&client, "the newer summary", newer).await;
+    // Give an answer that was merged by mistake time to show.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(newer(&client.state()), "the older answer won");
+}
+
+/// A card names a task that no snapshot holds, and the snapshots say that
+/// tasks were left out. The client asks the hub for the task.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_card_for_a_task_outside_the_snapshot_loads_the_task() {
+    let (url, hub) = start_hub().await;
+    let outside = {
+        let mut h = hub.lock().unwrap();
+        let channel_id = h.channel.as_ref().unwrap().id;
+        let (id, card_id) = (TaskId::new(), MessageId::new());
+        let mut card = text_message(channel_id, "", Timestamp::now().as_millis() - 50_000, None);
+        card.id = card_id;
+        card.kind = MessageKind::TaskCard;
+        card.author_task_id = Some(id);
+        h.messages.push(card);
+        let mut task = h.task.clone().unwrap();
+        task.id = id;
+        task.card_message_id = card_id;
+        task.title = "Port the old engine".into();
+        task.status = PS::Resolved;
+        h.outside_task = Some(task);
+        id
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let client = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
+    let everything = everything_id(&client);
+    wait_for(&client, "the card of the task outside the snapshot", |s| {
+        s.timeline(&everything).is_some_and(|t| {
+            t.items
+                .iter()
+                .any(|i| matches!(i, TimelineItem::TaskCard(c) if c.title == "Port the old engine"))
+        })
+    })
+    .await;
+    assert_eq!(hub.lock().unwrap().task_gets, vec![outside]);
+}
+
+/// Without `tasks_has_more`, a task that is not in the cache does not exist
+/// on the hub, and the client does not ask for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_card_for_an_unknown_task_is_not_fetched_when_no_task_was_left_out() {
+    let (url, hub) = start_hub().await;
+    {
+        let mut h = hub.lock().unwrap();
+        let channel_id = h.channel.as_ref().unwrap().id;
+        let mut card = text_message(channel_id, "", Timestamp::now().as_millis() - 50_000, None);
+        card.kind = MessageKind::TaskCard;
+        card.author_task_id = Some(TaskId::new());
+        h.messages.push(card);
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let client = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
+    let everything = everything_id(&client);
+    wait_for(&client, "the channel to load", |s| {
+        s.timeline(&everything).is_some_and(|t| t.loaded)
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(hub.lock().unwrap().task_gets.is_empty());
+}
+
+/// A thread names a task that the cache does not hold, and tasks were left
+/// out of the snapshot. Opening the thread loads the task and its replies.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn opening_a_thread_of_a_task_outside_the_snapshot_loads_the_task_and_its_replies() {
+    let (url, hub) = start_hub().await;
+    let outside = {
+        let mut h = hub.lock().unwrap();
+        let channel_id = h.channel.as_ref().unwrap().id;
+        let (id, card_id) = (TaskId::new(), MessageId::new());
+        let at = Timestamp::now().as_millis() - 50_000;
+        // The card is not in the timeline, only its replies are on the hub.
+        h.messages.push(text_message(
+            channel_id,
+            "A reply on an old task",
+            at,
+            Some(card_id),
+        ));
+        let mut task = h.task.clone().unwrap();
+        task.id = id;
+        task.card_message_id = card_id;
+        task.title = "An old task".into();
+        task.status = PS::Resolved;
+        h.outside_task = Some(task);
+        id
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let client = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
+    assert!(client.state().thread(&outside.to_string()).is_none());
+
+    client.load_thread(outside.to_string()).await.unwrap();
+    let state = wait_for(&client, "the thread of the old task", |s| {
+        s.thread(&outside.to_string())
+            .is_some_and(|t| !t.posts.is_empty())
+    })
+    .await;
+    let thread = state.thread(&outside.to_string()).unwrap();
+    assert_eq!(thread.title, "An old task");
+    assert!(matches!(
+        &thread.posts[0].bodies[0],
+        PostBody::Text(t) if t == "A reply on an old task"
+    ));
+    assert_eq!(hub.lock().unwrap().task_gets, vec![outside]);
 }

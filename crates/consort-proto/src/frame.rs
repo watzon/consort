@@ -49,6 +49,28 @@ pub const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[PROTOCOL_VERSION];
 /// is a protocol error. Large data goes through the blob endpoints.
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
+/// The largest message body, in bytes as [`json_len`] measures them. The hub
+/// refuses a larger body, and a client checks it before it sends. A frame
+/// with such a body stays under [`MAX_FRAME_BYTES`].
+pub const MESSAGE_BODY_MAX_BYTES: usize = 256 * 1024;
+
+const _: () = assert!(MESSAGE_BODY_MAX_BYTES < MAX_FRAME_BYTES);
+
+/// The number of bytes that `text` takes as a JSON string, without the
+/// quotes. Every size limit on text counts this way, because a frame holds
+/// JSON: a quote, a backslash and the common control characters count 2
+/// bytes, other control characters count 6 bytes, and every other character
+/// counts its UTF-8 bytes.
+pub fn json_len(text: &str) -> usize {
+    text.chars()
+        .map(|c| match c {
+            '"' | '\\' | '\u{08}' | '\u{0C}' | '\n' | '\r' | '\t' => 2,
+            c if u32::from(c) < 0x20 => 6,
+            c => c.len_utf8(),
+        })
+        .sum()
+}
+
 /// Picks the highest version that both sides support, as the hub does in the
 /// `hello` exchange. `None` means the hub closes with `protocol_mismatch`.
 pub fn negotiate_version(ours: &[u32], theirs: &[u32]) -> Option<u32> {
@@ -492,6 +514,27 @@ pub(crate) use message_family;
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn json_len_counts_the_bytes_of_a_json_string() {
+        assert_eq!(json_len(""), 0);
+        assert_eq!(json_len("abc"), 3);
+        // A quote, a backslash and the common control characters count 2.
+        assert_eq!(json_len("a\"b\\c"), 7);
+        assert_eq!(json_len("\u{08}\u{0C}\n\r\t"), 10);
+        // Other control characters count 6.
+        assert_eq!(json_len("\u{0}\u{1f}"), 12);
+        // Other characters count their UTF-8 bytes.
+        assert_eq!(json_len("\u{e9}"), 2);
+        assert_eq!(json_len("\u{20ac}"), 3);
+        assert_eq!(json_len("\u{1f600}"), 4);
+        // The size is the length of the JSON string without its quotes.
+        let text = "a\"\n\u{1}\u{e9}<\u{1f600}";
+        assert_eq!(
+            json_len(text) + 2,
+            serde_json::to_string(text).unwrap().len()
+        );
+    }
 
     #[test]
     fn parses_the_three_shapes() {

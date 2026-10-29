@@ -15,7 +15,9 @@
 //!   [`error::ErrorBody`].
 //! - [`frame`] has the `{v, id, type, body}` and `{v, re, ok, body|error}`
 //!   envelope, the [`frame::Message`], [`frame::Request`] and
-//!   [`frame::MessageFamily`] traits, and the version constants.
+//!   [`frame::MessageFamily`] traits, the version constants, and the size
+//!   limits that frames and message bodies share (with [`frame::json_len`],
+//!   the way to measure them).
 //! - [`model`] has every entity in data-model.md.
 //! - [`status`] has the task status machine, the Tasks panel tabs and the
 //!   "your turn" groups.

@@ -2,29 +2,13 @@
 //! gets a frame it must refuse and the link never breaks on a frame that is
 //! too large.
 //!
-//! The hub measures a text as a JSON string (see `limits.rs` in
-//! `consort-hub`): a quote, a backslash and the common control characters
-//! count 2 bytes, other control characters count 6 bytes, and every other
-//! character counts its UTF-8 bytes. This module measures the same way.
+//! The limit and the way to measure a text, [`MESSAGE_BODY_MAX_BYTES`] and
+//! [`json_len`], come from `consort-proto`. The hub uses the same ones, so a
+//! body that passes here passes there.
+
+use consort_proto::frame::{MESSAGE_BODY_MAX_BYTES, json_len};
 
 use crate::ClientError;
-
-/// The largest message body, as the hub measures it. The hub keeps this
-/// number in `MESSAGE_BODY_MAX_BYTES`. It is small enough that a frame with
-/// such a body stays under the 1 MiB frame limit.
-pub const MESSAGE_BODY_MAX_BYTES: usize = 256 * 1024;
-
-/// The number of bytes that `text` takes as a JSON string, without the
-/// quotes.
-pub fn json_len(text: &str) -> usize {
-    text.chars()
-        .map(|c| match c {
-            '"' | '\\' | '\u{08}' | '\u{0C}' | '\n' | '\r' | '\t' => 2,
-            c if u32::from(c) < 0x20 => 6,
-            c => c.len_utf8(),
-        })
-        .sum()
-}
 
 /// Refuses a message body that the hub would refuse. The error says how
 /// large the text is, what the limit is and what to do. The caller keeps

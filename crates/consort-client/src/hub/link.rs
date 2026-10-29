@@ -644,6 +644,7 @@ fn recover(shared: &Arc<Shared>, seq: u64, channel_id: Option<ChannelId>) {
                     }
                 }
                 shared.publish();
+                shared.loader_wake.notify_one();
             }
             Err(err) => {
                 tracing::warn!(error = %err, "cannot load the data of a skipped change, so the client connects again and loads a snapshot");
@@ -659,12 +660,17 @@ fn recover(shared: &Arc<Shared>, seq: u64, channel_id: Option<ChannelId>) {
     });
 }
 
-/// The longest wait between two tries to load a channel snapshot.
+/// The longest wait between two tries to load a channel snapshot or a task.
 const LOADER_RETRY_MAX: Duration = Duration::from_secs(60);
 
-/// Loads the snapshot of every open channel that has none: a channel whose
-/// first snapshot failed, one that someone created, and one that someone
-/// unarchived. Tries again with a growing delay.
+/// Loads what the cache misses and the user did not ask for:
+/// - the snapshot of every open channel that has none: a channel whose first
+///   snapshot failed, one that someone created, and one that someone
+///   unarchived,
+/// - the tasks from [`Cache::tasks_to_fetch`]: tasks that a task card names
+///   and no snapshot held, and previews of tasks with an open thread.
+///
+/// Tries again with a growing delay.
 pub(crate) async fn run_loader(shared: Arc<Shared>) {
     let start = Duration::from_secs(1);
     let mut delay = start;
@@ -675,17 +681,17 @@ pub(crate) async fn run_loader(shared: Arc<Shared>) {
             if !shared.is_online() {
                 break;
             }
-            let missing = shared
+            let (channels, tasks) = shared
                 .cache
                 .lock()
-                .map(|c| c.channels_to_load())
+                .map(|c| (c.channels_to_load(), c.tasks_to_fetch()))
                 .unwrap_or_default();
-            if missing.is_empty() {
+            if channels.is_empty() && tasks.is_empty() {
                 delay = start;
                 break;
             }
             let mut failed = false;
-            for id in missing {
+            for id in channels {
                 match shared
                     .call(SyncSnapshot {
                         scope: SnapshotScope::Channel(id),
@@ -706,6 +712,19 @@ pub(crate) async fn run_loader(shared: Arc<Shared>) {
                         if is_transport(&err) {
                             break;
                         }
+                    }
+                }
+            }
+            for id in tasks {
+                if let Err(err) = shared.fetch_task(id).await {
+                    // A task that the hub does not have is remembered, so
+                    // this is not a reason to try again.
+                    if !matches!(&err, ClientError::Hub { code, .. } if code == "not_found") {
+                        tracing::warn!(task_id = %id, error = %err, "cannot load a task, so the loader tries again");
+                        failed = true;
+                    }
+                    if is_transport(&err) {
+                        break;
                     }
                 }
             }
