@@ -1,0 +1,29 @@
+{
+  "font": { "sans": "Atkinson Hyperlegible Next", "mono": "Atkinson Hyperlegible Mono", "license": "SIL OFL 1.1" },
+  "type": {
+    "display": { "size": 30, "line": 36, "weight": 600, "tracking": -0.015 },
+    "heading": { "size": 22, "line": 28, "weight": 600, "tracking": -0.01 },
+    "title": { "size": 17, "line": 24, "weight": 600, "tracking": 0 },
+    "body": { "size": 15, "line": 24, "weight": 400, "tracking": 0, "max_chars": 68 },
+    "ui": { "size": 13, "line": 20, "weight": 400, "tracking": 0 },
+    "ui_strong": { "size": 13, "line": 20, "weight": 500, "tracking": 0 },
+    "label": { "size": 12, "line": 16, "weight": 500, "tracking": 0 },
+    "caption": { "size": 11, "line": 16, "weight": 400, "tracking": 0 },
+    "mono": { "size": 13, "line": 20, "weight": 400, "tracking": 0 },
+    "mono_inline_scale": 0.92
+  },
+  "space": { "xxs": 2, "xs": 4, "sm": 8, "md": 12, "lg": 16, "xl": 24, "xxl": 32, "page": 48 },
+  "radius": { "sm": 4, "md": 6, "lg": 10, "xl": 14, "full": 9999 },
+  "border_width": 1,
+  "shadow": {
+    "none": null,
+    "float": {
+      "dark": { "x": 0, "y": 8, "blur": 24, "spread": -4, "color": "#00000073" },
+      "light": { "x": 0, "y": 8, "blur": 24, "spread": -4, "color": "#14201C29" }
+    }
+  },
+  "motion": { "fast_ms": 120, "normal_ms": 180, "slow_ms": 280, "ease_enter": [0.2, 0, 0, 1], "ease_exit": [0.4, 0, 1, 1] },
+  "icon": { "set": "lucide", "size": 16, "dense_size": 14, "toolbar_size": 20, "stroke": 1.5 },
+  "layout": { "sidebar_width": 248, "panel_width": 400, "timeline_max_width": 720, "speaker_gutter": 64, "min_window": [960, 600] },
+  "derive": { "hover_delta_l": 0.035, "active_delta_l": 0.07, "selection_alpha": 0.28, "status_tint_alpha": 0.16, "scrim_alpha": { "dark": 0.55, "light": 0.3 } }
+}

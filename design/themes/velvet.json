@@ -1,0 +1,86 @@
+{
+  "$schema": "../theme.schema.json",
+  "name": "Velvet",
+  "author": "Consort",
+  "default": false,
+  "modes": {
+    "dark": {
+      "surface": {
+        "sidebar": "#1A131A",
+        "canvas": "#1F181F",
+        "card": "#292028",
+        "raised": "#302730",
+        "selected": "#392F39"
+      },
+      "border": {
+        "subtle": "#342B33",
+        "strong": "#463D46"
+      },
+      "text": {
+        "primary": "#EDECF1",
+        "secondary": "#BDB6BF",
+        "tertiary": "#938A93"
+      },
+      "accent": {
+        "fill": "#7EDDC0",
+        "text": "#86DFC3",
+        "on_fill": "#06251D",
+        "surface": "#153A33"
+      },
+      "status": {
+        "working": "#E1BC69",
+        "done": "#99C0B2",
+        "failed": "#F1735A",
+        "scheduled": "#A3A9E0"
+      },
+      "syntax": {
+        "keyword": "#C5B3E8",
+        "string": "#93CDAD",
+        "number": "#E1B38C",
+        "function": "#95C3EB",
+        "type": "#81CDD1",
+        "tag": "#C5B3E8",
+        "attribute": "#E1B38C"
+      }
+    },
+    "light": {
+      "surface": {
+        "sidebar": "#F4EFF4",
+        "canvas": "#FDFAFC",
+        "card": "#F3EDF2",
+        "raised": "#FFFFFF",
+        "selected": "#ECE3EA"
+      },
+      "border": {
+        "subtle": "#E4DDE3",
+        "strong": "#CFC7CE"
+      },
+      "text": {
+        "primary": "#281E27",
+        "secondary": "#564C55",
+        "tertiary": "#736A73"
+      },
+      "accent": {
+        "fill": "#6FD4B6",
+        "text": "#107460",
+        "on_fill": "#06251D",
+        "surface": "#D2F2E8"
+      },
+      "status": {
+        "working": "#8B5D00",
+        "done": "#33705F",
+        "failed": "#C1351E",
+        "scheduled": "#5E589F"
+      },
+      "syntax": {
+        "keyword": "#674E90",
+        "string": "#0B6F49",
+        "number": "#874E0D",
+        "function": "#1D6294",
+        "type": "#006E75",
+        "tag": "#674E90",
+        "attribute": "#874E0D"
+      }
+    }
+  }
+}

@@ -1,0 +1,422 @@
+# Data model
+
+This page lists the entities that the hub, the workers and the clients store, with their fields and state machines. The terms come from [CONTEXT.md](../CONTEXT.md). Wire formats are in [protocol.md](protocol.md).
+
+## Where data lives
+
+| Role | Store | Contents |
+|---|---|---|
+| Hub | `hub.db` (SQLite, WAL mode) | Every entity on this page except the worker-local state |
+| Hub | `blobs/` | Attachments, channel files and artifacts, named by SHA-256 |
+| Hub | FTS5 tables in `hub.db` | Search index over messages, memory notes and task titles |
+| Worker | `worker.toml` | Hub URL, labels, worker policy, harness accounts, local MCP servers, checkouts |
+| Worker | `worker.db` (SQLite) | Event spool, processed command IDs, local session registry |
+| Worker | `workspaces/` | Worktrees and clones that the worker made for tasks |
+| Worker | Each harness's own files | Raw session transcripts and harness logins. The worker never copies these to the hub |
+| Client | `cache.db` (SQLite) | A partial copy of hub entities and the last feed sequence number |
+
+The hub is the source of truth for everything except harness logins and raw transcripts. A session's native state on a worker is a cache that the hub can rebuild from the timeline and memory.
+
+## Identifiers
+
+Every ID is a UUIDv7 string with a type prefix, for example `tsk_0192f0c4-...`. UUIDv7 sorts by creation time.
+
+| Prefix | Entity |
+|---|---|
+| `grp_` | Group |
+| `chn_` | Channel |
+| `msg_` | Message |
+| `tsk_` | Task |
+| `ses_` | Session |
+| `itm_` | Session item |
+| `apr_` | Approval |
+| `dec_` | Decision |
+| `rep_` | Repo |
+| `cko_` | Checkout |
+| `rtn_` | Routine |
+| `wrk_` | Worker |
+| `acc_` | Harness account (unique per worker) |
+| `cli_` | Client |
+
+All timestamps are UTC, stored as Unix milliseconds.
+
+## Conversation entities
+
+### Group
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | ID | |
+| `name` | text | |
+| `position` | integer | Sidebar order |
+| `collapsed` | bool | Shared by all clients |
+
+### Channel
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | ID | |
+| `kind` | `everything` or `standard` | Exactly one `everything` channel exists. It has no group and cannot be archived or deleted |
+| `name` | text | |
+| `icon`, `color` | text | |
+| `group_id` | ID, optional | |
+| `position` | integer | Order inside the group |
+| `purpose` | text, one line | |
+| `instructions` | markdown | |
+| `coordinator_selection` | model selection | Falls back to the Everything channel's value |
+| `task_selection` | model selection | Default for new tasks in this channel |
+| `preferred_workers` | list of worker IDs | Ordered. Placement tries these first |
+| `default_isolation` | `in_place`, `worktree` or `clone` | |
+| `default_approval_mode` | `ask`, `auto_edits`, `auto` or `full_access` | |
+| `memory_enabled` | bool | |
+| `archived_at` | timestamp, optional | |
+| `created_at`, `updated_at` | timestamp | |
+
+### Repo and channel repo
+
+A repo is global, so two channels can attach the same repo.
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | ID | |
+| `url` | text | Git remote URL, normalized |
+| `name` | text | |
+| `default_branch` | text | |
+
+`channel_repos` joins a channel to its repos: `channel_id`, `repo_id`, `position`.
+
+### Message
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | ID | |
+| `channel_id` | ID | |
+| `thread_root_id` | ID, optional | Empty for timeline messages |
+| `author` | `user`, `assistant` or `system` | |
+| `author_session_id` | ID, optional | The coordinator or task session that posted it |
+| `author_task_id` | ID, optional | Set when a task posted it |
+| `author_routine_id` | ID, optional | Set when a routine caused it |
+| `kind` | `text`, `task_card`, `decision`, `approval` or `notice` | |
+| `body` | markdown | For `notice`, a JSON object with a `kind` field |
+| `attachments` | list of blob references | |
+| `in_timeline` | bool | True for a thread reply that also shows in the timeline |
+| `client_message_id` | text, optional | Idempotency key from the client. Unique per client |
+| `reply_count`, `last_reply_at` | integer, timestamp | Set on thread roots only |
+| `edited_at`, `deleted_at` | timestamp, optional | |
+| `created_at` | timestamp | |
+
+`reactions` holds `message_id`, `author`, `emoji` and `created_at`.
+
+### Read marker
+
+The hub has one user, so a message that is read on one client is read on all of them.
+
+| Field | Type | Notes |
+|---|---|---|
+| `channel_id` | ID | |
+| `thread_root_id` | ID, optional | Empty for the timeline |
+| `last_read_message_id` | ID | |
+
+## Work entities
+
+### Task
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | ID | |
+| `channel_id` | ID | |
+| `title` | text | |
+| `brief` | markdown | The first instruction to the task session |
+| `status` | task status | See [Task status](#task-status) |
+| `status_reason` | text, optional | For example "Waiting for bigboi to come online" |
+| `created_by` | `user`, `assistant` or `routine` | |
+| `card_message_id` | ID | The task card in the timeline. The task thread hangs from this message |
+| `model_selection` | model selection | |
+| `placement` | placement request | See below |
+| `approval_mode` | approval mode | |
+| `start_at` | timestamp, optional | Set for Scheduled tasks |
+| `current_session_id` | ID, optional | |
+| `review_summary` | markdown, optional | The text the task gave when it went to Ready for review |
+| `resolved_at`, `archived_at` | timestamp, optional | Archive hides a task in any status |
+| `created_at`, `updated_at` | timestamp | |
+
+A placement request has these fields:
+
+| Field | Type | Notes |
+|---|---|---|
+| `worker_id` | ID, optional | A fixed worker. Placement fails clearly if it cannot use this worker |
+| `require` | object, optional | Constraints: `os`, `labels`, `local_mcp_servers` |
+| `repos` | list of repo IDs | Defaults to the channel repos |
+| `isolation` | isolation | Defaults to the channel value |
+
+### Task status
+
+| Status | UI tab | Meaning |
+|---|---|---|
+| `scheduled` | Scheduled | `start_at` is in the future |
+| `up_next` | Up next | Waiting for placement or for a worker to come online |
+| `working` | Active | A session is running a turn |
+| `needs_input` | Active | One or more approvals or decisions are pending |
+| `review` | Active, under Ready for review | The session finished its turn and waits for the user |
+| `failed` | Active | The session cannot continue. `status_reason` says why |
+| `resolved` | Resolved | The user marked the task done |
+
+Allowed transitions:
+
+| From | To | Cause |
+|---|---|---|
+| (new) | `scheduled` | Created with a future `start_at` |
+| (new) | `up_next` | Created without `start_at` |
+| `scheduled` | `up_next` | `start_at` passed |
+| `up_next` | `working` | Placement found a worker and the session started |
+| `working` | `needs_input` | An approval or a decision opened |
+| `needs_input` | `working` | The last pending approval or decision closed |
+| `working` | `review` | The turn ended with nothing pending, or the task called `submit_for_review` |
+| `review` | `working` | The user or the coordinator sent the task a message |
+| `review` | `resolved` | The user resolved the task. No session can do this |
+| `resolved` | `review` | The user chose **Not done** |
+| `up_next`, `working`, `needs_input`, `review` | `failed` | The session was lost and cannot resume, the harness failed, or the fixed worker was removed |
+| `failed` | `up_next` | The user or the coordinator chose retry |
+
+A task whose worker goes offline stays in its current status. The task card shows the worker as offline. The worker keeps the session running and sends the buffered events when it reconnects.
+
+### Session
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | ID | |
+| `role` | `coordinator` or `task` | |
+| `channel_id` | ID | |
+| `task_id` | ID, optional | Set when `role` is `task` |
+| `worker_id` | ID | A session never moves to another worker |
+| `account_id` | ID | Harness account on that worker |
+| `harness` | text | `claude`, `codex`, `pi`, `opencode` or `acp:<agent-id>` |
+| `model`, `options` | text, object | |
+| `workspace_path` | text | Path on the worker |
+| `native_ref` | text, optional | The harness's own session ID, used to resume |
+| `state` | `starting`, `active`, `idle`, `ended` or `lost` | |
+| `last_seq` | integer | Highest event sequence number that the hub stored |
+| `usage` | object | Input, output and cached tokens, and cost when the harness reports it |
+| `started_at`, `ended_at` | timestamp | |
+| `end_reason` | text, optional | |
+
+### Session item
+
+The hub stores a normalized copy of what a session did. An update with the same `id` replaces the earlier copy.
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | ID | Unique per session |
+| `session_id` | ID | |
+| `turn_id` | text | |
+| `kind` | text | `assistant_message`, `reasoning`, `command`, `file_change`, `tool_call`, `plan`, `subagent`, `web_search` or `error` |
+| `status` | `in_progress`, `completed` or `failed` | |
+| `payload` | JSON | Command output keeps only the last 8 KiB. File changes keep paths and line counts. The full data stays on the worker |
+| `created_at`, `updated_at` | timestamp | |
+
+### Approval
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | ID | |
+| `session_id`, `task_id` | ID | |
+| `message_id` | ID | The approval card in the task thread |
+| `kind` | `command`, `file_change`, `tool`, `network` or `other` | |
+| `summary` | text | One line for the card and the push notification |
+| `details` | JSON | Command and folder, paths, or tool name and arguments |
+| `options` | list | From the harness, for example allow once, allow for this session, deny |
+| `status` | `pending`, `allowed`, `denied`, `expired` or `canceled` | |
+| `answered_at`, `answered_by_client_id` | timestamp, ID | |
+
+### Decision
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | ID | |
+| `channel_id` | ID | |
+| `task_id` | ID, optional | |
+| `session_id` | ID | The session that asked |
+| `message_id` | ID | The decision card |
+| `question` | text, at most 1,200 characters | |
+| `context` | markdown, optional | |
+| `options` | 2 to 4 objects | Each has `label` (at most 40 characters) and `consequence` (at most 800 characters) |
+| `recommended_index` | integer, optional | |
+| `allow_free_text` | bool | |
+| `status` | `pending`, `answered`, `expired` or `canceled` | |
+| `answer` | object, optional | `option_index`, `text` or both |
+| `answered_at` | timestamp, optional | |
+
+### Routine
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | ID | |
+| `channel_id` | ID | |
+| `name` | text | |
+| `schedule` | object | One of: `cron` with an expression and a time zone, `interval` in seconds (at least 60), or `once` with a timestamp |
+| `prompt` | markdown | |
+| `action` | object | `coordinator_turn`, or `start_task` with a title, a model selection and a placement request |
+| `enabled` | bool | |
+| `next_run_at`, `last_run_at` | timestamp | |
+| `last_run_status` | `ok` or `error` | |
+
+`routine_runs` keeps one row per run: `routine_id`, `started_at`, `message_id` or `task_id`, and `error`.
+
+## Knowledge entities
+
+### Memory note
+
+| Field | Type | Notes |
+|---|---|---|
+| `scope` | `global` or a channel ID | The Everything channel's memory is the global memory |
+| `path` | text | For example `people/kevin.md` |
+| `content` | markdown | |
+| `sha256` | text | Hash of `content` |
+| `version` | integer | |
+| `updated_by` | session ID or `user` | |
+| `updated_at` | timestamp | |
+
+`memory_note_versions` keeps every earlier version.
+
+Every write states the hash that it expects, or `not_exists` for a new note. If the stored hash differs, the hub rejects the write with `stale_write`.
+
+| Writer | Reads | Writes |
+|---|---|---|
+| Everything coordinator | All scopes | `global` |
+| Channel coordinator | `global` and its own channel | Its own channel. It can suggest a global note to the Everything coordinator |
+| Task session | `global` and its channel | Nothing. It can suggest a note to its channel coordinator |
+| User, from a client | All scopes | All scopes |
+
+A suggestion goes one level up: from a task to its channel coordinator, and from a channel coordinator to the Everything coordinator. The coordinator that gets a suggestion decides whether to write the note. The hub never writes a suggestion to memory by itself.
+
+### Channel file and artifact
+
+| Field | Type | Notes |
+|---|---|---|
+| `channel_id` | ID | |
+| `path` | text | |
+| `blob_sha256` | text | |
+| `size`, `mime` | integer, text | |
+| `task_id` | ID, optional | Set on artifacts |
+| `title` | text, optional | Set on artifacts |
+| `updated_by`, `updated_at` | text, timestamp | |
+| `deleted_at` | timestamp, optional | |
+
+An artifact is a channel file with a `task_id`. Tasks publish artifacts under `artifacts/<task-id>/`.
+
+## Machine entities
+
+### Worker
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | ID | |
+| `name` | text | Set by the user |
+| `hostname` | text | |
+| `os` | `macos`, `windows` or `linux` | |
+| `arch` | text | |
+| `public_key` | Ed25519 public key | |
+| `version`, `protocol_version` | text, integer | |
+| `labels` | list of text | For example `gpu` or `windows-test` |
+| `state` | `online` or `offline` | |
+| `last_seen_at` | timestamp | |
+| `inventory` | JSON | The newest inventory snapshot. See [protocol.md](protocol.md#inventory) |
+| `paired_at`, `revoked_at` | timestamp | |
+
+### Harness account
+
+The worker owns the account configuration and the login. The hub stores only what the worker reports in its inventory.
+
+| Field | Type | Notes |
+|---|---|---|
+| `worker_id`, `account_id` | ID | |
+| `harness` | text | |
+| `label` | text | For example "Claude Personal". Two workers with the same label share one login |
+| `harness_version` | text | |
+| `auth_state` | `signed_in`, `signed_out`, `error` or `unknown` | With a detail such as the plan name |
+| `models` | list | Each model has an ID, a name and option descriptors (select or boolean) |
+| `capabilities` | object | `steer`, `resume`, `fork`, `images`, `plan_mode`, `usage`, `mcp_http` and the approval modes it supports |
+| `enabled` | bool | |
+
+### Model selection
+
+A model selection is a value, not a row: `account_label`, `model` and `options`. Placement turns it into a worker and an account ID on that worker.
+
+### Checkout
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | ID | |
+| `repo_id` | ID | |
+| `worker_id` | ID | |
+| `path` | text | |
+| `managed` | bool | True when the worker made the clone itself |
+| `last_seen_at` | timestamp | |
+
+### Client
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | ID | |
+| `name` | text | |
+| `kind` | `desktop`, `ios` or `android` | |
+| `public_key` | Ed25519 public key | |
+| `push` | object, optional | Provider (`apns`, `fcm` or `expo`) and token |
+| `paired_at`, `last_seen_at`, `revoked_at` | timestamp | |
+
+## Feed
+
+Every write on the hub adds one feed entry in the same database transaction. Clients use the feed to stay in sync.
+
+| Field | Type | Notes |
+|---|---|---|
+| `seq` | integer | Increases by one for each entry, across the whole hub |
+| `at` | timestamp | |
+| `channel_id` | ID, optional | Lets a client filter by channel |
+| `entity` | text | `channel`, `group`, `message`, `task`, `session_item`, `approval`, `decision`, `memory_note`, `channel_file`, `routine` or `worker` |
+| `entity_id` | text | |
+| `op` | `upsert` or `delete` | |
+| `payload` | JSON | The full client view of the entity after the write |
+
+The hub merges updates to the same session item that arrive within 250 ms into one feed entry. The hub deletes feed entries after 30 days. A client whose last `seq` is older than the oldest kept entry gets a `resync_required` error and reloads its snapshots.
+
+## Worker-local state
+
+`worker.toml` holds the configuration that the user owns on that machine:
+
+```toml
+hub_url = "https://hub.example.com"
+name = "bigboi"
+labels = ["windows-test", "gpu"]
+
+[policy]
+allowed_roots = ["C:/Users/chris/Code"]
+max_approval_mode = "auto_edits"
+allow_shell = true
+
+[[accounts]]
+id = "acc_0192f0c4-..."
+harness = "codex"
+label = "Codex Personal"
+binary = "codex"
+home = "~/.codex"
+shadow_home = "~/.local/share/app/homes/codex-personal"
+args = []
+env = {}
+enabled = true
+
+[[local_mcp_servers]]
+name = "home-assistant"
+transport = "http"
+url = "http://192.168.1.20:8123/mcp"
+
+[[checkouts]]
+repo_url = "git@github.com:watzon/sayso.git"
+path = "C:/Users/chris/Code/sayso"
+```
+
+`worker.db` holds:
+
+- `spool`: session ID, sequence number, event and an acknowledged flag. The worker keeps events until the hub acknowledges them.
+- `processed_commands`: command ID, result and time, kept for 24 hours so that a repeated command runs once.
+- `sessions`: the local registry of sessions with their native references and workspace paths.

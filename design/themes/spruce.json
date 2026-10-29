@@ -1,0 +1,24 @@
+{
+  "$schema": "../theme.schema.json",
+  "name": "Spruce",
+  "author": "Consort",
+  "default": true,
+  "modes": {
+    "dark": {
+      "surface": { "sidebar": "#0F1815", "canvas": "#131E1A", "card": "#1B2623", "raised": "#222E2A", "selected": "#293732" },
+      "border": { "subtle": "#27322E", "strong": "#384440" },
+      "text": { "primary": "#F0EBDF", "secondary": "#B3BAB1", "tertiary": "#868F89" },
+      "accent": { "fill": "#E7BE62", "text": "#EAC673", "on_fill": "#2B2005", "surface": "#3E3519" },
+      "status": { "working": "#77B4ED", "done": "#80C7A8", "failed": "#F1735A", "scheduled": "#B2A0D6" },
+      "syntax": { "keyword": "#C5B3E8", "string": "#93CDAD", "number": "#E1B38C", "function": "#95C3EB", "type": "#81CDD1", "tag": "#C5B3E8", "attribute": "#E1B38C" }
+    },
+    "light": {
+      "surface": { "sidebar": "#EBF2EE", "canvas": "#F8FCF8", "card": "#E9F2ED", "raised": "#FFFFFF", "selected": "#DDE9E3" },
+      "border": { "subtle": "#D8E1DD", "strong": "#C2CCC7" },
+      "text": { "primary": "#192622", "secondary": "#46534F", "tertiary": "#64706C" },
+      "accent": { "fill": "#E1B856", "text": "#93640B", "on_fill": "#2B2005", "surface": "#F2E8C7" },
+      "status": { "working": "#1364B0", "done": "#237356", "failed": "#C1351E", "scheduled": "#6D5398" },
+      "syntax": { "keyword": "#674E90", "string": "#0B6F49", "number": "#874E0D", "function": "#1D6294", "type": "#006E75", "tag": "#674E90", "attribute": "#874E0D" }
+    }
+  }
+}

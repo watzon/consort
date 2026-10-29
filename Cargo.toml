@@ -1,0 +1,30 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.94"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+unwrap_used = "warn"
+
+[workspace.dependencies]
+# Internal crates
+consort-proto = { path = "crates/consort-proto" }
+consort-theme = { path = "crates/consort-theme" }
+consort-harness = { path = "crates/consort-harness" }
+consort-worker = { path = "crates/consort-worker" }
+consort-hub = { path = "crates/consort-hub" }
+consort-client = { path = "crates/consort-client" }
+consort-testkit = { path = "crates/consort-testkit" }
+
+[profile.dev.package."*"]
+opt-level = 1

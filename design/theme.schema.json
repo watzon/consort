@@ -1,0 +1,211 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://consort.dev/schema/theme.json",
+  "title": "Consort theme",
+  "description": "A Consort theme sets color roles only. Type, spacing, corners, motion and icons are fixed by design/structure.json.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "name",
+    "modes"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "author": {
+      "type": "string"
+    },
+    "default": {
+      "type": "boolean"
+    },
+    "modes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "dark",
+        "light"
+      ],
+      "properties": {
+        "dark": {
+          "$ref": "#/$defs/mode"
+        },
+        "light": {
+          "$ref": "#/$defs/mode"
+        }
+      }
+    }
+  },
+  "$defs": {
+    "color": {
+      "type": "string",
+      "pattern": "^#[0-9A-Fa-f]{6}$"
+    },
+    "mode": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "surface",
+        "border",
+        "text",
+        "accent",
+        "status",
+        "syntax"
+      ],
+      "properties": {
+        "surface": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "sidebar",
+            "canvas",
+            "card",
+            "raised",
+            "selected"
+          ],
+          "properties": {
+            "sidebar": {
+              "$ref": "#/$defs/color"
+            },
+            "canvas": {
+              "$ref": "#/$defs/color"
+            },
+            "card": {
+              "$ref": "#/$defs/color"
+            },
+            "raised": {
+              "$ref": "#/$defs/color"
+            },
+            "selected": {
+              "$ref": "#/$defs/color"
+            }
+          }
+        },
+        "border": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "subtle",
+            "strong"
+          ],
+          "properties": {
+            "subtle": {
+              "$ref": "#/$defs/color"
+            },
+            "strong": {
+              "$ref": "#/$defs/color"
+            }
+          }
+        },
+        "text": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "primary",
+            "secondary",
+            "tertiary"
+          ],
+          "properties": {
+            "primary": {
+              "$ref": "#/$defs/color"
+            },
+            "secondary": {
+              "$ref": "#/$defs/color"
+            },
+            "tertiary": {
+              "$ref": "#/$defs/color"
+            }
+          }
+        },
+        "accent": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "fill",
+            "text",
+            "on_fill",
+            "surface"
+          ],
+          "properties": {
+            "fill": {
+              "$ref": "#/$defs/color"
+            },
+            "text": {
+              "$ref": "#/$defs/color"
+            },
+            "on_fill": {
+              "$ref": "#/$defs/color"
+            },
+            "surface": {
+              "$ref": "#/$defs/color"
+            }
+          }
+        },
+        "status": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "working",
+            "done",
+            "failed",
+            "scheduled"
+          ],
+          "properties": {
+            "working": {
+              "$ref": "#/$defs/color"
+            },
+            "done": {
+              "$ref": "#/$defs/color"
+            },
+            "failed": {
+              "$ref": "#/$defs/color"
+            },
+            "scheduled": {
+              "$ref": "#/$defs/color"
+            }
+          }
+        },
+        "syntax": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "keyword",
+            "string",
+            "number",
+            "function",
+            "type",
+            "tag",
+            "attribute"
+          ],
+          "properties": {
+            "keyword": {
+              "$ref": "#/$defs/color"
+            },
+            "string": {
+              "$ref": "#/$defs/color"
+            },
+            "number": {
+              "$ref": "#/$defs/color"
+            },
+            "function": {
+              "$ref": "#/$defs/color"
+            },
+            "type": {
+              "$ref": "#/$defs/color"
+            },
+            "tag": {
+              "$ref": "#/$defs/color"
+            },
+            "attribute": {
+              "$ref": "#/$defs/color"
+            }
+          }
+        }
+      }
+    }
+  }
+}
