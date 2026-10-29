@@ -428,6 +428,18 @@ mod fake_agent {
                     send(&mut write, reply(json!({"configOptions": []}))).await
                 }
                 Some("session/prompt") => {
+                    // A prompt that the test wants to fail. -32000 is the ACP
+                    // code for "authentication required".
+                    let text = msg["params"]["prompt"][0]["text"].as_str().unwrap_or("");
+                    let failure = match text {
+                        "Expire" => Some((-32000, "Authentication required")),
+                        "Break" => Some((-32603, "Internal error")),
+                        _ => None,
+                    };
+                    if let Some((code, message)) = failure {
+                        send(&mut write, json!({"jsonrpc": "2.0", "id": id.clone(), "error": {"code": code, "message": message}})).await;
+                        continue;
+                    }
                     prompts += 1;
                     open_prompt = id.clone();
                     if prompts == 1 {
@@ -648,6 +660,84 @@ mod fake_agent {
                 .any(|m| m["method"] == "_session/steering"
                     && m["params"]["prompt"][0]["text"] == "Also this")
         );
+        session.close().await.unwrap();
+    }
+
+    /// Plays one turn and returns the events from `TurnStarted` up to and
+    /// including `TurnEnded`.
+    async fn events_of_turn(
+        session: &mut Box<dyn HarnessSession>,
+        events: &mut EventReceiver,
+        text: &str,
+    ) -> Vec<SessionEvent> {
+        session
+            .turn(TurnInput {
+                text: text.into(),
+                attachments: vec![],
+            })
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        loop {
+            let event = next_matching(events, |_| true).await;
+            let ended = matches!(event, SessionEvent::TurnEnded { .. });
+            out.push(event);
+            if ended {
+                return out;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_prompt_that_needs_a_login_reports_signed_out_and_the_next_step() {
+        let (client_side, agent_side) = tokio::io::duplex(1 << 16);
+        let log = Arc::new(Mutex::new(Vec::new()));
+        tokio::spawn(run_agent(agent_side, log));
+        let (read, write) = tokio::io::split(client_side);
+        let (session, mut events, _ready) = connect(
+            HarnessKind::ClaudeCode,
+            spec(),
+            write,
+            read,
+            None,
+            StderrTail::empty(),
+        )
+        .await
+        .unwrap();
+        let mut session: Box<dyn HarnessSession> = Box::new(session);
+        let hint = "Authentication required. Run `claude` on this machine and sign in with /login.";
+
+        let turn = events_of_turn(&mut session, &mut events, "Expire").await;
+        let signed_out = turn
+            .iter()
+            .position(|e| {
+                matches!(e, SessionEvent::Error { code, message }
+                    if code == crate::SIGNED_OUT_ERROR_CODE && message == hint)
+            })
+            .expect("a signed_out error event");
+        assert_eq!(
+            signed_out,
+            turn.len() - 2,
+            "it comes right before TurnEnded"
+        );
+        assert!(matches!(
+            turn.last(),
+            Some(SessionEvent::TurnEnded { reason: TurnEndReason::Failed, error: Some(error), .. })
+                if error == hint
+        ));
+
+        // Another failure is not a sign-out. The turn fails with its own text.
+        let turn = events_of_turn(&mut session, &mut events, "Break").await;
+        assert!(
+            !turn
+                .iter()
+                .any(|e| matches!(e, SessionEvent::Error { code, .. } if code == crate::SIGNED_OUT_ERROR_CODE))
+        );
+        assert!(matches!(
+            turn.last(),
+            Some(SessionEvent::TurnEnded { reason: TurnEndReason::Failed, error: Some(error), .. })
+                if error.contains("Internal error")
+        ));
         session.close().await.unwrap();
     }
 

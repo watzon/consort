@@ -17,10 +17,10 @@ use serde_json::Value;
 use super::protocol::{
     CommandApprovalParams, DeltaNotification, ErrorNotification, ExecStatus,
     FileChangeApprovalParams, FileUpdateChange, ItemNotification, PatchChangeKind,
-    PermissionsApprovalParams, ThreadItem, TokenUsageNotification, TurnNotification,
+    PermissionsApprovalParams, ThreadItem, TokenUsageNotification, TurnError, TurnNotification,
     TurnPlanNotification, TurnStatus, UserInputQuestion, method,
 };
-use crate::ItemTracker;
+use crate::{HarnessKind, ItemTracker, SIGNED_OUT_ERROR_CODE, sign_in_hint};
 
 fn parse<T: DeserializeOwned>(params: &Value) -> Option<T> {
     match serde_json::from_value(params.clone()) {
@@ -277,10 +277,25 @@ impl CodexMapper {
                         }
                         TurnStatus::Failed => (TurnEndReason::Failed, ItemStatus::Failed),
                     };
-                    let error = n.turn.error.map(|e| match e.additional_details {
+                    let signed_out = n
+                        .turn
+                        .error
+                        .as_ref()
+                        .is_some_and(TurnError::is_unauthorized);
+                    let mut error = n.turn.error.map(|e| match e.additional_details {
                         Some(more) => format!("{} {more}", e.message),
                         None => e.message,
                     });
+                    if signed_out {
+                        // The login is gone or expired. Tell the worker
+                        // first, and end the turn with the next step.
+                        let hint = sign_in_hint(HarnessKind::Codex, error.as_deref().unwrap_or(""));
+                        events.push(SessionEvent::Error {
+                            code: SIGNED_OUT_ERROR_CODE.to_owned(),
+                            message: hint.clone(),
+                        });
+                        error = Some(hint);
+                    }
                     events.extend(self.tracker.finish_open(item_status));
                     events.push(SessionEvent::TurnEnded {
                         turn_id: TurnId::new(n.turn.id),

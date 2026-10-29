@@ -285,6 +285,31 @@ pub fn turn_text(input: &TurnInput) -> String {
     format!("{}\n\n(Attached files: {})", input.text, names.join(", "))
 }
 
+/// The `code` of the [`SessionEvent::Error`] that tells the worker the
+/// harness account is signed out. The `message` of that event is the text for
+/// the user, and it includes what to do next (see [`sign_in_hint`]).
+pub const SIGNED_OUT_ERROR_CODE: &str = "signed_out";
+
+/// What to tell the user when a harness account is not signed in. `message`
+/// is the reason that the harness gave, and it may be empty.
+pub fn sign_in_hint(kind: HarnessKind, message: &str) -> String {
+    let command = match kind {
+        HarnessKind::ClaudeCode => "Run `claude` on this machine and sign in with /login.",
+        HarnessKind::Codex => "Run `codex login` on this machine.",
+        HarnessKind::OpenCode => "Run `opencode auth login` on this machine.",
+        HarnessKind::GeminiCli => "Run `gemini` on this machine and sign in.",
+        _ => "Sign in with the agent's own command on this machine.",
+    };
+    let message = message.trim();
+    if message.is_empty() {
+        command.to_owned()
+    } else if message.ends_with(['.', '!', '?']) {
+        format!("{message} {command}")
+    } else {
+        format!("{message}. {command}")
+    }
+}
+
 /// Returns the adapter for a kind, or `None` for a kind with no adapter in
 /// this build.
 pub fn adapter_for(kind: HarnessKind) -> Option<Box<dyn Harness>> {
@@ -311,6 +336,22 @@ mod tests {
             assert_eq!(back, kind);
         }
         assert_eq!(HarnessKind::GeminiCli.display_name(), "Gemini CLI");
+    }
+
+    #[test]
+    fn sign_in_hint_ends_the_reason_with_a_period() {
+        assert_eq!(
+            sign_in_hint(HarnessKind::ClaudeCode, "Authentication required"),
+            "Authentication required. Run `claude` on this machine and sign in with /login."
+        );
+        assert_eq!(
+            sign_in_hint(HarnessKind::Codex, "Token expired."),
+            "Token expired. Run `codex login` on this machine."
+        );
+        assert_eq!(
+            sign_in_hint(HarnessKind::OpenCode, ""),
+            "Run `opencode auth login` on this machine."
+        );
     }
 
     #[test]

@@ -230,6 +230,17 @@ pub struct TurnError {
     /// More detail.
     #[serde(default)]
     pub additional_details: Option<String>,
+    /// The kind of error. Codex sends `"unauthorized"` as a string when the
+    /// login is gone or expired. Other kinds can be objects.
+    #[serde(default)]
+    pub codex_error_info: Option<Value>,
+}
+
+impl TurnError {
+    /// Whether Codex says that the login is gone or expired.
+    pub fn is_unauthorized(&self) -> bool {
+        self.codex_error_info.as_ref().and_then(Value::as_str) == Some("unauthorized")
+    }
 }
 
 /// A turn.

@@ -498,3 +498,105 @@ async fn the_worker_allows_hub_tools_without_asking_the_hub() {
     );
     worker.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn a_signed_out_session_makes_the_worker_send_a_signed_out_inventory() {
+    let hub = FakeHub::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    consort_worker::pair(&hub.url, CODE, dir.path(), None, vec![])
+        .await
+        .unwrap();
+    let mut toml = WorkerToml::load(dir.path()).unwrap();
+    toml.auto_discover = false;
+    let account = AccountConfig::default_for(HarnessKind::ClaudeCode);
+    let account_id = account.id;
+    toml.accounts = vec![account];
+    toml.save(dir.path()).unwrap();
+
+    // The probe says "signed in", like the real probe of an expired Claude
+    // Code login. The first prompt then reports that the login is gone.
+    let hint = "Authentication required. Run `claude` on this machine and sign in with /login.";
+    let script = FakeScript {
+        turns: vec![vec![
+            FakeStep::Event(SessionEvent::Error {
+                code: consort_harness::SIGNED_OUT_ERROR_CODE.to_owned(),
+                message: hint.to_owned(),
+            }),
+            FakeStep::Fail(hint.to_owned()),
+        ]],
+    };
+    let fake = FakeHarness::new(HarnessKind::ClaudeCode, script);
+    let mut harnesses: Harnesses = HashMap::new();
+    harnesses.insert(
+        HarnessKind::ClaudeCode,
+        Arc::new(fake.clone()) as Arc<dyn Harness>,
+    );
+    let worker = consort_worker::run_with(
+        WorkerConfig {
+            config_dir: dir.path().to_path_buf(),
+        },
+        harnesses,
+    )
+    .await
+    .unwrap();
+    hub.wait_connected().await;
+    hub.wait_for("a signed-in inventory", |h| {
+        h.state
+            .inventories
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|i| {
+                i.accounts
+                    .first()
+                    .is_some_and(|a| a.auth_state == AuthState::SignedIn)
+            })
+            .then_some(())
+    })
+    .await;
+
+    let session_id = SessionId::new();
+    let start = session_start(session_id, account_id);
+    assert!(hub.command("start-1", start.into()).await.result.is_ok());
+
+    // The newest inventory shows the account as signed out, with the hint.
+    let inventory = hub
+        .wait_for("a signed-out inventory", |h| {
+            h.state
+                .inventories
+                .lock()
+                .unwrap()
+                .last()
+                .filter(|i| {
+                    i.accounts
+                        .first()
+                        .is_some_and(|a| a.auth_state == AuthState::SignedOut)
+                })
+                .cloned()
+        })
+        .await;
+    let account = &inventory.accounts[0];
+    assert_eq!(account.auth_detail.as_deref(), Some(hint));
+    assert_eq!(account.models[0].id, "fake-model", "the models stay");
+    assert!(
+        !account.can_run("fake-model"),
+        "the hub does not place work on a signed-out account"
+    );
+    assert_eq!(inventory.hash, inventory.compute_hash());
+
+    // The hub also gets the error event and the failed turn with the hint.
+    hub.wait_for("the failed turn", |h| {
+        let events = h.events(session_id);
+        let error = events.iter().any(|e| {
+            matches!(&e.event, SessionEvent::Error { code, message }
+                if code == consort_harness::SIGNED_OUT_ERROR_CODE && message == hint)
+        });
+        let failed = events.iter().any(|e| {
+            matches!(&e.event, SessionEvent::TurnEnded { reason: TurnEndReason::Failed, error: Some(text), .. }
+                if text == hint)
+        });
+        (error && failed).then_some(())
+    })
+    .await;
+    worker.shutdown().await.unwrap();
+}

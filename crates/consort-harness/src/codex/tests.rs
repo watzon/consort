@@ -167,6 +167,56 @@ fn interrupted_and_failed_turns() {
 }
 
 #[test]
+fn an_unauthorized_turn_reports_signed_out_before_it_ends() {
+    let mut m = CodexMapper::new(SessionId::new());
+    m.turn_accepted("t1");
+    let events = m.map_notification(
+        "turn/completed",
+        &json!({
+            "threadId": "th",
+            "turn": {"id": "t1", "items": [], "status": "failed", "error": {
+                "message": "Your access token could not be refreshed.",
+                "codexErrorInfo": "unauthorized"
+            }}
+        }),
+    );
+    let hint = "Your access token could not be refreshed. Run `codex login` on this machine.";
+    let signed_out = events
+        .iter()
+        .position(|e| {
+            matches!(e, SessionEvent::Error { code, message }
+                if code == crate::SIGNED_OUT_ERROR_CODE && message == hint)
+        })
+        .expect("a signed_out error event");
+    let ended = events
+        .iter()
+        .position(|e| {
+            matches!(e, SessionEvent::TurnEnded { reason: TurnEndReason::Failed, error: Some(error), .. }
+                if error == hint)
+        })
+        .expect("a failed turn with the hint");
+    assert!(signed_out < ended);
+
+    // Other error kinds are not a sign-out.
+    m.turn_accepted("t2");
+    let events = m.map_notification(
+        "turn/completed",
+        &json!({
+            "threadId": "th",
+            "turn": {"id": "t2", "items": [], "status": "failed", "error": {
+                "message": "Slow down.",
+                "codexErrorInfo": "rateLimitExceeded"
+            }}
+        }),
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, SessionEvent::Error { .. }))
+    );
+}
+
+#[test]
 fn approvals_and_questions() {
     let m = CodexMapper::new(SessionId::new());
     let cmd = m.command_approval(

@@ -8,10 +8,12 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use consort_harness::approval::effective_mode;
-use consort_harness::{EventReceiver, HarnessSession, McpServerSpec, SessionSpec, StdioCommand};
+use consort_harness::{
+    EventReceiver, HarnessSession, McpServerSpec, SIGNED_OUT_ERROR_CODE, SessionSpec, StdioCommand,
+};
 use consort_proto::error::{ErrorBody, ErrorCode};
 use consort_proto::frame::FrameId;
-use consort_proto::ids::{ItemId, RequestId, SessionId};
+use consort_proto::ids::{AccountId, ItemId, RequestId, SessionId};
 use consort_proto::model::{
     ApprovalDetails, ApprovalMode, Capabilities, RequestOptionKind, SessionState, Sha256Hash,
 };
@@ -175,6 +177,7 @@ fn deny_option(options: &[consort_proto::model::RequestOption]) -> Option<String
 async fn pump(
     core: Arc<Core>,
     session_id: SessionId,
+    account_id: AccountId,
     mut events: EventReceiver,
     jobs: mpsc::UnboundedSender<Job>,
     deny_commands: bool,
@@ -192,6 +195,13 @@ async fn pump(
         tokio::select! {
             event = events.recv() => {
                 let Some(event) = event else { break };
+                // The harness says that the login is gone or expired. Update
+                // the inventory now, so the hub stops placing work here.
+                if let SessionEvent::Error { code, message } = &event
+                    && code == SIGNED_OUT_ERROR_CODE
+                {
+                    core.mark_signed_out(account_id, message);
+                }
                 if let SessionEvent::RequestOpened(opened) = &event
                     && let Some(option_id) = hub_tool_allow(opened)
                 {
@@ -422,6 +432,7 @@ impl Runtime {
         self.pump = Some(tokio::spawn(pump(
             core.clone(),
             self.session_id,
+            start.account_id,
             events,
             self.jobs.clone(),
             !config.policy.allow_shell,

@@ -318,6 +318,28 @@ impl Core {
         }
     }
 
+    /// Marks an account as signed out, because one of its sessions reported
+    /// it. `detail` is the text for the user, with the step to sign in. The
+    /// models stay as the last probe found them. The hub does not place work
+    /// on an account that is not signed in. The next probe can set the state
+    /// back. Sends the new inventory to the hub at once.
+    pub fn mark_signed_out(&self, account_id: AccountId, detail: &str) {
+        lock(&self.statuses)
+            .entry(account_id)
+            .and_modify(|status| {
+                status.auth_state = AuthState::SignedOut;
+                status.auth_detail = Some(detail.to_owned());
+            })
+            .or_insert_with(|| AccountStatus {
+                harness_version: None,
+                auth_state: AuthState::SignedOut,
+                auth_detail: Some(detail.to_owned()),
+                models: Vec::new(),
+                capabilities: Default::default(),
+            });
+        self.send_inventory(false);
+    }
+
     pub fn inventory(&self) -> Inventory {
         let config = self.config_snapshot();
         let statuses = lock(&self.statuses).clone();

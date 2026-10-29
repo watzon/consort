@@ -33,7 +33,8 @@ use crate::approval::{claude_mode, gemini_mode, opencode_permission};
 use crate::process::{self, ProcessSpec, StderrTail, resolve_program};
 use crate::{
     AccountConfig, AccountStatus, Answer, EVENT_CHANNEL_CAPACITY, EventReceiver, Harness,
-    HarnessError, HarnessKind, HarnessSession, McpServerSpec, SessionSpec, turn_text,
+    HarnessError, HarnessKind, HarnessSession, McpServerSpec, SIGNED_OUT_ERROR_CODE, SessionSpec,
+    sign_in_hint, turn_text,
 };
 use mapper::{AcpMapper, stop_reason};
 
@@ -728,6 +729,17 @@ impl Actor {
                     }
                     let events = match result {
                         Ok(response) => mapper.end_turn(stop_reason(response.get("stopReason").and_then(Value::as_str)), None),
+                        Err(err) if err.code == ErrorCode::AuthRequired => {
+                            // The login is gone or expired. Tell the worker
+                            // first, then end the turn with the next step.
+                            let hint = sign_in_hint(self.kind, &err.message);
+                            self.emit(SessionEvent::Error {
+                                code: SIGNED_OUT_ERROR_CODE.to_owned(),
+                                message: hint.clone(),
+                            })
+                            .await;
+                            mapper.end_turn(TurnEndReason::Failed, Some(hint))
+                        }
                         Err(err) => mapper.end_turn(TurnEndReason::Failed, Some(err.to_string())),
                     };
                     self.emit_all(events).await;
@@ -983,21 +995,6 @@ impl Harness for AcpHarness {
     ) -> Result<(Box<dyn HarnessSession>, EventReceiver), HarnessError> {
         let (session, events, _ready) = start(self.kind, account, spec).await?;
         Ok((Box::new(session), events))
-    }
-}
-
-/// What to tell the user when an ACP agent is not signed in.
-fn sign_in_hint(kind: HarnessKind, message: &str) -> String {
-    let command = match kind {
-        HarnessKind::ClaudeCode => "Run `claude` on this machine and sign in with /login.",
-        HarnessKind::OpenCode => "Run `opencode auth login` on this machine.",
-        HarnessKind::GeminiCli => "Run `gemini` on this machine and sign in.",
-        _ => "Sign in with the agent's own command on this machine.",
-    };
-    if message.is_empty() {
-        command.to_owned()
-    } else {
-        format!("{message} {command}")
     }
 }
 

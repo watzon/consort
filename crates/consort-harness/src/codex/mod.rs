@@ -29,7 +29,7 @@ use crate::process::{
 };
 use crate::{
     AccountConfig, AccountStatus, Answer, EVENT_CHANNEL_CAPACITY, EventReceiver, Harness,
-    HarnessError, HarnessKind, HarnessSession, McpServerSpec, SessionSpec, turn_text,
+    HarnessError, HarnessKind, HarnessSession, McpServerSpec, SessionSpec, sign_in_hint, turn_text,
 };
 use mapper::CodexMapper;
 use protocol::{
@@ -303,7 +303,7 @@ impl Harness for CodexHarness {
                     Some(protocol::Account::Other) => (AuthState::SignedIn, None),
                     None if info.requires_openai_auth => (
                         AuthState::SignedOut,
-                        Some("Run `codex login` on this machine.".to_owned()),
+                        Some(sign_in_hint(HarnessKind::Codex, "")),
                     ),
                     None => (
                         AuthState::SignedIn,
