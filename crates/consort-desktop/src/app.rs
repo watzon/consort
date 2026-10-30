@@ -29,10 +29,11 @@ use crate::{
     read_marker::{self, MARK_RETRY, MarkInputs, UNLOADED_GRACE, Unloaded},
     ui::{
         links::LinkAction,
+        mark::{MarkPhase, MarkPlayer},
         markdown::TextCache,
         menu::{EditOp, MenuAction, MenuItem, OpenMenu, TextTarget, TriggerBounds, render_menu},
         model_picker::{OpenEffort, OpenPicker, PickerTarget},
-        parts::Spin,
+        motion::FrameClock,
     },
     waiting::{Waiting, waiting_for_channel},
 };
@@ -301,7 +302,7 @@ pub struct ConsortApp {
     /// A retry of a failed mark-as-read waits on its timer.
     mark_retry_waiting: bool,
     /// The window has the focus.
-    window_active: bool,
+    pub(crate) window_active: bool,
     /// The retry countdown, while the link is offline.
     pub offline: Option<RetryCountdown>,
     offline_ticker: bool,
@@ -326,8 +327,15 @@ pub struct ConsortApp {
     pub summary_closed: Vec<String>,
     /// The Archived list in the sidebar is open.
     pub archived_open: bool,
-    /// The timer that turns the Working glyphs runs.
-    spin_ticker: bool,
+    /// The 8 fps timer of the stop motion runs (see [`FrameClock`]).
+    clock_ticker: bool,
+    /// The rows of the open channel's chat: bubbles, cards and time
+    /// separators, made from its timeline (see [`consort_client::chat`]).
+    pub chat_rows: Vec<consort_client::chat::ChatRow>,
+    /// What the Three voices mark over the timeline shows.
+    pub mark: MarkPlayer,
+    /// A phase that `--screen mark-*` holds, for screenshots.
+    pub mark_forced: Option<MarkPhase>,
     /// What Enter does in the open dialog: the confirm button, unless Enter
     /// must not confirm (a destructive dialog, or a box with many lines).
     pub(crate) dialog_confirm: RefCell<Option<DialogConfirm>>,
@@ -518,8 +526,8 @@ impl ConsortApp {
             if this.window_active {
                 this.mark_read(cx);
             }
-            // The Working glyphs stop turning in a window that is not active,
-            // and turn again when it is. A draw restarts the timer.
+            // Stop motion stops in a window that is not active, and goes on
+            // when it is. A draw restarts the timer.
             cx.notify();
         }));
         // A quit writes the drafts, so the text in the message boxes comes
@@ -528,7 +536,7 @@ impl ConsortApp {
             this.save_drafts_now(cx);
             async {}
         }));
-        cx.set_global(Spin::default());
+        cx.set_global(FrameClock::default());
         let mut sub = client.subscribe();
         cx.spawn(async move |this, cx| {
             while let Some(state) = sub.next().await {
@@ -611,7 +619,10 @@ impl ConsortApp {
             brief_open: Vec::new(),
             summary_closed: Vec::new(),
             archived_open: false,
-            spin_ticker: false,
+            clock_ticker: false,
+            chat_rows: Vec::new(),
+            mark: MarkPlayer::default(),
+            mark_forced: None,
             dialog_confirm: RefCell::new(None),
             ext: crate::extensions::ExtState::default(),
             ext_inputs,
@@ -705,7 +716,7 @@ impl ConsortApp {
     /// Takes a new view state from the client. The client publishes changes
     /// only, but a state that equals the old one would still make every row
     /// measure again, so it ends here.
-    fn set_state(&mut self, state: Arc<ViewState>, cx: &mut Context<Self>) {
+    pub(crate) fn set_state(&mut self, state: Arc<ViewState>, cx: &mut Context<Self>) {
         if Arc::ptr_eq(&state, &self.state) || *state == *self.state {
             return;
         }
@@ -986,11 +997,15 @@ impl ConsortApp {
     /// spliced in, so the list keeps following new messages; other changes
     /// reset it.
     pub fn sync_lists(&mut self) {
-        let keys: Vec<String> = self
-            .state
-            .timeline(&self.channel_id)
-            .map(|t| t.items.iter().map(|i| i.key().to_owned()).collect())
-            .unwrap_or_default();
+        let (rows, keys) = match self.state.timeline(&self.channel_id) {
+            Some(t) => {
+                let rows = consort_client::chat::rows(&t.items);
+                let keys = rows.iter().map(|r| r.key(&t.items)).collect();
+                (rows, keys)
+            }
+            None => (Vec::new(), Vec::new()),
+        };
+        self.chat_rows = rows;
         let channel_changed = self.timeline_channel != self.channel_id;
         sync_list(
             &self.timeline,
@@ -1014,16 +1029,22 @@ impl ConsortApp {
         sync_list(&self.thread, &mut self.thread_keys, thread_keys, false);
     }
 
-    pub fn update_placeholder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// The composer's placeholder: "Message <channel>", and "Message Tutti"
+    /// in the main channel.
+    pub fn composer_placeholder(&self) -> String {
         let name = self
             .state
             .channel(&self.channel_id)
             .map(|c| match c.kind {
-                consort_client::ChannelKind::Everything => "Consort".to_owned(),
+                consort_client::ChannelKind::Everything => crate::ui::TUTTI.to_owned(),
                 consort_client::ChannelKind::Standard => c.name.clone(),
             })
-            .unwrap_or_else(|| "Consort".to_owned());
-        let placeholder = format!("Message {name}");
+            .unwrap_or_else(|| crate::ui::TUTTI.to_owned());
+        format!("Message {name}")
+    }
+
+    pub fn update_placeholder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let placeholder = self.composer_placeholder();
         self.inputs.composer.update(cx, |input, cx| {
             input.set_placeholder(placeholder, window, cx);
         });
@@ -1138,6 +1159,10 @@ impl ConsortApp {
                     self.open_thread(task, window, cx);
                 }
             }
+            // The Three voices mark in each state, over Tutti.
+            "mark-idle" | "mark-working" | "mark-needs-you" | "mark-done" => {
+                self.mark_forced = MarkPhase::from_screen(screen);
+            }
             "settings" => self.open_settings(SettingsSection::Appearance, cx),
             "workers" => self.open_settings(SettingsSection::Workers, cx),
             // Connectors and skills, as the designs show them.
@@ -1249,6 +1274,13 @@ impl ConsortApp {
                             .sign_in_code
                             .update(cx, |input, cx| input.focus(window, cx));
                     }
+                }
+            }
+            // The Instructions dialog of sayso, with its purpose.
+            "instructions" => {
+                if let Some(id) = sayso.clone() {
+                    self.open_channel(id.clone(), window, cx);
+                    self.open_dialog(Dialog::Instructions(id), window, cx);
                 }
             }
             "channel-tags" => {
@@ -1569,19 +1601,21 @@ impl ConsortApp {
         }
     }
 
-    /// True when a Working glyph can be on screen: a task works, the link
-    /// connects, or the Add worker dialog waits for a worker. The glyphs that
-    /// really drew are counted by [`Spin`] after each draw.
-    fn glyphs_may_show(&self) -> bool {
-        self.state
-            .tasks
-            .iter()
-            .any(|t| t.status == consort_client::TaskStatus::Working)
-            || matches!(
-                self.state.connection,
-                Connection::Connecting | Connection::Offline { .. }
+    /// True when something that moves can be on screen: a live status icon
+    /// (a task works or needs input, the link connects, a dialog waits for a
+    /// worker or a sign-in), an icon button under the pointer, or a mark
+    /// that animates. What really drew is counted by [`FrameClock`] after
+    /// each draw.
+    fn motion_may_show(&self, cx: &gpui_kit::App) -> bool {
+        self.state.tasks.iter().any(|t| {
+            matches!(
+                t.status,
+                consort_client::TaskStatus::Working | consort_client::TaskStatus::NeedsInput
             )
-            || self.dialog == Some(Dialog::AddWorker)
+        }) || matches!(
+            self.state.connection,
+            Connection::Connecting | Connection::Offline { .. }
+        ) || self.dialog == Some(Dialog::AddWorker)
             || matches!(self.dialog, Some(Dialog::AddAccount(_)))
             || self
                 .state
@@ -1589,42 +1623,82 @@ impl ConsortApp {
                 .iter()
                 .flat_map(|w| w.tools.iter())
                 .any(|t| t.state == consort_client::ToolState::Installing)
+            || self
+                .state
+                .sidebar
+                .groups
+                .iter()
+                .flat_map(|g| g.channels.iter())
+                .chain(self.state.sidebar.ungrouped.iter())
+                .chain(std::iter::once(&self.state.sidebar.everything))
+                .any(|c| {
+                    matches!(
+                        c.status,
+                        Some(
+                            consort_client::TaskStatus::Working
+                                | consort_client::TaskStatus::NeedsInput
+                        )
+                    )
+                })
+            || cx.global::<FrameClock>().hovered().is_some()
+            || self.mark_phase(cx).animates()
     }
 
-    /// Starts the timer that turns the Working glyphs. The glyphs turn in
-    /// steps, about 15 times a second, only while a draw showed one and the
-    /// window is active. The timer stops itself at the first tick that finds
-    /// no glyph, no active window, or a system that asks for less motion.
-    /// See [`crate::ui::parts::Spin`].
-    fn follow_spinner(&mut self, cx: &mut Context<Self>) {
-        if self.spin_ticker
-            || !crate::ui::parts::spin_runs(
-                self.glyphs_may_show(),
+    /// What the mark shows now.
+    pub fn mark_phase(&self, cx: &gpui_kit::App) -> MarkPhase {
+        self.mark_forced
+            .unwrap_or_else(|| self.mark.phase(cx.background_executor().now()))
+    }
+
+    /// Gives the mark the activity of the open channel. When work ends, the
+    /// mark holds Done for `motion.done_hold`, and a timer draws again at
+    /// its end.
+    fn follow_mark(&mut self, cx: &mut Context<Self>) {
+        let state = self.state.activity(&self.channel_id).state;
+        let hold = Self::tokens(cx).motion.done_hold;
+        let now = cx.background_executor().now();
+        if let Some(until) = self.mark.follow(&self.channel_id, state, now, hold) {
+            cx.spawn(async move |this, cx| {
+                let wait = until.saturating_duration_since(cx.background_executor().now());
+                cx.background_executor().timer(wait).await;
+                let _ = this.update(cx, |_, cx| cx.notify());
+            })
+            .detach();
+        }
+    }
+
+    /// Starts the timer of the stop motion: the Three voices mark and the
+    /// icon shimmer, at 8 frames a second (`motion.frame`). It runs only
+    /// while a draw showed something that moves and the window is active.
+    /// It stops itself at the first tick that finds nothing that moves, no
+    /// active window, or Reduce motion on. See [`FrameClock`].
+    fn follow_clock(&mut self, cx: &mut Context<Self>) {
+        if self.clock_ticker
+            || !crate::ui::motion::clock_runs(
+                self.motion_may_show(cx),
                 self.window_active,
                 cx.reduce_motion(),
             )
         {
             return;
         }
-        self.spin_ticker = true;
-        let period = Self::tokens(cx).motion.spin;
+        self.clock_ticker = true;
+        let period = Self::tokens(cx).motion.frame;
         cx.spawn(async move |this, cx| {
             loop {
-                cx.background_executor()
-                    .timer(crate::ui::parts::step_interval(period))
-                    .await;
+                cx.background_executor().timer(period).await;
                 let keep = this.update(cx, |this, cx| {
-                    // The last draw says if a Working glyph showed.
-                    let runs = crate::ui::parts::spin_runs(
-                        cx.global::<Spin>().used(),
+                    // The last draw says if something moved.
+                    let runs = crate::ui::motion::clock_runs(
+                        cx.global::<FrameClock>().used(),
                         this.window_active,
                         cx.reduce_motion(),
                     );
                     if !runs {
-                        this.spin_ticker = false;
+                        this.clock_ticker = false;
                         return false;
                     }
-                    cx.global::<Spin>().advance(period);
+                    cx.global::<FrameClock>().advance();
                     cx.notify();
                     true
                 });
@@ -1768,6 +1842,13 @@ impl ConsortApp {
                 focus_input(&self.inputs.name, window, cx);
             }
             Dialog::Instructions(id) => {
+                // The purpose lives here since the channel header went away.
+                let purpose = self
+                    .state
+                    .channel(id)
+                    .map(|c| c.purpose.clone())
+                    .unwrap_or_default();
+                self.set_field(Field::Purpose, &purpose, window, cx);
                 let notes = self
                     .state
                     .channel(id)
@@ -2718,7 +2799,8 @@ impl Render for ConsortApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = Self::tokens(cx);
         self.style_inputs(&t, cx);
-        cx.global::<Spin>().begin_frame();
+        cx.global::<FrameClock>().begin_frame();
+        self.follow_mark(cx);
         self.dialog_confirm.replace(None);
         // A change of channel that came with a state (a deleted channel, a
         // channel that the hub just made) gives the composer its draft too.
@@ -2745,7 +2827,7 @@ impl Render for ConsortApp {
         let picker = self.render_picker(&t, window, cx);
         let picker_tip = self.render_picker_tooltip(&t);
         let effort = self.render_effort_menu(&t, window, cx);
-        self.follow_spinner(cx);
+        self.follow_clock(cx);
         div()
             .id("consort")
             .key_context("Consort")

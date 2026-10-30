@@ -196,6 +196,7 @@ fn card(
         message_id: message_id.into(),
         task_id: task_id.into(),
         time_label: time.into(),
+        created_at: 0,
         title: String::new(),
         status: TaskStatus::default(),
         channel_name: channel_name.map(Into::into),
@@ -1254,13 +1255,7 @@ fn threads() -> Vec<TaskThreadView> {
 /// The view state from the designs.
 pub fn view_state() -> ViewState {
     let mut channels = vec![
-        channel(
-            EVERYTHING,
-            "Everything",
-            "All channels, one memory",
-            "brace",
-            None,
-        ),
+        channel(EVERYTHING, TUTTI, "All channels, one memory", "brace", None),
         channel(
             SAYSO,
             "sayso",
@@ -1387,7 +1382,9 @@ pub fn view_state() -> ViewState {
             sources: crate::mock_extensions::directory_sources(),
             ..SkillDirectoryView::default()
         },
+        activity: activity(),
     };
+    stamp_times(&mut state.timelines);
     if let Some(account) = state
         .workers
         .iter_mut()
@@ -1397,6 +1394,7 @@ pub fn view_state() -> ViewState {
         account.email = Some(text("cawatson1993@gmail.com"));
         account.extras = Some(crate::mock_extensions::claude_extras());
     }
+    stamp_times(&mut state.timelines);
     refresh(&mut state);
     state
 }
@@ -1414,6 +1412,7 @@ pub fn view_state_with_connect_card() -> ViewState {
             .items
             .extend(crate::mock_extensions::everything_items());
     }
+    stamp_times(&mut state.timelines);
     refresh(&mut state);
     state
 }
@@ -1452,6 +1451,7 @@ pub fn view_state_with_requests() -> ViewState {
             message_id: text("msg_lights_approval"),
             speaker: Speaker::Consort,
             time_label: text("9:02 AM"),
+            created_at: 0,
             approval: ApprovalView {
                 id: text("apr_lights_post"),
                 task_id: None,
@@ -1476,6 +1476,7 @@ pub fn view_state_with_requests() -> ViewState {
             message_id: text("msg_lights_decision"),
             speaker: Speaker::Consort,
             time_label: text("9:03 AM"),
+            created_at: 0,
             decision: DecisionView {
                 id: text("dec_lights_kit"),
                 task_id: None,
@@ -1499,6 +1500,7 @@ pub fn view_state_with_requests() -> ViewState {
             },
         }));
     }
+    stamp_times(&mut state.timelines);
     refresh(&mut state);
     state
 }
@@ -1518,6 +1520,78 @@ pub fn view_state_with_long_detail() -> ViewState {
         );
     }
     state
+}
+
+/// The mock's start of today, in Unix milliseconds. Only the gaps between
+/// the times matter: the labels stay the ones that the designs show.
+const MOCK_DAY: i64 = MOCK_NOW - 12 * 3_600_000;
+
+/// Minutes after midnight for a label such as "9:12 AM".
+fn minutes_of(label: &str) -> Option<i64> {
+    let (clock, half) = label.trim().split_once(' ')?;
+    let (h, m) = clock.split_once(':')?;
+    let (h, m): (i64, i64) = (h.parse().ok()?, m.parse().ok()?);
+    let h = h % 12
+        + if half.eq_ignore_ascii_case("PM") {
+            12
+        } else {
+            0
+        };
+    Some(h * 60 + m)
+}
+
+/// Gives the mock's items a time from their label, so the timeline can
+/// place its time separators: "Today 8:00 AM", then "9:12 AM" after a long
+/// gap. The day comes from the day item before them.
+pub fn stamp_times(timelines: &mut [TimelineView]) {
+    for timeline in timelines {
+        let mut day = 0i64;
+        for item in &mut timeline.items {
+            let (label, at) = match item {
+                TimelineItem::Day(d) => {
+                    day = match d.label.as_str() {
+                        "Yesterday" => -1,
+                        _ => 0,
+                    };
+                    continue;
+                }
+                TimelineItem::Message(m) => (m.time_label.clone(), &mut m.created_at),
+                TimelineItem::TaskCard(c) => (c.time_label.clone(), &mut c.created_at),
+                TimelineItem::Approval(a) => (a.time_label.clone(), &mut a.created_at),
+                TimelineItem::Decision(d) => (d.time_label.clone(), &mut d.created_at),
+                TimelineItem::Notice(n) => (n.time_label.clone(), &mut n.created_at),
+            };
+            if *at == 0
+                && let Some(minutes) = minutes_of(&label)
+            {
+                *at = MOCK_DAY + day * 86_400_000 + minutes * 60_000;
+            }
+        }
+    }
+}
+
+/// What the assistants do in the mock. Tutti matches the design: a command
+/// runs in sayso.
+fn activity() -> Vec<crate::activity::ChannelActivity> {
+    use crate::activity::{ActivityView, ChannelActivity, MarkState};
+    let entry = |id: &str, state: MarkState, line: Option<&str>| ChannelActivity {
+        channel_id: id.into(),
+        activity: ActivityView {
+            state,
+            line: line.map(text),
+        },
+    };
+    vec![
+        entry(
+            EVERYTHING,
+            MarkState::Working,
+            Some("Running a command in sayso"),
+        ),
+        entry(SAYSO, MarkState::NeedsYou, None),
+        entry(LUCY, MarkState::NeedsYou, None),
+        entry(HOMELAB, MarkState::Working, Some("Running a command")),
+        entry(LIGHTS, MarkState::Working, Some("Searching the web")),
+    ]
 }
 
 /// The id of the Everything channel in the mock.

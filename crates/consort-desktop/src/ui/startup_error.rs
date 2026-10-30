@@ -8,7 +8,7 @@ use gpui_kit::{
 };
 
 use crate::ui::{
-    parts::{ButtonKind, button, error_box, glyph, text},
+    parts::{ButtonKind, button, error_box, text},
     window_controls::{self, DragArea as _},
 };
 
@@ -31,11 +31,6 @@ impl Render for StartupError {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = cx.tokens().clone();
         let c = &t.colors;
-        let mark_color = if t.is_dark() {
-            c.accent_fill
-        } else {
-            c.accent_text
-        };
         let form = div()
             .flex()
             .flex_col()
@@ -46,7 +41,7 @@ impl Render for StartupError {
                     .flex()
                     .items_center()
                     .gap(t.component.brand_gap)
-                    .child(glyph("mark", t.component.brand_mark, mark_color))
+                    .child(crate::ui::mark::still_mark(t.component.brand_mark, &t))
                     .child(
                         div()
                             .text_size(t.text.heading.size)

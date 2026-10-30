@@ -221,6 +221,10 @@ pub struct Motion {
     pub slow: Duration,
     /// One turn of the spinner on a working task.
     pub spin: Duration,
+    /// One frame of stop motion (8 frames a second).
+    pub frame: Duration,
+    /// How long the mark holds Done.
+    pub done_hold: Duration,
     pub ease_enter: [f32; 4],
     pub ease_exit: [f32; 4],
 }
@@ -256,6 +260,9 @@ pub struct Layout {
     /// The tallest a block of error text grows: a toast, or the reason in a
     /// task thread. Its text scrolls past this.
     pub error_text_max_height: Pixels,
+    pub bubble_max_width: Pixels,
+    pub fade_top: Pixels,
+    pub fade_bottom: Pixels,
 }
 
 /// Opacities of dimmed parts, as shares of full color.
@@ -322,7 +329,28 @@ pub struct Components {
     pub brand_gap: Pixels,
     /// The width of the focus ring.
     pub focus_ring: Pixels,
+    pub chat: Chat,
     pub theme_preview: ThemePreview,
+}
+
+/// The sizes of the chat. See `structure::Chat`.
+#[derive(Clone, Copy, Debug)]
+pub struct Chat {
+    pub bubble_radius: Pixels,
+    pub bubble_tail: Pixels,
+    pub bubble_pad_x: Pixels,
+    pub bubble_pad_y: Pixels,
+    pub composer_radius: Pixels,
+    pub send_button: Pixels,
+    pub top_action: Pixels,
+    pub top_action_icon: Pixels,
+    pub task_connector: Pixels,
+    pub mark: Pixels,
+    pub mark_small: Pixels,
+    pub mark_top: Pixels,
+    pub pill_pad_x: Pixels,
+    pub pill_pad_y: Pixels,
+    pub brief_number: Pixels,
 }
 
 /// The drawing of a theme in its card.
@@ -393,6 +421,23 @@ impl Components {
             brand_mark: px(c.brand_mark),
             brand_gap: px(c.brand_gap),
             focus_ring: px(c.focus_ring),
+            chat: Chat {
+                bubble_radius: px(c.chat.bubble_radius),
+                bubble_tail: px(c.chat.bubble_tail),
+                bubble_pad_x: px(c.chat.bubble_pad_x),
+                bubble_pad_y: px(c.chat.bubble_pad_y),
+                composer_radius: px(c.chat.composer_radius),
+                send_button: px(c.chat.send_button),
+                top_action: px(c.chat.top_action),
+                top_action_icon: px(c.chat.top_action_icon),
+                task_connector: px(c.chat.task_connector),
+                mark: px(c.chat.mark),
+                mark_small: px(c.chat.mark_small),
+                mark_top: px(c.chat.mark_top),
+                pill_pad_x: px(c.chat.pill_pad_x),
+                pill_pad_y: px(c.chat.pill_pad_y),
+                brief_number: px(c.chat.brief_number),
+            },
             theme_preview: ThemePreview {
                 bar: px(p.bar),
                 bar_gap: px(p.bar_gap),
@@ -503,6 +548,8 @@ impl Tokens {
                 normal: Duration::from_millis(s.motion.normal_ms),
                 slow: Duration::from_millis(s.motion.slow_ms),
                 spin: Duration::from_millis(s.motion.spin_ms),
+                frame: Duration::from_millis(s.motion.frame_ms),
+                done_hold: Duration::from_millis(s.motion.done_hold_ms),
                 ease_enter: s.motion.ease_enter,
                 ease_exit: s.motion.ease_exit,
             },
@@ -527,6 +574,9 @@ impl Tokens {
                 switcher_top: px(s.layout.switcher_top),
                 switcher_name_max: px(s.layout.switcher_name_max),
                 error_text_max_height: px(s.layout.error_text_max_height),
+                bubble_max_width: px(s.layout.bubble_max_width),
+                fade_top: px(s.layout.fade_top),
+                fade_bottom: px(s.layout.fade_bottom),
             },
             opacity: Opacity {
                 answered_dim: s.opacity.answered_dim,

@@ -104,6 +104,11 @@ pub struct Motion {
     pub slow_ms: u64,
     /// One turn of the spinner on a working task.
     pub spin_ms: u64,
+    /// One frame of stop motion: the Three voices mark and the icon
+    /// shimmer play at 8 frames a second.
+    pub frame_ms: u64,
+    /// How long the mark holds its Done pose before it goes back to idle.
+    pub done_hold_ms: u64,
     pub ease_enter: [f32; 4],
     pub ease_exit: [f32; 4],
 }
@@ -151,6 +156,13 @@ pub struct Layout {
     /// The tallest a block of error text grows: a toast, or the reason in a
     /// task thread. Its text scrolls past this.
     pub error_text_max_height: f32,
+    /// The widest a bubble, a task card or an approval card grows in the
+    /// timeline.
+    pub bubble_max_width: f32,
+    /// The fade at the top of the timeline, under the Three voices mark.
+    pub fade_top: f32,
+    /// The fade at the bottom of the timeline, above the composer.
+    pub fade_bottom: f32,
 }
 
 /// Opacities of dimmed parts, as shares of full color.
@@ -271,7 +283,43 @@ pub struct Components {
     /// The width of the focus ring that a control shows when the keyboard
     /// focuses it. The ring is `accent.text`.
     pub focus_ring: f32,
+    pub chat: Chat,
     pub theme_preview: ThemePreview,
+}
+
+/// The sizes of the chat: bubbles, the composer, the top actions and the
+/// Three voices mark. From the approved Paper artboard "Tutti, bubbles,
+/// dark".
+#[derive(Clone, Copy, Debug, Deserialize)]
+pub struct Chat {
+    /// The corners of a bubble, a card in the timeline and the composer.
+    pub bubble_radius: f32,
+    /// The small corner on the speaker's side of the last bubble of a
+    /// group, and the top-left corner of a card under its task line.
+    pub bubble_tail: f32,
+    pub bubble_pad_x: f32,
+    pub bubble_pad_y: f32,
+    /// The corners of the composer field.
+    pub composer_radius: f32,
+    /// The send key inside the composer field.
+    pub send_button: f32,
+    /// A button at the top right of the timeline: Tasks, New task,
+    /// Connectors.
+    pub top_action: f32,
+    /// The icon in a top action.
+    pub top_action_icon: f32,
+    /// The curved connector at the start of a task line.
+    pub task_connector: f32,
+    /// The Three voices mark over the timeline.
+    pub mark: f32,
+    /// The mark in the sidebar, sharp.
+    pub mark_small: f32,
+    /// The space above the mark.
+    pub mark_top: f32,
+    pub pill_pad_x: f32,
+    pub pill_pad_y: f32,
+    /// The number column of a list in a brief.
+    pub brief_number: f32,
 }
 
 /// The drawing of a theme in its card: a miniature sidebar, two lines of
@@ -361,6 +409,21 @@ mod tests {
         assert!(s.layout.error_text_max_height > s.type_scale.ui.line * 3.0);
     }
 
+    /// The chat redesign: the bubble width, the fades and the frame rate of
+    /// the stop motion.
+    #[test]
+    fn chat_layout_and_motion_tokens_keep_the_design_values() {
+        let s = super::structure();
+        assert_eq!(s.layout.bubble_max_width, 560.0);
+        assert!(s.layout.bubble_max_width < s.layout.timeline_max_width);
+        assert_eq!((s.layout.fade_top, s.layout.fade_bottom), (96.0, 32.0));
+        // 8 frames a second.
+        assert_eq!(s.motion.frame_ms, 125);
+        assert_eq!(s.motion.done_hold_ms, 1500);
+        // The mark and its pill sit inside the top fade.
+        assert!(s.component.chat.mark_top + s.component.chat.mark < s.layout.fade_top);
+    }
+
     #[test]
     fn opacity_tokens_are_shares_between_zero_and_one() {
         let o = super::structure().opacity;
@@ -421,6 +484,17 @@ mod tests {
         assert_eq!(c.worker_row_pad_y * 2.0 + 20.0, 26.0);
         assert_eq!(c.switch_inset, 3.0);
         assert_eq!(c.focus_ring, 2.0);
+        let chat = c.chat;
+        assert_eq!((chat.bubble_radius, chat.bubble_tail), (16.0, 4.0));
+        assert_eq!((chat.bubble_pad_x, chat.bubble_pad_y), (14.0, 10.0));
+        assert_eq!((chat.composer_radius, chat.send_button), (16.0, 32.0));
+        assert_eq!((chat.top_action, chat.top_action_icon), (32.0, 18.0));
+        assert_eq!(
+            (chat.mark, chat.mark_small, chat.mark_top),
+            (56.0, 16.0, 4.0)
+        );
+        assert_eq!((chat.pill_pad_x, chat.pill_pad_y), (10.0, 3.0));
+        assert_eq!((chat.task_connector, chat.brief_number), (14.0, 16.0));
         let p = c.theme_preview;
         assert_eq!(
             (p.bar, p.bar_gap, p.sidebar, p.sidebar_item),

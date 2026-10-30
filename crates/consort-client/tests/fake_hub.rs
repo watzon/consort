@@ -904,7 +904,9 @@ async fn resync_required_reloads_the_snapshot() {
         Client::start_with(Some(Store::new(dir.path())), ClientOptions::desktop()).unwrap();
     client.pair(url, CODE.into()).await.unwrap();
     wait_for(&client, "the first snapshot", |s| {
-        s.connection == Connection::Online && s.everything().is_some_and(|c| c.name == "Everything")
+        s.connection == Connection::Online
+            && s.everything()
+                .is_some_and(|c| c.name == consort_client::TUTTI)
     })
     .await;
 

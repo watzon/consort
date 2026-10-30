@@ -7,7 +7,9 @@
 //! any executor, so GPUI can await them on its foreground executor. Public
 //! types are plain records and enums, so UniFFI can export them.
 
+pub mod activity;
 pub mod cache;
+pub mod chat;
 pub mod command;
 pub mod connectors;
 pub mod derive;

@@ -6,6 +6,8 @@
 
 mod app;
 mod assets;
+#[cfg(test)]
+mod chat_tests;
 mod countdown;
 mod drafts;
 mod edit_keys;
@@ -34,7 +36,8 @@ actions!(consort, [Quit]);
 /// new-channel, add-worker, worker-added, review, failed, error, new-folder,
 /// onboarding, connectors, add-connector, connect, connectors-in-channel,
 /// channel-connectors, skills, add-skill, add-skill-unsupported,
-/// account-settings, hub-cards, everything-manages. `--light` and `--dark` set
+/// account-settings, hub-cards, everything-manages, tutti, instructions, mark-idle,
+/// mark-working, mark-needs-you, mark-done. `--light` and `--dark` set
 /// the mode, and `--theme <name>` the theme.
 #[derive(Clone, Debug, Default)]
 pub struct Args {
@@ -107,6 +110,13 @@ fn main() {
             fonts::register(cx);
             consort_theme::init(cx);
             consort_theme::watch_user_themes(cx);
+            // Reduce motion starts from the user's choice, else from the
+            // system setting where the app can read it, else off.
+            let saved = consort_theme::ThemeLibrary::global(cx).reduce_motion;
+            cx.set_reduce_motion(consort_theme::start_reduce_motion(
+                saved,
+                ui::motion::system_reduce_motion(),
+            ));
             cx.on_action(|_: &Quit, cx| cx.quit());
             cx.bind_keys([gpui_kit::KeyBinding::new("cmd-q", Quit, None)]);
             cx.set_menus(vec![

@@ -25,7 +25,7 @@ use crate::{
 
 /// The glyph of an approval or a decision: the fermata while it waits,
 /// the resolved disc once answered, and the quiet ring once it closed.
-fn request_glyph(state: RequestState) -> TaskStatus {
+pub(crate) fn request_glyph(state: RequestState) -> TaskStatus {
     match state {
         RequestState::Pending | RequestState::Sending => TaskStatus::NeedsInput,
         RequestState::Answered => TaskStatus::Resolved,
@@ -108,6 +108,7 @@ impl ConsortApp {
         let c = &t.colors;
         let state = self.state.clone();
         let panel = &state.tasks_panel;
+        let need_you = panel.need_you;
         let tabs = [
             (TasksTab::Active, "Active", Some(panel.active_count)),
             (TasksTab::UpNext, "Up next", Some(panel.up_next_count)),
@@ -237,11 +238,20 @@ impl ConsortApp {
                     .pr(t.space.sm)
                     .child(
                         div()
-                            .flex_1()
                             .type_style(t.text.title)
                             .line_height(t.text.body.line)
                             .child("Tasks"),
                     )
+                    // How many tasks need you. The header of the column
+                    // said it before the redesign; the Tasks button has only
+                    // a dot now.
+                    .child(div().flex_1().pl(t.space.xs).when(need_you > 0, |d| {
+                        d.child(text(
+                            format!("{need_you} need you"),
+                            t.text.ui,
+                            c.accent_text,
+                        ))
+                    }))
                     .child(
                         icon_button(
                             "tasks-new",
@@ -251,6 +261,7 @@ impl ConsortApp {
                             c.text_secondary,
                             c.hover_sidebar,
                             t,
+                            cx,
                         )
                         .on_click(
                             cx.listener(|this, _, window, cx| this.start_task_draft(window, cx)),
@@ -265,6 +276,7 @@ impl ConsortApp {
                             c.text_secondary,
                             c.hover_sidebar,
                             t,
+                            cx,
                         )
                         .on_click(cx.listener(|this, _, _, cx| this.close_panel(cx))),
                     ),
@@ -391,6 +403,7 @@ impl ConsortApp {
                     c.text_secondary,
                     c.hover_sidebar,
                     t,
+                    cx,
                 )
                 .on_click(cx.listener(|this, _, _, cx| {
                     if let Panel::Thread(id) = &this.panel {
@@ -442,6 +455,7 @@ impl ConsortApp {
                             c.text_secondary,
                             c.hover_sidebar,
                             t,
+                            cx,
                         )
                         .on_click(cx.listener(move |this, _, _, cx| {
                             if let Some(bounds) = this.triggers.get("thread-more") {
@@ -461,6 +475,7 @@ impl ConsortApp {
                     c.text_secondary,
                     c.hover_sidebar,
                     t,
+                    cx,
                 )
                 .on_click(cx.listener(|this, _, _, cx| this.close_panel(cx))),
             );
@@ -713,6 +728,7 @@ impl ConsortApp {
                             c.text_secondary,
                             c.hover_card,
                             t,
+                            cx,
                         )
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.show_notice("Attachments come in a later build.".into(), cx)
@@ -1078,7 +1094,9 @@ impl ConsortApp {
                         })
                         .into_any_element()
                 }
-                PostBody::Approval(approval) => self.render_approval_card(approval, &key, t, cx),
+                PostBody::Approval(approval) => {
+                    self.render_approval_card(approval, &key, false, t, cx)
+                }
                 PostBody::Decision(decision) => self.render_decision(decision, &key, true, t, cx),
                 // A system notice: quiet, selectable, no speaker of its own.
                 PostBody::Notice { text: notice, .. } => selectable(
@@ -1096,19 +1114,22 @@ impl ConsortApp {
 
     /// An approval card: what asks, the detail, and the buttons or the answer.
     /// Task threads and the timeline both use it.
+    /// An approval card. `chat` gives it the corners of a card in the
+    /// chat (see [`crate::ui::parts::card_corners`]).
     pub fn render_approval_card(
         &mut self,
         approval: &consort_client::ApprovalView,
         key: &str,
+        chat: bool,
         t: &Tokens,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         if let Some(hub_card) = approval.card.clone() {
-            return self.render_hub_card(approval, &hub_card, key, t, cx);
+            return self.render_hub_card(approval, &hub_card, key, chat, t, cx);
         }
         let c = &t.colors;
         let answered = approval.state == RequestState::Answered;
-        let card = div()
+        let card = crate::ui::parts::card_corners(div(), chat, t)
             .flex()
             .flex_col()
             .flex_1()
@@ -1120,7 +1141,6 @@ impl ConsortApp {
             .bg(c.surface_card)
             .border(t.border_width)
             .border_color(c.border_subtle)
-            .rounded(t.radius.lg)
             .child(
                 div()
                     .flex()
@@ -1405,7 +1425,7 @@ impl ConsortApp {
                 })
                 .into_any_element()
         };
-        div()
+        crate::ui::parts::card_corners(div(), !in_thread, t)
             .flex()
             .flex_col()
             .flex_1()
@@ -1415,7 +1435,6 @@ impl ConsortApp {
             .bg(c.surface_card)
             .border(t.border_width)
             .border_color(c.border_subtle)
-            .rounded(t.radius.lg)
             .child(
                 div()
                     .flex()

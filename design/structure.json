@@ -22,7 +22,7 @@
       "light": { "x": 0, "y": 8, "blur": 24, "spread": -4, "color": "#14201C29" }
     }
   },
-  "motion": { "fast_ms": 120, "normal_ms": 180, "slow_ms": 280, "spin_ms": 1200, "ease_enter": [0.2, 0, 0, 1], "ease_exit": [0.4, 0, 1, 1] },
+  "motion": { "fast_ms": 120, "normal_ms": 180, "slow_ms": 280, "spin_ms": 1200, "frame_ms": 125, "done_hold_ms": 1500, "ease_enter": [0.2, 0, 0, 1], "ease_exit": [0.4, 0, 1, 1] },
   "icon": { "set": "lucide", "size": 16, "dense_size": 14, "toolbar_size": 20, "stroke": 1.5 },
   "layout": {
     "sidebar_width": 248,
@@ -41,7 +41,10 @@
     "switcher_width": 560,
     "switcher_top": 96,
     "switcher_name_max": 240,
-    "error_text_max_height": 240
+    "error_text_max_height": 240,
+    "bubble_max_width": 560,
+    "fade_top": 96,
+    "fade_bottom": 32
   },
   "opacity": { "answered_dim": 0.6, "busy": 0.7, "danger_hover": 0.9 },
   "component": {
@@ -94,6 +97,7 @@
     "brand_mark": 26,
     "brand_gap": 8,
     "focus_ring": 2,
+    "chat": { "bubble_radius": 16, "bubble_tail": 4, "bubble_pad_x": 14, "bubble_pad_y": 10, "composer_radius": 16, "send_button": 32, "top_action": 32, "top_action_icon": 18, "task_connector": 14, "mark": 56, "mark_small": 16, "mark_top": 4, "pill_pad_x": 10, "pill_pad_y": 3, "brief_number": 16 },
     "theme_preview": { "bar": 4, "bar_gap": 5, "sidebar": 32, "sidebar_item": 20, "text_line": 76, "title": 48, "chip": 6, "card": 28, "button": 22, "button_radius": 2 }
   },
   "derive": { "hover_delta_l": 0.035, "active_delta_l": 0.07, "selection_alpha": 0.28, "status_tint_alpha": 0.16, "scrim_alpha": { "dark": 0.55, "light": 0.3 } }

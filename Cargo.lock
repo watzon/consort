@@ -1423,6 +1423,7 @@ dependencies = [
  "gpui-kit",
  "gpui-pre",
  "markdown",
+ "resvg 0.46.0",
 ]
 
 [[package]]

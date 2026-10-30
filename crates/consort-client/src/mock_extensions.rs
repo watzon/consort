@@ -620,6 +620,7 @@ fn card_item(message_id: &str, time: &str, approval: ApprovalView) -> TimelineIt
         message_id: message_id.into(),
         speaker: Speaker::Consort,
         time_label: time.into(),
+        created_at: 0,
         approval,
     })
 }
@@ -711,9 +712,8 @@ pub fn hiring_items() -> Vec<TimelineItem> {
                 HubCardView::Management(ManagementCardView {
                     tool: "request_access".into(),
                     change: "Use Notion in channels tagged personal or work".into(),
-                    effect:
-                        "Notion becomes available in 3 more channels: acme, hiring and Everything."
-                            .into(),
+                    effect: "Notion becomes available in 3 more channels: acme, hiring and Tutti."
+                        .into(),
                 }),
                 ("Allow", "Don't"),
             ),

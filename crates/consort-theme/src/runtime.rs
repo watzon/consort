@@ -58,6 +58,9 @@ pub struct ThemeLibrary {
     pub theme: SharedString,
     pub appearance: Appearance,
     pub text_size: TextSize,
+    /// The Reduce motion setting. `None` until the user sets it: the app
+    /// then starts from the system setting.
+    pub reduce_motion: Option<bool>,
     user_dir: Option<PathBuf>,
     user_stamp: Vec<(PathBuf, Option<SystemTime>)>,
 }
@@ -85,6 +88,9 @@ pub struct SavedChoice {
     pub theme: Option<String>,
     pub appearance: Appearance,
     pub text_size: TextSize,
+    /// The Reduce motion setting. Not in the file until the user sets it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reduce_motion: Option<bool>,
 }
 
 /// The Consort config folder: `$CONSORT_CONFIG_DIR` when it is set, else
@@ -255,6 +261,7 @@ impl ThemeLibrary {
             theme: default.into(),
             appearance: Appearance::System,
             text_size: TextSize::Default,
+            reduce_motion: None,
             user_dir,
             user_stamp,
         }
@@ -281,6 +288,7 @@ impl ThemeLibrary {
             theme: Some(self.theme.to_string()),
             appearance: self.appearance,
             text_size: self.text_size,
+            reduce_motion: self.reduce_motion,
         }
     }
 
@@ -294,6 +302,7 @@ impl ThemeLibrary {
         }
         self.appearance = choice.appearance;
         self.text_size = choice.text_size;
+        self.reduce_motion = choice.reduce_motion;
     }
 }
 
@@ -404,6 +413,34 @@ pub fn choose(
     }
 }
 
+/// The Reduce motion setting at start: the saved choice when the user made
+/// one, else `system` (what the operating system asks for, when the app can
+/// read it).
+pub fn start_reduce_motion(saved: Option<bool>, system: Option<bool>) -> bool {
+    saved.or(system).unwrap_or(false)
+}
+
+/// Turns Reduce motion on or off for every window, and saves the choice.
+/// GPUI's own `reduce_motion` flag carries it, so GPUI's animations follow
+/// it too.
+pub fn choose_reduce_motion(on: bool, cx: &mut App) {
+    cx.global_mut::<ThemeLibrary>().reduce_motion = Some(on);
+    cx.set_reduce_motion(on);
+    let choice = ThemeLibrary::global(cx).choice();
+    if let Some(path) = choice_path() {
+        cx.background_executor()
+            .spawn(async move {
+                if let Err(err) = write_choice(&path, &choice) {
+                    eprintln!(
+                        "consort-theme: cannot save your motion choice in {}: {err}. Check that you may write to that folder",
+                        path.display()
+                    );
+                }
+            })
+            .detach();
+    }
+}
+
 /// Like [`choose`], but the choice lasts for this run only. For command line
 /// options such as `--dark`, which must not change the user's saved choice.
 pub fn choose_without_saving(
@@ -448,6 +485,7 @@ fn adopt(mut fresh: ThemeLibrary, system: WindowAppearance, cx: &mut App) {
     let previous = ThemeLibrary::global(cx).clone();
     fresh.appearance = previous.appearance;
     fresh.text_size = previous.text_size;
+    fresh.reduce_motion = previous.reduce_motion;
     if fresh
         .themes
         .iter()
@@ -510,6 +548,7 @@ mod tests {
             theme: Some("Velvet".into()),
             appearance: Appearance::Dark,
             text_size: TextSize::Larger,
+            reduce_motion: None,
         };
         write_choice(&path, &choice).expect("writes");
         assert_eq!(read_choice(&path), choice);
@@ -540,6 +579,7 @@ mod tests {
                             theme: Some(format!("Theme {i}-{j}")),
                             appearance: Appearance::Dark,
                             text_size: TextSize::Default,
+                            reduce_motion: None,
                         };
                         write_choice(&path, &choice).expect("writes");
                     }
@@ -602,11 +642,29 @@ mod tests {
             theme: Some(velvet.clone()),
             appearance: Appearance::Light,
             text_size: TextSize::Smaller,
+            reduce_motion: None,
         });
         assert_eq!(lib.theme.as_ref(), velvet);
         assert_eq!(lib.appearance, Appearance::Light);
         assert_eq!(lib.text_size, TextSize::Smaller);
         assert_eq!(lib.choice().theme.as_deref(), Some("Velvet"));
+    }
+
+    #[test]
+    fn reduce_motion_starts_from_the_saved_choice_then_the_system() {
+        assert!(start_reduce_motion(Some(true), Some(false)));
+        assert!(!start_reduce_motion(Some(false), Some(true)));
+        assert!(start_reduce_motion(None, Some(true)));
+        assert!(!start_reduce_motion(None, None));
+        // An old file with no reduce_motion reads as "not set".
+        let old: SavedChoice = serde_json::from_str(r#"{"appearance":"dark"}"#).expect("parses");
+        assert_eq!(old.reduce_motion, None);
+        let mut lib = library();
+        lib.apply_choice(&SavedChoice {
+            reduce_motion: Some(true),
+            ..SavedChoice::default()
+        });
+        assert_eq!(lib.choice().reduce_motion, Some(true));
     }
 
     #[test]
@@ -617,6 +675,7 @@ mod tests {
             theme: Some("Deleted".into()),
             appearance: Appearance::Dark,
             text_size: TextSize::Default,
+            reduce_motion: None,
         });
         assert_eq!(lib.theme, before);
         assert_eq!(lib.appearance, Appearance::Dark);

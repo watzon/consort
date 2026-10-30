@@ -145,15 +145,7 @@ pub fn title_bar(t: &Tokens, window: &Window) -> Option<AnyElement> {
                     .gap(t.space.sm)
                     .px(t.space.lg)
                     .drag_area()
-                    .child(crate::ui::parts::glyph(
-                        "brace",
-                        t.icon.size,
-                        if t.is_dark() {
-                            c.accent_fill
-                        } else {
-                            c.accent_text
-                        },
-                    ))
+                    .child(crate::ui::mark::still_mark(t.icon.size, t))
                     .child(
                         div()
                             .type_style(t.text.ui)

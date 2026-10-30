@@ -706,6 +706,64 @@ fn speaker(m: &model::Message) -> Speaker {
 }
 
 /// Builds the whole view state from the cache. `now` is Unix milliseconds.
+/// The name of a channel as the user sees it. The main channel shows as
+/// Tutti whatever the hub calls it: the hub and the wire still say
+/// Everything until the rename pass.
+fn shown_name(c: &model::Channel) -> String {
+    if c.kind == PK::Everything {
+        crate::view::TUTTI.to_owned()
+    } else {
+        c.name.clone()
+    }
+}
+
+/// What the assistant of each channel does now. See [`crate::activity`].
+fn channel_activities(cache: &Cache, state: &ViewState) -> Vec<crate::activity::ChannelActivity> {
+    let sessions: Vec<crate::activity::SessionActivity> =
+        cache.session_activity.values().cloned().collect();
+    let task_sessions: Vec<(String, Option<String>)> = state
+        .tasks
+        .iter()
+        .map(|t| {
+            (
+                t.id.clone(),
+                cache
+                    .tasks
+                    .get(&t.id)
+                    .and_then(|task| task.current_session_id)
+                    .map(|s| s.to_string()),
+            )
+        })
+        .collect();
+    let tasks: Vec<crate::activity::TaskWork<'_>> = state
+        .tasks
+        .iter()
+        .zip(task_sessions.iter())
+        .map(|(t, (_, session))| crate::activity::TaskWork {
+            channel_id: &t.channel_id,
+            channel_name: &t.channel_name,
+            status: t.status,
+            session_id: session.as_deref(),
+        })
+        .collect();
+    let name = |id: &str| state.channel(id).map(|c| c.name.clone());
+    state
+        .channels
+        .iter()
+        .map(|c| crate::activity::ChannelActivity {
+            channel_id: c.id.clone(),
+            activity: crate::activity::channel_activity(&crate::activity::Inputs {
+                channel_id: &c.id,
+                everything: c.kind == ChannelKind::Everything,
+                tasks: &tasks,
+                sessions: &sessions,
+                timeline: state.timeline(&c.id),
+                channel_name: &name,
+            }),
+        })
+        .collect()
+}
+
 pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i64) -> ViewState {
     let workers_by_id: BTreeMap<String, &model::Worker> =
         cache.workers.iter().map(|(k, v)| (k.clone(), v)).collect();
@@ -763,7 +821,7 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                 } else {
                     ChannelKind::Standard
                 },
-                name: c.name.clone(),
+                name: shown_name(c),
                 purpose: c.purpose.clone(),
                 instructions: c.instructions.clone(),
                 icon: c.icon.clone().unwrap_or_else(|| {
@@ -812,7 +870,7 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
         cache
             .channels
             .get(&id.to_string())
-            .map(|c| c.name.clone())
+            .map(shown_name)
             .unwrap_or_default()
     };
 
@@ -970,6 +1028,7 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                     message_id: m.id.to_string(),
                     task_id: task.id.to_string(),
                     time_label: format::time_label(at),
+                    created_at: at,
                     title: task.title.clone(),
                     status,
                     channel_name: (task.channel_id.to_string() != channel.id)
@@ -997,6 +1056,7 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                     message_id: m.id.to_string(),
                     speaker: speaker(m),
                     time_label: format::time_label(at),
+                    created_at: at,
                     approval,
                 }));
             } else if m.kind == MessageKind::Decision {
@@ -1009,6 +1069,7 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                     message_id: m.id.to_string(),
                     speaker: speaker(m),
                     time_label: format::time_label(at),
+                    created_at: at,
                     decision,
                 }));
             } else if m.kind == MessageKind::Notice {
@@ -1016,6 +1077,7 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                 items.push(TimelineItem::Notice(NoticeView {
                     message_id: m.id.to_string(),
                     time_label: format::time_label(at),
+                    created_at: at,
                     kind,
                     text,
                 }));
@@ -1413,7 +1475,7 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                 channel_name: cache
                     .channels
                     .get(&f.channel_id)
-                    .map(|c| c.name.clone())
+                    .map(shown_name)
                     .unwrap_or_else(|| f.channel_name.clone()),
                 body: f.body.clone(),
                 message: format!(
@@ -1454,7 +1516,9 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
         },
         service_tools: cache.extensions.service_tools.values().cloned().collect(),
         skill_directory: cache.extensions.directory.clone(),
+        activity: Vec::new(),
     };
+    state.activity = channel_activities(cache, &state);
     // Collapsed groups and unread counts come from the hub, so seed the
     // sidebar before the shared rules rebuild it.
     state.sidebar.groups = groups

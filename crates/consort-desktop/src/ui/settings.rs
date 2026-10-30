@@ -491,6 +491,7 @@ impl ConsortApp {
         )
         .w(t.component.settings_segmented);
         let _ = window;
+        let reduce_motion = cx.reduce_motion();
         self.page_frame(t)
             .child(
                 div()
@@ -509,7 +510,17 @@ impl ConsortApp {
                         div().flex().flex_col().gap(t.space.md).child(cards).child(add).child(rejected),
                         t,
                     ))
-                    .child(setting_row("Text size", "Scales every text style", sizes, t)),
+                    .child(setting_row("Text size", "Scales every text style", sizes, t))
+                    .child(setting_row(
+                        "Reduce motion",
+                        "The mark changes pose only when its state changes, and icons do not shimmer",
+                        switch("reduce-motion", reduce_motion, t)
+                            .on_click(cx.listener(|_, _, _, cx| {
+                                let on = !cx.reduce_motion();
+                                consort_theme::choose_reduce_motion(on, cx);
+                            })),
+                        t,
+                    )),
             )
             .into_any_element()
     }
@@ -841,6 +852,7 @@ impl ConsortApp {
                                                     c.text_secondary,
                                                     c.hover_canvas,
                                                     t,
+                                                    cx,
                                                 )
                                                 .on_click(cx.listener(move |this, _, _, cx| {
                                                     if let Some(bounds) =

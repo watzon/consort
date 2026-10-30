@@ -1297,6 +1297,7 @@ impl ConsortApp {
                             c.text_secondary,
                             c.hover_card,
                             t,
+                            cx,
                         )
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()));

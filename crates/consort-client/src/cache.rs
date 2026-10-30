@@ -99,6 +99,9 @@ pub struct Cache {
     pub read_markers: BTreeMap<String, ReadMarker>,
     /// What the view reads of the session items, by session ID and item ID.
     pub session_items: BTreeMap<String, BTreeMap<String, ItemSummary>>,
+    /// The newest item of each session, by session ID, with the channel of
+    /// its feed entry. The activity line of the Three voices mark reads it.
+    pub session_activity: BTreeMap<String, crate::activity::SessionActivity>,
     /// The messages that wait for the hub, in the order the user sent them.
     pub pending: Vec<PendingSend>,
     /// The messages that the hub refused after they left the composer.
@@ -307,6 +310,11 @@ impl Cache {
         for session in &sessions {
             removed |= self.session_items.remove(session).is_some();
         }
+        let before = self.session_activity.len();
+        self.session_activity.retain(|session, a| {
+            !sessions.contains(session) && a.channel_id.as_deref() != Some(id)
+        });
+        removed |= self.session_activity.len() != before;
         let (waiting, other): (Vec<PendingSend>, Vec<PendingSend>) =
             std::mem::take(&mut self.pending)
                 .into_iter()
@@ -640,6 +648,7 @@ impl Cache {
         if kind != EntityKind::SessionItem {
             self.touch(kind, entry.entity_id.clone(), entry.seq);
         }
+        let entry_channel = entry.channel_id.map(|c| c.to_string());
         match entry.change {
             FeedChange::Upsert(payload) => match payload {
                 EntityPayload::Group(g) => {
@@ -667,13 +676,24 @@ impl Cache {
                     self.read_markers.insert(marker_key(&m), m);
                 }
                 EntityPayload::SessionItem(item) => {
+                    let activity = crate::activity::SessionActivity::of(&item, entry_channel);
+                    let newer = self
+                        .session_activity
+                        .get(&activity.session_id)
+                        .is_none_or(|old| {
+                            old.updated_at <= activity.updated_at && *old != activity
+                        });
+                    if newer {
+                        self.session_activity
+                            .insert(activity.session_id.clone(), activity);
+                    }
                     if let Some(summary) = ItemSummary::of(&item) {
                         self.session_items
                             .entry(item.session_id.to_string())
                             .or_default()
                             .insert(item.id.to_string(), summary);
                     } else {
-                        return false;
+                        return newer;
                     }
                 }
                 // Only the sign-ins that this client started show. Another

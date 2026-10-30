@@ -36,6 +36,9 @@ schemars = "=1.2.3"
 # Desktop app, theme and client (added by the desktop agent)
 gpui-kit = "=0.8.1"
 markdown = "=1.0.0"
+# The SVG renderer that GPUI draws images with (gpui-pre 0.3.10). The
+# desktop tests check that it draws the Three voices frames.
+resvg = { version = "=0.46.0", default-features = false }
 directories = "6"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"

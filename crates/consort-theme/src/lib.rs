@@ -19,8 +19,9 @@ pub use file::{
 };
 pub use runtime::{
     Appearance, LoadedTheme, RejectedTheme, SavedChoice, ThemeLibrary, ThemeSource, apply,
-    choice_path, choose, choose_without_saving, init, read_choice, read_user_themes, resolve_mode,
-    user_themes_dir, watch_user_themes, write_choice,
+    choice_path, choose, choose_reduce_motion, choose_without_saving, init, read_choice,
+    read_user_themes, resolve_mode, start_reduce_motion, user_themes_dir, watch_user_themes,
+    write_choice,
 };
 pub use structure::{Structure, structure};
 pub use tokens::{ActiveTokens, Palette, TextSize, Tokens, Type, TypeExt};

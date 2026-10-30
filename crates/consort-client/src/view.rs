@@ -5,6 +5,10 @@
 //! Labels that need the user's clock or language ("9:12 AM", "Today",
 //! "2 min") are made here, so every client shows the same words.
 
+/// The name that every client shows for the main channel
+/// (`ChannelKind::Everything` in code). See `CONTEXT.md`.
+pub const TUTTI: &str = "Tutti";
+
 /// Everything a client draws, at one moment.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ViewState {
@@ -61,6 +65,9 @@ pub struct ViewState {
     pub service_tools: Vec<crate::connectors::ServiceToolsView>,
     /// The skill directory search of the Add skill dialog.
     pub skill_directory: crate::skills::SkillDirectoryView,
+    /// What the assistant of each channel does now, for the Three voices
+    /// mark and its activity line. A channel that is not here is idle.
+    pub activity: Vec<crate::activity::ChannelActivity>,
 }
 
 /// A message that the hub refused after it left the composer.
@@ -104,6 +111,15 @@ impl ViewState {
             .find(|c| c.id == channel_id)
             .map(|c| c.unread)
             .unwrap_or(0)
+    }
+
+    /// What the assistant of a channel does now. Idle when nothing is known.
+    pub fn activity(&self, channel_id: &str) -> crate::activity::ActivityView {
+        self.activity
+            .iter()
+            .find(|a| a.channel_id == channel_id)
+            .map(|a| a.activity.clone())
+            .unwrap_or_default()
     }
 
     pub fn timeline(&self, channel_id: &str) -> Option<&TimelineView> {
@@ -597,6 +613,9 @@ impl TimelineItem {
 pub struct NoticeView {
     pub message_id: String,
     pub time_label: String,
+    /// When the hub wrote it, in Unix milliseconds. The timeline uses it
+    /// for its time separators.
+    pub created_at: i64,
     /// The kind, such as `turn_failed`. Empty when the body did not parse.
     pub kind: String,
     pub text: String,
@@ -608,6 +627,8 @@ pub struct ApprovalCardView {
     pub message_id: String,
     pub speaker: Speaker,
     pub time_label: String,
+    /// When the hub wrote it, in Unix milliseconds.
+    pub created_at: i64,
     pub approval: ApprovalView,
 }
 
@@ -617,6 +638,8 @@ pub struct DecisionCardView {
     pub message_id: String,
     pub speaker: Speaker,
     pub time_label: String,
+    /// When the hub wrote it, in Unix milliseconds.
+    pub created_at: i64,
     pub decision: DecisionView,
 }
 
@@ -686,6 +709,8 @@ pub struct TaskCardView {
     pub message_id: String,
     pub task_id: String,
     pub time_label: String,
+    /// When the hub wrote the card, in Unix milliseconds.
+    pub created_at: i64,
     pub title: String,
     pub status: TaskStatus,
     /// The channel name, shown when the card is outside its channel.

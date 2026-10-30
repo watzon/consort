@@ -170,7 +170,7 @@ fn the_picker_filters_chooses_and_updates_the_channel(cx: &mut TestAppContext) {
     let (handle, app) = app_with_the_picker(cx);
     let cx = &mut VisualTestContext::from_window(handle, cx);
     assert_eq!(
-        assistant_model(&app, cx, "Everything"),
+        assistant_model(&app, cx, crate::ui::TUTTI),
         (
             "claude-opus-5-5".into(),
             Some("high".into()),
@@ -195,7 +195,7 @@ fn the_picker_filters_chooses_and_updates_the_channel(cx: &mut TestAppContext) {
         assert!(app.picker.is_none(), "a choice closes the picker")
     });
     assert_eq!(
-        assistant_model(&app, cx, "Everything"),
+        assistant_model(&app, cx, crate::ui::TUTTI),
         (
             "claude-sonnet-5-5".into(),
             Some("high".into()),
@@ -238,7 +238,7 @@ fn a_model_without_the_effort_level_falls_back_to_its_default(cx: &mut TestAppCo
     cx.simulate_keystrokes("enter");
     cx.run_until_parked();
     assert_eq!(
-        assistant_model(&app, cx, "Everything"),
+        assistant_model(&app, cx, crate::ui::TUTTI),
         (
             "gpt-5.5".into(),
             Some("high".into()),
@@ -261,7 +261,7 @@ fn a_model_without_the_effort_level_falls_back_to_its_default(cx: &mut TestAppCo
     cx.simulate_keystrokes("enter");
     cx.run_until_parked();
     assert_eq!(
-        assistant_model(&app, cx, "Everything"),
+        assistant_model(&app, cx, crate::ui::TUTTI),
         ("claude-haiku-4-5".into(), None, SelectionSource::Channel)
     );
 }
@@ -368,7 +368,7 @@ fn the_rail_takes_the_arrow_keys_and_typing_searches(cx: &mut TestAppContext) {
 fn the_star_toggles_a_favorite_without_choosing_the_model(cx: &mut TestAppContext) {
     let (handle, app) = app_with_the_picker(cx);
     let cx = &mut VisualTestContext::from_window(handle, cx);
-    let before = assistant_model(&app, cx, "Everything");
+    let before = assistant_model(&app, cx, crate::ui::TUTTI);
     // Down to Sonnet 5.5 of Claude Personal, a favorite in the mock.
     cx.simulate_keystrokes("down");
     cx.update(|window, _| window.refresh());
@@ -381,7 +381,7 @@ fn the_star_toggles_a_favorite_without_choosing_the_model(cx: &mut TestAppContex
             .is_favorite("Claude Personal", "claude-sonnet-5-5")
     }));
     cx.simulate_click(star.center(), gpui_kit::Modifiers::default());
-    let after = assistant_model(&app, cx, "Everything");
+    let after = assistant_model(&app, cx, crate::ui::TUTTI);
     app.read_with(cx, |app, _| {
         assert!(app.picker.is_some(), "the picker stays open");
         assert!(
@@ -460,10 +460,7 @@ fn escape_in_the_picker_closes_only_the_picker(cx: &mut TestAppContext) {
             .clone()
             .expect("a model for tasks");
         assert_eq!(chosen.account_label, "Codex Personal");
-        assert_eq!(
-            app.new_channel.coordinator_selection, None,
-            "Same as Everything"
-        );
+        assert_eq!(app.new_channel.coordinator_selection, None, "Same as Tutti");
         assert_eq!(app.dialog, Some(Dialog::NewChannel));
     });
 }
@@ -490,7 +487,7 @@ fn the_effort_menu_chooses_a_level(cx: &mut TestAppContext) {
     cx.simulate_keystrokes("down enter");
     cx.run_until_parked();
     assert_eq!(
-        assistant_model(&app, cx, "Everything"),
+        assistant_model(&app, cx, crate::ui::TUTTI),
         (
             "claude-opus-5-5".into(),
             Some("max".into()),

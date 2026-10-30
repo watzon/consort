@@ -296,6 +296,7 @@ impl ConsortApp {
                                     c.text_secondary,
                                     c.hover_canvas,
                                     t,
+                                    cx,
                                 )
                                 .on_click(cx.listener(
                                     move |this, _, _, cx| {

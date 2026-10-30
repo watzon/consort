@@ -43,12 +43,16 @@ fn is_paragraph(label: &str, value: &str) -> bool {
 }
 
 impl ConsortApp {
-    /// A hub card in the timeline.
+    /// A hub card. `chat` gives it the corners of a card in the chat:
+    /// `bubble_radius`, with the small corner at the top left under its task
+    /// line. A hub card inside a task card keeps `lg` corners.
+    #[allow(clippy::too_many_arguments)]
     pub fn render_hub_card(
         &mut self,
         approval: &ApprovalView,
         card: &HubCardView,
         key: &str,
+        chat: bool,
         t: &Tokens,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -64,8 +68,8 @@ impl ConsortApp {
             .p(t.space.lg)
             .bg(c.surface_card)
             .border(t.border_width)
-            .border_color(c.border_subtle)
-            .rounded(t.radius.lg);
+            .border_color(c.border_subtle);
+        frame = crate::ui::parts::card_corners(frame, chat, t);
         let glyph = status_glyph(
             SharedString::from(format!("{key}-glyph")),
             glyph_status(approval.state),

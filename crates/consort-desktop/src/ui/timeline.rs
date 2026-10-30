@@ -1,17 +1,19 @@
-//! The main column: header, timeline and composer.
+//! The main column: the timeline as bubbles, the Three voices mark and the
+//! top actions over it, and the composer.
 
 use std::time::Instant;
 
 use consort_client::{
     ApprovalChoice, ApprovalView, ChannelKind, MessageView, RequestState, Speaker, TaskCardView,
     TaskStatus, TimelineItem,
+    chat::{BubbleRow, ChatRow, Lane, Spacing},
 };
 use consort_theme::{Tokens, TypeExt as _};
 use gpui_kit::{
     AnyElement, App, Context, Div, Hsla, InteractiveElement, IntoElement, MouseButton,
     MouseDownEvent, ParentElement, SharedString, StatefulInteractiveElement as _, Styled, Window,
-    base::SelectableText, component::text::TextView, div, linear_color_stop, linear_gradient, list,
-    prelude::FluentBuilder as _,
+    base::SelectableText, component::text::TextView, div, img, linear_color_stop, linear_gradient,
+    list, prelude::FluentBuilder as _,
 };
 
 use crate::{
@@ -20,12 +22,14 @@ use crate::{
     ui::window_controls::DragArea as _,
     ui::{
         links::click_action,
+        mark::{MarkPhase, frame_path as mark_frame},
         markdown::{Segment, exact_selection, segments},
         menu::{MenuAction, MenuItem, OpenMenu, TextTarget, text_edit_menu},
         model_picker::{PickerTarget, TriggerStyle},
+        motion::FrameClock,
         parts::{
-            ButtonKind, button, detail, focusable, icon, icon_button, line, selectable,
-            status_glyph, text, worker_pill,
+            ButtonKind, button, detail, focusable, icon_button, line, selectable, status_glyph,
+            text, worker_pill,
         },
     },
 };
@@ -178,15 +182,18 @@ impl ConsortApp {
             self.timeline.remeasure();
         }
         let sidebar = self.render_sidebar(t, window, cx);
+        // No header: the timeline fills the column, and the Three voices
+        // mark and the top actions float over its top fade.
         let column = div()
+            .relative()
             .flex()
             .flex_col()
             .flex_1()
             .min_w_0()
             .h_full()
-            .child(self.render_header(t, cx))
             .child(self.render_timeline(t, window, cx))
-            .child(self.render_composer(t, cx));
+            .child(self.render_composer(t, cx))
+            .child(self.render_top_overlay(t, window, cx));
         let panel = match self.panel.clone() {
             Panel::None => None,
             Panel::Tasks => Some(self.render_tasks_panel(t, window, cx)),
@@ -201,154 +208,181 @@ impl ConsortApp {
             .into_any_element()
     }
 
-    fn render_header(&mut self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+    /// The top of the column, over the timeline: a strip that moves the
+    /// window, the Three voices mark with its activity pill at the center,
+    /// and the Tasks, New task and Connectors buttons at the right.
+    fn render_top_overlay(
+        &mut self,
+        t: &Tokens,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let c = &t.colors;
-
+        let chat = t.component.chat;
         let state = self.state.clone();
-        let channel = state.channel(&self.channel_id);
-        let name = channel.map(|c| c.name.clone()).unwrap_or_default();
-        let purpose = channel.map(|c| c.purpose.clone()).unwrap_or_default();
-        let tags = channel.map(|c| c.tags.clone()).unwrap_or_default();
-        let panel = &state.tasks_panel;
-        let pressed = self.panel == Panel::Tasks;
-        let tasks_button = focusable(div().id("tasks-button"), t)
-            .flex()
-            .flex_none()
-            .items_center()
-            .gap(t.space.sm)
-            .py(t.component.button_pad_y)
-            .px(t.space.md - t.space.xxs)
-            .rounded(t.radius.md)
-            .border(t.border_width)
-            .cursor_pointer()
-            .when(pressed, |d| {
-                d.bg(c.surface_selected).border_color(c.surface_selected)
-            })
-            .when(!pressed, |d| {
-                d.border_color(c.border_strong)
-                    .hover(|s| s.bg(c.hover_canvas))
-            })
-            .when(panel.need_you > 0, |d| {
-                d.child(status_glyph(
-                    "header-needs-input",
-                    TaskStatus::NeedsInput,
-                    t.icon.size,
-                    t,
+        let activity = state.activity(&self.channel_id);
+        let phase = self.mark_phase(cx);
+        let tick = cx.global::<FrameClock>().tick();
+        let reduce = cx.reduce_motion();
+        let frame = self.mark.frame(phase, tick, reduce);
+        if phase.animates() && !reduce {
+            cx.global::<FrameClock>().mark_used();
+            // Load the frames of the loop before they show, so a frame
+            // never draws empty while its image loads.
+            for n in 0..phase.frames() {
+                let path = mark_frame(phase, n, t.is_dark(), false);
+                let _ = window.use_asset::<gpui_kit::ImgResourceLoader>(
+                    &gpui_kit::Resource::Embedded(path),
                     cx,
-                ))
-                .child(
-                    text(
-                        format!("{} need you", panel.need_you),
-                        t.text.ui_strong,
-                        c.text_primary,
-                    )
-                    .whitespace_nowrap(),
+                );
+            }
+        }
+        // The pill shows only while the assistant works.
+        let line = (phase == MarkPhase::Working).then(|| {
+            activity
+                .line
+                .clone()
+                .filter(|l| !l.trim().is_empty())
+                .unwrap_or_else(|| "Working".to_owned())
+        });
+        let mark = div()
+            .absolute()
+            .top(chat.mark_top)
+            .left_0()
+            .right_0()
+            .flex()
+            .flex_col()
+            .items_center()
+            .gap(t.space.xxs)
+            .child(
+                div()
+                    .id("three-voices")
+                    .debug_selector(|| "three-voices".into())
+                    .child(img(mark_frame(phase, frame, t.is_dark(), false)).size(chat.mark)),
+            )
+            .when_some(line, |d, line| {
+                d.child(
+                    div()
+                        .id("activity-pill")
+                        .debug_selector(|| "activity-pill".into())
+                        .py(chat.pill_pad_y)
+                        .px(chat.pill_pad_x)
+                        .rounded(t.radius.full)
+                        .bg(c.surface_card)
+                        .border(t.border_width)
+                        .border_color(c.border_subtle)
+                        .child(text(line, detail(t), c.text_secondary).whitespace_nowrap()),
                 )
-                .child(
-                    text(
-                        format!("of {} tasks", panel.active_count),
-                        t.text.ui,
-                        if pressed {
-                            c.text_secondary
-                        } else {
-                            c.text_tertiary
-                        },
-                    )
-                    .whitespace_nowrap(),
+            });
+        // The top actions.
+        let action = |id: &'static str, name: &str, this: &Self, cx: &App| {
+            let _ = this;
+            icon_button(
+                id,
+                name,
+                chat.top_action,
+                chat.top_action_icon,
+                c.text_secondary,
+                c.hover_canvas,
+                t,
+                cx,
+            )
+        };
+        let pressed = self.panel == Panel::Tasks;
+        let need_you = state.tasks_panel.need_you > 0;
+        let tasks = action("tasks-button", "tasks", self, cx)
+            .debug_selector(|| "tasks-button".into())
+            .relative()
+            .when(pressed, |d| d.bg(c.surface_selected))
+            // A gold dot when something needs you.
+            .when(need_you, |d| {
+                d.child(
+                    div()
+                        .id("tasks-needs-you")
+                        .debug_selector(|| "tasks-needs-you".into())
+                        .absolute()
+                        .top(t.space.sm - t.space.xxs)
+                        .right(t.space.sm - t.space.xxs)
+                        .size(t.component.state_dot)
+                        .rounded(t.radius.full)
+                        .bg(c.accent_fill),
                 )
-            })
-            .when(panel.need_you == 0, |d| {
-                d.child(text("Tasks", t.text.ui_strong, c.text_primary))
-                    .child(text(
-                        format!("{} active", panel.active_count),
-                        t.text.ui,
-                        if pressed {
-                            c.text_secondary
-                        } else {
-                            c.text_tertiary
-                        },
-                    ))
             })
             .on_click(cx.listener(|this, _, _, cx| this.toggle_tasks(cx)));
-        let new_task = icon_button(
-            "new-task",
-            "square-pen",
-            t.space.xxl,
-            t.icon.size,
-            c.text_secondary,
-            c.hover_canvas,
-            t,
-        )
-        .on_click(cx.listener(|this, _, window, cx| this.start_task_draft(window, cx)));
-        // The connectors and skills of the channel, and the count of those
-        // that its sessions get.
-        let extensions_id = self.channel_id.clone();
+        let new_task = action("new-task", "compose", self, cx)
+            .debug_selector(|| "new-task".into())
+            .on_click(cx.listener(|this, _, window, cx| this.start_task_draft(window, cx)));
+        // The connectors and skills of the channel, for a channel that has
+        // some, with the count of those that its sessions get.
         let enabled = consort_client::channel_extensions(&state, &self.channel_id)
             .map(|set| set.enabled_connector_ids().len() + set.enabled_skill_ids().len())
             .unwrap_or(0);
-        let extensions_button = focusable(div().id("channel-extensions"), t)
+        let extensions_id = self.channel_id.clone();
+        let extensions = (enabled > 0).then(|| {
+            let id: gpui_kit::ElementId = "channel-extensions".into();
+            let hovered = crate::ui::motion::is_hovered(&id, cx);
+            let version = crate::ui::motion::shimmer_version(hovered, cx);
+            let hover_id = id.clone();
+            focusable(div().id(id), t)
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap(t.space.xs)
+                .h(chat.top_action)
+                .px(t.space.sm)
+                .rounded(t.radius.md)
+                .cursor_pointer()
+                .hover(|s| s.bg(c.hover_canvas))
+                .on_hover(move |on, window, cx| {
+                    if let Some(clock) = cx.try_global::<FrameClock>() {
+                        clock.set_hovered(hover_id.clone(), *on);
+                    }
+                    window.refresh();
+                })
+                .child(crate::ui::parts::icon_version(
+                    "connector",
+                    version,
+                    chat.top_action_icon,
+                    c.text_secondary,
+                ))
+                .child(text(enabled.to_string(), t.text.ui, c.text_secondary))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.open_dialog(
+                        crate::app::Dialog::ChannelExtensions(extensions_id.clone()),
+                        window,
+                        cx,
+                    )
+                }))
+        });
+        let actions = div()
+            .absolute()
+            .top(t.space.md)
+            .right(t.space.md)
             .flex()
-            .flex_none()
             .items_center()
-            .gap(t.space.xs + t.space.xxs)
-            .h(t.space.xxl)
-            .px(t.space.sm)
-            .rounded(t.radius.md)
-            .cursor_pointer()
-            .hover(|s| s.bg(c.hover_canvas))
-            .child(icon("link", t.icon.size, c.text_secondary))
-            .when(enabled > 0, |d| {
-                d.child(text(enabled.to_string(), t.text.ui, c.text_secondary))
-            })
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.open_dialog(
-                    crate::app::Dialog::ChannelExtensions(extensions_id.clone()),
-                    window,
-                    cx,
-                )
-            }));
+            .gap(t.space.xs)
+            .children(extensions)
+            .child(tasks)
+            .child(new_task);
         div()
-            .flex()
-            .flex_none()
-            .items_center()
-            .gap(t.space.md)
-            .h(t.space.page + t.space.xs)
-            .pl(t.space.xl)
-            .pr(t.space.lg)
-            .border_b(t.border_width)
-            .border_color(c.border_subtle)
-            .drag_area()
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .h(t.layout.fade_top)
+            // The overlay must not take the clicks and the scroll of the
+            // timeline under it, apart from its own parts.
             .child(
                 div()
-                    .type_style(t.text.title)
-                    .line_height(t.text.body.line)
-                    .text_color(c.text_primary)
-                    .whitespace_nowrap()
-                    .child(name),
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .h(t.space.page)
+                    .drag_area(),
             )
-            .when(!tags.is_empty(), |d| {
-                // The channel's worker tags: a click opens the Worker tags
-                // dialog.
-                let id = self.channel_id.clone();
-                let mut chips = div()
-                    .id("channel-tags")
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .gap(t.space.xs)
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.open_dialog(crate::app::Dialog::ChannelTags(id.clone()), window, cx)
-                    }));
-                for tag in &tags {
-                    chips = chips.child(crate::ui::parts::tag_chip(tag, false, t));
-                }
-                d.child(chips)
-            })
-            .child(line(purpose, t.text.ui, c.text_tertiary).flex_1())
-            .child(tasks_button)
-            .child(extensions_button)
-            .child(new_task)
+            .child(mark)
+            .child(actions)
             .into_any_element()
     }
 
@@ -359,15 +393,12 @@ impl ConsortApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let c = &t.colors;
-        let empty = self
-            .state
-            .timeline(&self.channel_id)
-            .is_none_or(|tl| tl.items.is_empty());
-        let fade_top = t.space.xl;
+        let empty = self.chat_rows.is_empty();
+        let fade_top = t.layout.fade_top;
         // At the live edge nothing is cut below, so the bottom fade shows only
         // while the reader is scrolled up.
         let at_end = empty || self.timeline.is_scrolled_to_end().unwrap_or(true);
-        let fade_bottom = t.space.xxl;
+        let fade_bottom = t.layout.fade_bottom;
         let unloaded = self.channel_unloaded();
         let body = if let Some(waiting) = self.waiting() {
             // No channel has loaded. It is not a channel with no messages.
@@ -377,7 +408,6 @@ impl ConsortApp {
         } else if empty {
             self.render_empty_timeline(t).into_any_element()
         } else {
-            let gap = t.space.xl;
             let count = self.timeline_keys.len();
             let max_width = t.layout.timeline_max_width;
             let inset = t.space.xl;
@@ -385,15 +415,18 @@ impl ConsortApp {
                 self.timeline.clone(),
                 cx.processor(move |this, ix: usize, window, cx| {
                     let t = ConsortApp::tokens(cx);
-                    let row = this.render_timeline_item(ix, &t, window, cx);
+                    let Some(row) = this.chat_rows.get(ix).cloned() else {
+                        return div().into_any_element();
+                    };
+                    let (top, content) = this.render_chat_row(&row, &t, window, cx);
                     div()
                         .w_full()
                         .flex()
                         .justify_center()
                         .px(inset)
-                        .when(ix == 0, |d| d.pt(t.space.xl))
-                        .when(ix + 1 < count, |d| d.pb(gap))
-                        .child(div().w_full().max_w(max_width).child(row))
+                        .pt(top)
+                        .when(ix + 1 == count, |d| d.pb(t.space.sm))
+                        .child(div().w_full().max_w(max_width).child(content))
                         .into_any_element()
                 }),
             )
@@ -412,7 +445,7 @@ impl ConsortApp {
                 d.child(
                     div()
                         .absolute()
-                        .top(t.space.sm)
+                        .top(t.layout.fade_top)
                         .left_0()
                         .right_0()
                         .flex()
@@ -428,7 +461,7 @@ impl ConsortApp {
                 )
             })
             // The chat never has a hard edge: it fades into the canvas at the
-            // top, and above the composer.
+            // top, under the mark, and above the composer.
             .child(
                 div()
                     .absolute()
@@ -438,7 +471,7 @@ impl ConsortApp {
                     .h(fade_top)
                     .bg(linear_gradient(
                         180.,
-                        linear_color_stop(c.surface_canvas, 0.),
+                        linear_color_stop(c.surface_canvas, 0.35),
                         linear_color_stop(c.canvas_clear, 1.),
                     )),
             )
@@ -551,9 +584,9 @@ impl ConsortApp {
                     .w_full()
                     .max_w(t.layout.timeline_max_width)
                     .px(t.space.xl)
-                    .pl(t.layout.speaker_gutter + t.space.lg + t.space.xl)
                     .flex()
                     .flex_col()
+                    .items_center()
                     .gap(t.space.xs)
                     .child(text(
                         format!("{name} has no messages yet"),
@@ -568,57 +601,66 @@ impl ConsortApp {
             )
     }
 
-    fn render_timeline_item(
+    /// One row of the chat: the space above it and its content.
+    fn render_chat_row(
         &mut self,
-        ix: usize,
+        row: &ChatRow,
         t: &Tokens,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let Some(item) = self
-            .state
-            .timeline(&self.channel_id)
-            .and_then(|tl| tl.items.get(ix))
-            .cloned()
-        else {
-            return div().into_any_element();
+    ) -> (gpui_kit::Pixels, AnyElement) {
+        let spacing = |spacing: Spacing| match spacing {
+            Spacing::Start => t.layout.fade_top,
+            Spacing::InGroup => t.space.xs,
+            Spacing::NewGroup => t.space.lg,
+            Spacing::AfterSeparator => gpui_kit::Pixels::ZERO,
         };
-        match item {
-            TimelineItem::Day(day) => div()
-                .when(!self.narrow, |d| d.pl(t.layout.speaker_gutter + t.space.lg))
-                .child(text(day.label, t.text.label, t.colors.text_tertiary))
-                .into_any_element(),
-            TimelineItem::Message(message) => self.render_message(&message, t, window, cx),
-            TimelineItem::TaskCard(card) => self.render_card_row(&card, t, cx),
-            TimelineItem::Approval(card) => {
-                let element = self.render_approval_card(&card.approval, &card.message_id, t, cx);
-                self.speaker_row(
-                    card.speaker,
-                    &card.time_label,
-                    false,
-                    t.space.md,
-                    element,
-                    t,
+        match row {
+            ChatRow::Separator { label, .. } => {
+                let first = self.chat_rows.first().is_some_and(
+                    |r| matches!(r, ChatRow::Separator { label: l, .. } if l == label),
+                );
+                (
+                    if first { t.layout.fade_top } else { t.space.lg },
+                    div()
+                        .flex()
+                        .justify_center()
+                        .pb(t.space.md)
+                        .child(text(label.clone(), detail(t), t.colors.text_tertiary))
+                        .into_any_element(),
                 )
             }
-            TimelineItem::Decision(card) => {
-                let element = self.render_decision(&card.decision, &card.message_id, false, t, cx);
-                self.speaker_row(
-                    card.speaker,
-                    &card.time_label,
-                    false,
-                    t.space.md,
-                    element,
-                    t,
+            ChatRow::Bubble(bubble) => (
+                spacing(bubble.spacing),
+                self.render_bubble(bubble, t, window, cx),
+            ),
+            ChatRow::Card(card) => (
+                spacing(card.spacing),
+                self.render_card_row(card.item, t, cx),
+            ),
+            ChatRow::Notice { item, spacing: s } => {
+                let notice = self
+                    .state
+                    .timeline(&self.channel_id)
+                    .and_then(|tl| tl.items.get(*item))
+                    .and_then(|i| match i {
+                        TimelineItem::Notice(n) => Some(n.clone()),
+                        _ => None,
+                    });
+                (
+                    spacing(*s),
+                    match notice {
+                        Some(n) => self.render_notice_line(&n, t, cx),
+                        None => div().into_any_element(),
+                    },
                 )
             }
-            TimelineItem::Notice(notice) => self.render_notice_line(&notice, t, cx),
         }
     }
 
-    /// A system notice: one quiet line in the column of the message text,
-    /// with no speaker. The text is selectable. The hub writes the kind and
-    /// the text; only the text shows.
+    /// A system notice: one quiet centered line, with no speaker. The text
+    /// is selectable. The hub writes the kind and the text; only the text
+    /// shows.
     fn render_notice_line(
         &self,
         notice: &consort_client::NoticeView,
@@ -630,9 +672,9 @@ impl ConsortApp {
         div()
             .id(SharedString::from(format!("notice-{}", notice.message_id)))
             .flex()
+            .justify_center()
             .items_baseline()
             .gap(t.space.sm)
-            .when(!self.narrow, |d| d.pl(t.layout.speaker_gutter + t.space.lg))
             .child(
                 selectable(
                     SharedString::from(format!("notice-line-{}", notice.message_id)),
@@ -662,87 +704,323 @@ impl ConsortApp {
             .into_any_element()
     }
 
-    /// One timeline row: the speaker in the gutter at 600 px and wider, or on
-    /// one line above the content when the column is narrower.
-    fn speaker_row(
-        &self,
-        speaker: Speaker,
-        time: &str,
-        edited: bool,
-        top: gpui_kit::Pixels,
-        content: impl IntoElement,
+    /// One bubble: a part of a message. The assistant's bubbles sit at the
+    /// left on `surface.card`, yours at the right on `accent.surface`. The
+    /// last bubble of a group has the small corner on the speaker's side.
+    fn render_bubble(
+        &mut self,
+        row: &BubbleRow,
         t: &Tokens,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
     ) -> AnyElement {
         let c = &t.colors;
-        if !self.narrow {
-            return div()
-                .flex()
-                .gap(t.space.lg)
-                .child(self.gutter_with(speaker, time, edited, top, t))
-                .child(content)
-                .into_any_element();
-        }
-        let color = if speaker == Speaker::You {
-            c.accent_text
-        } else {
-            c.text_secondary
+        let chat = t.component.chat;
+        let Some(TimelineItem::Message(message)) = self
+            .state
+            .timeline(&self.channel_id)
+            .and_then(|tl| tl.items.get(row.item))
+            .cloned()
+        else {
+            return div().into_any_element();
         };
-        let mut label = time.to_owned();
-        if edited {
-            label.push_str(", edited");
-        }
-        div()
+        let you = row.lane == Lane::You;
+        let editing = you && self.editing.as_deref() == Some(message.id.as_str());
+        let lane = div()
             .flex()
             .flex_col()
-            .gap(t.space.xs + t.space.xxs)
-            .child(
+            .w_full()
+            .when(you, |d| d.items_end())
+            .when(!you, |d| d.items_start());
+        if editing {
+            let edit = self.render_edit_box(t, cx);
+            return lane
+                .child(div().w_full().max_w(t.layout.bubble_max_width).child(edit))
+                .into_any_element();
+        }
+        let menu = message_menu(&message);
+        let key = format!("{}.p{}", message.id, row.part);
+        let mut content = div()
+            .flex()
+            .flex_col()
+            .min_w_0()
+            .gap(t.space.sm + t.space.xxs);
+        if row.title {
+            let title = message.title.clone().unwrap_or_default();
+            let items = menu.clone();
+            content = content.child(
                 div()
-                    .flex()
-                    .items_baseline()
-                    .gap(t.space.sm)
-                    .child(text(speaker.label(), t.text.label, color))
-                    .child(text(label, t.text.caption, c.text_tertiary)),
-            )
-            .child(content)
+                    .id(SharedString::from(format!("{key}.title")))
+                    .font_weight(t.text.title.weight)
+                    .child(SelectableText::new(
+                        SharedString::from(format!("{key}.title.text")),
+                        title,
+                    ))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            open_context_menu(this, event, items.clone(), window, cx)
+                        }),
+                    ),
+            );
+        } else if !row.markdown.is_empty() {
+            let code = if you {
+                c.surface_card
+            } else {
+                c.surface_raised
+            };
+            content = content.child(self.render_markdown(&key, &row.markdown, menu, code, t, cx));
+        }
+        if row.with_items {
+            content = content.child(self.render_brief_items(&message, t, cx));
+        }
+        let tail = chat.bubble_tail;
+        let selector = format!("bubble-{key}");
+        let bubble = div()
+            .id(SharedString::from(format!("bubble-{key}")))
+            .debug_selector(move || selector)
+            .max_w(t.layout.bubble_max_width)
+            .min_w_0()
+            .bg(if you {
+                c.accent_surface
+            } else {
+                c.surface_card
+            })
+            .rounded(chat.bubble_radius)
+            .when(row.last_in_group && you, |d| d.rounded_br(tail))
+            .when(row.last_in_group && !you, |d| d.rounded_bl(tail))
+            .py(chat.bubble_pad_y)
+            .px(chat.bubble_pad_x)
+            .type_style(t.text.body)
+            .text_color(c.text_primary)
+            .child(content);
+        // A message on its way, or one that you edited, says so under its
+        // last bubble. The times are in the separators.
+        let last_part = row.last_in_group
+            || self.chat_rows.iter().all(|r| match r {
+                ChatRow::Bubble(b) => b.item != row.item || b.part <= row.part,
+                _ => true,
+            });
+        let note = if !last_part {
+            None
+        } else if message.pending {
+            Some(time_text("", true).to_owned())
+        } else if message.edited {
+            Some("Edited".to_owned())
+        } else {
+            None
+        };
+        lane.child(bubble)
+            .when_some(note, |d, note| {
+                d.child(
+                    text(note, t.text.caption, c.text_tertiary)
+                        .pt(t.space.xxs)
+                        .px(chat.bubble_pad_x),
+                )
+            })
             .into_any_element()
     }
 
-    fn gutter_with(
-        &self,
-        speaker: Speaker,
-        time: &str,
-        edited: bool,
-        top: gpui_kit::Pixels,
+    /// The task references of a brief, as a numbered list in its bubble:
+    /// the status and the task name in a chip that opens the thread, the
+    /// channel, and the line about the task.
+    fn render_brief_items(
+        &mut self,
+        message: &MessageView,
         t: &Tokens,
+        cx: &mut Context<Self>,
     ) -> Div {
         let c = &t.colors;
-        let color = if speaker == Speaker::You {
-            c.accent_text
-        } else {
-            c.text_secondary
-        };
-        let speaker_line = if speaker == Speaker::Task {
-            t.text.label.line
-        } else {
-            t.text.body.line
-        };
+        let mut list = div().flex().flex_col().gap(t.space.sm + t.space.xxs);
+        for (i, item) in message.items.iter().enumerate() {
+            let task_id = item.task_id.clone();
+            let name = task_id
+                .as_deref()
+                .and_then(|id| self.state.task(id))
+                .map(|task| task.title.clone())
+                .unwrap_or_else(|| item.channel_name.clone());
+            let chip = div()
+                .id(SharedString::from(format!("{}-item-{i}", message.id)))
+                .flex()
+                .flex_none()
+                .items_center()
+                .gap(t.space.xs + t.space.xxs)
+                .py(t.space.xxs)
+                .pl(t.space.xs + t.space.xxs)
+                .pr(t.space.sm)
+                .rounded(t.radius.md)
+                .bg(c.surface_raised)
+                .when(task_id.is_some(), |d| {
+                    d.cursor_pointer().hover(|s| s.bg(c.hover_raised))
+                })
+                .child(status_glyph(
+                    SharedString::from(format!("{}-glyph-{i}", message.id)),
+                    item.status,
+                    t.icon.dense,
+                    t,
+                    cx,
+                ))
+                .child(text(name, t.text.ui_strong, c.text_primary).whitespace_nowrap())
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    if let Some(id) = task_id.clone() {
+                        this.open_thread(id, window, cx);
+                    }
+                }));
+            list = list.child(
+                div()
+                    .flex()
+                    .items_start()
+                    .gap(t.space.sm)
+                    .child(
+                        text(format!("{}.", i + 1), t.text.body, c.text_tertiary)
+                            .w(t.component.chat.brief_number)
+                            .flex_none(),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .min_w_0()
+                            .gap(t.space.xs)
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(t.space.sm)
+                                    .child(chip)
+                                    .child(
+                                        text(item.channel_name.clone(), detail(t), c.text_tertiary)
+                                            .whitespace_nowrap(),
+                                    ),
+                            )
+                            .child(selectable(
+                                SharedString::from(format!("{}-item-text-{i}", message.id)),
+                                item.text.clone(),
+                                t.text.body,
+                                c.text_primary,
+                            )),
+                    ),
+            );
+        }
+        list
+    }
+
+    /// The line above a card in the timeline: a curved connector, the
+    /// status, the name and the state.
+    #[allow(clippy::too_many_arguments)]
+    fn task_line(
+        &self,
+        key: &str,
+        status: TaskStatus,
+        name: String,
+        state: String,
+        state_color: Hsla,
+        place: Option<String>,
+        t: &Tokens,
+        cx: &App,
+    ) -> Div {
+        let c = &t.colors;
         div()
             .flex()
-            .flex_col()
-            .flex_none()
-            .w(t.layout.speaker_gutter)
-            .pt(top)
+            .items_end()
+            .gap(t.space.xs + t.space.xxs)
+            .pl(t.space.sm + t.space.xxs)
+            .child(crate::ui::parts::glyph(
+                "task-connector",
+                t.component.chat.task_connector,
+                c.border_strong,
+            ))
             .child(
                 div()
-                    .type_style(t.text.label)
-                    .line_height(speaker_line)
-                    .text_color(color)
-                    .child(speaker.label()),
+                    .flex()
+                    .items_center()
+                    .min_w_0()
+                    .gap(t.space.xs + t.space.xxs)
+                    .child(status_glyph(
+                        SharedString::from(format!("{key}-line-glyph")),
+                        status,
+                        t.icon.dense,
+                        t,
+                        cx,
+                    ))
+                    .child(line(name, t.text.ui_strong, c.text_primary))
+                    .child(text(state, t.text.ui, state_color).whitespace_nowrap())
+                    .when_some(place, |d, place| {
+                        d.child(text(place, t.text.ui, c.text_tertiary).whitespace_nowrap())
+                    }),
             )
-            .child(text(time.to_owned(), t.text.caption, c.text_tertiary))
-            .when(edited, |d| {
-                d.child(text("Edited", t.text.caption, c.text_tertiary))
-            })
+    }
+
+    /// A card in the assistant lane, under its task line: a task card, or
+    /// an approval or a decision of the channel's assistant.
+    fn render_card_row(&mut self, item: usize, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+        let c = &t.colors;
+        let Some(item) = self
+            .state
+            .timeline(&self.channel_id)
+            .and_then(|tl| tl.items.get(item))
+            .cloned()
+        else {
+            return div().into_any_element();
+        };
+        let request_state = |state: RequestState| match state {
+            RequestState::Pending | RequestState::Sending => {
+                ("Needs you".to_owned(), c.accent_text)
+            }
+            RequestState::Answered => ("Answered".to_owned(), c.text_tertiary),
+            RequestState::Expired | RequestState::Closed => ("Closed".to_owned(), c.text_tertiary),
+        };
+        let card_frame = |content: AnyElement| {
+            div()
+                .mt(t.space.xs + t.space.xxs)
+                .w_full()
+                .max_w(t.layout.bubble_max_width)
+                .flex()
+                .child(content)
+        };
+        match item {
+            TimelineItem::TaskCard(card) => self.render_task_card_row(&card, t, cx),
+            TimelineItem::Approval(card) => {
+                let (state, color) = request_state(card.approval.state);
+                let element =
+                    self.render_approval_card(&card.approval, &card.message_id, true, t, cx);
+                div()
+                    .flex()
+                    .flex_col()
+                    .child(self.task_line(
+                        &card.message_id,
+                        crate::ui::panels::request_glyph(card.approval.state),
+                        "Approval".to_owned(),
+                        state,
+                        color,
+                        None,
+                        t,
+                        cx,
+                    ))
+                    .child(card_frame(element))
+                    .into_any_element()
+            }
+            TimelineItem::Decision(card) => {
+                let (state, color) = request_state(card.decision.state);
+                let element = self.render_decision(&card.decision, &card.message_id, false, t, cx);
+                div()
+                    .flex()
+                    .flex_col()
+                    .child(self.task_line(
+                        &card.message_id,
+                        crate::ui::panels::request_glyph(card.decision.state),
+                        "Decision".to_owned(),
+                        state,
+                        color,
+                        None,
+                        t,
+                        cx,
+                    ))
+                    .child(card_frame(element))
+                    .into_any_element()
+            }
+            _ => div().into_any_element(),
+        }
     }
 
     /// Message text, split into prose and code blocks.
@@ -832,119 +1110,6 @@ impl ConsortApp {
         out
     }
 
-    fn render_message(
-        &mut self,
-        message: &MessageView,
-        t: &Tokens,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let c = &t.colors;
-        let you = message.speaker == Speaker::You;
-        let top = if you {
-            t.space.xs + t.space.xxs
-        } else {
-            t.space.xxs
-        };
-        let menu = message_menu(message);
-        let editing = you && self.editing.as_deref() == Some(message.id.as_str());
-        let body = if editing {
-            self.render_edit_box(t, cx)
-        } else {
-            self.render_markdown(&message.id, &message.body, menu, c.surface_card, t, cx)
-        };
-        let content = if editing {
-            div().flex().flex_col().flex_1().min_w_0().child(body)
-        } else if you {
-            div()
-                .flex()
-                .flex_col()
-                .items_start()
-                .flex_1()
-                .min_w_0()
-                .child(
-                    div()
-                        .max_w_full()
-                        .bg(c.accent_surface)
-                        .rounded(t.radius.lg)
-                        .py(t.space.xs + t.space.xxs)
-                        .px(t.space.md)
-                        .type_style(t.text.body)
-                        .text_color(c.text_primary)
-                        .child(body),
-                )
-        } else {
-            let mut content = div()
-                .flex()
-                .flex_col()
-                .flex_1()
-                .min_w_0()
-                .gap(t.space.sm)
-                .type_style(t.text.body)
-                .text_color(c.text_primary);
-            if let Some(title) = &message.title {
-                content = content.child(
-                    div()
-                        .type_style(t.text.title)
-                        .line_height(t.text.body.line)
-                        .child(title.clone()),
-                );
-            }
-            content = content.child(body);
-            if !message.items.is_empty() {
-                let mut rows = div()
-                    .flex()
-                    .flex_col()
-                    .pt(t.space.xs)
-                    .border_t(t.border_width)
-                    .border_color(c.border_subtle);
-                let last = message.items.len() - 1;
-                for (i, item) in message.items.iter().enumerate() {
-                    let task_id = item.task_id.clone();
-                    rows = rows.child(
-                        div()
-                            .id(SharedString::from(format!("{}-item-{i}", message.id)))
-                            .flex()
-                            .items_center()
-                            .gap(t.space.md)
-                            .py(t.space.sm)
-                            .when(i < last, |d| {
-                                d.border_b(t.border_width).border_color(c.border_subtle)
-                            })
-                            .when(task_id.is_some(), |d| d.cursor_pointer())
-                            .child(status_glyph(
-                                SharedString::from(format!("{}-glyph-{i}", message.id)),
-                                item.status,
-                                t.icon.size,
-                                t,
-                                cx,
-                            ))
-                            .child(
-                                text(item.text.clone(), t.text.ui, c.text_primary)
-                                    .flex_1()
-                                    .min_w_0(),
-                            )
-                            .child(
-                                text(item.channel_name.clone(), t.text.ui, c.text_tertiary)
-                                    .w(t.layout.speaker_gutter + t.space.page - t.space.sm)
-                                    .flex_none()
-                                    .text_right(),
-                            )
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                if let Some(id) = task_id.clone() {
-                                    this.open_thread(id, window, cx);
-                                }
-                            })),
-                    );
-                }
-                content = content.child(rows);
-            }
-            content
-        };
-        let time = time_text(&message.time_label, message.pending);
-        self.speaker_row(message.speaker, time, message.edited, top, content, t)
-    }
-
     /// The text box that edits one of the user's messages in place. Enter
     /// saves and Escape cancels.
     fn render_edit_box(&mut self, t: &Tokens, cx: &mut Context<Self>) -> Div {
@@ -995,53 +1160,52 @@ impl ConsortApp {
             )
     }
 
-    fn render_card_row(
+    /// A task card under its task line. The line names the task and its
+    /// state, so the card has no header row of its own. A resolved task
+    /// with nothing pending is the line alone, with its summary.
+    fn render_task_card_row(
         &mut self,
         card: &TaskCardView,
         t: &Tokens,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        let c = &t.colors;
+        let chat = t.component.chat;
         let collapsed = card
             .approval
             .as_ref()
             .is_none_or(|a| a.state == RequestState::Answered)
             && matches!(card.status, TaskStatus::Resolved);
-        let top = if collapsed {
-            t.space.sm + t.space.xxs
-        } else {
-            t.space.md
-        };
-        let card_element = self.render_task_card(card, collapsed, t, cx);
-        self.speaker_row(Speaker::Task, &card.time_label, false, top, card_element, t)
-    }
-
-    pub fn render_task_card(
-        &mut self,
-        card: &TaskCardView,
-        collapsed: bool,
-        t: &Tokens,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let c = &t.colors;
         let open = self.panel == Panel::Thread(card.task_id.clone());
+        let status = card.status;
+        let state = if collapsed && !card.summary.is_empty() {
+            card.summary.clone()
+        } else if status == TaskStatus::NeedsInput {
+            "Needs you".to_owned()
+        } else {
+            status.label().to_owned()
+        };
+        let place = card.channel_name.clone().map(|name| format!("in {name}"));
         let task_id = card.task_id.clone();
         let menu_task = card.task_id.clone();
-        let status = card.status;
-        let glyph = status_glyph(
-            SharedString::from(format!("card-{}", card.message_id)),
-            card.status,
-            t.icon.size,
-            t,
-            cx,
-        );
-        let base = div()
-            .id(SharedString::from(format!("card-{}", card.message_id)))
-            .flex()
-            .flex_1()
-            .min_w_0()
-            .rounded(t.radius.lg)
-            .border(t.border_width)
-            .border_color(if open { c.accent_text } else { c.border_subtle })
+        let line = self
+            .task_line(
+                &card.message_id,
+                status,
+                card.title.clone(),
+                state,
+                crate::ui::parts::status_color(status, t),
+                place,
+                t,
+                cx,
+            )
+            .id(SharedString::from(format!("task-line-{}", card.message_id)))
+            .cursor_pointer()
+            .on_click(
+                cx.listener(move |this, _, window, cx| {
+                    this.open_thread(task_id.clone(), window, cx)
+                }),
+            )
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
@@ -1049,48 +1213,40 @@ impl ConsortApp {
                 }),
             );
         if collapsed {
-            return focusable(base, t)
-                .items_center()
-                .gap(t.space.sm)
-                .py(t.space.sm + t.space.xxs)
-                .px(t.space.md + t.space.xxs)
-                .cursor_pointer()
-                .hover(|s| s.bg(c.hover_canvas))
-                .child(glyph)
-                .child(line(card.title.clone(), t.text.ui_strong, c.text_secondary).flex_1())
-                .child(text(card.summary.clone(), detail(t), c.text_tertiary).whitespace_nowrap())
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.open_thread(task_id.clone(), window, cx)
-                }))
-                .into_any_element();
+            return line.into_any_element();
         }
-        let inset = t.icon.size + t.space.sm;
-        let header = div()
-            .flex()
-            .items_center()
-            .gap(t.space.sm)
-            .child(glyph)
-            .child(line(card.title.clone(), t.text.ui_strong, c.text_primary).flex_1())
-            .when_some(card.channel_name.clone(), |d, name| {
-                d.child(text(name, detail(t), c.text_tertiary).whitespace_nowrap())
-            })
-            // How much the task may do without asking. A worker can cap it.
-            .child(text(card.approval_mode.tag(), detail(t), c.text_tertiary).whitespace_nowrap())
+        let menu_task = card.task_id.clone();
+        // The worker and the approval mode sit at the right of the first row.
+        let place_chips = |row: Div| {
+            row.child(
+                text(card.approval_mode.tag(), detail(t), c.text_tertiary).whitespace_nowrap(),
+            )
             .when_some(card.worker.clone(), |d, w| {
                 d.child(worker_pill(&w.name, &w.account, w.online, t))
-            });
+            })
+        };
         let mut body = div()
+            .id(SharedString::from(format!("card-{}", card.message_id)))
+            .mt(t.space.xs + t.space.xxs)
+            .w_full()
+            .max_w(t.layout.bubble_max_width)
             .flex()
             .flex_col()
-            .flex_1()
-            .min_w_0()
             .gap(t.space.md)
             .pt(t.space.md)
-            .pb(t.space.md + t.space.xxs)
-            .px(t.space.md + t.space.xxs)
+            .pb(chat.bubble_pad_x)
+            .px(chat.bubble_pad_x)
             .bg(c.surface_card)
-            .rounded(t.radius.lg)
-            .child(header);
+            .border(t.border_width)
+            .border_color(if open { c.accent_text } else { c.border_subtle })
+            .rounded(chat.bubble_radius)
+            .rounded_tl(chat.bubble_tail)
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    open_context_menu(this, event, task_menu(&menu_task, status, true), window, cx)
+                }),
+            );
         let pending = card
             .approval
             .clone()
@@ -1102,27 +1258,37 @@ impl ConsortApp {
             // task card.
             let key = format!("{}-hub-card", card.message_id);
             body = body
-                .child(
+                .child(place_chips(
                     div()
-                        .pl(inset)
-                        .child(self.render_hub_card(&approval, &hub_card, &key, t, cx)),
-                )
+                        .flex()
+                        .items_center()
+                        .gap(t.space.sm)
+                        .child(div().flex_1()),
+                ))
+                .child(self.render_hub_card(&approval, &hub_card, &key, false, t, cx))
                 .child(
                     div()
                         .flex()
-                        .pl(inset)
                         .child(div().flex_1())
                         .child(self.open_thread_link(&card.task_id, open, t, cx)),
                 );
         } else if let Some(approval) = pending {
+            // What asks, then the folder and the command, then the answers.
+            let summary = selectable(
+                SharedString::from(format!("{}.summary", approval.id)),
+                approval.summary.clone(),
+                t.text.ui,
+                c.text_secondary,
+            )
+            .flex_1()
+            .min_w_0();
             body = body
-                .child(
-                    self.render_approval_detail(&approval, true, t, cx)
-                        .pl(inset),
-                )
+                .child(place_chips(
+                    div().flex().items_center().gap(t.space.sm).child(summary),
+                ))
+                .child(self.render_approval_detail(&approval, false, t, cx))
                 .child(
                     self.render_approval_buttons(&approval, t, cx)
-                        .pl(inset)
                         .child(div().flex_1())
                         .child(self.open_thread_link(&card.task_id, open, t, cx)),
                 );
@@ -1141,28 +1307,32 @@ impl ConsortApp {
                     .map(consort_client::format::card_summary)
                     .unwrap_or_default(),
             };
-            if !summary.is_empty() {
-                // The text is selectable: it holds the reason for a failed
-                // task or the review summary, and the user may copy it.
-                body = body.child(
+            let (summary, color) = if summary.is_empty() {
+                (card.summary.clone(), c.text_tertiary)
+            } else {
+                (summary, c.text_secondary)
+            };
+            // The text is selectable: it holds the reason for a failed task
+            // or the review summary, and the user may copy it.
+            body = body.child(place_chips(
+                div().flex().items_start().gap(t.space.sm).child(
                     selectable(
                         SharedString::from(format!("card-latest-{}", card.message_id)),
                         summary,
                         t.text.ui,
-                        c.text_secondary,
+                        color,
                     )
-                    .pl(inset)
+                    .flex_1()
                     .min_w_0()
                     .line_clamp(3)
                     .text_ellipsis(),
-                );
-            }
+                ),
+            ));
             // The actions sit in one row at the bottom, as on an approval:
             // Resolve for a task in review, and Open thread at the right.
             let task_id = card.task_id.clone();
             body = body.child(
                 div()
-                    .pl(inset)
                     .flex()
                     .items_center()
                     .gap(t.space.sm)
@@ -1189,7 +1359,12 @@ impl ConsortApp {
                     .child(self.open_thread_link(&card.task_id, open, t, cx)),
             );
         }
-        base.child(body).into_any_element()
+        div()
+            .flex()
+            .flex_col()
+            .child(line)
+            .child(body)
+            .into_any_element()
     }
 
     fn open_thread_link(
@@ -1342,11 +1517,15 @@ impl ConsortApp {
         row
     }
 
+    /// The composer: one rounded field with the send key inside at the
+    /// right, and under it a quiet row of tools: add, voice, the model and
+    /// effort chips, and where the assistant runs.
     fn render_composer(&mut self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
         let c = &t.colors;
+        let chat = t.component.chat;
         let state = self.state.clone();
         let channel = state.channel(&self.channel_id);
-        // A channel without its own model says that it uses Everything's.
+        // A channel without its own model says that it uses Tutti's.
         let inherited = channel.is_some_and(|ch| {
             ch.kind != ChannelKind::Everything
                 && ch
@@ -1354,6 +1533,9 @@ impl ConsortApp {
                     .as_ref()
                     .is_some_and(|e| e.source == consort_client::SelectionSource::Everything)
         });
+        let runs_on = channel
+            .and_then(|ch| ch.coordinator_worker.clone())
+            .filter(|w| !w.trim().is_empty());
         let target = PickerTarget::Assistant(self.channel_id.clone());
         let model_chip = channel.map(|_| {
             self.render_model_trigger("composer-model", target.clone(), TriggerStyle::Chip, t, cx)
@@ -1362,39 +1544,39 @@ impl ConsortApp {
             self.render_effort_trigger("composer-effort", target.clone(), TriggerStyle::Chip, t, cx)
         });
         let input = crate::ui::parts::textarea(&self.inputs.composer, t.text.body);
-        let send = focusable(div().id("send"), t)
-            .size(t.space.xl + t.space.xs)
-            .flex_none()
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded(t.radius.md)
-            .bg(c.surface_raised)
-            .border(t.border_width)
-            .border_color(c.border_strong)
-            .cursor_pointer()
-            .hover(|s| s.bg(c.hover_raised))
-            .child(icon("corner-down-left", t.icon.dense, c.text_primary))
-            .on_click(cx.listener(|this, _, window, cx| {
-                this.send_message(window, cx);
-                // The button takes the focus. The composer gets it back, so
-                // the user can go on typing.
-                this.inputs
-                    .composer
-                    .update(cx, |input, cx| input.focus(window, cx));
-            }));
-        let tool = |id: &'static str, name: &str| {
+        let send = icon_button(
+            "send",
+            "send",
+            chat.send_button,
+            t.icon.size,
+            c.text_tertiary,
+            c.hover_card,
+            t,
+            cx,
+        )
+        .rounded(t.radius.lg)
+        .debug_selector(|| "send".into())
+        .on_click(cx.listener(|this, _, window, cx| {
+            this.send_message(window, cx);
+            // The button takes the focus. The composer gets it back, so
+            // the user can go on typing.
+            this.inputs
+                .composer
+                .update(cx, |input, cx| input.focus(window, cx));
+        }));
+        let tool = |id: &'static str, name: &str, cx: &App| {
             icon_button(
                 id,
                 name,
-                t.space.xl + t.space.xs,
+                t.component.composer_chip,
                 t.icon.size,
                 c.text_secondary,
-                c.hover_card,
+                c.hover_canvas,
                 t,
+                cx,
             )
         };
-        // The line under the composer: the state of the link, and for an
+        // The line above the composer: the state of the link, and for an
         // offline link the reason and a countdown that ticks once a second.
         let link: Option<(String, Option<String>, bool)> = match &state.connection {
             consort_client::Connection::Offline {
@@ -1418,10 +1600,10 @@ impl ConsortApp {
             .flex_col()
             .flex_none()
             .items_center()
-            .gap(t.space.sm)
+            .gap(t.space.xs + t.space.xxs)
             .px(t.space.xl)
-            .pt(t.space.lg)
-            .pb(t.space.xl)
+            .pt(t.space.md)
+            .pb(t.space.lg)
             .when_some(link, |d, (line_text, reason, offline)| {
                 d.child(
                     div()
@@ -1430,6 +1612,7 @@ impl ConsortApp {
                         .gap(t.space.sm)
                         .w_full()
                         .max_w(t.layout.timeline_max_width)
+                        .pb(t.space.xs)
                         .child(
                             div()
                                 .flex()
@@ -1473,57 +1656,31 @@ impl ConsortApp {
             .child(
                 div()
                     .id("composer")
+                    .debug_selector(|| "composer".into())
                     .flex()
-                    .flex_col()
+                    .items_end()
+                    .gap(t.space.sm)
                     .w_full()
                     .max_w(t.layout.timeline_max_width)
                     // No channel has loaded: the box takes no text.
                     .when(self.waiting().is_some(), |d| d.opacity(t.opacity.busy))
-                    .gap(t.space.sm + t.space.xxs)
-                    .pt(t.space.md)
-                    .pb(t.space.sm + t.space.xxs)
+                    .py(t.space.sm)
                     .pl(t.space.lg)
-                    .pr(t.space.md)
+                    .pr(t.space.sm)
                     .bg(c.surface_card)
                     .border(t.border_width)
                     .border_color(c.border_strong)
-                    .rounded(t.radius.lg)
+                    .rounded(chat.composer_radius)
                     .child(
                         div()
+                            .flex_1()
+                            .min_w_0()
+                            .py(t.space.xs)
                             .type_style(t.text.body)
                             .text_color(c.text_primary)
                             .child(input),
                     )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(t.space.xs)
-                            .ml(-t.space.sm)
-                            .child(tool("attach", "plus").on_click(cx.listener(
-                                |this, _, _, cx| {
-                                    this.show_notice(
-                                        "Attachments come in a later build.".into(),
-                                        cx,
-                                    )
-                                },
-                            )))
-                            .child(tool("voice", "mic").on_click(cx.listener(|this, _, _, cx| {
-                                this.show_notice("Voice input comes in a later build.".into(), cx)
-                            })))
-                            .child(div().flex_1())
-                            .when(inherited, |d| {
-                                d.child(
-                                    text("Same as Everything", detail(t), c.text_tertiary)
-                                        .flex_none()
-                                        .pr(t.space.xs),
-                                )
-                            })
-                            .children(model_chip)
-                            .children(effort_chip)
-                            .child(div().w(t.space.xs).flex_none())
-                            .child(send),
-                    )
+                    .child(send)
                     .on_mouse_down(
                         MouseButton::Right,
                         cx.listener(|this, event: &MouseDownEvent, _, cx| {
@@ -1532,6 +1689,57 @@ impl ConsortApp {
                             cx.stop_propagation();
                         }),
                     ),
+            )
+            .child(
+                div()
+                    .id("composer-tools")
+                    .debug_selector(|| "composer-tools".into())
+                    .flex()
+                    .items_center()
+                    .gap(t.space.xxs)
+                    .w_full()
+                    .max_w(t.layout.timeline_max_width)
+                    .px(t.space.xs)
+                    .child(
+                        tool("attach", "plus", cx).on_click(cx.listener(|this, _, _, cx| {
+                            this.show_notice("Attachments come in a later build.".into(), cx)
+                        })),
+                    )
+                    .child(
+                        tool("voice", "voice", cx).on_click(cx.listener(|this, _, _, cx| {
+                            this.show_notice("Voice input comes in a later build.".into(), cx)
+                        })),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(t.border_width)
+                            .h(t.icon.size)
+                            .mx(t.space.xs + t.space.xxs)
+                            .bg(c.border_strong),
+                    )
+                    .when(inherited, |d| {
+                        d.child(
+                            text(
+                                format!("Same as {}", crate::ui::TUTTI),
+                                detail(t),
+                                c.text_tertiary,
+                            )
+                            .flex_none()
+                            .pr(t.space.xs),
+                        )
+                    })
+                    .children(model_chip)
+                    .children(effort_chip)
+                    .child(div().flex_1())
+                    .when_some(runs_on, |d, worker| {
+                        d.child(
+                            text(format!("Runs on {worker}"), detail(t), c.text_tertiary)
+                                .whitespace_nowrap()
+                                .id("runs-on")
+                                .debug_selector(|| "runs-on".into()),
+                        )
+                    }),
             )
             .into_any_element()
     }

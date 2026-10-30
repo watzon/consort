@@ -13,7 +13,7 @@ use crate::{
     ui::window_controls::DragArea as _,
     ui::{
         dialogs::input_box,
-        parts::{ButtonKind, button, detail, error_box, glyph, text},
+        parts::{ButtonKind, button, detail, error_box, text},
     },
 };
 
@@ -90,11 +90,6 @@ impl ConsortApp {
                 "Connecting",
             )
         };
-        let mark_color = if t.is_dark() {
-            c.accent_fill
-        } else {
-            c.accent_text
-        };
         let field = |label: &str, input, hint: &str| {
             div()
                 .flex()
@@ -116,7 +111,7 @@ impl ConsortApp {
                     // The wordmark: the mark is 1.2 times the font size high,
                     // with a gap of 0.35 times the font size.
                     .gap(t.component.brand_gap)
-                    .child(glyph("mark", t.component.brand_mark, mark_color))
+                    .child(crate::ui::mark::still_mark(t.component.brand_mark, t))
                     .child(
                         div()
                             .text_size(t.text.heading.size)

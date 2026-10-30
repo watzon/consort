@@ -210,6 +210,7 @@ impl ConsortApp {
                         c.text_tertiary,
                         c.hover_sidebar,
                         t,
+                        cx,
                     )
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.open_settings(SettingsSection::Appearance, cx)
@@ -375,16 +376,8 @@ impl ConsortApp {
         let id = channel.id.clone();
         let menu_id = channel.id.clone();
         let leading = if everything {
-            crate::ui::parts::glyph(
-                "brace",
-                t.icon.size,
-                if is_selected {
-                    c.text_primary
-                } else {
-                    c.text_secondary
-                },
-            )
-            .into_any_element()
+            // The Three voices mark, idle and sharp.
+            crate::ui::mark::still_mark(t.component.chat.mark_small, t)
         } else {
             icon(&channel.icon, t.icon.size, c.text_secondary).into_any_element()
         };

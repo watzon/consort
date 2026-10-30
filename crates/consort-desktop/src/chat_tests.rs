@@ -1,0 +1,392 @@
+//! The chat redesign in a headless window: the bubbles, the composer, the
+//! top actions, the Three voices mark, Reduce motion and the icon shimmer.
+
+use std::{sync::Arc, time::Duration};
+
+use crate::app::{ConsortApp, Panel};
+use crate::ui::{mark::MarkPhase, motion::FrameClock};
+use consort_client::{
+    Client, TaskStatus, ViewState,
+    activity::{ActivityView, ChannelActivity, MarkState},
+    chat::{ChatRow, Lane},
+};
+use gpui::{AnyWindowHandle, TestAppContext, VisualTestContext};
+use gpui_kit::{AppContext as _, Entity, Modifiers, WindowOptions, point, px, size};
+
+/// One stop-motion frame: `motion.frame`.
+const FRAME: Duration = Duration::from_millis(125);
+
+fn open(state: ViewState, cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<ConsortApp>) {
+    // The mock client runs its own thread.
+    cx.executor().allow_parking();
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        consort_theme::init(cx);
+    });
+    let options = WindowOptions {
+        window_bounds: Some(gpui_kit::WindowBounds::Windowed(gpui_kit::Bounds {
+            origin: point(px(0.), px(0.)),
+            size: size(px(1440.), px(900.)),
+        })),
+        ..WindowOptions::default()
+    };
+    let (handle, app) = cx
+        .update(|cx| {
+            gpui_kit::open_window(options, cx, |window, cx| {
+                cx.new(|cx| {
+                    ConsortApp::new(Client::mock_with(state).expect("mock"), true, window, cx)
+                })
+            })
+        })
+        .expect("open the window");
+    let cx = &mut VisualTestContext::from_window(handle, cx);
+    cx.update(|window, _| window.refresh());
+    cx.run_until_parked();
+    (handle, app)
+}
+
+fn mock() -> ViewState {
+    consort_client::mock::view_state()
+}
+
+/// The mock with nothing that moves: no task works or needs input, Tutti
+/// has no messages, and every assistant is idle.
+fn quiet() -> ViewState {
+    let mut state = mock();
+    for task in &mut state.tasks {
+        task.status = TaskStatus::Resolved;
+    }
+    let tutti = consort_client::mock::everything_id();
+    for timeline in &mut state.timelines {
+        if timeline.channel_id == tutti {
+            timeline.items.clear();
+        }
+        // No approval or decision waits.
+        timeline.items.retain(|item| {
+            !matches!(
+                item,
+                consort_client::TimelineItem::Approval(_)
+                    | consort_client::TimelineItem::Decision(_)
+            )
+        });
+    }
+    state.activity.clear();
+    consort_client::derive::refresh(&mut state);
+    state
+}
+
+fn with_tutti(mut state: ViewState, mark: MarkState) -> ViewState {
+    let tutti = consort_client::mock::everything_id();
+    state.activity.retain(|a| a.channel_id != tutti);
+    state.activity.push(ChannelActivity {
+        channel_id: tutti.into(),
+        activity: ActivityView {
+            state: mark,
+            line: (mark == MarkState::Working).then(|| "Searching the web".into()),
+        },
+    });
+    state
+}
+
+fn draw(cx: &mut VisualTestContext) {
+    cx.update(|window, _| window.refresh());
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+fn tutti_draws_bubbles_in_two_lanes_with_time_separators(cx: &mut TestAppContext) {
+    let (handle, app) = open(mock(), cx);
+    let cx = &mut VisualTestContext::from_window(handle, cx);
+    app.read_with(cx, |app, _| {
+        let labels: Vec<&str> = app
+            .chat_rows
+            .iter()
+            .filter_map(|r| match r {
+                ChatRow::Separator { label, .. } => Some(label.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(labels, ["Today 8:00 AM", "9:12 AM"]);
+        let lanes: Vec<Lane> = app
+            .chat_rows
+            .iter()
+            .filter_map(|r| match r {
+                ChatRow::Bubble(b) => Some(b.lane),
+                _ => None,
+            })
+            .collect();
+        // The brief (title and text), your question, and the reply in two
+        // paragraphs.
+        assert_eq!(
+            lanes,
+            [
+                Lane::Assistant,
+                Lane::Assistant,
+                Lane::You,
+                Lane::Assistant,
+                Lane::Assistant
+            ]
+        );
+        assert!(matches!(app.chat_rows.last(), Some(ChatRow::Card(_))));
+    });
+    // The reply's two bubbles sit at the left, your bubble at the right, and
+    // no bubble is wider than the token.
+    let reply = cx
+        .debug_bounds("bubble-msg_everything_reply.p1")
+        .expect("the reply's second bubble draws");
+    let yours = cx
+        .debug_bounds("bubble-msg_everything_you.p0")
+        .expect("your bubble draws");
+    let first = cx
+        .debug_bounds("bubble-msg_everything_reply.p0")
+        .expect("the reply's first bubble draws");
+    assert_eq!(reply.origin.x, first.origin.x, "one lane");
+    assert!(reply.origin.y > first.origin.y);
+    assert!(yours.right() > reply.right(), "your lane is at the right");
+    assert!(yours.origin.x > reply.origin.x);
+    let max = app.read_with(cx, |_, cx| ConsortApp::tokens(cx).layout.bubble_max_width);
+    assert!(reply.size.width <= max && yours.size.width <= max);
+    // Bubbles in a group are 4 px apart.
+    let gap = reply.origin.y - first.bottom();
+    assert!((gap - px(4.)).abs() < px(0.5), "gap {gap:?}");
+}
+
+#[gpui::test]
+fn the_composer_has_one_field_with_send_inside_and_tools_under_it(cx: &mut TestAppContext) {
+    let (handle, app) = open(mock(), cx);
+    let cx = &mut VisualTestContext::from_window(handle, cx);
+    app.read_with(cx, |app, _| {
+        assert_eq!(app.composer_placeholder(), "Message Tutti");
+    });
+    let field = cx.debug_bounds("composer").expect("the field");
+    let send = cx.debug_bounds("send").expect("the send key");
+    let tools = cx.debug_bounds("composer-tools").expect("the tools row");
+    let runs_on = cx.debug_bounds("runs-on").expect("Runs on hub");
+    assert!(field.contains(&send.center()), "send is inside the field");
+    assert!(send.right() > field.center().x, "at the right");
+    assert!(
+        tools.origin.y >= field.bottom(),
+        "the tools sit under the field"
+    );
+    assert!(
+        runs_on.right() > tools.center().x,
+        "Runs on sits at the right"
+    );
+    // Another channel: its name in the placeholder.
+    let sayso = app.read_with(cx, |app, _| {
+        app.state
+            .channels
+            .iter()
+            .find(|c| c.name == "sayso")
+            .map(|c| c.id.clone())
+            .expect("sayso")
+    });
+    cx.update(|window, cx| app.update(cx, |app, cx| app.open_channel(sayso, window, cx)));
+    app.read_with(cx, |app, _| {
+        assert_eq!(app.composer_placeholder(), "Message sayso")
+    });
+}
+
+#[gpui::test]
+fn the_tasks_button_opens_the_panel_and_has_a_gold_dot_when_something_needs_you(
+    cx: &mut TestAppContext,
+) {
+    let (handle, app) = open(mock(), cx);
+    let cx = &mut VisualTestContext::from_window(handle, cx);
+    assert!(
+        cx.debug_bounds("tasks-needs-you").is_some(),
+        "two tasks need you"
+    );
+    assert!(cx.debug_bounds("new-task").is_some());
+    let tasks = cx.debug_bounds("tasks-button").expect("the Tasks button");
+    cx.simulate_click(tasks.center(), Modifiers::default());
+    cx.run_until_parked();
+    app.read_with(cx, |app, _| assert_eq!(app.panel, Panel::Tasks));
+    let tasks = cx.debug_bounds("tasks-button").expect("the Tasks button");
+    cx.simulate_click(tasks.center(), Modifiers::default());
+    cx.run_until_parked();
+    app.read_with(cx, |app, _| assert_eq!(app.panel, Panel::None));
+    // New task puts the start of a task in the composer.
+    let new_task = cx.debug_bounds("new-task").expect("New task");
+    cx.simulate_click(new_task.center(), Modifiers::default());
+    cx.run_until_parked();
+    app.read_with(cx, |app, cx| {
+        assert!(
+            app.inputs
+                .composer
+                .read(cx)
+                .value()
+                .starts_with(crate::app::START_TASK_TEXT)
+        )
+    });
+}
+
+#[gpui::test]
+fn no_gold_dot_when_nothing_needs_you(cx: &mut TestAppContext) {
+    let (handle, _app) = open(quiet(), cx);
+    let cx = &mut VisualTestContext::from_window(handle, cx);
+    assert!(cx.debug_bounds("tasks-button").is_some());
+    assert!(cx.debug_bounds("tasks-needs-you").is_none());
+}
+
+#[gpui::test]
+fn the_mark_follows_the_assistant_and_holds_done_when_work_ends(cx: &mut TestAppContext) {
+    let (handle, app) = open(with_tutti(quiet(), MarkState::Working), cx);
+    let cx = &mut VisualTestContext::from_window(handle, cx);
+    app.read_with(cx, |app, cx| {
+        assert_eq!(app.mark_phase(cx), MarkPhase::Working)
+    });
+    assert!(cx.debug_bounds("activity-pill").is_some(), "the pill shows");
+    // Work ends: Done for 1.5 s, then idle.
+    let idle = Arc::new(with_tutti(quiet(), MarkState::Idle));
+    cx.update(|_, cx| app.update(cx, |app, cx| app.set_state(idle, cx)));
+    draw(cx);
+    app.read_with(cx, |app, cx| {
+        assert_eq!(app.mark_phase(cx), MarkPhase::Done)
+    });
+    assert!(
+        cx.debug_bounds("activity-pill").is_none(),
+        "no pill after work"
+    );
+    cx.executor().advance_clock(Duration::from_millis(1400));
+    draw(cx);
+    app.read_with(cx, |app, cx| {
+        assert_eq!(app.mark_phase(cx), MarkPhase::Done)
+    });
+    cx.executor().advance_clock(Duration::from_millis(200));
+    draw(cx);
+    app.read_with(cx, |app, cx| {
+        assert_eq!(app.mark_phase(cx), MarkPhase::Idle)
+    });
+    // Something needs you.
+    let needs = Arc::new(with_tutti(quiet(), MarkState::NeedsYou));
+    cx.update(|_, cx| app.update(cx, |app, cx| app.set_state(needs, cx)));
+    draw(cx);
+    app.read_with(cx, |app, cx| {
+        assert_eq!(app.mark_phase(cx), MarkPhase::NeedsYou)
+    });
+}
+
+#[gpui::test]
+fn the_mark_plays_at_eight_frames_a_second_and_stops_under_reduce_motion(cx: &mut TestAppContext) {
+    let (handle, app) = open(with_tutti(quiet(), MarkState::Working), cx);
+    let cx = &mut VisualTestContext::from_window(handle, cx);
+    cx.update(|_, cx| app.update(cx, |app, _| app.window_active = true));
+    draw(cx);
+    let tick = |cx: &mut VisualTestContext| cx.update(|_, cx| cx.global::<FrameClock>().tick());
+    let start = tick(cx);
+    for _ in 0..8 {
+        cx.executor().advance_clock(FRAME);
+        cx.run_until_parked();
+    }
+    assert_eq!(tick(cx) - start, 8, "8 frames in one second");
+    // Reduce motion: the clock stops and the mark holds frame 0.
+    cx.update(|_, cx| cx.set_reduce_motion(true));
+    draw(cx);
+    cx.executor().advance_clock(FRAME);
+    cx.run_until_parked();
+    let held = tick(cx);
+    for _ in 0..8 {
+        cx.executor().advance_clock(FRAME);
+        cx.run_until_parked();
+    }
+    assert_eq!(tick(cx), held, "nothing moves under Reduce motion");
+    app.update(cx, |app, _| {
+        assert_eq!(app.mark.frame(MarkPhase::Working, held + 5, true), 0)
+    });
+    // A state change still changes the pose.
+    let needs = Arc::new(with_tutti(quiet(), MarkState::NeedsYou));
+    cx.update(|_, cx| app.update(cx, |app, cx| app.set_state(needs, cx)));
+    draw(cx);
+    app.read_with(cx, |app, cx| {
+        assert_eq!(app.mark_phase(cx), MarkPhase::Done)
+    });
+    cx.update(|_, cx| cx.set_reduce_motion(false));
+}
+
+#[gpui::test]
+fn an_icon_button_shimmers_only_while_hovered(cx: &mut TestAppContext) {
+    let (handle, app) = open(quiet(), cx);
+    let cx = &mut VisualTestContext::from_window(handle, cx);
+    cx.update(|_, cx| app.update(cx, |app, _| app.window_active = true));
+    draw(cx);
+    let tick = |cx: &mut VisualTestContext| cx.update(|_, cx| cx.global::<FrameClock>().tick());
+    // Nothing moves: the clock stands still.
+    let start = tick(cx);
+    for _ in 0..4 {
+        cx.executor().advance_clock(FRAME);
+        cx.run_until_parked();
+    }
+    assert_eq!(tick(cx), start, "an idle screen costs nothing");
+    // The pointer on the New task button: three versions in turn, 8 a second.
+    let button = cx.debug_bounds("new-task").expect("New task");
+    cx.simulate_mouse_move(button.center(), None, Modifiers::default());
+    cx.run_until_parked();
+    let hovered = cx.update(|_, cx| cx.global::<FrameClock>().hovered());
+    assert_eq!(hovered, Some("new-task".into()));
+    let from = tick(cx);
+    let mut versions = Vec::new();
+    for _ in 0..3 {
+        cx.executor().advance_clock(FRAME);
+        cx.run_until_parked();
+        versions.push(cx.update(|_, cx| {
+            let id = gpui_kit::ElementId::from("new-task");
+            let live = crate::ui::motion::is_hovered(&id, cx);
+            crate::ui::motion::shimmer_version(live, cx)
+        }));
+    }
+    assert_eq!(tick(cx) - from, 3);
+    versions.sort_unstable();
+    assert_eq!(
+        versions,
+        [0, 1, 2],
+        "each version shows once in three frames"
+    );
+    // The pointer leaves: the clock stops after the next frame.
+    cx.simulate_mouse_move(point(px(700.), px(500.)), None, Modifiers::default());
+    cx.run_until_parked();
+    let hovered = cx.update(|_, cx| cx.global::<FrameClock>().hovered());
+    assert_eq!(hovered, None, "the pointer left the button");
+    cx.executor().advance_clock(FRAME);
+    cx.run_until_parked();
+    let left = tick(cx);
+    for _ in 0..4 {
+        cx.executor().advance_clock(FRAME);
+        cx.run_until_parked();
+    }
+    assert_eq!(tick(cx), left);
+    let version = cx.update(|_, cx| {
+        let id = gpui_kit::ElementId::from("new-task");
+        crate::ui::motion::shimmer_version(crate::ui::motion::is_hovered(&id, cx), cx)
+    });
+    assert_eq!(version, 0, "an icon that is not hovered shows version 0");
+}
+
+#[gpui::test]
+fn reduce_motion_stops_the_shimmer_of_a_hovered_button(cx: &mut TestAppContext) {
+    let (handle, app) = open(quiet(), cx);
+    let cx = &mut VisualTestContext::from_window(handle, cx);
+    cx.update(|_, cx| {
+        cx.set_reduce_motion(true);
+        app.update(cx, |app, _| app.window_active = true);
+    });
+    draw(cx);
+    let button = cx.debug_bounds("new-task").expect("New task");
+    cx.simulate_mouse_move(button.center(), None, Modifiers::default());
+    cx.run_until_parked();
+    let start = cx.update(|_, cx| cx.global::<FrameClock>().tick());
+    for _ in 0..4 {
+        cx.executor().advance_clock(FRAME);
+        cx.run_until_parked();
+    }
+    let (tick, version) = cx.update(|_, cx| {
+        let id = gpui_kit::ElementId::from("new-task");
+        (
+            cx.global::<FrameClock>().tick(),
+            crate::ui::motion::shimmer_version(crate::ui::motion::is_hovered(&id, cx), cx),
+        )
+    });
+    assert_eq!(tick, start);
+    assert_eq!(version, 0);
+    cx.update(|_, cx| cx.set_reduce_motion(false));
+}

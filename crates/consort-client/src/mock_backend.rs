@@ -233,7 +233,7 @@ impl MockBackend {
                 {
                     return Err(ClientError::Hub {
                         code: "conflict".into(),
-                        message: "Everything cannot be archived or deleted.".into(),
+                        message: "Tutti cannot be archived or deleted.".into(),
                     });
                 }
                 if archiving

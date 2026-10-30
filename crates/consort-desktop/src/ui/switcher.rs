@@ -11,7 +11,7 @@ use gpui_kit::{
 
 use crate::{
     app::ConsortApp,
-    ui::parts::{detail, glyph, icon, line, status_glyph, text},
+    ui::parts::{detail, icon, line, status_glyph, text},
 };
 
 /// The most rows the switcher shows.
@@ -221,7 +221,7 @@ impl ConsortApp {
                     ..
                 } => (
                     if *everything {
-                        glyph("brace", t.icon.size, c.text_secondary).into_any_element()
+                        crate::ui::mark::still_mark(t.icon.size, t)
                     } else {
                         icon(icon_name, t.icon.size, c.text_secondary).into_any_element()
                     },

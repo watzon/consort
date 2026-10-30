@@ -596,7 +596,7 @@ impl ConsortApp {
                         .map(|e| e.selection.model_name.clone()),
                 };
                 (
-                    "Same as Everything".to_owned(),
+                    format!("Same as {}", crate::ui::TUTTI),
                     everything.unwrap_or_default(),
                 )
             }
@@ -925,7 +925,7 @@ impl ConsortApp {
                         .type_style(detail(t))
                         .text_color(c.text_secondary)
                         .hover(|s| s.text_color(c.text_primary).bg(c.hover_raised))
-                        .child("Use the Everything model")
+                        .child(format!("Use the {} model", crate::ui::TUTTI))
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.close_picker(window, cx);
                             this.apply_selection(&target, None, cx);

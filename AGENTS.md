@@ -55,7 +55,7 @@ These come from the user's experience with GPUI. Follow them in every view.
    - An account row (Settings > Workers): Account settings, Rename, Sign out, Remove.
    - A worker row: Rename, Edit tags, Pause, Remove.
    - The composer: Cut, Copy, Paste, Select all.
-3. **The chat never has a hard edge.** The top and bottom of the timeline fade into the canvas, so text never stops at a sharp line. GPUI has no blur filter for elements, so use layered gradients from the canvas color to transparent (about 24 px at the top and 32 px above the composer).
+3. **The chat never has a hard edge.** The top and bottom of the timeline fade into the canvas, so text never stops at a sharp line. GPUI has no blur filter for elements, so use layered gradients from the canvas color to transparent (`layout.fade_top`, 96 px, at the top under the Three voices mark, and `layout.fade_bottom`, 32 px, above the composer).
 4. **Dropdowns flip.** Any menu, popover or select that can run past the window edge opens downward when there is room and upward when there is not. Use GPUI's anchored positioning with anchor switching, not a fixed offset.
 5. **Colors and sizes come from tokens.** Read colors from the active `consort-theme` theme, and sizes from `design/structure.json` through `consort-theme`. No hex values or ad hoc pixel sizes in view code.
 6. **Copy follows the design system.** Sentence case, verbs on buttons, no all-caps labels, no middle dots between details, no arrows in button text. Errors say what happened and what to do next.

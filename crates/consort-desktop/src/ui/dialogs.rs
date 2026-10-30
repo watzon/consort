@@ -454,6 +454,7 @@ impl ConsortApp {
                                     c.text_secondary,
                                     c.hover_raised,
                                     t,
+                                    cx,
                                 )
                                 .on_click(cx.listener(|this, _, _, cx| this.dismiss_notice(cx))),
                             ),
@@ -658,7 +659,7 @@ impl ConsortApp {
                     .is_focused(window);
                 (
                     "Rename channel".to_owned(),
-                    "The name shows in the sidebar and in Everything.".to_owned(),
+                    "The name shows in the sidebar and in Tutti.".to_owned(),
                     t.layout.dialog_width,
                     field_block("Name", input_box(&self.inputs.name, focused, t), None, t),
                     self.dialog_actions("Rename", t, cx, move |this, window, cx| {
@@ -695,11 +696,27 @@ impl ConsortApp {
                     .channel(&id)
                     .map(|ch| ch.name.clone())
                     .unwrap_or_default();
+                let purpose_focused = self
+                    .inputs
+                    .purpose
+                    .read(cx)
+                    .focus_handle(cx)
+                    .is_focused(window);
                 (
                     format!("Instructions for {name}"),
                     "Standing guidance that Consort reads before every turn in this channel. Write it in Markdown.".to_owned(),
                     t.layout.dialog_wide,
                     div()
+                        .flex()
+                        .flex_col()
+                        .gap(t.space.lg)
+                        .child(field_block(
+                            "Purpose",
+                            input_box(&self.inputs.purpose, purpose_focused, t),
+                            Some("One line about what this channel is for"),
+                            t,
+                        ))
+                        .child(field_block("Instructions", div()
                         .min_h(t.component.notes_min_height)
                         .py(t.space.sm)
                         .px(t.space.md)
@@ -710,15 +727,16 @@ impl ConsortApp {
                         .type_style(t.text.ui)
                         .child(
                             crate::ui::parts::textarea(&self.inputs.notes, t.text.ui),
-                        ),
+                        ), None, t)),
                     self.dialog_actions("Save instructions", t, cx, move |this, window, cx| {
                         let notes = this.inputs.notes.read(cx).value().to_string();
+                        let purpose = this.field(Field::Purpose, cx);
                         let client = this.client.clone();
                         let id = id.clone();
                         this.submit_dialog(
                             async move {
                                 client
-                                    .update_channel(id, ChannelChanges { instructions: Some(notes), ..ChannelChanges::default() })
+                                    .update_channel(id, ChannelChanges { purpose: Some(purpose), instructions: Some(notes), ..ChannelChanges::default() })
                                     .await
                             },
                             window,
@@ -944,6 +962,7 @@ impl ConsortApp {
                             c.text_secondary,
                             c.hover_raised,
                             t,
+                            cx,
                         )
                         .on_click(cx.listener(|this, _, window, cx| this.close_dialog(window, cx))),
                     ),
@@ -1446,6 +1465,7 @@ impl ConsortApp {
                             c.text_secondary,
                             c.hover_card,
                             t,
+                            cx,
                         )
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()));

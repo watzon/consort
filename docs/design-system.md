@@ -8,8 +8,10 @@ This page is the reference for how Consort looks, on the desktop and on mobile. 
 | [`design/themes/`](../design/themes/) | One file per theme with the color roles for a dark mode and a light mode. Spruce is the default |
 | [`design/theme.schema.json`](../design/theme.schema.json) | The schema that every theme file must match |
 | [`design/gpui-kit-mapping.json`](../design/gpui-kit-mapping.json) | How the color roles become GPUI Kit theme keys |
-| [`design/logo/`](../design/logo/) | The brace mark and the app icons |
-| [`design/glyphs/`](../design/glyphs/) | Consort's own glyphs: the brace and the seven task statuses |
+| [`design/logo/`](../design/logo/) | The Three voices mark and the app icons |
+| [`design/mark/`](../design/mark/) | The generator of the Three voices frames (`assets/mark/`) |
+| [`design/icons/`](../design/icons/) | The hand-drawn icon set and its generator (`assets/icons/`) |
+| [`design/glyphs/`](../design/glyphs/) | Consort's own glyphs: the task-line connector and the task statuses that the icon set does not have |
 
 Why themes can change only color: [ADR 0009](adr/0009-themes-change-color-only.md).
 
@@ -18,9 +20,9 @@ Why themes can change only color: [ADR 0009](adr/0009-themes-change-color-only.m
 1. **One voice.** One type family, one icon set and one corner system everywhere. A harness, a model or a machine never gets its own style.
 2. **Color means state.** Surfaces stay neutral. Color appears only where something has a status. Code blocks are the one exception, and their colors stay muted.
 3. **The accent means your turn.** The accent marks you: your messages, the approvals and decisions that wait for you, and the buttons that answer them.
-4. **Notation signs mark Consort's own ideas.** The brace joins the parts of a score. It is the logo and the icon for Everything. The fermata means "hold until the leader gives the cue". It marks a task that needs your input. All other icons come from Lucide.
+4. **Notation signs mark Consort's own ideas.** The Three voices mark is three dabs of pigment for the voices of a broken consort. It is the logo, the icon for Tutti, and the sign of what the assistant does. The fermata means "hold until the leader gives the cue". It marks a task that needs your input. Every icon comes from Consort's own hand-drawn set.
 5. **Depth comes from surfaces, not shadows.** Five surface steps and two border colors. Only floating layers cast a shadow.
-6. **Calm by default.** Motion answers your actions or shows work in progress. Nothing moves for decoration.
+6. **Calm by default.** Motion answers your actions or shows work in progress. Nothing moves for decoration, and Reduce motion stops it.
 
 ## Themes
 
@@ -125,24 +127,24 @@ Each status has one glyph and one color, everywhere: the sidebar, task cards, th
 
 | Status | Glyph | Color role |
 |---|---|---|
-| Up next | `status-up-next.svg` (dashed ring) | `text.tertiary` |
-| Scheduled | `status-scheduled.svg` (clock) | `status.scheduled` |
-| Working | `status-working-track.svg` and `status-working-arc.svg` (a turning arc on a ring) | Arc in `status.working`, ring in `border.strong` |
-| Needs input | `status-needs-input.svg` (fermata) | `accent.text` |
-| Ready for review | `status-review.svg` (ring with check) | `accent.text` |
-| Failed | `status-failed.svg` (ring with cross) | `status.failed` |
-| Resolved | `status-resolved.svg` (solid disc with check) | `status.done` |
+| Up next | glyph `status-up-next.svg` (dashed ring) | `text.tertiary` |
+| Scheduled | icon `clock` | `status.scheduled` |
+| Working | icon `working` (an arc on a faint ring), shimmers while live | `status.working` |
+| Needs input | icon `needs-input` (fermata), shimmers while live | `accent.text` |
+| Ready for review | icon `done` (ring with check) | `accent.text` |
+| Failed | icon `failed` (ring with cross) | `status.failed` |
+| Resolved | glyph `status-resolved.svg` (solid disc with check) | `status.done` |
 
 Needs input and Ready for review both use the accent, because both are your turn. The fermata is filled, and the review ring is open, so the two stay apart without a second color.
 
-GPUI tints an SVG with one color, so the Working glyph is two layers: the ring and the arc. Only the arc turns.
+Up next and Resolved keep Consort's own glyphs, because the icon set has nothing like them. A live status (Working or Needs input) shimmers through the three versions of its icon at 8 frames a second. It stands still under Reduce motion.
 
 A worker that is online shows a solid dot in `status.done`. A worker that is offline shows an open ring in `text.tertiary`.
 
 ### Where status and requests appear
 
 - A sidebar row shows the status glyph of the most urgent task in that channel, in this order: Needs input, Ready for review, Failed, Working. A channel with something for you has its name in `text.primary`. Other channel names use `text.secondary`.
-- A task card in a timeline shows a pending approval inline, with its buttons, because the harness cannot continue until you answer. A decision does not block the harness, so it appears in the task thread and in the Tasks panel, not inline.
+- A task card in a timeline sits under its task line (see [The chat](#the-chat)). It shows a pending approval inline, with its buttons, because the harness cannot continue until you answer. A decision does not block the harness, so it appears in the task thread and in the Tasks panel, not inline.
 - When a task thread is open in the side panel, its task card in the timeline has an `accent.text` border.
 - In a decision card, the recommended option has an `accent.text` border on `surface.raised` and the word "Recommended". The other options have `border.strong` borders. Every option shows its consequence under its label. Only the option's Choose button answers the decision. The option text stays selectable and is not a click target, so selecting text cannot send an answer.
 - Every control that a mouse can use also takes keyboard focus. A focused control shows the focus ring: a `component.focus_ring` line in `accent.text`, drawn outside the control so the layout does not move. Enter or Space activates a focused control, and Enter in a form field submits the open form, except in dialogs that delete something or open a link.
@@ -189,15 +191,12 @@ Fixed layout sizes:
 | Sidebar width | 248 |
 | Side panel width (Tasks, task thread) | 400 |
 | Timeline content width | At most 720 |
-| Speaker gutter in the timeline | 64 |
+| Bubble and card width in the timeline (`layout.bubble_max_width`) | At most 560 |
+| Top fade, under the mark (`layout.fade_top`) | 96 |
+| Bottom fade, above the composer (`layout.fade_bottom`) | 32 |
 | Smallest window | 960 by 600 |
 
-Message layout depends on the width of its container:
-
-- **600 px or wider (the main timeline).** The speaker name and the time sit in the 64 px gutter on the left. The message, card or bubble starts 16 px to the right of the gutter. Day labels align with the message column.
-- **Narrower than 600 px (side panels and phones).** The speaker name and the time sit on one line above the message.
-- In both layouts, the assistant's text has no bubble. Your own messages sit on `accent.surface` with `lg` corners.
-- The timeline sticks to the bottom, next to the composer. Older messages scroll up.
+The timeline is a chat of bubbles. See [The chat](#the-chat). It sticks to the bottom, next to the composer. Older messages scroll up.
 
 On a phone:
 
@@ -207,6 +206,39 @@ On a phone:
 - Lists have no selected row.
 
 Settings use a fixed layout: the settings sidebar, then a label column of 160 px and the controls to its right. Dialogs are 520 to 560 px wide with `xl` corners and `shadow.float`, over a black scrim at 55 percent in dark mode. The Add account dialog is 600 px wide (`layout.dialog_account`), because its provider grid has two cards in a row.
+
+## The chat
+
+The main column has no header. The timeline fills it, the composer sits under it, and the Three voices mark and the top actions float over its top fade. The values come from the Paper artboard "Tutti, bubbles, dark".
+
+- **Lanes.** The assistant's messages are bubbles at the left on `surface.card`. Your messages are bubbles at the right on `accent.surface`. A bubble is at most `layout.bubble_max_width` (560 px) wide and has `chat.bubble_radius` (16 px) corners, with `chat.bubble_pad_y` by `chat.bubble_pad_x` padding. Message text uses Body.
+- **Groups.** Bubbles that follow each other in one lane form a group, `xs` (4 px) apart. Groups are `lg` (16 px) apart. The last bubble of a group has a `chat.bubble_tail` (4 px) corner on the speaker's side: bottom left for the assistant, bottom right for you. A time separator, a card or a notice ends a group.
+- **Paragraphs.** A message from the assistant becomes one bubble for each paragraph (`consort_client::chat::split_paragraphs`). A paragraph or a heading starts a bubble, except right after a heading. A list, a code block, a table, a quote or a rule stays whole in the bubble before it. Your own message stays one bubble.
+- **A brief** (a message with a title and task references) has a title bubble in semibold, then its text. The task references are a numbered list in the last bubble: a chip with the status and the task name that opens the thread, the channel in `text.tertiary`, and the line about the task.
+- **Time separators** are centered, in Label size and `text.tertiary`. The first item of a day gets the day and the time ("Today 8:00 AM", "October 12, 9:00 AM"). A later item gets the time alone ("9:12 AM") when it comes 30 minutes or more after the item before it (`chat::SEPARATOR_GAP_MS`). There is no time on each message. A message on its way says "Sending" under its last bubble, and an edited message says "Edited".
+- **Cards.** Task cards, approval cards and decision cards sit in the assistant lane at bubble width, with `chat.bubble_radius` corners and a `chat.bubble_tail` corner at the top left. Above each one is a task line: a curved connector (`glyphs/task-connector.svg`, `chat.task_connector`, `border.strong`), the status icon, the task name in UI strong, and its state in the status color ("Needs you" for Needs input). A task card in another channel adds "in <channel>" in `text.tertiary`. A card has no header row of its own: its first row is what asks or the newest update, with the approval mode and the worker pill at the right. A resolved task with nothing pending is the task line alone, with its summary. An approval or a decision of the channel's assistant has the task line "Approval" or "Decision", with "Needs you", "Answered" or "Closed".
+- **Notices** are a centered line in UI size and `text.tertiary`, with their time.
+- **The Three voices mark** sits at the top center, `chat.mark` (56 px), `chat.mark_top` from the top. Under it, an activity pill (`surface.card`, `border.subtle`, `full` corners, `chat.pill_pad_y` by `chat.pill_pad_x`, Label size in `text.secondary`) says what the assistant does, only while it works. See [Logo](#logo).
+- **Top actions** sit at the top right, `md` from the edges, `xs` apart: Connectors (for a channel that has connections or skills, with their count), Tasks and New task. Each is `chat.top_action` (32 px) square with a `chat.top_action_icon` (18 px) icon in `text.secondary`. Tasks opens the Tasks panel, has `surface.selected` while the panel is open, and has a `component.state_dot` dot in `accent.fill` while something needs you.
+- **Fades.** The top fade is `layout.fade_top` (96 px) high, from `surface.canvas` at 35 percent to clear, so messages pass under the mark. The bottom fade is `layout.fade_bottom` (32 px) and shows only while the reader is scrolled up.
+- **Composer.** One field on `surface.card` with a `border.strong` line and `chat.composer_radius` (16 px) corners, as wide as the timeline. The send key (`send` icon, `chat.send_button`, `text.tertiary`) sits inside it at the right. Under the field, outside it: add and voice (`component.composer_chip` square), a `border.strong` divider, "Same as Tutti" for a channel with no model of its own, the model chip and the effort chip, a spacer, and "Runs on <worker>" in Label size and `text.tertiary`. The placeholder is "Message <channel>", and "Message Tutti" in the main channel.
+
+### Chat sizes
+
+These sizes are in `component.chat` of `structure.json`, except the three in `layout`.
+
+| Token | Size (px) | Use |
+|---|---|---|
+| `layout.bubble_max_width` | 560 | The widest bubble or card in the timeline |
+| `layout.fade_top`, `layout.fade_bottom` | 96, 32 | The top and bottom fades of the timeline |
+| `bubble_radius`, `bubble_tail` | 16, 4 | Bubble and card corners, and the small corner |
+| `bubble_pad_x`, `bubble_pad_y` | 14, 10 | The padding of a bubble |
+| `composer_radius`, `send_button` | 16, 32 | The composer field and its send key |
+| `top_action`, `top_action_icon` | 32, 18 | A top action and its icon |
+| `task_connector` | 14 | The curved connector of a task line |
+| `mark`, `mark_small`, `mark_top` | 56, 16, 4 | The mark over the timeline, in the sidebar, and its top space |
+| `pill_pad_x`, `pill_pad_y` | 10, 3 | The padding of the activity pill |
+| `brief_number` | 16 | The number column of a brief's list |
 
 Settings > Workers uses these sizes from `component` in `structure.json`:
 
@@ -256,20 +288,20 @@ A service logo is the image that Composio gives. The client loads it (`https` on
 Every provider shows with its logo, never as text alone. The logos are in `crates/consort-desktop/assets/providers/` (see the NOTICE there).
 
 - Claude Code and Gemini CLI keep their own colors.
-- Codex, OpenCode and the ACP registry icons draw in the color of the text next to them, like an icon. Registry icons are SVGs that draw in `currentColor`. The client loads them from the registry (`https` only, at most 64 KiB, SVG only), and the app draws them like a Lucide icon.
-- A provider with no logo, such as a custom command, or a registry icon that did not load, gets the Lucide `bot` glyph.
+- Codex, OpenCode and the ACP registry icons draw in the color of the text next to them, like an icon. Registry icons are SVGs that draw in `currentColor`. The client loads them from the registry (`https` only, at most 64 KiB, SVG only), and the app draws them like an icon.
+- A provider with no logo, such as a custom command, or a registry icon that did not load, gets the `bot` glyph. It is the one Lucide drawing left, because it stands for a provider logo.
 - A provider that is not signed in or not installed shows its logo at 60 percent opacity, with its name in `text.secondary`.
 
 ## Model picker
 
 One component chooses a model everywhere: the composer, the New channel dialog, and Model in the channel menu.
 
-- **Trigger.** The provider logo, the model name in medium weight, and the account name in `text.tertiary`, then a chevron. In the composer it is a chip, `component.composer_chip` (28 px) high, with `md` corners and no ground until hover. While its popover is open, the chip has `surface.selected`. In a dialog it is a select field, as wide as its column. A dialog field with no model of its own says "Same as Everything", with Everything's model in `text.tertiary`. A channel that uses Everything's model shows "Same as Everything" before the chip in the composer.
+- **Trigger.** The provider logo, the model name in medium weight, and the account name in `text.tertiary`, then a chevron. In the composer it is a chip, `component.composer_chip` (28 px) high, with `md` corners and no ground until hover. While its popover is open, the chip has `surface.selected`. In a dialog it is a select field, as wide as its column. A dialog field with no model of its own says "Same as Tutti", with Tutti's model in `text.tertiary`. A channel that uses Tutti's model shows "Same as Tutti" before the chip in the composer.
 - **Popover.** `component.model_picker` (440 px) wide and `component.model_picker_height` (420 px) high, `surface.raised`, `lg` corners, `border.strong`, `shadow.float`. A rail is at the left, and the main pane fills the rest.
 - **Rail.** `component.picker_rail` (48 px) wide, on `surface.card`, with a `border.subtle` line on its right. From the top: Favorites (a filled star in `accent.text`), a `border.strong` divider, then one button per signed-in account name, in the order of the inventory, with its provider logo at `component.provider_logo`. Each button is `component.picker_rail_button` (36 px) square with `md` corners. The selected button has `surface.selected` and an `accent.text` bar of `component.picker_rail_marker` by `component.picker_rail_marker_height` on the rail's right edge. The pointer on a button shows a tooltip with the account name and its workers (or Favorites and "From every account"). The rail scrolls when it has more accounts than room.
 - **Badges.** When two or more accounts have the same provider, each of their buttons has a badge at its bottom right: a pill of `component.picker_rail_badge` on `surface.raised` with a `border.strong` line, in semibold text of `component.picker_rail_badge_text`. The text is `text.primary` on the selected button and `text.secondary` on the others. The label comes from the account names (`picker::badge_labels`): keep the words that no other account of that provider has, after a number joins the word before it. Take the first letter of each kept word in upper case, plus the digits at the end of the word, and cut it to 3 characters. So "Claude Code Personal 1" and "Claude Code Personal 2" give P1 and P2, and "Claude Work" next to them gives W. An account with no word of its own, or two accounts with the same label, get their position (1, 2).
 - **Search.** At the top of the main pane: a search icon and the field "Search every account". Typing filters by model name, model ID, account name and provider name, hides the rail, and shows the matches from every account as rows of the Favorites kind. Escape clears the search first, and the rail comes back. A second Escape closes only the popover.
-- **Header line.** Under the search field, outside the list, so it stays there while the list scrolls (this is the sticky header of a long account). It has a title in UI size and semibold, and a detail in caption style and `text.tertiary`: the account name and its workers, "Favorites" and "From every account", or "Search results" and "From every account". A channel with its own model has the text button Use the Everything model at the right end of the line, in every view.
+- **Header line.** Under the search field, outside the list, so it stays there while the list scrolls (this is the sticky header of a long account). It has a title in UI size and semibold, and a detail in caption style and `text.tertiary`: the account name and its workers, "Favorites" and "From every account", or "Search results" and "From every account". A channel with its own model has the text button Use the Tutti model at the right end of the line, in every view.
 - **Account rows.** The model name, the effort range in caption style (such as "Low to Max effort"), a star and a check. The selected row has `surface.selected`, the name in medium weight, and an `accent.text` check.
 - **Favorites and search rows.** The provider logo at 14 px, the model name, then the account name in caption style and `text.tertiary`, then the star and the check. The Favorites list ends with the note "Star a model in any account to add it here.", which is also its empty state.
 - **Stars.** A favorite has a filled star in `accent.text`. Another row shows an outline star in `text.secondary` only while the pointer or the keyboard is on the row. A click on the star adds or removes the favorite. It does not choose the model or close the popover.
@@ -277,7 +309,7 @@ One component chooses a model everywhere: the composer, the New channel dialog, 
 - **Keyboard.** Up and Down move in the list. Left (with an empty search) moves to the rail, where Up and Down change the view and the selected button shows the focus ring. Right, Enter or typing go back to the list. Enter in the list chooses.
 - **Scroll.** The list scrolls inside the popover. It fades into `surface.raised` at the top and the bottom while more rows are there.
 - **No account.** "No account is signed in. Add one in Settings > Workers." with the button Open Settings. The popover then has no rail, and it is as high as its content.
-- **Effort.** A second chip next to the model chip: the Lucide `signal` icon and the level. Its menu is `component.effort_menu` (240 px) wide, with the title "Effort for <model>", one row per level, "Default" after the provider's default level, and the note "<Provider> offers these levels for this model. More effort thinks longer and uses more of your plan." When the provider does not name its default, the first row is Default, which takes the effort out. The chip is not there for a model with no effort levels. In a dialog, the effort is a select of `component.effort_select` (150 px) next to the model field. A new model keeps the effort when it offers that level. Otherwise the effort goes back to the new model's default.
+- **Effort.** A second chip next to the model chip: the `effort` icon and the level. Its menu is `component.effort_menu` (240 px) wide, with the title "Effort for <model>", one row per level, "Default" after the provider's default level, and the note "<Provider> offers these levels for this model. More effort thinks longer and uses more of your plan." When the provider does not name its default, the first row is Default, which takes the effort out. The chip is not there for a model with no effort levels. In a dialog, the effort is a select of `component.effort_select` (150 px) next to the model field. A new model keeps the effort when it offers that level. Otherwise the effort goes back to the new model's default.
 - **Task threads** show the task's model under the reply box as text, such as "Runs with Opus 5.5, Claude Personal, High effort". A task keeps the model it started with.
 
 ## Worker tags
@@ -292,7 +324,7 @@ One component chooses a model everywhere: the composer, the New channel dialog, 
 |---|---|---|
 | `sm` | 4 | Badges, inline code and keyboard keys |
 | `md` | 6 | Buttons, inputs, sidebar rows and list rows |
-| `lg` | 10 | Cards, your messages, menus and popovers |
+| `lg` | 10 | Cards outside the chat, menus and popovers |
 | `xl` | 14 | Panels, dialogs and the app icon at 64 px |
 | `full` | 9999 | Avatars, status dots and pills |
 
@@ -314,25 +346,33 @@ When one rounded box sits inside another, the inner radius is the outer radius m
 
 Elements that enter use the curve `cubic-bezier(0.2, 0, 0, 1)`. Elements that leave use `cubic-bezier(0.4, 0, 1, 1)`. These durations match GPUI Kit's motion tokens, so kit components and Consort components move the same way.
 
-The Working arc is the only motion that runs by itself. It turns once every 1.2 seconds. If the system setting to reduce motion is on, nothing moves: elements fade in 120 ms, and the Working arc stands still.
+Stop motion runs at 8 frames a second (`motion.frame_ms`, 125 ms) on one shared clock. Three things use it:
+
+- The Three voices mark while it works or needs you.
+- A live status icon (Working or Needs input): it shows its three hand-drawn versions in turn.
+- An icon button under the pointer: it shows its three versions in turn, only while the pointer is on it.
+
+The clock runs only while a draw showed one of these and the window is active. An idle screen draws nothing on a timer.
+
+**Reduce motion** is a switch in Settings > Appearance. It starts from the user's choice (saved in `appearance.json`). Until the user sets it, it starts from the system setting where the app can read it (on macOS, `defaults read com.apple.universalaccess reduceMotion`), else off. With it on, the mark changes pose only when its state changes, nothing shimmers, and elements fade in 120 ms.
 
 ## Icons and glyphs
 
-- Icons come from Lucide, as in GPUI Kit. They are 16 px with a 1.5 px stroke. Dense lists use 14 px, and toolbars use 20 px. We export the Lucide SVGs with a 1.5 px stroke, because GPUI draws an SVG as it is.
-- Consort's own glyphs in `design/glyphs/` use the same 16 px grid and the same stroke.
-- An icon takes the color of the text next to it, except a status glyph, which takes its status color.
+- Icons come from Consort's own hand-drawn set in `design/icons/` (84 icons on a 24 px grid, drawn with a 1.9 px stroke, in `currentColor`). They show at 16 px. Dense lists use 14 px, and toolbars use 18 or 20 px.
+- Each icon has three hand-drawn versions: `assets/icons/<name>.svg`, `assets/icons/v1/<name>.svg` and `assets/icons/v2/<name>.svg`. `node design/icons/build.mjs <node_modules>` makes them.
+- The hub keeps a channel's icon as a Lucide name, such as `hash` or `mic`. The app shows the nearest icon of the set (`ui::icons::resolve`).
+- Consort's own glyphs in `design/glyphs/` are the task-line connector and the Up next and Resolved statuses.
+- An icon takes the color of the text next to it, except a status icon, which takes its status color.
 
 ## Logo
 
-The mark is a brace that joins three parts. In a score, a brace joins the staves that play together. To a developer, a brace opens a block. Both readings fit: one assistant that joins many parts.
+The logo is the Three voices mark: three dabs of pigment, one for each voice of a broken consort. Gold is the accent, then verdigris and lapis. Where they overlap, the paint mixes lighter (screen) on a dark ground and darker (multiply) on a light ground, like a chord.
 
-- **Mark** (`design/logo/mark.svg`). A filled brace, thick in the stems and thin at the ends and at the point, drawn on a 64 px grid. Use it at 24 px and larger.
-- **Small sizes.** Under 24 px (the sidebar, the favicon and the macOS menu bar), use the line glyph `design/glyphs/brace.svg`.
-- **App icon** (`design/logo/app-icon-dark.svg`, `design/logo/app-icon-light.svg`). The mark at 60 percent size on `surface.card`, in `accent.fill` for dark and `accent.text` for light.
-- **Color.** One color only: `accent.fill` on dark surfaces, `accent.text` on light surfaces, or plain black or white. The macOS menu bar uses the black glyph as a template image.
-- **Wordmark.** "consort" in lowercase, Atkinson Hyperlegible Next 600, tracking -0.02 em, to the right of the mark. The mark is 1.2 times the font size high, with a gap of 0.35 times the font size.
-- **Clear space.** Keep space equal to three bar thicknesses (13.5 px at 64 px) around the mark.
-- **Do not** add gradients, outlines or shadows, rotate the mark, change its proportions, or put it on a status color.
+- **Frames.** GPUI cannot run an SVG noise filter at every frame, so `design/mark/generate.mjs` renders every frame ahead of time into `assets/mark/`: idle (1 frame), working (12 poses, each with its hand-drawn edge), needs you (24 frames), and done (1 frame). Each set is in dark pigments (`dark/`) and light pigments (`light/`). GPUI's image renderer (resvg) draws the paint filter and the blends.
+- **Small sizes.** At 16 to 20 px, use the sharp frames (`dark-sharp/`, `light-sharp/`), which have no paint edges.
+- **States.** Idle holds still. Working: the voices circle each other. Needs you: gold comes forward and beats twice a second. Done: the voices close into a chord for `motion.done_hold_ms` (1.5 s) after work ends, then the mark goes back to idle or to needs you.
+- **Where.** The mark is the logo on onboarding and on the start-up error, the Tutti row in the sidebar and in the switcher (idle, sharp, 16 px), and the title bar on Windows and Linux. The app icons in `design/logo/` are the idle mark on `surface.card`.
+- **Wordmark.** "consort" in lowercase, Atkinson Hyperlegible Next 600, to the right of the mark. The mark is about 1.2 times the font size high.
 
 ## Text in the UI
 
