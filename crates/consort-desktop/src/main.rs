@@ -42,6 +42,9 @@ mod proactivity;
 mod proactivity_tests;
 mod read_marker;
 mod ui;
+mod voice;
+#[cfg(test)]
+mod voice_tests;
 mod waiting;
 
 use consort_client::Client;
@@ -167,6 +170,14 @@ fn main() {
             .and_then(consort_client::mock_proactivity::screen_state)
     {
         // The phase 4b screens: the assistant on its own.
+        Client::mock_with(state)
+    } else if mock
+        && let Some(state) = args
+            .screen
+            .as_deref()
+            .and_then(consort_client::mock_voice::screen_state)
+    {
+        // The phase 4c screens: write in my voice.
         Client::mock_with(state)
     } else if mock {
         Client::mock()

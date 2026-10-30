@@ -174,6 +174,8 @@ pub struct Cache {
     pub convo: crate::convo::ConvoCache,
     /// The proactivity settings and log. See [`crate::proactivity`].
     pub proactivity: crate::proactivity::ProactivityCache,
+    /// The voice settings and the "Try it" sample. See [`crate::voice`].
+    pub voice: crate::voice::VoiceCache,
 }
 
 /// A memory note in the cache. A list gives only the summary, so the text
@@ -578,6 +580,13 @@ impl Cache {
         ) {
             snapshot.proactivity = None;
         }
+        if self.changed_after(
+            EntityKind::VoiceSettings,
+            consort_proto::model::VOICE_ENTITY_ID,
+            at,
+        ) {
+            snapshot.voice = None;
+        }
     }
 
     /// Remembers that the feed entry at `seq` changed the entity.
@@ -667,6 +676,9 @@ impl Cache {
         }
         if let Some(settings) = snapshot.proactivity {
             self.proactivity.settings = Some(settings);
+        }
+        if let Some(settings) = snapshot.voice {
+            self.voice.apply_settings(settings);
         }
         for c in snapshot.connections {
             self.connections.insert(c.id.to_string(), c);
@@ -986,6 +998,9 @@ impl Cache {
                     return self.proactivity.apply_settings(settings);
                 }
                 EntityPayload::ProactiveWake(wake) => return self.proactivity.apply_wake(wake),
+                EntityPayload::VoiceSettings(settings) => {
+                    return self.voice.apply_settings(settings);
+                }
                 EntityPayload::Skill(skill) => {
                     self.skills.insert(skill.id.to_string(), skill);
                 }
@@ -1040,7 +1055,12 @@ impl Cache {
                     } else {
                         &self.memory_loaded
                     };
-                    if !list.contains(&scope) && !self.memory_notes.contains_key(&note.entity_id())
+                    // The style guide is always kept: Settings > Voice shows it.
+                    let voice_note = note.scope == consort_proto::model::MemoryScope::Global
+                        && note.path == consort_proto::model::VOICE_NOTE_PATH;
+                    if !list.contains(&scope)
+                        && !self.memory_notes.contains_key(&note.entity_id())
+                        && !voice_note
                     {
                         return false;
                     }

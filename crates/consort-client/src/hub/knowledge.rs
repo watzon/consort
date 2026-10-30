@@ -41,7 +41,7 @@ fn action(form: &RoutineForm, placement: PlacementRequest) -> RoutineAction {
 }
 
 impl Shared {
-    fn seq(&self) -> u64 {
+    pub(super) fn seq(&self) -> u64 {
         self.cache.lock().map(|c| c.seq).unwrap_or(0)
     }
 

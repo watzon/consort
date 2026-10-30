@@ -293,6 +293,7 @@ async fn an_answer_for_a_closed_request_cancels_the_approval_and_keeps_the_task(
         .request(ApprovalAnswer {
             approval_id: approval.id,
             option_id: "allow".to_owned(),
+            checked: false,
         })
         .await
         .unwrap();

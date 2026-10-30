@@ -21,6 +21,7 @@ mod session;
 mod skill;
 mod tag;
 mod tool;
+mod voice;
 mod waiting;
 mod work;
 
@@ -93,6 +94,16 @@ pub use skill::{
 };
 pub use tag::{InvalidTag, TAG_MAX_CHARS, is_valid_tag, normalize_tags, validate_tag};
 pub use tool::{ToolId, ToolState, ToolStatus};
+pub use voice::{
+    CORE_CONTEXT, CommitmentFlag, DISCLOSURE_LINE, DRAFT_PAIR_KEEP_DAYS, Disclosure, DraftPair,
+    EDITABLE_ARGUMENTS, FlagKind, NEUTRAL_STYLE_LINE, OutgoingKind, USER_RULE_MARK,
+    VOICE_CONTEXT_MIN_MESSAGES, VOICE_CONTEXTS, VOICE_EDITS_AGREE_MIN, VOICE_EDITS_WAKE_PAIRS,
+    VOICE_ENTITY_ID, VOICE_EXAMPLE_MAX_CHARS, VOICE_EXAMPLES_MAX, VOICE_MAIL_DAYS, VOICE_MAIL_MAX,
+    VOICE_NOTE_MAX_BYTES, VOICE_NOTE_PATH, VOICE_PROPOSAL_QUESTION, VOICE_RULE_MAX_CHARS,
+    VOICE_RULES_MAX, VOICE_TASK_TITLE, VoiceContextSection, VoiceGuide, VoiceRule, VoiceSample,
+    VoiceSampleState, VoiceSettings, VoiceSource, VoiceSourceKind, VoiceUse, context_description,
+    context_label, mark_user_rules, outgoing_kind, placeholders,
+};
 pub use waiting::{
     Approval, ApprovalDetails, ApprovalKind, ApprovalStatus, ConnectServiceCard, ConnectorCard,
     DECISION_CONSEQUENCE_MAX_CHARS, DECISION_LABEL_MAX_CHARS, DECISION_MAX_OPTIONS,

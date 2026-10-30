@@ -49,6 +49,7 @@ const SECTIONS: [(&str, &[SectionEntry]); 3] = [
             (SettingsSection::Connectors, "Connectors", "link"),
             (SettingsSection::Skills, "Skills", "box"),
             (SettingsSection::Memory, "Memory", "book-open"),
+            (SettingsSection::Voice, "Voice", "quote"),
             (SettingsSection::Routines, "Routines", "routine"),
             (SettingsSection::Proactivity, "Proactivity", "eye"),
         ],
@@ -243,6 +244,7 @@ impl ConsortApp {
             SettingsSection::Routines => self.render_routines_settings(t, window, cx),
             SettingsSection::Memory => self.render_memory_settings(t, window, cx),
             SettingsSection::Proactivity => self.render_proactivity(t, window, cx),
+            SettingsSection::Voice => self.render_voice(t, window, cx),
         };
         div()
             .flex()

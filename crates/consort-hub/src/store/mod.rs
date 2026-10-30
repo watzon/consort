@@ -46,6 +46,7 @@ pub mod proactivity;
 pub mod routines;
 pub mod sign_ins;
 pub mod skills;
+pub mod voice;
 pub mod work;
 
 const READER_POOL_SIZE: usize = 8;

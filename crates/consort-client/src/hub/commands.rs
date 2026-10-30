@@ -619,6 +619,7 @@ async fn run(shared: Arc<Shared>, command: Command) -> Result<CommandOutput, Cli
         Command::AnswerApproval {
             approval_id,
             choice,
+            checked,
         } => {
             // An approval is answered by its ID alone, so one from the
             // channel coordinator (with no task) works the same way.
@@ -633,6 +634,7 @@ async fn run(shared: Arc<Shared>, command: Command) -> Result<CommandOutput, Cli
                 .call(consort_proto::client_api::ApprovalAnswer {
                     approval_id: parse(&approval_id, "approval")?,
                     option_id,
+                    checked,
                 })
                 .await;
             if let Err(err) = answered {
@@ -889,6 +891,17 @@ async fn run(shared: Arc<Shared>, command: Command) -> Result<CommandOutput, Cli
         | Command::SetChannelProactivity { .. }
         | Command::RateMessage { .. }) => {
             return super::proactivity::run(&shared, command).await;
+        }
+        // Settings > Voice and the draft card.
+        command @ (Command::LoadVoice
+        | Command::SetVoice(_)
+        | Command::LearnVoice
+        | Command::ResetVoice
+        | Command::TryVoice { .. }
+        | Command::EditVoiceGuide(_)
+        | Command::VoiceFeedback { .. }
+        | Command::EditApproval { .. }) => {
+            return super::voice::run(&shared, command).await;
         }
         // Routines and memory.
         command @ (Command::SaveRoutine { .. }

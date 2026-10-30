@@ -30,6 +30,7 @@ use crate::time::Timestamp;
 mod connectors;
 mod management;
 mod proactivity;
+mod voice;
 
 pub use connectors::{
     CONNECTOR_APPROVAL_WAIT_MS, CONNECTOR_RESULT_MAX_BYTES, CONNECTOR_TOOLS_LIST_MAX,
@@ -50,6 +51,7 @@ pub use proactivity::{
     CancelFollowUpArgs, FollowUpLaterArgs, FollowUpResult, NoReplyNeededArgs, SetProactivityArgs,
     SetProactivityResult,
 };
+pub use voice::{VoiceGuideArgs, VoiceGuideResult, VoiceSampleArgs};
 
 /// The kind of session that a tool is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -717,6 +719,10 @@ hub_tools! {
     /// `run_connector_tool`.
     RunConnectorTool("run_connector_tool", RunConnectorToolArgs, EVERY_SESSION,
         "Run one connector tool with its arguments. When the connection's rule asks the user, the user sees a card with the arguments and allows or denies the call. The result has a status: ran, waiting_for_user or denied. When the connector needs a new sign-in, ask the user to reconnect it in Settings > Connectors."),
+    /// `voice_guide`. The hub lists it only while "Write in my voice" is
+    /// on.
+    VoiceGuide("voice_guide", VoiceGuideArgs, EVERY_SESSION,
+        "Get the user's style guide for one context before you write a draft that goes out in the user's name: mail, a chat message or a post. Use it for wording only. Never add a date, a time, a price, a promise or an agreement that the request does not contain. Never use it for your replies to the user, task briefs, code or commits."),
     /// `list_skills`. The hub lists it only for a harness that does not
     /// load skills itself.
     ListSkills("list_skills", NoArgs, EVERY_SESSION,
@@ -810,6 +816,9 @@ hub_tools! {
     SuggestMemory("suggest_memory", SuggestMemoryArgs, CHANNEL_COORDINATOR_AND_TASK,
         "Suggest a note for memory. A task sends it to the channel coordinator. A channel coordinator sends it to the Tutti coordinator as a global memory suggestion. The coordinator that gets it decides whether to keep it."),
     // The Tutti coordinator.
+    /// `voice_sample`.
+    VoiceSample("voice_sample", VoiceSampleArgs, TUTTI_ONLY,
+        "Return the sample draft for a voice_sample event. Nothing is sent and the hub does not save it. Post nothing else for this event."),
     /// `list_channels`.
     ListChannels("list_channels", NoArgs, TUTTI_ONLY,
         "List the channels with their purpose and task counts."),
@@ -1456,6 +1465,7 @@ mod tests {
             "run_connector_tool",
             "list_skills",
             "read_skill",
+            "voice_guide",
         ];
         let coordinator_extensions = [
             "list_connections",
@@ -1464,6 +1474,7 @@ mod tests {
             "add_skill",
         ];
         let tutti_only = [
+            "voice_sample",
             "list_channels",
             "read_channel",
             "message_channel",

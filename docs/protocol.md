@@ -423,6 +423,13 @@ Memory tools in the Tutti coordinator accept any `scope` for reads. Writes go to
 
 The Tutti coordinator also has the management tools in [Management tools](#management-tools).
 
+### Voice tools
+
+- `voice_guide { context? }`, for every session, listed only while "Write in my voice" is on: the Core rules and the section of one context (`email.formal`, `email.close`, `chat`, `post.public`) with its examples, then the hard rules. With no context, or a context with no rules, it gives the Core rules. The result has `enabled`; with the voice off it says to write in a neutral style. The hub records each call (`voice_uses`), so the draft card can say which voice wrote it.
+- `voice_sample { sample, draft, context? }`, for the Tutti coordinator: the answer to a `voice_sample` event. The hub keeps the sample only in memory.
+
+When the voice is on and a session's channel can reach a connector that drafts or sends (a mail, chat or social service, or a service whose cached tool list has a draft or send tool), the hub appends a section "The user's voice is on" to the session's system prompt: when to use the voice, the wording-only rule, the Core rules, the hard rules and the list of contexts. A coordinator's prompt fingerprint holds that section, so a change replaces an idle session.
+
 ### Tools for task sessions
 
 | Tool | Arguments | Result |
@@ -450,6 +457,14 @@ Every session can have these tools. The hub lists the connector tools only for a
 2. The tool kind picks the rule. "Ask every time" posts a connector approval card. "Ask once per task" posts one for the first call of that kind in the task (or in the coordinator session), and runs later calls of that kind without asking.
 3. The hub waits up to 4 minutes 45 seconds for the answer (`CONNECTOR_APPROVAL_WAIT_MS`, 5 minutes, less 15 seconds). A worker gives up on a hub request after 5 minutes, so the answer `waiting_for_user` must reach it first. Allow runs the call. Don't returns `denied`. When the time runs out, the call returns `waiting_for_user`. When the user allows the card later, the call runs then, and the result arrives as a `card_answered` event (a coordinator) or a message to the task.
 4. The hub runs the tool with the connection's Composio connected account, writes a connector call record (see [data-model.md](data-model.md#connector-call)), and returns the result. A `data` larger than 256 KiB is cut, with `truncated` set.
+
+A draft or send tool gets more on its card ([VOICE-PLAN.md](VOICE-PLAN.md)). Neither Composio nor MCP has a hint for "send", so the rule is in `consort_proto::model::outgoing_kind`: only a tool of the kind `change` (by the `readOnlyHint`, `createHint`, `updateHint` and `destructiveHint` tags) can draft or send; then the words of its slug decide: `DRAFT` makes a draft; `SEND`, `SENDS`, `REPLY`, `FORWARD`, `POST`, `PUBLISH`, `TWEET`, `COMMENT` or `COMPOSE` sends; `MESSAGE` with `CREATE`, `UPDATE` or `EDIT` sends. For such a tool:
+
+- The card has `outgoing` and `editable`: the text arguments (`subject`, `body`, `message_body`, `text`, `message`, `content`, `markdown_text`, `comment`) that `approval.edit` can change, with the voice on or off.
+- With the voice on and a saved style guide, the card has `voice` (the context of the session's last `voice_guide` call, or `core`), the hub adds the disclosure line "Drafted with Consort" to the main text when the setting asks for it (for "only new contacts": a recipient with no earlier draft pair), and it scans the text fields: dates, times, weekdays, money amounts and agreement phrases that the request does not contain become `flags`, and so does text that breaks a hard rule that a pattern can check (dates and times in a promise, prices, agreements to a meeting, emoji, exclamation marks, quoted phrases). The request is the task's title, brief and the user's messages in its thread, or the user messages of the coordinator's turn and the last 10 in its channel.
+- A call with flags always asks, also when the rule would run it. `approval.answer` that allows a card with flags needs `checked: true`; without it the hub answers `invalid`.
+- When the user allows a draft card, the hub stores a draft pair. After `approval.edit`, the call runs with the user's text.
+- In the voice task, the hub allows only read tools of the connections that the user chose (`policy_denied` otherwise), and replaces every result string that holds a text that the user sent unchanged with "[Left out: the assistant wrote this text.]".
 
 ### Management tools
 
@@ -560,6 +575,26 @@ In a proactive turn:
 
 A stale task is a task in Needs input for 24 hours or in Ready for review for 72 hours. It gets one `stale_task` event per status entry.
 
+### Write in my voice
+
+These events wake the Tutti coordinator about the voice ([ADR 0014](adr/0014-the-assistant-writes-in-the-users-voice-with-consent.md)). They are not proactive: they come from the user's own edits, feedback and requests.
+
+```xml
+<events>
+  <voice_edits context="email.formal" pairs="5">Edit 1:
+- removed: Hope you are well.
+...
+Changes in 3 or more edits:
+- removed "Hope you are well." in 4 of 5 edits</voice_edits>
+  <voice_feedback approval="apr_..." context="chat">yep, on it</voice_feedback>
+  <voice_sample sample="3">Reply to Dana, say yes</voice_sample>
+</events>
+```
+
+- `voice_edits` comes when 5 edited draft pairs of one context wait and "Your edits to drafts" is on. A rule change needs at least 3 edits that agree; the event lists them. In a turn with `voice_edits` or `voice_feedback`, `ask_decision` with `offer` works at every level, and the card's `proactive` mark has the kind `voice`.
+- `voice_feedback` comes once per card when the user says "Not how I write". The text is the draft.
+- `voice_sample` asks for a "Try it" sample. The coordinator answers with `voice_sample`. A turn whose events are all `voice_sample` posts no fallback message, and a sample that the turn did not write fails.
+
 ## Client API
 
 The client API uses the same frames, errors and authentication as the worker link.
@@ -665,6 +700,20 @@ A marketplace plugin can name its files with these source types: a relative path
 The hub checks the sources of installed skills once a day. A new commit sets `update` to `available` with the changed files. Only `skill.update` with `accept_new_version` moves the pin. A new version that adds or changes a script turns the skill off until the user turns it on again. Running sessions keep their version.
 
 `channel.set_connection_enabled` and `channel.set_skill_enabled` change one exception for each request, so two clients do not undo each other. Turning an item on removes the exception only. An item whose `use_in` does not give it to the channel fails with `conflict`.
+
+#### Write in my voice
+
+| Request | Body | Result |
+|---|---|---|
+| `voice.get` | `{}` | `{settings, sample?, proposal?}`: the settings, the newest "Try it" sample while the hub holds it in memory, and the style guide that waits for Do it |
+| `voice.set` | `{enabled?, sources?, learn_from_edits?, disclosure?}` | `{settings}`. Turning the voice on needs a source that can be read, and starts the voice task when no style guide exists. Turning it off keeps `voice.md` |
+| `voice.learn` | `{}` | `{settings}`: starts the voice task again ("Learn again") |
+| `voice.reset` | `{}` | `{settings}`: moves `voice.md` to Recently deleted (30 days; `memory.restore` brings it back) and turns the voice off |
+| `voice.try` | `{request}` | `{settings, sample}`: wakes the Tutti coordinator with `voice_sample`. Nothing is sent. The settings say `sample_state`; the text comes only with `voice.get` |
+| `voice.feedback` | `{approval_id}` | `{}`: "Not how I write" on a draft card. Wakes Tutti once with `voice_feedback` |
+| `approval.edit` | `{approval_id, fields: {key: text}}` | `{approval}`: new text for the `editable` fields of a pending draft card. The hub keeps the assistant's arguments in `draft_arguments` and scans the new text again |
+
+The voice task is a task in Tutti titled "Learn your writing voice", in Ask, with a fixed brief from the hub that lists only the chosen sources. Its `suggest_memory` does not reach the coordinator as a note: the hub screens the guide (only the `voice.md` format, placeholders for addresses, phone numbers and links, at most 6 KiB, the user's `(you)` rules kept), stores it, and posts the offer "Save this style guide?" in Tutti with Do it, Not now and Never about this. Do it writes `voice.md`; Never about this turns the voice off.
 
 ### Routine runs
 

@@ -161,6 +161,7 @@ const LOADED_THREADS: &str = "loaded_threads";
 const PREFERENCES: &str = "preferences";
 const PROACTIVITY_SETTINGS: &str = "proactivity_settings";
 const PROACTIVITY_LOG_HAS_MORE: &str = "proactivity_log_has_more";
+const VOICE_SETTINGS: &str = "voice_settings";
 
 /// A memory note with the flag that says whether its text is loaded.
 #[derive(Serialize, Deserialize)]
@@ -196,6 +197,8 @@ fn row<T: Serialize>(kind: &'static str, id: &str, value: &T) -> Result<Row, Per
 ///   paired clients): the app asks the hub for them when a page needs them.
 /// - `proactivity` (without the settings, the log entries and whether older
 ///   entries exist): the load state and the last error are screen state.
+/// - `voice` (without the settings): the "Try it" sample stays only in
+///   memory, and the guide that waits for Do it comes from the hub again.
 pub fn rows(cache: &Cache, fresh_at: i64, owner: &Owner) -> Result<Rows, PersistError> {
     let mut entities = Vec::new();
     for (id, v) in &cache.groups {
@@ -284,6 +287,7 @@ pub fn rows(cache: &Cache, fresh_at: i64, owner: &Owner) -> Result<Rows, Persist
     meta.insert(LOADED_THREADS, json(&cache.loaded_threads)?);
     meta.insert(PREFERENCES, json(&cache.preferences)?);
     meta.insert(PROACTIVITY_SETTINGS, json(&cache.proactivity.settings)?);
+    meta.insert(VOICE_SETTINGS, json(&cache.voice.settings)?);
     meta.insert(
         PROACTIVITY_LOG_HAS_MORE,
         json(&cache.proactivity.log_has_more)?,
@@ -421,6 +425,7 @@ fn restore(
         ..Cache::default()
     };
     cache.proactivity.settings = meta_value(meta, PROACTIVITY_SETTINGS)?;
+    cache.voice.settings = meta_value(meta, VOICE_SETTINGS)?;
     for (kind, id, text) in rows {
         restore_row(&mut cache, &kind, id, &text)?;
     }
@@ -1063,6 +1068,10 @@ mod tests {
             paired_by: None,
         };
         cache.admin.clients.insert(client.id.to_string(), client);
+        cache.voice.settings = Some(consort_proto::model::VoiceSettings {
+            enabled: true,
+            ..Default::default()
+        });
         cache.proactivity.settings = Some(consort_proto::model::ProactivitySettings {
             paused: true,
             time_zone: Some("America/Chicago".into()),
@@ -1137,6 +1146,7 @@ mod tests {
             admin,
             convo,
             proactivity,
+            voice,
         } = a;
         macro_rules! same {
             ($($field:ident),+ $(,)?) => {
@@ -1211,6 +1221,12 @@ mod tests {
                 )
             ),
             "the proactivity data differs"
+        );
+        // The voice settings are hub data. The sample and the proposal are
+        // not saved.
+        assert_eq!(
+            voice.settings, b.voice.settings,
+            "the voice settings differ"
         );
     }
 

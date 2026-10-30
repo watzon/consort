@@ -965,6 +965,8 @@ impl ConsortApp {
         let c = &t.colors;
         let p = t.component.proactivity;
         let chat = t.component.chat;
+        let guide_link = (decision.question == consort_client::voice::VOICE_PROPOSAL_QUESTION)
+            .then(|| self.render_open_guide_link(t, cx));
         let pending = matches!(
             decision.state,
             consort_client::RequestState::Pending | consort_client::RequestState::Sending
@@ -1033,6 +1035,8 @@ impl ConsortApp {
                         ))
                     }),
             )
+            // The offer of a learned style guide links to its full text.
+            .when_some(guide_link, |d, link| d.child(link))
             .child(
                 div()
                     .flex()

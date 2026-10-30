@@ -214,6 +214,7 @@ pub fn mark_icon(kind: ProactiveKind, offer: bool) -> &'static str {
         ProactiveKind::Research => "search",
         ProactiveKind::ChannelCreated => "channel",
         ProactiveKind::Feedback => "message",
+        ProactiveKind::Voice => "quote",
     }
 }
 

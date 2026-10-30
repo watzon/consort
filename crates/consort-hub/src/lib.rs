@@ -35,6 +35,7 @@ mod skills;
 pub mod store;
 mod tools;
 mod util;
+mod voice;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};

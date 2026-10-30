@@ -64,12 +64,18 @@ impl Hub {
         let ctx = self.tool_ctx(session_id).await?;
         let has_connections = self.channel_has_connections(&ctx).await?;
         let native_skills = crate::skills::harness_loads_skills(&ctx.session.harness);
+        // `voice_guide` is listed only while the voice is on.
+        let voice_on = self
+            .store
+            .read(|conn| Ok(crate::store::voice::settings(conn)?.enabled))
+            .await?;
         Ok(tools_for(ctx.audience)
             .into_iter()
             .filter(|t| {
                 HubTool::from_name(&t.name).is_none_or(|tool| {
                     (has_connections || !CONNECTOR_TOOLS.contains(&tool))
                         && (!native_skills || !SKILL_TOOLS.contains(&tool))
+                        && (voice_on || tool != HubTool::VoiceGuide)
                 })
             })
             .collect())
@@ -151,6 +157,8 @@ impl Hub {
             C::RunConnectorTool(a) => self.tool_run_connector_tool(ctx, a).await,
             C::ListSkills(_) => self.tool_list_skills(ctx).await,
             C::ReadSkill(a) => self.tool_read_skill(ctx, a).await,
+            C::VoiceGuide(a) => self.tool_voice_guide(ctx, a).await,
+            C::VoiceSample(a) => self.tool_voice_sample(ctx, a).await,
             C::SearchSkills(a) => self.tool_search_skills(a).await,
             C::AddSkill(a) => self.tool_add_skill(ctx, a).await,
             other => self.tool_management(ctx, other).await,

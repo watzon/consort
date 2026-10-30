@@ -45,5 +45,6 @@ pub mod startup_error;
 pub mod switcher;
 pub mod timeline;
 pub mod update_notice;
+pub mod voice;
 pub mod window_controls;
 pub mod workers;

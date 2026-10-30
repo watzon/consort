@@ -428,6 +428,7 @@ impl ConsortApp {
                 Some(self.account_settings_dialog(w, a, t, window, cx))
             }
             Dialog::PairClient => Some(self.pair_client_dialog(t, cx)),
+            Dialog::Voice(voice) => Some(self.voice_dialog_parts(voice, t, window, cx)),
             _ => None,
         };
         let (title, description, width, body, actions) = match dialog {
@@ -442,6 +443,7 @@ impl ConsortApp {
             | Dialog::SkillFiles(_)
             | Dialog::ChannelExtensions(_)
             | Dialog::PairClient
+            | Dialog::Voice(_)
             | Dialog::AccountSettings(..) => match ext_parts.take() {
                 Some((title, description, width, body, actions, logo)) => {
                     lead = logo;

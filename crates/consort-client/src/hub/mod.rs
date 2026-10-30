@@ -20,6 +20,7 @@ mod outbox;
 mod proactivity;
 mod save;
 mod url;
+mod voice;
 
 use std::{
     sync::{Arc, Mutex},

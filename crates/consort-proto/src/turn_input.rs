@@ -241,6 +241,35 @@ pub enum WakeEvent {
         #[serde(default, skip_serializing_if = "is_zero")]
         log: u64,
     },
+    /// Edited drafts of one context wait: the user changed what the voice
+    /// wrote. Propose a rule change only when at least 3 edits agree.
+    VoiceEdits {
+        /// The context, such as `email.formal`.
+        context: String,
+        /// The drafts and what the user sent, oldest first.
+        pairs: Vec<VoiceEditPair>,
+        /// The changes that at least 3 edits agree on, with their counts.
+        #[serde(default)]
+        agreeing: Vec<VoiceEditPattern>,
+    },
+    /// The user said "Not how I write" on a draft. Ask what is wrong.
+    VoiceFeedback {
+        /// The draft card.
+        approval: ApprovalId,
+        /// The context that the draft used.
+        #[serde(default)]
+        context: Option<String>,
+        /// The draft.
+        draft: String,
+    },
+    /// The user asked for a "Try it" sample in Settings > Voice. Write it
+    /// with `voice_sample`. Nothing is sent and nothing is posted.
+    VoiceSample {
+        /// The sample number.
+        sample: u64,
+        /// What to write.
+        request: String,
+    },
     /// The user made this channel. Greet and offer the guided start.
     ChannelCreated {
         /// The channel name.
@@ -251,6 +280,28 @@ pub enum WakeEvent {
         #[serde(default, skip_serializing_if = "is_zero")]
         log: u64,
     },
+}
+
+/// One edited draft in a `voice_edits` event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VoiceEditPair {
+    /// The sentences that the user removed.
+    #[serde(default)]
+    pub removed: Vec<String>,
+    /// The sentences that the user added.
+    #[serde(default)]
+    pub added: Vec<String>,
+}
+
+/// A change that several edits agree on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VoiceEditPattern {
+    /// `removed` or `added`.
+    pub change: String,
+    /// The sentence.
+    pub text: String,
+    /// In how many of the pairs.
+    pub count: u32,
 }
 
 // serde's `skip_serializing_if` passes a reference.
@@ -346,6 +397,9 @@ impl WakeEvent {
             Self::Research { .. } => "research",
             Self::ProactiveFeedback { .. } => "proactive_feedback",
             Self::ChannelCreated { .. } => "channel_created",
+            Self::VoiceEdits { .. } => "voice_edits",
+            Self::VoiceFeedback { .. } => "voice_feedback",
+            Self::VoiceSample { .. } => "voice_sample",
         }
     }
 
@@ -379,9 +433,50 @@ impl WakeEvent {
         }
     }
 
+    /// Whether this event is about the voice. A turn whose events are all
+    /// voice samples posts nothing as a fallback.
+    pub fn is_voice_sample(&self) -> bool {
+        matches!(self, Self::VoiceSample { .. })
+    }
+
     fn render_into(&self, out: &mut String) {
         let name = self.element_name();
         match self {
+            Self::VoiceEdits {
+                context,
+                pairs,
+                agreeing,
+            } => {
+                let text = voice_edits_text(pairs, agreeing);
+                element(
+                    out,
+                    name,
+                    &[
+                        ("context", Some(context.clone())),
+                        ("pairs", Some(pairs.len().to_string())),
+                    ],
+                    Some(&text),
+                );
+            }
+            Self::VoiceFeedback {
+                approval,
+                context,
+                draft,
+            } => element(
+                out,
+                name,
+                &[
+                    ("approval", Some(approval.to_string())),
+                    ("context", context.clone()),
+                ],
+                Some(draft),
+            ),
+            Self::VoiceSample { sample, request } => element(
+                out,
+                name,
+                &[("sample", Some(sample.to_string()))],
+                Some(request),
+            ),
             Self::UserMessage {
                 id,
                 thread,
@@ -553,6 +648,37 @@ impl WakeEvent {
             ),
         }
     }
+}
+
+/// The text of a `voice_edits` element: each pair as removed and added
+/// lines, then the changes that agree.
+fn voice_edits_text(pairs: &[VoiceEditPair], agreeing: &[VoiceEditPattern]) -> String {
+    let mut text = String::new();
+    for (i, pair) in pairs.iter().enumerate() {
+        let _ = writeln!(text, "Edit {}:", i + 1);
+        for line in &pair.removed {
+            let _ = writeln!(text, "- removed: {line}");
+        }
+        for line in &pair.added {
+            let _ = writeln!(text, "+ added: {line}");
+        }
+    }
+    if agreeing.is_empty() {
+        text.push_str("No change appears in 3 or more edits. Propose nothing.");
+    } else {
+        text.push_str("Changes in 3 or more edits:\n");
+        for p in agreeing {
+            let _ = writeln!(
+                text,
+                "- {} \"{}\" in {} of {} edits",
+                p.change,
+                p.text,
+                p.count,
+                pairs.len()
+            );
+        }
+    }
+    text.trim_end().to_owned()
 }
 
 /// The text of a `check_in` element: the hub summary, the note and the
@@ -871,5 +997,51 @@ What you saw and did not report in recent check-ins:
         assert_eq!(value["type"], "memory_suggestion");
         assert_eq!(value["from"], "chn_00000000-0000-0000-0000-000000000006");
         assert_eq!(serde_json::from_value::<WakeEvent>(value).unwrap(), event);
+    }
+
+    #[test]
+    fn voice_events_render_and_are_not_proactive() {
+        let approval: ApprovalId = "apr_00000000-0000-0000-0000-000000000007".parse().unwrap();
+        let edits = WakeEvent::VoiceEdits {
+            context: "email.formal".into(),
+            pairs: vec![VoiceEditPair {
+                removed: vec!["Hope you are well.".into()],
+                added: vec![],
+            }],
+            agreeing: vec![VoiceEditPattern {
+                change: "removed".into(),
+                text: "Hope you are well.".into(),
+                count: 4,
+            }],
+        };
+        let text = render_events(std::slice::from_ref(&edits));
+        assert!(
+            text.contains("<voice_edits context=\"email.formal\" pairs=\"1\">"),
+            "{text}"
+        );
+        assert!(text.contains("- removed: Hope you are well."));
+        assert!(text.contains("removed \"Hope you are well.\" in 4 of 1 edits"));
+        let none = WakeEvent::VoiceEdits {
+            context: "chat".into(),
+            pairs: vec![],
+            agreeing: vec![],
+        };
+        assert!(render_events(&[none]).contains("Propose nothing."));
+        let feedback = WakeEvent::VoiceFeedback {
+            approval,
+            context: Some("chat".into()),
+            draft: "yep <ok>".into(),
+        };
+        assert!(render_events(std::slice::from_ref(&feedback)).contains("yep &lt;ok&gt;"));
+        let sample = WakeEvent::VoiceSample {
+            sample: 3,
+            request: "Reply to Dana".into(),
+        };
+        assert!(sample.is_voice_sample());
+        for event in [edits, feedback, sample] {
+            assert_eq!(event.proactive_kind(), None);
+            let value = serde_json::to_value(&event).unwrap();
+            assert_eq!(serde_json::from_value::<WakeEvent>(value).unwrap(), event);
+        }
     }
 }

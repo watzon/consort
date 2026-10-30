@@ -35,7 +35,7 @@ use crate::model::{
     PlacementRequest, Preferences, ProactiveTasks, ProactiveWake, ProactivityLevel,
     ProactivitySettings, PushProvider, ReadMarker, Repo, Routine, RoutineAction, RoutineRun,
     RoutineSchedule, SecretEnv, SessionItem, Sha256Hash, SignIn, SignInMethod, Skill, Task, ToolId,
-    Worker, memory_note_entity_id,
+    VOICE_ENTITY_ID, VoiceSettings, Worker, memory_note_entity_id,
 };
 use crate::time::Timestamp;
 use crate::tools::{FilesListResult, MemoryListResult, RoutineResult, SearchResult};
@@ -45,6 +45,7 @@ mod connectors;
 mod hub_admin;
 mod proactivity;
 mod skills;
+mod voice;
 
 pub use connectors::{
     CATALOG_PAGE_MAX, CONNECTOR_CALLS_PAGE_MAX, ChannelSetConnectionEnabled,
@@ -72,6 +73,10 @@ pub use skills::{
     SkillDirectorySourcesResult, SkillFileContent, SkillFiles, SkillFilesResult, SkillInstall,
     SkillInstallSource, SkillPreview, SkillPreviewResult, SkillReadFile, SkillRemove, SkillResult,
     SkillUpdate, SkillVersion,
+};
+pub use voice::{
+    ApprovalEdit, VOICE_TRY_MAX_CHARS, VoiceFeedback, VoiceGet, VoiceLearn, VoiceReset,
+    VoiceResult, VoiceSet, VoiceTry,
 };
 
 /// How long the hub keeps feed entries, in milliseconds (30 days).
@@ -224,6 +229,10 @@ pub struct Snapshot {
     /// and a snapshot from an older hub leave it out.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proactivity: Option<ProactivitySettings>,
+    /// The voice settings, for the scope `all`. A channel snapshot and a
+    /// snapshot from an older hub leave it out.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub voice: Option<VoiceSettings>,
 }
 
 /// `sync.subscribe`. The hub answers `ok`, then sends every feed entry after
@@ -287,6 +296,9 @@ pub enum EntityKind {
     ProactivitySettings,
     /// [`ProactiveWake`]. The `entity_id` is the entry number.
     ProactiveWake,
+    /// [`VoiceSettings`]. There is one record, with the ID
+    /// [`VOICE_ENTITY_ID`].
+    VoiceSettings,
 }
 
 /// The full client view of an entity after a write.
@@ -335,6 +347,8 @@ pub enum EntityPayload {
     ProactivitySettings(ProactivitySettings),
     /// One entry of the proactivity log.
     ProactiveWake(ProactiveWake),
+    /// The voice settings.
+    VoiceSettings(VoiceSettings),
 }
 
 impl EntityPayload {
@@ -362,6 +376,7 @@ impl EntityPayload {
             Self::Skill(_) => EntityKind::Skill,
             Self::ProactivitySettings(_) => EntityKind::ProactivitySettings,
             Self::ProactiveWake(_) => EntityKind::ProactiveWake,
+            Self::VoiceSettings(_) => EntityKind::VoiceSettings,
         }
     }
 
@@ -395,6 +410,7 @@ impl EntityPayload {
             Self::Skill(e) => e.id.to_string(),
             Self::ProactivitySettings(_) => PROACTIVITY_ENTITY_ID.to_owned(),
             Self::ProactiveWake(e) => e.entity_id(),
+            Self::VoiceSettings(_) => VOICE_ENTITY_ID.to_owned(),
         }
     }
 
@@ -426,7 +442,8 @@ impl EntityPayload {
             | Self::Preferences(_)
             | Self::Connection(_)
             | Self::Skill(_)
-            | Self::ProactivitySettings(_) => None,
+            | Self::ProactivitySettings(_)
+            | Self::VoiceSettings(_) => None,
         }
     }
 }
@@ -1145,6 +1162,10 @@ pub struct ApprovalAnswer {
     pub approval_id: ApprovalId,
     /// The chosen option's ID.
     pub option_id: String,
+    /// For a connector card with commitment flags: the user ticked "I
+    /// checked the marked lines". The hub refuses an allow without it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub checked: bool,
 }
 
 /// The response to `approval.answer`.
@@ -1854,6 +1875,20 @@ message_family! {
         ProactivityCancelFollowUps("proactivity.cancel_follow_ups", ProactivityCancelFollowUps => ProactivityCancelFollowUpsResult),
         /// Rate a proactive message: Useful or Too noisy.
         MessageRate("message.rate", MessageRate => Empty),
+        /// The voice settings and the newest sample.
+        VoiceGet("voice.get", VoiceGet => VoiceResult),
+        /// Change the voice settings. Turning the voice on starts learning.
+        VoiceSet("voice.set", VoiceSet => VoiceResult),
+        /// Start the voice task again.
+        VoiceLearn("voice.learn", VoiceLearn => VoiceResult),
+        /// Delete the style guide and turn the voice off.
+        VoiceReset("voice.reset", VoiceReset => VoiceResult),
+        /// Write a sample draft. Nothing is sent.
+        VoiceTry("voice.try", VoiceTry => VoiceResult),
+        /// "Not how I write" on a draft card.
+        VoiceFeedback("voice.feedback", VoiceFeedback => Empty),
+        /// Change the text fields of a connector card before the answer.
+        ApprovalEdit("approval.edit", ApprovalEdit => ApprovalResult),
         /// Star a model, or take the star away.
         PreferencesSetFavoriteModel("preferences.set_favorite_model", PreferencesSetFavoriteModel => PreferencesResult),
         /// Get a bearer token for the blob endpoints.
@@ -1947,6 +1982,36 @@ mod tests {
     use crate::model::{ProactiveKind, ProactiveOutcome, QuietHours};
     use crate::status::TaskStatus;
     use serde_json::json;
+
+    #[test]
+    fn voice_settings_are_a_feed_entity_and_in_the_snapshot() {
+        let settings = VoiceSettings {
+            enabled: true,
+            ..VoiceSettings::default()
+        };
+        let payload = EntityPayload::VoiceSettings(settings.clone());
+        assert_eq!(payload.kind(), EntityKind::VoiceSettings);
+        assert_eq!(payload.entity_id(), "voice");
+        assert_eq!(payload.channel_id(), None);
+        let value = serde_json::to_value(&payload).unwrap();
+        assert_eq!(value["entity"], "voice_settings");
+        assert_eq!(
+            serde_json::from_value::<EntityPayload>(value).unwrap(),
+            payload
+        );
+        let snapshot = Snapshot {
+            voice: Some(settings),
+            ..Snapshot::default()
+        };
+        let value = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(value["voice"]["enabled"], true);
+        let old: Snapshot = serde_json::from_value(json!({"seq": 1})).unwrap();
+        assert!(old.voice.is_none());
+        let answer: ApprovalAnswer =
+            serde_json::from_value(json!({"approval_id": ApprovalId::new(), "option_id": "allow"}))
+                .unwrap();
+        assert!(!answer.checked);
+    }
 
     #[test]
     fn proactivity_settings_and_wakes_are_feed_entities_and_in_the_snapshot() {
@@ -2539,6 +2604,7 @@ mod tests {
             ApprovalAnswer {
                 approval_id: ApprovalId::new(),
                 option_id: "allow".into(),
+                checked: false,
             }
             .into(),
             DecisionAnswerRequest {
@@ -2749,6 +2815,34 @@ mod tests {
             }
             .into(),
             ProactivityCancelFollowUps { channel_id: None }.into(),
+            VoiceGet {}.into(),
+            VoiceSet {
+                enabled: Some(true),
+                sources: Some(vec![crate::model::VoiceSource {
+                    kind: crate::model::VoiceSourceKind::Mail,
+                    connection_id: Some(ConnectionId::new()),
+                    include_private: false,
+                    paths: Vec::new(),
+                }]),
+                learn_from_edits: Some(true),
+                disclosure: Some(crate::model::Disclosure::FooterNewContacts),
+            }
+            .into(),
+            VoiceLearn {}.into(),
+            VoiceReset {}.into(),
+            VoiceTry {
+                request: "Reply to Dana, say yes".into(),
+            }
+            .into(),
+            VoiceFeedback {
+                approval_id: ApprovalId::new(),
+            }
+            .into(),
+            ApprovalEdit {
+                approval_id: ApprovalId::new(),
+                fields: [("body".to_owned(), "Hi Dana,".to_owned())].into(),
+            }
+            .into(),
             MessageRate {
                 message_id: MessageId::new(),
                 rating: Some(crate::model::ProactiveRating::TooNoisy),
@@ -3260,6 +3354,13 @@ mod tests {
             "proactivity.log",
             "proactivity.cancel_follow_ups",
             "message.rate",
+            "voice.get",
+            "voice.set",
+            "voice.learn",
+            "voice.reset",
+            "voice.try",
+            "voice.feedback",
+            "approval.edit",
             "auth.http_token",
             "preferences.set_favorite_model",
             "composio.set_key",

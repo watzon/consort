@@ -33,6 +33,7 @@ pub mod mock_files;
 pub mod mock_offline;
 pub mod mock_proactivity;
 pub mod mock_routines;
+pub mod mock_voice;
 pub mod notify;
 pub mod offline;
 pub mod persist;
@@ -48,6 +49,7 @@ mod test_entities;
 pub mod update;
 pub mod uploads;
 pub mod view;
+pub mod voice;
 
 use std::sync::Arc;
 
@@ -367,6 +369,7 @@ impl Client {
         self.run(Command::AnswerApproval {
             approval_id,
             choice,
+            checked: false,
         })
         .await
     }

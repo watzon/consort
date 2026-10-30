@@ -444,6 +444,7 @@ pub fn hub_card(
                     })
                     .collect(),
                 rule_note: rule_note(kind, rule),
+                draft: crate::voice::draft_card(card),
             })
         }
         ApprovalDetails::Management(card) => HubCardView::Management(ManagementCardView {
@@ -544,6 +545,12 @@ mod tests {
                 value: "dana@acme.dev".into(),
             }],
             arguments: serde_json::json!({}),
+            outgoing: None,
+            editable: Vec::new(),
+            voice: None,
+            flags: Vec::new(),
+            draft_arguments: None,
+            not_my_voice: false,
         }));
         let options = details.hub_card_options().unwrap();
         let (card, labels) = hub_card(&details, &options, &Cache::default()).unwrap();

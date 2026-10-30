@@ -38,5 +38,6 @@ mod snapshot_and_feed;
 mod start_failures;
 mod task_lifecycle;
 mod task_session_guards;
+mod voice;
 mod wake_queue;
 mod workspace_release;

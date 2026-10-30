@@ -322,8 +322,43 @@ pub struct Components {
     pub update_notice: UpdateNotice,
     pub chat: Chat,
     pub proactivity: Proactivity,
+    pub voice: Voice,
     pub theme_preview: ThemePreview,
     pub convo: Convo,
+}
+
+/// The sizes of Settings > Voice and of the card of a draft in your voice.
+/// From the Paper artboards H3V-0, H7T-0 and HTB-0.
+#[derive(Clone, Copy, Debug, Deserialize)]
+pub struct Voice {
+    /// The fixed slot of Remove at the right of a rule or an example.
+    pub remove_slot: f32,
+    /// The dot before a rule.
+    pub rule_dot: f32,
+    /// The tile of a source: a monogram or an icon.
+    pub source_tile: f32,
+    /// A checkbox and a radio button.
+    pub check_box: f32,
+    /// The check mark in a ticked box.
+    pub check_icon: f32,
+    /// The dot of a chosen radio button.
+    pub radio_dot: f32,
+    /// The dot before "Nothing is sent".
+    pub sample_dot: f32,
+    /// The bar at the left of a commitment flag.
+    pub flag_bar: f32,
+    /// The label lane of the fields of a draft card.
+    pub field_label: f32,
+    /// The height of the Subject field in Edit.
+    pub subject_box: f32,
+    /// The least height of the Body field in Edit.
+    pub body_box: f32,
+    /// The quote icon of the voice line.
+    pub line_icon: f32,
+    /// The padding above and below a rule.
+    pub rule_pad_y: f32,
+    /// The padding above and below an example.
+    pub example_pad_y: f32,
 }
 
 /// The sizes of Settings > Proactivity, the proactive marks, the offer
@@ -892,6 +927,20 @@ mod tests {
         assert_eq!(
             (a.dock_tile, a.dock_badge, a.banner_width),
             (40.0, 18.0, 360.0)
+        );
+    }
+
+    #[test]
+    fn voice_tokens_keep_the_values_of_the_designs() {
+        let v = super::structure().component.voice;
+        assert_eq!(
+            (v.remove_slot, v.rule_dot, v.source_tile),
+            (84.0, 4.0, 32.0)
+        );
+        assert_eq!((v.check_box, v.radio_dot, v.flag_bar), (16.0, 8.0, 2.0));
+        assert_eq!(
+            (v.field_label, v.subject_box, v.body_box),
+            (52.0, 30.0, 150.0)
         );
     }
 

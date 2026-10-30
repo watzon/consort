@@ -127,6 +127,17 @@ The hub, not the prompt, decides when a proactive wake may run, before a model r
 
 The client shows the settings, the log, the marks, the offers, the quick-reply chips and the writing bubble. A proactive message notifies only when the hub marked it with `notify`, and only through the switch "When the assistant needs your attention". Nothing notifies in quiet hours or while snoozed.
 
+### Write in my voice
+
+When the user turns on "Write in my voice", drafts that go out in the user's name follow the style guide `voice.md`. The decision is [ADR 0014](adr/0014-the-assistant-writes-in-the-users-voice-with-consent.md), the design is [VOICE-PLAN.md](VOICE-PLAN.md), and the code is `consort-hub/src/voice/`. The hub enforces the rules in code:
+
+- **Learning.** `voice.set` (on) and `voice.learn` start the voice task in Tutti with a fixed brief that lists only the chosen sources (`voice::learn`). That task may run only read tools of those connections, and the text that the assistant wrote leaves its results. Its `suggest_memory` becomes the offer "Save this style guide?"; only Do it writes `voice.md`, which goes through the format and the screening of `consort_proto::model::VoiceGuide`.
+- **Scope.** Only a session whose channel can reach a draft or send tool gets the section "The user's voice is on" in its prompt (`Hub::voice_prompt_section`). `voice_guide` gives one context.
+- **The card.** A draft or send tool's card says which voice wrote it, has Edit (`approval.edit`), and marks commitments that the request did not contain (`voice::scan`). An allow needs the tick while flags exist, and a call with flags always asks. The voice never loosens an approval rule.
+- **Edits.** Allowed draft cards become draft pairs. Five edited pairs of one context wake Tutti with `voice_edits`; "Not how I write" wakes it with `voice_feedback`. Tutti proposes rule changes as offers.
+
+The client shows Settings > Voice, the offer with "Open the full guide", the voice task's card with its steps, and the draft card with its flags, the tick, Edit and "Not how I write".
+
 ### The model of the assistant
 
 Each channel has a coordinator selection (account, model and options such as the effort). A channel without its own selection uses Tutti's, so Tutti's selection is the default for every such channel. The user chooses it in the composer, in the New channel dialog, or with Model in the channel menu. The client sends `channel.update { coordinator_selection }` at once, and the hub stores it.

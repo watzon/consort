@@ -691,6 +691,7 @@ pub fn acme_items() -> Vec<TimelineItem> {
                         },
                     ],
                     rule_note: rule_note(ToolKindView::Change, ApprovalRuleView::AskEveryTime),
+                    draft: None,
                 }),
                 ("Allow", "Don't"),
             ),

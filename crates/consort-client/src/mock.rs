@@ -214,6 +214,8 @@ fn card(
         reply_count: 0,
         latest: latest.map(Into::into),
         approval_mode: ApprovalMode::default(),
+        steps: Vec::new(),
+        note: None,
     })
 }
 
@@ -1406,6 +1408,7 @@ pub fn view_state() -> ViewState {
         memory_deleted_loaded: vec![text(crate::memory::GLOBAL), text(LIGHTS), text(SAYSO)],
         convo: crate::convo::ConvoView::default(),
         proactivity: Default::default(),
+        voice: crate::mock_voice::off_view(),
     };
     stamp_times(&mut state.timelines);
     crate::mock_convo::decorate(&mut state);

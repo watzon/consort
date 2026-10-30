@@ -308,7 +308,7 @@ impl Hub {
         ctx: &ToolCtx,
         args: RunConnectorToolArgs,
     ) -> Result<Value> {
-        let arguments = match args.arguments {
+        let mut arguments = match args.arguments {
             Value::Null => Value::Object(Default::default()),
             Value::Object(map) => Value::Object(map),
             _ => {
@@ -321,14 +321,21 @@ impl Hub {
         self.connectors.client()?;
         let tool = self.connector_tool(&connection, &args.tool).await?;
         let kind = tool_kind(&tool);
+        let voice_task = self.check_voice_task_call(ctx, &connection, kind).await?;
         if kind != consort_proto::model::ToolKind::Read && self.in_research_turn(ctx).await? {
             return Err(crate::proactivity::turn::denied(
                 crate::proactivity::turn::RESEARCH_REFUSAL,
             ));
         }
+        // A draft or send tool: the voice, the disclosure line and the
+        // commitment flags. A call with flags always asks the user.
+        let voice = self
+            .voice_for_call(ctx, &tool.slug, kind, &mut arguments)
+            .await?;
         let scope = CallScope::of(ctx);
         let rule = connection.approvals.rule_for(kind);
         let decision = match rule {
+            _ if !voice.flags.is_empty() => None,
             ApprovalRule::RunWithoutAsking => Some(CallDecision::RanWithoutAsking),
             ApprovalRule::AskOncePerTask => {
                 let (key, id) = (scope.grant_key(), connection.id);
@@ -349,7 +356,8 @@ impl Hub {
             scope,
         };
         if decision.is_some() {
-            let result = self.execute_call(&record, &account).await?;
+            let mut result = self.execute_call(&record, &account).await?;
+            self.redact_for_voice_task(voice_task, &mut result).await?;
             return Ok(serde_json::to_value(result)?);
         }
 
@@ -360,7 +368,7 @@ impl Hub {
             "Run {} on {} ({})",
             tool.slug, connection.name, connection.service_name
         );
-        let card = ConnectorCard {
+        let mut card = ConnectorCard {
             connection_id: connection.id,
             connection_name: connection.name.clone(),
             service_name: connection.service_name.clone(),
@@ -368,7 +376,14 @@ impl Hub {
             tool_kind: kind,
             fields: display_fields(&arguments),
             arguments: arguments.clone(),
+            outgoing: None,
+            editable: Vec::new(),
+            voice: None,
+            flags: Vec::new(),
+            draft_arguments: None,
+            not_my_voice: false,
         };
+        voice.apply(&mut card);
         if let Err(err) = self
             .post_hub_card(
                 ctx,
@@ -401,8 +416,56 @@ impl Hub {
                 message: "The user has not answered the approval card yet. Go on with other work. When the user answers, the hub runs the call and sends the result.".to_owned(),
             })?);
         };
-        let result = self.answered_call(&record, &account, rule, status).await?;
+        // The user may have edited the text on the card: the call runs with
+        // the arguments of the card.
+        let edited = if status == ApprovalStatus::Allowed {
+            self.card_arguments(approval_id)
+                .await?
+                .unwrap_or_else(|| arguments.clone())
+        } else {
+            arguments.clone()
+        };
+        let record = CallRecord {
+            arguments: &edited,
+            ..record
+        };
+        let mut result = self.answered_call(&record, &account, rule, status).await?;
+        self.redact_for_voice_task(voice_task, &mut result).await?;
         Ok(serde_json::to_value(result)?)
+    }
+
+    /// The arguments on a connector card now, after any edit.
+    async fn card_arguments(&self, approval_id: ApprovalId) -> Result<Option<Value>> {
+        let approval = self
+            .store
+            .read(move |conn| crate::store::work::approval(conn, approval_id))
+            .await?;
+        Ok(approval.and_then(|a| match a.details {
+            ApprovalDetails::Connector(card) => Some(card.arguments),
+            _ => None,
+        }))
+    }
+
+    /// In the voice task, text that the assistant wrote leaves the result.
+    async fn redact_for_voice_task(
+        &self,
+        voice_task: bool,
+        result: &mut RunConnectorToolResult,
+    ) -> Result<()> {
+        if !voice_task {
+            return Ok(());
+        }
+        if let RunConnectorToolResult::Ran { data, .. } = result {
+            let texts = self.assistant_texts().await?;
+            let left_out = crate::voice::learn::redact_assistant_text(data, &texts);
+            if left_out > 0 {
+                tracing::info!(
+                    left_out,
+                    "left assistant text out of what the voice task read"
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Finishes a call after the user answered its card.

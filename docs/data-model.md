@@ -39,7 +39,7 @@ The client keeps its cache in `cache.sqlite3` in its folder (`<config dir>/conso
 | Table | Columns | Holds |
 |---|---|---|
 | `entity` | `kind`, `id`, `json` | One row for each entity of the cache, keyed by kind and the key that the cache uses. The `json` is the entity as the hub sends it. Kinds: `group`, `channel`, `repo`, `worker`, `message`, `channel_file`, `routine`, `routine_run`, `memory_note`, `task`, `approval`, `decision`, `read_marker`, `session_item`, `session_activity`, `connection`, `skill`, `client` and `proactive_wake` (the proactivity log) |
-| `meta` | `key`, `value` | `seq` (the feed position), `fresh_at` (Unix ms: when the data was last current), `client_id` and `hub_url` (who the data belongs to), `preferences`, `proactivity_settings`, `proactivity_log_has_more`, and the sets that say what the cache has loaded (`channels_loaded`, `files_loaded`, `runs_loaded`, `memory_loaded`, `memory_deleted_loaded`, `loaded_threads`, `task_previews`, `tasks_absent`, `has_older`, `tasks_have_more`) |
+| `meta` | `key`, `value` | `seq` (the feed position), `fresh_at` (Unix ms: when the data was last current), `client_id` and `hub_url` (who the data belongs to), `preferences`, `proactivity_settings`, `proactivity_log_has_more`, `voice_settings` (the "Try it" sample and the guide that waits for Do it are not saved), and the sets that say what the cache has loaded (`channels_loaded`, `files_loaded`, `runs_loaded`, `memory_loaded`, `memory_deleted_loaded`, `loaded_threads`, `task_previews`, `tasks_absent`, `has_older`, `tasks_have_more`) |
 
 The client writes the file about half a second after a change, in one transaction, and only the rows that changed. It writes only a cache whose first load is whole. At start, the client reads the file before it connects, and the app shows the data at once. A file for another client ID or another hub URL is emptied. A file with another schema version, a file that SQLite cannot open, a file that fails its integrity check, and a row that cannot be read are moved to `cache.sqlite3.broken`, and the client starts with no saved data. A schema change raises the version, and the client does not migrate: an old file is moved aside and the next connect loads a snapshot.
 
@@ -623,6 +623,56 @@ The settings are one JSON record in `meta` under the key `proactivity`, and a fe
 | `ended_at` | timestamp, optional | |
 
 `proactive_channels` keeps, per channel, when the last check-in looked at the hub (the next change summary starts there), the silent check-ins in a row, and the interval before back-off doubled it. `task_status_since` keeps when each task entered its status and whether it got its nudge. `follow_ups` keeps the `key` and the time when the assistant set each follow-up. The meta keys `proactivity.brief_made` and `proactivity.defaults_v1` make the brief and the default routines come once.
+
+## Voice
+
+Hub migration 10 adds "Write in my voice" ([VOICE-PLAN.md](VOICE-PLAN.md), [ADR 0014](adr/0014-the-assistant-writes-in-the-users-voice-with-consent.md)).
+
+The settings are one JSON record in `meta` under the key `voice`, and a feed entity (`voice_settings`, ID `voice`). The `all` snapshot has them as `voice`.
+
+| Field | Type | Notes |
+|---|---|---|
+| `enabled` | bool | Off by default |
+| `sources` | list of `{kind: mail \| chat \| documents, connection_id?, include_private, paths}` | What the voice task may read |
+| `learn_from_edits` | bool | On by default |
+| `disclosure` | `none`, `footer` or `footer_new_contacts` | Default `none` |
+| `last_learned_at`, `learned_summary` | timestamp, text, optional | Set by Do it |
+| `task_id` | ID, optional | The newest voice task |
+| `proposal_decision_id` | ID, optional | The offer that waits |
+| `sample_id`, `sample_state` | integer, `writing` \| `ready` \| `failed` | The newest "Try it" sample. Its text is only in the hub's memory |
+
+The style guide that waits for Do it is in `meta` under `voice_proposal`. The style guide itself is the global memory note `voice.md` (see [Memory note](#memory-note)), with versions:
+
+```markdown
+# Voice
+sources: gmail chris@example.com (sent, 90 days)
+learned: 214 sent mails and 380 Slack messages
+
+## Core
+- Short sentences. Plain words. Lead with the answer.
+
+## email.formal (Clients and new contacts)
+learned from: 96 mails
+- Greet with "Hi {first name},".
+- Examples:
+  1. "Hi {name},\nThanks for the quote.\nBest,\nChris"
+
+## email.close (Colleagues and friends)
+## chat (Slack and other chat)
+## post.public (Announcements and social posts)
+Not enough text yet. Add documents to learn this context.
+
+## Hard rules
+- Never promise a date or a price. (you)
+```
+
+Every write of `voice.md` goes through the parser: sections that the format does not know and loose text are dropped, addresses, phone numbers and links become `{email}`, `{phone}` and `{link}`, each section keeps at most 12 rules and 6 examples, and the note must fit in 6 KiB. A write by the user marks every new rule `(you)`. A write by a session must keep every `(you)` rule.
+
+`draft_pairs` keeps one row per allowed draft card for 90 days: `approval_id`, `connection_id`, `tool`, `context` (none for a neutral draft), `draft`, `final` (the subject line and the text fields), `recipients`, `unchanged` (sent with no edit: the assistant's text, never used for learning), `not_my_voice`, `at`, and `used` (taken by a `voice_edits` wake).
+
+`voice_uses` keeps each `voice_guide` call: `session_id`, `context`, `at`, for 90 days.
+
+A connector card ([Hub cards](#hub-cards)) of a draft or send tool has `outgoing` (`draft` or `send`), `editable`, `voice` (`{context}`, none is "Neutral style"), `flags` (`{field, label, text, kind: date | time | weekday | price | agreement | hard_rule, start, end, rule?}`, byte offsets into the field), `draft_arguments` (the assistant's arguments after an edit) and `not_my_voice`.
 
 ## Preferences
 

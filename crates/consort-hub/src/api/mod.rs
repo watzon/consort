@@ -90,6 +90,13 @@ pub(crate) async fn dispatch(hub: &Hub, caller: Caller, request: ClientRequest) 
             to_value(&hub.proactivity_cancel_follow_ups(caller, r).await?)
         }
         R::MessageRate(r) => to_value(&hub.message_rate(caller, r).await?),
+        R::VoiceGet(r) => to_value(&hub.voice_get(caller, r).await?),
+        R::VoiceSet(r) => to_value(&hub.voice_set(caller, r).await?),
+        R::VoiceLearn(r) => to_value(&hub.voice_learn(caller, r).await?),
+        R::VoiceReset(r) => to_value(&hub.voice_reset(caller, r).await?),
+        R::VoiceTry(r) => to_value(&hub.voice_try(caller, r).await?),
+        R::VoiceFeedback(r) => to_value(&hub.voice_feedback(caller, r).await?),
+        R::ApprovalEdit(r) => to_value(&hub.approval_edit(caller, r).await?),
         R::AccountCreate(r) => to_value(&hub.account_create(caller, r).await?),
         R::AccountUpdate(r) => to_value(&hub.account_update(caller, r).await?),
         R::AccountRemove(r) => to_value(&hub.account_remove(caller, r).await?),
