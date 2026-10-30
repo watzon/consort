@@ -652,3 +652,22 @@ The user was away during the first build, from 2026-10-29. These are the choices
 | 646 | Client | A generation per pairing; old links and calls never write the cache | Old hub data must not land under a new owner | Yes |
 | 647 | Client | No save while a recover waits for skipped data | The saved cursor never passes data that is not in the file | Yes |
 | 648 | Hub schema | Version 11; version 10 is a no-op kept for the voice build | Two branches add migrations at the same time | Yes |
+| 649 | Proto | A draft or send tool is a `change` tool whose slug words name a draft or a send (`outgoing_kind`) | Composio and MCP have no send hint; read and delete tools can never count | Yes |
+| 650 | Proto | The style guide format is parsed and rendered in proto (`VoiceGuide`); unknown sections and loose text are dropped | One format for the hub's screening, the client's page and the prompt; raw text cannot reach memory | Yes |
+| 651 | Proto | `ProactiveKind::Voice` marks offers about the style guide; every level allows them and the log does not list them | An offer card needs a mark; these offers answer the user's own edits | Yes |
+| 652 | Proto | `approval.edit` is its own request; `approval.answer` gets `checked` | The hub scans the edited text before the answer, and refuses an allow of a flagged card without the tick | Yes |
+| 653 | Hub | The hub posts the guide's offer and writes `voice.md` on Do it | The saved note is exactly what the user approved | Yes |
+| 654 | Hub | Every write of `voice.md` goes through the format, placeholders and the 6 KiB limit; a user write marks new rules `(you)`; a session write must keep them | "A learned change never overwrites them" holds in code | Yes |
+| 655 | Hub | The voice task may run only read tools of the chosen connections, and the assistant's unchanged text leaves its results | Consent per source, and assistant text never teaches the voice | Yes |
+| 656 | Hub | The scan and the disclosure line run only with the voice on; Edit works always | The voice is the feature that can add commitments; Edit is useful alone | Yes |
+| 657 | Hub | A connector call with flags always asks | The voice can only make approval stricter | Yes |
+| 658 | Hub | "New contact" is a recipient with no earlier draft pair | The hub sees only what went out through Consort | Yes |
+| 659 | Hub | Draft pairs are stored for every allowed draft card, with or without the voice, for 90 days | The "sent unchanged" filter needs them when the voice is turned on later; the approval already holds the text | Yes |
+| 660 | Hub | `voice_edits` takes all waiting edited pairs of a context at 5, with the changes that 3 or more agree on | The plan's thresholds, counted in code | Yes |
+| 661 | Hub | "Try it" is a Tutti coordinator turn whose sample stays in memory | The hub never runs a model; nothing is saved | Yes |
+| 662 | Hub | The voice section of the prompt is in the coordinator's fingerprint | Turning the voice on or off reaches an idle coordinator | Yes |
+| 663 | Client | The client keeps `voice.md` from the feed even when global memory is not loaded | Settings > Voice shows the guide that Do it or a coordinator wrote | Yes |
+| 664 | Desktop | The draft card keeps Allow and Don't and adds Edit; Allow stays off until the tick | Answer 2: one set of words for connector cards | Yes |
+| 665 | Desktop | Sources while off stay in the app until Turn on and learn | Unticking everything must not bring the defaults back | Yes |
+| 666 | Desktop | A flagged body is a selectable copy over an underlined copy | GPUI's selectable text has no highlights | Yes |
+| 667 | Desktop | Edit fields show only in the card where Edit started | One text input entity cannot draw in two views | Yes |
