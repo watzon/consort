@@ -82,6 +82,14 @@ pub(crate) async fn dispatch(hub: &Hub, caller: Caller, request: ClientRequest) 
         R::HubStatus(r) => to_value(&hub.hub_status(caller, r).await?),
         R::HubBackup(r) => to_value(&hub.hub_backup(caller, r).await?),
         R::HubBackupSettings(r) => to_value(&hub.hub_backup_settings(caller, r).await?),
+        R::ProactivityGet(r) => to_value(&hub.proactivity_get(caller, r).await?),
+        R::ProactivitySet(r) => to_value(&hub.proactivity_set(caller, r).await?),
+        R::ProactivitySnooze(r) => to_value(&hub.proactivity_snooze(caller, r).await?),
+        R::ProactivityLog(r) => to_value(&hub.proactivity_log(caller, r).await?),
+        R::ProactivityCancelFollowUps(r) => {
+            to_value(&hub.proactivity_cancel_follow_ups(caller, r).await?)
+        }
+        R::MessageRate(r) => to_value(&hub.message_rate(caller, r).await?),
         R::AccountCreate(r) => to_value(&hub.account_create(caller, r).await?),
         R::AccountUpdate(r) => to_value(&hub.account_update(caller, r).await?),
         R::AccountRemove(r) => to_value(&hub.account_remove(caller, r).await?),

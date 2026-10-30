@@ -16,6 +16,7 @@ pub const MIGRATIONS: &[&str] = &[
     include_str!("schema_v6.sql"),
     include_str!("schema_v7.sql"),
     include_str!("schema_v8.sql"),
+    include_str!("schema_v9.sql"),
 ];
 
 pub fn current_version() -> i64 {
@@ -115,6 +116,8 @@ mod tests {
             archived_at: None,
             created_at: now,
             updated_at: now,
+            proactive_tasks: Default::default(),
+            proactivity: None,
         };
         let json = serde_json::to_string(&channel).unwrap();
         let old = json

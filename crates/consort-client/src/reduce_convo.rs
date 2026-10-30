@@ -105,6 +105,8 @@ fn message_view(
         attachments: attachment_views(&m.attachments, artifacts, cache),
         reactions: crate::convo::reaction_views(&m.reactions),
         last_reply_label: last_reply(m, now),
+        proactive: None,
+        suggestions: Vec::new(),
     }
 }
 

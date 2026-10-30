@@ -35,8 +35,8 @@ The client keeps its cache in `cache.sqlite3` in its folder (`<config dir>/conso
 
 | Table | Columns | Holds |
 |---|---|---|
-| `entity` | `kind`, `id`, `json` | One row for each entity of the cache, keyed by kind and the key that the cache uses. The `json` is the entity as the hub sends it. Kinds: `group`, `channel`, `repo`, `worker`, `message`, `channel_file`, `routine`, `routine_run`, `memory_note`, `task`, `approval`, `decision`, `read_marker`, `session_item`, `session_activity`, `connection`, `skill` and `client` |
-| `meta` | `key`, `value` | `seq` (the feed position), `fresh_at` (Unix ms: when the data was last current), `client_id` and `hub_url` (who the data belongs to), `preferences`, and the sets that say what the cache has loaded (`channels_loaded`, `files_loaded`, `runs_loaded`, `memory_loaded`, `memory_deleted_loaded`, `loaded_threads`, `task_previews`, `tasks_absent`, `has_older`, `tasks_have_more`) |
+| `entity` | `kind`, `id`, `json` | One row for each entity of the cache, keyed by kind and the key that the cache uses. The `json` is the entity as the hub sends it. Kinds: `group`, `channel`, `repo`, `worker`, `message`, `channel_file`, `routine`, `routine_run`, `memory_note`, `task`, `approval`, `decision`, `read_marker`, `session_item`, `session_activity`, `connection`, `skill`, `client` and `proactive_wake` (the proactivity log) |
+| `meta` | `key`, `value` | `seq` (the feed position), `fresh_at` (Unix ms: when the data was last current), `client_id` and `hub_url` (who the data belongs to), `preferences`, `proactivity_settings`, `proactivity_log_has_more`, and the sets that say what the cache has loaded (`channels_loaded`, `files_loaded`, `runs_loaded`, `memory_loaded`, `memory_deleted_loaded`, `loaded_threads`, `task_previews`, `tasks_absent`, `has_older`, `tasks_have_more`) |
 
 The client writes the file about half a second after a change, in one transaction, and only the rows that changed. It writes only a cache whose first load is whole. At start, the client reads the file before it connects, and the app shows the data at once. A file for another client ID or another hub URL is emptied. A file with another schema version, a file that SQLite cannot open, a file that fails its integrity check, and a row that cannot be read are moved to `cache.sqlite3.broken`, and the client starts with no saved data. A schema change raises the version, and the client does not migrate: an old file is moved aside and the next connect loads a snapshot.
 
@@ -111,6 +111,8 @@ Turn IDs, harness request IDs and native references are opaque strings that the 
 | `tags` | list of text | Requirements. A coordinator turn, a task or a routine run of the channel runs only on a worker that has every tag. Empty by default |
 | `disabled_connections` | list of connection IDs | Channel exceptions: connections that the channel turned off. Empty by default |
 | `disabled_skills` | list of skill IDs | Channel exceptions: skills that the channel turned off. Empty by default |
+| `proactivity` | `off`, `quiet`, `normal` or `eager`, optional | The proactivity level. Empty means the default: `normal` for Tutti, `quiet` for other channels |
+| `proactive_tasks` | `drafts` or `channel_default` | What a task that a proactive turn starts may do. `drafts` (the default) runs it in Ask |
 | `archived_at` | timestamp, optional | |
 | `created_at`, `updated_at` | timestamp | |
 
@@ -149,6 +151,8 @@ A repo is global, so two channels can attach the same repo.
 | `reactions` | list | The client view of `reactions`: `author`, `emoji`, `created_at` |
 | `edited_at`, `deleted_at` | timestamp, optional | |
 | `created_at` | timestamp | |
+| `suggestions` | list, optional | Quick replies of an assistant message: `label` (at most 40 characters) and `action` (`send` or `type`). At most 4 |
+| `proactive` | object, optional | Set on a message that a proactive turn posted: `kind` (`check_in`, `brief`, `follow_up`, `stale_task`, `research`, `channel_created` or `feedback`), `notify`, and optional `reason` (a follow-up's reason), `offer` (true on an offer card) and `rating` (`useful` or `too_noisy`) |
 
 `reactions` holds `message_id`, `author`, `emoji` and `created_at`.
 
@@ -342,6 +346,9 @@ A hub card in a task makes the task Needs input, as any approval does. When a ca
 | `enabled` | bool | |
 | `next_run_at`, `last_run_at` | timestamp | |
 | `last_run_status` | `ok`, `error`, `skipped` or `running` | The status of the newest run. A run that the hub skips because the last run still runs does not change it |
+| `kind` | `custom`, `check_in`, `brief`, `follow_up` or `research` | Older rows read as `custom`. A routine of another kind is proactive: the hub gates it and sends its own wake event |
+| `origin` | `user`, `assistant` or `hub` | Who made it. Older rows read as `user` |
+| `created_at` | timestamp, optional | When it was made |
 
 ### Routine run
 
@@ -569,6 +576,37 @@ The files of each version are blobs. The hub keeps the file list of each version
 ### Effective set
 
 A session gets the connections and skills whose `use_in` matches its channel, minus the channel's exceptions. A skill must also be on and not blocked. The Tutti channel matches only `every_channel`, unless it has tags of its own.
+
+## Proactivity
+
+Hub migration 9 adds the state of the assistant on its own ([PROACTIVITY-PLAN.md](PROACTIVITY-PLAN.md)).
+
+The settings are one JSON record in `meta` under the key `proactivity`, and a feed entity (`proactivity_settings`, ID `proactivity`). The `all` snapshot has them as `proactivity`.
+
+| Field | Type | Notes |
+|---|---|---|
+| `quiet_hours` | `start`, `end` (`HH:MM`) | Default 21:00 to 07:00. A range can cross midnight |
+| `time_zone` | IANA name, optional | The user's zone for quiet hours, the brief and the research pass. UTC until a client sets it |
+| `snoozed_until` | timestamp, optional | |
+| `paused` | bool | Pause all |
+| `notify_cap_per_day` | integer | Default 3 |
+
+`proactive_wakes` is the proactivity log: one row per proactive wake, kept 30 days. Each row is a feed entity (`proactive_wake`, with its number as the ID):
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | integer | The entry number |
+| `channel_id` | ID | |
+| `kind` | `check_in`, `brief`, `follow_up`, `stale_task`, `research`, `channel_created` or `feedback` | |
+| `at` | timestamp | When the wake was due |
+| `outcome` | `pending`, `posted`, `notified`, `silent`, `skipped_no_change`, `skipped_quiet_hours`, `skipped_snoozed`, `skipped_paused`, `skipped_level`, `skipped_budget`, `skipped_busy` or `failed` | The hub writes no row for a wake that the level stops |
+| `detail` | text, optional | The finding of a silent turn, why the hub skipped the wake, or the first line of the post |
+| `message_ids` | list of IDs | What the turn posted |
+| `task_id`, `routine_id` | ID, optional | The task that the turn started, the routine that woke it |
+| `notify_held` | bool | The turn asked to notify, and the hub posted without a notification |
+| `ended_at` | timestamp, optional | |
+
+`proactive_channels` keeps, per channel, when the last check-in looked at the hub (the next change summary starts there), the silent check-ins in a row, and the interval before back-off doubled it. `task_status_since` keeps when each task entered its status and whether it got its nudge. `follow_ups` keeps the `key` and the time when the assistant set each follow-up. The meta keys `proactivity.brief_made` and `proactivity.defaults_v1` make the brief and the default routines come once.
 
 ## Preferences
 

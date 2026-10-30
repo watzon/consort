@@ -148,6 +148,8 @@ pub struct SettingsForm {
     pub isolation: Isolation,
     pub approval_mode: ApprovalMode,
     pub servers: Vec<String>,
+    /// The level of the channel's own. `None` is "Default for this channel".
+    pub proactivity: Option<consort_client::proactivity::ProactivityLevel>,
 }
 
 /// The diff of one file of a new skill version, or why it did not load.
@@ -452,6 +454,7 @@ impl ConsortApp {
                     isolation: channel.default_isolation,
                     approval_mode: channel.default_approval_mode,
                     servers: channel.allowed_local_mcp_servers.clone(),
+                    proactivity: self.channel_own_level(&channel.id),
                 };
                 set_input(&self.convo_inputs.settings_name, &channel.name, window, cx);
                 set_input(
@@ -556,6 +559,20 @@ impl ConsortApp {
         }
     }
 
+    /// The proactivity level that a channel has of its own. `None` when it
+    /// uses the default for its kind.
+    pub fn channel_own_level(
+        &self,
+        channel_id: &str,
+    ) -> Option<consort_client::proactivity::ProactivityLevel> {
+        self.state
+            .proactivity
+            .channels
+            .iter()
+            .find(|c| c.channel_id == channel_id)
+            .and_then(|c| c.level)
+    }
+
     /// The values that the channel settings dialog sends with Save changes:
     /// only the fields that changed.
     pub fn settings_changes(&self, cx: &gpui_kit::App) -> Option<(String, ChannelChanges)> {
@@ -605,6 +622,8 @@ impl ConsortApp {
             allowed_local_mcp_servers: (form.servers != channel.allowed_local_mcp_servers)
                 .then(|| form.servers.clone()),
             memory_enabled: (form.memory != channel.memory_enabled).then_some(form.memory),
+            proactivity: (form.proactivity != self.channel_own_level(&form.channel_id))
+                .then_some(form.proactivity),
             repos: (form.repos != repos_now).then(|| form.repos.clone()),
             ..ChannelChanges::default()
         };

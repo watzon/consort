@@ -586,3 +586,28 @@ The user was away during the first build, from 2026-10-29. These are the choices
 | 580 | Desktop | Task thread in bubbles; About from the settings rail and the app menu | Approved designs `BDH-0`, `DWF-0` | Yes |
 | 581 | Desktop | No voice button: the system dictation types through GPUI's text input; the tooltip names the shortcut | No safe AppKit call starts dictation | Yes |
 | 582 | Client cache | The saved cache keeps the archived tasks (row kind `archived_task`, newest archive first, and `archived_has_more`). The search, the open item and the loaded threads of `ConvoCache` stay out | Archived tasks come from the hub, so the list shows offline. The rest is screen state | Yes |
+| 583 | Proto | The proactive mark is on the message (`Message.proactive`: kind, notify, reason, offer, rating); decisions get no field | One record per message; an offer is a marked decision card | Yes |
+| 584 | Proto | Proactive wake events carry their log entry number, never rendered | The hub finishes the right log entries at the turn's end, also after a requeue | Yes |
+| 585 | Proto | The brief has its own wake event `brief` | A turn must know that it is proactive; `routine` stays for custom routines | Yes |
+| 586 | Hub | The gate is pure code that takes `now`; the scheduler and stale timer pass the clock | Tests at any time; the hub decides before a model runs | Yes |
+| 587 | Hub | A check-in's change summary starts at the last check-in that ran or found nothing; quiet hours, snooze and pause do not move it | Night changes show in the first morning check-in | Yes |
+| 588 | Hub | Status entry times live in `task_status_since`, written by `transition` | `Task` has no status time | Yes |
+| 589 | Hub | A check-in whose last one still waits for its turn is `skipped_busy` | "Waited more than one interval" | Yes |
+| 590 | Hub | The notification limit counts notifying messages today in the user's zone; one per proactive turn | "The brief may notify once"; one rule for all kinds | Yes |
+| 591 | Hub | A proactive turn cannot use tools that widen access or change channels, models, connectors, skills or routines | Settings changes need the user | Yes |
+| 592 | Hub | Offers need the level Eager and a proactive turn; three fixed options | The level table | Yes |
+| 593 | Hub | Follow-ups keep key and set time in `follow_ups`; `Routine.created_at` is new | "Set this morning" in the Follow-ups row | Yes |
+| 594 | Hub | Defaults come once per hub; the brief once ever; a deleted check-in returns only on a level change | The user's delete stays | Yes |
+| 595 | Hub | Tutti's check-in note is written as the user | `MemoryAuthor` has no hub value | Yes |
+| 596 | Hub | The prompt fingerprint and the system prompt include the level | A level change reaches the coordinator | Yes |
+| 597 | Hub | Run now of a proactive routine passes the gate | The user asked for it | Yes |
+| 598 | Hub | The guided start is gated like other wakes (Off: none; paused: logged skip) | Pause all stops everything that starts on its own | Yes |
+| 599 | Client | The client sets the hub's time zone with `time_zone_if_unset` and loads 200 log entries before it subscribes | Handshake calls drop feed events | Yes |
+| 600 | Client | Nothing notifies in quiet hours or while snoozed, for every kind | CONTEXT defines quiet hours as hours with no notifications | Yes |
+| 601 | Client | A proactive message notifies only with `notify` and the "needs your attention" switch, never as a channel message | The plan's tier 2 never notifies | Yes |
+| 602 | Client | "You made the channel X." is drawn from `created_at`, not posted by the hub | No message the user did not see come | Yes |
+| 603 | Desktop | Level selects use fixed IDs by row; the option names the channel | Static menu anchors; picks stay on their channel | Yes |
+| 604 | Desktop | Quiet hours use 30-minute time boxes and a short zone list | The design's boxes; one zone picker with search lives in the routine dialog | Yes |
+| 605 | Desktop | The writing bubble's dabs are SVG glyphs in three versions on the shared clock | GPUI has no SVG noise | Yes |
+| 606 | Client cache | The saved cache keeps the proactivity settings (`meta.proactivity_settings`), the log entries (row kind `proactive_wake`) and `proactivity_log_has_more`. The load state and the last error stay out. | A resume from the saved cache loads no snapshot, so it would not load the log again. The settings and the log are hub data; the load state is screen state. | Yes |
+| 607 | Desktop | The Proactivity row of the channel settings dialog sits after Model and effort. A pick stays in the form and Save changes sends it as `ChannelUpdate.proactivity`. "Open message" in the log uses `open_message`, the same path as a search result, and scrolls at once when the client holds the message. | Design `GHK-0`; the dialog has one Save changes. One path to a message for search and the log. | Yes |

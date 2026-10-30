@@ -17,6 +17,7 @@ mod files;
 mod knowledge;
 mod link;
 mod outbox;
+mod proactivity;
 mod save;
 mod url;
 

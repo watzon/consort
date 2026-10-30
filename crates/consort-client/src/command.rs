@@ -186,6 +186,9 @@ pub struct ChannelChanges {
     pub allowed_local_mcp_servers: Option<Vec<String>>,
     /// Channel memory on or off.
     pub memory_enabled: Option<bool>,
+    /// The proactivity level of the channel. `Some(None)` goes back to the
+    /// default for the channel.
+    pub proactivity: Option<Option<consort_proto::model::ProactivityLevel>>,
     /// The attached repos, in order. A new URL is made with `repo.create`
     /// first.
     pub repos: Option<Vec<crate::convo::RepoChoice>>,
@@ -688,6 +691,30 @@ pub enum Command {
     /// Sets the order of the groups (`group.reorder`).
     ReorderGroups {
         group_ids: Vec<String>,
+    },
+    // Settings > Proactivity. See `crate::proactivity`.
+    /// Loads the newest page of the proactivity log.
+    LoadProactivityLog,
+    /// Changes the settings: Pause all, the quiet hours, the time zone.
+    SetProactivity(crate::proactivity::ProactivityChanges),
+    /// Snoozes what starts on its own, or ends the snooze.
+    SnoozeProactivity(crate::proactivity::SnoozeOption),
+    /// Deletes the follow-ups that the assistant set, in one channel or in
+    /// every channel. One follow-up goes with [`Command::DeleteRoutine`].
+    CancelAllFollowUps {
+        channel_id: Option<String>,
+    },
+    /// Sets the proactivity level of a channel. `None` goes back to the
+    /// default for the channel.
+    SetChannelProactivity {
+        channel_id: String,
+        level: Option<consort_proto::model::ProactivityLevel>,
+    },
+    /// Rates a proactive message: Useful or Too noisy. `None` takes the
+    /// rating back.
+    RateMessage {
+        message_id: String,
+        rating: Option<consort_proto::model::ProactiveRating>,
     },
 }
 

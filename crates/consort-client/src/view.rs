@@ -93,6 +93,8 @@ pub struct ViewState {
     /// Phase 4: message threads, search, the open task item, the archived
     /// tasks and the repos. See [`crate::convo`].
     pub convo: crate::convo::ConvoView,
+    /// Settings > Proactivity. See [`crate::proactivity`].
+    pub proactivity: crate::proactivity::ProactivityView,
 }
 
 /// A message that the hub refused after it left the composer.
@@ -690,6 +692,8 @@ pub struct DecisionCardView {
     /// When the hub wrote it, in Unix milliseconds.
     pub created_at: i64,
     pub decision: DecisionView,
+    /// Set on an offer or a decision that the assistant asked on its own.
+    pub proactive: Option<crate::proactivity::ProactiveMarkView>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -741,6 +745,11 @@ pub struct MessageView {
     pub reactions: Vec<crate::convo::ReactionView>,
     /// "Last reply 9:31 AM", for a message with replies.
     pub last_reply_label: Option<String>,
+    /// The mark of a message that the assistant posted on its own.
+    pub proactive: Option<crate::proactivity::ProactiveMarkView>,
+    /// Quick replies. Only the newest assistant message has them, until
+    /// the user answers.
+    pub suggestions: Vec<crate::proactivity::SuggestionView>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]

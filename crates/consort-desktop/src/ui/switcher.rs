@@ -198,6 +198,56 @@ impl ConsortApp {
         }
     }
 
+    /// Opens a message in its channel and scrolls to it. A reply in a task
+    /// thread opens that thread. A reply in a message thread opens the
+    /// panel of the thread and scrolls to its root. The client loads older
+    /// pages first when it does not hold the message yet. Search results
+    /// and the proactivity log use this.
+    pub fn open_message(
+        &mut self,
+        channel_id: String,
+        message_id: String,
+        thread_root_id: Option<String>,
+        task_id: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let client = self.client.clone();
+        if self.state.channel(&channel_id).is_some() {
+            self.open_channel(channel_id.clone(), window, cx);
+        }
+        match (thread_root_id, task_id) {
+            (Some(_), Some(task)) => self.open_thread(task, window, cx),
+            (Some(root), None) => {
+                self.convo.scroll_to = Some(root.clone());
+                let (c2, r2) = (channel_id.clone(), root.clone());
+                let find = client.clone();
+                self.spawn_command(cx, async move {
+                    find.run(consort_client::Command::FindMessage {
+                        channel_id: c2,
+                        message_id: r2,
+                    })
+                    .await
+                });
+                self.open_message_thread(root, window, cx);
+            }
+            (None, _) => {
+                self.convo.scroll_to = Some(message_id.clone());
+                self.spawn_command(cx, async move {
+                    client
+                        .run(consort_client::Command::FindMessage {
+                            channel_id,
+                            message_id,
+                        })
+                        .await
+                });
+            }
+        }
+        // A message that the client holds already scrolls into view now.
+        // Otherwise it scrolls when the older pages arrive.
+        self.follow_convo(cx);
+    }
+
     /// Opens a hub result in place: a message in its channel, a reply in
     /// its thread, a task in its thread, a memory note in the Memory tab or in
     /// Settings > Memory.
@@ -211,36 +261,7 @@ impl ConsortApp {
                 thread_root_id,
                 task_id,
             } => {
-                if self.state.channel(&channel_id).is_some() {
-                    self.open_channel(channel_id.clone(), window, cx);
-                }
-                match (thread_root_id, task_id) {
-                    (Some(_), Some(task)) => self.open_thread(task, window, cx),
-                    (Some(root), None) => {
-                        self.convo.scroll_to = Some(root.clone());
-                        let (c2, r2) = (channel_id.clone(), root.clone());
-                        let find = client.clone();
-                        self.spawn_command(cx, async move {
-                            find.run(consort_client::Command::FindMessage {
-                                channel_id: c2,
-                                message_id: r2,
-                            })
-                            .await
-                        });
-                        self.open_message_thread(root, window, cx);
-                    }
-                    (None, _) => {
-                        self.convo.scroll_to = Some(message_id.clone());
-                        self.spawn_command(cx, async move {
-                            client
-                                .run(consort_client::Command::FindMessage {
-                                    channel_id,
-                                    message_id,
-                                })
-                                .await
-                        });
-                    }
-                }
+                self.open_message(channel_id, message_id, thread_root_id, task_id, window, cx);
             }
             SearchTarget::Task {
                 task_id,

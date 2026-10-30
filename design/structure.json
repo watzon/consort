@@ -198,7 +198,8 @@
       "dialog_settings": 880, "settings_column_gap": 28, "dialog_small": 460, "dialog_group": 400,
       "dialog_about": 440, "about_mark": 80, "wordmark": { "size": 28, "line": 34, "weight": 700, "tracking": 0 },
       "icon_choice": 38, "brief_box": 96, "instructions_box": 100, "root_ring": 1, "drag_line": 2
-    }
+    },
+    "proactivity": { "level_select": 112, "time_box": 72, "zone_select": 168, "filter_select": 146, "log_time": 68, "log_place": 112, "log_result": 176, "log_pad_y": 10, "count_bar": 4, "mark_icon": 14, "mark_gap": 6, "mark_indent": 4, "reason_indent": 20, "chip_pad_x": 14, "chip_pad_y": 5, "chip_gap": 6, "feedback_pad_x": 8, "feedback_pad_y": 2, "dab": 10, "dab_gap": 5, "dab_rise": 3, "dab_drop": 2, "writing_pad_x": 16, "writing_pad_y": 13, "offer_pad_top": 12, "offer_pad": 14, "brief_group_gap": 6 }
   },
   "derive": { "hover_delta_l": 0.035, "active_delta_l": 0.07, "selection_alpha": 0.28, "status_tint_alpha": 0.16, "scrim_alpha": { "dark": 0.55, "light": 0.3 }, "lightbox_alpha": 0.92 }
 }

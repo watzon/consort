@@ -141,8 +141,13 @@ impl Hub {
     pub(crate) async fn tool_ask_decision(
         &self,
         ctx: &ToolCtx,
-        args: AskDecisionArgs,
+        mut args: AskDecisionArgs,
     ) -> Result<Value> {
+        if args.offer {
+            // An offer always has the same three options.
+            args.options = crate::proactivity::tools::offer_options();
+            args.recommended_index = None;
+        }
         validate_decision(&args.question, &args.options, args.recommended_index)?;
         let (session, channel, task) = (ctx.session.clone(), ctx.channel.clone(), ctx.task.clone());
         let (decision_id, kick) = self
@@ -158,6 +163,9 @@ impl Hub {
                         &body,
                     )?,
                     None => {
+                        let mark = crate::proactivity::tools::decision_posting(
+                            tx, session.id, &channel, args.offer,
+                        )?;
                         let mut new = conversation::NewMessage::new(
                             channel.id,
                             Author::Assistant,
@@ -165,7 +173,12 @@ impl Hub {
                             body,
                         );
                         new.author_session_id = Some(session.id);
-                        tx.insert_message(new)?
+                        let mut card = tx.insert_message(new)?;
+                        if mark.is_some() {
+                            card.proactive = mark;
+                            tx.save_message(&card)?;
+                        }
+                        card
                     }
                 };
                 let decision = Decision {
@@ -220,12 +233,18 @@ impl Hub {
         // since the session started.
         let channel_id = ctx.channel.id;
         let paths = args.attachments.clone();
-        let (channel, attachments) = self
+        let session_id = ctx.session.id;
+        let requested = args.approval_mode;
+        let (channel, attachments, (proactive_mode, draft)) = self
             .store
             .read(move |conn| {
                 let channel = conversation::channel_or_404(conn, channel_id)?;
                 let attachments = super::chat::resolve_attachments(conn, channel_id, &paths)?;
-                Ok((channel, attachments))
+                // A task that a proactive turn starts runs in draft mode.
+                let mode = crate::proactivity::tools::task_approval_mode(
+                    conn, session_id, &channel, requested,
+                )?;
+                Ok((channel, attachments, mode))
             })
             .await?;
         let mut placement = PlacementRequest {
@@ -234,7 +253,7 @@ impl Hub {
             repos: args.repos,
             isolation: args.isolation,
         };
-        let mut approval_mode = args.approval_mode;
+        let mut approval_mode = proactive_mode;
         let limited = limit_to_channel(&channel, &mut placement, &mut approval_mode);
         if !limited.is_empty() {
             tracing::info!(channel_id = %channel_id, session_id = %ctx.session.id, "a coordinator asked for more than the channel allows, so the hub lowered the task");
@@ -274,11 +293,18 @@ impl Hub {
                 })
                 .await?;
         }
+        let mut notes = limited.for_assistant;
+        if draft {
+            self.note_turn_task(ctx, task.id).await?;
+            notes.push(
+                "You started this task on your own, so it runs in draft mode: every outward action waits for the user.".to_owned(),
+            );
+        }
         to_value(&StartTaskResult {
             task_id: task.id,
             status: task.status,
             status_reason: task.status_reason,
-            notes: limited.for_assistant,
+            notes,
         })
     }
 

@@ -98,7 +98,7 @@ fn parse_cron(expression: &str) -> Result<Cron> {
         })
 }
 
-fn parse_zone(time_zone: &str) -> Result<Tz> {
+pub(crate) fn parse_zone(time_zone: &str) -> Result<Tz> {
     time_zone.trim().parse::<Tz>().map_err(|_| {
         HubError::invalid(format!(
             "The time zone `{time_zone}` is not known. Use an IANA name such as America/Chicago."

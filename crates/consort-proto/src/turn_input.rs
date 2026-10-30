@@ -23,7 +23,7 @@ use std::fmt::{self, Write as _};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::ids::{ApprovalId, ChannelId, DecisionId, MessageId, RoutineId, TaskId};
-use crate::model::{ApprovalKind, ApprovalStatus};
+use crate::model::{ApprovalKind, ApprovalStatus, ChannelKind, ProactiveKind, ProactiveRating};
 use crate::status::TaskStatus;
 use crate::time::Timestamp;
 
@@ -169,6 +169,94 @@ pub enum WakeEvent {
         /// more channels.", or the result of a connector call.
         text: String,
     },
+    /// A check-in routine ran. The hub found a change or the check-in note
+    /// watches an outside source.
+    CheckIn {
+        /// The check-in routine.
+        routine: RoutineId,
+        /// What changed in the hub since the last check-in, one line each.
+        summary: String,
+        /// The check-in note, cut at 2 KiB.
+        note: String,
+        /// The findings of the last silent check-ins in this channel, newest
+        /// first, so the assistant does not report the same thing twice.
+        #[serde(default)]
+        recent_findings: Vec<String>,
+        /// The proactivity log entry. Not shown to the model.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        log: u64,
+    },
+    /// The morning brief ran.
+    Brief {
+        /// The brief routine.
+        routine: RoutineId,
+        /// What to put in the brief.
+        prompt: String,
+        /// The proactivity log entry. Not shown to the model.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        log: u64,
+    },
+    /// A follow-up that the assistant set came due.
+    FollowUp {
+        /// The follow-up routine. The hub deletes it after this turn.
+        routine: RoutineId,
+        /// Why the assistant set it.
+        reason: String,
+        /// When the assistant set it.
+        set_at: Timestamp,
+        /// The proactivity log entry. Not shown to the model.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        log: u64,
+    },
+    /// A task waited too long in Needs input or Ready for review.
+    StaleTask {
+        /// The task.
+        task: TaskId,
+        /// Its title.
+        title: String,
+        /// Its status.
+        status: TaskStatus,
+        /// Since when it has this status.
+        since: Timestamp,
+        /// The proactivity log entry. Not shown to the model.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        log: u64,
+    },
+    /// The daily research pass. The hub allows only read tools, memory
+    /// writes under `research/`, offers and `no_reply_needed`.
+    Research {
+        /// The research routine.
+        routine: RoutineId,
+        /// The proactivity log entry. Not shown to the model.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        log: u64,
+    },
+    /// The user rated a proactive message.
+    ProactiveFeedback {
+        /// The message.
+        message: MessageId,
+        /// The rating.
+        rating: ProactiveRating,
+        /// The proactivity log entry. Not shown to the model.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        log: u64,
+    },
+    /// The user made this channel. Greet and offer the guided start.
+    ChannelCreated {
+        /// The channel name.
+        name: String,
+        /// The channel kind.
+        kind: ChannelKind,
+        /// The proactivity log entry. Not shown to the model.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        log: u64,
+    },
+}
+
+// serde's `skip_serializing_if` passes a reference.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 fn approval_status_str(status: ApprovalStatus) -> &'static str {
@@ -251,6 +339,43 @@ impl WakeEvent {
             Self::MemorySuggestion { .. } => "memory_suggestion",
             Self::TuttiMessage { .. } => "tutti_message",
             Self::CardAnswered { .. } => "card_answered",
+            Self::CheckIn { .. } => "check_in",
+            Self::Brief { .. } => "brief",
+            Self::FollowUp { .. } => "follow_up",
+            Self::StaleTask { .. } => "stale_task",
+            Self::Research { .. } => "research",
+            Self::ProactiveFeedback { .. } => "proactive_feedback",
+            Self::ChannelCreated { .. } => "channel_created",
+        }
+    }
+
+    /// The proactive kind of this event, or `None` for an event that the
+    /// user or the work caused. A turn whose events are all proactive is a
+    /// proactive turn.
+    pub fn proactive_kind(&self) -> Option<ProactiveKind> {
+        Some(match self {
+            Self::CheckIn { .. } => ProactiveKind::CheckIn,
+            Self::Brief { .. } => ProactiveKind::Brief,
+            Self::FollowUp { .. } => ProactiveKind::FollowUp,
+            Self::StaleTask { .. } => ProactiveKind::StaleTask,
+            Self::Research { .. } => ProactiveKind::Research,
+            Self::ProactiveFeedback { .. } => ProactiveKind::Feedback,
+            Self::ChannelCreated { .. } => ProactiveKind::ChannelCreated,
+            _ => return None,
+        })
+    }
+
+    /// The proactivity log entry of a proactive event, when it has one.
+    pub fn log_id(&self) -> Option<u64> {
+        match self {
+            Self::CheckIn { log, .. }
+            | Self::Brief { log, .. }
+            | Self::FollowUp { log, .. }
+            | Self::StaleTask { log, .. }
+            | Self::Research { log, .. }
+            | Self::ProactiveFeedback { log, .. }
+            | Self::ChannelCreated { log, .. } => (*log != 0).then_some(*log),
+            _ => None,
         }
     }
 
@@ -336,8 +461,126 @@ impl WakeEvent {
                 ],
                 Some(text).filter(|t| !t.is_empty()).map(String::as_str),
             ),
+            Self::CheckIn {
+                routine,
+                summary,
+                note,
+                recent_findings,
+                ..
+            } => {
+                let text = check_in_text(summary, note, recent_findings);
+                element(
+                    out,
+                    name,
+                    &[("routine", Some(routine.to_string()))],
+                    Some(&text),
+                );
+            }
+            Self::Brief {
+                routine, prompt, ..
+            } => element(
+                out,
+                name,
+                &[("routine", Some(routine.to_string()))],
+                Some(prompt),
+            ),
+            Self::FollowUp {
+                routine,
+                reason,
+                set_at,
+                ..
+            } => element(
+                out,
+                name,
+                &[
+                    ("routine", Some(routine.to_string())),
+                    ("set_at", Some(set_at.to_rfc3339())),
+                ],
+                Some(reason),
+            ),
+            Self::StaleTask {
+                task,
+                title,
+                status,
+                since,
+                ..
+            } => element(
+                out,
+                name,
+                &[
+                    ("task", Some(task.to_string())),
+                    ("title", Some(title.clone())),
+                    ("status", Some(status.as_str().to_owned())),
+                    ("since", Some(since.to_rfc3339())),
+                ],
+                None,
+            ),
+            Self::Research { routine, .. } => {
+                element(out, name, &[("routine", Some(routine.to_string()))], None)
+            }
+            Self::ProactiveFeedback {
+                message, rating, ..
+            } => element(
+                out,
+                name,
+                &[
+                    ("message", Some(message.to_string())),
+                    ("rating", Some(rating.as_str().to_owned())),
+                ],
+                None,
+            ),
+            Self::ChannelCreated {
+                name: channel_name,
+                kind,
+                ..
+            } => element(
+                out,
+                name,
+                &[
+                    ("name", Some(channel_name.clone())),
+                    (
+                        "kind",
+                        Some(
+                            match kind {
+                                ChannelKind::Tutti => "tutti",
+                                ChannelKind::Standard => "standard",
+                            }
+                            .to_owned(),
+                        ),
+                    ),
+                ],
+                None,
+            ),
         }
     }
+}
+
+/// The text of a `check_in` element: the hub summary, the note and the
+/// recent findings, each under a short heading.
+fn check_in_text(summary: &str, note: &str, findings: &[String]) -> String {
+    let mut text = String::from("Changes since the last check-in:\n");
+    if summary.trim().is_empty() {
+        text.push_str("(none in the hub)\n");
+    } else {
+        text.push_str(summary.trim_end());
+        text.push('\n');
+    }
+    text.push_str("\nThe check-in note:\n");
+    if note.trim().is_empty() {
+        text.push_str("(no note)\n");
+    } else {
+        text.push_str(note.trim_end());
+        text.push('\n');
+    }
+    if !findings.is_empty() {
+        text.push_str("\nWhat you saw and did not report in recent check-ins:\n");
+        for finding in findings {
+            text.push_str("- ");
+            text.push_str(finding);
+            text.push('\n');
+        }
+    }
+    text.trim_end().to_owned()
 }
 
 /// Renders wake events as the `<events>` block of a coordinator turn, in
@@ -506,6 +749,108 @@ line 2</task_update>
             render_events(&[denied]),
             "<events>\n  <card_answered id=\"apr_00000000-0000-0000-0000-000000000007\" kind=\"connect_service\" outcome=\"denied\"/>\n</events>"
         );
+    }
+
+    #[test]
+    fn proactive_events_render_hide_their_log_entry_and_name_their_kind() {
+        let rtn: RoutineId = "rtn_00000000-0000-0000-0000-000000000005".parse().unwrap();
+        let task: TaskId = "tsk_00000000-0000-0000-0000-000000000003".parse().unwrap();
+        let msg: MessageId = "msg_00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let events = vec![
+            WakeEvent::CheckIn {
+                routine: rtn,
+                summary: "- Task \"Fix CI\" failed.".into(),
+                note: "Skip receipts & <newsletters>.".into(),
+                recent_findings: vec!["The quote did not change.".into()],
+                log: 7,
+            },
+            WakeEvent::FollowUp {
+                routine: rtn,
+                reason: "Check the vendor reply.".into(),
+                set_at: ts(),
+                log: 8,
+            },
+            WakeEvent::StaleTask {
+                task,
+                title: "Go through issues".into(),
+                status: TaskStatus::NeedsInput,
+                since: ts(),
+                log: 9,
+            },
+            WakeEvent::Research {
+                routine: rtn,
+                log: 10,
+            },
+            WakeEvent::ProactiveFeedback {
+                message: msg,
+                rating: ProactiveRating::TooNoisy,
+                log: 11,
+            },
+            WakeEvent::ChannelCreated {
+                name: "reading".into(),
+                kind: ChannelKind::Standard,
+                log: 12,
+            },
+            WakeEvent::Brief {
+                routine: rtn,
+                prompt: "Rank five items.".into(),
+                log: 13,
+            },
+        ];
+        let out = render_events(&events);
+        let expected = "<events>
+  <check_in routine=\"rtn_00000000-0000-0000-0000-000000000005\">Changes since the last check-in:
+- Task \"Fix CI\" failed.
+
+The check-in note:
+Skip receipts &amp; &lt;newsletters&gt;.
+
+What you saw and did not report in recent check-ins:
+- The quote did not change.</check_in>
+  <follow_up routine=\"rtn_00000000-0000-0000-0000-000000000005\" set_at=\"2026-10-28T21:49:00Z\">Check the vendor reply.</follow_up>
+  <stale_task task=\"tsk_00000000-0000-0000-0000-000000000003\" title=\"Go through issues\" status=\"needs_input\" since=\"2026-10-28T21:49:00Z\"/>
+  <research routine=\"rtn_00000000-0000-0000-0000-000000000005\"/>
+  <proactive_feedback message=\"msg_00000000-0000-0000-0000-000000000001\" rating=\"too_noisy\"/>
+  <channel_created name=\"reading\" kind=\"standard\"/>
+  <brief routine=\"rtn_00000000-0000-0000-0000-000000000005\">Rank five items.</brief>
+</events>";
+        assert_eq!(out, expected);
+        assert!(!out.contains("log"), "the log entry is for the hub only");
+        let kinds: Vec<_> = events.iter().map(WakeEvent::proactive_kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                Some(ProactiveKind::CheckIn),
+                Some(ProactiveKind::FollowUp),
+                Some(ProactiveKind::StaleTask),
+                Some(ProactiveKind::Research),
+                Some(ProactiveKind::Feedback),
+                Some(ProactiveKind::ChannelCreated),
+                Some(ProactiveKind::Brief),
+            ]
+        );
+        assert_eq!(events[0].log_id(), Some(7));
+        for event in &events {
+            let value = serde_json::to_value(event).unwrap();
+            assert_eq!(&serde_json::from_value::<WakeEvent>(value).unwrap(), event);
+        }
+        let user = WakeEvent::UserMessage {
+            id: msg,
+            thread: None,
+            at: ts(),
+            text: "hi".into(),
+        };
+        assert_eq!(user.proactive_kind(), None);
+        assert_eq!(user.log_id(), None);
+        // A check-in with no change and no note says so.
+        let bare = render_events(&[WakeEvent::CheckIn {
+            routine: rtn,
+            summary: String::new(),
+            note: String::new(),
+            recent_findings: Vec::new(),
+            log: 0,
+        }]);
+        assert!(bare.contains("(none in the hub)") && bare.contains("(no note)"));
     }
 
     #[test]

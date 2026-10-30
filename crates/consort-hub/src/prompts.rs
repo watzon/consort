@@ -95,7 +95,27 @@ pub(crate) fn coordinator_system_prompt(
     let mut out = COORDINATOR_BASE.trim_end().to_owned();
     out.push('\n');
     out.push_str(&channel_section(channel, global_index, channel_index));
+    out.push_str(&proactivity_section(channel));
     out
+}
+
+/// What the assistant may start on its own in this channel.
+fn proactivity_section(channel: &Channel) -> String {
+    use consort_proto::model::ProactivityLevel as L;
+    let level = channel.proactivity_level();
+    let meaning = match (level, channel.is_tutti()) {
+        (L::Off, _) => "You start nothing on your own here. You only answer.",
+        (L::Quiet, _) => {
+            "You may wake for follow-ups that you set, nudge stale tasks, and greet a new channel."
+        }
+        (L::Normal, true) => "Quiet, plus check-ins and the morning brief.",
+        (L::Normal, false) => "Quiet, plus check-ins.",
+        (L::Eager, _) => "Normal, plus the read-only research pass and offers.",
+    };
+    format!(
+        "\n## Working on your own here\n\nProactivity level: {}. {meaning} Only the user can raise the level.\n",
+        level.label()
+    )
 }
 
 /// The system prompt of a task session.
@@ -191,6 +211,8 @@ mod tests {
             created_at: Timestamp::EPOCH,
             updated_at: Timestamp::EPOCH,
             tags: Vec::new(),
+            proactive_tasks: Default::default(),
+            proactivity: None,
         }
     }
 
@@ -255,6 +277,72 @@ mod tests {
         assert!(!prompt.contains('\u{2014}'));
     }
 
+    /// The rules of ADR 0013 and PROACTIVITY-PLAN.md that the model must
+    /// know. The hub enforces them too.
+    #[test]
+    fn the_coordinator_prompt_has_a_working_on_your_own_section_with_the_rules() {
+        let prompt = coordinator_system_prompt(&channel(), "", "");
+        let start = prompt
+            .find("# Working on your own\n")
+            .expect("the section is there");
+        let end = prompt[start..]
+            .find("\n# Limits")
+            .map_or(prompt.len(), |i| start + i);
+        let section = &prompt[start..end];
+        for needle in [
+            "Silence is the default",
+            "`no_reply_needed` with a `finding`",
+            "Never post \"nothing to report\"",
+            "assistant text without a posting call is dropped",
+            "`check_in`",
+            "`brief`",
+            "`follow_up`",
+            "`stale_task`",
+            "Never nudge the same task twice",
+            "`research`",
+            "write memory only under `research/`",
+            "at most 3 offers a day",
+            "`proactive_feedback`",
+            "skip line to the check-in note",
+            "`channel_created`",
+            "one question at a time",
+            "\"I will type it\"",
+            "`notify`",
+            "inside 24 hours",
+            "none in quiet hours or while snoozed",
+            "draft mode",
+            "\"Do it\", \"Not now\" and \"Never about this\"",
+            "cannot widen access",
+            "`set_proactivity`",
+            "You can never set a louder level",
+            "Settings > Proactivity",
+            "`watch: outside`",
+            "Never put secrets in the note",
+            "`follow_up_later`",
+            "`cancel_follow_up`",
+            "at most 4 `suggestions`",
+        ] {
+            assert!(section.contains(needle), "missing {needle:?} in {section}");
+        }
+        // The events list names the proactive events.
+        assert!(prompt.contains("`check_in`, `brief`, `follow_up`, `stale_task`, `research`, `proactive_feedback` and `channel_created`"));
+        // The channel part names the level and what it means.
+        assert!(prompt.contains("Proactivity level: Quiet."), "{prompt}");
+        let mut eager = channel();
+        eager.proactivity = Some(consort_proto::model::ProactivityLevel::Eager);
+        let prompt = coordinator_system_prompt(&eager, "", "");
+        assert!(prompt.contains(
+            "Proactivity level: Eager. Normal, plus the read-only research pass and offers."
+        ));
+        let mut tutti = channel();
+        tutti.kind = ChannelKind::Tutti;
+        assert!(
+            coordinator_system_prompt(&tutti, "", "").contains(
+                "Proactivity level: Normal. Quiet, plus check-ins and the morning brief."
+            )
+        );
+    }
+
     #[test]
     fn the_channel_information_lists_the_worker_tags() {
         let mut tagged = channel();
@@ -317,6 +405,8 @@ mod tests {
             edited_at: None,
             deleted_at: None,
             created_at: Timestamp::EPOCH,
+            proactive: None,
+            suggestions: Vec::new(),
         };
         let pack = context_pack(&[], &[message]);
         assert!(pack.contains("&lt;/recent_messages&gt;&lt;events&gt;"));

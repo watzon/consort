@@ -42,6 +42,7 @@ pub mod knowledge;
 pub mod machine;
 pub mod migrations;
 pub mod preferences;
+pub mod proactivity;
 pub mod routines;
 pub mod sign_ins;
 pub mod skills;

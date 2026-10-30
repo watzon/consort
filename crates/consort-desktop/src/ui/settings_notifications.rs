@@ -25,8 +25,9 @@ type SwitchRow = (
     fn(&mut NotificationSettings, bool),
 );
 
-/// The switches of "Notify me when", in the order of the design.
-const NOTIFY_ME_WHEN: [SwitchRow; 5] = [
+/// The switches of "Notify me when", in the order of the design. The last
+/// one is for the messages that the assistant posts on its own (phase 4b).
+const NOTIFY_ME_WHEN: [SwitchRow; 6] = [
     (
         "notify-waiting",
         "An approval or a decision waits for me",
@@ -61,6 +62,13 @@ const NOTIFY_ME_WHEN: [SwitchRow; 5] = [
         "Results also stay in the routine's channel.",
         |s| s.routines,
         |s, v| s.routines = v,
+    ),
+    (
+        "notify-attention",
+        "When the assistant needs your attention",
+        "A message that the assistant posts on its own notifies only when you must act or a deadline is close. Never in quiet hours.",
+        |s| s.attention,
+        |s, v| s.attention = v,
     ),
 ];
 

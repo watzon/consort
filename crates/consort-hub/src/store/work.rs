@@ -178,6 +178,7 @@ impl Tx<'_> {
     /// approvals and decisions. The feed gets a delete for each.
     pub fn purge_task(&mut self, task: &Task) -> Result<()> {
         self.end_deleted_task_run(task.id)?;
+        self.forget_task_status(task.id)?;
         let id = task.id.to_string();
         let channel = task.channel_id;
 

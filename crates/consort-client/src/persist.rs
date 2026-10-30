@@ -29,7 +29,7 @@ use std::{
 
 use consort_proto::model::{
     Approval, Channel, ChannelFile, Client, Connection, Decision, Group, MemoryNote, Message,
-    Preferences, ReadMarker, Repo, Routine, RoutineRun, Skill, Task, Worker,
+    Preferences, ProactiveWake, ReadMarker, Repo, Routine, RoutineRun, Skill, Task, Worker,
 };
 use rusqlite::{OptionalExtension as _, params};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -140,6 +140,7 @@ const SESSION_ACTIVITY: &str = "session_activity";
 const CONNECTION: &str = "connection";
 const SKILL: &str = "skill";
 const CLIENT: &str = "client";
+const PROACTIVE_WAKE: &str = "proactive_wake";
 
 // The keys of the meta table.
 const SEQ: &str = "seq";
@@ -158,6 +159,8 @@ const HAS_OLDER: &str = "has_older";
 const CHANNELS_LOADED: &str = "channels_loaded";
 const LOADED_THREADS: &str = "loaded_threads";
 const PREFERENCES: &str = "preferences";
+const PROACTIVITY_SETTINGS: &str = "proactivity_settings";
+const PROACTIVITY_LOG_HAS_MORE: &str = "proactivity_log_has_more";
 
 /// A memory note with the flag that says whether its text is loaded.
 #[derive(Serialize, Deserialize)]
@@ -191,6 +194,8 @@ fn row<T: Serialize>(kind: &'static str, id: &str, value: &T) -> Result<Row, Per
 /// - `pending` and `send_failures`: the outbox has its own file.
 /// - `acp_registry*`, `extensions`, `local_blobs`, `admin` (without the
 ///   paired clients): the app asks the hub for them when a page needs them.
+/// - `proactivity` (without the settings, the log entries and whether older
+///   entries exist): the load state and the last error are screen state.
 pub fn rows(cache: &Cache, fresh_at: i64, owner: &Owner) -> Result<Rows, PersistError> {
     let mut entities = Vec::new();
     for (id, v) in &cache.groups {
@@ -258,6 +263,9 @@ pub fn rows(cache: &Cache, fresh_at: i64, owner: &Owner) -> Result<Rows, Persist
     for (id, v) in &cache.admin.clients {
         entities.push(row(CLIENT, id, v)?);
     }
+    for (id, v) in &cache.proactivity.wakes {
+        entities.push(row(PROACTIVE_WAKE, &id.to_string(), v)?);
+    }
     let mut meta = BTreeMap::new();
     meta.insert(SEQ, cache.seq.to_string());
     meta.insert(FRESH_AT, fresh_at.to_string());
@@ -275,6 +283,11 @@ pub fn rows(cache: &Cache, fresh_at: i64, owner: &Owner) -> Result<Rows, Persist
     meta.insert(CHANNELS_LOADED, json(&cache.channels_loaded)?);
     meta.insert(LOADED_THREADS, json(&cache.loaded_threads)?);
     meta.insert(PREFERENCES, json(&cache.preferences)?);
+    meta.insert(PROACTIVITY_SETTINGS, json(&cache.proactivity.settings)?);
+    meta.insert(
+        PROACTIVITY_LOG_HAS_MORE,
+        json(&cache.proactivity.log_has_more)?,
+    );
     Ok(Rows { entities, meta })
 }
 
@@ -374,6 +387,10 @@ fn restore_row(cache: &mut Cache, kind: &str, id: String, text: &str) -> Result<
         CLIENT => {
             cache.admin.clients.insert(id, parse::<Client>(text)?);
         }
+        PROACTIVE_WAKE => {
+            let wake = parse::<ProactiveWake>(text)?;
+            cache.proactivity.wakes.insert(wake.id, wake);
+        }
         // A kind that this version does not know came from a newer one that
         // kept the schema version. Leave it out. The next save removes it.
         _ => {}
@@ -403,6 +420,7 @@ fn restore(
         preferences: meta_value::<Preferences>(meta, PREFERENCES)?,
         ..Cache::default()
     };
+    cache.proactivity.settings = meta_value(meta, PROACTIVITY_SETTINGS)?;
     for (kind, id, text) in rows {
         restore_row(&mut cache, &kind, id, &text)?;
     }
@@ -414,6 +432,12 @@ fn restore(
     if !archived.tasks.is_empty() {
         archived.has_more = meta_value(meta, ARCHIVED_HAS_MORE)?;
         archived.load = crate::connectors::LoadState::Loaded;
+    }
+    // The log comes with the settings in the first load, and a resume does
+    // not load it again. A log with entries counts as loaded.
+    if !cache.proactivity.wakes.is_empty() {
+        cache.proactivity.log_has_more = meta_value(meta, PROACTIVITY_LOG_HAS_MORE)?;
+        cache.proactivity.log_load = crate::connectors::LoadState::Loaded;
     }
     Ok(cache)
 }
@@ -759,6 +783,8 @@ mod tests {
             edited_at: None,
             deleted_at: None,
             created_at: at(5),
+            proactive: None,
+            suggestions: Vec::new(),
         }
     }
 
@@ -868,6 +894,9 @@ mod tests {
             next_run_at: Some(at(100)),
             last_run_at: None,
             last_run_status: None,
+            kind: Default::default(),
+            origin: Default::default(),
+            created_at: None,
         };
         let run = RoutineRun {
             id: 12,
@@ -1034,6 +1063,28 @@ mod tests {
             paired_by: None,
         };
         cache.admin.clients.insert(client.id.to_string(), client);
+        cache.proactivity.settings = Some(consort_proto::model::ProactivitySettings {
+            paused: true,
+            time_zone: Some("America/Chicago".into()),
+            ..Default::default()
+        });
+        cache.proactivity.wakes.insert(
+            7,
+            ProactiveWake {
+                id: 7,
+                channel_id,
+                kind: consort_proto::model::ProactiveKind::CheckIn,
+                at: at(9),
+                outcome: consort_proto::model::ProactiveOutcome::Silent,
+                detail: Some("Nothing new.".into()),
+                message_ids: vec![],
+                task_id: None,
+                routine_id: Some(routine_id),
+                notify_held: false,
+                ended_at: Some(at(10)),
+            },
+        );
+        cache.proactivity.log_has_more = true;
         cache
     }
 
@@ -1085,6 +1136,7 @@ mod tests {
             extensions: _,
             admin,
             convo,
+            proactivity,
         } = a;
         macro_rules! same {
             ($($field:ident),+ $(,)?) => {
@@ -1139,6 +1191,27 @@ mod tests {
             format!("{:?}", b.admin.clients),
             "the paired clients differ"
         );
+        // The settings, the log entries and whether older entries exist are
+        // hub data. The load state and the last error are screen state.
+        assert_eq!(
+            format!(
+                "{:?}",
+                (
+                    &proactivity.settings,
+                    &proactivity.wakes,
+                    proactivity.log_has_more
+                )
+            ),
+            format!(
+                "{:?}",
+                (
+                    &b.proactivity.settings,
+                    &b.proactivity.wakes,
+                    b.proactivity.log_has_more
+                )
+            ),
+            "the proactivity data differs"
+        );
     }
 
     fn save(file: &mut CacheFile, cache: &Cache, fresh_at: i64) -> usize {
@@ -1154,8 +1227,8 @@ mod tests {
         let (mut file, saved) = CacheFile::open(&path, &owner()).unwrap();
         assert!(saved.is_none(), "a new file holds no data");
         let written = save(&mut file, &cache, 1_800_000_000_000);
-        // One row for each entity: 19 kinds, and two session items.
-        assert_eq!(written, 20);
+        // One row for each entity: 20 kinds, and two session items.
+        assert_eq!(written, 21);
         drop(file);
 
         let (_, saved) = CacheFile::open(&path, &owner()).unwrap();

@@ -615,6 +615,13 @@ fn release_coordinator(tx: &mut Tx<'_>, ctx: &mut Ctx<'_>, started: bool) -> Res
                 row.turn_started_at,
                 Some("The assistant stopped before it finished. Check what it did, then select Run now if something is missing."),
             )?;
+            tx.finish_proactive_turn(
+                &ctx.channel,
+                ctx.session.id,
+                &row,
+                TurnEndReason::Failed,
+                Some("The assistant stopped before it finished."),
+            )?;
         }
     }
     row.session_id = None;
@@ -1006,7 +1013,13 @@ fn coordinator_turn_ended(
         .tools_called
         .iter()
         .filter_map(|name| HubTool::from_name(name));
-    if reason == TurnEndReason::Completed && consort_proto::tools::needs_fallback_post(called) {
+    // A proactive turn that called no posting tool stays silent: its text is
+    // dropped, not posted.
+    let proactive = crate::proactivity::turn::classify(&row.turn_events).is_proactive();
+    if reason == TurnEndReason::Completed
+        && !proactive
+        && consort_proto::tools::needs_fallback_post(called)
+    {
         let text = ctx
             .runtime
             .last_assistant_text
@@ -1040,6 +1053,7 @@ fn coordinator_turn_ended(
         row.turn_started_at,
         failure,
     )?;
+    tx.finish_proactive_turn(&ctx.channel, ctx.session.id, &row, reason, failure)?;
     row.turn_open = false;
     row.turn_started_at = None;
     row.turn_events.clear();

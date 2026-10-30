@@ -32,6 +32,7 @@ pub mod motion;
 pub mod onboarding;
 pub mod panels;
 pub mod parts;
+pub mod proactivity;
 pub mod routines;
 pub mod schedule;
 pub mod settings;

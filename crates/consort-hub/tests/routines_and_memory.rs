@@ -57,7 +57,7 @@ async fn a_deleted_note_goes_to_recently_deleted_and_comes_back() {
         .await;
     assert_eq!(entry.entity_id, "global:people/kevin.md");
     // The note is gone from the list and from reads, and is in Recently
-    // deleted.
+    // deleted. The hub's own check-in note stays.
     assert!(
         world
             .client
@@ -65,7 +65,8 @@ async fn a_deleted_note_goes_to_recently_deleted_and_comes_back() {
             .await
             .unwrap()
             .notes
-            .is_empty()
+            .iter()
+            .all(|n| n.path == consort_proto::model::CHECK_IN_NOTE_PATH)
     );
     let deleted = world.client.request(list(true)).await.unwrap().notes;
     assert_eq!(deleted.len(), 1);
@@ -93,7 +94,15 @@ async fn a_deleted_note_goes_to_recently_deleted_and_comes_back() {
     assert_eq!(restored.version, 1);
     assert_eq!(restored.content, "Kevin.");
     assert_eq!(
-        world.client.request(list(false)).await.unwrap().notes.len(),
+        world
+            .client
+            .request(list(false))
+            .await
+            .unwrap()
+            .notes
+            .iter()
+            .filter(|n| n.path != consort_proto::model::CHECK_IN_NOTE_PATH)
+            .count(),
         1
     );
     assert!(
@@ -250,6 +259,7 @@ async fn a_rename_moves_the_note_and_its_versions() {
         .notes
         .into_iter()
         .map(|n| n.path)
+        .filter(|p| p != consort_proto::model::CHECK_IN_NOTE_PATH)
         .collect();
     assert_eq!(paths, vec!["people/kevin.md", "taken.md"]);
     world.hub.handle.shutdown().await.unwrap();

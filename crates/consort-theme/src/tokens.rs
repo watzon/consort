@@ -369,6 +369,7 @@ pub struct Components {
     pub sidebar: Sidebar,
     pub update_notice: UpdateNotice,
     pub chat: Chat,
+    pub proactivity: Proactivity,
     pub theme_preview: ThemePreview,
     pub convo: Convo,
 }
@@ -408,6 +409,38 @@ pub struct Convo {
     pub quick_emoji_text: Type,
     pub emoji_cell_text: Type,
     pub wordmark: Type,
+}
+
+/// The sizes of the proactivity screens. See `structure::Proactivity`.
+#[derive(Clone, Copy, Debug)]
+pub struct Proactivity {
+    pub level_select: Pixels,
+    pub time_box: Pixels,
+    pub zone_select: Pixels,
+    pub filter_select: Pixels,
+    pub log_time: Pixels,
+    pub log_place: Pixels,
+    pub log_result: Pixels,
+    pub log_pad_y: Pixels,
+    pub count_bar: Pixels,
+    pub mark_icon: Pixels,
+    pub mark_gap: Pixels,
+    pub mark_indent: Pixels,
+    pub reason_indent: Pixels,
+    pub chip_pad_x: Pixels,
+    pub chip_pad_y: Pixels,
+    pub chip_gap: Pixels,
+    pub feedback_pad_x: Pixels,
+    pub feedback_pad_y: Pixels,
+    pub dab: Pixels,
+    pub dab_gap: Pixels,
+    pub dab_rise: Pixels,
+    pub dab_drop: Pixels,
+    pub writing_pad_x: Pixels,
+    pub writing_pad_y: Pixels,
+    pub offer_pad_top: Pixels,
+    pub offer_pad: Pixels,
+    pub brief_group_gap: Pixels,
 }
 
 /// The sizes of the Hub, Clients and Notifications pages. See
@@ -794,6 +827,38 @@ impl Components {
                 pill_pad_x: px(c.chat.pill_pad_x),
                 pill_pad_y: px(c.chat.pill_pad_y),
                 brief_number: px(c.chat.brief_number),
+            },
+            proactivity: {
+                let p = &c.proactivity;
+                Proactivity {
+                    level_select: px(p.level_select),
+                    time_box: px(p.time_box),
+                    zone_select: px(p.zone_select),
+                    filter_select: px(p.filter_select),
+                    log_time: px(p.log_time),
+                    log_place: px(p.log_place),
+                    log_result: px(p.log_result),
+                    log_pad_y: px(p.log_pad_y),
+                    count_bar: px(p.count_bar),
+                    mark_icon: px(p.mark_icon),
+                    mark_gap: px(p.mark_gap),
+                    mark_indent: px(p.mark_indent),
+                    reason_indent: px(p.reason_indent),
+                    chip_pad_x: px(p.chip_pad_x),
+                    chip_pad_y: px(p.chip_pad_y),
+                    chip_gap: px(p.chip_gap),
+                    feedback_pad_x: px(p.feedback_pad_x),
+                    feedback_pad_y: px(p.feedback_pad_y),
+                    dab: px(p.dab),
+                    dab_gap: px(p.dab_gap),
+                    dab_rise: px(p.dab_rise),
+                    dab_drop: px(p.dab_drop),
+                    writing_pad_x: px(p.writing_pad_x),
+                    writing_pad_y: px(p.writing_pad_y),
+                    offer_pad_top: px(p.offer_pad_top),
+                    offer_pad: px(p.offer_pad),
+                    brief_group_gap: px(p.brief_group_gap),
+                }
             },
             theme_preview: ThemePreview {
                 bar: px(p.bar),

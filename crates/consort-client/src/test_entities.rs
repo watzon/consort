@@ -83,5 +83,7 @@ pub(crate) fn channel(
         created_at: Timestamp::from_millis(1),
         updated_at: Timestamp::from_millis(1),
         tags: Vec::new(),
+        proactive_tasks: Default::default(),
+        proactivity: None,
     }
 }

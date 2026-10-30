@@ -154,6 +154,11 @@ pub(crate) fn channel_update(
     if let Some(memory) = changes.memory_enabled {
         patch["memory_enabled"] = memory.into();
     }
+    // `null` goes back to the default level of the channel.
+    if let Some(level) = changes.proactivity {
+        patch["proactivity"] =
+            serde_json::to_value(level).map_err(|e| ClientError::Other(e.to_string()))?;
+    }
     // The caller turns new repo URLs into IDs first (`repo.create`).
     if let Some(repos) = changes.repos {
         let ids: Vec<String> = repos
@@ -876,6 +881,15 @@ async fn run(shared: Arc<Shared>, command: Command) -> Result<CommandOutput, Cli
         | Command::RevokeClient { .. }
         | Command::ClientPairingCode
         | Command::CancelClientPairing) => return super::admin::run(&shared, command).await,
+        // Settings > Proactivity.
+        command @ (Command::LoadProactivityLog
+        | Command::SetProactivity(_)
+        | Command::SnoozeProactivity(_)
+        | Command::CancelAllFollowUps { .. }
+        | Command::SetChannelProactivity { .. }
+        | Command::RateMessage { .. }) => {
+            return super::proactivity::run(&shared, command).await;
+        }
         // Routines and memory.
         command @ (Command::SaveRoutine { .. }
         | Command::SetRoutineEnabled { .. }

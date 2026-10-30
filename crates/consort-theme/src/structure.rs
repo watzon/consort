@@ -321,8 +321,70 @@ pub struct Components {
     pub sidebar: Sidebar,
     pub update_notice: UpdateNotice,
     pub chat: Chat,
+    pub proactivity: Proactivity,
     pub theme_preview: ThemePreview,
     pub convo: Convo,
+}
+
+/// The sizes of Settings > Proactivity, the proactive marks, the offer
+/// card, the quick-reply chips and the writing bubble. From the Paper
+/// artboards FYE-0, G2C-0, FDX-0 and FJC-0.
+#[derive(Clone, Copy, Debug, Deserialize)]
+pub struct Proactivity {
+    /// The level select of a channel row and of the channel settings dialog.
+    pub level_select: f32,
+    /// The From and To boxes of the quiet hours.
+    pub time_box: f32,
+    /// The time zone select of the quiet hours.
+    pub zone_select: f32,
+    /// The channel and kind filters of the log.
+    pub filter_select: f32,
+    /// The time lane of a log row.
+    pub log_time: f32,
+    /// The channel and kind lane of a log row.
+    pub log_place: f32,
+    /// The result lane of a log row.
+    pub log_result: f32,
+    /// The padding above and below a log row.
+    pub log_pad_y: f32,
+    /// The bar under the notification count.
+    pub count_bar: f32,
+    /// The icon of a proactive mark in the timeline.
+    pub mark_icon: f32,
+    /// The gap between the icon and the caption of a mark.
+    pub mark_gap: f32,
+    /// The indent of a mark from the bubble edge.
+    pub mark_indent: f32,
+    /// The indent of the reason line under a follow-up mark.
+    pub reason_indent: f32,
+    /// The padding at the sides of a quick-reply chip.
+    pub chip_pad_x: f32,
+    /// The padding above and below a quick-reply chip.
+    pub chip_pad_y: f32,
+    /// The gap between quick-reply chips and above them.
+    pub chip_gap: f32,
+    /// The padding at the sides of Useful and Too noisy.
+    pub feedback_pad_x: f32,
+    /// The padding above and below Useful and Too noisy.
+    pub feedback_pad_y: f32,
+    /// One dab of the writing bubble.
+    pub dab: f32,
+    /// The gap between the dabs.
+    pub dab_gap: f32,
+    /// How far the second dab sits above the line.
+    pub dab_rise: f32,
+    /// How far the first dab sits below the line.
+    pub dab_drop: f32,
+    /// The padding at the sides of the writing bubble.
+    pub writing_pad_x: f32,
+    /// The padding above and below the writing bubble.
+    pub writing_pad_y: f32,
+    /// The padding above the offer card content.
+    pub offer_pad_top: f32,
+    /// The padding at the sides and under the offer card content.
+    pub offer_pad: f32,
+    /// The gap between a brief group label and its items.
+    pub brief_group_gap: f32,
 }
 
 /// The sizes of Settings > Hub, Settings > Clients, the Pair a new app
@@ -831,6 +893,23 @@ mod tests {
             (a.dock_tile, a.dock_badge, a.banner_width),
             (40.0, 18.0, 360.0)
         );
+    }
+
+    #[test]
+    fn proactivity_tokens_keep_the_values_of_the_designs() {
+        let p = super::structure().component.proactivity;
+        assert_eq!(
+            (p.level_select, p.time_box, p.zone_select),
+            (112.0, 72.0, 168.0)
+        );
+        assert_eq!(
+            (p.log_time, p.log_place, p.log_result),
+            (68.0, 112.0, 176.0)
+        );
+        // The reason line starts under the caption: the icon and the gap.
+        assert_eq!(p.mark_icon + p.mark_gap, p.reason_indent);
+        assert_eq!((p.dab, p.dab_gap), (10.0, 5.0));
+        assert_eq!((p.chip_pad_x, p.chip_pad_y), (14.0, 5.0));
     }
 
     #[test]

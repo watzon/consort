@@ -322,10 +322,10 @@ impl Tx<'_> {
         failure: Option<&str>,
     ) -> Result<()> {
         for event in events {
-            let WakeEvent::Routine { id, .. } = event else {
+            let Some(id) = crate::proactivity::routines::routine_of(event) else {
                 continue;
             };
-            let Some(mut run) = running_run(self.db(), *id)? else {
+            let Some(mut run) = running_run(self.db(), id)? else {
                 continue;
             };
             if run.channel_id != channel_id {

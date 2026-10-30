@@ -14,6 +14,11 @@
 //! - Nothing notifies while its place is on screen in the active window: the
 //!   open channel for a message, the open task thread for a task.
 //! - Message text shows only when the user turns on "Show message text".
+//! - A message that the assistant posted on its own notifies only when the
+//!   hub marked it to notify, and only through "When the assistant needs
+//!   your attention". It never notifies as a message in a channel that is
+//!   not open.
+//! - Nothing notifies in quiet hours or while a snooze is on.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -41,6 +46,9 @@ pub struct NotificationSettings {
     pub show_text: bool,
     /// Show the count of what waits on the Dock icon.
     pub dock_badge: bool,
+    /// A message that the assistant posted on its own and marked to notify:
+    /// it needs the user to act, or a deadline is close.
+    pub attention: bool,
 }
 
 impl Default for NotificationSettings {
@@ -53,6 +61,7 @@ impl Default for NotificationSettings {
             routines: false,
             show_text: false,
             dock_badge: true,
+            attention: true,
         }
     }
 }
@@ -66,6 +75,8 @@ pub enum NotificationKind {
     Failed,
     Message,
     Routine,
+    /// A proactive message that the hub marked to notify.
+    Attention,
     /// Test notification in Settings > Notifications.
     Test,
 }
@@ -144,6 +155,9 @@ pub struct IncomingMessage {
     pub text: String,
     /// When the hub stored it, in Unix milliseconds.
     pub created_at: i64,
+    /// Set when the assistant posted it on its own: whether the hub marked
+    /// it to notify.
+    pub proactive: Option<bool>,
 }
 
 /// What needs the user, for notifications and the Dock badge.
@@ -158,6 +172,8 @@ pub struct AttentionView {
     pub tasks: Vec<TaskState>,
     /// The newest assistant messages in timelines, oldest first.
     pub messages: Vec<IncomingMessage>,
+    /// Quiet hours or a snooze is on now: nothing notifies.
+    pub quiet: bool,
 }
 
 /// How many assistant messages the attention view keeps.
@@ -251,6 +267,7 @@ pub(crate) fn attention(cache: &Cache) -> AttentionView {
             routine: m.author_routine_id.is_some(),
             text: crate::format::plain_text(&m.body),
             created_at: m.created_at.as_millis(),
+            proactive: m.proactive.as_ref().map(|p| p.notify),
         })
         .collect();
     messages.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
@@ -266,6 +283,10 @@ pub(crate) fn attention(cache: &Cache) -> AttentionView {
         waiting,
         tasks,
         messages,
+        quiet: crate::proactivity::quiet_now(
+            cache.proactivity.settings.as_ref(),
+            crate::format::now_ms(),
+        ),
     }
 }
 
@@ -359,7 +380,12 @@ fn task_notification(task: &TaskState, show_text: bool) -> Notification {
 }
 
 fn message_notification(message: &IncomingMessage, show_text: bool) -> Notification {
-    let (kind, hidden) = if message.routine {
+    let (kind, hidden) = if message.proactive.is_some() {
+        (
+            NotificationKind::Attention,
+            "The assistant needs your attention.",
+        )
+    } else if message.routine {
         (NotificationKind::Routine, "A routine posted a result.")
     } else {
         (NotificationKind::Message, "The assistant posted a message.")
@@ -477,8 +503,9 @@ impl Notifier {
         let first = !self.primed;
         self.primed = true;
         let mut out = Vec::new();
+        let quiet = attention.quiet;
         let keep = |notification: Notification, wanted: bool, out: &mut Vec<Notification>| {
-            if !first && wanted && !on_screen(&notification.target, focus) {
+            if !first && !quiet && wanted && !on_screen(&notification.target, focus) {
                 out.push(notification);
             }
         };
@@ -523,10 +550,12 @@ impl Notifier {
                 continue;
             }
             until = until.max(message.created_at);
-            let wanted = if message.routine {
-                settings.routines
-            } else {
-                settings.messages
+            // A proactive message notifies only when the hub marked it, and
+            // never through the switch for messages.
+            let wanted = match message.proactive {
+                Some(notify) => notify && settings.attention,
+                None if message.routine => settings.routines,
+                None => settings.messages,
             };
             keep(
                 message_notification(message, settings.show_text),
@@ -587,6 +616,7 @@ mod tests {
             routine,
             text: "The lights are on.".into(),
             created_at: at,
+            proactive: None,
         }
     }
 
@@ -601,6 +631,7 @@ mod tests {
             waiting,
             tasks,
             messages,
+            quiet: false,
         }
     }
 

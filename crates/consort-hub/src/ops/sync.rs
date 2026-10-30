@@ -78,6 +78,7 @@ impl Hub {
                         preferences: Some(preferences::preferences(&tx)?),
                         connections: crate::store::connectors::connections(&tx)?,
                         skills: crate::store::skills::skills(&tx)?,
+                        proactivity: Some(crate::store::proactivity::settings(&tx)?),
                         ..Snapshot::default()
                     },
                     SnapshotScope::Channel(channel_id) => {

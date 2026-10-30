@@ -114,6 +114,19 @@ The hub's timeline and memory are the source of truth. A coordinator's harness s
 
 Because the session is a cache, the user can change a channel's harness or model at any time. The next coordinator session starts on the new choice with the same context pack.
 
+### The assistant on its own
+
+The assistant starts contact and work without a new message from the user: check-ins, the morning brief, follow-ups that it set, nudges on stale tasks, the guided start of a new channel, and (at the level Eager) a read-only research pass with offers. The decision is [ADR 0013](adr/0013-the-assistant-is-proactive-within-limits.md), and the design is [PROACTIVITY-PLAN.md](PROACTIVITY-PLAN.md). The code is `consort-hub/src/proactivity/`.
+
+The hub, not the prompt, decides when a proactive wake may run, before a model runs:
+
+- **Where wakes come from.** Routines with a kind (`check_in`, `brief`, `follow_up`, `research`) go through the scheduler, which hands them to `proactivity::routines::begin_proactive_run`. A hub timer finds stale tasks every 30 seconds (`proactivity::stale`). `channel.create` queues the guided start, and `message.rate` with Too noisy queues feedback.
+- **The gate** (`proactivity::gate`) is pure code with no I/O: the level of the channel, Pause all, snooze, quiet hours in the user's time zone, and the daily turn limit. A check-in also needs a change: the hub builds a change summary from its own state since the last check-in (`proactivity::summary`), and skips the check-in when nothing changed and the check-in note does not start with `watch: outside`. Every skip is a row in the proactivity log, except a wake that the level stops. A skipped wake queues no wake event, so no turn and no model run.
+- **The routines follow the level.** A channel gets its check-in at Normal and its research pass at Eager, and both pause below. Tutti gets the morning brief once. The hub gives existing hubs these routines once, at the first start with proactivity.
+- **The turn.** A turn whose events are all proactive is a proactive turn (`proactivity::turn`). Its text without a posting call is dropped. Its messages carry a `proactive` mark. A notification needs the time outside quiet hours and snooze, and room under the daily limit. Its tasks run in Ask. Tools that widen access are refused, and a research turn may only read. When the turn ends, its log entries get their outcome, a silent check-in counts toward back-off (six in a row double the interval, up to 12 hours; a user message resets it), and a follow-up deletes itself.
+
+The client shows the settings, the log, the marks, the offers, the quick-reply chips and the writing bubble. A proactive message notifies only when the hub marked it with `notify`, and only through the switch "When the assistant needs your attention". Nothing notifies in quiet hours or while snoozed.
+
 ### The model of the assistant
 
 Each channel has a coordinator selection (account, model and options such as the effort). A channel without its own selection uses Tutti's, so Tutti's selection is the default for every such channel. The user chooses it in the composer, in the New channel dialog, or with Model in the channel menu. The client sends `channel.update { coordinator_selection }` at once, and the hub stores it.
@@ -201,7 +214,7 @@ GPUI has its own executors and does not run on Tokio. The desktop app gets updat
 
 ### Notifications
 
-The desktop app shows a system notification when an approval or a decision waits, when a task moves to Ready for review or Failed, when the assistant posts in a channel that is not on screen, and, when the user turns it on, when a routine posts a result. The rules live in `consort-client` (`notify`): each event notifies once, nothing that was there at the first load notifies, and nothing notifies while its place is on screen in the active window. The desktop app only delivers: GPUI's `show_system_notification` posts it, and a click opens the task thread or the channel. The Dock icon shows the number of approvals and decisions that wait plus the tasks in Ready for review (macOS, through `objc2-app-kit`); Windows and Linux show the number in the window title. The switches live on the client, not on the hub. Message text is off by default. macOS shows notifications only for an app that runs from an app bundle.
+The desktop app shows a system notification when an approval or a decision waits, when a task moves to Ready for review or Failed, when the assistant posts in a channel that is not on screen, and, when the user turns it on, when a routine posts a result. The rules live in `consort-client` (`notify`): each event notifies once, nothing that was there at the first load notifies, and nothing notifies while its place is on screen in the active window. The desktop app only delivers: GPUI's `show_system_notification` posts it, and a click opens the task thread or the channel. The Dock icon shows the number of approvals and decisions that wait plus the tasks in Ready for review (macOS, through `objc2-app-kit`); Windows and Linux show the number in the window title. The switches live on the client, not on the hub. Message text is off by default. A message that the assistant posted on its own notifies only with its `notify` mark, through the switch "When the assistant needs your attention", and never as a message in a channel that is not open. Nothing notifies in quiet hours or while a snooze is on. macOS shows notifications only for an app that runs from an app bundle.
 
 ### Mobile
 

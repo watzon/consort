@@ -117,6 +117,10 @@ impl Tx<'_> {
     /// Queues a wake event. The caller must call `kick_coordinator` for the
     /// channel after the transaction commits.
     pub fn queue_wake(&mut self, channel_id: ChannelId, event: &WakeEvent) -> Result<()> {
+        if matches!(event, WakeEvent::UserMessage { .. }) {
+            // The user is here: check-ins go back to their own pace.
+            self.reset_check_in_backoff(channel_id)?;
+        }
         self.db().execute(
             "INSERT INTO wake_events (channel_id, event, created_at) VALUES (?1, ?2, ?3)",
             params![

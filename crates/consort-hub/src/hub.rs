@@ -195,6 +195,8 @@ impl Hub {
                         archived_at: None,
                         created_at: now,
                         updated_at: now,
+                        proactive_tasks: Default::default(),
+                        proactivity: None,
                     })?;
                 }
                 // No worker is connected yet.
@@ -217,6 +219,16 @@ pub(crate) async fn test_hub() -> (Hub, tempfile::TempDir) {
         .unwrap();
     // A test that needs the coordinator calls `test_hub_with_coordinators`.
     hub.coordinators.set_disabled(true);
+    // Nothing starts on its own, so a new channel queues no greeting. The
+    // tests of proactivity end the pause themselves.
+    hub.store
+        .write(|tx| {
+            let mut settings = crate::store::proactivity::settings(tx.db())?;
+            settings.paused = true;
+            tx.save_proactivity_settings(&settings)
+        })
+        .await
+        .unwrap();
     (hub, dir)
 }
 

@@ -373,11 +373,14 @@ The hub gives each session the tools for its role. Each tool's `input_schema` is
 
 | Tool | Arguments | Result |
 |---|---|---|
-| `post_message` | `body`, optional `attachments` (channel file paths) | `message_id` |
-| `reply` | `message_id`, `body`, optional `in_timeline` and `attachments` (channel file paths) | `message_id` |
+| `post_message` | `body`, optional `attachments` (channel file paths), `suggestions` (at most 4 quick replies, each `label` of at most 40 characters and `action` `send` or `type`) and `notify` (only in a proactive turn; see [The assistant on its own](#the-assistant-on-its-own)) | `message_id` |
+| `reply` | `message_id`, `body`, optional `in_timeline`, `attachments` (channel file paths) and `suggestions` | `message_id` |
 | `update_message` | `message_id`, `body` | Only for the session's own messages |
 | `react` | `message_id`, `emoji` | |
-| `no_reply_needed` | None | Ends the turn with no visible reply |
+| `no_reply_needed` | optional `finding` (one line, at most 300 characters) | Ends the turn with no visible reply. In a proactive turn the finding goes into the proactivity log and into the next check-in |
+| `follow_up_later` | `after_minutes` or `at`, `reason`, optional `key` | Makes a one-time routine of kind `follow_up` in this channel: `routine_id`, `at`, and `replaced` when the same `key` replaced a follow-up. At least 15 minutes and at most 30 days ahead, at most 20 waiting in a channel, and none in a channel at the level Off |
+| `cancel_follow_up` | `routine_id` or `key` | Deletes a follow-up of this channel |
+| `set_proactivity` | optional `level` (quieter or the same only), `channel_id` (Tutti only), `snooze` (`off`, `two_hours`, `until_tomorrow` or `week`) | `level` and `snoozed_until`. A louder level is `policy_denied` |
 | `fetch_timeline` | optional `before`, `limit` | Messages, newest first, and `has_more`. The page stops early when its messages would take more than 320 KiB |
 | `fetch_thread` | `message_id` (the root or any reply), optional `before` and `limit` | `root`, a page of `replies` (oldest first), `has_more`, and `message`: the reply that `message_id` names, when it is not in `replies`. All of it takes at most 320 KiB. The named reply is always whole. A long root is cut when the call names a reply, and the newest reply is cut when it alone does not fit. A cut message ends with a note that names its ID. With `before`, the page has the replies older than that reply, and no `message`. The default `limit` is 50, and the limit is 200 |
 | `memory_write` | `path`, `content`, `expected_sha256` or `"not_exists"`, optional `from_suggestion` (the `from` of the memory suggestion that the write keeps) | New `sha256`, or `stale_write`. Each write that changes the note posts the memory saved line in the session's channel (see [The memory saved line](#the-memory-saved-line)) |
@@ -390,6 +393,8 @@ The hub gives each session the tools for its role. Each tool's `input_schema` is
 | `interrupt_task`, `retry_task` | `task_id` | |
 | `routine_list`, `routine_create`, `routine_update`, `routine_delete` | Routine fields | `routine_create` and `routine_update` give `routine`, and `notes` when the hub lowered the placement of a `start_task` action |
 | `suggest_memory` | `note`, `reason` | Channel coordinators only. Sends the note to the Tutti coordinator as a global memory suggestion |
+
+`ask_decision` from a coordinator also takes `offer`. An offer is for a proactive turn in a channel at the level Eager: the hub sets the options "Do it", "Not now" and "Never about this", and marks the card as an offer.
 
 Text in a web page, a file or a message can steer a coordinator. So a task that a coordinator starts, with `start_task` or with a `start_task` routine, gets at most what its channel allows:
 
@@ -508,7 +513,45 @@ The hub writes the events into the turn text in this form:
 
 A suggestion from a channel coordinator has `from="chn_..."`. A decision answer with free text puts the text inside the element. The hub escapes `&`, `<` and `>` in text, and also `"`, `'`, tabs and line breaks in attribute values, so user text cannot close an element or add an event.
 
-A coordinator speaks only through `post_message`, `reply` and `no_reply_needed`. If a turn ends with assistant text and none of those three calls, the hub posts the last assistant message to the timeline.
+A coordinator speaks only through `post_message`, `reply` and `no_reply_needed`. If a turn ends with assistant text and none of those three calls, the hub posts the last assistant message to the timeline. A proactive turn is the exception: its text is dropped.
+
+### The assistant on its own
+
+These events wake a coordinator with no new message from the user. A turn whose events are all of these is a proactive turn ([ADR 0013](adr/0013-the-assistant-is-proactive-within-limits.md)):
+
+```xml
+<events>
+  <check_in routine="rtn_...">Changes since the last check-in:
+- Task "Fix CI" is now Failed.
+
+The check-in note:
+watch: outside
+Skip receipts.
+
+What you saw and did not report in recent check-ins:
+- The quote did not change.</check_in>
+  <brief routine="rtn_...">Write the morning brief. ...</brief>
+  <follow_up routine="rtn_..." set_at="2026-10-30T09:10:00Z">Check whether Brightline replied to the quote.</follow_up>
+  <stale_task task="tsk_..." title="Go through open Sayso issues" status="needs_input" since="2026-10-29T11:00:00Z"/>
+  <research routine="rtn_..."/>
+  <proactive_feedback message="msg_..." rating="too_noisy"/>
+  <channel_created name="reading" kind="standard"/>
+</events>
+```
+
+The stored events also hold the number of their proactivity log entry (`log`). The hub never writes it into the turn text.
+
+Before a model runs, the hub gates each wake in this order: the level of the channel (no log entry), Pause all, snooze, quiet hours, then the daily turn limit of the channel (8 in Tutti, 3 elsewhere). A check-in that passes is skipped as `skipped_no_change` when the change summary is empty and its check-in note does not start with `watch: outside`. A check-in whose last one still waits for its turn is `skipped_busy`. Quiet hours skip a check-in and hold a stale-task nudge until they end. Follow-ups, the brief and the research pass run in quiet hours. Snooze stops check-ins, nudges and the research pass. Pause all stops everything but feedback; a follow-up that comes due is skipped, logged and deleted. A manual Run now passes the gate.
+
+In a proactive turn:
+
+- Messages and decision cards get a `proactive` mark with the kind of the turn, and for a follow-up its reason.
+- `post_message` with `notify` notifies only outside quiet hours, snooze and Pause all, once per turn, and while the hub-wide count of notifying messages today is under the limit (3 by default). Otherwise the message posts without it, and the log entry gets `notify_held`.
+- `start_task` runs in Ask (draft mode), unless the channel's `proactive_tasks` is `channel_default`.
+- The tools that widen access or change settings are `policy_denied`: `connect_service`, `add_skill`, `request_access`, `set_channel_tags`, `set_channel_connector`, `set_channel_skill`, `set_worker_tags`, `set_account_extras`, `update_connection`, `update_skill`, `disconnect`, `remove_skill`, `install_tool`, `add_account`, `start_sign_in`, `create_channel`, `update_channel`, `archive_channel`, `set_default_model`, `update_this_channel` and the routine tools.
+- A turn whose only events are `research` may use only the read tools, `memory_write` under `research/`, `ask_decision` with `offer` (at most 3 offers a day), `run_connector_tool` for read tools, and `no_reply_needed`. Every other tool fails with "The research pass is read-only. Make an offer with ask_decision instead."
+
+A stale task is a task in Needs input for 24 hours or in Ready for review for 72 hours. It gets one `stale_task` event per status entry.
 
 ## Client API
 
@@ -545,7 +588,7 @@ A client that does not know these fields shows the preview, which ends with a no
 
 | Area | Types |
 |---|---|
-| Channels and groups | `channel.create`, `channel.update`, `channel.archive` (with `archived`, default true), `channel.delete`, `channel.move`, `group.create`, `group.update`, `group.delete`, `group.reorder`, `repo.create` |
+| Channels and groups | `channel.create` (a new channel at a level of Quiet or more queues a `channel_created` event: the guided start), `channel.update` (also `proactivity`: a level or `null` for the default, and `proactive_tasks`), `channel.archive` (with `archived`, default true), `channel.delete`, `channel.move`, `group.create`, `group.update`, `group.delete`, `group.reorder`, `repo.create` |
 | Messages | `message.send` (with `client_message_id`), `message.list` (a page of a timeline or a thread, newest first; the page stops early when its messages would take more than 768 KiB, and `has_more` is then true), `message.edit`, `message.delete`, `message.react`, `message.search` (with `query`, optional `channel_id`, `limit` and `kinds`: `message`, `memory_note` or `task`; empty finds every kind), `read.mark` |
 | Tasks | `task.create`, `task.update`, `task.get` (with `task_id`: the full task), `task.resolve`, `task.reopen`, `task.retry`, `task.interrupt`, `task.archive` (with `archived`, default true; archiving a resolved task stops its session and deletes its workspace), `task.list_archived` (with optional `channel_id`, `offset`, `limit`: a page of the archived tasks, the most recently archived first, with `tasks_cut` and `has_more`; long texts are cut as in a snapshot), `task.delete`, `task.items`, `task.item_detail` (with `session_id` and `item_id`) |
 | Waiting on the user | `approval.answer`, `decision.answer` |
@@ -556,6 +599,7 @@ A client that does not know these fields shows the preview, which ends with a no
 | Accounts | `account.create` (with `worker_id`, `harness`, `label`, optional `acp`, `env`; the result has `account_id`), `account.update` (with `worker_id`, `account_id`, optional `label`, `env_set`, `env_remove`, `extras_enabled`), `account.remove` and `account.sign_out` (with `worker_id` and `account_id`), `acp_registry.list` (the result has `agents`, each with `id`, `name`, `description`, `version`, `icon_url` and `supported`) |
 | Sign-in | `sign_in.start` (with `worker_id`, `account_id` and `method`; the result has `sign_in`), `sign_in.submit_code` (with `sign_in_id` and `code`), `sign_in.cancel` (with `sign_in_id`) |
 | Preferences | `preferences.set_favorite_model` (with `account_label`, `model` and `favorite`; the result has `preferences`) |
+| Proactivity | `proactivity.get`, `proactivity.set` (with optional `paused`, `quiet_hours` (`start` and `end`, `HH:MM`), `time_zone` (IANA), `time_zone_if_unset` (true: set the zone only when the hub has none; a client sends this at start), `notify_cap_per_day` (0 to 20)), `proactivity.snooze` (with `choice`: `off`, `two_hours`, `until_tomorrow` or `week`). Each result has `settings`. `proactivity.log` (with optional `channel_id`, `kind`, `before` (an entry number) and `limit` (default 100, at most 500); the result has `wakes`, newest first, and `has_more`). `proactivity.cancel_follow_ups` (with optional `channel_id`; the result has `canceled`). `message.rate` (with `message_id` and `rating`: `useful`, `too_noisy` or `null`; only a message with a `proactive` mark; Too noisy wakes the coordinator with a `proactive_feedback` event) |
 | Composio | `composio.set_key` (with `api_key`), `composio.remove_key`, `composio.status`. Each result has `status`: `key_present`, `key_hint` (the last 4 characters), `plan`, `usage` (`used`, `limit`, `resets_at`), `error` and `checked_at`. Never the key |
 | Connector catalog | `connector_catalog.search` (with optional `search`, `category`, `cursor`, `limit`; the result has `services` and `next_cursor`), `connector_catalog.categories`, `connector_catalog.service` (with `service`; the result has `service` and its `tools`) |
 | Connections | `connection.connect` (with `service`, `name`, optional `use_in`, `approvals`, `auth_scheme`, `credentials`, `approval_id`; the result is a connect attempt: `connection`, `redirect_url` and `expires_at`), `connection.update` (with `connection_id`, optional `name`, `use_in`, `approvals`), `connection.disconnect`, `connection.reconnect` (with `connection_id`, optional `credentials`), `connection.calls` (with `connection_id`, optional `before`, `limit`; the result has `calls`, newest first, and `has_more`) |

@@ -178,6 +178,7 @@ fn attention() -> AttentionView {
         }],
         tasks: Vec::new(),
         messages: Vec::new(),
+        quiet: false,
     }
 }
 

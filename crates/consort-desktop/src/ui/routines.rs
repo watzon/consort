@@ -13,7 +13,7 @@ use consort_client::{
         self as r, RoutineActionView, RoutineRunStatus, RoutineRunView, RoutineView, StatusTone,
     },
 };
-use consort_theme::Tokens;
+use consort_theme::{Tokens, Type};
 use gpui_kit::{
     AnyElement, Context, Div, Hsla, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
     ParentElement, SharedString, StatefulInteractiveElement as _, Styled, Window, div,
@@ -185,7 +185,14 @@ impl ConsortApp {
         cx: &mut Context<Self>,
     ) -> Div {
         let c = &t.colors;
-        let routines = self.routines_of(&self.channel_id.clone());
+        // Follow-ups that the assistant set have their own section.
+        let (follow_ups, routines): (Vec<RoutineView>, Vec<RoutineView>) = self
+            .routines_of(&self.channel_id.clone())
+            .into_iter()
+            .partition(|r| r.kind == consort_client::proactivity::RoutineKind::FollowUp);
+        let mut routines = routines;
+        // The check-in comes first, as in the design.
+        routines.sort_by_key(|r| r.kind != consort_client::proactivity::RoutineKind::CheckIn);
         let on = routines.iter().filter(|r| r.enabled).count();
         let channel_id = self.channel_id.clone();
         let new_button = icon_text_button("routine-new", "plus", "New routine", t)
@@ -194,7 +201,7 @@ impl ConsortApp {
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.open_routine_dialog(None, &channel_id, window, cx)
             }));
-        if routines.is_empty() {
+        if routines.is_empty() && follow_ups.is_empty() {
             let channel_id = self.channel_id.clone();
             return div().flex_1().min_h_0().p(t.space.lg).child(
                 div()
@@ -249,6 +256,9 @@ impl ConsortApp {
         for routine in &routines {
             list = list.child(self.routine_row(routine, RowPlace::Panel, t, cx));
         }
+        if !follow_ups.is_empty() {
+            list = list.child(self.render_follow_ups(&follow_ups, t, cx));
+        }
         div()
             .flex()
             .flex_col()
@@ -288,12 +298,30 @@ impl ConsortApp {
         let k = t.component.knowledge;
         let now = consort_client::format::now_ms();
         let id = routine.id.clone();
-        let status = r::status_line(routine, now);
+        let mut status = r::status_line(routine, now);
         let summary = r::summary_line(routine);
         let (words, action) = summary
             .rsplit_once(", ")
             .map(|(w, a)| (w.to_owned(), format!(", {a}")))
             .unwrap_or((summary.clone(), String::new()));
+        // A check-in: "Every 6 hours, uses check-in.md", and its last result
+        // from the proactivity log, such as "Stayed silent at 7:25.".
+        let check_in = routine.kind == consort_client::proactivity::RoutineKind::CheckIn;
+        let (words, action) = if check_in {
+            (format!("{words}, uses "), String::new())
+        } else {
+            (words, action)
+        };
+        if check_in
+            && routine.enabled
+            && let Some(result) = consort_client::proactivity::check_in_line(
+                &self.state.proactivity,
+                &routine.channel_id,
+            )
+        {
+            status.result = result;
+        }
+        let note_scope = self.memory_scope(&routine.channel_id);
         let menu_open = self.menu.as_ref().is_some_and(|m| {
             m.items.first().is_some_and(|i| {
                 i.action == MenuAction::Knowledge(KnowledgeAction::RunRoutine(id.clone()))
@@ -335,7 +363,20 @@ impl ConsortApp {
                             c.text_tertiary
                         },
                     ))
-                    .child(line(action, detail(t), c.text_tertiary)),
+                    .child(line(action, detail(t), c.text_tertiary))
+                    .when(check_in, |d| {
+                        d.child(
+                            text(
+                                consort_client::proactivity::CHECK_IN_NOTE_PATH,
+                                Type {
+                                    size: detail(t).size,
+                                    ..t.text.mono
+                                },
+                                c.text_secondary,
+                            )
+                            .font_family(t.font_mono.clone()),
+                        )
+                    }),
             )
             .child(
                 div()
@@ -401,6 +442,31 @@ impl ConsortApp {
                                 },
                             )),
                         )
+                        .when(check_in, |d| {
+                            let scope = note_scope.clone();
+                            d.child(
+                                row_button(
+                                    format!("routine-note-{}", routine.id),
+                                    "Open note",
+                                    None,
+                                    false,
+                                    t,
+                                )
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .on_click(cx.listener(
+                                    move |this, _, window, cx| {
+                                        cx.stop_propagation();
+                                        this.open_channel_tab(crate::app::ChannelTab::Memory, cx);
+                                        this.open_note_in_panel(
+                                            &scope,
+                                            consort_client::proactivity::CHECK_IN_NOTE_PATH,
+                                            window,
+                                            cx,
+                                        );
+                                    },
+                                )),
+                            )
+                        })
                         .child(div().flex_1())
                         .child(
                             icon_button(
@@ -459,7 +525,11 @@ impl ConsortApp {
                     .h(t.text.ui.line)
                     .w(t.icon.size)
                     .when(!enabled, |d| d.opacity(t.opacity.answered_dim))
-                    .child(icon("routine", t.icon.size, c.text_secondary)),
+                    .child(icon(
+                        if check_in { "eye" } else { "routine" },
+                        t.icon.size,
+                        c.text_secondary,
+                    )),
             )
             .child(lines)
             .child(

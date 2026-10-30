@@ -1049,6 +1049,42 @@ impl ConsortApp {
             cx,
         );
         let memory_on = form.memory;
+        let level_kind = if tutti {
+            consort_client::proactivity::LevelKind::Tutti
+        } else {
+            consort_client::proactivity::LevelKind::Standard
+        };
+        let level_select = crate::ui::proactivity::level_select(
+            crate::proactivity::CHANNEL_SETTINGS_LEVEL_SELECT,
+            id,
+            form.proactivity,
+            level_kind,
+            t.component.proactivity.level_select,
+            self,
+            t,
+            cx,
+        )
+        .w_full();
+        let proactivity = div()
+            .flex()
+            .flex_col()
+            .gap(t.space.xs + t.space.xxs)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(text("Proactivity", t.text.label, c.text_secondary))
+                    .when(form.proactivity.is_none(), |d| {
+                        d.child(text("Default for this channel", detail(t), c.text_tertiary))
+                    }),
+            )
+            .child(level_select)
+            .child(crate::ui::proactivity::level_helper_text(
+                form.proactivity,
+                level_kind,
+                t,
+            ));
         let assistant = div()
             .flex()
             .flex_col()
@@ -1064,6 +1100,7 @@ impl ConsortApp {
                 None,
                 t,
             ))
+            .child(proactivity)
             .child(
                 div()
                     .flex()

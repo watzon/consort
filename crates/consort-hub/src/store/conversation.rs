@@ -350,6 +350,7 @@ impl Tx<'_> {
             ));
         }
 
+        self.delete_channel_wakes(id)?;
         let db = self.db();
         for sql in [
             "DELETE FROM search_idx WHERE channel_id = ?1",
@@ -429,6 +430,8 @@ impl Tx<'_> {
             edited_at: None,
             deleted_at: None,
             created_at: now,
+            proactive: None,
+            suggestions: Vec::new(),
         };
         self.db().execute(
             "INSERT INTO messages (id, channel_id, thread_root_id, in_timeline, created_at,

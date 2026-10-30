@@ -37,6 +37,9 @@ mod notify_platform;
 mod offline_tests;
 #[cfg(test)]
 mod phase5_tests;
+mod proactivity;
+#[cfg(test)]
+mod proactivity_tests;
 mod read_marker;
 mod ui;
 mod waiting;
@@ -156,6 +159,14 @@ fn main() {
             .and_then(consort_client::mock_offline::screen_state)
     {
         // The hub is offline at start: saved data, a queued message.
+        Client::mock_with(state)
+    } else if mock
+        && let Some(state) = args
+            .screen
+            .as_deref()
+            .and_then(consort_client::mock_proactivity::screen_state)
+    {
+        // The phase 4b screens: the assistant on its own.
         Client::mock_with(state)
     } else if mock {
         Client::mock()

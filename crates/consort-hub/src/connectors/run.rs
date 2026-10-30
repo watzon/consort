@@ -321,6 +321,11 @@ impl Hub {
         self.connectors.client()?;
         let tool = self.connector_tool(&connection, &args.tool).await?;
         let kind = tool_kind(&tool);
+        if kind != consort_proto::model::ToolKind::Read && self.in_research_turn(ctx).await? {
+            return Err(crate::proactivity::turn::denied(
+                crate::proactivity::turn::RESEARCH_REFUSAL,
+            ));
+        }
         let scope = CallScope::of(ctx);
         let rule = connection.approvals.rule_for(kind);
         let decision = match rule {

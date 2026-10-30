@@ -295,11 +295,19 @@ impl Hub {
                     archived_at: None,
                     created_at: now,
                     updated_at: now,
+                    proactive_tasks: Default::default(),
+                    proactivity: None,
                 };
                 tx.save_channel(&channel)?;
-                Ok(channel)
+                // The guided start: the coordinator greets and offers setup.
+                let kick = crate::proactivity::channel_created(tx, &channel)?;
+                Ok((channel, kick))
             })
             .await?;
+        let (channel, kick) = channel;
+        if kick {
+            self.kick_coordinator(channel.id);
+        }
         Ok(ChannelResult { channel })
     }
 
@@ -368,11 +376,21 @@ impl Hub {
                 if let Some(tags) = request.tags {
                     channel.tags = normalize_tags(&tags)?;
                 }
+                if let Some(level) = request.proactivity {
+                    channel.proactivity = level;
+                }
+                if let Some(tasks) = request.proactive_tasks {
+                    channel.proactive_tasks = tasks;
+                }
                 if channel == before {
                     return Ok((channel, Default::default(), Vec::new()));
                 }
                 channel.updated_at = tx.now();
                 tx.save_channel(&channel)?;
+                if channel.proactivity_level() != before.proactivity_level() {
+                    // A check-in from Normal, the research pass at Eager.
+                    crate::proactivity::routines::sync_channel_routines(tx, &channel)?;
+                }
                 let moved = if channel.coordinator_selection != before.coordinator_selection {
                     let tutti = conversation::tutti_channel(tx.db())?;
                     let channels = conversation::channels(tx.db())?;

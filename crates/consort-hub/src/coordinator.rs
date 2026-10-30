@@ -216,9 +216,15 @@ fn main_text(event: &mut WakeEvent) -> Option<&mut String> {
         | WakeEvent::TaskUpdate { text, .. }
         | WakeEvent::TuttiMessage { text, .. }
         | WakeEvent::CardAnswered { text, .. } => Some(text),
-        WakeEvent::Routine { prompt, .. } => Some(prompt),
+        WakeEvent::Routine { prompt, .. } | WakeEvent::Brief { prompt, .. } => Some(prompt),
         WakeEvent::MemorySuggestion { note, .. } => Some(note),
         WakeEvent::DecisionAnswered { text, .. } => text.as_mut(),
+        WakeEvent::CheckIn { summary, .. } => Some(summary),
+        WakeEvent::FollowUp { reason, .. } => Some(reason),
+        WakeEvent::StaleTask { .. }
+        | WakeEvent::Research { .. }
+        | WakeEvent::ProactiveFeedback { .. }
+        | WakeEvent::ChannelCreated { .. } => None,
     }
 }
 
@@ -268,11 +274,12 @@ fn cut_event(event: &WakeEvent, room: usize) -> WakeEvent {
 fn prompt_fingerprint(channel: &Channel, tutti: &Channel, extensions_key: &str) -> String {
     let selection = channel.effective_coordinator_selection(tutti);
     let text = format!(
-        "{}\n{}\n{}\n{}\n{extensions_key}",
+        "{}\n{}\n{}\n{}\n{extensions_key}\n{}",
         channel.name,
         channel.purpose,
         channel.instructions,
-        serde_json::to_string(&selection).unwrap_or_default()
+        serde_json::to_string(&selection).unwrap_or_default(),
+        channel.proactivity_level().as_str()
     );
     crate::util::sha256(text.as_bytes()).to_string()
 }

@@ -152,7 +152,15 @@ async fn a_routine_runs_now_and_wakes_the_coordinator() {
         .routine;
     assert!(routine.next_run_at.is_some());
     let snapshot = world.client.snapshot(SnapshotScope::All).await;
-    assert_eq!(snapshot.routines.len(), 1);
+    // The hub's own check-in and morning brief are there too.
+    assert_eq!(
+        snapshot
+            .routines
+            .iter()
+            .filter(|r| r.kind == consort_proto::model::RoutineKind::Custom)
+            .count(),
+        1
+    );
 
     world
         .client

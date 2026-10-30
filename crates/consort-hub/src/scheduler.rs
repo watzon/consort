@@ -89,7 +89,12 @@ pub(crate) fn spawn(hub: &Hub) -> JoinHandle<()> {
 /// Runs every routine that is due now. A failure of one routine is logged
 /// and does not stop the others.
 pub(crate) async fn tick(hub: &Hub) {
-    let now = hub.now();
+    tick_at(hub, hub.now()).await;
+}
+
+/// Runs every routine that is due at `now`, as if the clock said `now`.
+/// Tests use it to run the schedule at a chosen time.
+pub(crate) async fn tick_at(hub: &Hub, now: Timestamp) {
     let due = match hub
         .store
         .read(move |conn| routines::due_routines(conn, now))
@@ -105,7 +110,10 @@ pub(crate) async fn tick(hub: &Hub) {
         if hub.shutdown.is_cancelled() {
             break;
         }
-        match hub.run_routine(&routine, RunTrigger::Schedule).await {
+        match hub
+            .run_routine_at(&routine, RunTrigger::Schedule, Some(now))
+            .await
+        {
             Ok(run) => {
                 tracing::info!(
                     routine = %routine.id,
@@ -167,10 +175,20 @@ impl Hub {
         routine: &Routine,
         trigger: RunTrigger,
     ) -> Result<RoutineRun> {
+        self.run_routine_at(routine, trigger, None).await
+    }
+
+    /// [`Hub::run_routine`] with the clock at `at`. `None` is now.
+    pub(crate) async fn run_routine_at(
+        &self,
+        routine: &Routine,
+        trigger: RunTrigger,
+        at: Option<Timestamp>,
+    ) -> Result<RoutineRun> {
         let id = routine.id;
         let begun = self
             .store
-            .write(move |tx| begin_run(tx, id, trigger))
+            .write(move |tx| begin_run(tx, id, trigger, at))
             .await?;
         match begun {
             Begun::Refused(reason) => Err(HubError::conflict(reason)),
@@ -241,8 +259,13 @@ impl Hub {
 
 /// The first transaction of a run. It reads the routine, decides whether it
 /// runs, and records the run.
-fn begin_run(tx: &mut Tx<'_>, id: RoutineId, trigger: RunTrigger) -> Result<Begun> {
-    let now = tx.now();
+fn begin_run(
+    tx: &mut Tx<'_>,
+    id: RoutineId,
+    trigger: RunTrigger,
+    at: Option<Timestamp>,
+) -> Result<Begun> {
+    let now = at.unwrap_or(tx.now());
     let mut routine = routines::routine_or_404(tx.db(), id)?;
     let scheduled = trigger == RunTrigger::Schedule;
     if scheduled && !is_due(&routine, now) {
@@ -262,6 +285,18 @@ fn begin_run(tx: &mut Tx<'_>, id: RoutineId, trigger: RunTrigger) -> Result<Begu
             "The channel of the routine is archived or missing. The routine did not run."
                 .to_owned(),
         ));
+    }
+
+    if let Some(kind) = routine.kind.proactive_kind() {
+        let channel = conversation::channel_or_404(tx.db(), routine.channel_id)?;
+        return Ok(
+            match crate::proactivity::routines::begin_proactive_run(
+                tx, routine, kind, &channel, now, scheduled,
+            )? {
+                Ok((run, wake)) => Begun::Recorded { run, wake },
+                Err(reason) => Begun::Refused(reason),
+            },
+        );
     }
 
     if still_running(tx, &routine, now)? {
@@ -356,7 +391,7 @@ fn begin_run(tx: &mut Tx<'_>, id: RoutineId, trigger: RunTrigger) -> Result<Begu
 /// Whether the last run of a routine still runs. A run whose work is gone
 /// (its prompt left the coordinator queue without a turn, or its task is
 /// gone or ended) ends here, so it never blocks the routine.
-fn still_running(tx: &mut Tx<'_>, routine: &Routine, now: Timestamp) -> Result<bool> {
+pub(crate) fn still_running(tx: &mut Tx<'_>, routine: &Routine, now: Timestamp) -> Result<bool> {
     let Some(mut run) = routines::running_run(tx.db(), routine.id)? else {
         return Ok(false);
     };
@@ -403,7 +438,7 @@ fn still_running(tx: &mut Tx<'_>, routine: &Routine, now: Timestamp) -> Result<b
 /// channel, or is in the open turn.
 fn prompt_waits(tx: &Tx<'_>, run: &RoutineRun) -> Result<bool> {
     let is_this =
-        |event: &WakeEvent| matches!(event, WakeEvent::Routine { id, .. } if *id == run.routine_id);
+        |event: &WakeEvent| crate::proactivity::routines::routine_of(event) == Some(run.routine_id);
     if coordinator::pending_wakes(tx.db(), run.channel_id)?
         .iter()
         .any(|(_, event)| is_this(event))
@@ -414,7 +449,7 @@ fn prompt_waits(tx: &Tx<'_>, run: &RoutineRun) -> Result<bool> {
     Ok(row.turn_open && row.turn_events.iter().any(is_this))
 }
 
-fn new_run(routine: &Routine, started_at: Timestamp, manual: bool) -> RoutineRun {
+pub(crate) fn new_run(routine: &Routine, started_at: Timestamp, manual: bool) -> RoutineRun {
     RoutineRun {
         id: 0,
         routine_id: routine.id,
@@ -429,7 +464,7 @@ fn new_run(routine: &Routine, started_at: Timestamp, manual: bool) -> RoutineRun
     }
 }
 
-fn skipped_run(routine: &Routine, due: Timestamp, reason: &str) -> RoutineRun {
+pub(crate) fn skipped_run(routine: &Routine, due: Timestamp, reason: &str) -> RoutineRun {
     RoutineRun {
         ended_at: Some(due),
         status: RoutineRunStatus::Skipped,
@@ -450,7 +485,7 @@ fn is_due(routine: &Routine, now: Timestamp) -> bool {
 /// A `once` routine turns off. A routine whose stored schedule is not valid
 /// any more (for example a time zone name that the hub no longer knows) also
 /// turns off. In that case the function returns the reason.
-fn advance(routine: &mut Routine, now: Timestamp) -> Option<String> {
+pub(crate) fn advance(routine: &mut Routine, now: Timestamp) -> Option<String> {
     if matches!(routine.schedule, RoutineSchedule::Once { .. }) {
         routine.enabled = false;
         routine.next_run_at = None;
@@ -465,7 +500,14 @@ fn advance(routine: &mut Routine, now: Timestamp) -> Option<String> {
     }
     match next_run_at(&routine.schedule, now) {
         Ok(next) => {
-            routine.next_run_at = next;
+            // The research pass starts a few minutes after its time, so
+            // routines that share a minute do not all start at once.
+            routine.next_run_at = match routine.kind {
+                consort_proto::model::RoutineKind::Research => {
+                    next.map(|at| at.plus_millis(crate::proactivity::gate::jitter_ms(routine.id)))
+                }
+                _ => next,
+            };
             None
         }
         Err(err) => {
@@ -509,12 +551,12 @@ fn join_errors(previous: Option<String>, schedule_error: Option<String>) -> Opti
 }
 
 /// Adds the reason from [`advance`] to the error of a run.
-fn add_schedule_error(run: &mut RoutineRun, schedule_error: Option<String>) {
+pub(crate) fn add_schedule_error(run: &mut RoutineRun, schedule_error: Option<String>) {
     run.error = join_errors(run.error.take(), schedule_error);
 }
 
 /// Copies a new run to the routine as its last run.
-fn note_last_run(routine: &mut Routine, run: &RoutineRun) {
+pub(crate) fn note_last_run(routine: &mut Routine, run: &RoutineRun) {
     routine.last_run_at = Some(run.started_at);
     routine.last_run_status = Some(run.status);
 }
@@ -559,6 +601,8 @@ pub(crate) mod testing {
             created_at: now,
             updated_at: now,
             tags: Vec::new(),
+            proactive_tasks: Default::default(),
+            proactivity: None,
         };
         let saved = channel.clone();
         hub.store
@@ -585,6 +629,9 @@ pub(crate) mod testing {
             next_run_at: None,
             last_run_at: None,
             last_run_status: None,
+            kind: Default::default(),
+            origin: Default::default(),
+            created_at: None,
         }
     }
 

@@ -279,6 +279,12 @@ impl MockBackend {
                 if let Some(chosen) = changes.coordinator_selection {
                     set_coordinator_selection(&mut state, &channel_id, chosen);
                 }
+                if let Some(level) = changes.proactivity {
+                    crate::mock_proactivity::apply(
+                        &mut state,
+                        Command::SetChannelProactivity { channel_id, level },
+                    )?;
+                }
             }
             Command::ArchiveChannel { channel_id } | Command::DeleteChannel { channel_id } => {
                 if state
@@ -781,6 +787,15 @@ impl MockBackend {
             | Command::ClientPairingCode
             | Command::CancelClientPairing) => {
                 applied.output = crate::mock_admin::apply(&mut state, command, &mut applied.later)?;
+            }
+            // Settings > Proactivity.
+            command @ (Command::LoadProactivityLog
+            | Command::SetProactivity(_)
+            | Command::SnoozeProactivity(_)
+            | Command::CancelAllFollowUps { .. }
+            | Command::SetChannelProactivity { .. }
+            | Command::RateMessage { .. }) => {
+                applied.output = crate::mock_proactivity::apply(&mut state, command)?;
             }
             // Routines and memory.
             command @ (Command::SaveRoutine { .. }
