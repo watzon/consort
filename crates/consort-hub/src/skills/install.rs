@@ -19,10 +19,11 @@ use consort_proto::model::{
 use consort_proto::tools::{AddSkillArgs, ManagementResult, SearchSkillsArgs, SearchSkillsResult};
 use serde_json::Value;
 
-use super::NewSkillFile;
 use super::directory::looks_like_entry_id;
-use super::git::{Repo, check_ref, normalize_repo_path, parse_git_url};
+use super::directory::with_ref;
+use super::git::{check_ref, normalize_repo_path, parse_git_url};
 use super::package::{Prepared, prepare, skill_invalid};
+use super::remote::{Remote, RemoteFiles};
 use super::upload::unpack_zip;
 use crate::error::{HubError, Result};
 use crate::hub::{Caller, Hub, ToolCtx};
@@ -93,33 +94,32 @@ fn skill_blocked(message: impl Into<String>) -> HubError {
     HubError::new(ErrorCode::SkillBlocked, message)
 }
 
-impl Hub {
-    /// Fetches the files of a skill folder in a git repo. Returns the
-    /// commit and the checked files.
-    async fn fetch_git_skill(
-        &self,
-        url: &str,
-        path: Option<&str>,
-        git_ref: Option<&str>,
-    ) -> Result<(String, Vec<NewSkillFile>)> {
-        let sources = &self.skill_sources;
-        let repo = Repo::fetch(sources.tmp_root(), url, git_ref, sources.git_options()).await?;
-        let files = repo.skill_files(path).await?;
-        Ok((repo.commit.clone(), files))
+/// The location text that a `SkillSource::Directory` records: a git repo with
+/// the ref it follows, or the marker of another type.
+fn directory_location(got: &RemoteFiles) -> String {
+    match Remote::parse(&got.url) {
+        Remote::Git(url) => with_ref(&url, got.git_ref.as_deref()),
+        _ => got.url.clone(),
     }
+}
 
+impl Hub {
     /// Fetches and checks a skill, or takes it from a recent preview.
+    /// `typed_by_user` is true for a request of a client: the user gave the
+    /// URL, so git may use the credentials of the hub's user for it (see
+    /// `git.rs`). A tool of the assistant passes false.
     pub(crate) async fn fetch_install_source(
         &self,
         source: &SkillInstallSource,
+        typed_by_user: bool,
     ) -> Result<Arc<Fetched>> {
         let key = source_key(source);
         if let Some(fetched) = self.skill_sources.preview(&key) {
             return Ok(fetched);
         }
-        let options = self.skill_sources.git_options();
         let fetched = match source {
             SkillInstallSource::Git { url, path, git_ref } => {
+                let options = self.git_options_for(url, typed_by_user).await?;
                 let target = parse_git_url(url, options)?;
                 let path = normalize_repo_path(path.as_deref().or(target.path.as_deref()))?;
                 let git_ref = git_ref
@@ -131,17 +131,22 @@ impl Hub {
                 if let Some(r) = &git_ref {
                     check_ref(r)?;
                 }
-                let (commit, files) = self
-                    .fetch_git_skill(&target.url, path.as_deref(), git_ref.as_deref())
+                let got = self
+                    .fetch_remote(
+                        &target.url,
+                        path.as_deref(),
+                        git_ref.as_deref(),
+                        typed_by_user,
+                    )
                     .await?;
                 Fetched {
                     source: SkillSource::Git {
-                        url: target.url,
+                        url: got.url,
                         path,
                         git_ref,
                     },
-                    commit: Some(commit),
-                    prepared: prepare(files, None)?,
+                    commit: Some(got.commit),
+                    prepared: prepare(got.files, None)?,
                     audits: Vec::new(),
                 }
             }
@@ -149,26 +154,26 @@ impl Hub {
                 let entry = self.directory_entry(source.as_deref(), entry_id).await?;
                 let repo = entry.repo_url.clone().ok_or_else(|| {
                     HubError::not_found(format!(
-                        "The skill {} has no git repo, so the hub cannot install it.",
+                        "The skill {} has no source that the hub can install from.",
                         entry.name
                     ))
                 })?;
-                // The directory's URL is checked like one that the user
-                // types. Directory skills follow the default branch.
-                let target = parse_git_url(&repo, options)?;
+                // The directory's location is checked like one that the user
+                // types. A git entry follows the branch that the directory
+                // names, or the default branch.
                 let path = normalize_repo_path(entry.path.as_deref())?;
-                let (commit, files) = self
-                    .fetch_git_skill(&target.url, path.as_deref(), None)
+                let got = self
+                    .fetch_remote(&repo, path.as_deref(), None, false)
                     .await?;
                 Fetched {
                     source: SkillSource::Directory {
                         directory: entry.directory,
                         entry_id: entry.entry_id.clone(),
-                        url: target.url,
+                        url: directory_location(&got),
                         path,
                     },
-                    commit: Some(commit),
-                    prepared: prepare(files, entry.license.clone())?,
+                    commit: Some(got.commit),
+                    prepared: prepare(got.files, entry.license.clone())?,
                     audits: entry.audits.clone(),
                 }
             }
@@ -227,7 +232,7 @@ impl Hub {
         _caller: &Caller,
         request: SkillPreview,
     ) -> Result<SkillPreviewResult> {
-        let fetched = self.fetch_install_source(&request.source).await?;
+        let fetched = self.fetch_install_source(&request.source, true).await?;
         let p = &fetched.prepared;
         let installed = self.installed_named(&p.name).await?;
         Ok(SkillPreviewResult {
@@ -286,7 +291,7 @@ impl Hub {
         if let Some(id) = request.approval_id {
             self.pending_install_card(id).await?;
         }
-        let fetched = self.fetch_install_source(&request.source).await?;
+        let fetched = self.fetch_install_source(&request.source, true).await?;
         let skill = self
             .install_fetched(&fetched, request.use_in, request.enabled)
             .await?;
@@ -372,7 +377,7 @@ impl Hub {
     }
 
     async fn fetch_card_again(&self, card: &SkillInstallCard) -> Result<Fetched> {
-        let (url, path, git_ref) = match &card.source {
+        let (location, path, git_ref) = match &card.source {
             SkillSource::Git { url, path, git_ref } => (url, path, git_ref.as_deref()),
             SkillSource::Directory { url, path, .. } => (url, path, None),
             SkillSource::Upload { .. } => {
@@ -381,20 +386,23 @@ impl Hub {
                 ));
             }
         };
-        let target = parse_git_url(url, self.skill_sources.git_options())?;
-        let wanted = card.commit.as_deref().or(git_ref);
-        let (commit, files) = self
-            .fetch_git_skill(&target.url, path.as_deref(), wanted)
+        // A git commit that the card shows is the ref to fetch.
+        let wanted = match Remote::parse(location) {
+            Remote::Git(_) => card.commit.as_deref().or(git_ref),
+            _ => None,
+        };
+        let got = self
+            .fetch_remote(location, path.as_deref(), wanted, false)
             .await?;
-        if card.commit.as_ref().is_some_and(|c| *c != commit) {
+        if card.commit.as_ref().is_some_and(|c| *c != got.commit) {
             return Err(HubError::conflict(
-                "The repo no longer has the commit that the card showed. Ask for the skill again.",
+                "The source no longer has the version that the card showed. Ask for the skill again.",
             ));
         }
         Ok(Fetched {
             source: card.source.clone(),
-            commit: Some(commit),
-            prepared: prepare(files, card.license.clone())?,
+            commit: Some(got.commit),
+            prepared: prepare(got.files, card.license.clone())?,
             audits: card.audits.clone(),
         })
     }
@@ -432,7 +440,9 @@ impl Hub {
                     .unwrap_or_else(|| Self::default_use_in(ctx)),
             )
             .await?;
-        let fetched = self.fetch_install_source(&source).await?;
+        // The assistant typed this source, not the user, so git uses no
+        // credentials for it unless the user gave the hub this URL before.
+        let fetched = self.fetch_install_source(&source, false).await?;
         let p = &fetched.prepared;
         if let Some(reason) = fetched.blocked_reason() {
             return Ok(serde_json::to_value(ManagementResult::refused(format!(

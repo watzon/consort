@@ -728,10 +728,25 @@ mod fake_agent {
                     let failure = match text {
                         "Expire" => Some((-32000, "Authentication required")),
                         "Break" => Some((-32603, "Internal error")),
+                        // What `claude-agent-acp` sends for an expired
+                        // OAuth token: an internal error that carries the
+                        // API error in its data.
+                        "Expire401" => Some((-32603, "Internal error")),
                         _ => None,
                     };
                     if let Some((code, message)) = failure {
-                        send(&mut write, json!({"jsonrpc": "2.0", "id": id.clone(), "error": {"code": code, "message": message}})).await;
+                        let mut error = json!({"code": code, "message": message});
+                        if text == "Expire401" {
+                            error["data"] = json!({
+                                "kind": "authentication_failed",
+                                "details": "Failed to authenticate. API Error: 401 {\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\"message\":\"OAuth token has expired. Please obtain a new token or refresh your existing token.\"}}"
+                            });
+                        }
+                        send(
+                            &mut write,
+                            json!({"jsonrpc": "2.0", "id": id.clone(), "error": error}),
+                        )
+                        .await;
                         continue;
                     }
                     prompts += 1;
@@ -1023,6 +1038,44 @@ mod fake_agent {
                 return out;
             }
         }
+    }
+
+    #[tokio::test]
+    async fn an_expired_claude_login_that_the_probe_cannot_see_ends_the_turn_with_login_expired() {
+        let (client_side, agent_side) = tokio::io::duplex(1 << 16);
+        let log = Arc::new(Mutex::new(Vec::new()));
+        tokio::spawn(run_agent(agent_side, log));
+        let (read, write) = tokio::io::split(client_side);
+        let (session, mut events, _ready) = connect(
+            HarnessKind::ClaudeCode,
+            spec(),
+            write,
+            read,
+            None,
+            StderrTail::empty(),
+        )
+        .await
+        .unwrap();
+        let mut session: Box<dyn HarnessSession> = Box::new(session);
+        let turn = events_of_turn(&mut session, &mut events, "Expire401").await;
+        let at = turn
+            .iter()
+            .position(|e| {
+                matches!(e, SessionEvent::Error { code, message }
+                    if code == crate::LOGIN_EXPIRED_ERROR_CODE && message == crate::LOGIN_EXPIRED_MESSAGE)
+            })
+            .expect("a login_expired error event");
+        assert_eq!(at, turn.len() - 2, "it comes right before TurnEnded");
+        assert!(matches!(
+            turn.last(),
+            Some(SessionEvent::TurnEnded { reason: TurnEndReason::Failed, error: Some(error), .. })
+                if error == crate::LOGIN_EXPIRED_MESSAGE
+        ));
+        // It is not a sign-out: that event is for a login that is gone.
+        assert!(!turn.iter().any(
+            |e| matches!(e, SessionEvent::Error { code, .. } if code == crate::SIGNED_OUT_ERROR_CODE)
+        ));
+        session.close().await.unwrap();
     }
 
     #[tokio::test]

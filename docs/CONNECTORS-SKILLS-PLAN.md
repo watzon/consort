@@ -261,11 +261,3 @@ The contract as built (the Rust names in `consort-proto`, and the wire names). S
 | `RequestAccess` | `request_access` | `RequestAccessArgs { connection, skill }` | `ManagementResult` | channel coordinator |
 
 `ManagementResult { status: ChangeStatus, summary, approval_id, channel_id, connection_id, skill_id, account_id }`, with `ChangeStatus` `applied`, `waiting_for_user`, `refused`, and the constructors `ManagementResult::applied`, `waiting_for_user(approval_id, ..)`, `refused`. `ConnectorToolInfo { slug, description, kind, approval }`. Constants: `CONNECTOR_TOOLS_LIST_MAX` (200), `CONNECTOR_RESULT_MAX_BYTES` (256 KiB), `CONNECTOR_APPROVAL_WAIT_MS` (5 minutes). The new audience constant is `CHANNEL_COORDINATOR_ONLY` (private, like the others). The args and results live in `tools/connectors.rs` and `tools/management.rs`, and are re-exported from `tools`.
-
-**Placeholders for step 2.** Each part answers `unsupported` ("Not built yet: <name>.") until it is built. Remove the entry when you build it:
-
-- Hub client requests: the or-pattern at the end of `consort-hub/src/api/mod.rs`.
-- Hub tools: `consort-hub/src/tools/mod.rs`, the `NOT_BUILT` list (which also keeps the tools out of `tool.list`) and the matching arm of `dispatch_tool`. Also make `tool.list` show the connector tools only when the session's channel has a connection, and `list_skills` and `read_skill` only for a harness with no native skills.
-- `skill_bundle.get`: `consort-hub/src/net/worker_ws.rs`.
-- The extras toggle: built in the worker (`accounts.rs`, `store.rs`, `core.rs`). See `docs/notes/step2-worker.md`.
-- The worker reads `SessionStart.extensions`, fetches and caches the skill bundles, writes the per-session skill folder and adds the context text to the system prompt. See `docs/notes/step2-worker.md`.

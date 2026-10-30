@@ -67,11 +67,48 @@ fn http_base(hub_url: &str) -> String {
     }
 }
 
-fn client() -> Result<reqwest::Client, WorkerError> {
+/// The time limits of the calls to the hub.
+#[derive(Debug, Clone, Copy)]
+pub struct HttpLimits {
+    /// The whole call, for a small request.
+    pub total: std::time::Duration,
+    /// Connecting, for a call that may take long (a large blob).
+    pub connect: std::time::Duration,
+    /// Waiting for the next bytes, for a call that may take long.
+    pub read: std::time::Duration,
+}
+
+impl HttpLimits {
+    /// What the worker uses.
+    pub const DEFAULT: Self = Self {
+        total: std::time::Duration::from_secs(60),
+        connect: std::time::Duration::from_secs(30),
+        read: std::time::Duration::from_secs(60),
+    };
+}
+
+fn client(limits: HttpLimits) -> Result<reqwest::Client, WorkerError> {
     reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
+        .timeout(limits.total)
         .build()
         .map_err(|e| WorkerError::Network(e.to_string()))
+}
+
+/// A failed call as the worker reports it. A time-out says how long the
+/// worker waited and what to check.
+fn network_error(err: &reqwest::Error, waited: std::time::Duration) -> WorkerError {
+    if err.is_timeout() {
+        let secs = waited.as_secs();
+        let limit = if secs == 0 {
+            format!("{} milliseconds", waited.as_millis().max(1))
+        } else {
+            format!("{secs} seconds")
+        };
+        return WorkerError::Network(format!(
+            "the hub did not answer within {limit}. Check that the hub is running and that this machine reaches it, then try again"
+        ));
+    }
+    WorkerError::Network(err.to_string())
 }
 
 async fn hub_error(response: reqwest::Response) -> WorkerError {
@@ -94,12 +131,13 @@ pub async fn pair_worker(
     request: &PairWorkerRequest,
 ) -> Result<WorkerId, WorkerError> {
     let url = format!("{}{PAIR_WORKER_PATH}", http_base(hub_url));
-    let response = client()?
+    let limits = HttpLimits::DEFAULT;
+    let response = client(limits)?
         .post(&url)
         .json(request)
         .send()
         .await
-        .map_err(|e| WorkerError::Network(e.to_string()))?;
+        .map_err(|e| network_error(&e, limits.total))?;
     if !response.status().is_success() {
         return Err(hub_error(response).await);
     }
@@ -126,7 +164,8 @@ pub async fn upload_blob(
         "PUT", &origin, &path, timestamp, worker_id,
     ));
     let url = format!("{}{path}", http_base(hub_url));
-    let response = client()?
+    let limits = HttpLimits::DEFAULT;
+    let response = client(limits)?
         .put(&url)
         .header(HEADER_WORKER_ID, worker_id.to_string())
         .header(HEADER_TIMESTAMP, timestamp.as_millis().to_string())
@@ -134,7 +173,7 @@ pub async fn upload_blob(
         .body(bytes)
         .send()
         .await
-        .map_err(|e| WorkerError::Network(e.to_string()))?;
+        .map_err(|e| network_error(&e, limits.total))?;
     if !response.status().is_success() {
         return Err(hub_error(response).await);
     }
@@ -151,6 +190,26 @@ pub async fn download_blob(
     sha256: &Sha256Hash,
     max_bytes: u64,
 ) -> Result<Vec<u8>, WorkerError> {
+    download_blob_within(
+        hub_url,
+        worker_id,
+        identity,
+        sha256,
+        max_bytes,
+        HttpLimits::DEFAULT,
+    )
+    .await
+}
+
+/// [`download_blob`] with other time limits, for tests.
+pub async fn download_blob_within(
+    hub_url: &str,
+    worker_id: WorkerId,
+    identity: &Identity,
+    sha256: &Sha256Hash,
+    max_bytes: u64,
+    limits: HttpLimits,
+) -> Result<Vec<u8>, WorkerError> {
     let origin = normalize_origin(hub_url).map_err(|e| WorkerError::Config(e.to_string()))?;
     let path = blob_path(sha256);
     let timestamp = Timestamp::now();
@@ -158,14 +217,14 @@ pub async fn download_blob(
         "GET", &origin, &path, timestamp, worker_id,
     ));
     let url = format!("{}{path}", http_base(hub_url));
-    let response = client()?
+    let response = client(limits)?
         .get(&url)
         .header(HEADER_WORKER_ID, worker_id.to_string())
         .header(HEADER_TIMESTAMP, timestamp.as_millis().to_string())
         .header(HEADER_SIGNATURE, signature.to_hex())
         .send()
         .await
-        .map_err(|e| WorkerError::Network(e.to_string()))?;
+        .map_err(|e| network_error(&e, limits.total))?;
     if !response.status().is_success() {
         return Err(hub_error(response).await);
     }
@@ -179,7 +238,7 @@ pub async fn download_blob(
     while let Some(chunk) = response
         .chunk()
         .await
-        .map_err(|e| WorkerError::Network(e.to_string()))?
+        .map_err(|e| network_error(&e, limits.total))?
     {
         if (body.len() as u64).saturating_add(chunk.len() as u64) > max_bytes {
             return Err(WorkerError::Network(format!(
@@ -204,6 +263,28 @@ pub async fn download_blob_to_file(
     max_bytes: u64,
     dest: &std::path::Path,
 ) -> Result<u64, WorkerError> {
+    download_blob_to_file_within(
+        hub_url,
+        worker_id,
+        identity,
+        sha256,
+        max_bytes,
+        dest,
+        HttpLimits::DEFAULT,
+    )
+    .await
+}
+
+/// [`download_blob_to_file`] with other time limits, for tests.
+pub async fn download_blob_to_file_within(
+    hub_url: &str,
+    worker_id: WorkerId,
+    identity: &Identity,
+    sha256: &Sha256Hash,
+    max_bytes: u64,
+    dest: &std::path::Path,
+    limits: HttpLimits,
+) -> Result<u64, WorkerError> {
     use tokio::io::AsyncWriteExt as _;
     let origin = normalize_origin(hub_url).map_err(|e| WorkerError::Config(e.to_string()))?;
     let path = blob_path(sha256);
@@ -213,8 +294,8 @@ pub async fn download_blob_to_file(
     ));
     let url = format!("{}{path}", http_base(hub_url));
     let client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(30))
-        .read_timeout(std::time::Duration::from_secs(60))
+        .connect_timeout(limits.connect)
+        .read_timeout(limits.read)
         .build()
         .map_err(|e| WorkerError::Network(e.to_string()))?;
     let mut response = client
@@ -224,7 +305,7 @@ pub async fn download_blob_to_file(
         .header(HEADER_SIGNATURE, signature.to_hex())
         .send()
         .await
-        .map_err(|e| WorkerError::Network(e.to_string()))?;
+        .map_err(|e| network_error(&e, limits.read))?;
     if !response.status().is_success() {
         return Err(hub_error(response).await);
     }
@@ -250,7 +331,7 @@ pub async fn download_blob_to_file(
     while let Some(chunk) = response
         .chunk()
         .await
-        .map_err(|e| WorkerError::Network(e.to_string()))?
+        .map_err(|e| network_error(&e, limits.read))?
     {
         written = written.saturating_add(chunk.len() as u64);
         if written > max_bytes {
@@ -265,6 +346,75 @@ pub async fn download_blob_to_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
+
+    /// A server that accepts a connection and never answers.
+    async fn silent_server() -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        (url, task)
+    }
+
+    fn short(limit: Duration) -> HttpLimits {
+        HttpLimits {
+            total: limit,
+            connect: limit,
+            read: limit,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_hub_that_never_answers_ends_a_blob_download_at_its_limit() {
+        let (url, task) = silent_server().await;
+        let identity = Identity::generate();
+        let hash = Sha256Hash::from_bytes([7; 32]);
+        let started = Instant::now();
+        let err = download_blob_within(
+            &url,
+            WorkerId::new(),
+            &identity,
+            &hash,
+            1024,
+            short(Duration::from_millis(400)),
+        )
+        .await
+        .unwrap_err();
+        let took = started.elapsed();
+        assert!(took >= Duration::from_millis(350), "{took:?}");
+        assert!(took < Duration::from_secs(10), "{took:?}");
+        let message = err.to_string();
+        assert!(
+            message.contains("did not answer within 400 milliseconds"),
+            "{message}"
+        );
+        assert!(message.contains("hub is running"), "{message}");
+
+        // A download to a file has its limit too, and leaves no file behind
+        // that could pass for a finished blob.
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("blob");
+        let started = Instant::now();
+        let err = download_blob_to_file_within(
+            &url,
+            WorkerId::new(),
+            &identity,
+            &hash,
+            1024,
+            &dest,
+            short(Duration::from_millis(400)),
+        )
+        .await
+        .unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(err.to_string().contains("did not answer within"), "{err}");
+        task.abort();
+    }
 
     #[test]
     fn urls() {

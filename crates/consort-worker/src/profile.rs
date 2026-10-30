@@ -440,6 +440,48 @@ mod tests {
         }
     }
 
+    /// OpenSSH finds `~/.ssh` through the password database, not through
+    /// `HOME`. So the own `HOME` of an OpenCode account hides the skills of
+    /// the real home, but not the ssh keys, the ssh config and `known_hosts`
+    /// of the user. This test shows it with `ssh -G`, which reads the user's
+    /// config and connects to nothing. It runs where `ssh` is installed and
+    /// the user has a password database entry (Linux and macOS).
+    #[cfg(unix)]
+    #[test]
+    fn openssh_ignores_the_own_home_of_an_opencode_account() {
+        let Ok(output) = std::process::Command::new("ssh").arg("-V").output() else {
+            return;
+        };
+        if !output.status.success() && output.stderr.is_empty() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("profile");
+        prepare_profile(HarnessKind::OpenCode, &profile).unwrap();
+        let env = profile_env(HarnessKind::OpenCode, &profile);
+        let own_home = std::path::PathBuf::from(&env["HOME"]);
+        // A config in the own home that sets a user name nobody else sets.
+        std::fs::create_dir_all(own_home.join(".ssh")).unwrap();
+        std::fs::write(
+            own_home.join(".ssh/config"),
+            "Host *\n  User user-from-the-own-home\n",
+        )
+        .unwrap();
+        let run = |home: &std::path::Path| {
+            let out = std::process::Command::new("ssh")
+                .args(["-G", "host.example.invalid"])
+                .env("HOME", home)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        let config = run(&own_home);
+        assert!(
+            !config.contains("user-from-the-own-home"),
+            "ssh read ~/.ssh/config from HOME, not from the password database:\n{config}"
+        );
+    }
+
     #[test]
     fn tools_of_the_user_keep_their_real_places() {
         let dir = tempfile::tempdir().unwrap();

@@ -249,6 +249,16 @@ impl TestRepo {
         std::os::unix::fs::symlink(target, full).unwrap();
     }
 
+    /// Starts a new branch at the current commit and switches to it.
+    pub fn branch(&self, name: &str) {
+        run_git(self.dir.path(), &["checkout", "-q", "-b", name]);
+    }
+
+    /// Switches to a branch.
+    pub fn checkout(&self, name: &str) {
+        run_git(self.dir.path(), &["checkout", "-q", name]);
+    }
+
     pub fn remove(&self, path: &str) {
         std::fs::remove_file(self.dir.path().join(path)).unwrap();
     }

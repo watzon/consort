@@ -165,6 +165,19 @@ pub async fn serve(config: HubConfig) -> Result<HubHandle> {
     if let Err(err) = hub.resume_connect_polls().await {
         tracing::warn!(error = %err, "could not resume the open connect attempts");
     }
+    if let Err(err) = hub.refresh_connection_logos().await {
+        tracing::warn!(error = %err, "could not update the logos of the connections");
+    }
+    // Ask Composio about the key at once, off the start path: a key that
+    // Composio refused while the hub was down shows in the status.
+    {
+        let hub = hub.clone();
+        tokio::spawn(async move {
+            if let Err(err) = hub.refresh_composio_status().await {
+                tracing::warn!(error = %err, "could not check the Composio key");
+            }
+        });
+    }
     tracing::info!(address = %local_addr, url = %public_url, "the hub listens");
     Ok(HubHandle {
         hub,
@@ -251,6 +264,12 @@ impl HubHandle {
         self.hub
             .skill_sources
             .set_config(move |c| c.allow_local = allow);
+    }
+
+    /// Allows service logos on `http://` origins. Only tests turn this on: a
+    /// real hub fetches logos over https only.
+    pub fn allow_local_logo_origins(&self, allow: bool) {
+        self.hub.connectors.logos.set_allow_local(allow);
     }
 
     /// Checks every installed skill for a new version now, as the daily

@@ -740,7 +740,15 @@ fn url_key(url: &str) -> String {
 
 async fn load_logo(client: &reqwest::Client, url: &str) -> Option<Vec<u8>> {
     let parsed = url::Url::parse(url).ok()?;
-    if parsed.scheme() != "https" {
+    // Logos come from the hub (`/v1/logos/<key>`). A hub on this machine
+    // listens on plain http, so a loopback address is allowed too.
+    let on_this_machine = match parsed.host() {
+        Some(url::Host::Domain(name)) => name.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    };
+    if parsed.scheme() != "https" && !(parsed.scheme() == "http" && on_this_machine) {
         return None;
     }
     let response = client.get(parsed).send().await.ok()?;
@@ -840,6 +848,40 @@ mod tests {
         assert!(matches!(failed(err), LoadState::Unsupported(_)));
         let other = ClientError::TimedOut;
         assert_eq!(unsupported(other.clone(), "x"), other);
+    }
+
+    /// A server on this machine that answers each request with one SVG.
+    async fn serve_one_svg() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut buffer = [0_u8; 1024];
+                let _ = socket.read(&mut buffer).await;
+                let body = "<svg xmlns=\"http://www.w3.org/2000/svg\"/>";
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: image/svg+xml\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(reply.as_bytes()).await;
+            }
+        });
+        format!("http://{addr}/v1/logos/abc")
+    }
+
+    #[tokio::test]
+    async fn a_logo_loads_from_a_hub_on_this_machine_over_http() {
+        let url = serve_one_svg().await;
+        let client = reqwest::Client::new();
+        assert!(load_logo(&client, &url).await.is_some());
+        // Another host over plain http stays refused, and so does a bad URL.
+        assert!(
+            load_logo(&client, "http://logos.example/a.svg")
+                .await
+                .is_none()
+        );
+        assert!(load_logo(&client, "not a url").await.is_none());
     }
 
     #[test]

@@ -23,15 +23,16 @@ use super::fake::{FakeComposio, SENDGRID_KEY};
 use crate::hub::{Caller, Hub, test_hub, test_task_session};
 use crate::store::{connectors as con_store, conversation, coordinator as coord_store, work};
 
-fn fast() -> Timings {
+pub(super) fn fast() -> Timings {
     Timings {
         approval_wait: Duration::from_secs(5),
         poll_interval: Duration::from_millis(20),
         connect_timeout_ms: 10 * 60 * 1_000,
+        request_timeout: None,
     }
 }
 
-async fn hub_with_fake() -> (Hub, tempfile::TempDir, FakeComposio) {
+pub(super) async fn hub_with_fake() -> (Hub, tempfile::TempDir, FakeComposio) {
     let (hub, dir) = test_hub().await;
     let fake = FakeComposio::start().await;
     fake.configure(&hub).await;
@@ -64,7 +65,11 @@ async fn channel(hub: &Hub, name: &str, tags: &[&str]) -> ChannelId {
     .id
 }
 
-async fn coordinator_session(hub: &Hub, channel_id: ChannelId, harness: &str) -> SessionId {
+pub(super) async fn coordinator_session(
+    hub: &Hub,
+    channel_id: ChannelId,
+    harness: &str,
+) -> SessionId {
     let session = Session {
         id: SessionId::new(),
         role: SessionRole::Coordinator,
@@ -92,7 +97,7 @@ async fn coordinator_session(hub: &Hub, channel_id: ChannelId, harness: &str) ->
     id
 }
 
-async fn tutti(hub: &Hub) -> ChannelId {
+pub(super) async fn tutti(hub: &Hub) -> ChannelId {
     hub.store
         .read(conversation::tutti_channel)
         .await
@@ -100,7 +105,7 @@ async fn tutti(hub: &Hub) -> ChannelId {
         .id
 }
 
-async fn connect(
+pub(super) async fn connect(
     hub: &Hub,
     service: &str,
     name: &str,
@@ -128,7 +133,7 @@ async fn connect(
     .connection
 }
 
-async fn wait_for<T>(mut probe: impl AsyncFnMut() -> Option<T>) -> T {
+pub(super) async fn wait_for<T>(mut probe: impl AsyncFnMut() -> Option<T>) -> T {
     for _ in 0..250 {
         if let Some(value) = probe().await {
             return value;
@@ -138,7 +143,7 @@ async fn wait_for<T>(mut probe: impl AsyncFnMut() -> Option<T>) -> T {
     panic!("timed out");
 }
 
-async fn stored(hub: &Hub, id: consort_proto::ids::ConnectionId) -> Connection {
+pub(super) async fn stored(hub: &Hub, id: consort_proto::ids::ConnectionId) -> Connection {
     hub.store
         .read(move |conn| con_store::connection_or_404(conn, id))
         .await
@@ -146,7 +151,11 @@ async fn stored(hub: &Hub, id: consort_proto::ids::ConnectionId) -> Connection {
 }
 
 /// An active Gmail connection for every channel.
-async fn active_gmail(hub: &Hub, fake: &FakeComposio, approvals: ToolApprovals) -> Connection {
+pub(super) async fn active_gmail(
+    hub: &Hub,
+    fake: &FakeComposio,
+    approvals: ToolApprovals,
+) -> Connection {
     fake.set_auto_activate(true);
     let connection = connect(hub, "gmail", "Gmail Work", UseIn::EveryChannel, approvals).await;
     let id = connection.id;
@@ -181,7 +190,7 @@ async fn answer(hub: &Hub, approval_id: consort_proto::ids::ApprovalId, option: 
     .unwrap();
 }
 
-async fn call(hub: &Hub, session: SessionId, name: &str, args: Value) -> Value {
+pub(super) async fn call(hub: &Hub, session: SessionId, name: &str, args: Value) -> Value {
     let result = hub.call_tool(session, name, args).await;
     let body = result.structured_content.clone().unwrap_or(Value::Null);
     assert!(!result.is_error, "{name}: {body}");

@@ -41,8 +41,11 @@ use consort_proto::model::{
 use serde_json::Value;
 
 use super::front_matter;
-use super::git::{GitOptions, Repo, TreeItem, normalize_repo_path, parse_git_url, same_repo};
+use super::git::{
+    GIT_TIMEOUT, GitOptions, Repo, TreeItem, normalize_repo_path, parse_git_url, same_repo,
+};
 use super::install::Fetched;
+use super::remote::Remote;
 use crate::error::{HubError, Result};
 use crate::hub::{Caller, Hub};
 use crate::store::{meta_get, skills as skill_store};
@@ -70,6 +73,8 @@ const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(60);
 const SEARCHES_KEPT: usize = 64;
 /// The time limit of one HTTP request.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
+/// The time limit of one download of an archive or an npm tarball.
+const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 /// The most bytes of one JSON answer or marketplace file.
 const JSON_MAX_BYTES: usize = 2 * 1024 * 1024;
 /// The most bytes of a `SKILL.md` that a listing reads.
@@ -92,6 +97,12 @@ pub(crate) struct SourceConfig {
     pub smithery_url: String,
     pub anthropic_url: String,
     pub allow_local: bool,
+    /// The time limit of one git command.
+    pub git_timeout: Duration,
+    /// The time limit of one HTTP request.
+    pub http_timeout: Duration,
+    /// The time limit of one download of an archive or an npm tarball.
+    pub download_timeout: Duration,
 }
 
 impl Default for SourceConfig {
@@ -107,6 +118,9 @@ impl Default for SourceConfig {
             smithery_url: env("CONSORT_SMITHERY_URL", SMITHERY_API_URL),
             anthropic_url: env("CONSORT_ANTHROPIC_SKILLS_URL", ANTHROPIC_REPO_URL),
             allow_local: false,
+            git_timeout: GIT_TIMEOUT,
+            http_timeout: HTTP_TIMEOUT,
+            download_timeout: DOWNLOAD_TIMEOUT,
         }
     }
 }
@@ -189,9 +203,12 @@ impl SkillSources {
         }
     }
 
+    /// The options for a fetch with no credentials.
     pub(crate) fn git_options(&self) -> GitOptions {
+        let config = self.config();
         GitOptions {
-            allow_local: self.config().allow_local,
+            timeout: config.git_timeout,
+            ..GitOptions::new(config.allow_local)
         }
     }
 
@@ -225,9 +242,10 @@ impl SkillSources {
     }
 
     fn http(&self) -> Result<reqwest::Client> {
+        let config = self.config();
         reqwest::Client::builder()
-            .timeout(HTTP_TIMEOUT)
-            .https_only(!self.config().allow_local)
+            .timeout(config.http_timeout)
+            .https_only(!config.allow_local)
             .redirect(reqwest::redirect::Policy::limited(5))
             .user_agent(concat!("consort-hub/", env!("CARGO_PKG_VERSION")))
             .build()
@@ -244,7 +262,10 @@ impl SkillSources {
             .await
             .map_err(|e| {
                 if e.is_timeout() {
-                    "it did not answer in time".to_owned()
+                    format!(
+                        "it did not answer within {}",
+                        crate::util::duration_text(self.config().http_timeout)
+                    )
                 } else {
                     "it could not be reached".to_owned()
                 }
@@ -260,11 +281,16 @@ impl SkillSources {
             return Err("its answer is too large".to_owned());
         }
         let mut body = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|_| "its answer stopped early".to_owned())?
-        {
+        while let Some(chunk) = response.chunk().await.map_err(|e| {
+            if e.is_timeout() {
+                format!(
+                    "it did not finish its answer within {}",
+                    crate::util::duration_text(self.config().http_timeout)
+                )
+            } else {
+                "its answer stopped early".to_owned()
+            }
+        })? {
             body.extend_from_slice(&chunk);
             if body.len() > JSON_MAX_BYTES {
                 return Err("its answer is too large".to_owned());
@@ -379,10 +405,24 @@ pub(crate) fn looks_like_entry_id(text: &str) -> bool {
 }
 
 /// Splits a Smithery `gitUrl` (a GitHub page URL of the skill folder, or a
-/// repo URL) into the repo and the folder.
+/// repo URL) into the repo and the folder. The repo keeps the branch of the
+/// page URL as a `#branch` suffix, so an install follows the branch that the
+/// directory names, and not the default branch.
 fn split_git_page_url(url: &str, options: GitOptions) -> Option<(String, Option<String>)> {
     let target = parse_git_url(url, options).ok()?;
-    Some((target.url, target.path))
+    Some((
+        with_ref(&target.url, target.git_ref.as_deref()),
+        target.path,
+    ))
+}
+
+/// A repo URL with the branch, tag or commit to follow as a `#ref` suffix.
+/// `parse_git_url` reads it back.
+pub(crate) fn with_ref(url: &str, git_ref: Option<&str>) -> String {
+    match git_ref {
+        Some(r) if !r.is_empty() => format!("{url}#{r}"),
+        _ => url.to_owned(),
+    }
 }
 
 /// The text of a JSON field.
@@ -522,41 +562,64 @@ fn marketplace_plugins(doc: &Value, root: &str, options: GitOptions) -> Vec<Plug
                 (None, dir, false)
             }
             Some(Value::Object(source)) => {
-                let kind = source.get("source").and_then(Value::as_str).unwrap_or("");
-                let (url, dir) = match kind {
-                    "github" => (
-                        source
-                            .get("repo")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned),
-                        String::new(),
-                    ),
-                    "url" => (
-                        source.get("url").and_then(Value::as_str).map(str::to_owned),
-                        String::new(),
-                    ),
-                    "git-subdir" => (
-                        source.get("url").and_then(Value::as_str).map(str::to_owned),
-                        source
-                            .get("path")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_owned(),
-                    ),
-                    _ => (None, String::new()),
+                let field = |key: &str| source.get(key).and_then(Value::as_str);
+                let kind = field("source").unwrap_or("");
+                // The ref to follow: a pinned commit wins over a branch.
+                let git_ref = field("sha").or_else(|| field("ref")).map(str::to_owned);
+                let (location, dir) = match kind {
+                    "github" | "url" | "git-subdir" => {
+                        let url = if kind == "github" {
+                            field("repo")
+                        } else {
+                            field("url")
+                        };
+                        // A URL from a marketplace is third-party text: git
+                        // gets no credentials for it, and an ssh URL is
+                        // skipped.
+                        let Some(target) = url.and_then(|u| parse_git_url(u, options).ok()) else {
+                            continue;
+                        };
+                        let dir = if kind == "git-subdir" {
+                            field("path").unwrap_or("").to_owned()
+                        } else {
+                            String::new()
+                        };
+                        let git_ref = git_ref.or(target.git_ref);
+                        (with_ref(&target.url, git_ref.as_deref()), dir)
+                    }
+                    "archive" => {
+                        let Some(url) = field("url").filter(|u| is_download_url(u, options)) else {
+                            continue;
+                        };
+                        let sha = field("sha256")
+                            .filter(|h| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+                            .map(str::to_ascii_lowercase);
+                        (Remote::archive_text(url, sha.as_deref()), String::new())
+                    }
+                    "npm" => {
+                        let Some(package) = field("package").filter(|p| is_plain_npm_name(p))
+                        else {
+                            continue;
+                        };
+                        let registry = field("registry").filter(|r| is_download_url(r, options));
+                        (
+                            Remote::npm_text(package, field("version"), registry),
+                            String::new(),
+                        )
+                    }
+                    // The hub does not run it. The entry stays in the list,
+                    // and an install says why it cannot work.
+                    "command" => (Remote::command_text(&name), String::new()),
+                    _ => continue,
                 };
-                let Some(url) = url.and_then(|u| parse_git_url(&u, options).ok()) else {
-                    continue;
-                };
-                let Some(dir) = join_path("", &dir) else {
-                    continue;
-                };
+                let is_command = kind == "command";
                 // Only folders that the plugin names can be listed: the hub
-                // does not fetch another repo to scan it.
-                if explicit.is_empty() {
+                // does not fetch another repo, archive or package to scan
+                // it. A command plugin has one entry for the plugin.
+                if explicit.is_empty() && !is_command {
                     continue;
                 }
-                (Some(url.url), dir, true)
+                (Some(location), dir, true)
             }
             _ => continue,
         };
@@ -564,6 +627,13 @@ fn marketplace_plugins(doc: &Value, root: &str, options: GitOptions) -> Vec<Plug
             .iter()
             .filter_map(|rel| join_path(&plugin_dir, rel))
             .collect();
+        if folders.is_empty()
+            && repo_url
+                .as_deref()
+                .is_some_and(|r| r.starts_with("command:"))
+        {
+            folders.push(String::new());
+        }
         if !listed_only && let Some(default) = join_path(&plugin_dir, "skills") {
             folders.push(default);
         }
@@ -579,6 +649,32 @@ fn marketplace_plugins(doc: &Value, root: &str, options: GitOptions) -> Vec<Plug
         });
     }
     out
+}
+
+/// An https address, or an http one in tests, with a host.
+fn is_download_url(url: &str, options: GitOptions) -> bool {
+    let lower = url.to_ascii_lowercase();
+    (lower.starts_with("https://") || (options.allow_local && lower.starts_with("http://")))
+        && !lower.contains(char::is_whitespace)
+        && !lower.contains(['#', '?'])
+}
+
+/// A plain npm package name, with no version, no link and no path.
+fn is_plain_npm_name(package: &str) -> bool {
+    let part = |p: &str| {
+        !p.is_empty()
+            && p.bytes().all(|b| {
+                b.is_ascii_lowercase()
+                    || b.is_ascii_digit()
+                    || matches!(b, b'-' | b'.' | b'_' | b'~')
+            })
+    };
+    match package.strip_prefix('@') {
+        Some(rest) => rest
+            .split_once('/')
+            .is_some_and(|(a, b)| part(a) && part(b)),
+        None => part(package),
+    }
 }
 
 /// The parent folder of a `SKILL.md` path: `""` for the root.
@@ -597,6 +693,9 @@ fn last_segment(path: &str) -> &str {
 /// A skill folder found in a listing, before its `SKILL.md` is read.
 struct Found {
     path: String,
+    /// The plugin that names the folder. A plugin with no folder is one
+    /// entry with the plugin's name.
+    plugin_name: Option<String>,
     repo_url: Option<String>,
     author: Option<String>,
     license: Option<String>,
@@ -661,7 +760,8 @@ impl Hub {
         _caller: &Caller,
         request: SkillDirectoryAddSource,
     ) -> Result<SkillDirectorySourcesResult> {
-        let options = self.skill_sources.git_options();
+        // The user typed this URL, so git may use their credentials for it.
+        let options = self.skill_sources.git_options().trusted();
         let (id, location) = locate(&request.url, options)?;
         let existing = self.directory_sources().await?;
         if existing
@@ -671,16 +771,16 @@ impl Hub {
             return Ok(SkillDirectorySourcesResult { sources: existing });
         }
         // Read it once: the user learns now when it does not work.
-        let (name, entries) = self
-            .list_location(&id, &location)
-            .await
-            .map_err(|message| {
-                HubError::invalid(format!(
-                    "The hub could not read {}: {}. Check the URL, then try again.",
-                    request.url.trim(),
-                    message.trim_end_matches('.')
-                ))
-            })?;
+        let (name, entries) =
+            self.list_location(&id, &location, options)
+                .await
+                .map_err(|message| {
+                    HubError::invalid(format!(
+                        "The hub could not read {}: {}. Check the URL, then try again.",
+                        request.url.trim(),
+                        message.trim_end_matches('.')
+                    ))
+                })?;
         if entries.is_empty() {
             return Err(HubError::invalid(format!(
                 "{} has no skills that the hub can list. Add a repo with SKILL.md files or a marketplace.json with skills.",
@@ -748,9 +848,10 @@ impl Hub {
         git_ref: Option<&str>,
         marketplace_path: &str,
         kind: SkillDirectoryKind,
+        options: GitOptions,
     ) -> std::result::Result<(Option<String>, Vec<SkillDirectoryEntry>), String> {
         let sources = &self.skill_sources;
-        let repo = Repo::fetch(sources.tmp_root(), url, git_ref, sources.git_options())
+        let repo = Repo::fetch(sources.tmp_root(), url, git_ref, options)
             .await
             .map_err(|e| e.to_error_body().message)?;
         let items = repo
@@ -779,11 +880,13 @@ impl Hub {
                 .and_then(|b| serde_json::from_slice(b).ok())
                 .ok_or_else(|| "its marketplace.json is not JSON".to_owned())?;
             name = text(&doc, "name");
+            // The plugins' own locations are third-party text: no credentials.
             for plugin in marketplace_plugins(&doc, &root, sources.git_options()) {
                 for folder in &plugin.folders {
                     let mut push = |path: String| {
                         found.push(Found {
                             path,
+                            plugin_name: Some(plugin.plugin.clone()),
                             repo_url: plugin.repo_url.clone(),
                             author: plugin.author.clone(),
                             license: plugin.license.clone(),
@@ -814,6 +917,7 @@ impl Hub {
             for path in manifests.keys() {
                 found.push(Found {
                     path: (*path).to_owned(),
+                    plugin_name: None,
                     repo_url: None,
                     author: None,
                     license: None,
@@ -853,10 +957,12 @@ impl Hub {
                 None => (None, None, None),
             };
             let folder_name = if f.path.is_empty() {
-                url.trim_end_matches('/')
-                    .rsplit('/')
-                    .next()
-                    .unwrap_or("skill")
+                f.plugin_name.as_deref().unwrap_or_else(|| {
+                    url.trim_end_matches('/')
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or("skill")
+                })
             } else {
                 last_segment(&f.path)
             };
@@ -873,7 +979,7 @@ impl Hub {
                 name: skill_name.unwrap_or_else(|| folder_name.to_owned()),
                 description: description.unwrap_or(f.fallback_description),
                 author: f.author.or_else(|| owner.clone()),
-                url: Some(repo_page_url(&repo_url, &f.path)),
+                url: repo_page_url(&repo_url, &f.path),
                 repo_url: Some(repo_url),
                 path: (!f.path.is_empty()).then_some(f.path),
                 license: license.or(f.license),
@@ -911,7 +1017,7 @@ impl Hub {
                     },
                     description: plugin.description.clone(),
                     author: plugin.author.clone(),
-                    url: Some(repo_page_url(&repo_url, folder)),
+                    url: repo_page_url(&repo_url, folder),
                     repo_url: Some(repo_url.clone()),
                     path: (!folder.is_empty()).then(|| folder.clone()),
                     license: plugin.license.clone(),
@@ -930,6 +1036,7 @@ impl Hub {
         &self,
         source_id: &str,
         location: &Location,
+        options: GitOptions,
     ) -> std::result::Result<(String, Vec<SkillDirectoryEntry>), String> {
         let (name, entries) = match location {
             Location::Git {
@@ -943,6 +1050,7 @@ impl Hub {
                     git_ref.as_deref(),
                     marketplace,
                     SkillDirectoryKind::Marketplace,
+                    options,
                 )
                 .await?
             }
@@ -989,14 +1097,19 @@ impl Hub {
                     None,
                     MARKETPLACE_PATH,
                     SkillDirectoryKind::Anthropic,
+                    self.skill_sources.git_options(),
                 )
                 .await
                 .map(|(_, e)| e),
-            _ => match locate(&source.url, self.skill_sources.git_options()) {
-                Ok((_, location)) => self
-                    .list_location(&source.id, &location)
-                    .await
-                    .map(|(_, e)| e),
+            // A source that the user added may use their git credentials.
+            _ => match self.git_options_for(&source.url, false).await {
+                Ok(options) => match locate(&source.url, options) {
+                    Ok((_, location)) => self
+                        .list_location(&source.id, &location, options)
+                        .await
+                        .map(|(_, e)| e),
+                    Err(err) => Err(err.to_error_body().message),
+                },
                 Err(err) => Err(err.to_error_body().message),
             },
         };
@@ -1227,12 +1340,31 @@ impl Hub {
     }
 }
 
-/// The GitHub page of a folder, or the repo URL for another host.
-fn repo_page_url(repo: &str, path: &str) -> String {
-    if repo.starts_with("https://github.com/") && !path.is_empty() {
-        format!("{}/tree/HEAD/{path}", repo.trim_end_matches('/'))
-    } else {
-        repo.to_owned()
+/// The page of a location for people: the GitHub page of a folder, the repo
+/// URL for another host, the archive address, or the npm page. `None` when
+/// there is no page to show (a command).
+fn repo_page_url(repo: &str, path: &str) -> Option<String> {
+    match Remote::parse(repo) {
+        Remote::Archive { url, .. } => Some(url),
+        Remote::Npm {
+            package, registry, ..
+        } => (registry == super::remote::NPM_REGISTRY)
+            .then(|| format!("https://www.npmjs.com/package/{package}")),
+        Remote::Command { .. } => None,
+        Remote::Git(repo) => {
+            let (base, git_ref) = match repo.split_once('#') {
+                Some((base, git_ref)) => (base, git_ref),
+                None => (repo.as_str(), "HEAD"),
+            };
+            if base.starts_with("https://github.com/") && !path.is_empty() {
+                Some(format!(
+                    "{}/tree/{git_ref}/{path}",
+                    base.trim_end_matches('/')
+                ))
+            } else {
+                Some(base.to_owned())
+            }
+        }
     }
 }
 
@@ -1258,7 +1390,7 @@ mod tests {
 
     use super::*;
 
-    const LOCAL: GitOptions = GitOptions { allow_local: true };
+    const LOCAL: GitOptions = GitOptions::new(true);
 
     #[test]
     fn entry_ids_are_told_apart_from_git_urls() {
@@ -1280,9 +1412,10 @@ mod tests {
         });
         let entry = smithery_entry(&item, LOCAL).unwrap();
         assert_eq!(entry.entry_id, "smithery:openclaw/nano-pdf");
+        // The branch of the page URL stays, so an install follows it.
         assert_eq!(
             entry.repo_url.as_deref(),
-            Some("https://github.com/openclaw/openclaw")
+            Some("https://github.com/openclaw/openclaw#main")
         );
         assert_eq!(entry.path.as_deref(), Some("skills/nano-pdf"));
         assert_eq!(entry.installs, Some(6));
@@ -1308,7 +1441,7 @@ mod tests {
         });
         let plugins = marketplace_plugins(&doc, "", LOCAL);
         let names: Vec<&str> = plugins.iter().map(|p| p.plugin.as_str()).collect();
-        assert_eq!(names, vec!["docs", "bare", "remote"]);
+        assert_eq!(names, vec!["docs", "bare", "remote", "npm"]);
         assert_eq!(
             plugins[0].folders,
             vec!["skills/pdf", "skills/xlsx", "skills"]
@@ -1320,6 +1453,69 @@ mod tests {
         );
         assert_eq!(plugins[2].folders, vec!["skills/lint"]);
         assert!(plugins[2].listed_only);
+        assert_eq!(plugins[3].repo_url.as_deref(), Some("npm:x"));
+        assert_eq!(plugins[3].folders, vec!["a"]);
+    }
+
+    #[test]
+    fn plugin_sources_of_every_type_become_locations() {
+        let hash = "b".repeat(64);
+        let doc = json!({
+            "name": "example",
+            "plugins": [
+                {"name": "pinned", "skills": ["./skills/a"],
+                 "source": {"source": "github", "repo": "acme/tools", "ref": "v2", "sha": "0123456789abcdef0123456789abcdef01234567"}},
+                {"name": "branch", "skills": ["./skills/a"],
+                 "source": {"source": "git-subdir", "url": "https://git.example.com/mono.git", "path": "tools/x", "ref": "stable"}},
+                {"name": "zip", "skills": ["./skills/a"],
+                 "source": {"source": "archive", "url": "https://files.example.com/p.zip", "sha256": hash}},
+                {"name": "zip-plain", "skills": ["./skills/a"],
+                 "source": {"source": "archive", "url": "https://files.example.com/p.zip"}},
+                {"name": "pkg", "skills": ["./skills/a"],
+                 "source": {"source": "npm", "package": "@acme/skills", "version": "2.1.0", "registry": "https://npm.example.com"}},
+                {"name": "built", "source": {"source": "command", "command": "my-tool path"}},
+                {"name": "built-listed", "skills": ["./skills/a"], "source": {"source": "command", "command": "x"}},
+                {"name": "ssh", "skills": ["./skills/a"], "source": {"source": "url", "url": "git@github.com:acme/private.git"}},
+                {"name": "http-zip", "skills": ["./skills/a"], "source": {"source": "archive", "url": "http://files.example.com/p.zip"}},
+                {"name": "npm-link", "skills": ["./skills/a"], "source": {"source": "npm", "package": "https://x.example/p.tgz"}}
+            ]
+        });
+        let plugins = marketplace_plugins(&doc, "", GitOptions::new(false));
+        let by_name = |name: &str| plugins.iter().find(|p| p.plugin == name);
+        assert_eq!(
+            by_name("pinned").unwrap().repo_url.as_deref(),
+            Some("https://github.com/acme/tools#0123456789abcdef0123456789abcdef01234567"),
+            "a pinned commit wins over the ref"
+        );
+        assert_eq!(
+            by_name("branch").unwrap().repo_url.as_deref(),
+            Some("https://git.example.com/mono.git#stable")
+        );
+        assert_eq!(by_name("branch").unwrap().folders, vec!["tools/x/skills/a"]);
+        assert_eq!(
+            by_name("zip").unwrap().repo_url.as_deref(),
+            Some(format!("archive+https://files.example.com/p.zip#sha256={hash}").as_str())
+        );
+        assert_eq!(
+            by_name("zip-plain").unwrap().repo_url.as_deref(),
+            Some("archive+https://files.example.com/p.zip")
+        );
+        assert_eq!(
+            by_name("pkg").unwrap().repo_url.as_deref(),
+            Some("npm:@acme/skills@2.1.0?registry=https://npm.example.com")
+        );
+        // A command plugin stays in the list as one entry, so an install can
+        // say why it does not work.
+        assert_eq!(
+            by_name("built").unwrap().repo_url.as_deref(),
+            Some("command:built")
+        );
+        assert_eq!(by_name("built").unwrap().folders, vec![String::new()]);
+        assert_eq!(by_name("built-listed").unwrap().folders, vec!["skills/a"]);
+        // Third-party ssh, plain http and a link instead of a name: skipped.
+        for skipped in ["ssh", "http-zip", "npm-link"] {
+            assert!(by_name(skipped).is_none(), "{skipped}");
+        }
     }
 
     #[test]
@@ -1331,7 +1527,7 @@ mod tests {
         );
         let (_, loc) = locate(
             "https://raw.githubusercontent.com/acme/skills/main/.claude-plugin/marketplace.json",
-            GitOptions { allow_local: false },
+            GitOptions::new(false),
         )
         .unwrap();
         assert_eq!(
@@ -1343,20 +1539,11 @@ mod tests {
             }
         );
         assert!(matches!(
-            locate(
-                "https://example.com/m.json",
-                GitOptions { allow_local: false }
-            )
-            .unwrap()
-            .1,
+            locate("https://example.com/m.json", GitOptions::new(false))
+                .unwrap()
+                .1,
             Location::Http { .. }
         ));
-        assert!(
-            locate(
-                "http://example.com/m.json",
-                GitOptions { allow_local: false }
-            )
-            .is_err()
-        );
+        assert!(locate("http://example.com/m.json", GitOptions::new(false)).is_err());
     }
 }

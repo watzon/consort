@@ -9,7 +9,7 @@ The files for this page are in `deploy/hub/` and in the `Dockerfile` at the root
 - A Linux server (x64 or arm64) with a public IP address.
 - A DNS name for the hub, for example `hub.example.com`, with an A or AAAA record that points at the server.
 - Ports 80 and 443 open to the internet. Port 7600 stays closed: only the proxy on the same machine uses it.
-- `git` on the server. The hub uses it to read skill sources.
+- `git` on the server. The hub uses it to read skill sources. For a private skill repo, the user that runs the hub needs a way to sign in to it: a git credential helper for an `https` repo, or an ssh key in an ssh agent (`SSH_AUTH_SOCK`) and the host in `~/.ssh/known_hosts` for an `ssh` repo. Check with `git ls-remote <url>` as that user. The hub stores no password or key. The `consort` systemd unit and the Docker image do not have an ssh agent by default, so a private ssh repo needs the agent socket in the unit (`Environment=SSH_AUTH_SOCK=...`) or a read-only deploy key in the user's `~/.ssh`.
 
 Install one of these ways: a systemd service with Caddy (below), or Docker with Compose (see "Docker").
 

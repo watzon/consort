@@ -42,6 +42,14 @@ fn read_limited(reader: impl Read, limit: u64) -> Result<Vec<u8>> {
 /// The files of a skill zip, after every check. When the zip holds one
 /// folder with the skill in it, that folder is the skill folder.
 pub(crate) fn unpack_zip(bytes: &[u8]) -> Result<Vec<NewSkillFile>> {
+    unpack_zip_folder(bytes, None)
+}
+
+/// The files of one skill folder in a zip of a whole plugin. The plugin root
+/// is at the top of the zip, or in the one folder that holds everything.
+/// With no `folder`, the zip is one skill, as for an upload. Only the files
+/// of the folder are read, and every check of an upload applies to them.
+pub(crate) fn unpack_zip_folder(bytes: &[u8], folder: Option<&str>) -> Result<Vec<NewSkillFile>> {
     if bytes.len() as u64 > SKILL_UPLOAD_MAX_BYTES {
         return Err(skill_invalid(format!(
             "The zip is larger than {SKILL_UPLOAD_MAX_BYTES} bytes."
@@ -93,11 +101,43 @@ pub(crate) fn unpack_zip(bytes: &[u8]) -> Result<Vec<NewSkillFile>> {
         };
         listed.push((name, kind, index));
     }
+    // A folder of a plugin: keep only its entries.
+    let folder_prefix = match folder {
+        Some(folder) => {
+            let top = listed
+                .first()
+                .and_then(|(n, _, _)| n.split_once('/').map(|(top, _)| format!("{top}/")))
+                .filter(|top| listed.iter().all(|(n, _, _)| n.starts_with(top.as_str())));
+            let wanted = format!("{}/", folder.trim_matches('/'));
+            let root = [Some(String::new()), top]
+                .into_iter()
+                .flatten()
+                .find(|root| {
+                    listed
+                        .iter()
+                        .any(|(n, _, _)| n.starts_with(&format!("{root}{wanted}")))
+                })
+                .ok_or_else(|| {
+                    skill_invalid(format!(
+                        "The archive has no folder {}.",
+                        wanted.trim_end_matches('/')
+                    ))
+                })?;
+            Some(format!("{root}{wanted}"))
+        }
+        None => None,
+    };
+    if let Some(prefix) = &folder_prefix {
+        listed.retain(|(n, _, _)| n.starts_with(prefix.as_str()));
+    }
     // One folder around the skill: use it as the root.
-    let has_root_manifest = listed
-        .iter()
-        .any(|(n, _, _)| n.trim_start_matches("./") == SKILL_MANIFEST_FILE);
-    let prefix = if has_root_manifest {
+    let has_root_manifest = folder_prefix.is_none()
+        && listed
+            .iter()
+            .any(|(n, _, _)| n.trim_start_matches("./") == SKILL_MANIFEST_FILE);
+    let prefix = if let Some(prefix) = folder_prefix {
+        Some(prefix)
+    } else if has_root_manifest {
         None
     } else {
         listed

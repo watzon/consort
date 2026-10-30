@@ -382,6 +382,41 @@ pub(crate) fn command_cwd(given: Option<&str>, workspace: Option<&Path>) -> Opti
 /// the user, and it includes what to do next (see [`sign_in_hint`]).
 pub const SIGNED_OUT_ERROR_CODE: &str = "signed_out";
 
+/// The `code` of the [`SessionEvent::Error`] that tells the worker that a
+/// harness login has expired, though the last probe said it was signed in.
+/// Claude Code is the case: `claude auth status` reports no expiry, so the
+/// first turn finds out (docs/harness-adapters.md, "A login that expired").
+pub const LOGIN_EXPIRED_ERROR_CODE: &str = "login_expired";
+
+/// The message of that event, and the detail that the account shows. It
+/// has the word "expired", which the app reads as "Sign in again".
+pub const LOGIN_EXPIRED_MESSAGE: &str = "The login expired. Sign in again.";
+
+/// Whether the error text of a failed turn says that the login expired or
+/// the provider refused its credentials. The words are those of Claude
+/// Code's API errors: `API Error: 401`, `authentication_error`, "OAuth token
+/// has expired", and the SDK's own `authentication_failed`. A text that only
+/// has "401" in a number or a path does not count.
+pub fn login_expired_text(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    [
+        "oauth token has expired",
+        "token has expired",
+        "token expired",
+        "authentication_error",
+        "authentication_failed",
+        "failed to authenticate",
+        "api error: 401",
+        "invalid authentication credentials",
+        "invalid bearer token",
+        "invalid_grant",
+        "refresh token is invalid",
+        "refresh token has expired",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
 /// What to tell the user when a harness account is not signed in. `message`
 /// is the reason that the harness gave, and it may be empty.
 pub fn sign_in_hint(kind: HarnessKind, message: &str) -> String {
@@ -462,6 +497,31 @@ mod tests {
             sign_in_hint(HarnessKind::OpenCode, ""),
             "Run `opencode auth login` on this machine."
         );
+    }
+
+    #[test]
+    fn an_expired_login_is_told_from_other_failures() {
+        for expired in [
+            "Failed to authenticate. API Error: 401 {\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\"message\":\"OAuth token has expired. Please obtain a new token or refresh your existing token.\"}}",
+            "Internal error {\"kind\":\"authentication_failed\"}",
+            "API Error: 401 Invalid authentication credentials",
+            "invalid_grant: Refresh token is invalid",
+        ] {
+            assert!(login_expired_text(expired), "{expired}");
+        }
+        for other in [
+            "Internal error",
+            "rate_limit_error: slow down",
+            "Request 4010 failed",
+            "The file /tmp/401/x was not found",
+            "overloaded_error",
+            "",
+        ] {
+            assert!(!login_expired_text(other), "{other}");
+        }
+        // The detail has the word that the app reads as Expired.
+        assert!(LOGIN_EXPIRED_MESSAGE.contains("expired"));
+        assert!(LOGIN_EXPIRED_MESSAGE.contains("Sign in again"));
     }
 
     #[test]

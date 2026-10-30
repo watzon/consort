@@ -8,8 +8,10 @@ This page lists the entities that the hub, the workers and the clients store, wi
 |---|---|---|
 | Hub | `hub.db` (SQLite, WAL mode) | Every entity on this page except the worker-local state |
 | Hub | `blobs/` | Attachments, channel files, artifacts, skill files and skill uploads, named by SHA-256 |
-| Hub | `hub-secret.key` | The 256-bit key that encrypts `composio.key` (mode 0600) |
-| Hub | `composio.key` | The Composio project key, encrypted with a key that the hub makes (mode 0600). See ADR 0011 |
+| Hub | `hub-secret.key` | The 256-bit key that encrypts `composio.key` (mode 0600). The hub makes it the first time it stores a Composio key. 32 random bytes, no header. Without it the Composio key cannot be read, so a backup keeps it with `composio.key` |
+| Hub | `composio.key` | The Composio project key, encrypted at rest (mode 0600). The file is the 4 bytes `CSK1`, a 12-byte nonce and the AES-256-GCM ciphertext with its tag. The associated data is `consort composio.key v1`. A copy of `hub.db` or of this file alone does not give the key. See ADR 0011 |
+| Hub | `logos/` | The logo cache: one file for each service logo, named by the SHA-256 of its origin address in hex, and a `<key>.url` file with that address for a logo that a connection uses. Not in `hub.db` and not in a backup, because the hub fetches a logo again when it is gone. See [Logo cache](#logo-cache) |
+| Hub | `tmp/` | Temporary folders of skill fetches (`skill-fetch-*`). The hub removes them when a fetch ends and when it starts |
 | Hub | FTS5 tables in `hub.db` | Search index over messages, memory notes and task titles |
 | Hub | `backup.json` | The backup settings (schedule, folder, how many to keep) and the last backup result, written through a temp file and a rename (mode 0600). Not in `hub.db`, so it needs no schema migration. See [Backups](#backups) |
 | Hub | `hub.lock` | A lock that a running hub holds, so a second hub and `consort hub restore` cannot use the folder at the same time |
@@ -20,6 +22,7 @@ This page lists the entities that the hub, the workers and the clients store, wi
 | Worker | `workspaces/` | Worktrees and clones that the worker made for tasks |
 | Worker | `<consort home>/profiles/<name>/` | The profile folder of each account, named after the account name when the worker made it (`profile_dir` in `worker.toml`): the harness's own config and login, and `env.json` with the secret variables (mode 0600 on Unix) |
 | Worker | `<consort home>/tools/<tool>/<version>/` | The managed tools that the worker installed |
+| Worker | `<consort home>/cache/skills/<content hash>/` | The skill bundles of sessions: `bundle.json` (the file list), `files/`, and `used`, an empty file that each use touches. The worker removes a bundle that no open session names and that nobody used for 30 days, when it starts and then once a day. A bundle that it needs again comes from the hub. See [Skill](#skill) |
 | Worker | `<consort home>/cache/blobs/<sha256>` | Attachments and channel files that the worker downloaded, checked by hash (mode 0600 on Unix). Sessions get copies in their workspace |
 | Worker | `<workspace>/.consort/attachments/` and `<workspace>/.channel/files/` | The attachments of a session's turns, and the read-only copy of the channel files (see [protocol.md](protocol.md#attachments-and-channel-files-on-the-worker)) |
 | Worker | A log file, outside the worker folder | The log of the installed service: `~/Library/Logs/Consort/worker.log`, `~/.local/state/consort/worker.log` or `%LOCALAPPDATA%\Consort\logs\worker.log`. See [install.md](install.md) |
@@ -512,7 +515,7 @@ One connected account of one Composio service. A feed entity with no channel (`c
 | `name` | text | For example "Gmail Work". At most 80 characters |
 | `handle` | text | The assistant's name for it: a unique slug of the name, such as `gmail_work`. At most 40 lowercase ASCII letters, digits and `_`. A repeat gets `_2`, `_3` |
 | `service`, `service_name` | text | The Composio toolkit slug (`gmail`) and its name (`Gmail`) |
-| `logo_url` | text, optional | From the hub's logo cache |
+| `logo_url` | text, optional | An address of the hub, `<hub address>/v1/logos/<key>`, from the logo cache. Never an address of Composio |
 | `identity` | text, optional | The account's email address or login, when the service tells |
 | `use_in` | object | `kind`: `every_channel`, `tags` with `tags` (a channel needs all of them), or `channels` with `channel_ids` |
 | `approvals` | object | `read`, `change` and `delete`, each `run_without_asking`, `ask_once_per_task` or `ask_every_time`. The defaults are run without asking, ask every time and ask every time |
@@ -549,8 +552,8 @@ An installed skill. A feed entity with no channel (`skill`).
 |---|---|---|
 | `id` | ID | `skl_` |
 | `name`, `description` | text | From `SKILL.md`. The name is 1 to 64 lowercase letters, digits and `-`, and is unique on the hub. The description has at most 1,024 characters |
-| `source` | object | `kind`: `git` with `url`, `path` and `ref`, `directory` with `directory`, `entry_id`, `url` and `path`, or `upload` with `file_name` |
-| `commit` | text, optional | The pinned commit. Empty for an upload |
+| `source` | object | `kind`: `git` with `url`, `path` and `ref`, `directory` with `directory`, `entry_id`, `url` and `path`, or `upload` with `file_name`. A `git` url is `https://...` or an ssh URL (`ssh://git@host/owner/repo`, `git@host:owner/repo`). The `url` of a `directory` source is the location of the files in one text: a git repo with the branch, tag or commit to follow after `#` (`https://github.com/acme/tools#dev`), `archive+https://host/file.zip` with an optional `#sha256=<hex>`, or `npm:<package>[@<version or tag>]` with an optional `?registry=<https address>`. A skill whose plugin builds its files with a command is never installed |
+| `commit` | text, optional | The pin. A git commit, the SHA-256 of an archive, or the `integrity` (`sha512-...`) of an npm version. Empty for an upload |
 | `content_hash` | text | The SHA-256 of one line per file, sorted by path: `<path>\0<sha256>\0<x or ->\n`, where `x` marks an executable file |
 | `license` | text, optional | |
 | `scripts` | list of text | Files that can run: files with the executable bit and files under `scripts/` |
@@ -568,6 +571,19 @@ The files of each version are blobs. The hub keeps the file list of each version
 ### Effective set
 
 A session gets the connections and skills whose `use_in` matches its channel, minus the channel's exceptions. A skill must also be on and not blocked. The Tutti channel matches only `every_channel`, unless it has tags of its own.
+
+### Logo cache
+
+The hub does not give clients the logo addresses of Composio. It fetches each logo once and serves it from `<data dir>/logos/` at `GET /v1/logos/{key}` (see [protocol.md](protocol.md#service-logos)).
+
+| Item | Rule |
+|---|---|
+| Key | The SHA-256 of the origin address, 64 lowercase hex characters. The file `logos/<key>` holds the image |
+| Sources | `https` only. The image is at most 256 KiB and must be a PNG, JPEG, GIF, WebP or SVG. The hub checks the bytes, not the `Content-Type` of the answer |
+| Fetch | When a client asks for a key and the file is missing or older than 7 days. One fetch at a time for a key, with a limit of 10 seconds. When a fetch fails, the hub keeps the old file if there is one and does not ask the origin again for 10 minutes |
+| Size | At most 1,000 files and 32 MiB. The oldest files go first. A removed logo is fetched again when a client asks for it |
+| Origin file | A connection stores its logo address, so `logos/<key>.url` keeps the origin address and the logo works after a restart. The hub trusts the file only when the key is the hash of its content. A catalog logo keeps its origin in memory until the hub restarts, and the client asks for the catalog again when it opens the dialog |
+| Address change | The hub updates the `logo_url` of its connections at start, so a connection that came from Composio's address, or from an older address of the hub, gets the current one |
 
 ## Preferences
 

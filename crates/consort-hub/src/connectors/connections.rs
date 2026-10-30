@@ -242,7 +242,10 @@ impl Hub {
             .choose_scheme(&client, &service, spec.auth_scheme, &spec.credentials)
             .await?;
         let timeout = self.connectors.timings().connect_timeout_ms;
-        let (service_name, logo_url) = (detail.name.clone(), detail.meta.logo.clone());
+        let (service_name, logo_url) = (
+            detail.name.clone(),
+            self.hub_logo_url(detail.meta.logo.as_deref(), true),
+        );
         let reserved = self
             .store
             .write(move |tx| {
@@ -734,6 +737,9 @@ impl Hub {
         let Ok(client) = self.connectors.client() else {
             return Ok(());
         };
+        // Also ask whether Composio still accepts the key, so a key that was
+        // revoked shows in `composio.status`.
+        self.refresh_composio_status().await?;
         let connections = self.store.read(con_store::connections).await?;
         for connection in connections.into_iter().filter(|c| c.status.is_active()) {
             let id = connection.id;
@@ -761,24 +767,80 @@ impl Hub {
         id: ConnectionId,
         account_id: &str,
     ) -> bool {
-        let expired = match client.connected_account(account_id).await {
-            Ok(account) => matches!(
-                account.state(),
-                AccountState::Expired | AccountState::Failed
-            ),
-            Err(err) => composio::is_not_found(&err),
+        let message = match client.connected_account(account_id).await {
+            Ok(account)
+                if matches!(
+                    account.state(),
+                    AccountState::Expired | AccountState::Failed
+                ) =>
+            {
+                Some(EXPIRED_MESSAGE)
+            }
+            Err(err) if composio::is_not_found(&err) => Some(OTHER_PROJECT_MESSAGE),
+            _ => None,
         };
-        if expired {
-            let status = ConnectionStatus::NeedsSignIn {
-                message: Some(
-                    "The sign-in expired. Reconnect it in Settings > Connectors.".to_owned(),
-                ),
+        let Some(message) = message else {
+            return false;
+        };
+        let status = ConnectionStatus::NeedsSignIn {
+            message: Some(message.to_owned()),
+        };
+        if let Err(err) = self.set_connection_status(id, status, None, false).await {
+            tracing::warn!(error = %err, "could not mark a connection as needing a new sign-in");
+        }
+        true
+    }
+
+    /// Checks every connection against the key that the hub has now. The key
+    /// can belong to another Composio project, and that project has none of
+    /// the old connected accounts. A connection whose account Composio does
+    /// not know is marked "needs a new sign-in", with a message that names
+    /// the cause, and it stays in the list, so the user can reconnect it.
+    /// When the old key comes back, the accounts are found again and the
+    /// connections work again. Returns how many connections it marked.
+    pub(crate) async fn reconcile_connections_with_key(&self) -> Result<usize> {
+        let Ok(client) = self.connectors.client() else {
+            return Ok(0);
+        };
+        let rows = self.store.read(con_store::connection_rows).await?;
+        let mut marked = 0;
+        for row in rows {
+            let Some(account_id) = row.composio_account_id.clone() else {
+                continue;
             };
-            if let Err(err) = self.set_connection_status(id, status, None, false).await {
-                tracing::warn!(error = %err, "could not mark a connection as needing a new sign-in");
+            let id = row.connection.id;
+            match row.connection.status {
+                ConnectionStatus::Active => {
+                    if self.check_account(&client, id, &account_id).await {
+                        marked += 1;
+                    }
+                }
+                // Back in the project that knows the account: it works again.
+                ConnectionStatus::NeedsSignIn { ref message }
+                    if message.as_deref() == Some(OTHER_PROJECT_MESSAGE) =>
+                {
+                    if let Ok(account) = client.connected_account(&account_id).await
+                        && account.state() == AccountState::Active
+                    {
+                        self.set_connection_status(
+                            id,
+                            ConnectionStatus::Active,
+                            account.identity,
+                            false,
+                        )
+                        .await?;
+                    }
+                }
+                _ => {}
             }
         }
-        expired
+        if marked > 0 {
+            tracing::warn!(
+                marked,
+                "connections belong to another Composio project and need a new sign-in"
+            );
+        }
+        Ok(marked)
     }
 
     // Channel exceptions -------------------------------------------------------
@@ -855,6 +917,12 @@ impl Hub {
         Ok(ChannelResult { channel })
     }
 }
+
+/// The message of a connection whose sign-in Composio reports as expired.
+const EXPIRED_MESSAGE: &str = "The sign-in expired. Reconnect it in Settings > Connectors.";
+/// The message of a connection whose account Composio does not know. This
+/// is what a key of another Composio project gives.
+pub(crate) const OTHER_PROJECT_MESSAGE: &str = "Composio does not know this account with the current key. It may belong to another Composio project. Reconnect it in Settings > Connectors, or add the old key again.";
 
 fn failed_message(reason: Option<&str>) -> String {
     match reason.map(str::trim).filter(|r| !r.is_empty()) {

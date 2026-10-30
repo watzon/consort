@@ -111,10 +111,16 @@ async fn git_with_input(
     let output = tokio::time::timeout(timeout, run)
         .await
         .map_err(|_| {
+            let limit = if timeout.as_secs() == 0 {
+                format!("{} milliseconds", timeout.as_millis())
+            } else if timeout.as_secs().is_multiple_of(60) {
+                format!("{} minutes", timeout.as_secs() / 60)
+            } else {
+                format!("{} seconds", timeout.as_secs())
+            };
             WorkerError::Workspace(format!(
-                "`git {}` did not finish in {} seconds",
+                "`git {}` did not finish in {limit}. The server may be slow or down. Check the repo address and the network, then try again",
                 args.first().copied().unwrap_or_default(),
-                timeout.as_secs()
             ))
         })?
         .map_err(|e| WorkerError::Workspace(format!("could not run git: {e}")))?;
@@ -1164,6 +1170,51 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("longer than 40 minutes"), "{err}");
         assert!(!workspaces.join("tsk_t").exists(), "nothing is left");
+    }
+
+    #[tokio::test]
+    async fn a_git_server_that_never_answers_ends_at_the_limit() {
+        // The server accepts the connection and says nothing.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/slow.git", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                held.push(socket);
+            }
+        });
+        let started = Instant::now();
+        let err = git_with(
+            &["ls-remote", "--end-of-options", &url],
+            None,
+            &[("GIT_ALLOW_PROTOCOL", "http")],
+            Duration::from_millis(600),
+        )
+        .await
+        .unwrap_err();
+        let took = started.elapsed();
+        assert!(took >= Duration::from_millis(550), "{took:?}");
+        assert!(took < Duration::from_secs(15), "{took:?}");
+        let message = err.to_string();
+        assert!(
+            message.contains("did not finish in 600 milliseconds"),
+            "{message}"
+        );
+        assert!(message.contains("slow or down"), "{message}");
+
+        // A clone of the silent server fails the same way.
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("clone");
+        let err = git_with(
+            &["clone", "--quiet", &url, &dest.display().to_string()],
+            None,
+            &[("GIT_ALLOW_PROTOCOL", "http")],
+            Duration::from_millis(600),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("did not finish"), "{err}");
+        server.abort();
     }
 
     #[tokio::test]

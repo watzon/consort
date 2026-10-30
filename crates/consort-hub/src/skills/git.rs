@@ -17,6 +17,28 @@
 //! terminal prompt, no credential helper and only the allowed protocols.
 //! Every command has a time limit, and a fetch stops when the temp folder
 //! grows past a size limit. The temp folder goes away with [`Repo`].
+//!
+//! # Private repos and ssh
+//!
+//! A public repo is fetched in the clean setup above. A repo that needs a
+//! login is fetched with the credentials of the user that runs the hub, so
+//! the hub stores no secret:
+//! - An `https` repo is fetched without credentials first. When the server
+//!   asks for a login, git runs again with the real home folder, so the
+//!   credential helper of that user (the keychain, `gh auth`, a store file)
+//!   answers. The hub never reads the answer: git does.
+//! - An `ssh` repo (`ssh://git@host/owner/repo`, or `git@host:owner/repo`
+//!   as the user types it) goes straight to the second setup. Git runs
+//!   `ssh` with the ssh agent (`SSH_AUTH_SOCK`) and the `~/.ssh` folder of
+//!   that user. `ssh` runs with `BatchMode` (no prompt) and with strict host
+//!   key checking, so an unknown host fails with a message that names the
+//!   fix. No agent forwarding.
+//! - Only a URL that the user gave the hub may use this: a URL typed in a
+//!   client request, a source that the user added, or a repo of a skill that
+//!   the user installed. A URL from a directory, a marketplace plugin or
+//!   an assistant tool fetches without credentials, and an `ssh` URL from
+//!   there is refused. So a listing cannot make the hub offer its keys to a
+//!   host that the user did not choose.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -33,7 +55,9 @@ use super::package::{Entry, EntryKind, LISTING_MAX_ENTRIES, check_listing, skill
 use crate::error::{HubError, Result};
 
 /// How long one git command may take.
-const GIT_TIMEOUT: Duration = Duration::from_secs(120);
+pub(crate) const GIT_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long `ssh` waits to connect.
+const SSH_CONNECT_SECONDS: u32 = 20;
 /// How large the temp folder of one fetch may grow. Trees of a large repo
 /// take a few MiB; the blobs of a skill take at most its size limit.
 const FETCH_MAX_BYTES: u64 = 256 * 1024 * 1024;
@@ -49,6 +73,22 @@ const NULL_DEVICE: &str = "/dev/null";
 
 /// The environment variables that git keeps: the path, and the proxy and
 /// certificate settings of the hub machine.
+/// The variables that git also keeps when it may use the credentials of the
+/// user: the ssh agent, and what credential helpers need to find the keychain
+/// or the session bus.
+const CREDENTIAL_ENV: &[&str] = &[
+    "SSH_AUTH_SOCK",
+    "USER",
+    "LOGNAME",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "XDG_RUNTIME_DIR",
+    "DBUS_SESSION_BUS_ADDRESS",
+];
+
 const KEPT_ENV: &[&str] = &[
     "PATH",
     "SYSTEMROOT",
@@ -70,20 +110,105 @@ const KEPT_ENV: &[&str] = &[
 pub(crate) struct GitOptions {
     /// Allow `file://` and `http://` URLs. Only tests turn this on.
     pub allow_local: bool,
+    /// How long one git command may take.
+    pub timeout: Duration,
+    /// Whether git may use the credentials of the hub's user for this repo.
+    /// See the module docs: only for a URL that the user gave the hub.
+    pub credentials: bool,
+    /// Git runs with the credentials now. The fetch sets it after an
+    /// anonymous try met a login, or at once for an `ssh` URL.
+    pub(crate) with_credentials: bool,
 }
 
 impl GitOptions {
+    /// Clean setup, the default time limit, no credentials.
+    pub(crate) const fn new(allow_local: bool) -> Self {
+        Self {
+            allow_local,
+            timeout: GIT_TIMEOUT,
+            credentials: false,
+            with_credentials: false,
+        }
+    }
+
+    /// The same, for a URL that the user gave the hub.
+    pub(crate) const fn trusted(mut self) -> Self {
+        self.credentials = true;
+        self
+    }
+
     fn allowed_protocols(self) -> &'static str {
-        if self.allow_local {
-            "https:http:file"
-        } else {
-            "https"
+        match (self.allow_local, self.with_credentials) {
+            (true, true) => "https:http:file:ssh",
+            (true, false) => "https:http:file",
+            (false, true) => "https:ssh",
+            (false, false) => "https",
         }
     }
 }
 
+/// The text of a git failure that means "git needs a login".
+fn is_login_failure(detail: &str) -> bool {
+    let lower = detail.to_ascii_lowercase();
+    [
+        "terminal prompts disabled",
+        "could not read username",
+        "could not read password",
+        "authentication failed",
+        "permission denied (publickey",
+        "permission denied, please try again",
+        "http basic: access denied",
+        "the requested url returned error: 401",
+        "the requested url returned error: 403",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+/// The fix for the failure, when the text names one.
+pub(crate) fn failure_hint(url: &str, detail: &str, credentials: bool) -> Option<String> {
+    let lower = detail.to_ascii_lowercase();
+    if lower.contains("host key verification failed") {
+        let host = ssh_host(url).unwrap_or("the host");
+        return Some(format!(
+            "The hub does not know the host key of {host}. Run `ssh {host}` once on the hub machine, as the user that runs the hub, and accept the key. Then try again."
+        ));
+    }
+    if lower.contains("permission denied (publickey") {
+        return Some(
+            "The ssh agent of the hub user has no key that this host accepts. Run `ssh-add -l` on the hub machine, as the user that runs the hub, to see the keys. Then try again."
+                .to_owned(),
+        );
+    }
+    if lower.contains("took longer than") {
+        return Some(format!(
+            "The server did not finish in time ({}). It may be slow or down. Try again later.",
+            detail.trim_start_matches("git ")
+        ));
+    }
+    if is_login_failure(detail) {
+        return Some(if credentials {
+            "The repo needs a login, and the hub's git credentials did not give one. Check that `git ls-remote <url>` works on the hub machine, as the user that runs the hub. The hub keeps no password. Then try again.".to_owned()
+        } else {
+            "The repo needs a login. The hub uses git credentials only for a repo that you add yourself in Settings > Skills. Add the URL there, then try again.".to_owned()
+        });
+    }
+    None
+}
+
 fn fetch_failed(url: &str, detail: &str) -> HubError {
+    fetch_failed_with(url, detail, false)
+}
+
+fn fetch_failed_with(url: &str, detail: &str, credentials: bool) -> HubError {
     let detail: String = detail.trim().chars().take(STDERR_MAX_CHARS).collect();
+    let url = shown_url(url);
+    if let Some(hint) = failure_hint(&url, &detail, credentials) {
+        return HubError::new(
+            ErrorCode::NotFound,
+            format!("The hub could not fetch {url}. {hint}"),
+        );
+    }
     HubError::new(
         ErrorCode::NotFound,
         if detail.is_empty() {
@@ -94,6 +219,22 @@ fn fetch_failed(url: &str, detail: &str) -> HubError {
             )
         },
     )
+}
+
+/// The URL for a message: without the `#ref` suffix.
+fn shown_url(url: &str) -> String {
+    url.split('#').next().unwrap_or(url).to_owned()
+}
+
+/// The host of an ssh URL, in either form.
+fn ssh_host(url: &str) -> Option<&str> {
+    if let Some(rest) = url.strip_prefix("ssh://") {
+        let authority = rest.split('/').next()?;
+        let host = authority.rsplit('@').next()?;
+        return Some(host.split(':').next().unwrap_or(host));
+    }
+    let (left, _) = url.split_once(':').filter(|_| !url.contains("://"))?;
+    Some(left.rsplit('@').next().unwrap_or(left))
 }
 
 /// A git URL with the parts that a GitHub page URL can give.
@@ -117,10 +258,13 @@ fn is_github_name(part: &str) -> bool {
 }
 
 /// Reads a git source as the user gives it: a clone URL, `owner/repo` for
-/// GitHub, or a GitHub page URL such as
-/// `https://github.com/owner/repo/tree/main/skills/pdf`. Only `https` is
-/// allowed, and `http` and `file` with `allow_local`. A URL with a user
-/// name or a password is refused, so no secret reaches a log or a skill.
+/// GitHub, a GitHub page URL such as
+/// `https://github.com/owner/repo/tree/main/skills/pdf`, or an `ssh` URL
+/// (`ssh://git@host/owner/repo`, or `git@host:owner/repo`). A `#ref` at the
+/// end names a branch, a tag or a commit. Only `https` is allowed, and
+/// `http` and `file` with `allow_local`, and `ssh` with `credentials` (see
+/// the module docs). A URL with a password is refused, so no secret reaches
+/// a log or a skill.
 pub(crate) fn parse_git_url(input: &str, options: GitOptions) -> Result<GitTarget> {
     let input = input.trim();
     let invalid = |why: &str| {
@@ -138,6 +282,26 @@ pub(crate) fn parse_git_url(input: &str, options: GitOptions) -> Result<GitTarge
             "it has a space, a control character or a leading -",
         ));
     }
+    // A ref after `#`, as in `https://host/repo#v2`.
+    let (body, fragment_ref) = match input.split_once('#') {
+        Some((body, git_ref)) => {
+            check_ref(git_ref)?;
+            (body, Some(git_ref.to_owned()))
+        }
+        None => (input, None),
+    };
+    let mut target = parse_git_body(body, options, &invalid)?;
+    if fragment_ref.is_some() {
+        target.git_ref = fragment_ref;
+    }
+    Ok(target)
+}
+
+fn parse_git_body(
+    input: &str,
+    options: GitOptions,
+    invalid: &dyn Fn(&str) -> HubError,
+) -> Result<GitTarget> {
     if !input.contains(':') {
         let parts: Vec<&str> = input.trim_end_matches('/').split('/').collect();
         if parts.len() == 2 && parts.iter().all(|p| is_github_name(p)) {
@@ -149,22 +313,24 @@ pub(crate) fn parse_git_url(input: &str, options: GitOptions) -> Result<GitTarge
         }
         return Err(invalid("it is not owner/repo"));
     }
-    let (scheme, rest) = input
-        .split_once("://")
-        .ok_or_else(|| invalid("it has no scheme"))?;
+    let Some((scheme, rest)) = input.split_once("://") else {
+        // `git@host:owner/repo`, the form that GitHub shows for ssh.
+        return parse_scp_url(input, options, invalid);
+    };
     let scheme = scheme.to_ascii_lowercase();
     match scheme.as_str() {
         "https" => {}
         "http" | "file" if options.allow_local => {}
-        _ => return Err(invalid("only https URLs are allowed")),
+        "ssh" => return parse_ssh_url(rest, options, invalid),
+        _ => return Err(invalid("only https and ssh URLs are allowed")),
     }
     if scheme != "file" {
         let authority = rest.split('/').next().unwrap_or_default();
         if authority.is_empty() || authority.contains('@') {
             return Err(invalid("it has no host, or it has a user name"));
         }
-        if rest.contains(['?', '#']) {
-            return Err(invalid("it has a query or a fragment"));
+        if rest.contains('?') {
+            return Err(invalid("it has a query"));
         }
     }
     // A GitHub page URL of a folder: /owner/repo/tree/<ref>/<path>.
@@ -200,11 +366,130 @@ pub(crate) fn parse_git_url(input: &str, options: GitOptions) -> Result<GitTarge
     })
 }
 
+fn is_ssh_user(user: &str) -> bool {
+    !user.is_empty()
+        && user.len() <= 64
+        && user
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+fn is_ssh_host(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 253
+        && !host.starts_with(['-', '.'])
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-'))
+}
+
+fn ssh_refused(invalid: &dyn Fn(&str) -> HubError) -> HubError {
+    invalid(
+        "it is an ssh URL. The hub uses ssh only for a repo that you add yourself in Settings > Skills",
+    )
+}
+
+/// `ssh://[user@]host[:port]/path`, after the scheme.
+fn parse_ssh_url(
+    rest: &str,
+    options: GitOptions,
+    invalid: &dyn Fn(&str) -> HubError,
+) -> Result<GitTarget> {
+    if !options.credentials {
+        return Err(ssh_refused(invalid));
+    }
+    let (authority, path) = rest
+        .split_once('/')
+        .ok_or_else(|| invalid("it has no path"))?;
+    if path.is_empty() || path.starts_with('-') || rest.contains('?') {
+        return Err(invalid(
+            "its path is empty or starts with -, or it has a query",
+        ));
+    }
+    let (user, host_port) = match authority.rsplit_once('@') {
+        Some((user, host_port)) => (Some(user), host_port),
+        None => (None, authority),
+    };
+    if user.is_some_and(|u| !is_ssh_user(u)) {
+        return Err(invalid(
+            "its ssh user name has a character that is not allowed",
+        ));
+    }
+    let (host, port) = match host_port.split_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (host_port, None),
+    };
+    if !is_ssh_host(host) {
+        return Err(invalid("its host name is not valid"));
+    }
+    if port.is_some_and(|p| p.is_empty() || p.len() > 5 || !p.bytes().all(|b| b.is_ascii_digit())) {
+        return Err(invalid("its port is not a number"));
+    }
+    let user = user.map(|u| format!("{u}@")).unwrap_or_default();
+    let port = port.map(|p| format!(":{p}")).unwrap_or_default();
+    Ok(GitTarget {
+        url: format!("ssh://{user}{host}{port}/{path}"),
+        git_ref: None,
+        path: None,
+    })
+}
+
+/// `[user@]host:path`, the scp-like form of an ssh URL. Git reads this form
+/// itself: a path without a leading `/` is in the home folder of the ssh
+/// user. The hub keeps the text as the user typed it, after the checks.
+fn parse_scp_url(
+    input: &str,
+    options: GitOptions,
+    invalid: &dyn Fn(&str) -> HubError,
+) -> Result<GitTarget> {
+    let Some((left, path)) = input.split_once(':') else {
+        return Err(invalid("it has no scheme"));
+    };
+    let (user, host) = match left.rsplit_once('@') {
+        Some((user, host)) => (Some(user), host),
+        None => (None, left),
+    };
+    // `ext::command`, `C:\folder` and the like are not ssh URLs.
+    if left.contains('/')
+        || path.is_empty()
+        || path.starts_with(':')
+        || !(user.is_some() || host.contains('.'))
+        || !is_ssh_host(host)
+    {
+        return Err(invalid("it has no scheme"));
+    }
+    if !options.credentials {
+        return Err(ssh_refused(invalid));
+    }
+    if user.is_some_and(|u| !is_ssh_user(u)) {
+        return Err(invalid(
+            "its ssh user name has a character that is not allowed",
+        ));
+    }
+    if path.starts_with('-') || path.contains("..") {
+        return Err(invalid("its path starts with - or climbs out of a folder"));
+    }
+    Ok(GitTarget {
+        url: input.to_owned(),
+        git_ref: None,
+        path: None,
+    })
+}
+
+/// Whether a clone URL goes over ssh: `ssh://...` or the scp-like
+/// `user@host:path`. Every other form that the hub accepts has `://`.
+pub(crate) fn is_ssh_url(url: &str) -> bool {
+    url.starts_with("ssh://") || (!url.contains("://") && url.contains(':'))
+}
+
 /// Two clone URLs name the same repo: the same text without case in the
 /// host, a trailing `/` or `.git`.
 pub(crate) fn same_repo(a: &str, b: &str) -> bool {
     fn key(url: &str) -> String {
         url.trim()
+            .split('#')
+            .next()
+            .unwrap_or_default()
             .trim_end_matches('/')
             .trim_end_matches(".git")
             .to_ascii_lowercase()
@@ -279,9 +564,34 @@ fn folder_size(path: &Path) -> u64 {
     total
 }
 
+/// The home folder of the user that runs the hub, for the setup with
+/// credentials. Tests set another one for their thread.
+fn user_home() -> Option<PathBuf> {
+    #[cfg(test)]
+    if let Some(home) = TEST_HOME.with(|h| h.borrow().clone()) {
+        return Some(home);
+    }
+    ["HOME", "USERPROFILE"]
+        .iter()
+        .find_map(|key| std::env::var_os(key).filter(|v| !v.is_empty()))
+        .map(PathBuf::from)
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_HOME: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Makes the setup with credentials use `home` in this test thread.
+#[cfg(test)]
+pub(crate) fn set_test_home(home: Option<PathBuf>) {
+    TEST_HOME.with(|h| *h.borrow_mut() = home);
+}
+
 /// One git command, in a clean environment. `home` is the temp folder of
 /// the fetch. With `watch`, the command stops when that folder grows past
-/// [`FETCH_MAX_BYTES`].
+/// [`FETCH_MAX_BYTES`]. With `options.with_credentials`, git also gets the
+/// real home folder, the user's git config and the ssh agent.
 async fn run_git(
     options: GitOptions,
     home: &Path,
@@ -298,27 +608,50 @@ async fn run_git(
         }
     }
     command
-        .env("HOME", home)
-        .env("XDG_CONFIG_HOME", home)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", NULL_DEVICE)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_ALLOW_PROTOCOL", options.allowed_protocols())
         .env("GIT_NO_LAZY_FETCH", "1")
         .env("LC_ALL", "C")
         .current_dir(home);
-    for setting in [
+    if options.with_credentials {
+        for key in CREDENTIAL_ENV {
+            if let Some(value) = std::env::var_os(key) {
+                command.env(key, value);
+            }
+        }
+        // The user's own `~/.gitconfig` and system config give the
+        // credential helper. The settings below still win, as they come on
+        // the command line. `GIT_SSH_COMMAND` wins over `core.sshCommand`.
+        command
+            .env("HOME", user_home().unwrap_or_else(|| home.to_path_buf()))
+            .env(
+                "GIT_SSH_COMMAND",
+                format!(
+                    "ssh -o BatchMode=yes -o ConnectTimeout={SSH_CONNECT_SECONDS} -o StrictHostKeyChecking=yes -o ForwardAgent=no -o ForwardX11=no"
+                ),
+            );
+    } else {
+        command
+            .env("HOME", home)
+            .env("XDG_CONFIG_HOME", home)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", NULL_DEVICE);
+    }
+    let mut settings = vec![
         format!("core.hooksPath={NULL_DEVICE}"),
         "core.fsmonitor=false".to_owned(),
         "core.symlinks=false".to_owned(),
         "transfer.fsckObjects=true".to_owned(),
         "protocol.version=2".to_owned(),
         "init.defaultBranch=main".to_owned(),
-        "credential.helper=".to_owned(),
         "fetch.recurseSubmodules=false".to_owned(),
         "http.lowSpeedLimit=1024".to_owned(),
         "http.lowSpeedTime=30".to_owned(),
-    ] {
+    ];
+    if !options.with_credentials {
+        settings.push("credential.helper=".to_owned());
+    }
+    for setting in settings {
         command.arg("-c").arg(setting);
     }
     if let Some(dir) = git_dir {
@@ -349,13 +682,13 @@ async fn run_git(
     }
     let output = child.wait_with_output();
     tokio::pin!(output);
-    let deadline = tokio::time::sleep(GIT_TIMEOUT);
+    let deadline = tokio::time::sleep(options.timeout);
     tokio::pin!(deadline);
     let mut tick = tokio::time::interval(Duration::from_millis(250));
     let output = loop {
         tokio::select! {
             out = &mut output => break out.map_err(|e| format!("git failed ({e})"))?,
-            () = &mut deadline => return Err(format!("git took longer than {} seconds", GIT_TIMEOUT.as_secs())),
+            () = &mut deadline => return Err(format!("git took longer than {}", crate::util::duration_text(options.timeout))),
             _ = tick.tick(), if watch => {
                 let dir = home.to_path_buf();
                 let size = tokio::task::spawn_blocking(move || folder_size(&dir)).await.unwrap_or(0);
@@ -370,10 +703,21 @@ async fn run_git(
         Ok(output.stdout)
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        // A login or host key problem is the useful line, though git ends
+        // with "Could not read from remote repository."
         let line = stderr
             .lines()
-            .rev()
-            .find(|l| l.starts_with("fatal:") || l.starts_with("error:"))
+            .find(|l| {
+                is_login_failure(l)
+                    || l.to_ascii_lowercase()
+                        .contains("host key verification failed")
+            })
+            .or_else(|| {
+                stderr
+                    .lines()
+                    .rev()
+                    .find(|l| l.starts_with("fatal:") || l.starts_with("error:"))
+            })
             .or_else(|| stderr.lines().rev().find(|l| !l.trim().is_empty()))
             .unwrap_or("git failed");
         Err(line
@@ -383,8 +727,19 @@ async fn run_git(
     }
 }
 
+/// The options for the first try at `url`: an `ssh` URL goes straight to the
+/// setup with credentials, any other URL starts anonymous.
+fn first_try(url: &str, options: GitOptions) -> GitOptions {
+    GitOptions {
+        with_credentials: options.credentials && is_ssh_url(url),
+        ..options
+    }
+}
+
 /// The commit that a branch or tag points to now, without a fetch
-/// (`git ls-remote`). A full SHA is its own answer.
+/// (`git ls-remote`). A full SHA is its own answer. A repo that needs a
+/// login is asked again with the credentials of the hub's user when
+/// `options.credentials` allows it.
 pub(crate) async fn remote_commit(
     tmp_root: &Path,
     url: &str,
@@ -399,16 +754,18 @@ pub(crate) async fn remote_commit(
     }
     let home = new_temp(tmp_root)?;
     let wanted = git_ref.unwrap_or("HEAD");
-    let out = run_git(
-        options,
-        home.path(),
-        None,
-        &["ls-remote", "--end-of-options", url, wanted],
-        None,
-        false,
-    )
-    .await
-    .map_err(|e| fetch_failed(url, &e))?;
+    let args = ["ls-remote", "--end-of-options", url, wanted];
+    let mut tried = first_try(url, options);
+    let mut result = run_git(tried, home.path(), None, &args, None, false).await;
+    if let Err(detail) = &result
+        && options.credentials
+        && !tried.with_credentials
+        && is_login_failure(detail)
+    {
+        tried.with_credentials = true;
+        result = run_git(tried, home.path(), None, &args, None, false).await;
+    }
+    let out = result.map_err(|e| fetch_failed_with(url, &e, tried.with_credentials))?;
     let text = String::from_utf8_lossy(&out);
     // An exact match first: a branch, then a tag, then anything.
     let rows: Vec<(&str, &str)> = text.lines().filter_map(|l| l.split_once('\t')).collect();
@@ -487,25 +844,30 @@ impl Repo {
         .await
         .map_err(|e| fetch_failed(url, &e))?;
         let wanted = git_ref.unwrap_or("HEAD");
-        run_git(
-            options,
-            dir.path(),
-            Some(&git_dir),
-            &[
-                "fetch",
-                "--quiet",
-                "--no-tags",
-                "--depth=1",
-                "--filter=blob:none",
-                "--end-of-options",
-                url,
-                wanted,
-            ],
-            None,
-            true,
-        )
-        .await
-        .map_err(|e| fetch_failed(url, &e))?;
+        let fetch_args = [
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            "--depth=1",
+            "--filter=blob:none",
+            "--end-of-options",
+            url,
+            wanted,
+        ];
+        // Anonymous first (except for ssh). A login asks for the setup with
+        // the credentials of the hub's user, when the URL allows it.
+        let mut options = first_try(url, options);
+        let mut fetched =
+            run_git(options, dir.path(), Some(&git_dir), &fetch_args, None, true).await;
+        if let Err(detail) = &fetched
+            && options.credentials
+            && !options.with_credentials
+            && is_login_failure(detail)
+        {
+            options.with_credentials = true;
+            fetched = run_git(options, dir.path(), Some(&git_dir), &fetch_args, None, true).await;
+        }
+        fetched.map_err(|e| fetch_failed_with(url, &e, options.with_credentials))?;
         let out = run_git(
             options,
             dir.path(),
@@ -544,7 +906,7 @@ impl Repo {
             watch,
         )
         .await
-        .map_err(|e| fetch_failed(&self.url, &e))
+        .map_err(|e| fetch_failed_with(&self.url, &e, self.options.with_credentials))
     }
 
     /// Every file, link and submodule under `path` (the whole tree when
@@ -802,8 +1164,8 @@ impl Repo {
 mod tests {
     use super::*;
 
-    const LOCAL: GitOptions = GitOptions { allow_local: true };
-    const REMOTE: GitOptions = GitOptions { allow_local: false };
+    const LOCAL: GitOptions = GitOptions::new(true);
+    const REMOTE: GitOptions = GitOptions::new(false);
 
     #[test]
     fn git_urls_are_read_and_checked() {

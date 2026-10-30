@@ -324,6 +324,7 @@ pub async fn run_with(
         harnesses,
         sessions: Mutex::new(Default::default()),
         statuses: Mutex::new(Default::default()),
+        login_expired: Mutex::default(),
         spool_notify: Notify::new(),
         inventory_notify: Notify::new(),
         last_inventory_hash: Mutex::new(None),

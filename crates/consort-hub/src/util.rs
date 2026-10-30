@@ -93,9 +93,32 @@ pub fn truncate_chars(text: &str, max_chars: usize) -> String {
     out
 }
 
+/// A time limit as words for a message: "2 minutes", "30 seconds" or
+/// "250 milliseconds".
+pub fn duration_text(limit: std::time::Duration) -> String {
+    let (n, unit) = match limit.as_secs() {
+        0 => (limit.as_millis().max(1), "millisecond"),
+        s if s % 60 == 0 => (u128::from(s / 60), "minute"),
+        s => (u128::from(s), "second"),
+    };
+    format!("{n} {unit}{}", if n == 1 { "" } else { "s" })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn limits_read_as_words() {
+        use std::time::Duration;
+        assert_eq!(
+            duration_text(Duration::from_millis(250)),
+            "250 milliseconds"
+        );
+        assert_eq!(duration_text(Duration::from_secs(1)), "1 second");
+        assert_eq!(duration_text(Duration::from_secs(90)), "90 seconds");
+        assert_eq!(duration_text(Duration::from_secs(120)), "2 minutes");
+    }
 
     #[test]
     fn sha256_of_empty_input() {
