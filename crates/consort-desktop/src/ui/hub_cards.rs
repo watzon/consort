@@ -96,81 +96,91 @@ impl ConsortApp {
                         .child(glyph)
                         .child(service_logo(&card.logo, t.icon.dense, t))
                         .child(summary)
-                        .child(text(
-                            card.rule_note.clone(),
-                            t.text.caption,
-                            c.text_tertiary,
-                        )),
+                        // A draft card says why it asks in its voice line
+                        // and flags, so the rule note stays off.
+                        .when(card.draft.is_none(), |d| {
+                            d.child(text(
+                                card.rule_note.clone(),
+                                t.text.caption,
+                                c.text_tertiary,
+                            ))
+                        }),
                 );
-                let mut fields = div()
-                    .flex()
-                    .flex_col()
-                    .gap(t.space.xs)
-                    .py(t.space.md - t.space.xxs)
-                    .px(t.space.md)
-                    .rounded(t.radius.md)
-                    .border(t.border_width)
-                    .border_color(c.border_subtle)
-                    .bg(c.surface_canvas);
-                let mut paragraphs = Vec::new();
-                for (i, field) in card.fields.iter().enumerate() {
-                    if is_paragraph(&field.label, &field.value) {
-                        paragraphs.push((i, field.clone()));
-                        continue;
+                // A draft or send tool: the voice line, the flags, Edit and
+                // "Not how I write".
+                if let Some(draft) = card.draft.clone() {
+                    frame = frame.child(self.render_draft_card(approval, card, &draft, key, t, cx));
+                } else {
+                    let mut fields = div()
+                        .flex()
+                        .flex_col()
+                        .gap(t.space.xs)
+                        .py(t.space.md - t.space.xxs)
+                        .px(t.space.md)
+                        .rounded(t.radius.md)
+                        .border(t.border_width)
+                        .border_color(c.border_subtle)
+                        .bg(c.surface_canvas);
+                    let mut paragraphs = Vec::new();
+                    for (i, field) in card.fields.iter().enumerate() {
+                        if is_paragraph(&field.label, &field.value) {
+                            paragraphs.push((i, field.clone()));
+                            continue;
+                        }
+                        fields = fields.child(
+                            div()
+                                .flex()
+                                .items_baseline()
+                                .gap(t.space.md)
+                                .child(
+                                    text(field.label.clone(), detail(t), c.text_tertiary)
+                                        .w(t.layout.speaker_gutter)
+                                        .flex_none(),
+                                )
+                                .child(
+                                    selectable(
+                                        SharedString::from(format!("{key}-field-{i}")),
+                                        field.value.clone(),
+                                        t.text.ui,
+                                        c.text_primary,
+                                    )
+                                    .flex_1()
+                                    .min_w_0(),
+                                ),
+                        );
                     }
-                    fields = fields.child(
+                    for (i, field) in paragraphs {
+                        fields = fields.child(div().pt(t.space.sm).child(selectable(
+                            SharedString::from(format!("{key}-field-{i}")),
+                            field.value.clone(),
+                            t.text.ui,
+                            c.text_secondary,
+                        )));
+                    }
+                    if card.fields.is_empty() {
+                        fields = fields.child(text(
+                            "The call has no arguments to show.",
+                            t.text.ui,
+                            c.text_tertiary,
+                        ));
+                    }
+                    frame = frame.child(fields);
+                    let tool = card.tool.clone();
+                    frame = frame.child(
                         div()
                             .flex()
-                            .items_baseline()
-                            .gap(t.space.md)
-                            .child(
-                                text(field.label.clone(), detail(t), c.text_tertiary)
-                                    .w(t.layout.speaker_gutter)
-                                    .flex_none(),
-                            )
-                            .child(
-                                selectable(
-                                    SharedString::from(format!("{key}-field-{i}")),
-                                    field.value.clone(),
-                                    t.text.ui,
-                                    c.text_primary,
-                                )
-                                .flex_1()
-                                .min_w_0(),
-                            ),
+                            .items_center()
+                            .gap(t.space.sm)
+                            .child(self.card_outcome_or_buttons(approval, whole, key, t, cx))
+                            .child(div().flex_1())
+                            .child(div().font_family(t.font_mono.clone()).child(selectable(
+                                SharedString::from(format!("{key}-tool")),
+                                tool,
+                                t.text.caption,
+                                c.text_tertiary,
+                            ))),
                     );
                 }
-                for (i, field) in paragraphs {
-                    fields = fields.child(div().pt(t.space.sm).child(selectable(
-                        SharedString::from(format!("{key}-field-{i}")),
-                        field.value.clone(),
-                        t.text.ui,
-                        c.text_secondary,
-                    )));
-                }
-                if card.fields.is_empty() {
-                    fields = fields.child(text(
-                        "The call has no arguments to show.",
-                        t.text.ui,
-                        c.text_tertiary,
-                    ));
-                }
-                frame = frame.child(fields);
-                let tool = card.tool.clone();
-                frame = frame.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(t.space.sm)
-                        .child(self.card_outcome_or_buttons(approval, whole, key, t, cx))
-                        .child(div().flex_1())
-                        .child(div().font_family(t.font_mono.clone()).child(selectable(
-                            SharedString::from(format!("{key}-tool")),
-                            tool,
-                            t.text.caption,
-                            c.text_tertiary,
-                        ))),
-                );
             }
             HubCardView::Management(card) => {
                 frame = frame
@@ -426,7 +436,7 @@ impl ConsortApp {
 
     /// The buttons of a card that waits, or the line that says how it was
     /// answered.
-    fn card_outcome_or_buttons(
+    pub(crate) fn card_outcome_or_buttons(
         &mut self,
         approval: &ApprovalView,
         card: &HubCardView,

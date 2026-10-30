@@ -116,6 +116,7 @@ async fn a_connector_call_waits_for_the_card_that_the_client_answers() {
                 .request(ApprovalAnswer {
                     approval_id: card.id,
                     option_id: "allow".to_owned(),
+                    checked: false,
                 })
                 .await
                 .unwrap();

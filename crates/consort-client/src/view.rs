@@ -95,6 +95,8 @@ pub struct ViewState {
     pub convo: crate::convo::ConvoView,
     /// Settings > Proactivity. See [`crate::proactivity`].
     pub proactivity: crate::proactivity::ProactivityView,
+    /// Settings > Voice. See [`crate::voice`].
+    pub voice: crate::voice::VoiceView,
 }
 
 /// A message that the hub refused after it left the composer.
@@ -789,6 +791,11 @@ pub struct TaskCardView {
     pub latest: Option<String>,
     /// How much the task may do without asking.
     pub approval_mode: ApprovalMode,
+    /// The finished steps of a Ready for review card, such as those of the
+    /// voice task.
+    pub steps: Vec<String>,
+    /// A last line of the card, such as "Raw text stays in this task.".
+    pub note: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]

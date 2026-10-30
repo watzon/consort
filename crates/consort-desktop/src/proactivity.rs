@@ -129,7 +129,15 @@ pub fn zone_options(current: &str) -> Vec<String> {
 }
 
 /// The kinds of the kind filter.
-pub const LOG_KINDS: [ProactiveKind; 7] = ProactiveKind::ALL;
+pub const LOG_KINDS: [ProactiveKind; 7] = [
+    ProactiveKind::CheckIn,
+    ProactiveKind::Brief,
+    ProactiveKind::FollowUp,
+    ProactiveKind::StaleTask,
+    ProactiveKind::Research,
+    ProactiveKind::ChannelCreated,
+    ProactiveKind::Feedback,
+];
 
 impl ConsortApp {
     /// Runs one proactivity command. A failure shows as a notice.

@@ -165,11 +165,14 @@ pub enum ProactiveKind {
     ChannelCreated,
     /// The user rated a proactive message as too noisy.
     Feedback,
+    /// An offer about the style guide of "Write in my voice". It comes from
+    /// the user's own sources or edits, so no level stops it.
+    Voice,
 }
 
 impl ProactiveKind {
     /// Every kind.
-    pub const ALL: [ProactiveKind; 7] = [
+    pub const ALL: [ProactiveKind; 8] = [
         Self::CheckIn,
         Self::Brief,
         Self::FollowUp,
@@ -177,6 +180,7 @@ impl ProactiveKind {
         Self::Research,
         Self::ChannelCreated,
         Self::Feedback,
+        Self::Voice,
     ];
 
     /// The wire text.
@@ -189,6 +193,7 @@ impl ProactiveKind {
             Self::Research => "research",
             Self::ChannelCreated => "channel_created",
             Self::Feedback => "feedback",
+            Self::Voice => "voice",
         }
     }
 
@@ -207,6 +212,7 @@ impl ProactiveKind {
             Self::Research => "Research",
             Self::ChannelCreated => "New channel",
             Self::Feedback => "Feedback",
+            Self::Voice => "Voice",
         }
     }
 
@@ -217,7 +223,7 @@ impl ProactiveKind {
             Self::FollowUp | Self::StaleTask | Self::ChannelCreated => ProactivityLevel::Quiet,
             Self::CheckIn | Self::Brief => ProactivityLevel::Normal,
             Self::Research => ProactivityLevel::Eager,
-            Self::Feedback => ProactivityLevel::Off,
+            Self::Feedback | Self::Voice => ProactivityLevel::Off,
         }
     }
 

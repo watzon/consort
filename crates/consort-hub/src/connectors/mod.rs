@@ -134,6 +134,17 @@ pub struct Connectors {
 }
 
 impl Connectors {
+    /// The tool lists in the cache, by service, also stale ones. It never
+    /// asks Composio.
+    pub(crate) async fn cached_tools(&self) -> HashMap<String, Vec<Tool>> {
+        self.tools
+            .lock()
+            .await
+            .iter()
+            .map(|(service, (_, tools))| (service.clone(), tools.clone()))
+            .collect()
+    }
+
     /// Reads the stored key. A key that cannot be read leaves the hub with
     /// no key, and a warning in the log.
     pub(crate) fn open(data_dir: &Path) -> Self {

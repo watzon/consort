@@ -1586,6 +1586,26 @@ impl ConsortApp {
                     .text_ellipsis(),
                 ),
             ));
+            // The voice task: its finished steps, and what stays in it.
+            if !card.steps.is_empty() {
+                body = body.child(self.render_task_steps(&card.message_id, &card.steps, t));
+            }
+            if let Some(note) = card.note.clone() {
+                body = body.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(t.space.sm)
+                        .child(text(note, detail(t), c.text_tertiary).flex_1())
+                        .child(self.open_thread_link(&card.task_id, open, t, cx)),
+                );
+                return div()
+                    .flex()
+                    .flex_col()
+                    .child(line)
+                    .child(body)
+                    .into_any_element();
+            }
             // The actions sit in one row at the bottom, as on an approval:
             // Resolve for a task in review, and Open thread at the right.
             let task_id = card.task_id.clone();

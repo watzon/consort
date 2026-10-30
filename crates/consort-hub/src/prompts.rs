@@ -417,6 +417,43 @@ mod tests {
     }
 
     #[test]
+    fn the_prompts_have_the_rules_of_the_voice() {
+        let coordinator = coordinator_system_prompt(&channel(), "", "");
+        for rule in [
+            "# Writing in the user's voice",
+            "Use the voice only for text that goes out in the user's name",
+            "Never for your own replies to the user, task briefs, code or commits.",
+            "Never write in the voice of anyone else.",
+            "call `voice_guide` with the context",
+            "Never add a date, a time, a price, a promise or an agreement that the request does not contain.",
+            "every send still waits for the user",
+            "Propose a rule change only for a change that at least 3 edits agree on",
+            "One edit changes nothing.",
+            "`voice_feedback`",
+            "Keep every rule that ends with `(you)` word for word",
+            "Only the Tutti coordinator writes `voice.md`.",
+            "`voice_sample`",
+            "Post nothing and send nothing for this event.",
+            "- `voice_edits`, `voice_feedback` and `voice_sample`",
+        ] {
+            assert!(
+                coordinator.contains(rule),
+                "the coordinator prompt lacks: {rule}"
+            );
+        }
+        let task = task_system_prompt(&channel(), &task_for_prompt(), "", "");
+        for rule in [
+            "# Writing in the user's voice",
+            "call `voice_guide` with the context",
+            "never add a date, a time, a price, a promise or an agreement that the brief and the user did not give",
+            "Never use the voice for your updates, your summary, code or commits.",
+            "write drafts in a neutral, short and polite style",
+        ] {
+            assert!(task.contains(rule), "the task prompt lacks: {rule}");
+        }
+    }
+
+    #[test]
     fn the_base_prompts_use_no_em_dashes() {
         assert!(!COORDINATOR_BASE.contains('\u{2014}') && !COORDINATOR_BASE.contains('\u{2013}'));
         assert!(!TASK_BASE.contains('\u{2014}') && !TASK_BASE.contains('\u{2013}'));

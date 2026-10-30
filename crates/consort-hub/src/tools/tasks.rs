@@ -484,6 +484,11 @@ impl Hub {
         ctx: &ToolCtx,
         args: SuggestMemoryArgs,
     ) -> Result<Value> {
+        // The voice task's guide goes to the offer card, never straight
+        // to the coordinator as a note.
+        if self.is_voice_task(ctx.task.as_ref()).await? {
+            return self.voice_proposal(ctx, args).await;
+        }
         let (source, target) = match &ctx.task {
             Some(task) => (SuggestionSource::Task(task.id), ctx.channel.id),
             None => {

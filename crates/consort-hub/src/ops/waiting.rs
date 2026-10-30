@@ -19,6 +19,8 @@ impl Hub {
     ) -> Result<ApprovalResult> {
         let client_id = caller.client_id();
         let hub = self.clone();
+        let mut voice_edits = None;
+        let voice_edits_slot = &mut voice_edits;
         let (approval, worker_id) = self
             .store
             .write(move |tx| {
@@ -37,6 +39,11 @@ impl Hub {
                             "The approval has no option with this ID. Choose one of its options.",
                         )
                     })?;
+                crate::voice::card::check_allow(
+                    &approval,
+                    !option.kind.is_deny(),
+                    request.checked,
+                )?;
                 approval.status = if option.kind.is_deny() {
                     ApprovalStatus::Denied
                 } else {
@@ -50,7 +57,9 @@ impl Hub {
                     // The hub made this card and carries out the answer
                     // itself, after the commit. No session.respond.
                     resume_if_nothing_waits(tx, approval.task_id)?;
-                    return Ok((approval, None));
+                    // A draft that goes out becomes a draft pair.
+                    let tutti = crate::voice::card::record_pair_in_tx(tx, &approval)?;
+                    return Ok((approval, None, tutti));
                 }
                 let session = work::session_or_404(tx.db(), approval.session_id)?;
                 tx.queue_command(
@@ -66,9 +75,16 @@ impl Hub {
                 )?;
                 resume_if_nothing_waits(tx, approval.task_id)?;
                 let _ = &hub;
-                Ok((approval, Some(session.worker_id)))
+                Ok((approval, Some(session.worker_id), None))
             })
-            .await?;
+            .await
+            .map(|(approval, worker_id, tutti)| {
+                *voice_edits_slot = tutti;
+                (approval, worker_id)
+            })?;
+        if let Some(tutti) = voice_edits {
+            self.kick_coordinator(tutti);
+        }
         match worker_id {
             Some(worker_id) => self.pump_worker(worker_id),
             None => self.hub_card_answered(approval.clone()),
@@ -97,6 +113,11 @@ impl Hub {
                 decision.answer = Some(request.answer.clone());
                 decision.answered_at = Some(tx.now());
                 tx.save_decision(&decision)?;
+                // The offer "Save this style guide?": the hub carries out
+                // the answer itself.
+                if crate::voice::learn::proposal_answered(tx, &decision)? {
+                    return Ok((decision, None, None));
+                }
 
                 let text = request
                     .answer

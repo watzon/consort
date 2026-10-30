@@ -237,8 +237,11 @@ impl Hub {
             workspace.isolation = Isolation::Clone;
         }
         let (global_index, channel_index) = self.memory_indexes(&channel).await?;
-        let system_prompt =
+        let mut system_prompt =
             prompts::task_system_prompt(&channel, &task, &global_index, &channel_index);
+        if let Some(voice) = self.voice_prompt_section(&channel).await? {
+            system_prompt.push_str(&voice);
+        }
         let first_turn = prompts::task_first_turn(&task);
         let local_mcp = task
             .placement
@@ -1042,6 +1045,7 @@ mod tests {
             ApprovalAnswer {
                 approval_id,
                 option_id: "allow".to_owned(),
+                checked: false,
             },
         )
         .await

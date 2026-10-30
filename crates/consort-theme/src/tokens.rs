@@ -370,6 +370,7 @@ pub struct Components {
     pub update_notice: UpdateNotice,
     pub chat: Chat,
     pub proactivity: Proactivity,
+    pub voice: Voice,
     pub theme_preview: ThemePreview,
     pub convo: Convo,
 }
@@ -409,6 +410,25 @@ pub struct Convo {
     pub quick_emoji_text: Type,
     pub emoji_cell_text: Type,
     pub wordmark: Type,
+}
+
+/// The sizes of the voice screens. See `structure::Voice`.
+#[derive(Clone, Copy, Debug)]
+pub struct Voice {
+    pub remove_slot: Pixels,
+    pub rule_dot: Pixels,
+    pub source_tile: Pixels,
+    pub check_box: Pixels,
+    pub check_icon: Pixels,
+    pub radio_dot: Pixels,
+    pub sample_dot: Pixels,
+    pub flag_bar: Pixels,
+    pub field_label: Pixels,
+    pub subject_box: Pixels,
+    pub body_box: Pixels,
+    pub line_icon: Pixels,
+    pub rule_pad_y: Pixels,
+    pub example_pad_y: Pixels,
 }
 
 /// The sizes of the proactivity screens. See `structure::Proactivity`.
@@ -858,6 +878,25 @@ impl Components {
                     offer_pad_top: px(p.offer_pad_top),
                     offer_pad: px(p.offer_pad),
                     brief_group_gap: px(p.brief_group_gap),
+                }
+            },
+            voice: {
+                let v = &c.voice;
+                Voice {
+                    remove_slot: px(v.remove_slot),
+                    rule_dot: px(v.rule_dot),
+                    source_tile: px(v.source_tile),
+                    check_box: px(v.check_box),
+                    check_icon: px(v.check_icon),
+                    radio_dot: px(v.radio_dot),
+                    sample_dot: px(v.sample_dot),
+                    flag_bar: px(v.flag_bar),
+                    field_label: px(v.field_label),
+                    subject_box: px(v.subject_box),
+                    body_box: px(v.body_box),
+                    line_icon: px(v.line_icon),
+                    rule_pad_y: px(v.rule_pad_y),
+                    example_pad_y: px(v.example_pad_y),
                 }
             },
             theme_preview: ThemePreview {

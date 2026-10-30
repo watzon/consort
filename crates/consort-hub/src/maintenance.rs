@@ -80,6 +80,11 @@ pub(crate) fn spawn(hub: &Hub) -> JoinHandle<()> {
                     Ok(_) => {}
                     Err(err) => tracing::warn!(error = %err, "could not prune the feed"),
                 }
+                match hub.purge_voice().await {
+                    Ok(0) => {}
+                    Ok(purged) => tracing::info!(purged, "removed draft pairs older than 90 days"),
+                    Err(err) => tracing::warn!(error = %err, "could not purge draft pairs"),
+                }
             }
         }
     })

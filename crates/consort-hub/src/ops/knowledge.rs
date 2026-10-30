@@ -62,6 +62,19 @@ impl Hub {
                         ));
                     }
                 }
+                // voice.md keeps the style guide format, its screening and
+                // the rules that the user wrote.
+                let content = if scope == MemoryScope::Global
+                    && path == consort_proto::model::VOICE_NOTE_PATH
+                {
+                    crate::voice::screen_note_write(
+                        tx.db(),
+                        source.by == MemoryAuthor::User,
+                        &content,
+                    )?
+                } else {
+                    content
+                };
                 let before = knowledge::memory_note(tx.db(), scope, &path)?;
                 let note = tx.write_memory(
                     scope,
@@ -123,7 +136,7 @@ fn suggestion_name(conn: &rusqlite::Connection, source: SuggestionSource) -> Res
 /// note, its version and the suggestion that it keeps. When the newest
 /// timeline message is the line for the same note, the hub updates that
 /// line, so a turn that writes a note twice shows one line.
-fn post_memory_saved(
+pub(crate) fn post_memory_saved(
     tx: &mut Tx<'_>,
     channel_id: ChannelId,
     note: &MemoryNote,

@@ -1237,6 +1237,26 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                     1 => format!("{}, 1 reply", status.label()),
                     n => format!("{}, {n} replies", status.label()),
                 };
+                let mut latest = match status {
+                    TaskStatus::Review => task.review_summary.clone(),
+                    TaskStatus::Failed | TaskStatus::UpNext => task.status_reason.clone(),
+                    _ => None,
+                };
+                // The voice task's card shows its steps and what stays in it.
+                let voice_task = cache
+                    .voice
+                    .settings
+                    .as_ref()
+                    .is_some_and(|v| v.task_id == Some(task.id));
+                let (mut steps, mut note) = (Vec::new(), None);
+                if voice_task {
+                    note = Some(crate::voice::VOICE_TASK_NOTE.to_owned());
+                    if let Some(summary) = latest.as_deref() {
+                        let (rest, found) = crate::voice::voice_task_steps(summary);
+                        steps = found;
+                        latest = Some(rest).filter(|r| !r.is_empty());
+                    }
+                }
                 items.push(TimelineItem::TaskCard(TaskCardView {
                     message_id: m.id.to_string(),
                     task_id: task.id.to_string(),
@@ -1250,12 +1270,10 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                     approval,
                     summary,
                     reply_count: replies,
-                    latest: match status {
-                        TaskStatus::Review => task.review_summary.clone(),
-                        TaskStatus::Failed | TaskStatus::UpNext => task.status_reason.clone(),
-                        _ => None,
-                    },
+                    latest,
                     approval_mode: approval_mode(task.approval_mode),
+                    steps,
+                    note,
                 }));
             } else if m.kind == MessageKind::Approval {
                 // Snapshots hold only pending approvals, so an answered one
@@ -1780,6 +1798,7 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
         memory_deleted_loaded: cache.memory_deleted_loaded.iter().cloned().collect(),
         convo: crate::convo::ConvoView::default(),
         proactivity: crate::proactivity::proactivity_view(cache, now),
+        voice: crate::voice::voice_view(cache),
     };
     crate::proactivity::decorate_timelines(cache, &mut state.timelines);
     state.activity = channel_activities(cache, &state);

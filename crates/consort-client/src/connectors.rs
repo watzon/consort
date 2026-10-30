@@ -557,6 +557,9 @@ pub struct ConnectorCardView {
     pub fields: Vec<CardFieldView>,
     /// Why it asks, such as "Create and change tools ask every time".
     pub rule_note: String,
+    /// The voice parts, for a tool that drafts or sends in the user's
+    /// name: the voice line, the flags and Edit.
+    pub draft: Option<crate::voice::DraftCardView>,
 }
 
 /// A management change that waits for the user.

@@ -56,6 +56,8 @@ const CODE: &str = "ABCD-EFGH";
 
 #[path = "fake_hub_parts/phase4.rs"]
 mod phase4;
+#[path = "fake_hub_parts/voice.rs"]
+mod voice;
 
 #[derive(Default)]
 struct Hub {
@@ -156,6 +158,7 @@ struct Hub {
     versions: Vec<consort_proto::model::MemoryNote>,
     /// Phase 4: see `fake_hub_parts/phase4.rs`.
     phase4: phase4::State,
+    voice: voice::State,
     /// The hub epoch that `hello` sends.
     hub_epoch: Option<String>,
     /// While set, each channel snapshot waits until this fires.
@@ -1831,6 +1834,7 @@ async fn session(hub: Shared, mut socket: WebSocket) {
                     expires_at: Timestamp::now().plus_millis(600_000),
                 })
                 .unwrap(),
+            kind if voice::handles(kind) => voice::answer(&hub, &req),
             kind if phase4::handles(kind) => {
                 let (reply, events) = phase4::answer(&hub, &req);
                 send(&mut socket, reply).await;
@@ -3909,6 +3913,12 @@ async fn connectors_and_hub_cards_use_their_requests() {
                 value: "dana@acme.dev".into(),
             }],
             arguments: serde_json::json!({"to": "dana@acme.dev"}),
+            outgoing: None,
+            editable: Vec::new(),
+            voice: None,
+            flags: Vec::new(),
+            draft_arguments: None,
+            not_my_voice: false,
         }));
         approval.options = details.hub_card_options().unwrap();
         approval.details = details;
@@ -6087,4 +6097,149 @@ async fn a_hub_with_a_new_epoch_gets_a_snapshot_not_a_resume() {
         saved(dir.path()).is_some_and(|s| s.cache.hub_epoch.as_deref() == Some("after-restore"))
     })
     .await;
+}
+
+#[tokio::test]
+async fn the_voice_page_and_the_draft_card_use_their_requests() {
+    use consort_client::voice::{VoiceChanges, VoiceSampleState};
+    use consort_proto::model::{
+        CommitmentFlag, ConnectorCard, DisplayField, FlagKind, OutgoingKind, ToolKind, VoiceUse,
+    };
+    let (url, hub) = start_hub().await;
+    {
+        let mut h = hub.lock().unwrap();
+        h.record_answers = true;
+        let approval = h.approval.as_mut().unwrap();
+        let body = "Friday at 3 PM works for me.";
+        let details = ApprovalDetails::Connector(Box::new(ConnectorCard {
+            connection_id: consort_proto::ids::ConnectionId::new(),
+            connection_name: "Gmail Work".into(),
+            service_name: "Gmail".into(),
+            tool: "GMAIL_SEND_EMAIL".into(),
+            tool_kind: ToolKind::Change,
+            fields: vec![DisplayField {
+                label: "Body".into(),
+                value: body.into(),
+            }],
+            arguments: serde_json::json!({"to": "dana@acme.dev", "body": body}),
+            outgoing: Some(OutgoingKind::Send),
+            editable: vec!["body".into()],
+            voice: Some(VoiceUse {
+                context: "email.formal".into(),
+            }),
+            flags: vec![CommitmentFlag {
+                field: "body".into(),
+                label: "Body".into(),
+                text: "Friday at 3 PM".into(),
+                kind: FlagKind::Date,
+                start: 0,
+                end: 14,
+                rule: None,
+            }],
+            draft_arguments: None,
+            not_my_voice: false,
+        }));
+        approval.options = details.hub_card_options().unwrap();
+        approval.details = details;
+        approval.request_id = consort_proto::model::hub_card_request_id(approval.id);
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let client = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
+    let approval_id = hub
+        .lock()
+        .unwrap()
+        .approval
+        .as_ref()
+        .unwrap()
+        .id
+        .to_string();
+
+    // The draft card reads with the voice line and the flag.
+    let state = wait_for(&client, "the draft card", |s| {
+        s.timelines
+            .iter()
+            .flat_map(|t| t.items.iter())
+            .any(|i| matches!(i, TimelineItem::TaskCard(c) if c.approval.is_some()))
+    })
+    .await;
+    let card = state
+        .timelines
+        .iter()
+        .flat_map(|t| t.items.iter())
+        .find_map(|i| match i {
+            TimelineItem::TaskCard(c) => c.approval.clone(),
+            _ => None,
+        })
+        .unwrap();
+    let Some(consort_client::HubCardView::Connector(connector)) = card.card.as_deref() else {
+        panic!("not a connector card");
+    };
+    let draft = connector.draft.clone().unwrap();
+    assert_eq!(draft.voice_line, "Written in your voice (Formal email)");
+    assert_eq!(draft.flags.len(), 1);
+    assert!(draft.allow_blocked(false));
+
+    // Settings > Voice: load, turn on, try it.
+    client.run(Command::LoadVoice).await.unwrap();
+    client
+        .run(Command::SetVoice(VoiceChanges {
+            enabled: Some(true),
+            sources: Some(Vec::new()),
+            ..VoiceChanges::default()
+        }))
+        .await
+        .unwrap();
+    client
+        .run(Command::TryVoice {
+            request: "Reply to Dana, say yes".into(),
+        })
+        .await
+        .unwrap();
+    let state = wait_for(&client, "the sample", |s| {
+        s.voice
+            .sample
+            .as_ref()
+            .is_some_and(|x| x.state == VoiceSampleState::Ready)
+    })
+    .await;
+    assert!(state.voice.enabled);
+    assert_eq!(
+        state.voice.sample.as_ref().unwrap().voice_line,
+        "Written in your voice (Formal email)"
+    );
+
+    // Edit, then allow with the tick.
+    client
+        .run(Command::EditApproval {
+            approval_id: approval_id.clone(),
+            fields: vec![("body".into(), "I will check my calendar.".into())],
+        })
+        .await
+        .unwrap();
+    client
+        .run(Command::AnswerApproval {
+            approval_id: approval_id.clone(),
+            choice: ApprovalChoice::AllowOnce,
+            checked: true,
+        })
+        .await
+        .unwrap();
+    client
+        .run(Command::VoiceFeedback {
+            approval_id: approval_id.clone(),
+        })
+        .await
+        .unwrap();
+    let edit = recorded_of(&hub, "approval.edit");
+    assert_eq!(edit[0]["fields"]["body"], "I will check my calendar.");
+    let answer = recorded_of(&hub, "approval.answer");
+    assert_eq!(answer[0]["checked"], true);
+    let set = recorded_of(&hub, "voice.set");
+    assert_eq!(set[0]["enabled"], true);
+    assert_eq!(recorded_of(&hub, "voice.get").len(), 1);
+    assert_eq!(
+        recorded_of(&hub, "voice.try")[0]["request"],
+        "Reply to Dana, say yes"
+    );
+    assert_eq!(recorded_of(&hub, "voice.feedback").len(), 1);
 }

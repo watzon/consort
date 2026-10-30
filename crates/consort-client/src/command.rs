@@ -344,6 +344,9 @@ pub enum Command {
     AnswerApproval {
         approval_id: String,
         choice: ApprovalChoice,
+        /// The user ticked "I checked the marked lines" on a draft card
+        /// with flags. The hub refuses an allow of such a card without it.
+        checked: bool,
     },
     AnswerDecision {
         decision_id: String,
@@ -715,6 +718,34 @@ pub enum Command {
     RateMessage {
         message_id: String,
         rating: Option<consort_proto::model::ProactiveRating>,
+    },
+    // Settings > Voice and the draft card. See `crate::voice`.
+    /// Loads the voice settings, the "Try it" sample, the style guide that
+    /// waits for Do it, and `voice.md`.
+    LoadVoice,
+    /// Changes the voice settings. Turning the voice on starts learning.
+    SetVoice(crate::voice::VoiceChanges),
+    /// Starts the voice task again ("Learn again").
+    LearnVoice,
+    /// Deletes the style guide and turns the voice off.
+    ResetVoice,
+    /// Writes a sample draft for a request. Nothing is sent.
+    TryVoice {
+        request: String,
+    },
+    /// Changes the style guide: removes a rule or an example, adds a hard
+    /// rule, or replaces the markdown.
+    EditVoiceGuide(crate::voice::GuideEdit),
+    /// "Not how I write" on a draft card.
+    VoiceFeedback {
+        approval_id: String,
+    },
+    /// Saves the user's text on a draft card ("Save changes"). The hub
+    /// checks the new text again.
+    EditApproval {
+        approval_id: String,
+        /// The new text by argument key, such as `body`.
+        fields: Vec<(String, String)>,
     },
 }
 

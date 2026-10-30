@@ -120,6 +120,7 @@ pub enum SettingsSection {
     Memory,
     Routines,
     Proactivity,
+    Voice,
 }
 
 /// The open dialog.
@@ -196,6 +197,8 @@ pub enum Dialog {
     About,
     /// The changes of a new skill version, by skill ID.
     SkillDiff(String),
+    /// A dialog of Settings > Voice. See `crate::voice`.
+    Voice(crate::voice::VoiceDialog),
 }
 
 /// The step of the Add account dialog.
@@ -419,6 +422,9 @@ pub struct ConsortApp {
     pub knowledge_inputs: crate::knowledge::KnowledgeInputs,
     /// Settings > Proactivity, the ratings and the quick replies.
     pub proactivity: crate::proactivity::ProactivityUi,
+    /// Settings > Voice and the draft cards. See `crate::voice`.
+    pub voice: crate::voice::VoiceUi,
+    pub voice_inputs: crate::voice::VoiceInputs,
     pub focus: FocusHandle,
     styled_for: Option<(gpui_kit::SharedString, consort_theme::Mode)>,
     _subscriptions: Vec<Subscription>,
@@ -473,6 +479,7 @@ impl ConsortApp {
         let (admin, admin_subscriptions) = crate::admin::AdminState::new(&client, demo, window, cx);
         let mut subscriptions = admin_subscriptions;
         let knowledge_inputs = crate::knowledge::KnowledgeInputs::new(window, cx);
+        let voice_inputs = crate::voice::VoiceInputs::new(window, cx);
         subscriptions.extend(knowledge_inputs.subscribe(window, cx));
         subscriptions.extend(convo_subscriptions);
         subscriptions.push(cx.subscribe_in(
@@ -711,6 +718,8 @@ impl ConsortApp {
             knowledge: crate::knowledge::KnowledgeState::default(),
             knowledge_inputs,
             proactivity: crate::proactivity::ProactivityUi::default(),
+            voice: crate::voice::VoiceUi::default(),
+            voice_inputs,
             focus: cx.focus_handle(),
             styled_for: None,
             _subscriptions: subscriptions,
@@ -772,6 +781,7 @@ impl ConsortApp {
         ]
         .into_iter()
         .chain(self.knowledge_inputs.areas())
+        .chain(self.voice_inputs.areas())
         {
             let style = style.clone();
             area.update(cx, |s, cx| {
@@ -796,6 +806,7 @@ impl ConsortApp {
         .into_iter()
         .chain(self.ext_inputs.all())
         .chain(self.knowledge_inputs.fields())
+        .chain(self.voice_inputs.fields())
         {
             let style = style.clone();
             field.update(cx, |s, cx| {
@@ -1620,6 +1631,9 @@ impl ConsortApp {
             screen if crate::knowledge::SCREENS.contains(&screen) => {
                 self.open_knowledge_screen(screen, window, cx)
             }
+            screen if crate::voice::SCREENS.contains(&screen) => {
+                self.open_voice_screen(screen, window, cx);
+            }
             screen if crate::proactivity::SCREENS.contains(&screen) => {
                 self.open_proactive_screen(screen, window, cx);
             }
@@ -1985,6 +1999,9 @@ impl ConsortApp {
         if section == SettingsSection::Proactivity {
             self.load_proactivity_log(cx);
         }
+        if section == SettingsSection::Voice {
+            self.load_voice(cx);
+        }
         if section == SettingsSection::Skills {
             self.enter_skills(cx);
         }
@@ -2047,6 +2064,7 @@ impl ConsortApp {
             | Dialog::ConfirmDeleteTask(_)
             | Dialog::SkillDiff(_)
             | Dialog::About => self.prepare_convo_dialog(&dialog, window, cx),
+            Dialog::Voice(voice) => self.prepare_voice_dialog(voice, window, cx),
             Dialog::RenameWorker(id) => {
                 let name = self
                     .state

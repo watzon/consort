@@ -15,6 +15,7 @@ use super::account::SignInMethod;
 use super::common::ValidationError;
 use super::connector::{DisplayField, ToolApprovals, ToolKind, UseIn};
 use super::skill::{SkillAudit, SkillSource};
+use super::voice::{CommitmentFlag, OutgoingKind, VoiceUse};
 use crate::ids::{
     AccountId, ApprovalId, ChannelId, ClientId, ConnectionId, DecisionId, MessageId, RequestId,
     SessionId, SignInId, SkillId, TaskId, WorkerId,
@@ -163,9 +164,42 @@ pub struct ConnectorCard {
     /// Body.
     #[serde(default)]
     pub fields: Vec<DisplayField>,
-    /// The exact arguments that run when the user allows the call.
+    /// The exact arguments that run when the user allows the call. After
+    /// an edit, they hold the user's text.
     #[serde(default)]
     pub arguments: Value,
+    /// Set when the tool drafts or sends text in the user's name. Only such
+    /// a card has Edit, the voice line and commitment flags.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outgoing: Option<OutgoingKind>,
+    /// The argument keys that the user can edit on the card, such as
+    /// `subject` and `body`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub editable: Vec<String>,
+    /// The voice that wrote the text. `None` on a draft card is "Neutral
+    /// style".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice: Option<VoiceUse>,
+    /// Phrases that the user must check. While there are flags, an allow
+    /// answer must say `checked`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub flags: Vec<CommitmentFlag>,
+    /// The arguments that the assistant wrote, kept after the user edited
+    /// the card.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft_arguments: Option<Value>,
+    /// The user said "Not how I write".
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub not_my_voice: bool,
+}
+
+impl ConnectorCard {
+    /// Whether the user changed the text of the card.
+    pub fn edited(&self) -> bool {
+        self.draft_arguments
+            .as_ref()
+            .is_some_and(|draft| draft != &self.arguments)
+    }
 }
 
 /// A management change that asks first. Allow makes the change. Don't
@@ -747,6 +781,12 @@ mod tests {
                     },
                 ],
                 arguments: json!({"recipient_email": "kevin@example.com", "subject": "Friday"}),
+                outgoing: None,
+                editable: Vec::new(),
+                voice: None,
+                flags: Vec::new(),
+                draft_arguments: None,
+                not_my_voice: false,
             })),
             ApprovalDetails::Management(Box::new(ManagementCard {
                 tool: "update_connection".into(),

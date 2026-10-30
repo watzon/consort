@@ -1043,7 +1043,9 @@ fn coordinator_turn_ended(
         .filter_map(|name| HubTool::from_name(name));
     // A proactive turn that called no posting tool stays silent: its text is
     // dropped, not posted.
-    let proactive = crate::proactivity::turn::classify(&row.turn_events).is_proactive();
+    let proactive = crate::proactivity::turn::classify(&row.turn_events).is_proactive()
+        || crate::voice::only_samples(&row.turn_events);
+    crate::voice::turn_ended(tx, &row.turn_events)?;
     if reason == TurnEndReason::Completed
         && !proactive
         && consort_proto::tools::needs_fallback_post(called)

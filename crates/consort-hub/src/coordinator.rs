@@ -240,7 +240,10 @@ fn main_text(event: &mut WakeEvent) -> Option<&mut String> {
         WakeEvent::DecisionAnswered { text, .. } => text.as_mut(),
         WakeEvent::CheckIn { summary, .. } => Some(summary),
         WakeEvent::FollowUp { reason, .. } => Some(reason),
-        WakeEvent::StaleTask { .. }
+        WakeEvent::VoiceFeedback { draft, .. } => Some(draft),
+        WakeEvent::VoiceSample { request, .. } => Some(request),
+        WakeEvent::VoiceEdits { .. }
+        | WakeEvent::StaleTask { .. }
         | WakeEvent::Research { .. }
         | WakeEvent::ProactiveFeedback { .. }
         | WakeEvent::ChannelCreated { .. } => None,
@@ -345,6 +348,9 @@ struct Inputs {
     context: String,
     /// The effective set of connectors and skills, for the fingerprint.
     extensions_key: String,
+    /// The voice part of the prompt, when the session can draft or send in
+    /// the user's voice.
+    voice: Option<String>,
 }
 
 impl Hub {
@@ -379,8 +385,15 @@ impl Hub {
             return Ok(());
         };
 
-        let fingerprint =
-            prompt_fingerprint(&inputs.channel, &inputs.tutti, &inputs.extensions_key);
+        let fingerprint = prompt_fingerprint(
+            &inputs.channel,
+            &inputs.tutti,
+            &format!(
+                "{}{}",
+                inputs.extensions_key,
+                inputs.voice.as_deref().unwrap_or_default()
+            ),
+        );
         let mut inputs = inputs;
         if let Some(session) = inputs.session.clone() {
             let current = self
@@ -492,11 +505,14 @@ impl Hub {
         };
         self.coordinators.clear_notice(channel_id);
 
-        let system_prompt = prompts::coordinator_system_prompt(
+        let mut system_prompt = prompts::coordinator_system_prompt(
             &inputs.channel,
             &inputs.global_index,
             &inputs.channel_index,
         );
+        if let Some(voice) = &inputs.voice {
+            system_prompt.push_str(voice);
+        }
         // The first turn also holds the context pack, and the command holds
         // the system prompt, so the events get the room that is left.
         let room = turn_room(json_len(&system_prompt) + json_len(&inputs.context))
@@ -745,12 +761,14 @@ impl Hub {
                     channel_index: String::new(),
                     context,
                     extensions_key,
+                    voice: None,
                 }))
             })
             .await?
         else {
             return Ok(None);
         };
+        partial.voice = self.voice_prompt_section(&partial.channel).await?;
         if partial.session.is_none() {
             let (global, own) = self.memory_indexes(&partial.channel).await?;
             partial.global_index = global;

@@ -428,6 +428,7 @@ impl MockBackend {
             Command::AnswerApproval {
                 approval_id,
                 choice,
+                ..
             } => {
                 let mut task_id = None;
                 for_each_approval(&mut state, &approval_id, |approval| {
@@ -797,6 +798,17 @@ impl MockBackend {
             | Command::RateMessage { .. }) => {
                 applied.output = crate::mock_proactivity::apply(&mut state, command)?;
             }
+            // Settings > Voice and the draft card.
+            command @ (Command::LoadVoice
+            | Command::SetVoice(_)
+            | Command::LearnVoice
+            | Command::ResetVoice
+            | Command::TryVoice { .. }
+            | Command::EditVoiceGuide(_)
+            | Command::VoiceFeedback { .. }
+            | Command::EditApproval { .. }) => {
+                applied.output = crate::mock_voice::apply(&mut state, command)?;
+            }
             // Routines and memory.
             command @ (Command::SaveRoutine { .. }
             | Command::SetRoutineEnabled { .. }
@@ -1030,7 +1042,11 @@ fn set_status(state: &mut ViewState, task_id: &str, status: TaskStatus) -> Resul
     Ok(())
 }
 
-fn for_each_approval(state: &mut ViewState, id: &str, mut f: impl FnMut(&mut ApprovalView)) {
+pub(crate) fn for_each_approval(
+    state: &mut ViewState,
+    id: &str,
+    mut f: impl FnMut(&mut ApprovalView),
+) {
     for timeline in &mut state.timelines {
         for item in &mut timeline.items {
             match item {
