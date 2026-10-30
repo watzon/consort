@@ -455,6 +455,7 @@ mod tests {
                 created_by: TaskCreator::User,
                 routine_id: None,
                 attachments: Vec::new(),
+                proactive: None,
             })
             .await
             .unwrap();
@@ -624,6 +625,7 @@ mod tests {
                 attachments: Vec::new(),
             },
             channel_files: None,
+            approval_mode: None,
         });
         let worker_id = session.worker_id;
         let id = hub

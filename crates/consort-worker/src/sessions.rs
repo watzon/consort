@@ -421,6 +421,11 @@ struct Runtime {
     jobs: mpsc::UnboundedSender<Job>,
     harness: Option<Box<dyn HarnessSession>>,
     capabilities: Capabilities,
+    /// The approval mode that the session opened in, and the mode that the
+    /// harness runs in now. They differ after a turn with a stricter mode
+    /// of its own (`SessionTurn::approval_mode`).
+    mode: ApprovalMode,
+    turn_mode: ApprovalMode,
     mcp: Option<McpEndpoint>,
     pump: Option<tokio::task::JoinHandle<()>>,
     /// Keeps the managed tool of the session from an update.
@@ -583,6 +588,35 @@ impl Runtime {
         self.harness
             .as_mut()
             .ok_or_else(|| ErrorBody::new(ErrorCode::Conflict, "the session has no harness"))
+    }
+
+    /// Puts the harness in the approval mode of the next turn: the lower
+    /// of `wanted` and the session's own mode, or the session's own mode
+    /// when the turn names none. A harness that cannot change its mode
+    /// refuses a stricter turn, so the turn never runs with more access
+    /// than the hub asked for.
+    async fn prepare_turn_mode(&mut self, wanted: Option<ApprovalMode>) -> Result<(), ErrorBody> {
+        let target = wanted.map_or(self.mode, |m| m.min(self.mode));
+        if target == self.turn_mode {
+            return Ok(());
+        }
+        let session_id = self.session_id;
+        let result = self.harness()?.set_approval_mode(target).await;
+        match result {
+            Ok(()) => {
+                tracing::info!(session = %session_id, mode = mode_name(target), "the next turn runs in another approval mode");
+                self.turn_mode = target;
+                Ok(())
+            }
+            Err(consort_harness::HarnessError::Unsupported(_)) => Err(ErrorBody::new(
+                ErrorCode::PolicyDenied,
+                format!(
+                    "This harness cannot change its approval mode in a running session, so it cannot run this turn in {}. Set the default approval mode of the channel to Ask.",
+                    mode_name(target)
+                ),
+            )),
+            Err(err) => Err(harness_body(err)),
+        }
     }
 
     /// Opens the harness for a new or resumed session.
@@ -779,6 +813,10 @@ impl Runtime {
         };
         self.tool_lease = lease;
         self.capabilities = session.capabilities().clone();
+        // The mode that the harness runs in: the asked mode, or the lower
+        // one that the adapter had to use.
+        self.mode = self.capabilities.best_mode_up_to(mode).unwrap_or(mode);
+        self.turn_mode = self.mode;
         if !self.capabilities.approval_modes.contains(&mode) {
             // The adapter had to start the session in a lower mode, for
             // example because Claude Code turned `bypassPermissions` off
@@ -940,8 +978,11 @@ impl Runtime {
         let native_ref = self.harness.as_ref().and_then(|h| h.native_ref());
         if let Some(turn) = start.turn {
             self.save_attachments(&turn).await;
-            let result = match self.harness() {
-                Ok(h) => h.turn(turn).await.map_err(harness_body),
+            let result = match self.prepare_turn_mode(start.turn_approval_mode).await {
+                Ok(()) => match self.harness() {
+                    Ok(h) => h.turn(turn).await.map_err(harness_body),
+                    Err(e) => Err(e),
+                },
                 Err(e) => Err(e),
             };
             if let Err(err) = result {
@@ -1088,8 +1129,11 @@ impl Runtime {
                     self.refresh_channel_files(turn.channel_files).await;
                     self.save_attachments(&turn.turn).await;
                 }
-                let result = match self.harness() {
-                    Ok(h) => h.turn(turn.turn).await.map_err(harness_body),
+                let result = match self.prepare_turn_mode(turn.approval_mode).await {
+                    Ok(()) => match self.harness() {
+                        Ok(h) => h.turn(turn.turn).await.map_err(harness_body),
+                        Err(e) => Err(e),
+                    },
                     Err(e) => Err(e),
                 };
                 (
@@ -1201,6 +1245,8 @@ pub(crate) async fn run_session(
         jobs: jobs_tx,
         harness: None,
         capabilities: Capabilities::default(),
+        mode: ApprovalMode::Ask,
+        turn_mode: ApprovalMode::Ask,
         mcp: None,
         pump: None,
         tool_lease: None,

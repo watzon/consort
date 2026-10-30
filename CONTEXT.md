@@ -99,7 +99,7 @@ A prompt that the hub runs on a schedule in one channel.
 _Avoid_: cron job, scheduled task, automation, trigger
 
 **Proactive turn**:
-A coordinator turn whose wake events are all proactive, such as a check-in or a follow-up. A turn that also has a user message is a normal turn.
+A coordinator turn with a proactive wake event, such as a check-in or a follow-up, and no event that the user caused. An update of a task that a proactive turn started is proactive too. A turn that also has a user message, an answer or a rating is a normal turn.
 _Avoid_: background turn, autonomous turn
 
 **Proactivity level**:

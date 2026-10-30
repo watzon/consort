@@ -39,9 +39,11 @@ The client keeps its cache in `cache.sqlite3` in its folder (`<config dir>/conso
 | Table | Columns | Holds |
 |---|---|---|
 | `entity` | `kind`, `id`, `json` | One row for each entity of the cache, keyed by kind and the key that the cache uses. The `json` is the entity as the hub sends it. Kinds: `group`, `channel`, `repo`, `worker`, `message`, `channel_file`, `routine`, `routine_run`, `memory_note`, `task`, `approval`, `decision`, `read_marker`, `session_item`, `session_activity`, `connection`, `skill`, `client` and `proactive_wake` (the proactivity log) |
-| `meta` | `key`, `value` | `seq` (the feed position), `fresh_at` (Unix ms: when the data was last current), `client_id` and `hub_url` (who the data belongs to), `preferences`, `proactivity_settings`, `proactivity_log_has_more`, and the sets that say what the cache has loaded (`channels_loaded`, `files_loaded`, `runs_loaded`, `memory_loaded`, `memory_deleted_loaded`, `loaded_threads`, `task_previews`, `tasks_absent`, `has_older`, `tasks_have_more`) |
+| `meta` | `key`, `value` | `seq` (the feed position), `hub_epoch` (the hub epoch of that position, from `hello`), `fresh_at` (Unix ms: when the data was last current), `client_id` and `hub_url` (who the data belongs to), `preferences`, `proactivity_settings`, `proactivity_log_has_more`, and the sets that say what the cache has loaded (`channels_loaded`, `files_loaded`, `runs_loaded`, `memory_loaded`, `memory_deleted_loaded`, `loaded_threads`, `task_previews`, `tasks_absent`, `has_older`, `tasks_have_more`) |
 
 The client writes the file about half a second after a change, in one transaction, and only the rows that changed. It writes only a cache whose first load is whole. At start, the client reads the file before it connects, and the app shows the data at once. A file for another client ID or another hub URL is emptied. A file with another schema version, a file that SQLite cannot open, a file that fails its integrity check, and a row that cannot be read are moved to `cache.sqlite3.broken`, and the client starts with no saved data. A schema change raises the version, and the client does not migrate: an old file is moved aside and the next connect loads a snapshot.
+
+When the epoch in `hello` differs from `hub_epoch` (the hub was restored from a backup), the client drops its position and loads a snapshot. While the client loads the data of a change that it skipped (`feed.skipped`, or an entry it cannot read), it saves nothing, so the saved position never moves past a change whose data is not in the file. Each pairing has its own generation: a link or a request that started before Pair or Unpair writes nothing into the cache.
 
 The cache does not hold the outbox, the sign-ins, the ACP registry, the connector catalog, the logos and the hub status. The outbox has its own file. The rest loads again when a page needs it.
 
@@ -622,7 +624,9 @@ The settings are one JSON record in `meta` under the key `proactivity`, and a fe
 | `notify_held` | bool | The turn asked to notify, and the hub posted without a notification |
 | `ended_at` | timestamp, optional | |
 
-`proactive_channels` keeps, per channel, when the last check-in looked at the hub (the next change summary starts there), the silent check-ins in a row, and the interval before back-off doubled it. `task_status_since` keeps when each task entered its status and whether it got its nudge. `follow_ups` keeps the `key` and the time when the assistant set each follow-up. The meta keys `proactivity.brief_made` and `proactivity.defaults_v1` make the brief and the default routines come once.
+`proactive_channels` keeps, per channel, when the last check-in looked at the hub (the next change summary starts there), the silent check-ins in a row, and the interval before back-off doubled it. `task_status_since` keeps when each task entered its status and whether it got its nudge. `follow_ups` keeps the `key` and the time when the assistant set each follow-up, and `set_in_proactive_turn` (schema 11): a follow-up that a proactive turn set counts against the daily turn budget. `proactive_tasks` (schema 11) keeps the tasks that a proactive turn started: `task_id`, `channel_id`, the `kind` of the turn and `draft`. An update of such a task is proactive, and a draft task asks the user before each connector call that writes or sends. A task that a normal turn starts after the user chose "Do it" on an offer is a draft task too, with the kind of the offer. The meta keys `proactivity.brief_made` and `proactivity.defaults_v1` make the brief and the default routines come once. The meta key `hub_epoch` is the random epoch of the database (see [protocol.md](protocol.md)): the hub makes it when it creates the database, and a restore makes a new one.
+
+Schema 10 is kept for the voice build and changes nothing in this branch.
 
 ## Preferences
 
@@ -636,7 +640,7 @@ A favorite whose account is not signed in on any worker, or whose account no lon
 
 ## Backups
 
-A backup is one tar archive in the backup folder on the hub machine. The hub names it after its start time in the time zone of the schedule, `consort-2026-10-29-0300.tar` (`-2` and so on when the name is taken). The entries:
+A backup is one tar archive in the backup folder on the hub machine. The hub names it after its start time in UTC, `consort-2026-10-29-0800.tar` (`-2` and so on when the name is taken). A name in local time could go back when the time zone changes or in the hour that daylight saving time repeats. The entries:
 
 | Entry | Contents |
 |---|---|
@@ -645,7 +649,7 @@ A backup is one tar archive in the backup folder on the hub machine. The hub nam
 | `hub-secret.key`, `composio.key`, `backup.json` | When they exist. Without `hub-secret.key` the Composio key cannot be read |
 | `blobs/<sha256>` | Every blob, skill files included. A blob never changes after it is written, so a plain copy is consistent |
 
-The hub writes the archive as a hidden `.partial` file and renames it when it is complete, so a half archive never has an archive name. After a backup that worked, it deletes the oldest archives with the archive name so that `keep` stay. Other files in the folder stay.
+The hub writes the archive as a hidden `.partial` file and renames it when it is complete, so a half archive never has an archive name. After a backup that worked, it deletes the oldest archives with the archive name so that `keep` stay. The order is the `created_at` of each manifest, or the time in the name read as UTC when the manifest cannot be read, so an older hub's names in local time cannot make it delete the newest archive. Other files in the folder stay. The copy of the database that the backup makes in the folder before it goes into the archive is created with mode 0600 on Unix.
 
 `backup.json` holds `settings` (`schedule` with `frequency` `off`, `daily` or `weekly`, `time` as `HH:MM`, `weekday` and an IANA `time_zone`; `folder`; `keep`, 1 to 100, default 7), `schedule_changed_at`, `last` (the last backup that finished or failed) and `last_slot` (the schedule slot of the last scheduled backup). A missing or damaged file reads as the defaults: no schedule, `<data>/backups`, keep 7.
 

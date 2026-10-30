@@ -1620,6 +1620,61 @@ mod fake_agent {
     }
 
     #[tokio::test]
+    async fn a_claude_session_changes_its_mode_for_a_turn_and_back() {
+        let mut auto = spec();
+        auto.approval_mode = ApprovalMode::Auto;
+        let (result, log) = connect_with(HarnessKind::ClaudeCode, auto, Behavior::default()).await;
+        let (session, _events, _ready) = result.unwrap();
+        let mut session: Box<dyn HarnessSession> = Box::new(session);
+        session.set_approval_mode(ApprovalMode::Ask).await.unwrap();
+        session.set_approval_mode(ApprovalMode::Auto).await.unwrap();
+        let sets: Vec<String> = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|m| {
+                m["method"] == "session/set_config_option" && m["params"]["configId"] == "mode"
+            })
+            .map(|m| m["params"]["value"].as_str().unwrap().to_owned())
+            .collect();
+        // The fake agent starts in `acceptEdits`, so the open sets nothing.
+        assert_eq!(sets, vec!["default", "acceptEdits"]);
+        session.close().await.unwrap();
+
+        // A mode that the agent does not take fails, so the worker refuses
+        // the turn.
+        let mut auto = spec();
+        auto.approval_mode = ApprovalMode::Auto;
+        let behavior = Behavior {
+            refuse_reset: true,
+            ..Behavior::default()
+        };
+        let (result, _log) = connect_with(HarnessKind::ClaudeCode, auto, behavior).await;
+        let (session, _events, _ready) = result.unwrap();
+        let mut session: Box<dyn HarnessSession> = Box::new(session);
+        // The fake refuses every mode change after the first one.
+        session.set_approval_mode(ApprovalMode::Ask).await.unwrap();
+        assert!(session.set_approval_mode(ApprovalMode::Auto).await.is_err());
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn other_agents_cannot_change_their_mode_in_a_session() {
+        let mut auto = spec();
+        auto.approval_mode = ApprovalMode::Auto;
+        let (result, _log) = connect_with(HarnessKind::OpenCode, auto, Behavior::default()).await;
+        let (session, _events, _ready) = result.unwrap();
+        let mut session: Box<dyn HarnessSession> = Box::new(session);
+        assert!(matches!(
+            session.set_approval_mode(ApprovalMode::Ask).await,
+            Err(HarnessError::Unsupported(_))
+        ));
+        // The same mode needs no change.
+        assert!(session.set_approval_mode(ApprovalMode::Auto).await.is_ok());
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn a_mode_that_cannot_be_set_back_loses_the_session() {
         let behavior = Behavior {
             escalate: Some("bypassPermissions"),

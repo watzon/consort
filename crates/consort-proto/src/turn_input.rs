@@ -115,6 +115,12 @@ pub enum WakeEvent {
         status: TaskStatus,
         /// The review summary, the status reason, or the newest update.
         text: String,
+        /// The kind of the proactive turn that started the task. An update
+        /// of such a task is proactive too: a turn whose events are all
+        /// proactive keeps the limits of a proactive turn. Not shown to the
+        /// model. Older hubs leave it out.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        proactive: Option<ProactiveKind>,
     },
     /// The user answered a decision.
     DecisionAnswered {
@@ -351,9 +357,11 @@ impl WakeEvent {
 
     /// The proactive kind of this event, or `None` for an event that the
     /// user or the work caused. A turn whose events are all proactive is a
-    /// proactive turn.
+    /// proactive turn. An update of a task that a proactive turn started
+    /// has the kind of that turn.
     pub fn proactive_kind(&self) -> Option<ProactiveKind> {
         Some(match self {
+            Self::TaskUpdate { proactive, .. } => return *proactive,
             Self::CheckIn { .. } => ProactiveKind::CheckIn,
             Self::Brief { .. } => ProactiveKind::Brief,
             Self::FollowUp { .. } => ProactiveKind::FollowUp,
@@ -363,6 +371,23 @@ impl WakeEvent {
             Self::ChannelCreated { .. } => ProactiveKind::ChannelCreated,
             _ => return None,
         })
+    }
+
+    /// Whether the user caused this event: a message, an answer to a
+    /// decision (an offer's "Do it" included), an answer to a hub card, or a
+    /// rating of a proactive message. A turn with such an event is a normal
+    /// turn, because the user acted. A card that expired or was canceled is
+    /// not an answer.
+    pub fn user_caused(&self) -> bool {
+        match self {
+            Self::UserMessage { .. }
+            | Self::DecisionAnswered { .. }
+            | Self::ProactiveFeedback { .. } => true,
+            Self::CardAnswered { outcome, .. } => {
+                matches!(outcome, ApprovalStatus::Allowed | ApprovalStatus::Denied)
+            }
+            _ => false,
+        }
     }
 
     /// The proactivity log entry of a proactive event, when it has one.
@@ -402,6 +427,7 @@ impl WakeEvent {
                 title,
                 status,
                 text,
+                ..
             } => element(
                 out,
                 name,
@@ -603,6 +629,68 @@ mod tests {
     }
 
     #[test]
+    fn a_proactive_task_update_is_proactive_and_hides_its_origin() {
+        let task: TaskId = "tsk_00000000-0000-0000-0000-000000000003".parse().unwrap();
+        let old = serde_json::json!({
+            "type": "task_update", "task": task.to_string(), "title": "Draft",
+            "status": "review", "text": "Done."
+        });
+        let parsed: WakeEvent = serde_json::from_value(old.clone()).unwrap();
+        assert_eq!(parsed.proactive_kind(), None);
+        assert_eq!(serde_json::to_value(&parsed).unwrap(), old);
+        let proactive = WakeEvent::TaskUpdate {
+            task,
+            title: "Draft".into(),
+            status: TaskStatus::Review,
+            text: "Done.".into(),
+            proactive: Some(ProactiveKind::CheckIn),
+        };
+        assert_eq!(proactive.proactive_kind(), Some(ProactiveKind::CheckIn));
+        assert_eq!(proactive.log_id(), None);
+        assert!(!proactive.user_caused());
+        let value = serde_json::to_value(&proactive).unwrap();
+        assert_eq!(value["proactive"], "check_in");
+        assert_eq!(
+            serde_json::from_value::<WakeEvent>(value).unwrap(),
+            proactive
+        );
+        // The model never sees the origin.
+        assert!(!render_events(&[proactive]).contains("check_in"));
+    }
+
+    #[test]
+    fn only_what_the_user_did_is_user_caused() {
+        let card = |outcome| WakeEvent::CardAnswered {
+            id: ApprovalId::new(),
+            kind: ApprovalKind::Connector,
+            outcome,
+            text: String::new(),
+        };
+        assert!(card(ApprovalStatus::Allowed).user_caused());
+        assert!(card(ApprovalStatus::Denied).user_caused());
+        assert!(!card(ApprovalStatus::Expired).user_caused());
+        assert!(!card(ApprovalStatus::Canceled).user_caused());
+        let rating = WakeEvent::ProactiveFeedback {
+            message: MessageId::new(),
+            rating: ProactiveRating::TooNoisy,
+            log: 1,
+        };
+        assert!(rating.user_caused());
+        let answer = WakeEvent::DecisionAnswered {
+            id: DecisionId::new(),
+            option: Some("Do it".into()),
+            text: None,
+        };
+        assert!(answer.user_caused());
+        let tutti = WakeEvent::TuttiMessage {
+            id: MessageId::new(),
+            at: ts(),
+            text: "Hi".into(),
+        };
+        assert!(!tutti.user_caused());
+    }
+
+    #[test]
     fn renders_the_protocol_example() {
         let msg: MessageId = "msg_00000000-0000-0000-0000-000000000001".parse().unwrap();
         let root: MessageId = "msg_00000000-0000-0000-0000-000000000002".parse().unwrap();
@@ -622,6 +710,7 @@ mod tests {
                 title: "Go through open Sayso issues".into(),
                 status: TaskStatus::Review,
                 text: "PR #62 is up. Windows jobs still need a manual run.".into(),
+                proactive: None,
             },
             WakeEvent::DecisionAnswered {
                 id: dec,
@@ -692,6 +781,7 @@ mod tests {
                 title: "Fix \"a\" & <b>\nnow".into(),
                 status: TaskStatus::Failed,
                 text: "line 1\nline 2".into(),
+                proactive: None,
             },
         ];
         let out = render_events(&events);

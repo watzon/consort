@@ -317,7 +317,7 @@ fn begin_run(
 
     if scheduled
         && let Some(due) = routine.next_run_at
-        && now.as_millis() - due.as_millis() >= LATE_LIMIT_MS
+        && now.as_millis().saturating_sub(due.as_millis()) >= LATE_LIMIT_MS
     {
         let mut run = skipped_run(
             &routine,
@@ -380,6 +380,7 @@ fn begin_run(
                     created_by: TaskCreator::Routine,
                     routine_id: Some(id),
                     attachments: Vec::new(),
+                    proactive: None,
                 }),
                 run,
                 schedule_error,

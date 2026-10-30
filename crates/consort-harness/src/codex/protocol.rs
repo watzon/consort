@@ -199,6 +199,14 @@ pub struct TurnStartParams {
     /// The reasoning effort, such as `high`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// The approval policy for this turn and the next ones, such as
+    /// `untrusted`. Sent only when it changes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_policy: Option<String>,
+    /// The sandbox policy for this turn and the next ones, such as
+    /// `{"type": "readOnly"}`. Sent only when it changes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sandbox_policy: Option<Value>,
 }
 
 /// `turn/steer` params.
@@ -856,6 +864,8 @@ mod tests {
             thread_id: "t".into(),
             input: vec![UserInput::text("hi")],
             effort: None,
+            approval_policy: None,
+            sandbox_policy: None,
         };
         assert_eq!(
             serde_json::to_value(&turn).unwrap(),

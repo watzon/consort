@@ -89,6 +89,9 @@ impl Hub {
                 };
                 tx.save_task(&task)?;
                 tx.save_task_attachments(task.id, &new.attachments)?;
+                if let Some((kind, draft)) = new.proactive {
+                    tx.save_proactive_task(&task, kind, draft)?;
+                }
                 Ok(task)
             })
             .await?;
@@ -304,6 +307,7 @@ impl Hub {
                             text: first_turn,
                             attachments,
                         }),
+                        turn_approval_mode: None,
                     }),
                 )?;
                 transition(
@@ -390,6 +394,7 @@ impl Hub {
                 created_by,
                 routine_id: None,
                 attachments: Vec::new(),
+                proactive: None,
             })
             .await?;
         Ok(TaskResult { task })

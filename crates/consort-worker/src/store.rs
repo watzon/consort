@@ -773,6 +773,7 @@ pub(crate) mod tests {
             extensions: Default::default(),
             resume: None,
             turn: None,
+            turn_approval_mode: None,
         }
     }
 

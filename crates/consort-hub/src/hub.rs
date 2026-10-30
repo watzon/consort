@@ -258,6 +258,7 @@ pub(crate) async fn test_task_session(
             created_by: TaskCreator::User,
             routine_id: None,
             attachments: Vec::new(),
+            proactive: None,
         })
         .await
         .unwrap();

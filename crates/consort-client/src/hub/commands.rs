@@ -185,10 +185,9 @@ async fn run(shared: Arc<Shared>, command: Command) -> Result<CommandOutput, Cli
             if let Some(store) = &shared.store {
                 store.save(&identity)?;
             }
-            if let Ok(mut i) = shared.identity.lock() {
-                *i = Some(identity);
-            }
-            if let Ok(mut cache) = shared.cache.lock() {
+            // A new owner first: from here on, a link or a call of the old
+            // hub writes nothing into the cache.
+            shared.new_owner(|cache| {
                 // Messages for the old hub do not go to the new one. The
                 // user keeps their text as failed sends, and can send them
                 // again.
@@ -200,6 +199,9 @@ async fn run(shared: Arc<Shared>, command: Command) -> Result<CommandOutput, Cli
                     send_failures: failures,
                     ..Cache::default()
                 };
+            });
+            if let Ok(mut i) = shared.identity.lock() {
+                *i = Some(identity);
             }
             // The saved data is the old hub's. A live link to the old hub
             // ends, so the client connects to the new one.
@@ -210,14 +212,7 @@ async fn run(shared: Arc<Shared>, command: Command) -> Result<CommandOutput, Cli
             shared.wake.notify_one();
         }
         Command::Unpair => {
-            if let Ok(mut i) = shared.identity.lock() {
-                *i = None;
-            }
-            shared.forget_saved();
-            if let Some(store) = &shared.store {
-                store.clear()?;
-            }
-            if let Ok(mut cache) = shared.cache.lock() {
+            shared.new_owner(|cache| {
                 cache.fail_pending(
                     "This message did not go out, because you unpaired this app from the hub.",
                 );
@@ -226,6 +221,13 @@ async fn run(shared: Arc<Shared>, command: Command) -> Result<CommandOutput, Cli
                     send_failures: failures,
                     ..Cache::default()
                 };
+            });
+            if let Ok(mut i) = shared.identity.lock() {
+                *i = None;
+            }
+            shared.forget_saved();
+            if let Some(store) = &shared.store {
+                store.clear()?;
             }
             shared.defer_waiters();
             // A live link ends at its next tick. The link loop then sees

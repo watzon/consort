@@ -103,6 +103,10 @@ pub(crate) fn copy_database(db_path: &Path, dest: &Path) -> Result<i64> {
     use rusqlite::backup::{Backup, StepResult};
     let src = crate::store::open_connection(db_path)?;
     let schema_version: i64 = src.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    // The copy is the whole database, and the backup folder may be shared:
+    // the file is private (mode 0600 on Unix) from the start. SQLite gives
+    // its journal the same mode.
+    drop(crate::util::create_new_private_file(dest)?);
     let mut dst = rusqlite::Connection::open(dest)?;
     {
         let backup = Backup::new(&src, &mut dst)?;
@@ -277,18 +281,33 @@ pub(crate) fn archive_order(name: &str) -> Option<(String, u32)> {
     ok.then(|| (stamp.to_owned(), n))
 }
 
+/// The time of an archive for pruning: the time in its manifest, or else
+/// the time in its name read as UTC. Names in local time from older hubs
+/// do not decide the order when the manifest can be read.
+fn archive_time(path: &Path, stamp: &str) -> i64 {
+    if let Ok(manifest) = super::restore::read_manifest(path) {
+        return manifest.created_at.as_millis();
+    }
+    chrono::NaiveDateTime::parse_from_str(stamp, "%Y-%m-%d-%H%M")
+        .map(|t| t.and_utc().timestamp_millis())
+        .unwrap_or(0)
+}
+
 /// Deletes the oldest archives in `folder` so that `keep` stay. Only files
-/// with the archive name count. Returns the names it deleted.
+/// with the archive name count. The order is the time in each manifest
+/// (see [`archive_time`]), then the name. Returns the names it deleted.
 pub(crate) fn prune(folder: &Path, keep: u32) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(folder) else {
         return Vec::new();
     };
-    let mut archives: Vec<((String, u32), String)> = entries
+    let mut archives: Vec<((i64, String, u32), String)> = entries
         .flatten()
         .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
         .filter_map(|e| {
             let name = e.file_name().to_string_lossy().into_owned();
-            archive_order(&name).map(|order| (order, name))
+            let (stamp, n) = archive_order(&name)?;
+            let time = archive_time(&e.path(), &stamp);
+            Some(((time, stamp, n), name))
         })
         .collect();
     archives.sort();
@@ -322,6 +341,65 @@ mod tests {
         assert_eq!(archive_order("consort-notes.tar"), None);
         assert_eq!(archive_order("consort-2026-10-29-0300.tar.partial"), None);
         assert_eq!(archive_order("other-2026-10-29-0300.tar"), None);
+    }
+
+    /// An archive file with only a manifest that says `created_at`.
+    fn archive_made_at(path: &Path, created_at: Timestamp) {
+        let manifest = Manifest {
+            kind: MANIFEST_KIND.to_owned(),
+            format: FORMAT,
+            hub_version: "0.1.0".to_owned(),
+            schema_version: 9,
+            created_at,
+            blobs: 0,
+        };
+        let mut builder = tar::Builder::new(std::fs::File::create(path).unwrap());
+        append_bytes(
+            &mut builder,
+            MANIFEST_NAME,
+            &serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        builder.finish().unwrap();
+    }
+
+    #[test]
+    fn prune_keeps_the_newest_archive_by_its_manifest_not_its_name() {
+        // The old hub named the first archive in UTC (20:00), and the next
+        // one five minutes later in Chicago time (15:05). The newer one has
+        // the older name.
+        let dir = tempfile::tempdir().unwrap();
+        let older = dir.path().join("consort-2026-10-29-2000.tar");
+        let newer = dir.path().join("consort-2026-10-29-1505.tar");
+        archive_made_at(
+            &older,
+            Timestamp::parse_rfc3339("2026-10-29T20:00:00Z").unwrap(),
+        );
+        archive_made_at(
+            &newer,
+            Timestamp::parse_rfc3339("2026-10-29T20:05:00Z").unwrap(),
+        );
+        let deleted = prune(dir.path(), 1);
+        assert_eq!(deleted, vec!["consort-2026-10-29-2000.tar".to_owned()]);
+        assert!(newer.exists());
+    }
+
+    #[test]
+    fn the_database_copy_is_private_from_the_start() {
+        let data = tempfile::tempdir().unwrap();
+        let conn = crate::store::open_and_migrate(data.path()).unwrap();
+        drop(conn);
+        let folder = tempfile::tempdir().unwrap();
+        let dest = folder.path().join(".consort-backup-test.db");
+        copy_database(&data.path().join("hub.db"), &dest).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        // A file that is there already is never overwritten.
+        assert!(copy_database(&data.path().join("hub.db"), &dest).is_err());
     }
 
     #[test]

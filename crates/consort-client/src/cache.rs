@@ -81,6 +81,10 @@ pub struct Cache {
     /// catch up from `seq` instead of loading everything again. A load that
     /// stops half way leaves it false.
     pub loaded: bool,
+    /// The hub epoch that `seq` belongs to (`hello`). A hub that was
+    /// restored from a backup has a new epoch, and its feed numbers name
+    /// other changes, so the client loads a snapshot.
+    pub hub_epoch: Option<String>,
     pub groups: BTreeMap<String, Group>,
     pub channels: BTreeMap<String, Channel>,
     pub repos: BTreeMap<String, Repo>,

@@ -27,7 +27,7 @@ What Consort adds that none of them document: one clear level per channel with a
 
 ## Terms (add to CONTEXT.md)
 
-- **Proactive turn**: a coordinator turn whose wake events are all proactive. A turn that also has a user message is a normal turn.
+- **Proactive turn**: a coordinator turn with a proactive wake event and no event that the user caused. The stricter rule wins in a batch: a user message, a decision or card answer (an offer's "Do it" included) or a rating makes a normal turn; otherwise one proactive event makes the whole turn proactive. An update of a task that a proactive turn started is proactive too, so the limits travel with the work. The research pass always gets a turn of its own. A turn of memory suggestions only is normal, but it may only use memory tools and post. (Changed by the review fixes, 2026-10-30.)
 - **Proactivity level**: Off, Quiet, Normal or Eager, per channel.
 - **Check-in**: a routine of kind `check_in` that wakes the coordinator to look for things that need the user.
 - **Check-in note**: the memory note `check-in.md` that says what to watch and what to skip. Tutti's note is in global memory. A channel can have its own note in channel memory.
@@ -101,15 +101,15 @@ During quiet hours and snooze, nothing notifies.
 ### M8. Follow-ups the assistant sets (from dots "decide when to wake up" and OpenClaw one-shot `--at`)
 
 - Tool `follow_up_later { after_minutes | at, reason, key? }` creates a routine with `kind: follow_up`, `origin: assistant`, a once schedule, and the reason as the prompt. The same `key` in a channel replaces the old follow-up.
-- Limits: at least 15 minutes, at most 30 days ahead, at most 20 waiting per channel.
+- Limits: at least 15 minutes, at most 30 days ahead, at most 20 waiting per channel, at most 10 that run in a channel in a day (the next ones that day are `skipped_budget`). The hub checks the time with checked math, so a time far out of range is a clear error. `routine_update` of a follow-up keeps the same limits.
 - Tool `cancel_follow_up { routine_id | key }`. The user cancels one in the Routines tab ("Follow-ups" section) or all of them in Settings > Proactivity.
 - The wake event `follow_up` carries the reason and when it was set. A follow-up deletes itself after it runs.
-- A follow-up that falls inside quiet hours runs at its time (the assistant chose it for a reason) but cannot notify.
+- A follow-up that falls inside quiet hours runs at its time (the assistant chose it for a reason) but cannot notify. Like every routine, a follow-up that is more than 1 hour late (the hub was offline) is skipped and deleted.
 - No hidden pass that guesses commitments (OpenClaw removed that for good reason).
 
 ### M9. The research pass (from dots "proactive research is read-only")
 
-- Level Eager only. A routine with `kind: research`, daily at 06:30 in the user's time zone (before the brief, so the brief can use what it found).
+- Level Eager only. A routine with `kind: research`, daily at 06:30 in the user's time zone (before the brief, so the brief can use what it found). Its notes under `research/` post no "memory saved" line.
 - The hub enforces read-only in code for a turn whose only event is `research`: it allows the read tools (`list_*`, `read_*`, `search`, `fetch_*`, `memory_read`, `files_list`, connector tools whose hints say read-only), `memory_write` only under `research/`, `ask_decision` for offers (M10), and `no_reply_needed`. It refuses every other tool with the error "The research pass is read-only. Make an offer with ask_decision instead."
 - At most 3 offers a day from research.
 
@@ -118,12 +118,16 @@ During quiet hours and snooze, nothing notifies.
 - An offer is `ask_decision` with the options "Do it", "Not now" and "Never about this", marked as an offer. "Never about this" makes the coordinator add a skip line to the check-in note.
 - A task that a proactive turn starts runs in draft mode: the hub sets its approval mode to the strictest mode (every outward action waits for the user), unless the channel setting "Tasks the assistant starts on its own" is "Use the channel default". Drafts go to a draft place (a mail draft, a file). The approval cards stay until the user answers. They never expire and never run on their own.
 - A proactive turn cannot resolve a task, widen access, add a connector, or turn on scripts. The management tools refuse these in a proactive turn.
+- A proactive turn cannot message another channel ("A proactive turn cannot message another channel. Post in this channel, or make an offer."). It can message or retry only a task that a proactive turn of the same channel started in draft mode.
+- In a proactive turn and in a draft task, every connector tool that can write or send asks the user each time. Earlier allows ("ask once", "allow for this task") do not count there. Read-only tools (by their hints) run as usual.
+- A proactive turn and the research pass run the coordinator's harness in Ask for that turn (`session.turn.approval_mode`), so its own shell commands and file edits wait for the user too.
+- A task that a normal turn starts after the user chose "Do it" on an offer runs in draft mode, as the offer says.
 
 ### M11. Quiet hours, snooze and the off switch (the gap in all three products)
 
 - Quiet hours: one global range, default 21:00 to 07:00, in the user's time zone. The desktop app sets the time zone from the system when the hub has none.
 - In quiet hours, check-ins and stale-task nudges wait, and nothing notifies. The routines that the user expects at a fixed time (the morning brief, the research pass, follow-ups) run at their time, but they cannot notify inside quiet hours. The research pass never posts, so it runs at night with no effect on the user.
-- Snooze: for 2 hours, until tomorrow at the end of quiet hours, or for a week. While snoozed, check-ins, stale-task nudges and the research pass do not run. Follow-ups and the morning brief still run, but they cannot notify. The coordinator can snooze with `set_proactivity` ("not today").
+- Snooze: for 2 hours, until tomorrow at the end of quiet hours, or for a week. While snoozed, check-ins, stale-task nudges and the research pass do not run. Follow-ups and the morning brief still run, but they cannot notify. The coordinator can snooze with `set_proactivity` ("not today"), but only quieter: it can start or extend a snooze, never end or shorten one, and never end Pause all.
 - Off per channel, or "Pause all" in Settings > Proactivity. "Pause all" stops everything that starts on its own, including the brief and follow-ups (a follow-up that comes due while paused is skipped and logged).
 
 ### M12. The proactivity log and feedback (from OpenClaw's audit transcript and Grok's run history)
@@ -134,7 +138,8 @@ During quiet hours and snooze, nothing notifies.
 
 ### M13. Budgets and back-off (from OpenClaw's cost list and Duet's slow poll)
 
-- A daily budget of proactive turns per channel: 8 in Tutti, 3 in other channels. A wake over the budget is skipped (`skipped_budget`). Follow-ups and the brief count but are never skipped for the budget.
+- A daily budget of proactive turns per channel: 8 in Tutti, 3 in other channels. A wake over the budget is skipped (`skipped_budget`). Follow-ups and the brief count. The budget never skips the brief or a follow-up that the user's turn set, but it skips a follow-up that a proactive turn set, so the assistant cannot chain follow-ups. The brief and the research pass run at most once in 12 hours: the hub computes the next runs of a new schedule and refuses one that runs more often, from tools and from clients.
+- Proactive routines follow the rule of every routine: a run that is more than 1 hour late (the hub was offline) is skipped.
 - Back-off: after 6 silent check-ins in a row in a channel, the hub doubles that channel's check-in interval, up to 12 hours. A user message in the channel resets it.
 - A proactive wake while the channel's turn runs waits (`skipped_busy` only if it waited more than one interval).
 - Check-ins and the research pass jitter their start by up to 5 minutes, so routines do not all start at the same minute.

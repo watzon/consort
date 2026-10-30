@@ -33,6 +33,9 @@ pub trait HarnessSession: Send {
 	/// `HarnessError::Unsupported` when `capabilities().steer` is false.
 	fn steer(&mut self, input: TurnInput) -> SteerFuture;
 	async fn interrupt(&mut self) -> Result<(), HarnessError>;
+	/// The mode of the next turns, at or below the session's mode. See
+	/// "A mode for one turn". The default is `Unsupported`.
+	async fn set_approval_mode(&mut self, mode: ApprovalMode) -> Result<(), HarnessError>;
 	async fn respond(&mut self, request: RequestId, answer: Answer) -> Result<(), HarnessError>;
 	async fn close(self: Box<Self>) -> Result<(), HarnessError>;
 }
@@ -233,6 +236,16 @@ If `allow_shell` is false in the worker policy, the worker caps the mode at Auto
 | Codex | `features.shell_tool` and `features.unified_exec` are false in the `thread/start` config. Tested with codex-cli 0.165.0: the model gets no `exec_command` and no `write_stdin` tool |
 | OpenCode | `bash` is `deny` in `OPENCODE_CONFIG_CONTENT` |
 | Gemini CLI | Not done yet. Only the worker's denial of each command approval applies |
+
+### A mode for one turn
+
+A `session.turn` (and the first turn of a `session.start`) can name an approval mode for that turn only. The hub does this for a coordinator's proactive turns and the research pass: they run in Ask, so the coordinator's own shell commands and file edits wait for the user, whatever the channel's default mode. The worker runs the turn at the lower of that mode and the session's own mode, and the next turn that names no mode goes back to the session's mode. It calls `HarnessSession::set_approval_mode` only when the mode changes, and never while a turn runs.
+
+| Adapter | How it changes the mode |
+|---|---|
+| Claude (ACP) | The same call that sets the mode at the start (`session/set_config_option` with the `mode` option, or `session/set_mode`), and the adapter reads the mode back. The new limit holds at once: the options that would raise the mode are removed, and a higher mode that the agent reports is set back |
+| Codex | `turn/start` takes `approvalPolicy` and `sandboxPolicy` (an object such as `{"type": "readOnly"}`). Codex keeps them for the next turns, so the adapter sends them only with the turn whose mode changed. A session that goes back to its mode gets the plain sandbox policy of that mode, without the extra settings of the user's Codex config |
+| OpenCode, Gemini CLI, other ACP agents, Pi | Not supported: they take their mode when they start. The worker refuses a stricter turn with `policy_denied`. A coordinator on such a harness runs proactive turns only when the channel's default mode is Ask already |
 
 ### What an approval shows
 

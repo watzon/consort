@@ -503,6 +503,13 @@ pub struct ClientHelloResult {
     pub hub_version: String,
     /// The current feed sequence number.
     pub feed_seq: u64,
+    /// A random ID of this hub's database. The hub makes a new one when it
+    /// creates its database and when it restores a backup. A restored hub
+    /// has an older feed, so its sequence numbers name other changes. A
+    /// client that saved a feed position for another epoch drops it and
+    /// loads a snapshot. `None` from an older hub.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hub_epoch: Option<String>,
 }
 
 /// `auth.http_token`: ask for a bearer token for the blob endpoints.

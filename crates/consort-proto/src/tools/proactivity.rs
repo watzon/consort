@@ -58,7 +58,9 @@ pub struct SetProactivityArgs {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channel_id: Option<ChannelId>,
     /// Snooze everything that starts on its own in every channel:
-    /// `two_hours`, `until_tomorrow` or `week`. `off` ends a snooze.
+    /// `two_hours`, `until_tomorrow` or `week`. A snooze only gets longer: a
+    /// shorter choice keeps the current end. You cannot end a snooze
+    /// (`off`). Only the user can, in Settings > Proactivity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snooze: Option<SnoozeChoice>,
 }

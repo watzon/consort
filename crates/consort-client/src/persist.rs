@@ -5,9 +5,10 @@
 //! - `entity(kind, id, json)`: one row for each entity that the cache keeps.
 //!   `kind` names the kind (`message`, `task`, ...), `id` is the key that the
 //!   cache uses for it, and `json` is the entity as the hub sends it.
-//! - `meta(key, value)`: the feed position (`seq`), the time when the data
-//!   was last known to be current (`fresh_at`), the hub that the data came
-//!   from, and the sets that say what the cache has loaded.
+//! - `meta(key, value)`: the feed position (`seq`) and the hub epoch that it
+//!   belongs to (`hub_epoch`), the time when the data was last known to be
+//!   current (`fresh_at`), the hub that the data came from, and the sets
+//!   that say what the cache has loaded.
 //!
 //! `PRAGMA user_version` holds [`SCHEMA_VERSION`].
 //!
@@ -144,6 +145,7 @@ const PROACTIVE_WAKE: &str = "proactive_wake";
 
 // The keys of the meta table.
 const SEQ: &str = "seq";
+const HUB_EPOCH: &str = "hub_epoch";
 const FRESH_AT: &str = "fresh_at";
 const CLIENT_ID: &str = "client_id";
 const HUB_URL: &str = "hub_url";
@@ -268,6 +270,7 @@ pub fn rows(cache: &Cache, fresh_at: i64, owner: &Owner) -> Result<Rows, Persist
     }
     let mut meta = BTreeMap::new();
     meta.insert(SEQ, cache.seq.to_string());
+    meta.insert(HUB_EPOCH, json(&cache.hub_epoch)?);
     meta.insert(FRESH_AT, fresh_at.to_string());
     meta.insert(CLIENT_ID, owner.client_id.clone());
     meta.insert(HUB_URL, owner.hub_url.clone());
@@ -407,6 +410,7 @@ fn restore(
         // A file holds a cache only after its first load was done.
         loaded: true,
         seq: meta_value(meta, SEQ)?,
+        hub_epoch: meta_value(meta, HUB_EPOCH)?,
         files_loaded: meta_value(meta, FILES_LOADED)?,
         runs_loaded: meta_value(meta, RUNS_LOADED)?,
         memory_loaded: meta_value(meta, MEMORY_LOADED)?,
@@ -844,6 +848,7 @@ mod tests {
         let mut cache = Cache {
             seq: 4_242,
             loaded: true,
+            hub_epoch: Some("epoch-1".into()),
             tasks_have_more: true,
             ..Cache::default()
         };
@@ -1096,6 +1101,7 @@ mod tests {
         let Cache {
             seq,
             loaded,
+            hub_epoch,
             groups,
             channels,
             repos,
@@ -1150,6 +1156,7 @@ mod tests {
         same!(
             seq,
             loaded,
+            hub_epoch,
             groups,
             channels,
             repos,

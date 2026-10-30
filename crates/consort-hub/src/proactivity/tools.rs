@@ -7,10 +7,11 @@ use consort_proto::ids::{ChannelId, RoutineId, SessionId};
 use consort_proto::model::{
     ApprovalMode, Channel, DecisionOption, FINDING_MAX_CHARS, FOLLOW_UP_MAX_DAYS,
     FOLLOW_UP_MIN_MINUTES, FOLLOW_UP_REASON_MAX_CHARS, FOLLOW_UPS_MAX_PER_CHANNEL, OFFER_DO_IT,
-    OFFER_NEVER, OFFER_NOT_NOW, ProactiveMark, ProactiveTasks, ProactivityLevel,
+    OFFER_NEVER, OFFER_NOT_NOW, ProactiveKind, ProactiveMark, ProactiveTasks, ProactivityLevel,
     RESEARCH_MEMORY_FOLDER, RESEARCH_OFFERS_MAX_PER_DAY, Routine, RoutineAction, RoutineKind,
-    RoutineOrigin, RoutineSchedule, Suggestion, validate_suggestions,
+    RoutineOrigin, RoutineSchedule, SnoozeChoice, Suggestion, validate_suggestions,
 };
+use consort_proto::time::Timestamp;
 use consort_proto::tools::{
     CancelFollowUpArgs, FollowUpLaterArgs, FollowUpResult, OkResult, SetProactivityArgs,
     SetProactivityResult, ToolAudience,
@@ -139,34 +140,132 @@ pub(crate) fn decision_posting(
     Ok(mark)
 }
 
-/// The approval mode of a task that a coordinator starts: in a proactive
-/// turn, Ask (draft mode), unless the channel lets such tasks use its
-/// default.
+/// The kind of the proactive turn that starts a task, and whether the task
+/// runs in draft mode.
+pub(crate) type TaskOrigin = (ProactiveKind, bool);
+
+/// How a task that a coordinator starts now runs: its approval mode, and
+/// its proactive origin with the draft flag. A task that a proactive turn
+/// starts runs in draft mode (Ask), unless the channel lets such tasks use
+/// its default. A task that a normal turn starts after the user chose "Do
+/// it" on an offer runs in draft mode too, as the offer says.
 pub(crate) fn task_approval_mode(
     conn: &rusqlite::Connection,
     session_id: SessionId,
     channel: &Channel,
     requested: Option<ApprovalMode>,
-) -> Result<(Option<ApprovalMode>, bool)> {
-    let (kind, _) = turn::turn_of_session(conn, session_id, channel.id)?;
-    if kind.is_proactive() && channel.proactive_tasks == ProactiveTasks::Drafts {
-        return Ok((Some(ApprovalMode::Ask), true));
-    }
-    Ok((requested, false))
+) -> Result<(Option<ApprovalMode>, Option<TaskOrigin>)> {
+    let (kind, row) = turn::turn_of_session(conn, session_id, channel.id)?;
+    let origin = match kind.proactive_kind() {
+        Some(kind) => Some(kind),
+        None => offer_taken(conn, &row.turn_events)?,
+    };
+    let Some(origin) = origin else {
+        return Ok((requested, None));
+    };
+    let draft = channel.proactive_tasks == ProactiveTasks::Drafts;
+    let mode = if draft {
+        Some(ApprovalMode::Ask)
+    } else {
+        requested
+    };
+    Ok((mode, Some((origin, draft))))
 }
 
-/// The research pass may write memory only under `research/`.
+/// The kind of the offer that the user answered with "Do it" in these
+/// events, when there is one.
+fn offer_taken(
+    conn: &rusqlite::Connection,
+    events: &[consort_proto::turn_input::WakeEvent],
+) -> Result<Option<ProactiveKind>> {
+    for event in events {
+        let consort_proto::turn_input::WakeEvent::DecisionAnswered {
+            id,
+            option: Some(option),
+            ..
+        } = event
+        else {
+            continue;
+        };
+        if option != OFFER_DO_IT {
+            continue;
+        }
+        let Some(decision) = crate::store::work::decision(conn, *id)? else {
+            continue;
+        };
+        if let Some(mark) = conversation::message(conn, decision.message_id)?
+            .and_then(|m| m.proactive)
+            .filter(|mark| mark.offer)
+        {
+            return Ok(Some(mark.kind));
+        }
+    }
+    Ok(None)
+}
+
+/// The time of a new follow-up from `after_minutes` or `at`, checked: at
+/// least 15 minutes and at most 30 days ahead of `now`. The math is
+/// checked, so a value far out of range is an error and never a panic.
+pub(crate) fn follow_up_time(
+    now: Timestamp,
+    after_minutes: Option<u64>,
+    at: Option<Timestamp>,
+) -> Result<Timestamp> {
+    let too_late = || {
+        HubError::invalid(format!(
+            "A follow-up can be at most {FOLLOW_UP_MAX_DAYS} days ahead. Choose an earlier time."
+        ))
+    };
+    let at = match (after_minutes, at) {
+        (Some(minutes), None) => i64::try_from(minutes)
+            .ok()
+            .and_then(|m| m.checked_mul(MINUTE_MS))
+            .and_then(|ms| now.as_millis().checked_add(ms))
+            .map(Timestamp::from_millis)
+            .ok_or_else(too_late)?,
+        (None, Some(at)) => at,
+        _ => {
+            return Err(HubError::invalid(
+                "Give after_minutes or at, not both and not neither.",
+            ));
+        }
+    };
+    let min = i64::try_from(FOLLOW_UP_MIN_MINUTES).unwrap_or(15) * MINUTE_MS;
+    let max = i64::try_from(FOLLOW_UP_MAX_DAYS).unwrap_or(30) * DAY_MS;
+    let Some(ahead) = at.as_millis().checked_sub(now.as_millis()) else {
+        // Only a time far outside the range of real times gets here.
+        return Err(HubError::invalid(format!(
+            "The time {} is out of range. Give a time from {FOLLOW_UP_MIN_MINUTES} minutes to {FOLLOW_UP_MAX_DAYS} days ahead.",
+            at.as_millis()
+        )));
+    };
+    if ahead < min {
+        return Err(HubError::invalid(format!(
+            "A follow-up must be at least {FOLLOW_UP_MIN_MINUTES} minutes ahead. Choose a later time."
+        )));
+    }
+    if ahead > max {
+        return Err(too_late());
+    }
+    Ok(at)
+}
+
+/// The research pass may write memory only under `research/`. Returns
+/// whether the write is a research write, which posts no line.
 pub(crate) fn check_memory_write(
     conn: &rusqlite::Connection,
     session_id: SessionId,
     channel_id: ChannelId,
     path: &str,
-) -> Result<()> {
+) -> Result<bool> {
     let (kind, _) = turn::turn_of_session(conn, session_id, channel_id)?;
-    if kind == TurnKind::Research && !path.starts_with(RESEARCH_MEMORY_FOLDER) {
+    if kind != TurnKind::Research {
+        return Ok(false);
+    }
+    if !path.starts_with(RESEARCH_MEMORY_FOLDER) {
         return Err(denied(RESEARCH_REFUSAL));
     }
-    Ok(())
+    Ok(true)
 }
 
 impl Hub {
@@ -185,6 +284,56 @@ impl Hub {
             .read(move |conn| Ok(turn::turn_of_session(conn, session_id, channel_id)?.0))
             .await?;
         turn::check_tool(&kind, tool)
+    }
+
+    /// The kind of the open turn of a coordinator session. A task session
+    /// runs no coordinator turn, so its kind is normal.
+    pub(crate) async fn turn_kind(&self, ctx: &ToolCtx) -> Result<TurnKind> {
+        if ctx.audience == ToolAudience::TaskSession {
+            return Ok(TurnKind::Normal);
+        }
+        let (session_id, channel_id) = (ctx.session.id, ctx.channel.id);
+        self.store
+            .read(move |conn| Ok(turn::turn_of_session(conn, session_id, channel_id)?.0))
+            .await
+    }
+
+    /// `message_task` and `retry_task` in a proactive turn reach only a task
+    /// that a proactive turn of this channel started in draft mode. Other
+    /// tasks may act outward with their own mode, so the user must steer
+    /// them.
+    pub(crate) async fn check_steer_task(
+        &self,
+        ctx: &ToolCtx,
+        task_id: consort_proto::ids::TaskId,
+    ) -> Result<()> {
+        if !self.turn_kind(ctx).await?.is_proactive() {
+            return Ok(());
+        }
+        let channel_id = ctx.channel.id;
+        let origin = self
+            .store
+            .read(move |conn| store::proactive_task(conn, task_id))
+            .await?;
+        match origin {
+            Some(origin) if origin.draft && origin.channel_id == channel_id => Ok(()),
+            _ => Err(denied(turn::STEER_TASK_REFUSAL)),
+        }
+    }
+
+    /// Whether a connector call must ask the user each time: in a proactive
+    /// turn, and in a task that runs in draft mode. Earlier allows do not
+    /// count there.
+    pub(crate) async fn connector_calls_ask_each_time(&self, ctx: &ToolCtx) -> Result<bool> {
+        if let Some(task) = &ctx.task {
+            let task_id = task.id;
+            let origin = self
+                .store
+                .read(move |conn| store::proactive_task(conn, task_id))
+                .await?;
+            return Ok(origin.is_some_and(|o| o.draft));
+        }
+        Ok(self.turn_kind(ctx).await?.is_proactive())
     }
 
     /// Whether the session runs the research pass now.
@@ -269,36 +418,12 @@ impl Hub {
                 "The key is longer than 80 characters. Use a short key.",
             ));
         }
-        let channel_id = ctx.channel.id;
+        let (channel_id, session_id) = (ctx.channel.id, ctx.session.id);
         let result = self
             .store
             .write(move |tx| {
                 let now = tx.now();
-                let at = match (args.after_minutes, args.at) {
-                    (Some(minutes), None) => now.plus_millis(
-                        i64::try_from(minutes)
-                            .unwrap_or(i64::MAX / MINUTE_MS)
-                            .saturating_mul(MINUTE_MS),
-                    ),
-                    (None, Some(at)) => at,
-                    _ => {
-                        return Err(HubError::invalid(
-                            "Give after_minutes or at, not both and not neither.",
-                        ));
-                    }
-                };
-                let min = i64::try_from(FOLLOW_UP_MIN_MINUTES).unwrap_or(15) * MINUTE_MS;
-                let max = i64::try_from(FOLLOW_UP_MAX_DAYS).unwrap_or(30) * DAY_MS;
-                if at.as_millis() - now.as_millis() < min {
-                    return Err(HubError::invalid(format!(
-                        "A follow-up must be at least {FOLLOW_UP_MIN_MINUTES} minutes ahead. Choose a later time."
-                    )));
-                }
-                if at.as_millis() - now.as_millis() > max {
-                    return Err(HubError::invalid(format!(
-                        "A follow-up can be at most {FOLLOW_UP_MAX_DAYS} days ahead. Choose an earlier time."
-                    )));
-                }
+                let at = follow_up_time(now, args.after_minutes, args.at)?;
                 let channel = conversation::channel_or_404(tx.db(), channel_id)?;
                 if channel.proactivity_level() == ProactivityLevel::Off {
                     return Err(denied(format!(
@@ -340,12 +465,18 @@ impl Hub {
                     origin: RoutineOrigin::Assistant,
                     created_at: Some(now),
                 };
+                // A follow-up that a proactive turn sets counts against the
+                // daily turn budget, so the assistant cannot chain them.
+                let set_in_proactive_turn = turn::turn_of_session(tx.db(), session_id, channel_id)?
+                    .0
+                    .is_proactive();
                 tx.save_routine(&routine)?;
                 tx.save_follow_up(&store::FollowUpRow {
                     routine_id: routine.id,
                     channel_id,
                     key,
                     set_at: now,
+                    set_in_proactive_turn,
                 })?;
                 Ok(FollowUpResult {
                     routine_id: routine.id,
@@ -435,8 +566,24 @@ impl Hub {
                 }
                 let mut settings = store::settings(tx.db())?;
                 if let Some(choice) = args.snooze {
-                    settings.snoozed_until = gate::snooze_until(&settings, choice, now);
-                    tx.save_proactivity_settings(&settings)?;
+                    // The tool only makes things quieter: it starts or
+                    // extends a snooze, never ends or shortens one. It has no
+                    // way to end Pause all.
+                    if choice == SnoozeChoice::Off {
+                        return Err(denied(
+                            "You cannot end a snooze. Only the user can, in Settings > Proactivity.",
+                        ));
+                    }
+                    let current = settings.snoozed_until.filter(|until| *until > now);
+                    let wanted = gate::snooze_until(&settings, choice, now);
+                    let until = match (current, wanted) {
+                        (Some(current), Some(wanted)) => Some(current.max(wanted)),
+                        (current, wanted) => wanted.or(current),
+                    };
+                    if until != settings.snoozed_until {
+                        settings.snoozed_until = until;
+                        tx.save_proactivity_settings(&settings)?;
+                    }
                 }
                 Ok(SetProactivityResult {
                     level: channel.proactivity_level(),

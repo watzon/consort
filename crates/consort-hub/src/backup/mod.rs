@@ -101,16 +101,14 @@ impl Backups {
     }
 }
 
-/// The archive name for a backup that starts at `at`: the time in the time
-/// zone of the schedule, for example `consort-2026-10-29-0300`.
-fn archive_stem(at: Timestamp, time_zone: &str) -> String {
+/// The archive name for a backup that starts at `at`: the time in UTC, for
+/// example `consort-2026-10-29-0800`. A name in local time can go back
+/// (a change of the time zone, or the hour that daylight saving time
+/// repeats), so a newer archive could get an older name.
+fn archive_stem(at: Timestamp) -> String {
     let utc =
         chrono::DateTime::<chrono::Utc>::from_timestamp_millis(at.as_millis()).unwrap_or_default();
-    let stamp = match settings::time_zone(time_zone) {
-        Ok(tz) => utc.with_timezone(&tz).format("%Y-%m-%d-%H%M").to_string(),
-        Err(_) => utc.format("%Y-%m-%d-%H%M").to_string(),
-    };
-    format!("{}{stamp}", archive::NAME_PREFIX)
+    format!("{}{}", archive::NAME_PREFIX, utc.format("%Y-%m-%d-%H%M"))
 }
 
 impl Hub {
@@ -228,7 +226,7 @@ impl Hub {
         };
         let hub = self.clone();
         let folder = PathBuf::from(&file.settings.folder);
-        let stem = archive_stem(started_at, &file.settings.schedule.time_zone);
+        let stem = archive_stem(started_at);
         let keep = file.settings.keep;
         tokio::spawn(async move {
             let job_folder = folder.clone();
@@ -364,14 +362,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn an_archive_is_named_after_its_start_in_the_schedule_zone() {
-        // 2026-10-29T08:00:00Z is 3:00 AM in Chicago.
+    fn an_archive_is_named_after_its_start_in_utc() {
+        // 2026-10-29T08:00:00Z is 3:00 AM in Chicago. The name is in UTC
+        // whatever the zone of the schedule.
         let at = Timestamp::from_millis(1_793_260_800_000);
-        assert_eq!(
-            archive_stem(at, "America/Chicago"),
-            "consort-2026-10-29-0300"
-        );
-        assert_eq!(archive_stem(at, "UTC"), "consort-2026-10-29-0800");
-        assert_eq!(archive_stem(at, "Nowhere/Else"), "consort-2026-10-29-0800");
+        assert_eq!(archive_stem(at), "consort-2026-10-29-0800");
     }
 }

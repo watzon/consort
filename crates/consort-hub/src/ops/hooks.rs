@@ -21,6 +21,9 @@ pub(crate) struct NewTask {
     pub routine_id: Option<RoutineId>,
     /// Files for the first turn of each session of the task.
     pub attachments: Vec<BlobRef>,
+    /// The kind of the proactive turn that starts the task, and whether
+    /// the task runs in draft mode. `None` for every other task.
+    pub proactive: Option<(consort_proto::model::ProactiveKind, bool)>,
 }
 
 impl Hub {

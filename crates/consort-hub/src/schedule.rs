@@ -46,6 +46,43 @@ pub(crate) fn next_run_at(
     }
 }
 
+/// The shortest time between two runs of `schedule` after `from`, in
+/// milliseconds, or `None` for a schedule that runs at most once. For a
+/// cron schedule it looks at the runs of the next 400 days, at most 1,000
+/// runs, so a pattern that repeats each week or each year shows.
+pub(crate) fn shortest_gap_ms(schedule: &RoutineSchedule, from: Timestamp) -> Result<Option<i64>> {
+    const SPAN_MS: i64 = 400 * 24 * 60 * 60 * 1000;
+    const MAX_RUNS: usize = 1000;
+    match schedule {
+        RoutineSchedule::Once { .. } => Ok(None),
+        RoutineSchedule::Interval { seconds } => Ok(Some(
+            i64::try_from(*seconds)
+                .ok()
+                .and_then(|s| s.checked_mul(MS_PER_SECOND))
+                .unwrap_or(i64::MAX),
+        )),
+        RoutineSchedule::Cron { .. } => {
+            let Some(mut previous) = next_run_at(schedule, from)? else {
+                return Ok(None);
+            };
+            let end = from.plus_millis(SPAN_MS);
+            let mut shortest: Option<i64> = None;
+            for _ in 0..MAX_RUNS {
+                let Some(next) = next_run_at(schedule, previous)? else {
+                    break;
+                };
+                let gap = next.as_millis().saturating_sub(previous.as_millis());
+                shortest = Some(shortest.map_or(gap, |s| s.min(gap)));
+                if next > end {
+                    break;
+                }
+                previous = next;
+            }
+            Ok(shortest)
+        }
+    }
+}
+
 /// Checks a schedule for a new or changed routine.
 ///
 /// It runs the proto checks, then parses the cron expression and the time

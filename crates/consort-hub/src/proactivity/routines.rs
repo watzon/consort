@@ -4,8 +4,9 @@
 
 use consort_proto::ids::{ChannelId, RoutineId};
 use consort_proto::model::{
-    CHECK_IN_CHANNEL_SECONDS, CHECK_IN_MIN_SECONDS, CHECK_IN_NOTE_PATH, CHECK_IN_TUTTI_SECONDS,
-    Channel, ChannelKind, ExpectedHash, MemoryAuthor, MemoryScope, ProactiveKind, ProactiveOutcome,
+    BRIEF_RESEARCH_MIN_GAP_SECONDS, CHECK_IN_CHANNEL_SECONDS, CHECK_IN_MIN_SECONDS,
+    CHECK_IN_NOTE_PATH, CHECK_IN_TUTTI_SECONDS, Channel, ChannelKind, ExpectedHash,
+    FOLLOW_UPS_MAX_RUNS_PER_DAY, MemoryAuthor, MemoryScope, ProactiveKind, ProactiveOutcome,
     ProactiveWake, ProactivityLevel, ProactivitySettings, Routine, RoutineAction, RoutineKind,
     RoutineOrigin, RoutineRun, RoutineSchedule,
 };
@@ -271,6 +272,19 @@ pub(crate) fn check_routine_change(
             }
         }));
     }
+    if matches!(before.kind, RoutineKind::Brief | RoutineKind::Research)
+        && after.schedule != before.schedule
+    {
+        check_daily_schedule(before.kind, &after.schedule, tx.now())?;
+    }
+    if before.kind == RoutineKind::FollowUp && after.schedule != before.schedule {
+        let RoutineSchedule::Once { at } = after.schedule else {
+            return Err(HubError::invalid(
+                "A follow-up runs once. Give it one time with a once schedule.",
+            ));
+        };
+        super::tools::follow_up_time(tx.now(), None, Some(at))?;
+    }
     if before.kind == RoutineKind::CheckIn && after.schedule != before.schedule {
         match after.schedule {
             RoutineSchedule::Interval { seconds } if seconds >= CHECK_IN_MIN_SECONDS => {
@@ -287,6 +301,36 @@ pub(crate) fn check_routine_change(
         }
     }
     Ok(())
+}
+
+/// The morning brief and the research pass run at most once in 12 hours.
+/// The hub computes the next runs of the schedule and refuses one that
+/// runs more often.
+pub(crate) fn check_daily_schedule(
+    kind: RoutineKind,
+    schedule: &RoutineSchedule,
+    now: Timestamp,
+) -> Result<()> {
+    let Some(gap) = crate::schedule::shortest_gap_ms(schedule, now)? else {
+        return Ok(());
+    };
+    let min_ms = i64::try_from(BRIEF_RESEARCH_MIN_GAP_SECONDS).unwrap_or(i64::MAX) * 1000;
+    if gap >= min_ms {
+        return Ok(());
+    }
+    let name = match kind {
+        RoutineKind::Brief => "The morning brief",
+        _ => "The research pass",
+    };
+    let minutes = gap / 60_000;
+    let apart = if minutes >= 60 {
+        format!("{} hours", minutes / 60)
+    } else {
+        format!("{minutes} minutes")
+    };
+    Err(HubError::invalid(format!(
+        "{name} runs at most once in 12 hours, and this schedule runs it {apart} apart. Choose a daily or weekly time."
+    )))
 }
 
 /// The note of a channel's check-in: Tutti's note in global memory, or the
@@ -321,6 +365,41 @@ pub(crate) fn pending_wake(
     }
 }
 
+/// The budget of a follow-up that passed the gate: at most 10 follow-ups
+/// run in a channel in a day, and a follow-up that a proactive turn set
+/// counts against the daily turn budget like a check-in. So the assistant
+/// cannot chain follow-ups without an end.
+fn follow_up_budget(
+    tx: &mut Tx<'_>,
+    routine: &Routine,
+    channel: &Channel,
+    day_start: Timestamp,
+    turns_today: u32,
+) -> Result<Gate> {
+    let ran_today = store::follow_ups_since(tx.db(), channel.id, day_start)?;
+    if ran_today >= FOLLOW_UPS_MAX_RUNS_PER_DAY {
+        return Ok(Gate::Skip(
+            ProactiveOutcome::SkippedBudget,
+            format!(
+                "{FOLLOW_UPS_MAX_RUNS_PER_DAY} follow-ups ran in {} today.",
+                channel.name
+            ),
+        ));
+    }
+    let chained = store::follow_up(tx.db(), routine.id)?.is_some_and(|f| f.set_in_proactive_turn);
+    let budget = gate::turn_budget(channel.kind);
+    if chained && turns_today >= budget {
+        return Ok(Gate::Skip(
+            ProactiveOutcome::SkippedBudget,
+            format!(
+                "{budget} of {budget} proactive turns used in {}. A turn that started on its own set this follow-up.",
+                channel.name
+            ),
+        ));
+    }
+    Ok(Gate::Run)
+}
+
 /// Starts a run of a proactive routine: the gate, the log entry, the wake
 /// event and the routine run. Called by the scheduler for a routine whose
 /// kind is not `custom`. Returns the run and the channel to kick.
@@ -340,9 +419,31 @@ pub(crate) fn begin_proactive_run(
             routine.name
         )));
     }
+    // The same rule as for other routines: a run that is more than 1 hour
+    // late (the hub was offline) is skipped. The routine run says so.
+    if scheduled
+        && let Some(due) = routine.next_run_at
+        && now.as_millis().saturating_sub(due.as_millis()) >= scheduler::LATE_LIMIT_MS
+    {
+        let mut run = scheduler::skipped_run(
+            &routine,
+            due,
+            "The hub was offline at the run time and came back more than 1 hour later.",
+        );
+        scheduler::add_schedule_error(&mut run, scheduler::advance(&mut routine, now));
+        scheduler::note_last_run(&mut routine, &run);
+        tx.record_routine_run(&mut run)?;
+        if routine.kind == RoutineKind::FollowUp {
+            tx.delete_routine(&routine)?;
+            tx.delete_follow_up_row(routine.id)?;
+        } else {
+            tx.save_routine(&routine)?;
+        }
+        return Ok(Ok((run, None)));
+    }
     let decision = if scheduled {
-        let turns_today =
-            store::turns_since(tx.db(), channel.id, gate::start_of_day(&settings, now))?;
+        let day_start = gate::start_of_day(&settings, now);
+        let turns_today = store::turns_since(tx.db(), channel.id, day_start)?;
         let decided = gate::decide(&GateInput {
             kind,
             level: channel.proactivity_level(),
@@ -352,6 +453,12 @@ pub(crate) fn begin_proactive_run(
             now,
             turns_today,
         });
+        let decided = match decided {
+            Gate::Run if kind == ProactiveKind::FollowUp => {
+                follow_up_budget(tx, &routine, channel, day_start, turns_today)?
+            }
+            other => other,
+        };
         match decided {
             Gate::Run if busy => Gate::Skip(
                 ProactiveOutcome::SkippedBusy,

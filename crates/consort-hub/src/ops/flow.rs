@@ -93,6 +93,10 @@ pub(crate) fn transition(
             .or_else(|| task.status_reason.clone())
             .or_else(|| task.review_summary.clone())
             .unwrap_or_else(|| to.label().to_owned());
+        // An update of a task that a proactive turn started is proactive
+        // too, so the turn that it wakes keeps the proactive limits.
+        let proactive =
+            crate::store::proactivity::proactive_task(tx.db(), task.id)?.map(|origin| origin.kind);
         tx.queue_wake(
             task.channel_id,
             &WakeEvent::TaskUpdate {
@@ -100,6 +104,7 @@ pub(crate) fn transition(
                 title: task.title.clone(),
                 status: to,
                 text,
+                proactive,
             },
         )?;
     }
@@ -225,6 +230,7 @@ fn deliver(
                 session_id,
                 turn,
                 channel_files,
+                approval_mode: None,
             }),
         )?;
         runtime.turn_open = true;

@@ -508,7 +508,10 @@ impl Hub {
     ) -> Result<Value> {
         let scope = writable_scope(ctx)?;
         let (session_id, channel_id, path) = (ctx.session.id, ctx.channel.id, args.path.clone());
-        self.store
+        // The research pass never posts: its notes under `research/` get no
+        // "memory saved" line.
+        let research = self
+            .store
             .read(move |conn| {
                 crate::proactivity::tools::check_memory_write(conn, session_id, channel_id, &path)
             })
@@ -526,7 +529,7 @@ impl Hub {
                 crate::ops::knowledge::WriteSource {
                     by: MemoryAuthor::Session(ctx.session.id),
                     suggested_by,
-                    saved_line: Some(ctx.channel.id),
+                    saved_line: (!research).then_some(ctx.channel.id),
                 },
             )
             .await?;

@@ -86,6 +86,19 @@ pub fn turns_since(conn: &Connection, channel_id: ChannelId, since: Timestamp) -
     Ok(u32::try_from(count).unwrap_or(u32::MAX))
 }
 
+/// The follow-ups that ran a model in a channel since a time.
+pub fn follow_ups_since(conn: &Connection, channel_id: ChannelId, since: Timestamp) -> Result<u32> {
+    let count: i64 = conn.query_row(
+        &format!(
+            "SELECT count(*) FROM proactive_wakes
+             WHERE channel_id = ?1 AND kind = 'follow_up' AND at >= ?2 AND outcome IN {RAN_A_MODEL}"
+        ),
+        params![channel_id.to_string(), since.as_millis()],
+        |row| row.get(0),
+    )?;
+    Ok(u32::try_from(count).unwrap_or(u32::MAX))
+}
+
 /// The notifying proactive messages since a time, across the hub.
 pub fn notified_since(conn: &Connection, since: Timestamp) -> Result<u32> {
     let count: i64 = conn.query_row(
@@ -184,6 +197,8 @@ impl Tx<'_> {
         )?;
         self.db()
             .execute("DELETE FROM follow_ups WHERE channel_id = ?1", [&id])?;
+        self.db()
+            .execute("DELETE FROM proactive_tasks WHERE channel_id = ?1", [&id])?;
         Ok(())
     }
 }
@@ -366,8 +381,65 @@ impl Tx<'_> {
             "DELETE FROM task_status_since WHERE task_id = ?1",
             [task_id.to_string()],
         )?;
+        self.db().execute(
+            "DELETE FROM proactive_tasks WHERE task_id = ?1",
+            [task_id.to_string()],
+        )?;
         Ok(())
     }
+
+    /// Records that a proactive turn of `kind` started a task, and whether
+    /// the task runs in draft mode.
+    pub fn save_proactive_task(
+        &mut self,
+        task: &Task,
+        kind: ProactiveKind,
+        draft: bool,
+    ) -> Result<()> {
+        self.db().execute(
+            "INSERT INTO proactive_tasks (task_id, channel_id, kind, draft) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(task_id) DO UPDATE SET kind = excluded.kind, draft = excluded.draft",
+            params![
+                task.id.to_string(),
+                task.channel_id.to_string(),
+                kind.as_str(),
+                draft
+            ],
+        )?;
+        Ok(())
+    }
+}
+
+// Tasks that a proactive turn started -----------------------------------------
+
+/// The origin of a task that a proactive turn started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProactiveTask {
+    /// The channel of the task.
+    pub channel_id: ChannelId,
+    /// The kind of the turn that started it.
+    pub kind: ProactiveKind,
+    /// Whether the task runs in draft mode.
+    pub draft: bool,
+}
+
+/// The origin of a task, when a proactive turn started it.
+pub fn proactive_task(conn: &Connection, task_id: TaskId) -> Result<Option<ProactiveTask>> {
+    let row: Option<(String, String, bool)> = conn
+        .query_row(
+            "SELECT channel_id, kind, draft FROM proactive_tasks WHERE task_id = ?1",
+            [task_id.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    row.map(|(channel_id, kind, draft)| {
+        Ok(ProactiveTask {
+            channel_id: channel_id.parse()?,
+            kind: ProactiveKind::parse(&kind).unwrap_or(ProactiveKind::CheckIn),
+            draft,
+        })
+    })
+    .transpose()
 }
 
 // Follow-ups ---------------------------------------------------------------
@@ -379,27 +451,36 @@ pub struct FollowUpRow {
     pub channel_id: ChannelId,
     pub key: Option<String>,
     pub set_at: Timestamp,
+    /// A proactive turn set it, so the daily turn budget can skip it.
+    pub set_in_proactive_turn: bool,
 }
 
-fn follow_up_from_row(
-    row: &rusqlite::Row<'_>,
-) -> rusqlite::Result<(String, String, Option<String>, i64)> {
-    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+type FollowUpParts = (String, String, Option<String>, i64, bool);
+
+fn follow_up_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FollowUpParts> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+    ))
 }
 
-fn follow_up_parts(parts: (String, String, Option<String>, i64)) -> Result<FollowUpRow> {
-    let (routine_id, channel_id, key, set_at) = parts;
+fn follow_up_parts(parts: FollowUpParts) -> Result<FollowUpRow> {
+    let (routine_id, channel_id, key, set_at, set_in_proactive_turn) = parts;
     Ok(FollowUpRow {
         routine_id: routine_id.parse()?,
         channel_id: channel_id.parse()?,
         key,
         set_at: Timestamp::from_millis(set_at),
+        set_in_proactive_turn,
     })
 }
 
 pub fn follow_up(conn: &Connection, routine_id: RoutineId) -> Result<Option<FollowUpRow>> {
     conn.query_row(
-        "SELECT routine_id, channel_id, key, set_at FROM follow_ups WHERE routine_id = ?1",
+        "SELECT routine_id, channel_id, key, set_at, set_in_proactive_turn FROM follow_ups WHERE routine_id = ?1",
         [routine_id.to_string()],
         follow_up_from_row,
     )
@@ -414,7 +495,7 @@ pub fn follow_up_by_key(
     key: &str,
 ) -> Result<Option<FollowUpRow>> {
     conn.query_row(
-        "SELECT routine_id, channel_id, key, set_at FROM follow_ups WHERE channel_id = ?1 AND key = ?2",
+        "SELECT routine_id, channel_id, key, set_at, set_in_proactive_turn FROM follow_ups WHERE channel_id = ?1 AND key = ?2",
         params![channel_id.to_string(), key],
         follow_up_from_row,
     )
@@ -426,14 +507,17 @@ pub fn follow_up_by_key(
 impl Tx<'_> {
     pub fn save_follow_up(&mut self, row: &FollowUpRow) -> Result<()> {
         self.db().execute(
-            "INSERT INTO follow_ups (routine_id, channel_id, key, set_at) VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO follow_ups (routine_id, channel_id, key, set_at, set_in_proactive_turn)
+             VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(routine_id) DO UPDATE SET channel_id = excluded.channel_id,
-                key = excluded.key, set_at = excluded.set_at",
+                key = excluded.key, set_at = excluded.set_at,
+                set_in_proactive_turn = excluded.set_in_proactive_turn",
             params![
                 row.routine_id.to_string(),
                 row.channel_id.to_string(),
                 row.key,
-                row.set_at.as_millis()
+                row.set_at.as_millis(),
+                row.set_in_proactive_turn
             ],
         )?;
         Ok(())
