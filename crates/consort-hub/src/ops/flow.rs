@@ -101,6 +101,9 @@ pub(crate) fn transition(
             },
         )?;
     }
+    // A task that a routine started ends the routine's run when it is
+    // ready for review, resolved or failed.
+    tx.end_task_run(task)?;
     Ok(true)
 }
 

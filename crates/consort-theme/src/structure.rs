@@ -311,6 +311,7 @@ pub struct Components {
     pub focus_ring: f32,
     pub admin: Admin,
     pub files: Files,
+    pub knowledge: Knowledge,
     pub sidebar: Sidebar,
     pub update_notice: UpdateNotice,
     pub chat: Chat,
@@ -362,6 +363,49 @@ pub struct Admin {
     pub banner_gap: f32,
     pub banner_title: TypeStyle,
     pub banner_text: TypeStyle,
+}
+
+/// The sizes of routines and memory: the routine rows, the routine dialog
+/// with its schedule picker, the run history, the memory tree, the note
+/// editor and the version history. From the phase 2 Paper artboards.
+#[derive(Clone, Copy, Debug, Deserialize)]
+pub struct Knowledge {
+    /// The small switch of a routine row and of the routine page header.
+    pub switch_w: f32,
+    pub switch_h: f32,
+    pub switch_thumb: f32,
+    /// The dot before the result of a routine and the "Just now" of a note.
+    pub status_dot: f32,
+    /// The padding of a routine row.
+    pub row_pad_y: f32,
+    /// The label column of the routine summary.
+    pub summary_label: f32,
+    /// The duration and the link columns of the run history.
+    pub run_duration: f32,
+    pub run_link: f32,
+    /// The Channel select of the routine dialog.
+    pub channel_field: f32,
+    /// The time field, the interval number and its unit select.
+    pub time_field: f32,
+    pub every_field: f32,
+    pub unit_field: f32,
+    /// A day button of the Weekly preset.
+    pub day_button: f32,
+    /// The time zone popover and the height of its list.
+    pub zone_popover: f32,
+    pub zone_list: f32,
+    /// A day of the calendar popover of the date field.
+    pub calendar_cell: f32,
+    /// The indent of one level of the memory tree.
+    pub tree_indent: f32,
+    /// The bar that marks a changed line in a version preview.
+    pub change_bar: f32,
+    /// The least height of the note editor.
+    pub editor_min_height: f32,
+    /// The version list of the version history.
+    pub version_list: f32,
+    /// The icon of the memory saved line.
+    pub line_icon: f32,
 }
 
 /// The sizes of attachments and channel files: the chips of the composer,
@@ -709,6 +753,32 @@ mod tests {
         assert_eq!((f.lightbox_bar, f.lightbox_nav), (56.0, 40.0));
         assert_eq!((f.size_col, f.date_col, f.more), (64.0, 52.0, 20.0));
         assert!(s.derive.lightbox_alpha > s.derive.scrim_alpha.dark);
+    }
+
+    /// The phase 2 artboards: routine rows, the routine dialog, the run
+    /// history, the memory tree and the version history.
+    #[test]
+    fn knowledge_tokens_keep_the_values_of_the_phase_2_designs() {
+        let s = super::structure();
+        let k = s.component.knowledge;
+        assert_eq!((k.switch_w, k.switch_h, k.switch_thumb), (32.0, 18.0, 14.0));
+        // The thumb sits 2 px inside the track.
+        assert_eq!(k.switch_h - k.switch_thumb, 2.0 * s.space.xxs);
+        assert_eq!(
+            (k.summary_label, k.run_duration, k.run_link),
+            (80.0, 64.0, 76.0)
+        );
+        assert_eq!((k.channel_field, k.time_field), (190.0, 84.0));
+        // The Name field and the Channel field fill the dialog body, inside
+        // the dialog's border and padding.
+        assert_eq!(
+            s.layout.dialog_wide
+                - 2.0 * (s.space.xl + s.border_width)
+                - s.space.md
+                - k.channel_field,
+            308.0
+        );
+        assert_eq!((k.tree_indent, k.change_bar), (22.0, 3.0));
     }
 
     #[test]

@@ -14,7 +14,7 @@ use consort_proto::model::{
 };
 use consort_proto::status::TaskStatus;
 use consort_proto::tools::*;
-use consort_proto::turn_input::WakeEvent;
+use consort_proto::turn_input::{SuggestionSource, WakeEvent};
 use rusqlite::Connection;
 use serde_json::Value;
 use tokio::io::AsyncWriteExt;
@@ -474,18 +474,50 @@ impl Hub {
         args: MemoryWriteArgs,
     ) -> Result<Value> {
         let scope = writable_scope(ctx)?;
+        let suggested_by = match args.from_suggestion {
+            Some(source) => Some(source),
+            None => self.only_suggestion_in_turn(ctx).await?,
+        };
         let note = self
             .write_memory_note(
                 scope,
                 args.path,
                 args.content,
                 args.expected_sha256,
-                MemoryAuthor::Session(ctx.session.id),
+                crate::ops::knowledge::WriteSource {
+                    by: MemoryAuthor::Session(ctx.session.id),
+                    suggested_by,
+                    saved_line: Some(ctx.channel.id),
+                },
             )
             .await?;
         to_value(&MemoryWriteResult {
             sha256: note.sha256,
             version: note.version,
+        })
+    }
+
+    /// The source of the memory suggestion in the coordinator's open turn,
+    /// when the turn holds suggestions from one source only. A write in such
+    /// a turn keeps that suggestion, also when the call does not say so.
+    async fn only_suggestion_in_turn(&self, ctx: &ToolCtx) -> Result<Option<SuggestionSource>> {
+        let channel_id = ctx.channel.id;
+        let session_id = ctx.session.id;
+        let row = self
+            .store
+            .read(move |conn| crate::store::coordinator::coordinator(conn, channel_id))
+            .await?;
+        if !row.turn_open || row.session_id != Some(session_id) {
+            return Ok(None);
+        }
+        let mut sources = row.turn_events.iter().filter_map(|event| match event {
+            WakeEvent::MemorySuggestion { from, .. } => Some(*from),
+            _ => None,
+        });
+        let first = sources.next();
+        Ok(match first {
+            Some(first) if sources.all(|other| other == first) => Some(first),
+            _ => None,
         })
     }
 
@@ -878,6 +910,7 @@ mod tests {
                     path: path.to_owned(),
                     content: content.to_owned(),
                     expected_sha256: ExpectedHash::NotExists,
+                    from_suggestion: None,
                 },
             )
             .await
@@ -1292,6 +1325,7 @@ mod tests {
                     path: "t.md".to_owned(),
                     content: "x".to_owned(),
                     expected_sha256: ExpectedHash::NotExists,
+                    from_suggestion: None,
                 },
             )
             .await;
@@ -1338,6 +1372,7 @@ mod tests {
             path: "a.md".to_owned(),
             content: content.to_owned(),
             expected_sha256: expected,
+            from_suggestion: None,
         };
         let stale = hub
             .tool_memory_write(&ctx, write(ExpectedHash::Sha256(sha256(b"other")), "two"))
@@ -1365,6 +1400,7 @@ mod tests {
                     path: "a.txt".to_owned(),
                     content: "x".to_owned(),
                     expected_sha256: ExpectedHash::NotExists,
+                    from_suggestion: None,
                 },
             )
             .await;
@@ -1421,6 +1457,7 @@ mod tests {
                     path: "a.md".to_owned(),
                     content: "x".to_owned(),
                     expected_sha256: ExpectedHash::NotExists,
+                    from_suggestion: None,
                 },
             )
             .await
@@ -1899,5 +1936,183 @@ mod tests {
             )
             .await;
         assert_eq!(code_of(message), ErrorCode::PolicyDenied);
+    }
+
+    // The memory saved line ---------------------------------------------------
+
+    /// The memory saved lines in a channel's timeline, oldest first, as
+    /// their JSON bodies.
+    async fn saved_lines(hub: &Hub, channel_id: ChannelId) -> Vec<serde_json::Value> {
+        let (mut page, _) = hub
+            .store
+            .read(move |conn| {
+                conversation::messages_page(conn, channel_id, None, None, 50, usize::MAX)
+            })
+            .await
+            .unwrap();
+        page.reverse();
+        page.into_iter()
+            .filter(|m| m.kind == MessageKind::Notice)
+            .map(|m| serde_json::from_str::<serde_json::Value>(&m.body).unwrap())
+            .filter(|body| body["kind"] == "memory_saved")
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_coordinator_write_posts_one_memory_saved_line_per_note() {
+        let (hub, _dir) = test_hub().await;
+        let channel = new_channel(&hub, "house-lights").await;
+        let ctx = ctx_for(&hub, &channel, SessionRole::Coordinator).await;
+
+        let first = write_note(&hub, &ctx, "decisions/roofline.md", "Use Lumen Co.").await;
+        let lines = saved_lines(&hub, channel.id).await;
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            lines[0]["text"],
+            "Saved the new memory note decisions/roofline.md"
+        );
+        assert_eq!(lines[0]["path"], "decisions/roofline.md");
+        assert_eq!(lines[0]["scope"], channel.id.to_string());
+        assert_eq!(lines[0]["version"], 1);
+
+        // A second write of the same note right after updates the line.
+        hub.tool_memory_write(
+            &ctx,
+            MemoryWriteArgs {
+                path: "decisions/roofline.md".to_owned(),
+                content: "Use Lumen Co for the front.".to_owned(),
+                expected_sha256: ExpectedHash::Sha256(first.sha256),
+                from_suggestion: None,
+            },
+        )
+        .await
+        .unwrap();
+        let lines = saved_lines(&hub, channel.id).await;
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["version"], 2);
+        assert_eq!(lines[0]["created"], true);
+
+        // A user message in between makes the next write a new line.
+        user_message(&hub, channel.id, "Thanks.").await;
+        write_note(&hub, &ctx, "vendors/lumen-co.md", "Lumen Co.").await;
+        assert_eq!(saved_lines(&hub, channel.id).await.len(), 2);
+
+        // A write by the user from a client posts no line.
+        hub.memory_write(
+            &Caller::Hub,
+            consort_proto::client_api::MemoryWrite {
+                scope: MemoryScope::Channel(channel.id),
+                path: "house.md".to_owned(),
+                content: "The house.".to_owned(),
+                expected_sha256: ExpectedHash::NotExists,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(saved_lines(&hub, channel.id).await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_write_that_keeps_a_suggestion_names_the_task_that_made_it() {
+        let (hub, _dir) = test_hub().await;
+        let channel = new_channel(&hub, "house-lights").await;
+        let ctx = ctx_for(&hub, &channel, SessionRole::Coordinator).await;
+        let task = make_task(
+            &hub,
+            channel.id,
+            "Price out roofline lighting",
+            TaskStatus::Review,
+        )
+        .await;
+
+        let result = hub
+            .tool_memory_write(
+                &ctx,
+                MemoryWriteArgs {
+                    path: "decisions/roofline.md".to_owned(),
+                    content: "Use Lumen Co.".to_owned(),
+                    expected_sha256: ExpectedHash::NotExists,
+                    from_suggestion: Some(SuggestionSource::Task(task.id)),
+                },
+            )
+            .await
+            .unwrap();
+        let _: MemoryWriteResult = parse(result);
+
+        let line = saved_lines(&hub, channel.id).await.remove(0);
+        assert_eq!(
+            line["text"],
+            "Saved the new memory note decisions/roofline.md, from a suggestion by Price out roofline lighting"
+        );
+        assert_eq!(line["suggested_by"], task.id.to_string());
+        assert_eq!(line["suggested_by_name"], "Price out roofline lighting");
+        let scope = MemoryScope::Channel(channel.id);
+        let note = hub
+            .store
+            .read(move |conn| knowledge::memory_note(conn, scope, "decisions/roofline.md"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(note.suggested_by, Some(SuggestionSource::Task(task.id)));
+    }
+
+    #[tokio::test]
+    async fn a_write_in_a_turn_with_one_suggestion_keeps_that_suggestion() {
+        let (hub, _dir) = test_hub().await;
+        let channel = new_channel(&hub, "house-lights").await;
+        let ctx = ctx_for(&hub, &channel, SessionRole::Coordinator).await;
+        let task = make_task(&hub, channel.id, "Price out", TaskStatus::Review).await;
+        let suggestion = |from| WakeEvent::MemorySuggestion {
+            from,
+            reason: "The user chose it.".to_owned(),
+            note: "Lumen Co.".to_owned(),
+        };
+        let open_turn = |events: Vec<WakeEvent>| {
+            let channel_id = channel.id;
+            let session_id = ctx.session.id;
+            let hub = hub.clone();
+            async move {
+                hub.store
+                    .write(move |tx| {
+                        tx.save_coordinator(&crate::store::coordinator::CoordinatorRow {
+                            channel_id,
+                            session_id: Some(session_id),
+                            turn_open: true,
+                            turn_started_at: Some(tx.now()),
+                            turn_events: events,
+                        })
+                    })
+                    .await
+                    .unwrap();
+            }
+        };
+        let scope = MemoryScope::Channel(channel.id);
+        let stored = |path: &'static str| {
+            let hub = hub.clone();
+            async move {
+                hub.store
+                    .read(move |conn| knowledge::memory_note(conn, scope, path))
+                    .await
+                    .unwrap()
+                    .unwrap()
+            }
+        };
+
+        open_turn(vec![suggestion(SuggestionSource::Task(task.id))]).await;
+        write_note(&hub, &ctx, "a.md", "A.").await;
+        assert_eq!(
+            stored("a.md").await.suggested_by,
+            Some(SuggestionSource::Task(task.id))
+        );
+
+        // Two sources in one turn: the hub cannot tell which one the write
+        // keeps.
+        open_turn(vec![
+            suggestion(SuggestionSource::Task(task.id)),
+            suggestion(SuggestionSource::Channel(channel.id)),
+        ])
+        .await;
+        write_note(&hub, &ctx, "b.md", "B.").await;
+        assert_eq!(stored("b.md").await.suggested_by, None);
     }
 }

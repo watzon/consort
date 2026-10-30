@@ -45,6 +45,8 @@ pub enum PickerTarget {
     NewChannelAssistant,
     /// "Model for tasks" in the New channel dialog.
     NewChannelTasks,
+    /// The model of a "Start a task" routine, in the routine dialog.
+    RoutineTask,
 }
 
 /// The part of the picker that the arrow keys move in. The search field
@@ -147,6 +149,11 @@ impl ConsortApp {
                 .map(|e| e.selection.clone()),
             PickerTarget::NewChannelAssistant => self.new_channel.coordinator_selection.clone(),
             PickerTarget::NewChannelTasks => self.new_channel.task_selection.clone(),
+            PickerTarget::RoutineTask => self
+                .knowledge
+                .routine_dialog
+                .as_ref()
+                .and_then(|d| d.form.selection.clone()),
         }
     }
 
@@ -162,6 +169,11 @@ impl ConsortApp {
             }),
             PickerTarget::NewChannelAssistant => self.new_channel.coordinator_selection.is_some(),
             PickerTarget::NewChannelTasks => self.new_channel.task_selection.is_some(),
+            PickerTarget::RoutineTask => self
+                .knowledge
+                .routine_dialog
+                .as_ref()
+                .is_some_and(|d| d.form.selection.is_some()),
         }
     }
 
@@ -192,6 +204,11 @@ impl ConsortApp {
             }
             PickerTarget::NewChannelAssistant => self.new_channel.coordinator_selection = selection,
             PickerTarget::NewChannelTasks => self.new_channel.task_selection = selection,
+            PickerTarget::RoutineTask => {
+                if let Some(dialog) = self.knowledge.routine_dialog.as_mut() {
+                    dialog.form.selection = selection;
+                }
+            }
         }
         cx.notify();
     }
@@ -672,6 +689,9 @@ impl ConsortApp {
             PickerTarget::Assistant(_) => true,
             PickerTarget::NewChannelAssistant | PickerTarget::NewChannelTasks => {
                 self.dialog == Some(crate::app::Dialog::NewChannel)
+            }
+            PickerTarget::RoutineTask => {
+                matches!(self.dialog, Some(crate::app::Dialog::Routine(_)))
             }
         }
     }

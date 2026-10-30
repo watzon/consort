@@ -53,16 +53,39 @@ impl Serialize for SuggestionSource {
     }
 }
 
+impl std::str::FromStr for SuggestionSource {
+    type Err = crate::ids::IdError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.starts_with(ChannelId::PREFIX) {
+            s.parse().map(Self::Channel)
+        } else {
+            s.parse().map(Self::Task)
+        }
+    }
+}
+
 impl<'de> Deserialize<'de> for SuggestionSource {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let s = Cow::<'de, str>::deserialize(deserializer)?;
-        if s.starts_with(ChannelId::PREFIX) {
-            s.parse()
-                .map(Self::Channel)
-                .map_err(serde::de::Error::custom)
-        } else {
-            s.parse().map(Self::Task).map_err(serde::de::Error::custom)
-        }
+        s.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+impl schemars::JsonSchema for SuggestionSource {
+    fn inline_schema() -> bool {
+        true
+    }
+
+    fn schema_name() -> Cow<'static, str> {
+        Cow::Borrowed("SuggestionSource")
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "string",
+            "description": "The `from` of a memory suggestion: a task ID (`tsk_...`) or a channel ID (`chn_...`).",
+        })
     }
 }
 

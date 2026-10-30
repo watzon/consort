@@ -72,8 +72,7 @@ pub enum Panel {
     Channel,
 }
 
-/// The tabs of the Channel panel. Only Files is built. Routines and Memory
-/// come with phase 2 and are disabled tabs until then.
+/// The tabs of the Channel panel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChannelTab {
     Files,
@@ -179,6 +178,16 @@ pub enum Dialog {
     ChooseChannelFiles(consort_client::UploadTarget),
     /// Pair a new app: a setup code, a QR code and the hub address.
     PairClient,
+    /// New routine (`None`) or Edit routine. The form is in
+    /// `ConsortApp::knowledge.routine_dialog`.
+    Routine(Option<String>),
+    ConfirmDeleteRoutine(String),
+    /// Name a new memory note: the scope.
+    NewNote(String),
+    /// Rename a memory note: the scope and the path.
+    RenameNote(String, String),
+    /// Delete a memory note: the scope and the path.
+    ConfirmDeleteNote(String, String),
 }
 
 /// The step of the Add account dialog.
@@ -417,6 +426,9 @@ pub struct ConsortApp {
     pub fetching: std::collections::HashSet<String>,
     /// Settings > Hub, Clients and Notifications, and the notifications.
     pub admin: crate::admin::AdminState,
+    /// Routines and memory: their tabs, dialogs and the note editor.
+    pub knowledge: crate::knowledge::KnowledgeState,
+    pub knowledge_inputs: crate::knowledge::KnowledgeInputs,
     pub focus: FocusHandle,
     styled_for: Option<(gpui_kit::SharedString, consort_theme::Mode)>,
     _subscriptions: Vec<Subscription>,
@@ -476,6 +488,8 @@ impl ConsortApp {
         let ext_inputs = crate::extensions::ExtInputs::new(window, cx);
         let (admin, admin_subscriptions) = crate::admin::AdminState::new(&client, demo, window, cx);
         let mut subscriptions = admin_subscriptions;
+        let knowledge_inputs = crate::knowledge::KnowledgeInputs::new(window, cx);
+        subscriptions.extend(knowledge_inputs.subscribe(window, cx));
         subscriptions.push(cx.subscribe_in(
             &inputs.composer,
             window,
@@ -710,6 +724,8 @@ impl ConsortApp {
             files_menu_for: None,
             fetching: std::collections::HashSet::new(),
             admin,
+            knowledge: crate::knowledge::KnowledgeState::default(),
+            knowledge_inputs,
             focus: cx.focus_handle(),
             styled_for: None,
             _subscriptions: subscriptions,
@@ -769,7 +785,10 @@ impl ConsortApp {
             &self.inputs.decision_answer,
             &self.inputs.notes,
             &self.inputs.edit,
-        ] {
+        ]
+        .into_iter()
+        .chain(self.knowledge_inputs.areas())
+        {
             let style = style.clone();
             area.update(cx, |s, cx| {
                 s.set_editor_style(style);
@@ -794,6 +813,7 @@ impl ConsortApp {
         ]
         .into_iter()
         .chain(self.ext_inputs.all())
+        .chain(self.knowledge_inputs.fields())
         {
             let style = style.clone();
             field.update(cx, |s, cx| {
@@ -1630,6 +1650,9 @@ impl ConsortApp {
                     self.open_menu(OpenMenu::at(at, items), cx);
                 }
             }
+            screen if crate::knowledge::SCREENS.contains(&screen) => {
+                self.open_knowledge_screen(screen, window, cx)
+            }
             other => {
                 self.open_admin_screen(other, window, cx);
             }
@@ -2171,6 +2194,11 @@ impl ConsortApp {
             }
             Dialog::ConfirmDeleteFile(..) | Dialog::ChooseChannelFiles(_) => {}
             Dialog::PairClient => self.start_client_pairing(cx),
+            Dialog::Routine(_)
+            | Dialog::ConfirmDeleteRoutine(_)
+            | Dialog::NewNote(_)
+            | Dialog::RenameNote(..)
+            | Dialog::ConfirmDeleteNote(..) => {}
             Dialog::ConfirmDeleteChannel(_)
             | Dialog::ConfirmRemoveWorker(_)
             | Dialog::ConfirmRemoveAccount(..)
@@ -2894,6 +2922,7 @@ impl ConsortApp {
             MenuAction::DeleteFile(channel_id, path) => {
                 self.open_dialog(Dialog::ConfirmDeleteFile(channel_id, path), window, cx)
             }
+            MenuAction::Knowledge(action) => self.run_knowledge_menu(action, window, cx),
         }
         cx.notify();
     }

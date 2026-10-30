@@ -746,6 +746,22 @@ impl MockBackend {
             | Command::CancelClientPairing) => {
                 applied.output = crate::mock_admin::apply(&mut state, command, &mut applied.later)?;
             }
+            // Routines and memory.
+            command @ (Command::SaveRoutine { .. }
+            | Command::SetRoutineEnabled { .. }
+            | Command::DeleteRoutine { .. }
+            | Command::RunRoutineNow { .. }
+            | Command::LoadRoutineRuns { .. }
+            | Command::LoadMemory { .. }
+            | Command::ReadMemoryNote { .. }
+            | Command::WriteMemoryNote { .. }
+            | Command::DeleteMemoryNote { .. }
+            | Command::RestoreMemoryNote { .. }
+            | Command::MoveMemoryNote { .. }
+            | Command::LoadMemoryHistory { .. }) => {
+                applied.output =
+                    crate::mock_routines::apply(&mut state, command, &mut self.next_id)?;
+            }
             // Connectors, skills and the provider extras.
             other => {
                 applied.output = crate::mock_backend_ext::apply(

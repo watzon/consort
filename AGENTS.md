@@ -62,6 +62,8 @@ These come from the user's experience with GPUI. Follow them in every view.
    - An attachment chip in the composer or the reply box: Try again (failed only), Remove.
    - A file row (Channel panel > Files): Open, Download, Rename, Move, Delete. A folder row and a task row of the artifacts have no menu.
    - The add button of the composer and the reply box (a left click): Upload from this computer, Choose from channel files.
+   - A routine row and a routine opened in the panel: Run now, Run history, Edit, Turn off (Turn on when it is off), Delete.
+   - A memory note (in a tree, on its page and in Settings > Memory): Version history, Copy path, Rename, Delete.
 3. **The chat never has a hard edge.** The top and bottom of the timeline fade into the canvas, so text never stops at a sharp line. GPUI has no blur filter for elements, so use layered gradients. At the top, a progressive tint `layout.top_tint` (the canvas from about 94 percent to clear at 184 px, drawn as three gradient layers) lies under the Three voices mark, the activity pill and the top actions; content under it stays faintly visible. At rest the first item starts at `layout.content_top` (92 px). Above the composer, `layout.fade_bottom` (32 px). Lists that scroll inside a panel or a dialog fade at their edges too.
 4. **Dropdowns flip.** Any menu, popover or select that can run past the window edge opens downward when there is room and upward when there is not. Use GPUI's anchored positioning with anchor switching, not a fixed offset.
 5. **Colors and sizes come from tokens.** Read colors from the active `consort-theme` theme, and sizes from `design/structure.json` through `consort-theme`. No hex values or ad hoc pixel sizes in view code.

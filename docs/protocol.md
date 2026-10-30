@@ -380,8 +380,8 @@ The hub gives each session the tools for its role. Each tool's `input_schema` is
 | `no_reply_needed` | None | Ends the turn with no visible reply |
 | `fetch_timeline` | optional `before`, `limit` | Messages, newest first, and `has_more`. The page stops early when its messages would take more than 320 KiB |
 | `fetch_thread` | `message_id` (the root or any reply), optional `before` and `limit` | `root`, a page of `replies` (oldest first), `has_more`, and `message`: the reply that `message_id` names, when it is not in `replies`. All of it takes at most 320 KiB. The named reply is always whole. A long root is cut when the call names a reply, and the newest reply is cut when it alone does not fit. A cut message ends with a note that names its ID. With `before`, the page has the replies older than that reply, and no `message`. The default `limit` is 50, and the limit is 200 |
-| `memory_write` | `path`, `content`, `expected_sha256` or `"not_exists"` | New `sha256`, or `stale_write` |
-| `memory_delete` | `path`, `expected_sha256` | |
+| `memory_write` | `path`, `content`, `expected_sha256` or `"not_exists"`, optional `from_suggestion` (the `from` of the memory suggestion that the write keeps) | New `sha256`, or `stale_write`. Each write that changes the note posts the memory saved line in the session's channel (see [The memory saved line](#the-memory-saved-line)) |
+| `memory_delete` | `path`, `expected_sha256` | The note goes to Recently deleted for 30 days |
 | `files_write` | `path`, `content` | Text files only |
 | `start_task` | `title`, `brief`, optional `model_selection`, `worker_id`, `require`, `repos`, `isolation`, `approval_mode`, `start_at` (RFC 3339) and `attachments` (channel file paths, which go with the first turn of each session of the task) | `task_id`, `status`, optional `status_reason`, and `notes` when the hub lowered the request (see below) |
 | `message_task` | `task_id`, `body`, optional `attachments` (channel file paths) | Starts a turn, or steers the running turn when the harness can steer. `delivery` is `turn`, `steer` or `queued` |
@@ -523,6 +523,8 @@ The client API uses the same frames, errors and authentication as the worker lin
 | `feed` (from the hub) | `seq`, `at`, `channel_id`, `entity`, `entity_id`, `op` and `payload` | None. `payload` is `null` for `delete` |
 | `feed.skipped` (from the hub) | `seq`, `channel_id`, `entity` and `entity_id` | None. The hub could not send the entry `seq`, because it does not fit in one frame. The feed goes on after it. Get the entity again, for example with `message.list` or a new snapshot. A client that does not know this event ignores it |
 
+A `routine_run` feed entry has the run number as its `entity_id`. The hub sends one when a run starts and one when it ends. A `memory_note` entry with `deleted_at` is a note that went to Recently deleted. The hub sends a `delete` for a memory note when it renames the note (with an upsert for the new path) and when the purge removes a note 30 days after its deletion.
+
 When a channel is deleted, the feed has a `delete` for each entity of the channel that a client can hold (messages, read markers, tasks, session items, approvals, decisions, routines, channel files and memory notes), and then one for the channel.
 
 #### Tasks in a snapshot
@@ -545,9 +547,9 @@ A client that does not know these fields shows the preview, which ends with a no
 | Messages | `message.send` (with `client_message_id`), `message.list` (a page of a timeline or a thread, newest first; the page stops early when its messages would take more than 768 KiB, and `has_more` is then true), `message.edit`, `message.delete`, `message.react`, `message.search`, `read.mark` |
 | Tasks | `task.create`, `task.update`, `task.get` (with `task_id`: the full task), `task.resolve`, `task.reopen`, `task.retry`, `task.interrupt`, `task.archive` (with `archived`, default true; archiving a resolved task stops its session and deletes its workspace), `task.delete`, `task.items`, `task.item_detail` (with `session_id` and `item_id`) |
 | Waiting on the user | `approval.answer`, `decision.answer` |
-| Memory | `memory.list`, `memory.read`, `memory.write`, `memory.delete`, `memory.history` |
+| Memory | `memory.list` (with optional `scope`, and `deleted: true` for the notes in Recently deleted, newest deletion first), `memory.read`, `memory.write`, `memory.delete` (the note goes to Recently deleted), `memory.history`, `memory.restore` (with `scope` and `path`: brings a note back from Recently deleted, as it was), `memory.move` (with `scope`, `from_path`, `to_path` and `expected_sha256`: renames a note with its versions; `conflict` when a note that is not deleted has the new path) |
 | Channel files | `files.list`, `files.put` (after a blob upload), `files.move`, `files.delete` |
-| Routines | `routine.create`, `routine.update`, `routine.delete`, `routine.run_now`, `routine.runs` |
+| Routines | `routine.create`, `routine.update` (a client may also send `channel_id` to move the routine; a session may not), `routine.delete`, `routine.run_now` (`conflict` while the last run of the routine still runs), `routine.runs` |
 | Workers | `worker.list`, `worker.pairing_code`, `worker.rename`, `worker.set_tags` (with `worker_id` and `tags`), `worker.set_paused`, `worker.revoke`, `worker.refresh_inventory`, `worker.tools_check` (with `worker_id`), `worker.tool_install` (with `worker_id` and `tool`) |
 | Accounts | `account.create` (with `worker_id`, `harness`, `label`, optional `acp`, `env`; the result has `account_id`), `account.update` (with `worker_id`, `account_id`, optional `label`, `env_set`, `env_remove`, `extras_enabled`), `account.remove` and `account.sign_out` (with `worker_id` and `account_id`), `acp_registry.list` (the result has `agents`, each with `id`, `name`, `description`, `version`, `icon_url` and `supported`) |
 | Sign-in | `sign_in.start` (with `worker_id`, `account_id` and `method`; the result has `sign_in`), `sign_in.submit_code` (with `sign_in_id` and `code`), `sign_in.cancel` (with `sign_in_id`) |
@@ -604,6 +606,33 @@ A scheme with no browser step, such as an API key, sends the form values in `cre
 The hub checks the sources of installed skills once a day. A new commit sets `update` to `available` with the changed files. Only `skill.update` with `accept_new_version` moves the pin. A new version that adds or changes a script turns the skill off until the user turns it on again. Running sessions keep their version.
 
 `channel.set_connection_enabled` and `channel.set_skill_enabled` change one exception for each request, so two clients do not undo each other. Turning an item on removes the exception only. An item whose `use_in` does not give it to the channel fails with `conflict`.
+
+### Routine runs
+
+A routine run has a `status`:
+
+- `running`: the run started and its work did not end. For an `coordinator_turn` routine, the work is the coordinator turn that gets the routine's prompt. For a `start_task` routine, it is the task until the task is Ready for review, Resolved or Failed.
+- `ok`: the work ended well. A coordinator run has `message_id`: the first message that the coordinator posted in the timeline in that turn.
+- `error`: the work failed. `error` says why, with the next step.
+- `skipped`: the hub did not start the run. `error` says why.
+
+The hub skips a scheduled run when the last run of the same routine still runs. Run now then fails with `conflict` and records nothing. When the hub was down at a run time, it runs the routine once when it is back, if it is less than 1 hour late. A later run is recorded as `skipped`, with the time when it was due as `started_at`. Either way, the next run is the first one after now, so there is no catch-up. An interval routine counts its runs from the time when it was saved, so a late run does not move its rhythm.
+
+A run has `manual: true` when the user started it with Run now. `ended_at` is empty while it runs. The routine's `last_run_status` is the status of its newest run that is not a skip for a run that still runs.
+
+### The memory saved line
+
+When a coordinator writes a memory note with `memory_write`, the hub posts a notice in the timeline of the coordinator's channel. Its body is a JSON object:
+
+| Field | Value |
+|---|---|
+| `kind` | `memory_saved` |
+| `text` | "Saved the new memory note `<path>`" or "Updated the memory note `<path>`", with ", from a suggestion by `<name>`" when the write keeps a memory suggestion |
+| `scope`, `path`, `version` | The note and the version that the write made |
+| `created` | True when the write made the note |
+| `suggested_by`, `suggested_by_name` | The task or channel ID of the memory suggestion and its title or name, or `null` and an empty text |
+
+When the newest timeline message is already the line for the same note from the same session, the hub updates that line instead of posting a second one. A write by the user from a client posts no line. The `suggested_by` of the version is also on the memory note. When the call has no `from_suggestion` and the coordinator's open turn holds memory suggestions from one source only, the write keeps that source.
 
 ### Push notifications
 

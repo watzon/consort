@@ -154,6 +154,7 @@ impl Tx<'_> {
     /// Deletes a task with its card, thread messages, sessions, items,
     /// approvals and decisions. The feed gets a delete for each.
     pub fn purge_task(&mut self, task: &Task) -> Result<()> {
+        self.end_deleted_task_run(task.id)?;
         let id = task.id.to_string();
         let channel = task.channel_id;
 

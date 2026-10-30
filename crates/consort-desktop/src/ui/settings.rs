@@ -1,5 +1,6 @@
 //! Settings, in the window: Appearance and Workers, and a line for the
-//! sections that come later.
+//! sections that come later. Routines and Memory are in `ui/routines.rs`
+//! and `ui/memory.rs`.
 
 use consort_client::{ApprovalMode, ViewState, WorkerView};
 use consort_theme::{Appearance, Mode, TextSize, ThemeLibrary, Tokens, TypeExt as _};
@@ -237,7 +238,8 @@ impl ConsortApp {
             SettingsSection::Hub => self.render_hub(t, window, cx),
             SettingsSection::Clients => self.render_clients(t, window, cx),
             SettingsSection::Notifications => self.render_notifications(t, window, cx),
-            other => self.render_later(other, t),
+            SettingsSection::Routines => self.render_routines_settings(t, window, cx),
+            SettingsSection::Memory => self.render_memory_settings(t, window, cx),
         };
         div()
             .flex()
@@ -267,39 +269,6 @@ impl ConsortApp {
             .gap(t.space.xs + t.space.xxs)
             .child(text(title.to_owned(), t.text.heading, c.text_primary))
             .child(text(description.to_owned(), t.text.ui, c.text_secondary))
-    }
-
-    fn render_later(&self, section: SettingsSection, t: &Tokens) -> AnyElement {
-        let (title, line_text) = match section {
-            SettingsSection::Notifications => (
-                "Notifications",
-                "Notifications come in a later build. Consort will tell you when an approval or a decision waits for you.",
-            ),
-            SettingsSection::Clients => (
-                "Clients",
-                "This page comes in a later build. It will list the paired desktop and phone apps, and pair a new one with a QR code.",
-            ),
-            SettingsSection::Hub => (
-                "Hub",
-                "This page comes in a later build. It will show the hub address, its version and its storage.",
-            ),
-            SettingsSection::Memory => (
-                "Memory",
-                "This page comes in a later build. It will list the memory notes for each channel, so you can read and edit them.",
-            ),
-            SettingsSection::Routines => (
-                "Routines",
-                "This page comes in a later build. It will list the routines of each channel, with their schedules and last runs.",
-            ),
-            _ => ("", ""),
-        };
-        self.page_frame(t)
-            .child(
-                div()
-                    .max_w(t.layout.timeline_max_width)
-                    .child(self.page_title(title, line_text, t)),
-            )
-            .into_any_element()
     }
 
     fn render_appearance(

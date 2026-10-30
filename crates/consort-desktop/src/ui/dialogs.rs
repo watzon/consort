@@ -550,6 +550,20 @@ impl ConsortApp {
                     div(),
                 ),
             },
+            Dialog::Routine(_) => self.routine_dialog(t, window, cx),
+            Dialog::ConfirmDeleteRoutine(id) => self.confirm_delete_routine_dialog(id, t, cx),
+            Dialog::NewNote(_) | Dialog::RenameNote(..) | Dialog::ConfirmDeleteNote(..) => {
+                match self.memory_dialog(dialog, t, window, cx) {
+                    Some(parts) => parts,
+                    None => (
+                        String::new(),
+                        String::new(),
+                        t.layout.dialog_width,
+                        div(),
+                        div(),
+                    ),
+                }
+            }
             Dialog::ConfirmDeleteFile(..)
             | Dialog::RenameFile(..)
             | Dialog::MoveFile(..)

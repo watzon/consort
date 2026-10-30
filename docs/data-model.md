@@ -326,9 +326,23 @@ A hub card in a task makes the task Needs input, as any approval does. When a ca
 | `action` | object | Has a `kind`: `coordinator_turn`, or `start_task` with `title`, `model_selection` and `placement` |
 | `enabled` | bool | |
 | `next_run_at`, `last_run_at` | timestamp | |
-| `last_run_status` | `ok` or `error` | |
+| `last_run_status` | `ok`, `error`, `skipped` or `running` | The status of the newest run. A run that the hub skips because the last run still runs does not change it |
 
-`routine_runs` keeps one row per run: `routine_id`, `started_at`, `message_id` or `task_id`, and `error`.
+### Routine run
+
+`routine_runs` keeps one row per run. A run is a feed entity (`routine_run`, with the run number as its `entity_id`).
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | integer | The run number. It grows with each run |
+| `routine_id`, `channel_id` | ID | The channel of the routine when the run started |
+| `started_at` | timestamp | For a skipped run, the time when it was due |
+| `ended_at` | timestamp, optional | Empty while the run runs |
+| `status` | `running`, `ok`, `error` or `skipped` | See [protocol.md](protocol.md#routine-runs) |
+| `manual` | bool | True for Run now |
+| `message_id` | ID, optional | The first message that the coordinator posted in the run's turn |
+| `task_id` | ID, optional | The task that a `start_task` run started |
+| `error` | text, optional | Why the run failed or was skipped |
 
 ## Knowledge entities
 
@@ -343,8 +357,12 @@ A hub card in a task makes the task Needs input, as any approval does. When a ca
 | `version` | integer | |
 | `updated_by` | session ID or `user` | |
 | `updated_at` | timestamp | |
+| `suggested_by` | task ID or channel ID, optional | The memory suggestion that this version keeps |
+| `deleted_at` | timestamp, optional | Set while the note is in Recently deleted |
 
-`memory_note_versions` keeps every earlier version.
+`memory_note_versions` keeps every earlier version, with its `suggested_by`. A rename moves the versions to the new path.
+
+A delete moves a note to Recently deleted: the row stays with `deleted_at`, and sessions, `memory.list` and search skip it. `memory.restore` brings it back as it was. A write with `not_exists` to its path starts it again with the next version number. The hourly maintenance removes a note and its versions 30 days after the delete.
 
 Every write states the hash that it expects, or `not_exists` for a new note. If the stored hash differs, the hub rejects the write with `stale_write`.
 
@@ -571,8 +589,8 @@ Every write on the hub adds one feed entry in the same database transaction. Cli
 | `seq` | integer | Increases by one for each entry, across the whole hub |
 | `at` | timestamp | |
 | `channel_id` | ID, optional | Lets a client filter by channel |
-| `entity` | text | `channel`, `group`, `repo`, `message`, `read_marker`, `task`, `session_item`, `approval`, `decision`, `memory_note`, `channel_file`, `routine`, `worker`, `client`, `sign_in`, `preferences`, `connection` or `skill` |
-| `entity_id` | text | The entity's ID. A memory note uses `<scope>:<path>`, a channel file `<channel-id>:<path>`, a read marker `<channel-id>` or `<channel-id>:<thread-root-id>`, a session item `<session-id>:<item-id>`, and the preferences `preferences` |
+| `entity` | text | `channel`, `group`, `repo`, `message`, `read_marker`, `task`, `session_item`, `approval`, `decision`, `memory_note`, `channel_file`, `routine`, `routine_run`, `worker`, `client`, `sign_in`, `preferences`, `connection` or `skill` |
+| `entity_id` | text | The entity's ID. A memory note uses `<scope>:<path>`, a channel file `<channel-id>:<path>`, a read marker `<channel-id>` or `<channel-id>:<thread-root-id>`, a session item `<session-id>:<item-id>`, a routine run its number, and the preferences `preferences` |
 | `op` | `upsert` or `delete` | |
 | `payload` | JSON | The full client view of the entity after the write. `null` for `delete` |
 

@@ -162,7 +162,7 @@ async fn a_routine_runs_now_and_wakes_the_coordinator() {
         .await
         .unwrap();
     let start = world.worker.accept_session_start().await;
-    let text = start.turn.unwrap().text;
+    let text = start.turn.clone().unwrap().text;
     assert!(
         text.contains(&format!("<routine id=\"{}\"", routine.id)),
         "{text}"
@@ -179,6 +179,8 @@ async fn a_routine_runs_now_and_wakes_the_coordinator() {
         .unwrap();
     assert_eq!(runs.runs.len(), 1);
     assert!(runs.runs[0].error.is_none());
+    assert_eq!(runs.runs[0].status, RoutineRunStatus::Running);
+    assert!(runs.runs[0].manual);
     let updated = world
         .client
         .wait_feed(
@@ -188,7 +190,44 @@ async fn a_routine_runs_now_and_wakes_the_coordinator() {
     let Some(EntityPayload::Routine(updated)) = upserted(&updated) else {
         unreachable!()
     };
-    assert_eq!(updated.last_run_status, Some(RoutineRunStatus::Ok));
+    assert_eq!(updated.last_run_status, Some(RoutineRunStatus::Running));
+
+    // The coordinator answers in the timeline and ends its turn. The run
+    // ends well and links to the answer.
+    let session_id = start.session_id;
+    world
+        .worker
+        .send_events(
+            session_id,
+            vec![state(SessionState::Active), turn_started("t1")],
+        )
+        .await;
+    let posted = world
+        .worker
+        .tool_json(
+            session_id,
+            "post_message",
+            json!({"body": "Two tasks are open."}),
+        )
+        .await;
+    world
+        .worker
+        .send_events(session_id, vec![turn_ended("t1", TurnEndReason::Completed)])
+        .await;
+    let ended = world
+        .client
+        .wait_feed(|e| {
+            matches!(upserted(e), Some(EntityPayload::RoutineRun(r)) if r.status == RoutineRunStatus::Ok)
+        })
+        .await;
+    let Some(EntityPayload::RoutineRun(ended)) = upserted(&ended) else {
+        unreachable!()
+    };
+    assert_eq!(
+        ended.message_id.map(|m| m.to_string()),
+        posted["message_id"].as_str().map(str::to_owned)
+    );
+    assert!(ended.ended_at.is_some());
 
     // An interval below one minute is refused.
     let error = world

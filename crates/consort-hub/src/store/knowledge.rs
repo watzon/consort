@@ -9,6 +9,7 @@ use consort_proto::model::{
 };
 use consort_proto::time::Timestamp;
 use consort_proto::tools::SearchHit;
+use consort_proto::turn_input::SuggestionSource;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use super::{Tx, get_doc, list_docs, to_doc};
@@ -37,9 +38,19 @@ fn scope_from_text(text: &str) -> Result<MemoryScope> {
         .map_err(|e: consort_proto::model::ScopeParseError| HubError::internal(e.to_string()))
 }
 
-fn note_from_row(
-    row: &rusqlite::Row<'_>,
-) -> rusqlite::Result<(String, String, String, String, i64, String, i64)> {
+type NoteRow = (
+    String,
+    String,
+    String,
+    String,
+    i64,
+    String,
+    i64,
+    Option<String>,
+    Option<i64>,
+);
+
+fn note_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<NoteRow> {
     Ok((
         row.get(0)?,
         row.get(1)?,
@@ -48,13 +59,14 @@ fn note_from_row(
         row.get(4)?,
         row.get(5)?,
         row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
     ))
 }
 
-type NoteRow = (String, String, String, String, i64, String, i64);
-
 fn note_from_parts(parts: NoteRow) -> Result<MemoryNote> {
-    let (scope, path, content, hash, version, updated_by, updated_at) = parts;
+    let (scope, path, content, hash, version, updated_by, updated_at, suggested_by, deleted_at) =
+        parts;
     Ok(MemoryNote {
         scope: scope_from_text(&scope)?,
         path,
@@ -65,16 +77,34 @@ fn note_from_parts(parts: NoteRow) -> Result<MemoryNote> {
         version: u64::try_from(version).unwrap_or(0),
         updated_by: author_from_text(&updated_by),
         updated_at: Timestamp::from_millis(updated_at),
+        suggested_by: suggested_by.and_then(|s| s.parse::<SuggestionSource>().ok()),
+        deleted_at: deleted_at.map(Timestamp::from_millis),
     })
 }
 
-const NOTE_COLUMNS: &str = "scope, path, content, sha256, version, updated_by, updated_at";
+/// The columns of a note row, in the order of [`NoteRow`].
+const NOTE_COLUMNS: &str =
+    "scope, path, content, sha256, version, updated_by, updated_at, suggested_by, deleted_at";
+/// The same for a version row, which has no `deleted_at`.
+const VERSION_COLUMNS: &str =
+    "scope, path, content, sha256, version, updated_by, updated_at, suggested_by, NULL";
 
-pub fn memory_note(
+fn notes_where(
     conn: &Connection,
-    scope: MemoryScope,
-    path: &str,
-) -> Result<Option<MemoryNote>> {
+    sql: &str,
+    params: impl rusqlite::Params,
+) -> Result<Vec<MemoryNote>> {
+    let mut stmt = conn.prepare_cached(sql)?;
+    let rows = stmt.query_map(params, note_from_row)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(note_from_parts(row?)?);
+    }
+    Ok(out)
+}
+
+/// The stored row of a note, also when the note is deleted.
+fn note_row(conn: &Connection, scope: MemoryScope, path: &str) -> Result<Option<MemoryNote>> {
     let row = conn
         .query_row(
             &format!("SELECT {NOTE_COLUMNS} FROM memory_notes WHERE scope = ?1 AND path = ?2"),
@@ -85,53 +115,90 @@ pub fn memory_note(
     row.map(note_from_parts).transpose()
 }
 
-/// Every note of one scope, ordered by path.
-pub fn memory_notes(conn: &Connection, scope: MemoryScope) -> Result<Vec<MemoryNote>> {
-    let mut stmt = conn.prepare_cached(&format!(
-        "SELECT {NOTE_COLUMNS} FROM memory_notes WHERE scope = ?1 ORDER BY path"
-    ))?;
-    let rows = stmt.query_map([scope.to_string()], note_from_row)?;
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(note_from_parts(row?)?);
-    }
-    Ok(out)
+/// A note that is not deleted.
+pub fn memory_note(
+    conn: &Connection,
+    scope: MemoryScope,
+    path: &str,
+) -> Result<Option<MemoryNote>> {
+    Ok(note_row(conn, scope, path)?.filter(|note| note.deleted_at.is_none()))
 }
 
-/// Note summaries of one scope, or of all scopes, ordered by scope and path.
+/// A note in Recently deleted.
+pub fn deleted_memory_note(
+    conn: &Connection,
+    scope: MemoryScope,
+    path: &str,
+) -> Result<Option<MemoryNote>> {
+    Ok(note_row(conn, scope, path)?.filter(|note| note.deleted_at.is_some()))
+}
+
+/// Every note of one scope that is not deleted, ordered by path.
+pub fn memory_notes(conn: &Connection, scope: MemoryScope) -> Result<Vec<MemoryNote>> {
+    notes_where(
+        conn,
+        &format!(
+            "SELECT {NOTE_COLUMNS} FROM memory_notes WHERE scope = ?1 AND deleted_at IS NULL
+             ORDER BY path"
+        ),
+        [scope.to_string()],
+    )
+}
+
+/// Summaries of the notes that are not deleted, of one scope or of all
+/// scopes, ordered by scope and path.
 pub fn memory_list(
     conn: &Connection,
     scope: Option<MemoryScope>,
 ) -> Result<Vec<MemoryNoteSummary>> {
-    let mut stmt = conn.prepare_cached(&format!(
-        "SELECT {NOTE_COLUMNS} FROM memory_notes
-         WHERE (?1 IS NULL OR scope = ?1) ORDER BY scope, path"
-    ))?;
-    let rows = stmt.query_map([scope.map(|s| s.to_string())], note_from_row)?;
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(note_from_parts(row?)?.summary());
-    }
-    Ok(out)
+    Ok(notes_where(
+        conn,
+        &format!(
+            "SELECT {NOTE_COLUMNS} FROM memory_notes
+             WHERE (?1 IS NULL OR scope = ?1) AND deleted_at IS NULL ORDER BY scope, path"
+        ),
+        [scope.map(|s| s.to_string())],
+    )?
+    .iter()
+    .map(MemoryNote::summary)
+    .collect())
+}
+
+/// Summaries of the notes in Recently deleted, of one scope or of all
+/// scopes, the newest deletion first.
+pub fn deleted_memory_list(
+    conn: &Connection,
+    scope: Option<MemoryScope>,
+) -> Result<Vec<MemoryNoteSummary>> {
+    Ok(notes_where(
+        conn,
+        &format!(
+            "SELECT {NOTE_COLUMNS} FROM memory_notes
+             WHERE (?1 IS NULL OR scope = ?1) AND deleted_at IS NOT NULL
+             ORDER BY deleted_at DESC, scope, path"
+        ),
+        [scope.map(|s| s.to_string())],
+    )?
+    .iter()
+    .map(MemoryNote::summary)
+    .collect())
 }
 
 /// Every stored version of a note, oldest first. A deleted note keeps its
-/// versions.
+/// versions until the purge.
 pub fn memory_history(
     conn: &Connection,
     scope: MemoryScope,
     path: &str,
 ) -> Result<Vec<MemoryNote>> {
-    let mut stmt = conn.prepare_cached(&format!(
-        "SELECT {NOTE_COLUMNS} FROM memory_note_versions
-         WHERE scope = ?1 AND path = ?2 ORDER BY version"
-    ))?;
-    let rows = stmt.query_map(params![scope.to_string(), path], note_from_row)?;
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(note_from_parts(row?)?);
-    }
-    Ok(out)
+    notes_where(
+        conn,
+        &format!(
+            "SELECT {VERSION_COLUMNS} FROM memory_note_versions
+             WHERE scope = ?1 AND path = ?2 ORDER BY version"
+        ),
+        params![scope.to_string(), path],
+    )
 }
 
 fn stale_write() -> HubError {
@@ -151,6 +218,8 @@ fn scope_channel(scope: MemoryScope) -> Option<ChannelId> {
 impl Tx<'_> {
     /// Writes a note if `expected` matches the stored hash. Returns the stored
     /// note. A write with the same content as the stored note changes nothing.
+    /// A deleted note counts as no note: a write with `not_exists` brings
+    /// the path back with the next version number.
     pub fn write_memory(
         &mut self,
         scope: MemoryScope,
@@ -158,6 +227,7 @@ impl Tx<'_> {
         content: &str,
         expected: &ExpectedHash,
         by: MemoryAuthor,
+        suggested_by: Option<SuggestionSource>,
     ) -> Result<MemoryNote> {
         let current = memory_note(self.db(), scope, path)?;
         if !expected.matches(current.as_ref().map(|n| &n.sha256)) {
@@ -183,6 +253,8 @@ impl Tx<'_> {
             version,
             updated_by: by,
             updated_at: self.now(),
+            suggested_by,
+            deleted_at: None,
         };
         let values = params![
             note.scope.to_string(),
@@ -191,56 +263,162 @@ impl Tx<'_> {
             note.sha256.as_str(),
             i64::try_from(note.version).unwrap_or(i64::MAX),
             author_to_text(note.updated_by),
-            note.updated_at.as_millis()
+            note.updated_at.as_millis(),
+            note.suggested_by.map(|s| s.to_string()),
         ];
         self.db().execute(
-            &format!(
-                "INSERT INTO memory_notes ({NOTE_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                 ON CONFLICT(scope, path) DO UPDATE SET content = excluded.content,
-                    sha256 = excluded.sha256, version = excluded.version,
-                    updated_by = excluded.updated_by, updated_at = excluded.updated_at"
-            ),
+            "INSERT INTO memory_notes (scope, path, content, sha256, version, updated_by,
+                updated_at, suggested_by, deleted_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)
+             ON CONFLICT(scope, path) DO UPDATE SET content = excluded.content,
+                sha256 = excluded.sha256, version = excluded.version,
+                updated_by = excluded.updated_by, updated_at = excluded.updated_at,
+                suggested_by = excluded.suggested_by, deleted_at = NULL",
             values,
         )?;
         self.db().execute(
-            &format!(
-                "INSERT INTO memory_note_versions ({NOTE_COLUMNS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)"
-            ),
+            "INSERT INTO memory_note_versions (scope, path, content, sha256, version, updated_by,
+                updated_at, suggested_by)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             values,
         )?;
+        self.index_memory(&note)?;
+        self.emit(EntityPayload::MemoryNote(note.clone()))?;
+        Ok(note)
+    }
+
+    /// Puts a note in the search index in place of its old text.
+    fn index_memory(&mut self, note: &MemoryNote) -> Result<()> {
         let entity_id = note.entity_id();
         self.unindex_search("memory_note", &entity_id)?;
         self.index_search(
             "memory_note",
             &entity_id,
-            scope_channel(scope),
-            &scope.to_string(),
+            scope_channel(note.scope),
+            &note.scope.to_string(),
             &note.path,
             &note.content,
-        )?;
-        self.emit(EntityPayload::MemoryNote(note.clone()))?;
-        Ok(note)
+        )
     }
 
-    /// Deletes a note if `expected` matches the stored hash. The versions stay.
+    /// Moves a note to Recently deleted if `expected` matches the stored
+    /// hash. The note and its versions stay until the purge. The feed gets
+    /// the note with its `deleted_at`.
     pub fn delete_memory(
         &mut self,
         scope: MemoryScope,
         path: &str,
         expected: &Sha256Hash,
     ) -> Result<()> {
-        let current = memory_note(self.db(), scope, path)?
+        let mut note = memory_note(self.db(), scope, path)?
             .ok_or_else(|| HubError::not_found(format!("There is no memory note at {path}.")))?;
-        if &current.sha256 != expected {
+        if &note.sha256 != expected {
             return Err(stale_write());
         }
+        note.deleted_at = Some(self.now());
         self.db().execute(
-            "DELETE FROM memory_notes WHERE scope = ?1 AND path = ?2",
+            "UPDATE memory_notes SET deleted_at = ?3 WHERE scope = ?1 AND path = ?2",
+            params![
+                scope.to_string(),
+                path,
+                note.deleted_at.map(|t| t.as_millis())
+            ],
+        )?;
+        self.unindex_search("memory_note", &note.entity_id())?;
+        self.emit(EntityPayload::MemoryNote(note))
+    }
+
+    /// Brings a note back from Recently deleted, as it was.
+    pub fn restore_memory(&mut self, scope: MemoryScope, path: &str) -> Result<MemoryNote> {
+        let mut note = deleted_memory_note(self.db(), scope, path)?.ok_or_else(|| {
+            HubError::not_found(format!(
+                "The note {path} is not in Recently deleted. It may be back already, or more than 30 days old."
+            ))
+        })?;
+        note.deleted_at = None;
+        self.db().execute(
+            "UPDATE memory_notes SET deleted_at = NULL WHERE scope = ?1 AND path = ?2",
             params![scope.to_string(), path],
         )?;
+        self.index_memory(&note)?;
+        self.emit(EntityPayload::MemoryNote(note.clone()))?;
+        Ok(note)
+    }
+
+    /// Renames a note in its scope, with its versions. A deleted note at the
+    /// new path is removed for good first.
+    pub fn move_memory(
+        &mut self,
+        scope: MemoryScope,
+        from: &str,
+        to: &str,
+        expected: &Sha256Hash,
+    ) -> Result<MemoryNote> {
+        let mut note = memory_note(self.db(), scope, from)?
+            .ok_or_else(|| HubError::not_found(format!("There is no memory note at {from}.")))?;
+        if &note.sha256 != expected {
+            return Err(stale_write());
+        }
+        if from == to {
+            return Ok(note);
+        }
+        if memory_note(self.db(), scope, to)?.is_some() {
+            return Err(HubError::conflict(format!(
+                "A note at {to} exists already. Choose another name."
+            )));
+        }
+        if deleted_memory_note(self.db(), scope, to)?.is_some() {
+            self.purge_memory_note(scope, to)?;
+        }
+        // Versions of a note that an older hub deleted for good can still
+        // hold the new path.
+        self.db().execute(
+            "DELETE FROM memory_note_versions WHERE scope = ?1 AND path = ?2",
+            params![scope.to_string(), to],
+        )?;
+        let old_entity = note.entity_id();
+        for table in ["memory_notes", "memory_note_versions"] {
+            self.db().execute(
+                &format!("UPDATE {table} SET path = ?3 WHERE scope = ?1 AND path = ?2"),
+                params![scope.to_string(), from, to],
+            )?;
+        }
+        self.unindex_search("memory_note", &old_entity)?;
+        self.emit_delete(EntityKind::MemoryNote, old_entity, scope_channel(scope))?;
+        note.path = to.to_owned();
+        self.index_memory(&note)?;
+        self.emit(EntityPayload::MemoryNote(note.clone()))?;
+        Ok(note)
+    }
+
+    /// Removes a note and its versions for good.
+    fn purge_memory_note(&mut self, scope: MemoryScope, path: &str) -> Result<()> {
+        for table in ["memory_notes", "memory_note_versions"] {
+            self.db().execute(
+                &format!("DELETE FROM {table} WHERE scope = ?1 AND path = ?2"),
+                params![scope.to_string(), path],
+            )?;
+        }
         let entity_id = memory_note_entity_id(scope, path);
         self.unindex_search("memory_note", &entity_id)?;
         self.emit_delete(EntityKind::MemoryNote, entity_id, scope_channel(scope))
+    }
+
+    /// Removes the notes that were deleted before `before`, with their
+    /// versions. Returns how many it removed.
+    pub fn purge_deleted_memory(&mut self, before: Timestamp) -> Result<usize> {
+        let old: Vec<(String, String)> = {
+            let mut stmt = self.db().prepare(
+                "SELECT scope, path FROM memory_notes WHERE deleted_at IS NOT NULL AND deleted_at < ?1",
+            )?;
+            let rows =
+                stmt.query_map([before.as_millis()], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        for (scope, path) in &old {
+            self.purge_memory_note(scope_from_text(scope)?, path)?;
+        }
+        Ok(old.len())
     }
 }
 
@@ -550,6 +728,7 @@ mod tests {
                     "Kevin likes tea.",
                     &ExpectedHash::NotExists,
                     MemoryAuthor::User,
+                    None,
                 )
             })
             .await
@@ -565,6 +744,7 @@ mod tests {
                     "x",
                     &ExpectedHash::NotExists,
                     MemoryAuthor::User,
+                    None,
                 )
             })
             .await
@@ -580,6 +760,7 @@ mod tests {
                     "x",
                     &ExpectedHash::Sha256(stale),
                     MemoryAuthor::User,
+                    None,
                 )
             })
             .await
@@ -595,6 +776,7 @@ mod tests {
                     "Kevin likes coffee.",
                     &ExpectedHash::Sha256(current),
                     MemoryAuthor::User,
+                    None,
                 )
             })
             .await
@@ -611,5 +793,68 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(history.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn the_purge_removes_notes_deleted_before_the_limit_with_their_versions() {
+        let (hub, _dir) = crate::hub::test_hub().await;
+        let scope = MemoryScope::Global;
+        let deleted_at = hub
+            .store
+            .write(move |tx| {
+                for path in ["old.md", "kept.md", "live.md"] {
+                    let note = tx.write_memory(
+                        scope,
+                        path,
+                        path,
+                        &ExpectedHash::NotExists,
+                        MemoryAuthor::User,
+                        None,
+                    )?;
+                    if path != "live.md" {
+                        tx.delete_memory(scope, path, &note.sha256)?;
+                    }
+                }
+                Ok(tx.now())
+            })
+            .await
+            .unwrap();
+        // Make old.md look deleted long ago.
+        hub.store
+            .write(move |tx| {
+                tx.db().execute(
+                    "UPDATE memory_notes SET deleted_at = ?1 WHERE path = 'old.md'",
+                    [deleted_at.as_millis() - 31 * 24 * 3_600_000],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let mut feed = hub.store.subscribe();
+
+        let purged = hub
+            .store
+            .write(move |tx| tx.purge_deleted_memory(deleted_at.plus_millis(-30 * 24 * 3_600_000)))
+            .await
+            .unwrap();
+
+        assert_eq!(purged, 1);
+        let entry = feed.recv().await.unwrap();
+        assert_eq!(entry.entity_id, "global:old.md");
+        let (deleted, live, history) = hub
+            .store
+            .read(move |conn| {
+                Ok((
+                    deleted_memory_list(conn, Some(scope))?,
+                    memory_list(conn, Some(scope))?,
+                    memory_history(conn, scope, "old.md")?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(deleted.len(), 1);
+        assert_eq!(deleted[0].path, "kept.md");
+        assert_eq!(live.len(), 1);
+        assert!(history.is_empty());
     }
 }

@@ -15,6 +15,7 @@ pub const MIGRATIONS: &[&str] = &[
     include_str!("schema_v5.sql"),
     include_str!("schema_v6.sql"),
     include_str!("schema_v7.sql"),
+    include_str!("schema_v8.sql"),
 ];
 
 pub fn current_version() -> i64 {
@@ -229,6 +230,51 @@ mod tests {
             .query_row("SELECT attachments FROM task_inbox", [], |r| r.get(0))
             .unwrap();
         assert_eq!(attachments, "[]");
+    }
+
+    #[test]
+    fn version_8_ends_old_routine_runs_and_keeps_memory_notes() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        for sql in &MIGRATIONS[..7] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.execute_batch("PRAGMA user_version = 7").unwrap();
+        conn.execute(
+            "INSERT INTO routines (id, channel_id, enabled, next_run_at, data) VALUES ('rtn_1', 'chn_1', 1, NULL, '{}')",
+            [],
+        )
+        .unwrap();
+        conn.execute_batch(
+            "INSERT INTO routine_runs (routine_id, started_at, error) VALUES ('rtn_1', 5, NULL);
+             INSERT INTO routine_runs (routine_id, started_at, error) VALUES ('rtn_1', 9, 'It broke.');
+             INSERT INTO memory_notes (scope, path, content, sha256, version, updated_by, updated_at)
+                 VALUES ('global', 'a.md', 'A', 'x', 1, 'user', 1);",
+        )
+        .unwrap();
+        migrate(&mut conn).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT status, ended_at, channel_id, manual FROM routine_runs ORDER BY id")
+            .unwrap();
+        let rows: Vec<(String, Option<i64>, String, bool)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("ok".to_owned(), Some(5), "chn_1".to_owned(), false),
+                ("error".to_owned(), Some(9), "chn_1".to_owned(), false),
+            ]
+        );
+        let (deleted, suggested): (Option<i64>, Option<String>) = conn
+            .query_row(
+                "SELECT deleted_at, suggested_by FROM memory_notes",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((deleted, suggested), (None, None));
     }
 
     #[test]

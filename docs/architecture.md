@@ -75,7 +75,7 @@ A decision works the same way from the user's side, but the assistant starts it 
 
 ### A routine runs
 
-The hub's scheduler checks `next_run_at` once a second. For a `coordinator_turn` routine, it adds a `routine` wake event to the channel. For a `start_task` routine, it creates a task. The morning brief is a routine in the Tutti channel.
+The hub's scheduler checks `next_run_at` once a second. For a `coordinator_turn` routine, it adds a `routine` wake event to the channel. For a `start_task` routine, it creates a task. The morning brief is a routine in the Tutti channel. Each run is recorded and stays `running` until its turn or its task ends. A scheduled run that would start while the last run still runs is `skipped`, and so is a run that the hub missed by 1 hour or more while it was down (see [protocol.md](protocol.md#routine-runs)).
 
 ### A machine goes offline
 

@@ -97,6 +97,12 @@ pub enum CommandOutput {
     SkillFile(SkillFileContentView),
     /// A page of the audit log of a connection.
     ConnectionCalls(ConnectionCallsView),
+    /// `routine.create` or `routine.update` saved the routine with this ID.
+    RoutineSaved(String),
+    /// One memory note, with its text.
+    MemoryNote(crate::memory::MemoryNoteView),
+    /// The versions of a memory note, newest first, with their text.
+    MemoryHistory(Vec<crate::memory::MemoryNoteView>),
 }
 
 /// The fields of a new connection, from the Connect dialog.
@@ -495,6 +501,75 @@ pub enum Command {
     },
     RemoveSkill {
         skill_id: String,
+    },
+    // Routines.
+    /// Creates a routine (no `routine_id`) or saves the changes of one. The
+    /// output is [`CommandOutput::RoutineSaved`].
+    SaveRoutine {
+        routine_id: Option<String>,
+        form: crate::routines::RoutineForm,
+    },
+    /// Turns a routine on or off.
+    SetRoutineEnabled {
+        routine_id: String,
+        enabled: bool,
+    },
+    DeleteRoutine {
+        routine_id: String,
+    },
+    /// Runs a routine now. The hub refuses it while the last run still runs.
+    RunRoutineNow {
+        routine_id: String,
+    },
+    /// Loads the newest runs of a routine (`routine.runs`).
+    LoadRoutineRuns {
+        routine_id: String,
+    },
+    // Memory. A scope is `global` or a channel ID.
+    /// Loads the notes of a scope (`memory.list`), or with `deleted` the
+    /// ones in Recently deleted.
+    LoadMemory {
+        scope: String,
+        deleted: bool,
+    },
+    /// Reads one note with its text. The output is
+    /// [`CommandOutput::MemoryNote`].
+    ReadMemoryNote {
+        scope: String,
+        path: String,
+    },
+    /// Writes a note. `expected_sha256` is the hash that the user started
+    /// from, or `None` for a new note. A note that changed since then fails
+    /// with the hub code `stale_write`, and the text stays with the caller.
+    /// The output is [`CommandOutput::MemoryNote`].
+    WriteMemoryNote {
+        scope: String,
+        path: String,
+        content: String,
+        expected_sha256: Option<String>,
+    },
+    /// Moves a note to Recently deleted.
+    DeleteMemoryNote {
+        scope: String,
+        path: String,
+        sha256: String,
+    },
+    /// Brings a note back from Recently deleted.
+    RestoreMemoryNote {
+        scope: String,
+        path: String,
+    },
+    /// Renames a note. The output is [`CommandOutput::MemoryNote`].
+    MoveMemoryNote {
+        scope: String,
+        from_path: String,
+        to_path: String,
+        sha256: String,
+    },
+    /// The output is [`CommandOutput::MemoryHistory`].
+    LoadMemoryHistory {
+        scope: String,
+        path: String,
     },
     /// The output is [`CommandOutput::SkillFiles`].
     LoadSkillFiles {

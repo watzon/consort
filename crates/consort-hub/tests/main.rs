@@ -27,6 +27,7 @@ mod pairing_and_auth;
 mod refused_turns;
 mod reopened_and_decisions;
 mod revoke_and_handshake;
+mod routines_and_memory;
 mod session_end;
 mod size_budgets;
 mod skills;

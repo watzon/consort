@@ -797,6 +797,21 @@ async fn run(shared: Arc<Shared>, command: Command) -> Result<CommandOutput, Cli
         | Command::RevokeClient { .. }
         | Command::ClientPairingCode
         | Command::CancelClientPairing) => return super::admin::run(&shared, command).await,
+        // Routines and memory.
+        command @ (Command::SaveRoutine { .. }
+        | Command::SetRoutineEnabled { .. }
+        | Command::DeleteRoutine { .. }
+        | Command::RunRoutineNow { .. }
+        | Command::LoadRoutineRuns { .. }
+        | Command::LoadMemory { .. }
+        | Command::ReadMemoryNote { .. }
+        | Command::WriteMemoryNote { .. }
+        | Command::DeleteMemoryNote { .. }
+        | Command::RestoreMemoryNote { .. }
+        | Command::MoveMemoryNote { .. }
+        | Command::LoadMemoryHistory { .. }) => {
+            return super::knowledge::run(&shared, command).await;
+        }
         // Connectors, skills and the provider extras.
         other => return super::extensions::run(&shared, other).await,
     }
