@@ -118,3 +118,25 @@ The code was `main` at commit `2057d66` (phases 2, 4, 4b and 5 and the smaller h
 - The ssh command shell is `cmd.exe`. A task that needs `powershell` must call it.
 - The checks that need a person at the machine are unchanged: real toasts, the window title count with a paired hub, `consort worker install` for real, and `worker.ps1` against a real release.
 - `consort-desktop` `--mock` shows saved data, but the screens do not show the SQLite file on disk. Nothing in the run opened a real cache file in the app. The tests cover it.
+
+## Third run (2026-10-30)
+
+The code was `main` at commit `8a7b5ce`. It has phase 4c (voice, hub migration 10, `crates/consort-hub/src/voice/`) and the review fixes (the approval mode per turn in `session.turn` and in the ACP and Codex adapters, the hub epoch in `hello`, the pairing generations in the client, UTC backup names, migration 11). The two earlier runs are in `main` now, so the history went to bigboi as a bundle (`git bundle create 2057d66..HEAD`, `scp`, `git fetch` of the bundle, `git checkout -B w3`). The old uncommitted patch of the second run was discarded first, because `main` has it. No change files were needed. The ssh user is `cawat@bigboi.local`.
+
+### Passed
+
+- `cargo build --workspace`: no warning.
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `cargo test --workspace --no-fail-fast` (no nextest on bigboi): 1926 passed, 0 failed, 25 ignored, in 32 test binaries. The flaky `heartbeat` test and the slow skill search test passed.
+- Desktop app with `--mock --screen voice-on` and `--screen voice-approval`: both draw, with the Windows title bar controls. The Voice settings page shows the toggle, the learned sources, the style guide rules and the examples. The approval screen shows the draft email, the marked lines ("Not in your request. Check it."), the check box, and the buttons Allow (off until the box is checked), Edit, Don't and "Not how I write", in the Tutti timeline and in the task panel. The screenshots are `docs/screenshots/windows-voice-on.png` and `windows-voice-approval.png`. Each app was stopped by PID. The `ConsortShot` task was gone after each run.
+- `scripts/check.sh` on the Mac: "All checks passed in 123s".
+
+### Failed and fixed
+
+Nothing failed on Windows in this run. The code and the tests of this branch are the same as `main`.
+
+### Left
+
+- The same items as in the first and second run: real toasts and the window title count with a paired hub, `consort worker install` for real, and `worker.ps1` against a real release.
+- The voice check needs a real connector (Gmail or Slack) to learn from. The run used `--mock` data only, so reading real sources on Windows is not checked.
+- The temp files on bigboi (bundle, test log, screenshots, capture script) are deleted. The repo there is on branch `w3` at `8a7b5ce`.
