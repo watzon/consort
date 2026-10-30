@@ -601,6 +601,30 @@ pub enum Command {
     /// `ViewState::admin.pairing`.
     ClientPairingCode,
     CancelClientPairing,
+    // Settings > Proactivity. See `crate::proactivity`.
+    /// Loads the newest page of the proactivity log.
+    LoadProactivityLog,
+    /// Changes the settings: Pause all, the quiet hours, the time zone.
+    SetProactivity(crate::proactivity::ProactivityChanges),
+    /// Snoozes what starts on its own, or ends the snooze.
+    SnoozeProactivity(crate::proactivity::SnoozeOption),
+    /// Deletes the follow-ups that the assistant set, in one channel or in
+    /// every channel. One follow-up goes with [`Command::DeleteRoutine`].
+    CancelAllFollowUps {
+        channel_id: Option<String>,
+    },
+    /// Sets the proactivity level of a channel. `None` goes back to the
+    /// default for the channel.
+    SetChannelProactivity {
+        channel_id: String,
+        level: Option<consort_proto::model::ProactivityLevel>,
+    },
+    /// Rates a proactive message: Useful or Too noisy. `None` takes the
+    /// rating back.
+    RateMessage {
+        message_id: String,
+        rating: Option<consort_proto::model::ProactiveRating>,
+    },
 }
 
 /// Refuses a channel ID that cannot name a channel. The ID is empty until the

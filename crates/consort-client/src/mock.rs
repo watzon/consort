@@ -1391,6 +1391,7 @@ pub fn view_state() -> ViewState {
         memory_notes: crate::mock_routines::memory_notes(),
         memory_loaded: vec![text(crate::memory::GLOBAL), text(LIGHTS), text(SAYSO)],
         memory_deleted_loaded: vec![text(crate::memory::GLOBAL), text(LIGHTS), text(SAYSO)],
+        proactivity: Default::default(),
     };
     stamp_times(&mut state.timelines);
     if let Some(account) = state
@@ -1512,6 +1513,7 @@ pub fn view_state_with_requests() -> ViewState {
                 chosen: None,
                 answer_text: None,
             },
+            proactive: None,
         }));
     }
     stamp_times(&mut state.timelines);

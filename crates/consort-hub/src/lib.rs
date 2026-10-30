@@ -27,6 +27,7 @@ mod maintenance;
 mod net;
 mod ops;
 mod placement;
+mod proactivity;
 mod prompts;
 mod schedule;
 mod scheduler;
@@ -160,7 +161,11 @@ pub async fn serve(config: HubConfig) -> Result<HubHandle> {
         spawn_connector_sweep(&hub),
         spawn_skill_update_check(&hub),
         backup::spawn_scheduler(&hub),
+        proactivity::spawn(&hub),
     ];
+    if let Err(err) = hub.make_proactive_defaults().await {
+        tracing::warn!(error = %err, "could not make the proactive routines");
+    }
     hub.recover();
     if let Err(err) = hub.resume_connect_polls().await {
         tracing::warn!(error = %err, "could not resume the open connect attempts");
@@ -299,6 +304,18 @@ impl HubHandle {
     /// run the schedule at a chosen time.
     pub fn backup_if_due_at(&self, at: Timestamp) -> Result<bool> {
         self.hub.backup_if_due(at)
+    }
+
+    /// Runs every routine that is due at `at`, as the scheduler does every
+    /// second with the clock at `at`. Tests use it to run check-ins and
+    /// follow-ups at a chosen time.
+    pub async fn run_routines_at(&self, at: Timestamp) {
+        scheduler::tick_at(&self.hub, at).await;
+    }
+
+    /// Looks for stale tasks at `at`, as the hub does every 30 seconds.
+    pub async fn nudge_stale_tasks_at(&self, at: Timestamp) -> Result<()> {
+        self.hub.nudge_stale_tasks_at(at).await
     }
 
     /// Whether a backup runs now.

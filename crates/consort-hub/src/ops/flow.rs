@@ -86,6 +86,8 @@ pub(crate) fn transition(
     task.status_reason = reason;
     task.updated_at = now;
     task.resolved_at = (to == TaskStatus::Resolved).then_some(now);
+    // For stale-task nudges: when the task entered this status.
+    tx.note_task_status(task)?;
     if to.wakes_coordinator() {
         let text = wake_text
             .or_else(|| task.status_reason.clone())

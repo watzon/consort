@@ -342,8 +342,9 @@ pub fn rows(items: &[TimelineItem]) -> Vec<ChatRow> {
                 if m.title.as_deref().is_some_and(|t| !t.trim().is_empty()) {
                     parts.push((String::new(), true));
                 }
-                // Your own words stay in one bubble, as you sent them.
-                if lane == Lane::Assistant {
+                // Your own words stay in one bubble, as you sent them. So
+                // does a morning brief.
+                if lane == Lane::Assistant && !crate::proactivity::is_brief(m) {
                     parts.extend(
                         split_paragraphs(&m.body)
                             .into_iter()

@@ -170,6 +170,8 @@ pub struct Cache {
     pub extensions: Extensions,
     /// The hub status and the paired clients. See [`crate::admin`].
     pub admin: crate::admin::AdminCache,
+    /// The proactivity settings and log. See [`crate::proactivity`].
+    pub proactivity: crate::proactivity::ProactivityCache,
 }
 
 /// A memory note in the cache. A list gives only the summary, so the text
@@ -393,6 +395,7 @@ impl Cache {
     /// It moves to the failed sends with the reason, so the user keeps the
     /// text.
     fn remove_channel(&mut self, id: &str) -> bool {
+        self.proactivity.drop_channel(id);
         let channel = self.channels.remove(id);
         let channel_name = channel.as_ref().map(|c| c.name.clone()).unwrap_or_default();
         let mut removed = channel.is_some();
@@ -566,6 +569,13 @@ impl Cache {
         if self.changed_after(EntityKind::Preferences, PREFERENCES_ENTITY_ID, at) {
             snapshot.preferences = None;
         }
+        if self.changed_after(
+            EntityKind::ProactivitySettings,
+            consort_proto::model::PROACTIVITY_ENTITY_ID,
+            at,
+        ) {
+            snapshot.proactivity = None;
+        }
     }
 
     /// Remembers that the feed entry at `seq` changed the entity.
@@ -652,6 +662,9 @@ impl Cache {
         // the skills.
         if let Some(preferences) = snapshot.preferences {
             self.preferences = preferences;
+        }
+        if let Some(settings) = snapshot.proactivity {
+            self.proactivity.settings = Some(settings);
         }
         for c in snapshot.connections {
             self.connections.insert(c.id.to_string(), c);
@@ -967,6 +980,10 @@ impl Cache {
                 EntityPayload::Connection(c) => {
                     self.connections.insert(c.id.to_string(), c);
                 }
+                EntityPayload::ProactivitySettings(settings) => {
+                    return self.proactivity.apply_settings(settings);
+                }
+                EntityPayload::ProactiveWake(wake) => return self.proactivity.apply_wake(wake),
                 EntityPayload::Skill(skill) => {
                     self.skills.insert(skill.id.to_string(), skill);
                 }
@@ -1162,6 +1179,8 @@ mod tests {
             edited_at: None,
             deleted_at: None,
             created_at: Timestamp::from_millis(1),
+            proactive: None,
+            suggestions: Vec::new(),
         }
     }
 
@@ -1321,6 +1340,9 @@ mod tests {
             next_run_at: None,
             last_run_at: None,
             last_run_status: None,
+            created_at: None,
+            kind: Default::default(),
+            origin: Default::default(),
         }
     }
 

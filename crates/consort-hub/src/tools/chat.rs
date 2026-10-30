@@ -37,6 +37,22 @@ const THREAD_PAGE_MAX: u32 = 200;
 /// one of its replies. A longer root is cut.
 const THREAD_ROOT_MAX_BYTES: usize = 48 * 1024;
 
+/// Sets the proactive mark and the suggestions of a message that a
+/// coordinator just posted, and stores it again when either is set.
+fn mark_message(
+    tx: &mut crate::store::Tx<'_>,
+    mut message: Message,
+    posting: crate::proactivity::tools::Posting,
+) -> Result<Message> {
+    if posting.mark.is_none() && posting.suggestions.is_empty() {
+        return Ok(message);
+    }
+    message.proactive = posting.mark;
+    message.suggestions = posting.suggestions;
+    tx.save_message(&message)?;
+    Ok(message)
+}
+
 /// The bytes that a message takes in a list as JSON.
 fn message_cost(message: &Message) -> Result<usize> {
     Ok(serde_json::to_vec(message)?.len() + 1)
@@ -256,12 +272,20 @@ impl Hub {
             .store
             .write(move |tx| {
                 let attachments = resolve_attachments(tx.db(), channel_id, &args.attachments)?;
-                tx.insert_message(NewMessage {
+                let posting = crate::proactivity::tools::posting(
+                    tx,
+                    session_id,
+                    channel_id,
+                    args.notify,
+                    args.suggestions,
+                )?;
+                let message = tx.insert_message(NewMessage {
                     author_session_id: Some(session_id),
                     author_task_id: task_id,
                     attachments,
                     ..NewMessage::new(channel_id, Author::Assistant, MessageKind::Text, args.body)
-                })
+                })?;
+                mark_message(tx, message, posting)
             })
             .await?;
         to_value(&MessageIdResult {
@@ -287,14 +311,22 @@ impl Hub {
                     )));
                 }
                 let attachments = resolve_attachments(tx.db(), channel_id, &args.attachments)?;
-                tx.insert_message(NewMessage {
+                let posting = crate::proactivity::tools::posting(
+                    tx,
+                    session_id,
+                    channel_id,
+                    false,
+                    args.suggestions,
+                )?;
+                let message = tx.insert_message(NewMessage {
                     thread_root_id: Some(args.message_id),
                     in_timeline: args.in_timeline,
                     author_session_id: Some(session_id),
                     author_task_id: task_id,
                     attachments,
                     ..NewMessage::new(channel_id, Author::Assistant, MessageKind::Text, args.body)
-                })
+                })?;
+                mark_message(tx, message, posting)
             })
             .await?;
         to_value(&MessageIdResult {
@@ -352,9 +384,10 @@ impl Hub {
 
     pub(crate) async fn tool_no_reply_needed(
         &self,
-        _ctx: &ToolCtx,
-        _args: NoArgs,
+        ctx: &ToolCtx,
+        args: NoReplyNeededArgs,
     ) -> Result<Value> {
+        self.note_finding(ctx, args.finding).await?;
         to_value(&OkResult::OK)
     }
 
@@ -474,6 +507,12 @@ impl Hub {
         args: MemoryWriteArgs,
     ) -> Result<Value> {
         let scope = writable_scope(ctx)?;
+        let (session_id, channel_id, path) = (ctx.session.id, ctx.channel.id, args.path.clone());
+        self.store
+            .read(move |conn| {
+                crate::proactivity::tools::check_memory_write(conn, session_id, channel_id, &path)
+            })
+            .await?;
         let suggested_by = match args.from_suggestion {
             Some(source) => Some(source),
             None => self.only_suggestion_in_turn(ctx).await?,
@@ -856,6 +895,8 @@ mod tests {
                 PostMessageArgs {
                     body: body.to_owned(),
                     attachments: Vec::new(),
+                    notify: false,
+                    suggestions: Vec::new(),
                 },
             )
             .await
@@ -948,6 +989,8 @@ mod tests {
                 PostMessageArgs {
                     body: " ".to_owned(),
                     attachments: Vec::new(),
+                    notify: false,
+                    suggestions: Vec::new(),
                 },
             )
             .await;
@@ -978,6 +1021,8 @@ mod tests {
                 PostMessageArgs {
                     body: String::new(),
                     attachments: vec!["reports/summary.md".to_owned()],
+                    notify: false,
+                    suggestions: Vec::new(),
                 },
             )
             .await
@@ -999,6 +1044,8 @@ mod tests {
                 PostMessageArgs {
                     body: "See the file".to_owned(),
                     attachments: vec!["reports/missing.md".to_owned()],
+                    notify: false,
+                    suggestions: Vec::new(),
                 },
             )
             .await
@@ -1029,6 +1076,7 @@ mod tests {
                     body: "answer".to_owned(),
                     in_timeline: true,
                     attachments: Vec::new(),
+                    suggestions: Vec::new(),
                 },
             )
             .await
@@ -1048,6 +1096,7 @@ mod tests {
                     body: "x".to_owned(),
                     in_timeline: false,
                     attachments: Vec::new(),
+                    suggestions: Vec::new(),
                 },
             )
             .await;
@@ -1060,6 +1109,7 @@ mod tests {
                     body: String::new(),
                     in_timeline: false,
                     attachments: Vec::new(),
+                    suggestions: Vec::new(),
                 },
             )
             .await;
@@ -1142,7 +1192,10 @@ mod tests {
             .await;
         assert_eq!(code_of(wrong_channel), ErrorCode::NotFound);
 
-        let done = hub.tool_no_reply_needed(&ctx, NoArgs {}).await.unwrap();
+        let done = hub
+            .tool_no_reply_needed(&ctx, NoReplyNeededArgs::default())
+            .await
+            .unwrap();
         assert_eq!(done, serde_json::json!({"ok": true}));
     }
 
@@ -1165,6 +1218,7 @@ mod tests {
                     body: "reply".to_owned(),
                     in_timeline: false,
                     attachments: Vec::new(),
+                    suggestions: Vec::new(),
                 },
             )
             .await
@@ -1754,6 +1808,7 @@ mod tests {
                     body: "in a thread".to_owned(),
                     in_timeline: false,
                     attachments: Vec::new(),
+                    suggestions: Vec::new(),
                 },
             )
             .await

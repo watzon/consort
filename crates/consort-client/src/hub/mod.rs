@@ -15,6 +15,7 @@ mod files;
 mod knowledge;
 mod link;
 mod outbox;
+mod proactivity;
 mod url;
 
 use std::{

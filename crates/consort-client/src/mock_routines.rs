@@ -170,6 +170,9 @@ fn routine(
         last_run_status: None,
         runs: Vec::new(),
         runs_loaded: false,
+        created_at: None,
+        kind: Default::default(),
+        origin: Default::default(),
     }
 }
 
@@ -579,6 +582,9 @@ fn from_form(id: String, form: &RoutineForm, now: i64) -> Result<RoutineView, Cl
         last_run_status: None,
         runs: Vec::new(),
         runs_loaded: true,
+        created_at: None,
+        kind: Default::default(),
+        origin: Default::default(),
     })
 }
 

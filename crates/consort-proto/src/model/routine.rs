@@ -128,6 +128,63 @@ impl RoutineRunStatus {
     }
 }
 
+/// What a routine is for. A routine that is not `custom` is proactive: the
+/// hub gates it and gives the coordinator its own wake event.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutineKind {
+    /// A routine with the user's or the assistant's own prompt.
+    #[default]
+    Custom,
+    /// A check-in: the coordinator looks for things that need the user.
+    CheckIn,
+    /// The morning brief in Tutti.
+    Brief,
+    /// A one-time wake that the assistant set for itself.
+    FollowUp,
+    /// The daily read-only research pass.
+    Research,
+}
+
+impl RoutineKind {
+    /// The wire text.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Custom => "custom",
+            Self::CheckIn => "check_in",
+            Self::Brief => "brief",
+            Self::FollowUp => "follow_up",
+            Self::Research => "research",
+        }
+    }
+
+    /// The proactive kind of a routine of this kind, or `None` for a custom
+    /// routine.
+    pub fn proactive_kind(self) -> Option<super::ProactiveKind> {
+        use super::ProactiveKind as P;
+        match self {
+            Self::Custom => None,
+            Self::CheckIn => Some(P::CheckIn),
+            Self::Brief => Some(P::Brief),
+            Self::FollowUp => Some(P::FollowUp),
+            Self::Research => Some(P::Research),
+        }
+    }
+}
+
+/// Who made a routine.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutineOrigin {
+    /// The user, in a client.
+    #[default]
+    User,
+    /// The assistant, with a hub tool.
+    Assistant,
+    /// The hub, for a check-in, the brief or the research pass.
+    Hub,
+}
+
 /// A prompt that the hub runs on a schedule in one channel.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Routine {
@@ -151,6 +208,15 @@ pub struct Routine {
     pub last_run_at: Option<Timestamp>,
     /// The result of the last run.
     pub last_run_status: Option<RoutineRunStatus>,
+    /// What the routine is for. Older records read as `custom`.
+    #[serde(default)]
+    pub kind: RoutineKind,
+    /// Who made it. Older records read as `user`.
+    #[serde(default)]
+    pub origin: RoutineOrigin,
+    /// When it was made. Empty for a routine from an older hub.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<Timestamp>,
 }
 
 /// One run of a routine. It is a feed entity, so a client sees a run start
@@ -286,6 +352,36 @@ mod tests {
             );
         }
         assert_eq!(RoutineRunStatus::parse("done"), None);
+    }
+
+    #[test]
+    fn an_old_routine_reads_as_a_custom_routine_of_the_user() {
+        let channel: ChannelId = "chn_00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let value = json!({
+            "id": "rtn_00000000-0000-0000-0000-000000000005", "channel_id": channel,
+            "name": "Sunset check", "schedule": {"kind": "interval", "seconds": 3600},
+            "prompt": "p", "action": {"kind": "coordinator_turn"}, "enabled": true,
+            "next_run_at": null, "last_run_at": null, "last_run_status": null
+        });
+        let routine: Routine = serde_json::from_value(value).unwrap();
+        assert_eq!(routine.kind, RoutineKind::Custom);
+        assert_eq!(routine.origin, RoutineOrigin::User);
+        assert_eq!(routine.kind.proactive_kind(), None);
+        let check_in = Routine {
+            kind: RoutineKind::CheckIn,
+            origin: RoutineOrigin::Hub,
+            ..routine
+        };
+        let value = serde_json::to_value(&check_in).unwrap();
+        assert_eq!(
+            (value["kind"].clone(), value["origin"].clone()),
+            (json!("check_in"), json!("hub"))
+        );
+        assert_eq!(serde_json::from_value::<Routine>(value).unwrap(), check_in);
+        assert_eq!(
+            RoutineKind::FollowUp.proactive_kind(),
+            Some(super::super::ProactiveKind::FollowUp)
+        );
     }
 
     #[test]

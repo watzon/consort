@@ -87,6 +87,8 @@ pub struct ViewState {
     pub memory_loaded: Vec<String>,
     /// The scopes whose Recently deleted notes are loaded.
     pub memory_deleted_loaded: Vec<String>,
+    /// Settings > Proactivity. See [`crate::proactivity`].
+    pub proactivity: crate::proactivity::ProactivityView,
 }
 
 /// A message that the hub refused after it left the composer.
@@ -675,6 +677,8 @@ pub struct DecisionCardView {
     /// When the hub wrote it, in Unix milliseconds.
     pub created_at: i64,
     pub decision: DecisionView,
+    /// Set on an offer or a decision that the assistant asked on its own.
+    pub proactive: Option<crate::proactivity::ProactiveMarkView>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -722,6 +726,11 @@ pub struct MessageView {
     pub pending: bool,
     /// The files attached to the message.
     pub attachments: Vec<crate::files::AttachmentView>,
+    /// The mark of a message that the assistant posted on its own.
+    pub proactive: Option<crate::proactivity::ProactiveMarkView>,
+    /// Quick replies. Only the newest assistant message has them, until
+    /// the user answers.
+    pub suggestions: Vec<crate::proactivity::SuggestionView>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]

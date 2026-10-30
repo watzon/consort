@@ -797,11 +797,31 @@ pub struct World {
 
 impl World {
     /// A hub, a subscribed client and an online worker with one account.
+    /// Proactivity is paused (Pause all), so a new channel gets no greeting
+    /// turn. The tests of proactivity use [`World::start_proactive`].
     pub async fn start() -> Self {
+        Self::start_with(true).await
+    }
+
+    /// [`World::start`] with proactivity on, as a new hub has it.
+    pub async fn start_proactive() -> Self {
+        Self::start_with(false).await
+    }
+
+    async fn start_with(paused: bool) -> Self {
         let hub = TestHub::start().await;
         let mut client = FakeClient::pair_and_connect(&hub).await;
         let worker = FakeWorker::pair_and_connect(&hub).await;
         let tutti = client.tutti().await;
+        if paused {
+            client
+                .request(consort_proto::client_api::ProactivitySet {
+                    paused: Some(true),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
         let snapshot = client.snapshot(SnapshotScope::All).await;
         client.subscribe(snapshot.seq).await.unwrap();
         // Wait until the hub has stored the inventory.

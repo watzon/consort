@@ -582,6 +582,9 @@ async fn initial_sync(
                 }
             }
         }
+        // Before the subscription: a handshake call drops the feed events
+        // that come while it waits.
+        load_proactivity(shared, ws, limit).await?;
         handshake_call(
             ws,
             &SyncSubscribe {
@@ -595,6 +598,48 @@ async fn initial_sync(
     }
     if let Ok(mut cache) = shared.cache.lock() {
         cache.finish_load();
+    }
+    Ok(())
+}
+
+/// Loads the newest page of the proactivity log, and gives the hub this
+/// computer's time zone when it has none. An older hub has neither, so a
+/// refusal is fine.
+async fn load_proactivity(
+    shared: &Arc<Shared>,
+    ws: &mut Ws,
+    limit: Duration,
+) -> Result<(), SessionEnd> {
+    let zone_unset = shared
+        .cache
+        .lock()
+        .map(|c| {
+            c.proactivity
+                .settings
+                .as_ref()
+                .is_some_and(|s| s.time_zone.is_none())
+        })
+        .unwrap_or(false);
+    if zone_unset {
+        let request = consort_proto::client_api::ProactivitySet {
+            time_zone: Some(crate::admin::local_time_zone()),
+            time_zone_if_unset: true,
+            ..Default::default()
+        };
+        if let Ok(result) = handshake_call(ws, &request, limit).await?
+            && let Ok(mut cache) = shared.cache.lock()
+        {
+            cache.proactivity.apply_settings(result.settings);
+        }
+    }
+    let page = consort_proto::client_api::ProactivityLog {
+        limit: Some(crate::proactivity::LOG_PAGE),
+        ..Default::default()
+    };
+    if let Ok(page) = handshake_call(ws, &page, limit).await?
+        && let Ok(mut cache) = shared.cache.lock()
+    {
+        cache.proactivity.load_page(page.wakes, page.has_more);
     }
     Ok(())
 }
@@ -972,6 +1017,8 @@ mod tests {
             edited_at: None,
             deleted_at: None,
             created_at: consort_proto::time::Timestamp::from_millis(at),
+            proactive: None,
+            suggestions: Vec::new(),
         }
     }
 

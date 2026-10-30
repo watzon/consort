@@ -93,6 +93,9 @@ impl Hub {
         let call = HubToolCall::parse_for(ctx.audience, name, arguments)
             .map_err(|e| HubError::Api(e.to_error_body()))?;
         let tool = call.tool();
+        // A turn that the assistant started on its own has limits that the
+        // hub enforces here, not in the prompt.
+        self.check_turn_tool(&ctx, tool).await?;
         let result = self.dispatch_tool(&ctx, call).await;
         // Only a call that worked counts for the fallback post. A failed
         // `post_message` posted nothing, so the turn still needs a post.
@@ -133,6 +136,9 @@ impl Hub {
             C::RoutineCreate(a) => self.tool_routine_create(ctx, a).await,
             C::RoutineUpdate(a) => self.tool_routine_update(ctx, a).await,
             C::RoutineDelete(a) => self.tool_routine_delete(ctx, a).await,
+            C::FollowUpLater(a) => self.tool_follow_up_later(ctx, a).await,
+            C::CancelFollowUp(a) => self.tool_cancel_follow_up(ctx, a).await,
+            C::SetProactivity(a) => self.tool_set_proactivity(ctx, a).await,
             C::SuggestMemory(a) => self.tool_suggest_memory(ctx, a).await,
             C::ListChannels(a) => self.tool_list_channels(ctx, a).await,
             C::ReadChannel(a) => self.tool_read_channel(ctx, a).await,

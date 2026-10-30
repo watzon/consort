@@ -264,7 +264,9 @@ impl KnowledgeInputs {
 pub fn routine_menu(routine: &RoutineView) -> Vec<MenuItem> {
     let id = routine.id.clone();
     let k = |a: KnowledgeAction| MenuAction::Knowledge(a);
-    vec![
+    // The hub sets the prompt of a check-in, so it has no Edit.
+    let check_in = routine.kind == consort_client::proactivity::RoutineKind::CheckIn;
+    let mut items = vec![
         MenuItem::new("Run now", k(KnowledgeAction::RunRoutine(id.clone()))),
         MenuItem::new(
             "Run history",
@@ -285,7 +287,16 @@ pub fn routine_menu(routine: &RoutineView) -> Vec<MenuItem> {
         MenuItem::new("Delete", k(KnowledgeAction::DeleteRoutine(id)))
             .danger()
             .separated(),
-    ]
+    ];
+    if check_in {
+        items.retain(|i| {
+            !matches!(
+                i.action,
+                MenuAction::Knowledge(KnowledgeAction::EditRoutine(_))
+            )
+        });
+    }
+    items
 }
 
 /// The menu of a memory note: Version history, Copy path, Rename, then

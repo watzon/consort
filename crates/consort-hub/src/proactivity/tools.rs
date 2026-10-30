@@ -1,0 +1,449 @@
+//! The hub tools with which the assistant works on its own:
+//! `follow_up_later`, `cancel_follow_up` and `set_proactivity`, and the
+//! rules that `post_message`, `reply`, `ask_decision`, `start_task` and
+//! `no_reply_needed` follow in a proactive turn.
+
+use consort_proto::ids::{ChannelId, RoutineId, SessionId};
+use consort_proto::model::{
+    ApprovalMode, Channel, DecisionOption, FINDING_MAX_CHARS, FOLLOW_UP_MAX_DAYS,
+    FOLLOW_UP_MIN_MINUTES, FOLLOW_UP_REASON_MAX_CHARS, FOLLOW_UPS_MAX_PER_CHANNEL, OFFER_DO_IT,
+    OFFER_NEVER, OFFER_NOT_NOW, ProactiveMark, ProactiveTasks, ProactivityLevel,
+    RESEARCH_MEMORY_FOLDER, RESEARCH_OFFERS_MAX_PER_DAY, Routine, RoutineAction, RoutineKind,
+    RoutineOrigin, RoutineSchedule, Suggestion, validate_suggestions,
+};
+use consort_proto::tools::{
+    CancelFollowUpArgs, FollowUpLaterArgs, FollowUpResult, OkResult, SetProactivityArgs,
+    SetProactivityResult, ToolAudience,
+};
+use serde_json::Value;
+
+use super::gate;
+use super::turn::{
+    self, RESEARCH_REFUSAL, TurnKind, denied, notifying_messages_since, turn_notified,
+};
+use crate::error::{HubError, Result};
+use crate::hub::{Hub, ToolCtx};
+use crate::store::{Tx, conversation, proactivity as store, routines};
+
+const MINUTE_MS: i64 = 60 * 1000;
+const DAY_MS: i64 = 24 * 60 * MINUTE_MS;
+
+/// The proactive mark and the suggestions of one message that a
+/// coordinator posts. Call it inside the transaction that posts it.
+pub(crate) struct Posting {
+    pub mark: Option<ProactiveMark>,
+    pub suggestions: Vec<Suggestion>,
+}
+
+/// Decides the mark of a message that a coordinator session posts now: the
+/// kind of its turn, and whether it may notify. A notification needs a
+/// proactive turn, the time outside quiet hours and snooze, no other
+/// notification in this turn, and room under the daily limit. When the hub
+/// holds a notification back, the turn's log entries say so.
+pub(crate) fn posting(
+    tx: &mut Tx<'_>,
+    session_id: SessionId,
+    channel_id: ChannelId,
+    notify: bool,
+    suggestions: Vec<Suggestion>,
+) -> Result<Posting> {
+    validate_suggestions(&suggestions)?;
+    let (kind, row) = turn::turn_of_session(tx.db(), session_id, channel_id)?;
+    if kind == TurnKind::Research {
+        return Err(denied(RESEARCH_REFUSAL));
+    }
+    let mut mark = turn::mark_for(&kind);
+    if let Some(mark) = mark.as_mut()
+        && notify
+    {
+        let now = tx.now();
+        let settings = store::settings(tx.db())?;
+        let since = row.turn_started_at.unwrap_or(now);
+        let allowed = gate::may_notify(&settings, now)
+            && !turn_notified(tx.db(), channel_id, session_id, since)?
+            && notifying_messages_since(tx.db(), gate::start_of_day(&settings, now))?
+                < settings.notify_cap_per_day;
+        if allowed {
+            mark.notify = true;
+        } else {
+            tx.update_turn_wakes(&row.turn_events, |wake| wake.notify_held = true)?;
+        }
+    }
+    Ok(Posting { mark, suggestions })
+}
+
+/// The three options of an offer.
+pub(crate) fn offer_options() -> Vec<DecisionOption> {
+    vec![
+        DecisionOption {
+            label: OFFER_DO_IT.to_owned(),
+            consequence: "The assistant does the work it offered, in draft mode.".to_owned(),
+            id: None,
+        },
+        DecisionOption {
+            label: OFFER_NOT_NOW.to_owned(),
+            consequence: "Nothing happens now. The assistant may ask again later.".to_owned(),
+            id: None,
+        },
+        DecisionOption {
+            label: OFFER_NEVER.to_owned(),
+            consequence:
+                "The assistant adds a skip line to the check-in note and does not offer this again."
+                    .to_owned(),
+            id: None,
+        },
+    ]
+}
+
+/// The rules of `ask_decision` for a coordinator: in a research turn only
+/// offers, at most 3 a day; an offer only at the level Eager. Returns the
+/// mark of the card.
+pub(crate) fn decision_posting(
+    tx: &mut Tx<'_>,
+    session_id: SessionId,
+    channel: &Channel,
+    offer: bool,
+) -> Result<Option<ProactiveMark>> {
+    let (kind, _) = turn::turn_of_session(tx.db(), session_id, channel.id)?;
+    if kind == TurnKind::Research && !offer {
+        return Err(denied(RESEARCH_REFUSAL));
+    }
+    if !offer {
+        return Ok(turn::mark_for(&kind));
+    }
+    if !kind.is_proactive() {
+        return Err(HubError::invalid(
+            "An offer is for a turn that you started on your own. Ask a normal decision instead.",
+        ));
+    }
+    if channel.proactivity_level() < ProactivityLevel::Eager {
+        return Err(denied(format!(
+            "Offers need the level Eager in {}. Ask a normal decision, or tell the user.",
+            channel.name
+        )));
+    }
+    if kind == TurnKind::Research {
+        let settings = store::settings(tx.db())?;
+        let now = tx.now();
+        let made = store::research_offers_since(tx.db(), gate::start_of_day(&settings, now))?;
+        if made >= RESEARCH_OFFERS_MAX_PER_DAY {
+            return Err(denied(format!(
+                "The research pass made {RESEARCH_OFFERS_MAX_PER_DAY} offers today. Keep the rest in memory under research/ and call no_reply_needed."
+            )));
+        }
+    }
+    let mut mark = turn::mark_for(&kind);
+    if let Some(mark) = mark.as_mut() {
+        mark.offer = true;
+    }
+    Ok(mark)
+}
+
+/// The approval mode of a task that a coordinator starts: in a proactive
+/// turn, Ask (draft mode), unless the channel lets such tasks use its
+/// default.
+pub(crate) fn task_approval_mode(
+    conn: &rusqlite::Connection,
+    session_id: SessionId,
+    channel: &Channel,
+    requested: Option<ApprovalMode>,
+) -> Result<(Option<ApprovalMode>, bool)> {
+    let (kind, _) = turn::turn_of_session(conn, session_id, channel.id)?;
+    if kind.is_proactive() && channel.proactive_tasks == ProactiveTasks::Drafts {
+        return Ok((Some(ApprovalMode::Ask), true));
+    }
+    Ok((requested, false))
+}
+
+/// The research pass may write memory only under `research/`.
+pub(crate) fn check_memory_write(
+    conn: &rusqlite::Connection,
+    session_id: SessionId,
+    channel_id: ChannelId,
+    path: &str,
+) -> Result<()> {
+    let (kind, _) = turn::turn_of_session(conn, session_id, channel_id)?;
+    if kind == TurnKind::Research && !path.starts_with(RESEARCH_MEMORY_FOLDER) {
+        return Err(denied(RESEARCH_REFUSAL));
+    }
+    Ok(())
+}
+
+impl Hub {
+    /// Refuses a tool that the kind of the session's turn does not allow.
+    pub(crate) async fn check_turn_tool(
+        &self,
+        ctx: &ToolCtx,
+        tool: consort_proto::tools::HubTool,
+    ) -> Result<()> {
+        if ctx.audience == ToolAudience::TaskSession {
+            return Ok(());
+        }
+        let (session_id, channel_id) = (ctx.session.id, ctx.channel.id);
+        let kind = self
+            .store
+            .read(move |conn| Ok(turn::turn_of_session(conn, session_id, channel_id)?.0))
+            .await?;
+        turn::check_tool(&kind, tool)
+    }
+
+    /// Whether the session runs the research pass now.
+    pub(crate) async fn in_research_turn(&self, ctx: &ToolCtx) -> Result<bool> {
+        if ctx.audience == ToolAudience::TaskSession {
+            return Ok(false);
+        }
+        let (session_id, channel_id) = (ctx.session.id, ctx.channel.id);
+        self.store
+            .read(move |conn| {
+                Ok(turn::turn_of_session(conn, session_id, channel_id)?.0 == TurnKind::Research)
+            })
+            .await
+    }
+
+    /// `no_reply_needed` with a finding: in a proactive turn, the finding goes
+    /// into the log entries of the turn.
+    pub(crate) async fn note_finding(&self, ctx: &ToolCtx, finding: Option<String>) -> Result<()> {
+        let Some(finding) = finding
+            .map(|f| f.trim().to_owned())
+            .filter(|f| !f.is_empty())
+        else {
+            return Ok(());
+        };
+        let finding = crate::util::truncate_chars(&finding, FINDING_MAX_CHARS);
+        let (session_id, channel_id) = (ctx.session.id, ctx.channel.id);
+        self.store
+            .write(move |tx| {
+                let (kind, row) = turn::turn_of_session(tx.db(), session_id, channel_id)?;
+                if kind.is_proactive() {
+                    tx.update_turn_wakes(&row.turn_events, |wake| {
+                        wake.detail = Some(finding.clone());
+                    })?;
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    /// Records the task that a proactive turn started in its log entries.
+    pub(crate) async fn note_turn_task(
+        &self,
+        ctx: &ToolCtx,
+        task_id: consort_proto::ids::TaskId,
+    ) -> Result<()> {
+        let (session_id, channel_id) = (ctx.session.id, ctx.channel.id);
+        self.store
+            .write(move |tx| {
+                let (kind, row) = turn::turn_of_session(tx.db(), session_id, channel_id)?;
+                if kind.is_proactive() {
+                    tx.update_turn_wakes(&row.turn_events, |wake| {
+                        wake.task_id.get_or_insert(task_id);
+                    })?;
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    pub(crate) async fn tool_follow_up_later(
+        &self,
+        ctx: &ToolCtx,
+        args: FollowUpLaterArgs,
+    ) -> Result<Value> {
+        let reason = args.reason.trim().to_owned();
+        if reason.is_empty() {
+            return Err(HubError::invalid(
+                "The reason is empty. Say in one line why you will wake.",
+            ));
+        }
+        if reason.chars().count() > FOLLOW_UP_REASON_MAX_CHARS {
+            return Err(HubError::invalid(format!(
+                "The reason is longer than {FOLLOW_UP_REASON_MAX_CHARS} characters. Use one short line."
+            )));
+        }
+        let key = args
+            .key
+            .map(|k| k.trim().to_owned())
+            .filter(|k| !k.is_empty());
+        if key.as_ref().is_some_and(|k| k.chars().count() > 80) {
+            return Err(HubError::invalid(
+                "The key is longer than 80 characters. Use a short key.",
+            ));
+        }
+        let channel_id = ctx.channel.id;
+        let result = self
+            .store
+            .write(move |tx| {
+                let now = tx.now();
+                let at = match (args.after_minutes, args.at) {
+                    (Some(minutes), None) => now.plus_millis(
+                        i64::try_from(minutes)
+                            .unwrap_or(i64::MAX / MINUTE_MS)
+                            .saturating_mul(MINUTE_MS),
+                    ),
+                    (None, Some(at)) => at,
+                    _ => {
+                        return Err(HubError::invalid(
+                            "Give after_minutes or at, not both and not neither.",
+                        ));
+                    }
+                };
+                let min = i64::try_from(FOLLOW_UP_MIN_MINUTES).unwrap_or(15) * MINUTE_MS;
+                let max = i64::try_from(FOLLOW_UP_MAX_DAYS).unwrap_or(30) * DAY_MS;
+                if at.as_millis() - now.as_millis() < min {
+                    return Err(HubError::invalid(format!(
+                        "A follow-up must be at least {FOLLOW_UP_MIN_MINUTES} minutes ahead. Choose a later time."
+                    )));
+                }
+                if at.as_millis() - now.as_millis() > max {
+                    return Err(HubError::invalid(format!(
+                        "A follow-up can be at most {FOLLOW_UP_MAX_DAYS} days ahead. Choose an earlier time."
+                    )));
+                }
+                let channel = conversation::channel_or_404(tx.db(), channel_id)?;
+                if channel.proactivity_level() == ProactivityLevel::Off {
+                    return Err(denied(format!(
+                        "The proactivity level of {} is Off, so you cannot wake on your own here. Tell the user what to check instead.",
+                        channel.name
+                    )));
+                }
+                let replaced = match &key {
+                    Some(key) => store::follow_up_by_key(tx.db(), channel_id, key)?,
+                    None => None,
+                };
+                if let Some(old) = &replaced {
+                    if let Some(routine) = routines::routine(tx.db(), old.routine_id)? {
+                        tx.delete_routine(&routine)?;
+                    }
+                    tx.delete_follow_up_row(old.routine_id)?;
+                }
+                let waiting = routines::routines_in_channel(tx.db(), channel_id)?
+                    .iter()
+                    .filter(|r| r.kind == RoutineKind::FollowUp && r.enabled)
+                    .count();
+                if waiting >= FOLLOW_UPS_MAX_PER_CHANNEL {
+                    return Err(HubError::conflict(format!(
+                        "{FOLLOW_UPS_MAX_PER_CHANNEL} follow-ups wait in this channel already. Cancel one with cancel_follow_up first."
+                    )));
+                }
+                let routine = Routine {
+                    id: RoutineId::new(),
+                    channel_id,
+                    name: "Follow-up".to_owned(),
+                    schedule: RoutineSchedule::Once { at },
+                    prompt: reason,
+                    action: RoutineAction::CoordinatorTurn,
+                    enabled: true,
+                    next_run_at: Some(at),
+                    last_run_at: None,
+                    last_run_status: None,
+                    kind: RoutineKind::FollowUp,
+                    origin: RoutineOrigin::Assistant,
+                    created_at: Some(now),
+                };
+                tx.save_routine(&routine)?;
+                tx.save_follow_up(&store::FollowUpRow {
+                    routine_id: routine.id,
+                    channel_id,
+                    key,
+                    set_at: now,
+                })?;
+                Ok(FollowUpResult {
+                    routine_id: routine.id,
+                    at,
+                    replaced: replaced.map(|r| r.routine_id),
+                })
+            })
+            .await?;
+        Ok(serde_json::to_value(result)?)
+    }
+
+    pub(crate) async fn tool_cancel_follow_up(
+        &self,
+        ctx: &ToolCtx,
+        args: CancelFollowUpArgs,
+    ) -> Result<Value> {
+        let channel_id = ctx.channel.id;
+        self.store
+            .write(move |tx| {
+                let id = match (args.routine_id, args.key.as_deref()) {
+                    (Some(id), _) => id,
+                    (None, Some(key)) => store::follow_up_by_key(tx.db(), channel_id, key.trim())?
+                        .map(|row| row.routine_id)
+                        .ok_or_else(|| {
+                            HubError::not_found(format!(
+                                "No follow-up with the key \"{key}\" waits in this channel."
+                            ))
+                        })?,
+                    (None, None) => {
+                        return Err(HubError::invalid("Give routine_id or key."));
+                    }
+                };
+                let routine = routines::routine(tx.db(), id)?
+                    .filter(|r| r.channel_id == channel_id && r.kind == RoutineKind::FollowUp)
+                    .ok_or_else(|| {
+                        HubError::not_found(format!(
+                            "The follow-up {id} does not wait in this channel."
+                        ))
+                    })?;
+                tx.delete_routine(&routine)?;
+                tx.delete_follow_up_row(routine.id)
+            })
+            .await?;
+        Ok(serde_json::to_value(OkResult::OK)?)
+    }
+
+    pub(crate) async fn tool_set_proactivity(
+        &self,
+        ctx: &ToolCtx,
+        args: SetProactivityArgs,
+    ) -> Result<Value> {
+        if args.level.is_none() && args.snooze.is_none() {
+            return Err(HubError::invalid("Give level, snooze or both."));
+        }
+        let target = match args.channel_id {
+            Some(id) if id != ctx.channel.id => {
+                if ctx.audience != ToolAudience::TuttiCoordinator {
+                    return Err(denied(
+                        "You can change only this channel. Tutti can change other channels.",
+                    ));
+                }
+                id
+            }
+            _ => ctx.channel.id,
+        };
+        let result = self
+            .store
+            .write(move |tx| {
+                let now = tx.now();
+                let mut channel = conversation::channel_or_404(tx.db(), target)?;
+                if let Some(level) = args.level {
+                    let current = channel.proactivity_level();
+                    if level > current {
+                        return Err(denied(format!(
+                            "You cannot raise the level of {} from {} to {}. Only the user can, in Settings > Proactivity or in the channel settings.",
+                            channel.name,
+                            current.label(),
+                            level.label()
+                        )));
+                    }
+                    if level != current {
+                        channel.proactivity = Some(level);
+                        channel.updated_at = now;
+                        tx.save_channel(&channel)?;
+                        super::routines::sync_channel_routines(tx, &channel)?;
+                    }
+                }
+                let mut settings = store::settings(tx.db())?;
+                if let Some(choice) = args.snooze {
+                    settings.snoozed_until = gate::snooze_until(&settings, choice, now);
+                    tx.save_proactivity_settings(&settings)?;
+                }
+                Ok(SetProactivityResult {
+                    level: channel.proactivity_level(),
+                    snoozed_until: settings.snoozed_until.filter(|until| *until > now),
+                })
+            })
+            .await?;
+        Ok(serde_json::to_value(result)?)
+    }
+}

@@ -885,6 +885,9 @@ fn routine_views(cache: &Cache) -> Vec<crate::routines::RoutineView> {
                 last_run_at: r.last_run_at.map(|t| t.as_millis()),
                 last_run_status: r.last_run_status,
                 runs,
+                kind: r.kind,
+                origin: r.origin,
+                created_at: r.created_at.map(|t| t.as_millis()),
             }
         })
         .collect();
@@ -1277,6 +1280,7 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                     time_label: format::time_label(at),
                     created_at: at,
                     decision,
+                    proactive: None,
                 }));
             } else if m.kind == MessageKind::Notice {
                 let (kind, text) = notice_parts(&m.body);
@@ -1305,6 +1309,8 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                     reply_count: m.reply_count,
                     pending: false,
                     attachments: attachment_views(&m.attachments, &artifacts, cache),
+                    proactive: None,
+                    suggestions: Vec::new(),
                 }));
             }
         }
@@ -1755,7 +1761,9 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
         memory_notes: memory_note_views(cache),
         memory_loaded: cache.memory_loaded.iter().cloned().collect(),
         memory_deleted_loaded: cache.memory_deleted_loaded.iter().cloned().collect(),
+        proactivity: crate::proactivity::proactivity_view(cache, now),
     };
+    crate::proactivity::decorate_timelines(cache, &mut state.timelines);
     state.activity = channel_activities(cache, &state);
     // Collapsed groups and unread counts come from the hub, so seed the
     // sidebar before the shared rules rebuild it.
@@ -2013,6 +2021,8 @@ mod tests {
             created_at: Timestamp::from_millis(NOW - 100_000),
             updated_at: Timestamp::from_millis(NOW - 100_000),
             tags: Vec::new(),
+            proactive_tasks: Default::default(),
+            proactivity: None,
         }
     }
 
@@ -2043,6 +2053,8 @@ mod tests {
             edited_at: None,
             deleted_at: None,
             created_at: Timestamp::from_millis(at),
+            proactive: None,
+            suggestions: Vec::new(),
         }
     }
 

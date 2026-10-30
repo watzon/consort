@@ -98,6 +98,38 @@ _Avoid_: state, stage
 A prompt that the hub runs on a schedule in one channel.
 _Avoid_: cron job, scheduled task, automation, trigger
 
+**Proactive turn**:
+A coordinator turn whose wake events are all proactive, such as a check-in or a follow-up. A turn that also has a user message is a normal turn.
+_Avoid_: background turn, autonomous turn
+
+**Proactivity level**:
+How much the assistant starts on its own in one channel: Off, Quiet, Normal or Eager.
+_Avoid_: autonomy, mode
+
+**Check-in**:
+A routine of kind `check_in` that wakes the coordinator to look for things that need the user.
+_Avoid_: heartbeat, poll
+
+**Check-in note**:
+The memory note `check-in.md` that says what to watch and what to skip. Tutti's note is in global memory. A channel can have its own note in its channel memory.
+_Avoid_: heartbeat file, checklist
+
+**Follow-up**:
+A one-time wake that the assistant sets for itself, with a reason.
+_Avoid_: reminder, wake-up, commitment
+
+**Offer**:
+A decision that the assistant posts on its own initiative, with the options "Do it", "Not now" and "Never about this".
+_Avoid_: suggestion, proposal
+
+**Quiet hours**:
+The hours when the assistant starts nothing and sends no notifications.
+_Avoid_: do not disturb, active hours
+
+**Proactivity log**:
+The list of every proactive wake and its outcome.
+_Avoid_: audit log, history
+
 **Coordinator**:
 The session that speaks for the assistant in one channel.
 _Avoid_: main agent, orchestrator, channel bot

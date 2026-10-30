@@ -22,13 +22,14 @@ use crate::model::{
     ApprovalMode, AuthState, Channel, ChannelFile, ChannelKind, CheckoutInfo, DecisionOption,
     ExpectedHash, Isolation, MemoryNoteSummary, MemoryScope, Message, ModelSelection, Os,
     PlacementRequire, Routine, RoutineAction, RoutineSchedule, SessionItem, SessionRole,
-    Sha256Hash, Task, Worker, WorkerState,
+    Sha256Hash, Suggestion, Task, Worker, WorkerState,
 };
 use crate::status::TaskStatus;
 use crate::time::Timestamp;
 
 mod connectors;
 mod management;
+mod proactivity;
 
 pub use connectors::{
     CONNECTOR_APPROVAL_WAIT_MS, CONNECTOR_RESULT_MAX_BYTES, CONNECTOR_TOOLS_LIST_MAX,
@@ -44,6 +45,10 @@ pub use management::{
     SetAccountExtrasArgs, SetChannelConnectorArgs, SetChannelSkillArgs, SetChannelTagsArgs,
     SetDefaultModelArgs, SetWorkerTagsArgs, StartSignInArgs, UpdateChannelArgs,
     UpdateConnectionArgs, UpdateSkillArgs, UpdateThisChannelArgs,
+};
+pub use proactivity::{
+    CancelFollowUpArgs, FollowUpLaterArgs, FollowUpResult, NoReplyNeededArgs, SetProactivityArgs,
+    SetProactivityResult,
 };
 
 /// The kind of session that a tool is for.
@@ -278,7 +283,9 @@ pub struct AskDecisionArgs {
     /// The question. At most 1,200 characters.
     pub question: String,
     /// Two to four options. Each label has at most 40 characters and each
-    /// consequence at most 800.
+    /// consequence at most 800. Leave it out for an offer: the hub sets
+    /// "Do it", "Not now" and "Never about this".
+    #[serde(default)]
     pub options: Vec<DecisionOption>,
     /// The index of the option that you recommend.
     #[serde(default)]
@@ -289,6 +296,11 @@ pub struct AskDecisionArgs {
     /// Let the user answer with their own text.
     #[serde(default)]
     pub allow_free_text: bool,
+    /// An offer: in a turn that you started on your own, propose work that
+    /// you would do. Say in `context` what you will do and what you will
+    /// not do. Only in a channel at the level Eager.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub offer: bool,
 }
 
 /// `search`.
@@ -309,6 +321,16 @@ pub struct PostMessageArgs {
     /// Channel file paths to attach.
     #[serde(default)]
     pub attachments: Vec<String>,
+    /// At most four quick replies under the message, each at most 40
+    /// characters. A `type` suggestion, such as "I will type it", only moves
+    /// the focus to the composer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suggestions: Vec<Suggestion>,
+    /// In a turn that you started on your own: ask for an OS notification.
+    /// Only when the user must act or a deadline is inside 24 hours. The
+    /// hub allows a few a day and none in quiet hours.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub notify: bool,
 }
 
 /// `reply`.
@@ -324,6 +346,10 @@ pub struct ReplyArgs {
     /// Channel file paths to attach.
     #[serde(default)]
     pub attachments: Vec<String>,
+    /// At most four quick replies under the reply, each at most 40
+    /// characters.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suggestions: Vec<Suggestion>,
 }
 
 /// `update_message`.
@@ -712,8 +738,8 @@ hub_tools! {
     React("react", ReactArgs, COORDINATORS,
         "Add an emoji reaction to a message."),
     /// `no_reply_needed`.
-    NoReplyNeeded("no_reply_needed", NoArgs, COORDINATORS,
-        "End the turn without a visible reply. Use it when the events need no answer."),
+    NoReplyNeeded("no_reply_needed", NoReplyNeededArgs, COORDINATORS,
+        "End the turn without a visible reply. Use it when the events need no answer. In a turn that you started on your own, give a finding: one short line about what you saw and did not report."),
     /// `fetch_timeline`.
     FetchTimeline("fetch_timeline", FetchTimelineArgs, COORDINATORS,
         "Get older messages from the channel timeline, newest first."),
@@ -759,6 +785,15 @@ hub_tools! {
     /// `routine_delete`.
     RoutineDelete("routine_delete", RoutineDeleteArgs, COORDINATORS,
         "Delete a routine."),
+    /// `follow_up_later`.
+    FollowUpLater("follow_up_later", FollowUpLaterArgs, COORDINATORS,
+        "Wake yourself later in this channel, once, with a reason. Use it when you said you would check again, for example after a vendor replies. The same key replaces the old follow-up. At least 15 minutes and at most 30 days ahead, and at most 20 waiting in a channel."),
+    /// `cancel_follow_up`.
+    CancelFollowUp("cancel_follow_up", CancelFollowUpArgs, COORDINATORS,
+        "Cancel a follow-up that you set, by its routine ID or its key."),
+    /// `set_proactivity`.
+    SetProactivity("set_proactivity", SetProactivityArgs, COORDINATORS,
+        "Make yourself quieter when the user asks, for example \"stop pinging me\" or \"not today\". Set a quieter level for this channel, or snooze everything that starts on its own. You cannot set a louder level: tell the user to change it in Settings > Proactivity."),
     /// `list_connections`.
     ListConnections("list_connections", NoArgs, COORDINATORS,
         "List the connections with their handle, service, account, scope, approval rules and status. In a channel, it lists the ones that this channel can use, and says which ones this channel turned off."),
@@ -1370,6 +1405,9 @@ mod tests {
             "routine_create",
             "routine_update",
             "routine_delete",
+            "follow_up_later",
+            "cancel_follow_up",
+            "set_proactivity",
         ];
         let every_extensions = [
             "list_connector_tools",
@@ -1496,7 +1534,9 @@ mod tests {
             .iter()
             .map(|v| v.as_str().unwrap())
             .collect();
-        assert_eq!(required, ["question", "options"]);
+        // An offer leaves out the options: the hub sets them.
+        assert_eq!(required, ["question"]);
+        assert!(schema["properties"]["offer"].is_object());
         let option = &schema["properties"]["options"]["items"];
         assert!(option["properties"]["label"].is_object());
         assert!(option["properties"]["consequence"].is_object());
@@ -1517,7 +1557,21 @@ mod tests {
         );
         assert!(start.get("description").is_none());
         let none = HubTool::NoReplyNeeded.input_schema();
-        assert_eq!(none["properties"], json!({}));
+        assert!(none["properties"]["finding"].is_object());
+        assert!(none.get("required").is_none());
+        let list = HubTool::RoutineList.input_schema();
+        assert_eq!(list["properties"], json!({}));
+        let post = HubTool::PostMessage.input_schema();
+        assert!(post["properties"]["suggestions"]["items"]["properties"]["action"].is_object());
+        assert!(post["properties"]["notify"].is_object());
+        let follow = HubTool::FollowUpLater.input_schema();
+        let required: Vec<&str> = follow["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(required, ["reason"]);
     }
 
     #[test]
@@ -1541,7 +1595,10 @@ mod tests {
         assert_eq!(call.tool(), HubTool::AskDecision);
 
         let none = HubToolCall::parse("no_reply_needed", Value::Null).unwrap();
-        assert_eq!(none, HubToolCall::NoReplyNeeded(NoArgs {}));
+        assert_eq!(
+            none,
+            HubToolCall::NoReplyNeeded(NoReplyNeededArgs::default())
+        );
 
         let start = HubToolCall::parse(
             "start_task",

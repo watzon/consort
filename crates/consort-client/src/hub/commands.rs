@@ -797,6 +797,15 @@ async fn run(shared: Arc<Shared>, command: Command) -> Result<CommandOutput, Cli
         | Command::RevokeClient { .. }
         | Command::ClientPairingCode
         | Command::CancelClientPairing) => return super::admin::run(&shared, command).await,
+        // Settings > Proactivity.
+        command @ (Command::LoadProactivityLog
+        | Command::SetProactivity(_)
+        | Command::SnoozeProactivity(_)
+        | Command::CancelAllFollowUps { .. }
+        | Command::SetChannelProactivity { .. }
+        | Command::RateMessage { .. }) => {
+            return super::proactivity::run(&shared, command).await;
+        }
         // Routines and memory.
         command @ (Command::SaveRoutine { .. }
         | Command::SetRoutineEnabled { .. }

@@ -508,6 +508,8 @@ impl Hub {
                     allowed_local_mcp_servers: None,
                     memory_enabled: None,
                     tags,
+                    proactive_tasks: None,
+                    proactivity: None,
                 },
             )
             .await?

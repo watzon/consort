@@ -35,6 +35,11 @@ pub struct RoutineView {
     /// ([`crate::Command::LoadRoutineRuns`]).
     pub runs: Vec<RoutineRunView>,
     pub runs_loaded: bool,
+    /// What the routine is for: a check-in or a follow-up shows apart.
+    pub kind: consort_proto::model::RoutineKind,
+    pub origin: consort_proto::model::RoutineOrigin,
+    /// When it was made, in Unix milliseconds.
+    pub created_at: Option<i64>,
 }
 
 /// What a routine does when it runs.
@@ -1529,6 +1534,9 @@ mod tests {
             last_run_status: status,
             runs: Vec::new(),
             runs_loaded: false,
+            created_at: None,
+            kind: Default::default(),
+            origin: Default::default(),
         }
     }
 

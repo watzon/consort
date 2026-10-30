@@ -330,6 +330,23 @@ Connectors and skills use these sizes. The Add connector and Add skill dialogs a
 
 A service logo is the image that Composio gives. The client loads it (`https` only, at most 256 KiB, SVG, PNG, JPEG, WebP or GIF). Until it loads, and when it does not, the logo is a monogram: the first letter of the service on `surface.selected`.
 
+### The assistant on its own
+
+The values come from the Paper artboards `FYE-0`, `G2C-0`, `G8V-0`, `F6N-0`, `FDX-0` and `FJC-0`, through `component.proactivity` in `structure.json`.
+
+- **Settings > Proactivity** is a settings page of `settings_detail_max`. Its parts, in order: When the assistant may start things (Pause all, Quiet hours, Snooze, Follow-ups), Each channel, Today, and Activity. The settings rail item is "Proactivity" with the `eye` icon, after Routines.
+- **The quiet hours** are two `time_box` (72 px) boxes in mono with no chevron, and a `zone_select` (168 px) time zone select.
+- **Each channel** shows its icon, its name, the meaning of its level, and a `level_select` (112 px) select with no color. A channel at Off says "The assistant only answers here." The channel settings dialog reuses the same select, wider, with "Default for this channel" and a helper line.
+- **Today** has two numbers in Heading and one `count_bar` (4 px) bar in `status.working` on `surface.selected`. A full bar is not an error.
+- **The log** has four lanes: `log_time` (68 px), `log_place` (112 px, the channel and the kind), `log_result` (176 px) and the detail. A result is in words: Notified in `accent.text`, Failed in `status.failed`, Posted in `text.primary`, every skip and Stayed silent in `text.tertiary`. "Open message" is an underlined link. The filters are two `filter_select` (146 px) selects.
+- **A proactive mark** is a caption above the first bubble of the group: a `mark_icon` (14 px) icon, `mark_gap` (6 px), the kind in Label and `text.tertiary`. A follow-up's reason sits under it, indented `reason_indent` (20 px). The icons: `eye` for a check-in, `sun` for the morning brief, `clock` for a follow-up, `compose` for an offer.
+- **Useful and Too noisy** show under the bubble on hover, in Label with `feedback_pad_x` by `feedback_pad_y` (8 by 2 px) padding, no border; hover and the chosen rating are on `surface.selected`.
+- **The offer card** is a bubble-shaped card on `surface.card` with a `border.subtle` line, `offer_pad_top` (12 px) and `offer_pad` (14 px) padding: the question in Body at the title weight, the context in UI and `text.secondary`, then Do it (primary), Not now (secondary) and Never about this (quiet).
+- **The morning brief** is one bubble: the first line, then the group labels in Label (Needs you and Ready for review in `accent.text`, Done since yesterday in `text.tertiary`), and numbered items whose name is an underlined link.
+- **Quick-reply chips** are pills on `surface.raised` with a `border.strong` line and `chip_pad_x` by `chip_pad_y` (14 by 5 px) padding, `chip_gap` (6 px) apart. "I will type it" has a dashed border and no fill.
+- **The writing bubble** is a bubble with `writing_pad_x` by `writing_pad_y` (16 by 13 px) padding and three `dab` (10 px) dabs of the mark, `dab_gap` (5 px) apart: gold `dab_drop` (2 px) low, verdigris `dab_rise` (3 px) high, lapis 1 px low. The dabs are `assets/glyphs/dab-*.svg`, in three hand-drawn versions each, and shimmer on the shared mark clock; they stand still with Reduce motion.
+- **The Routines tab** shows the check-in first, with the `eye` icon, "Every 6 hours, uses `check-in.md`" and its last result from the log ("Stayed silent at 7:25."). Its hover actions are Run now, Run history and Open note, and its menu has no Edit. The Follow-ups section lists each follow-up with the `clock` icon, its reason as the title and its time ("Today at 15:00, set this morning"), Cancel on hover, and Cancel all.
+
 ### Hub, Clients and Notifications
 
 Settings pages that are not lists (Hub, Clients, Notifications) use one column of `settings_detail_max` (760 px), with section titles in Body at the title weight and bordered row groups (`border.subtle`, `lg` corners, rows with 12 by 16 px padding). The values come from the Paper artboards `7JP-0`, `86L-0`, `8L0-0` and `8XN-0`, through `component.admin` in `structure.json`:

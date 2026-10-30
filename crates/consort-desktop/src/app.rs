@@ -120,6 +120,7 @@ pub enum SettingsSection {
     Skills,
     Memory,
     Routines,
+    Proactivity,
 }
 
 /// The open dialog.
@@ -429,6 +430,8 @@ pub struct ConsortApp {
     /// Routines and memory: their tabs, dialogs and the note editor.
     pub knowledge: crate::knowledge::KnowledgeState,
     pub knowledge_inputs: crate::knowledge::KnowledgeInputs,
+    /// Settings > Proactivity, the ratings and the quick replies.
+    pub proactivity: crate::proactivity::ProactivityUi,
     pub focus: FocusHandle,
     styled_for: Option<(gpui_kit::SharedString, consort_theme::Mode)>,
     _subscriptions: Vec<Subscription>,
@@ -726,6 +729,7 @@ impl ConsortApp {
             admin,
             knowledge: crate::knowledge::KnowledgeState::default(),
             knowledge_inputs,
+            proactivity: crate::proactivity::ProactivityUi::default(),
             focus: cx.focus_handle(),
             styled_for: None,
             _subscriptions: subscriptions,
@@ -1112,14 +1116,21 @@ impl ConsortApp {
     /// spliced in, so the list keeps following new messages; other changes
     /// reset it.
     pub fn sync_lists(&mut self) {
-        let (rows, keys) = match self.state.timeline(&self.channel_id) {
+        let (rows, mut keys) = match self.state.timeline(&self.channel_id) {
             Some(t) => {
                 let rows = consort_client::chat::rows(&t.items);
-                let keys = rows.iter().map(|r| r.key(&t.items)).collect();
+                let keys: Vec<String> = rows.iter().map(|r| r.key(&t.items)).collect();
                 (rows, keys)
             }
             None => (Vec::new(), Vec::new()),
         };
+        // The writing bubble hangs under the last row, so that row is
+        // measured again when the bubble comes or goes.
+        if consort_client::proactivity::is_writing(&self.state, &self.channel_id)
+            && let Some(last) = keys.last_mut()
+        {
+            last.push_str("+writing");
+        }
         self.chat_rows = rows;
         let channel_changed = self.timeline_channel != self.channel_id;
         sync_list(
@@ -1653,6 +1664,9 @@ impl ConsortApp {
             screen if crate::knowledge::SCREENS.contains(&screen) => {
                 self.open_knowledge_screen(screen, window, cx)
             }
+            screen if crate::proactivity::SCREENS.contains(&screen) => {
+                self.open_proactive_screen(screen, window, cx);
+            }
             other => {
                 self.open_admin_screen(other, window, cx);
             }
@@ -2012,6 +2026,9 @@ impl ConsortApp {
         }
         if section == SettingsSection::Connectors {
             self.enter_connectors(cx);
+        }
+        if section == SettingsSection::Proactivity {
+            self.load_proactivity_log(cx);
         }
         if section == SettingsSection::Skills {
             self.enter_skills(cx);

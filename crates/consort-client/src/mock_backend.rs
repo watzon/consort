@@ -746,6 +746,15 @@ impl MockBackend {
             | Command::CancelClientPairing) => {
                 applied.output = crate::mock_admin::apply(&mut state, command, &mut applied.later)?;
             }
+            // Settings > Proactivity.
+            command @ (Command::LoadProactivityLog
+            | Command::SetProactivity(_)
+            | Command::SnoozeProactivity(_)
+            | Command::CancelAllFollowUps { .. }
+            | Command::SetChannelProactivity { .. }
+            | Command::RateMessage { .. }) => {
+                applied.output = crate::mock_proactivity::apply(&mut state, command)?;
+            }
             // Routines and memory.
             command @ (Command::SaveRoutine { .. }
             | Command::SetRoutineEnabled { .. }

@@ -463,6 +463,9 @@ impl ConsortApp {
             let count = self.timeline_keys.len();
             let max_width = t.layout.timeline_max_width;
             let inset = t.space.xl;
+            // The writing bubble follows the last row while a turn owes a
+            // reply (`consort_client::proactivity::is_writing`).
+            let writing = consort_client::proactivity::is_writing(&self.state, &self.channel_id);
             list(
                 self.timeline.clone(),
                 cx.processor(move |this, ix: usize, window, cx| {
@@ -471,6 +474,8 @@ impl ConsortApp {
                         return div().into_any_element();
                     };
                     let (top, content) = this.render_chat_row(&row, &t, window, cx);
+                    let bubble =
+                        (writing && ix + 1 == count).then(|| this.render_writing_bubble(&t, cx));
                     div()
                         .w_full()
                         .flex()
@@ -478,7 +483,15 @@ impl ConsortApp {
                         .px(inset)
                         .pt(top)
                         .when(ix + 1 == count, |d| d.pb(t.space.sm))
-                        .child(div().w_full().max_w(max_width).child(content))
+                        .child(
+                            div()
+                                .w_full()
+                                .max_w(max_width)
+                                .child(content)
+                                .when_some(bubble, |d, bubble| {
+                                    d.child(div().flex().pt(t.space.lg).child(bubble))
+                                }),
+                        )
                         .into_any_element()
                 }),
             )
@@ -736,11 +749,14 @@ impl ConsortApp {
                 )
                 .min_w_0(),
             )
-            .child(text(
-                notice.time_label.clone(),
-                t.text.caption,
-                c.text_tertiary,
-            ))
+            // The line that starts a channel sits under its time separator.
+            .when(notice.kind != "channel_created", |d| {
+                d.child(text(
+                    notice.time_label.clone(),
+                    t.text.caption,
+                    c.text_tertiary,
+                ))
+            })
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
@@ -815,6 +831,11 @@ impl ConsortApp {
                         }),
                     ),
             );
+        } else if let Some(brief) = (!you && consort_client::proactivity::is_brief(&message))
+            .then(|| consort_client::proactivity::parse_brief(&message.body))
+            .flatten()
+        {
+            content = content.child(self.render_brief(&key, &brief, t, cx));
         } else if !row.markdown.is_empty() {
             let code = if you {
                 c.surface_card
@@ -866,7 +887,33 @@ impl ConsortApp {
         } else {
             None
         };
-        lane.child(bubble)
+        // A message that the assistant posted on its own: its mark above the
+        // first bubble, Useful and Too noisy under the last one on hover,
+        // and quick replies under the newest message.
+        let caption = message
+            .proactive
+            .as_ref()
+            .filter(|m| row.part == 0 && m.show_caption)
+            .map(|m| self.render_mark_caption(m, t));
+        let hovered = self.proactivity.hovered.as_deref() == Some(message.id.as_str());
+        let feedback = message
+            .proactive
+            .as_ref()
+            .filter(|m| last_part && (hovered || m.rating.is_some()))
+            .map(|m| self.render_feedback(&message.id, m.rating, t, cx));
+        // Chips show only under the newest message: any reply hides them.
+        let newest = self.state.timeline(&self.channel_id).and_then(|tl| {
+            tl.items
+                .iter()
+                .rposition(|i| matches!(i, TimelineItem::Message(_)))
+        });
+        let chips = (last_part && !message.suggestions.is_empty() && newest == Some(row.item))
+            .then(|| self.render_chips(&message.suggestions, t, cx));
+        let hover_id = message.id.clone();
+        let proactive = message.proactive.is_some();
+        let body = lane
+            .when_some(caption, |d, caption| d.child(caption))
+            .child(bubble)
             .when_some(note, |d, note| {
                 d.child(
                     text(note, t.text.caption, c.text_tertiary)
@@ -874,6 +921,24 @@ impl ConsortApp {
                         .px(chat.bubble_pad_x),
                 )
             })
+            .when_some(feedback, |d, feedback| d.child(feedback.pt(t.space.xs)))
+            .when_some(chips, |d, chips| d.child(chips));
+        // The pointer over a proactive message shows its feedback actions,
+        // which sit under the bubble, inside this region.
+        div()
+            .id(SharedString::from(format!("message-{key}")))
+            .w_full()
+            .when(proactive, |d| {
+                d.on_hover(cx.listener(move |this, on: &bool, _, cx| {
+                    if *on {
+                        this.proactivity.hovered = Some(hover_id.clone());
+                    } else if this.proactivity.hovered.as_deref() == Some(hover_id.as_str()) {
+                        this.proactivity.hovered = None;
+                    }
+                    cx.notify();
+                }))
+            })
+            .child(body)
             .into_any_element()
     }
 
@@ -1054,6 +1119,17 @@ impl ConsortApp {
                         cx,
                     ))
                     .child(card_frame(element))
+                    .into_any_element()
+            }
+            TimelineItem::Decision(card) if card.proactive.as_ref().is_some_and(|m| m.offer) => {
+                let mark = card.proactive.clone().unwrap_or_default();
+                let element = self.render_offer_card(&card.decision, t, cx);
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(t.space.xs)
+                    .child(self.render_mark_caption(&mark, t))
+                    .child(element)
                     .into_any_element()
             }
             TimelineItem::Decision(card) => {

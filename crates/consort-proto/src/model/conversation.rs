@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use super::common::{BlobRef, ModelSelection};
 use super::knowledge::MemoryScope;
+use super::proactivity::{ProactiveMark, ProactiveTasks, ProactivityLevel, Suggestion};
 use super::work::{ApprovalMode, Isolation};
 use crate::ids::{
     ChannelId, ConnectionId, GroupId, MessageId, RepoId, RoutineId, SessionId, SkillId, TaskId,
@@ -99,9 +100,24 @@ pub struct Channel {
     pub created_at: Timestamp,
     /// When the channel last changed.
     pub updated_at: Timestamp,
+    /// The proactivity level. Empty means the default for the channel kind:
+    /// Normal in Tutti, Quiet elsewhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proactivity: Option<ProactivityLevel>,
+    /// What a task that a proactive turn starts may do. The default is
+    /// draft mode.
+    #[serde(default)]
+    pub proactive_tasks: ProactiveTasks,
 }
 
 impl Channel {
+    /// The proactivity level that applies: the channel's own, or the
+    /// default for its kind.
+    pub fn proactivity_level(&self) -> ProactivityLevel {
+        self.proactivity
+            .unwrap_or_else(|| ProactivityLevel::default_for(self.kind))
+    }
+
     /// Whether this is the Tutti channel.
     pub fn is_tutti(&self) -> bool {
         self.kind == ChannelKind::Tutti
@@ -235,6 +251,12 @@ pub struct Message {
     pub deleted_at: Option<Timestamp>,
     /// When the message was posted.
     pub created_at: Timestamp,
+    /// Quick replies under an assistant message. At most four.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suggestions: Vec<Suggestion>,
+    /// Set on a message that a proactive turn posted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proactive: Option<ProactiveMark>,
 }
 
 impl Message {

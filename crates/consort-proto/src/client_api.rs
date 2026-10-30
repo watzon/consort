@@ -31,8 +31,9 @@ use crate::ids::{
 use crate::model::{
     AcpAccountSpec, AcpRegistryAgent, Approval, ApprovalMode, BlobRef, Channel, ChannelFile,
     Client, Connection, Decision, DecisionAnswer, ExpectedHash, FavoriteModel, Group, Isolation,
-    MemoryNote, MemoryScope, Message, ModelSelection, PREFERENCES_ENTITY_ID, PlacementRequest,
-    Preferences, PushProvider, ReadMarker, Repo, Routine, RoutineAction, RoutineRun,
+    MemoryNote, MemoryScope, Message, ModelSelection, PREFERENCES_ENTITY_ID, PROACTIVITY_ENTITY_ID,
+    PlacementRequest, Preferences, ProactiveTasks, ProactiveWake, ProactivityLevel,
+    ProactivitySettings, PushProvider, ReadMarker, Repo, Routine, RoutineAction, RoutineRun,
     RoutineSchedule, SecretEnv, SessionItem, Sha256Hash, SignIn, SignInMethod, Skill, Task, ToolId,
     Worker, memory_note_entity_id,
 };
@@ -42,6 +43,7 @@ use crate::worker_link::ItemDetailResult;
 
 mod connectors;
 mod hub_admin;
+mod proactivity;
 mod skills;
 
 pub use connectors::{
@@ -58,6 +60,11 @@ pub use hub_admin::{
     BackupInfo, BackupProgress, BackupRecord, BackupSchedule, BackupSettings, BackupTrigger,
     HubBackup, HubBackupResult, HubBackupSettings, HubBackupSettingsResult, HubInfo, HubStatus,
     HubStatusResult, HubStorage, Weekday, parse_time,
+};
+pub use proactivity::{
+    MessageRate, PROACTIVITY_LOG_PAGE_MAX, ProactivityCancelFollowUps,
+    ProactivityCancelFollowUpsResult, ProactivityGet, ProactivityLog, ProactivityLogResult,
+    ProactivityResult, ProactivitySet, ProactivitySnooze,
 };
 pub use skills::{
     SKILL_DIRECTORY_PAGE_MAX, SkillDirectoryAddSource, SkillDirectoryRemoveSource,
@@ -213,6 +220,10 @@ pub struct Snapshot {
     /// Every installed skill, for the scope `all`. Left out when empty.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub skills: Vec<Skill>,
+    /// The proactivity settings, for the scope `all`. A channel snapshot
+    /// and a snapshot from an older hub leave it out.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub proactivity: Option<ProactivitySettings>,
 }
 
 /// `sync.subscribe`. The hub answers `ok`, then sends every feed entry after
@@ -271,6 +282,11 @@ pub enum EntityKind {
     Connection,
     /// [`Skill`].
     Skill,
+    /// [`ProactivitySettings`]. There is one record, with the ID
+    /// [`PROACTIVITY_ENTITY_ID`].
+    ProactivitySettings,
+    /// [`ProactiveWake`]. The `entity_id` is the entry number.
+    ProactiveWake,
 }
 
 /// The full client view of an entity after a write.
@@ -315,6 +331,10 @@ pub enum EntityPayload {
     Connection(Connection),
     /// An installed skill.
     Skill(Skill),
+    /// The proactivity settings.
+    ProactivitySettings(ProactivitySettings),
+    /// One entry of the proactivity log.
+    ProactiveWake(ProactiveWake),
 }
 
 impl EntityPayload {
@@ -340,6 +360,8 @@ impl EntityPayload {
             Self::Preferences(_) => EntityKind::Preferences,
             Self::Connection(_) => EntityKind::Connection,
             Self::Skill(_) => EntityKind::Skill,
+            Self::ProactivitySettings(_) => EntityKind::ProactivitySettings,
+            Self::ProactiveWake(_) => EntityKind::ProactiveWake,
         }
     }
 
@@ -371,6 +393,8 @@ impl EntityPayload {
             Self::Preferences(_) => PREFERENCES_ENTITY_ID.to_owned(),
             Self::Connection(e) => e.id.to_string(),
             Self::Skill(e) => e.id.to_string(),
+            Self::ProactivitySettings(_) => PROACTIVITY_ENTITY_ID.to_owned(),
+            Self::ProactiveWake(e) => e.entity_id(),
         }
     }
 
@@ -392,6 +416,7 @@ impl EntityPayload {
             Self::ChannelFile(e) => Some(e.channel_id),
             Self::Routine(e) => Some(e.channel_id),
             Self::RoutineRun(e) => Some(e.channel_id),
+            Self::ProactiveWake(e) => Some(e.channel_id),
             Self::Group(_)
             | Self::Repo(_)
             | Self::SessionItem(_)
@@ -400,7 +425,8 @@ impl EntityPayload {
             | Self::SignIn(_)
             | Self::Preferences(_)
             | Self::Connection(_)
-            | Self::Skill(_) => None,
+            | Self::Skill(_)
+            | Self::ProactivitySettings(_) => None,
         }
     }
 }
@@ -674,6 +700,17 @@ pub struct ChannelUpdate {
     /// The new tags. An empty list removes every tag.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tags: Option<Vec<String>>,
+    /// The new proactivity level. `null` goes back to the default for the
+    /// channel kind.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "patch::deserialize"
+    )]
+    pub proactivity: Option<Option<ProactivityLevel>>,
+    /// What a task that a proactive turn starts may do.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proactive_tasks: Option<ProactiveTasks>,
 }
 
 impl ChannelUpdate {
@@ -696,6 +733,8 @@ impl ChannelUpdate {
             allowed_local_mcp_servers: None,
             memory_enabled: None,
             tags: None,
+            proactivity: None,
+            proactive_tasks: None,
         }
     }
 }
@@ -1768,6 +1807,18 @@ message_family! {
         HubBackup("hub.backup", HubBackup => HubBackupResult),
         /// Read or change the backup settings.
         HubBackupSettings("hub.backup_settings", HubBackupSettings => HubBackupSettingsResult),
+        /// The proactivity settings.
+        ProactivityGet("proactivity.get", ProactivityGet => ProactivityResult),
+        /// Change the proactivity settings.
+        ProactivitySet("proactivity.set", ProactivitySet => ProactivityResult),
+        /// Snooze what starts on its own, or end the snooze.
+        ProactivitySnooze("proactivity.snooze", ProactivitySnooze => ProactivityResult),
+        /// A page of the proactivity log.
+        ProactivityLog("proactivity.log", ProactivityLog => ProactivityLogResult),
+        /// Delete the follow-ups that the assistant set.
+        ProactivityCancelFollowUps("proactivity.cancel_follow_ups", ProactivityCancelFollowUps => ProactivityCancelFollowUpsResult),
+        /// Rate a proactive message: Useful or Too noisy.
+        MessageRate("message.rate", MessageRate => Empty),
         /// Star a model, or take the star away.
         PreferencesSetFavoriteModel("preferences.set_favorite_model", PreferencesSetFavoriteModel => PreferencesResult),
         /// Get a bearer token for the blob endpoints.
@@ -1858,8 +1909,98 @@ mod tests {
         MemoryAuthor, MessageKind, SkillSource, SkillUpdateState, TaskCreator, ToolApprovals,
         UseIn,
     };
+    use crate::model::{ProactiveKind, ProactiveOutcome, QuietHours};
     use crate::status::TaskStatus;
     use serde_json::json;
+
+    #[test]
+    fn proactivity_settings_and_wakes_are_feed_entities_and_in_the_snapshot() {
+        let settings = ProactivitySettings {
+            paused: true,
+            ..ProactivitySettings::default()
+        };
+        let payload = EntityPayload::ProactivitySettings(settings.clone());
+        assert_eq!(payload.kind(), EntityKind::ProactivitySettings);
+        assert_eq!(payload.entity_id(), "proactivity");
+        assert_eq!(payload.channel_id(), None);
+        let value = serde_json::to_value(&payload).unwrap();
+        assert_eq!(value["entity"], "proactivity_settings");
+        assert_eq!(
+            serde_json::from_value::<EntityPayload>(value).unwrap(),
+            payload
+        );
+
+        let wake = ProactiveWake {
+            id: 12,
+            channel_id: chn(),
+            kind: ProactiveKind::FollowUp,
+            at: Timestamp::from_millis(5),
+            outcome: ProactiveOutcome::Posted,
+            detail: None,
+            message_ids: vec![MessageId::new()],
+            task_id: None,
+            routine_id: None,
+            notify_held: false,
+            ended_at: Some(Timestamp::from_millis(9)),
+        };
+        let payload = EntityPayload::ProactiveWake(wake.clone());
+        assert_eq!(payload.entity_id(), "12");
+        assert_eq!(payload.channel_id(), Some(chn()));
+        let value = serde_json::to_value(&payload).unwrap();
+        assert_eq!(value["entity"], "proactive_wake");
+        assert_eq!(
+            serde_json::from_value::<EntityPayload>(value).unwrap(),
+            payload
+        );
+
+        let snapshot = Snapshot {
+            proactivity: Some(settings.clone()),
+            ..Snapshot::default()
+        };
+        let value = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(value["proactivity"]["paused"], true);
+        let old: Snapshot = serde_json::from_value(json!({"seq": 1})).unwrap();
+        assert_eq!(old.proactivity, None);
+        assert!(
+            serde_json::to_value(Snapshot::default())
+                .unwrap()
+                .get("proactivity")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_channel_update_can_set_and_clear_the_proactivity_level() {
+        let set: ChannelUpdate = serde_json::from_value(
+            json!({"channel_id": chn(), "proactivity": "eager", "proactive_tasks": "channel_default"}),
+        )
+        .unwrap();
+        assert_eq!(set.proactivity, Some(Some(ProactivityLevel::Eager)));
+        assert_eq!(set.proactive_tasks, Some(ProactiveTasks::ChannelDefault));
+        let clear: ChannelUpdate =
+            serde_json::from_value(json!({"channel_id": chn(), "proactivity": null})).unwrap();
+        assert_eq!(clear.proactivity, Some(None));
+        let none: ChannelUpdate = serde_json::from_value(json!({"channel_id": chn()})).unwrap();
+        assert_eq!(none.proactivity, None);
+        assert!(
+            serde_json::to_value(ChannelUpdate::new(chn()))
+                .unwrap()
+                .get("proactivity")
+                .is_none()
+        );
+        // The quiet hours of a set request read back.
+        let request: ProactivitySet =
+            serde_json::from_value(json!({"quiet_hours": {"start": "22:00", "end": "06:00"}}))
+                .unwrap();
+        assert_eq!(
+            request.quiet_hours,
+            Some(QuietHours {
+                start: "22:00".into(),
+                end: "06:00".into()
+            })
+        );
+        assert!(!request.time_zone_if_unset);
+    }
 
     fn chn() -> ChannelId {
         "chn_00000000-0000-0000-0000-000000000001".parse().unwrap()
@@ -1885,6 +2026,8 @@ mod tests {
             edited_at: None,
             deleted_at: None,
             created_at: Timestamp::from_millis(1_000),
+            proactive: None,
+            suggestions: Vec::new(),
         }
     }
 
@@ -2491,6 +2634,32 @@ mod tests {
                 keep: Some(7),
             }
             .into(),
+            ProactivityGet {}.into(),
+            ProactivitySet {
+                paused: Some(true),
+                quiet_hours: Some(QuietHours::default()),
+                time_zone: Some("America/Chicago".into()),
+                time_zone_if_unset: true,
+                notify_cap_per_day: Some(3),
+            }
+            .into(),
+            ProactivitySnooze {
+                choice: crate::model::SnoozeChoice::TwoHours,
+            }
+            .into(),
+            ProactivityLog {
+                channel_id: Some(ChannelId::new()),
+                kind: Some(crate::model::ProactiveKind::CheckIn),
+                before: Some(9),
+                limit: Some(50),
+            }
+            .into(),
+            ProactivityCancelFollowUps { channel_id: None }.into(),
+            MessageRate {
+                message_id: MessageId::new(),
+                rating: Some(crate::model::ProactiveRating::TooNoisy),
+            }
+            .into(),
             PreferencesSetFavoriteModel {
                 model: FavoriteModel {
                     account_label: "Claude Personal".into(),
@@ -2991,6 +3160,12 @@ mod tests {
             "hub.status",
             "hub.backup",
             "hub.backup_settings",
+            "proactivity.get",
+            "proactivity.set",
+            "proactivity.snooze",
+            "proactivity.log",
+            "proactivity.cancel_follow_ups",
+            "message.rate",
             "auth.http_token",
             "preferences.set_favorite_model",
             "composio.set_key",
@@ -3071,6 +3246,8 @@ mod tests {
             archived_at: None,
             created_at: Timestamp::from_millis(0),
             updated_at: Timestamp::from_millis(0),
+            proactive_tasks: Default::default(),
+            proactivity: None,
         };
         let entry = FeedEntry::upsert(
             3,
@@ -3110,6 +3287,8 @@ mod tests {
             archived_at: None,
             created_at: Timestamp::from_millis(0),
             updated_at: Timestamp::from_millis(0),
+            proactive_tasks: Default::default(),
+            proactivity: None,
         })
         .unwrap();
         value

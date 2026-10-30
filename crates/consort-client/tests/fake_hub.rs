@@ -248,6 +248,8 @@ fn seed(hub: &mut Hub) {
         created_at: ts(now - 10_000),
         updated_at: ts(now - 10_000),
         tags: Vec::new(),
+        proactive_tasks: Default::default(),
+        proactivity: None,
     });
     hub.messages.push(Message {
         id: card,
@@ -268,6 +270,8 @@ fn seed(hub: &mut Hub) {
         edited_at: None,
         deleted_at: None,
         created_at: ts(now - 5_000),
+        proactive: None,
+        suggestions: Vec::new(),
     });
     hub.task = Some(Task {
         id: task_id,
@@ -999,6 +1003,9 @@ async fn session(hub: Shared, mut socket: WebSocket) {
                     next_run_at: Some(ts(Timestamp::now().as_millis() + 3_600_000)),
                     last_run_at: None,
                     last_run_status: None,
+                    created_at: None,
+                    kind: Default::default(),
+                    origin: Default::default(),
                 };
                 h.routines.push(routine.clone());
                 req.respond_ok(&consort_proto::tools::RoutineResult {
@@ -1294,6 +1301,8 @@ async fn session(hub: Shared, mut socket: WebSocket) {
                     edited_at: None,
                     deleted_at: None,
                     created_at: Timestamp::now(),
+                    proactive: None,
+                    suggestions: Vec::new(),
                 };
                 if silent {
                     // The hub stores the message, but the answer and the
@@ -1932,12 +1941,16 @@ async fn pairs_syncs_sends_answers_and_reconnects() {
     })
     .await;
     assert_eq!(
-        hub.lock().unwrap().sessions[0][..5],
+        hub.lock().unwrap().sessions[0][..6],
         [
             "auth.response",
             "hello",
             "sync.snapshot",
             "sync.snapshot",
+            // The proactivity log loads before the subscription. This fake
+            // hub sends no proactivity settings, so the client sends no
+            // time zone.
+            "proactivity.log",
             "sync.subscribe"
         ]
     );
@@ -1984,6 +1997,7 @@ async fn resync_required_reloads_the_snapshot() {
             "sync.subscribe",
             "sync.snapshot",
             "sync.snapshot",
+            "proactivity.log",
             "sync.subscribe"
         ]
     );
@@ -2009,6 +2023,8 @@ fn text_message(channel_id: ChannelId, body: &str, at: i64, root: Option<Message
         edited_at: None,
         deleted_at: None,
         created_at: ts(at),
+        proactive: None,
+        suggestions: Vec::new(),
     }
 }
 
@@ -4410,6 +4426,8 @@ async fn an_install_card_closes_when_the_skill_is_added_from_it() {
             edited_at: None,
             deleted_at: None,
             created_at: ts(Timestamp::now().as_millis() - 3_000),
+            proactive: None,
+            suggestions: Vec::new(),
         });
         let approval = h.approval.as_mut().unwrap();
         approval.task_id = None;

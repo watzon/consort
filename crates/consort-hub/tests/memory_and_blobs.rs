@@ -82,7 +82,14 @@ async fn a_memory_write_with_a_stale_hash_is_refused() {
         })
         .await
         .unwrap();
-    assert_eq!(list.notes.len(), 1);
+    // Kevin's note, beside the check-in note that the hub writes at start.
+    assert_eq!(
+        list.notes
+            .iter()
+            .filter(|n| n.path != consort_proto::model::CHECK_IN_NOTE_PATH)
+            .count(),
+        1
+    );
     let history = client
         .request(MemoryHistory {
             scope: MemoryScope::Global,

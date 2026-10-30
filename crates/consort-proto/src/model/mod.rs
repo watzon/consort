@@ -15,6 +15,7 @@ mod conversation;
 mod knowledge;
 mod machine;
 mod preferences;
+mod proactivity;
 mod routine;
 mod session;
 mod skill;
@@ -59,9 +60,21 @@ pub use preferences::{
     FAVORITE_FIELD_MAX_CHARS, FAVORITE_MODELS_MAX, FavoriteModel, PREFERENCES_ENTITY_ID,
     Preferences,
 };
+pub use proactivity::{
+    CHECK_IN_BACKOFF_MAX_SECONDS, CHECK_IN_CHANNEL_SECONDS, CHECK_IN_MIN_SECONDS,
+    CHECK_IN_NOTE_MAX_BYTES, CHECK_IN_NOTE_PATH, CHECK_IN_TUTTI_SECONDS, CHECK_IN_WATCH_OUTSIDE,
+    FINDING_MAX_CHARS, FOLLOW_UP_MAX_DAYS, FOLLOW_UP_MIN_MINUTES, FOLLOW_UP_REASON_MAX_CHARS,
+    FOLLOW_UPS_MAX_PER_CHANNEL, NOTIFY_CAP_DEFAULT, OFFER_DO_IT, OFFER_NEVER, OFFER_NOT_NOW,
+    PROACTIVE_LOG_KEEP_DAYS, PROACTIVITY_ENTITY_ID, ProactiveKind, ProactiveMark, ProactiveOutcome,
+    ProactiveRating, ProactiveTasks, ProactiveWake, ProactivityLevel, ProactivitySettings,
+    QuietHours, RESEARCH_MEMORY_FOLDER, RESEARCH_OFFERS_MAX_PER_DAY,
+    SILENT_CHECK_INS_BEFORE_BACKOFF, STALE_NEEDS_INPUT_MS, STALE_REVIEW_MS,
+    SUGGESTION_LABEL_MAX_CHARS, SUGGESTIONS_MAX, SnoozeChoice, Suggestion, SuggestionAction,
+    TURN_BUDGET_CHANNEL, TURN_BUDGET_TUTTI, validate_suggestions,
+};
 pub use routine::{
-    ROUTINE_MIN_INTERVAL_SECONDS, Routine, RoutineAction, RoutineRun, RoutineRunStatus,
-    RoutineSchedule,
+    ROUTINE_MIN_INTERVAL_SECONDS, Routine, RoutineAction, RoutineKind, RoutineOrigin, RoutineRun,
+    RoutineRunStatus, RoutineSchedule,
 };
 pub use session::{
     AssistantMessagePayload, COMMAND_OUTPUT_TAIL_BYTES, CommandPayload, ErrorPayload, FileChange,

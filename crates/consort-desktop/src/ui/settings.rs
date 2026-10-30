@@ -50,6 +50,7 @@ const SECTIONS: [(&str, &[SectionEntry]); 3] = [
             (SettingsSection::Skills, "Skills", "box"),
             (SettingsSection::Memory, "Memory", "book-open"),
             (SettingsSection::Routines, "Routines", "routine"),
+            (SettingsSection::Proactivity, "Proactivity", "eye"),
         ],
     ),
 ];
@@ -240,6 +241,7 @@ impl ConsortApp {
             SettingsSection::Notifications => self.render_notifications(t, window, cx),
             SettingsSection::Routines => self.render_routines_settings(t, window, cx),
             SettingsSection::Memory => self.render_memory_settings(t, window, cx),
+            SettingsSection::Proactivity => self.render_proactivity(t, window, cx),
         };
         div()
             .flex()
@@ -891,6 +893,9 @@ impl ConsortApp {
         cx: &mut Context<Self>,
     ) {
         if self.pick_admin_select(select, option, cx) {
+            return;
+        }
+        if self.pick_proactivity_select(select, option, cx) {
             return;
         }
         match resolve_pick(&self.state, &self.new_channel.workers, select, option) {

@@ -144,6 +144,9 @@ impl Hub {
                     next_run_at,
                     last_run_at: None,
                     last_run_status: None,
+                    kind: Default::default(),
+                    origin: Default::default(),
+                    created_at: Some(now),
                 };
                 tx.save_routine(&routine)?;
                 Ok(routine)
@@ -172,6 +175,7 @@ impl Hub {
             .write(move |tx| {
                 let now = tx.now();
                 let mut routine = routine_in_scope(tx.db(), scope, update.routine_id)?;
+                let before = routine.clone();
                 if let Some(channel_id) = update.channel_id
                     && channel_id != routine.channel_id
                 {
@@ -214,6 +218,7 @@ impl Hub {
                     routine.enabled = enabled;
                 }
                 check_text(&routine.name, &routine.prompt, &routine.action)?;
+                crate::proactivity::routines::check_routine_change(tx, &before, &routine)?;
 
                 if schedule_changed {
                     require_future_once(&routine.schedule, now)?;

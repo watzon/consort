@@ -414,6 +414,8 @@ mod tests {
             edited_at: None,
             deleted_at: None,
             created_at: Timestamp::now(),
+            proactive: None,
+            suggestions: Vec::new(),
         }
     }
 
