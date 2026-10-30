@@ -118,6 +118,10 @@ async fn put_blob(
         hub.put_lengths.push(length);
     }
     if !authorized(&headers) {
+        // Read the body before the answer, as a hub behind a proxy does.
+        // Windows resets a connection that closes with unread data, and the
+        // client would see a lost connection, not the 401.
+        let _ = axum::body::to_bytes(body, MAX_BLOB_BYTES as usize).await;
         return unauthorized();
     }
     if length.is_some_and(|len| len > MAX_BLOB_BYTES) {

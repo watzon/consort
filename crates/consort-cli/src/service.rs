@@ -85,11 +85,11 @@ impl ServiceEnv {
             .map(|d| d.home_dir().to_string_lossy().into_owned())
             .context("could not find the home folder")?;
         let var = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
-        let windows_user = match (var("USERDOMAIN"), var("USERNAME")) {
-            (Some(domain), Some(user)) => Some(format!("{domain}\\{user}")),
-            (None, Some(user)) => Some(user),
-            _ => None,
-        };
+        let windows_user = windows_account(
+            var("USERDOMAIN").as_deref(),
+            var("COMPUTERNAME").as_deref(),
+            var("USERNAME").as_deref(),
+        );
         let uid = if cfg!(target_os = "macos") {
             let out = std::process::Command::new("id")
                 .arg("-u")
@@ -110,6 +110,27 @@ impl ServiceEnv {
             path: var("PATH"),
             config_dir: config_dir.map(|d| d.to_string_lossy().into_owned()),
         })
+    }
+}
+
+/// The `DOMAIN\user` name that Task Scheduler accepts. Over SSH, Windows sets
+/// `USERDOMAIN` to `WORKGROUP` for a local account. No account has that
+/// domain, so the name does not resolve and `schtasks` rejects the task. A
+/// local account belongs to the machine: use the computer name then.
+fn windows_account(
+    domain: Option<&str>,
+    computer: Option<&str>,
+    user: Option<&str>,
+) -> Option<String> {
+    let user = user?;
+    let domain = match domain {
+        Some(d) if d.eq_ignore_ascii_case("workgroup") => computer,
+        Some(d) => Some(d),
+        None => computer,
+    };
+    match domain {
+        Some(d) => Some(format!("{d}\\{user}")),
+        None => Some(user.to_owned()),
     }
 }
 
@@ -936,6 +957,31 @@ WantedBy=default.target
         e.exe = "C:\\Users\\O'Neil\\consort.exe".into();
         let text = task_xml(&e, "C:\\logs\\w.log");
         assert!(text.contains("'C:\\Users\\O''Neil\\consort.exe'"));
+    }
+
+    #[test]
+    fn the_windows_account_uses_the_computer_name_for_the_ssh_workgroup() {
+        assert_eq!(
+            windows_account(Some("WORKGROUP"), Some("BIGBOI"), Some("cawat")).as_deref(),
+            Some("BIGBOI\\cawat")
+        );
+        assert_eq!(
+            windows_account(Some("Workgroup"), None, Some("cawat")).as_deref(),
+            Some("cawat")
+        );
+    }
+
+    #[test]
+    fn the_windows_account_keeps_a_real_domain_and_fills_a_missing_one() {
+        assert_eq!(
+            windows_account(Some("CORP"), Some("BIGBOI"), Some("ann")).as_deref(),
+            Some("CORP\\ann")
+        );
+        assert_eq!(
+            windows_account(None, Some("BIGBOI"), Some("ann")).as_deref(),
+            Some("BIGBOI\\ann")
+        );
+        assert_eq!(windows_account(Some("CORP"), None, None), None);
     }
 
     #[test]

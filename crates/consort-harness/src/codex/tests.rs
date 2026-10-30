@@ -591,7 +591,8 @@ mod fake_server {
             assert_eq!(methods, ["skills/extraRoots/set", "thread/start"]);
             assert_eq!(
                 log[0]["params"]["extraRoots"],
-                json!([std::path::PathBuf::from("/runtime/ses_1/skills/skills")
+                json!([std::path::PathBuf::from("/runtime/ses_1/skills")
+                    .join("skills")
                     .to_string_lossy()
                     .into_owned()])
             );

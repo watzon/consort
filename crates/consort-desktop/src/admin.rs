@@ -261,11 +261,7 @@ impl ConsortApp {
         if notify_platform::HAS_DOCK_BADGE || self.demo {
             return;
         }
-        let title = match &self.admin.badge {
-            Some(count) => format!("Consort ({count})"),
-            None => "Consort".to_owned(),
-        };
-        window.set_window_title(&title);
+        window.set_window_title(&window_title(self.admin.badge.as_deref()));
     }
 
     /// Opens the place of a notification that the user clicked.
@@ -523,6 +519,14 @@ impl ConsortApp {
     }
 }
 
+/// The window title: the app name, and the count when there is one.
+fn window_title(badge: Option<&str>) -> String {
+    match badge {
+        Some(count) => format!("Consort ({count})"),
+        None => "Consort".to_owned(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -560,5 +564,12 @@ mod tests {
         assert_eq!(backup_pick(KEEP_SELECT, "14").unwrap().keep, Some(14));
         assert!(backup_pick(TIME_SELECT, "25:00").is_none());
         assert!(backup_pick("other", "1").is_none());
+    }
+
+    #[test]
+    fn the_window_title_shows_the_count_where_there_is_no_dock_badge() {
+        assert_eq!(window_title(None), "Consort");
+        assert_eq!(window_title(Some("3")), "Consort (3)");
+        assert_eq!(window_title(Some("99+")), "Consort (99+)");
     }
 }

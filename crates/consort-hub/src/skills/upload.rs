@@ -167,8 +167,11 @@ pub(crate) mod tests {
                     .unwrap();
                 continue;
             }
+            // Windows writes the DOS system by default, and a reader then
+            // ignores the Unix mode. Real zips with a mode come from Unix.
             let options = SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Deflated)
+                .system(zip::System::Unix)
                 .external_attributes(mode << 16);
             writer.start_file(*path, options).unwrap();
             writer.write_all(bytes).unwrap();
