@@ -274,6 +274,7 @@ impl ConsortApp {
                     .child(groups),
             )
             .child(workers)
+            .children(self.update_notice(t, cx))
             .child(account)
             .into_any_element()
     }

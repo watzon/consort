@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Consort
+Comment=A personal assistant that runs on your own machines
+Exec=consort-desktop
+Icon=consort
+Terminal=false
+Categories=Utility;Office;
+StartupWMClass=consort-desktop

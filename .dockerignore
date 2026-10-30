@@ -1,0 +1,7 @@
+target
+.git
+.consort-dev
+docs
+*.db
+*.db-wal
+*.db-shm

@@ -1,0 +1,53 @@
+# A Consort hub and a Caddy proxy with automatic HTTPS.
+#
+#   cp deploy/hub/.env.example deploy/hub/.env     # then set HUB_DOMAIN
+#   docker compose -f deploy/hub/docker-compose.yml up -d
+#
+# The first start prints a client setup code in the hub log:
+#   docker compose -f deploy/hub/docker-compose.yml logs hub
+#
+# The image comes from the Dockerfile at the root of the repo. Build it
+# first, or let Compose build it.
+services:
+  hub:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: consort-hub:local
+    restart: unless-stopped
+    environment:
+      CONSORT_PUBLIC_URL: https://${HUB_DOMAIN:?Set HUB_DOMAIN in deploy/hub/.env}
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - hub-data:/data
+    # Only Caddy reaches the hub, over the Compose network.
+    expose:
+      - "7600"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    depends_on:
+      - hub
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      HUB_DOMAIN: ${HUB_DOMAIN:?Set HUB_DOMAIN in deploy/hub/.env}
+    volumes:
+      - ./Caddyfile.compose:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  hub-data:
+  caddy-data:
+  caddy-config:

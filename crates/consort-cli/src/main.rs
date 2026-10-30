@@ -11,6 +11,9 @@ use clap::{Args, Parser, Subcommand};
 use consort_worker::WorkerConfig;
 use consort_worker::config::WorkerToml;
 
+mod service;
+mod service_cmd;
+
 /// The default hub address.
 const DEFAULT_LISTEN: &str = "127.0.0.1:7600";
 
@@ -51,14 +54,17 @@ enum Command {
 struct HubArgs {
     #[command(subcommand)]
     command: Option<HubCommand>,
-    /// The data folder, with hub.db and blobs/.
-    #[arg(long)]
+    /// The data folder, with hub.db and blobs/. Can also come from
+    /// CONSORT_HUB_DATA.
+    #[arg(long, env = "CONSORT_HUB_DATA")]
     data: Option<PathBuf>,
-    /// The address to listen on.
-    #[arg(long, default_value = DEFAULT_LISTEN)]
+    /// The address to listen on. Can also come from CONSORT_HUB_LISTEN.
+    #[arg(long, env = "CONSORT_HUB_LISTEN", default_value = DEFAULT_LISTEN)]
     listen: SocketAddr,
     /// The URL that clients and workers use, when it is not http://<listen>.
-    #[arg(long)]
+    /// Behind a reverse proxy, it is the HTTPS URL of the proxy. Can also
+    /// come from CONSORT_PUBLIC_URL.
+    #[arg(long, env = "CONSORT_PUBLIC_URL")]
     public_url: Option<String>,
 }
 
@@ -143,7 +149,21 @@ enum WorkerCommand {
         /// The worker folder.
         #[arg(long, env = "CONSORT_WORKER_DIR")]
         config_dir: Option<PathBuf>,
+        /// Write the log to this file, not to the terminal. A log larger
+        /// than 10 MiB moves to `<file>.1` when the worker starts.
+        #[arg(long)]
+        log_file: Option<PathBuf>,
     },
+    /// Pair this machine with a hub, then install a service that starts the
+    /// worker when you sign in and starts it again after a failure.
+    ///
+    /// The service is a launchd agent on macOS, a systemd user unit on
+    /// Linux and a Task Scheduler task on Windows. It needs no admin rights.
+    Install(service_cmd::InstallArgs),
+    /// Stop the worker service and remove it. The worker folder stays.
+    Uninstall(service_cmd::ServiceArgs),
+    /// Show whether the worker service is installed and running.
+    Status(service_cmd::ServiceArgs),
 }
 
 #[derive(Args)]
@@ -156,14 +176,37 @@ struct DevArgs {
     listen: SocketAddr,
 }
 
-fn init_logging() {
+/// The size above which a log file moves aside when the worker starts.
+const LOG_LIMIT: u64 = 10 * 1024 * 1024;
+
+fn init_logging(log_file: Option<&Path>) -> Result<()> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    if let Some(path) = log_file {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("could not make the folder {}", parent.display()))?;
+        }
+        service::rotate_log(path, LOG_LIMIT)
+            .with_context(|| format!("could not move the old log {}", path.display()))?;
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .with_context(|| format!("could not open the log file {}", path.display()))?;
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_ansi(false)
+            .with_writer(std::sync::Mutex::new(file))
+            .init();
+        return Ok(());
+    }
     // Logs go to stderr, so stdout stays free for mcp-bridge.
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .init();
+    Ok(())
 }
 
 fn default_hub_dir() -> Result<PathBuf> {
@@ -570,7 +613,13 @@ async fn run_bridge(url: &str) -> Result<()> {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
-    init_logging();
+    let log_file = match &cli.command {
+        Command::Worker {
+            command: WorkerCommand::Run { log_file, .. },
+        } => log_file.as_deref(),
+        _ => None,
+    };
+    init_logging(log_file)?;
     match cli.command {
         Command::Hub(args) => run_hub(args).await,
         Command::Worker { command } => match command {
@@ -597,7 +646,19 @@ async fn main() -> Result<()> {
                 );
                 Ok(())
             }
-            WorkerCommand::Run { config_dir } => run_worker(worker_dir(config_dir)?).await,
+            WorkerCommand::Run { config_dir, .. } => run_worker(worker_dir(config_dir)?).await,
+            WorkerCommand::Install(args) => {
+                let dir = worker_dir(args.config_dir.clone())?;
+                service_cmd::install(args, dir, &mut std::io::stdin().lock()).await
+            }
+            WorkerCommand::Uninstall(args) => {
+                let dir = worker_dir(args.config_dir.clone())?;
+                service_cmd::uninstall(args, &dir)
+            }
+            WorkerCommand::Status(args) => {
+                let dir = worker_dir(args.config_dir.clone())?;
+                service_cmd::status(args, &dir)
+            }
         },
         Command::Dev(args) => run_dev(args).await,
         Command::McpBridge { url } => run_bridge(&url).await,
@@ -686,6 +747,49 @@ mod tests {
             Cli::try_parse_from(["consort", "dev"]).is_err(),
             "dev needs --data"
         );
+    }
+
+    #[test]
+    fn the_service_commands_parse() {
+        let cli = Cli::try_parse_from([
+            "consort",
+            "worker",
+            "install",
+            "--hub",
+            "https://h.example.com",
+            "--code",
+            "ABCD-EFGH",
+            "--tag",
+            "gpu",
+            "--dry-run",
+        ])
+        .unwrap();
+        let Command::Worker {
+            command: WorkerCommand::Install(args),
+        } = cli.command
+        else {
+            panic!("expected worker install")
+        };
+        assert_eq!(args.hub, "https://h.example.com");
+        assert_eq!(args.code.as_deref(), Some("ABCD-EFGH"));
+        assert_eq!(args.tags, vec!["gpu"]);
+        assert!(args.dry_run && !args.linger);
+        assert!(
+            Cli::try_parse_from(["consort", "worker", "install"]).is_err(),
+            "install needs --hub"
+        );
+        for name in ["uninstall", "status"] {
+            assert!(Cli::try_parse_from(["consort", "worker", name, "--dry-run"]).is_ok());
+        }
+        let cli =
+            Cli::try_parse_from(["consort", "worker", "run", "--log-file", "/tmp/w.log"]).unwrap();
+        let Command::Worker {
+            command: WorkerCommand::Run { log_file, .. },
+        } = cli.command
+        else {
+            panic!("expected worker run")
+        };
+        assert_eq!(log_file, Some(PathBuf::from("/tmp/w.log")));
     }
 
     #[test]

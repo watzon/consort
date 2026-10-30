@@ -5,6 +5,7 @@
 pub const TUTTI: &str = "Tutti";
 
 pub mod add_account;
+pub mod add_worker;
 pub mod attachments;
 pub mod channel_extensions;
 pub mod channel_panel;
@@ -28,5 +29,6 @@ pub mod skills;
 pub mod startup_error;
 pub mod switcher;
 pub mod timeline;
+pub mod update_notice;
 pub mod window_controls;
 pub mod workers;

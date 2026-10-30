@@ -29,6 +29,8 @@ Dependency direction: `proto` and `theme` depend on no other Consort crate. `cli
 
 `scripts/dev.sh` builds the debug binaries, starts a dev hub with its worker, and starts the desktop app. Quitting the app stops the hub. The first run prints a setup code to type in the app. The comment at the top of the script lists its settings. `scripts/dev.sh --mock` starts only the app, with the designs' content and no hub.
 
+Installs, releases and app updates are in [docs/install.md](docs/install.md). Running a hub on a server is in [docs/deploy.md](docs/deploy.md). `scripts/bundle-macos.sh` builds `Consort.app`.
+
 ## Rust rules
 
 - Edition 2024, Rust 1.98.1 (see `rust-toolchain.toml`). `unsafe_code` is forbidden in every crate.

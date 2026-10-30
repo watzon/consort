@@ -226,15 +226,17 @@ The binary name `app` is a placeholder until the product has a name.
 
 ## Deployment
 
-**Hub.** One binary and one data folder (`hub.db` and `blobs/`). It serves HTTPS itself with automatic certificates, or it sits behind a reverse proxy such as Caddy. It runs as a systemd service. To run a worker on the same machine, start a second service with `app worker` that points at `https://localhost`. Back up `hub.db` with SQLite's online backup, or stream it with Litestream.
+**Hub.** One binary and one data folder (`hub.db` and `blobs/`). It listens on a local address and does not serve HTTPS itself: a reverse proxy such as Caddy does, with automatic certificates (decision: a documented proxy is enough, no built-in ACME). It runs as a hardened systemd service (`deploy/hub/consort-hub.service`) or as a container (`Dockerfile`, `deploy/hub/docker-compose.yml`). To run a worker on the same machine, install it as a user service with `consort worker install`. Back up `hub.db` with SQLite's online backup, or stream it with Litestream. The steps are in [deploy.md](deploy.md).
 
 **Worker.** One binary for each OS. The worker must run as the logged-in user, not as a system account, because harness logins live in the profile folders in the user's Consort home (`~/.consort`, or `CONSORT_HOME`), next to the managed tools. The service for each OS:
 
 | OS | Service |
 |---|---|
-| macOS | launchd user agent |
-| Linux | systemd user service, with lingering on for headless machines |
-| Windows | Task Scheduler task at logon. On Windows, the worker kills a session's process tree with a job object |
+| macOS | launchd user agent (`dev.consort.worker`) |
+| Linux | systemd user service (`consort-worker.service`), with lingering on for headless machines (`consort worker install --linger`) |
+| Windows | Task Scheduler task at logon (`Consort worker`). On Windows, the worker kills a session's process tree with a job object |
+
+`consort worker install` pairs the machine and installs the service for the current user, `consort worker uninstall` removes it, and `consort worker status` shows it. The install scripts and the release files are in [install.md](install.md).
 
 ## Security model
 

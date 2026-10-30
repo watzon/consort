@@ -8,6 +8,7 @@ This page lists the entities that the hub, the workers and the clients store, wi
 |---|---|---|
 | Hub | `hub.db` (SQLite, WAL mode) | Every entity on this page except the worker-local state |
 | Hub | `blobs/` | Attachments, channel files, artifacts, skill files and skill uploads, named by SHA-256 |
+| Hub | `hub-secret.key` | The 256-bit key that encrypts `composio.key` (mode 0600) |
 | Hub | `composio.key` | The Composio project key, encrypted with a key that the hub makes (mode 0600). See ADR 0011 |
 | Hub | FTS5 tables in `hub.db` | Search index over messages, memory notes and task titles |
 | Worker | `worker.toml` | Hub URL, tags, worker policy, harness accounts, local MCP servers, checkouts |
@@ -17,8 +18,11 @@ This page lists the entities that the hub, the workers and the clients store, wi
 | Worker | `<consort home>/tools/<tool>/<version>/` | The managed tools that the worker installed |
 | Worker | `<consort home>/cache/blobs/<sha256>` | Attachments and channel files that the worker downloaded, checked by hash (mode 0600 on Unix). Sessions get copies in their workspace |
 | Worker | `<workspace>/.consort/attachments/` and `<workspace>/.channel/files/` | The attachments of a session's turns, and the read-only copy of the channel files (see [protocol.md](protocol.md#attachments-and-channel-files-on-the-worker)) |
+| Worker | A log file, outside the worker folder | The log of the installed service: `~/Library/Logs/Consort/worker.log`, `~/.local/state/consort/worker.log` or `%LOCALAPPDATA%\Consort\logs\worker.log`. See [install.md](install.md) |
 | Worker | Each harness's own files | Raw session transcripts and harness logins. The worker never copies these to the hub |
 | Client | `cache.db` (SQLite) | A partial copy of hub entities and the last feed sequence number |
+| Client | `updates.json` | The switch "Get updates on their own" (`{"auto": true}`, on by default) |
+| Client | `<cache dir>/consort/updates/<version>/` | The staging folder of app updates: the downloaded release file, checked by its SHA-256 |
 
 The Consort home is `~/.consort` (`%USERPROFILE%\.consort` on Windows). `CONSORT_HOME` overrides it. `consort dev` sets it to `<data>/home` unless `CONSORT_HOME` is set.
 

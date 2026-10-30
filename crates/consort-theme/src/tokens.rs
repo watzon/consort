@@ -359,6 +359,7 @@ pub struct Components {
     pub focus_ring: Pixels,
     pub files: Files,
     pub sidebar: Sidebar,
+    pub update_notice: UpdateNotice,
     pub chat: Chat,
     pub theme_preview: ThemePreview,
 }
@@ -415,6 +416,18 @@ pub struct Sidebar {
     pub avatar: Pixels,
     pub account_pad_top: Pixels,
     pub account_pad_bottom: Pixels,
+}
+
+/// The sizes of the update notice. See `structure::UpdateNotice`.
+#[derive(Clone, Copy, Debug)]
+pub struct UpdateNotice {
+    pub pad_y: Pixels,
+    pub pad_left: Pixels,
+    pub pad_right: Pixels,
+    pub gap: Pixels,
+    pub margin_bottom: Pixels,
+    pub action_pad_x: Pixels,
+    pub action_pad_y: Pixels,
 }
 
 /// The sizes of the chat. See `structure::Chat`.
@@ -552,6 +565,15 @@ impl Components {
                 avatar: px(sb.avatar),
                 account_pad_top: px(sb.account_pad_top),
                 account_pad_bottom: px(sb.account_pad_bottom),
+            },
+            update_notice: UpdateNotice {
+                pad_y: px(c.update_notice.pad_y),
+                pad_left: px(c.update_notice.pad_left),
+                pad_right: px(c.update_notice.pad_right),
+                gap: px(c.update_notice.gap),
+                margin_bottom: px(c.update_notice.margin_bottom),
+                action_pad_x: px(c.update_notice.action_pad_x),
+                action_pad_y: px(c.update_notice.action_pad_y),
             },
             chat: Chat {
                 bubble_radius: px(c.chat.bubble_radius),

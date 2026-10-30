@@ -1,0 +1,66 @@
+# The Consort hub as a hardened systemd service.
+#
+# Install (see docs/deploy.md):
+#   sudo useradd --system --home-dir /var/lib/consort --shell /usr/sbin/nologin consort
+#   sudo install -m 0755 consort /usr/local/bin/consort
+#   sudo install -m 0644 deploy/hub/consort-hub.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now consort-hub
+#
+# The hub listens on 127.0.0.1 only. A reverse proxy (Caddy, see
+# deploy/hub/Caddyfile) serves HTTPS and passes WebSocket traffic to it.
+# Change the public URL below to the address of your proxy.
+[Unit]
+Description=Consort hub
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=consort
+Group=consort
+# systemd makes /var/lib/consort, owned by the user above, and keeps it
+# writable under ProtectSystem=strict. The hub keeps hub.db and blobs/ there.
+StateDirectory=consort
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/consort
+Environment=CONSORT_HUB_DATA=/var/lib/consort
+Environment=CONSORT_HUB_LISTEN=127.0.0.1:7600
+Environment=CONSORT_PUBLIC_URL=https://hub.example.com
+# Extra settings, such as RUST_LOG=debug. The file is optional.
+EnvironmentFile=-/etc/consort/hub.env
+ExecStart=/usr/local/bin/consort hub
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+
+# Hardening. The hub needs the network, its data folder and `git` (for skill
+# sources). It needs nothing else.
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

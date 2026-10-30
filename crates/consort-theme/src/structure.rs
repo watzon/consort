@@ -311,6 +311,7 @@ pub struct Components {
     pub focus_ring: f32,
     pub files: Files,
     pub sidebar: Sidebar,
+    pub update_notice: UpdateNotice,
     pub chat: Chat,
     pub theme_preview: ThemePreview,
 }
@@ -399,6 +400,22 @@ pub struct Sidebar {
     pub avatar: f32,
     pub account_pad_top: f32,
     pub account_pad_bottom: f32,
+}
+
+/// The sizes of the update notice above the account row in the sidebar.
+/// From the approved Paper artboard "App update in the sidebar, dark".
+#[derive(Clone, Copy, Debug, Deserialize)]
+pub struct UpdateNotice {
+    pub pad_y: f32,
+    pub pad_left: f32,
+    pub pad_right: f32,
+    /// The gap between the icon, the text and the button.
+    pub gap: f32,
+    /// The space between the notice and the account row.
+    pub margin_bottom: f32,
+    /// The padding of the Restart button.
+    pub action_pad_x: f32,
+    pub action_pad_y: f32,
 }
 
 /// The sizes of the chat: bubbles, the composer, the top actions and the
