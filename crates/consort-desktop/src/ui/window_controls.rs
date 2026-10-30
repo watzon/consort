@@ -187,6 +187,23 @@ pub trait DragArea: Styled + InteractiveElement + Sized {
         });
         this
     }
+
+    /// A drag area with no controls inside it: on macOS it also moves the
+    /// window below the native title bar, and a double click zooms. A
+    /// control over it must occlude it, or a click on the control starts a
+    /// move.
+    fn drag_zone(self) -> Self {
+        let this = self.drag_area();
+        #[cfg(target_os = "macos")]
+        let this = this.on_mouse_down(MouseButton::Left, |event, window, _| {
+            if event.click_count >= 2 {
+                window.titlebar_double_click();
+            } else {
+                window.start_window_move();
+            }
+        });
+        this
+    }
 }
 
 impl DragArea for Div {}

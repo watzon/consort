@@ -48,11 +48,12 @@ impl ConsortApp {
         let Some(thread) = self.state.thread(&task_id).cloned() else {
             return div().into_any_element();
         };
-        let parts: Vec<String> = consort_client::chat::split_paragraphs(&thread.brief)
+        // The brief is one bubble (DECISIONS 731).
+        let parts: Vec<String> = Some(thread.brief.trim().to_owned())
+            .filter(|p| !p.is_empty())
             .into_iter()
-            .filter(|p| !p.trim().is_empty())
             .collect();
-        let max = t.layout.panel_width - t.space.page;
+        let max = self.right_panel_width(t) - t.space.page;
         let mut col = div().flex().flex_col().items_start().gap(t.space.xs);
         let count = parts.len();
         for (i, part) in parts.into_iter().enumerate() {

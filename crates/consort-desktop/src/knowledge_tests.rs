@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use crate::app::{ChannelTab, ConsortApp, Dialog, Panel, SettingsSection};
+use crate::app::{ChannelTab, ConsortApp, Dialog, Page, Panel, SettingsSection};
 use crate::knowledge::{KnowledgeAction, Place, note_menu, routine_menu};
 use consort_client::{
     Client, Command, ViewState,
@@ -587,4 +587,161 @@ fn a_memory_search_hit_opens_the_note_in_the_memory_views(cx: &mut TestAppContex
         );
     });
     assert!(has(cx, "settings-memory"));
+}
+
+fn open_settings_routines(app: &Entity<ConsortApp>, cx: &mut VisualTestContext) {
+    cx.update(|_, cx| {
+        app.update(cx, |app, cx| {
+            app.open_settings(SettingsSection::Routines, cx)
+        })
+    });
+    draw(cx);
+}
+
+/// A click on a routine row in Settings stays in Settings. The routine
+/// opens in place of the list, with Back at the top left. Back returns to
+/// the list, and the list shows again.
+#[gpui::test]
+fn a_routine_row_in_settings_opens_in_settings_and_back_returns(cx: &mut TestAppContext) {
+    let (handle, app) = open(state(), cx);
+    let cx = &mut VisualTestContext::from_window(handle, cx);
+    open_settings_routines(&app, cx);
+    click(cx, &format!("routine-row-{SUNSET}"));
+    app.read_with(cx, |app, _| {
+        assert_eq!(app.page, Page::Settings);
+        assert_eq!(app.knowledge.settings_routine.as_deref(), Some(SUNSET));
+        assert!(app.knowledge.routine_open.is_none());
+    });
+    for selector in [
+        "settings-routine",
+        "routine-back",
+        "routine-page-run",
+        "routine-page-edit",
+        "routine-show-in-channel",
+        "routine-runs-label",
+    ] {
+        assert!(has(cx, selector), "{selector} draws");
+    }
+    assert!(has(cx, "run-1"));
+    // Back is at the top left of the content.
+    let back = bounds(cx, "routine-back");
+    let show = bounds(cx, "routine-show-in-channel");
+    assert!(back.origin.x < show.origin.x && back.origin.y <= show.origin.y);
+    // Run now works in place.
+    click(cx, "routine-page-run");
+    until(cx, &app, "a new run", |app| {
+        routine(app, SUNSET).runs.len() == 6
+    });
+    app.read_with(cx, |app, _| assert_eq!(app.page, Page::Settings));
+
+    click(cx, "routine-back");
+    app.read_with(cx, |app, _| {
+        assert_eq!(app.page, Page::Settings);
+        assert!(app.knowledge.settings_routine.is_none());
+    });
+    assert!(has(cx, &format!("routine-row-{SUNSET}")));
+}
+
+/// Escape in a routine opened in Settings goes back to the list. A second
+/// Escape leaves Settings.
+#[gpui::test]
+fn escape_in_a_settings_routine_goes_back_then_leaves_settings(cx: &mut TestAppContext) {
+    let (handle, app) = open(state(), cx);
+    let cx = &mut VisualTestContext::from_window(handle, cx);
+    open_settings_routines(&app, cx);
+    click(cx, &format!("routine-row-{SUNSET}"));
+    cx.simulate_keystrokes("escape");
+    draw(cx);
+    app.read_with(cx, |app, _| {
+        assert_eq!(app.page, Page::Settings);
+        assert!(app.knowledge.settings_routine.is_none());
+    });
+    assert!(has(cx, &format!("routine-row-{SUNSET}")));
+    cx.simulate_keystrokes("escape");
+    draw(cx);
+    app.read_with(cx, |app, _| assert_eq!(app.page, Page::Main));
+}
+
+/// "Show in channel" leaves Settings on purpose: it opens the channel and
+/// the routine in the Channel panel.
+#[gpui::test]
+fn show_in_channel_leaves_settings_for_the_routine_in_its_channel(cx: &mut TestAppContext) {
+    let (handle, app) = open(state(), cx);
+    let cx = &mut VisualTestContext::from_window(handle, cx);
+    open_settings_routines(&app, cx);
+    click(cx, &format!("routine-row-{SUNSET}"));
+    click(cx, "routine-show-in-channel");
+    app.read_with(cx, |app, _| {
+        assert_eq!(app.page, Page::Main);
+        assert_eq!(app.channel_id, LIGHTS);
+        assert_eq!(app.panel, Panel::Channel);
+        assert_eq!(app.channel_tab, ChannelTab::Routines);
+        assert_eq!(app.knowledge.routine_open.as_deref(), Some(SUNSET));
+        assert!(app.knowledge.settings_routine.is_none());
+    });
+}
+
+/// A run's message link in Settings says "Show in channel", and it leaves
+/// Settings even when the channel is the open one.
+#[gpui::test]
+fn a_run_message_link_in_settings_leaves_settings(cx: &mut TestAppContext) {
+    let (handle, app) = open(state(), cx);
+    let cx = &mut VisualTestContext::from_window(handle, cx);
+    open_tab(&app, ChannelTab::Routines, cx);
+    open_settings_routines(&app, cx);
+    click(cx, &format!("routine-row-{SUNSET}"));
+    app.read_with(cx, |app, _| {
+        assert_eq!(app.channel_id, LIGHTS);
+        assert_eq!(app.page, Page::Settings);
+    });
+    // A run that shows a message link (the mock gives one to each run that
+    // succeeded).
+    let run = (1..=5)
+        .find(|run| has(cx, &format!("run-link-{run}")))
+        .expect("a run with a link");
+    click(cx, &format!("run-link-{run}"));
+    app.read_with(cx, |app, _| assert_eq!(app.page, Page::Main));
+}
+
+/// The menu of a routine row in Settings keeps Run history in Settings.
+#[gpui::test]
+fn run_history_from_the_menu_in_settings_stays_in_settings(cx: &mut TestAppContext) {
+    let (handle, app) = open(state(), cx);
+    let cx = &mut VisualTestContext::from_window(handle, cx);
+    open_settings_routines(&app, cx);
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            app.run_knowledge_menu(KnowledgeAction::RoutineHistory(SUNSET.into()), window, cx)
+        })
+    });
+    draw(cx);
+    app.read_with(cx, |app, _| {
+        assert_eq!(app.page, Page::Settings);
+        assert_eq!(app.knowledge.settings_routine.as_deref(), Some(SUNSET));
+    });
+}
+
+/// A channel note in Settings > Memory opens in Settings.
+#[gpui::test]
+fn a_channel_note_in_settings_memory_opens_in_settings(cx: &mut TestAppContext) {
+    let (handle, app) = open(state(), cx);
+    let cx = &mut VisualTestContext::from_window(handle, cx);
+    cx.update(|_, cx| app.update(cx, |app, cx| app.open_settings(SettingsSection::Memory, cx)));
+    draw(cx);
+    let path = "decisions/roofline.md";
+    // The note is under a folder of the channel's memory.
+    let folder = format!("memory-folder-{LIGHTS}-decisions");
+    if !has(cx, &format!("memory-note-{LIGHTS}-{path}")) && has(cx, &folder) {
+        click(cx, &folder);
+    }
+    click(cx, &format!("memory-note-{LIGHTS}-{path}"));
+    app.read_with(cx, |app, _| {
+        assert_eq!(app.page, Page::Settings);
+        assert_eq!(app.settings_section, SettingsSection::Memory);
+        assert_eq!(
+            app.knowledge.settings_note,
+            Some((LIGHTS.to_owned(), path.to_owned()))
+        );
+        assert!(app.knowledge.panel_note.is_none());
+    });
 }

@@ -166,7 +166,7 @@ pub(super) async fn active_gmail(
     .await
 }
 
-async fn pending_card(hub: &Hub) -> consort_proto::model::Approval {
+pub(super) async fn pending_card(hub: &Hub) -> consort_proto::model::Approval {
     wait_for(async || {
         hub.store
             .read(|conn| work::pending_approvals(conn, None))
@@ -178,7 +178,7 @@ async fn pending_card(hub: &Hub) -> consort_proto::model::Approval {
     .await
 }
 
-async fn answer(hub: &Hub, approval_id: consort_proto::ids::ApprovalId, option: &str) {
+pub(super) async fn answer(hub: &Hub, approval_id: consort_proto::ids::ApprovalId, option: &str) {
     hub.approval_answer(
         &Caller::Hub,
         ApprovalAnswer {
@@ -750,7 +750,7 @@ async fn ask_once_per_task_asks_only_the_first_time() {
             hub.call_tool(
                 session_id,
                 "run_connector_tool",
-                json!({"connector": "gmail_work", "tool": "GMAIL_SEND_EMAIL", "arguments": {}}),
+                json!({"connector": "gmail_work", "tool": "GMAIL_ADD_LABEL", "arguments": {}}),
             )
             .await
         })
@@ -775,7 +775,7 @@ async fn ask_once_per_task_asks_only_the_first_time() {
         &hub,
         session_id,
         "run_connector_tool",
-        json!({"connector": "gmail_work", "tool": "GMAIL_SEND_EMAIL", "arguments": {}}),
+        json!({"connector": "gmail_work", "tool": "GMAIL_ADD_LABEL", "arguments": {}}),
     )
     .await;
     assert_eq!(again["status"], "ran");
@@ -790,6 +790,76 @@ async fn ask_once_per_task_asks_only_the_first_time() {
         .0;
     assert_eq!(calls[0].decision, CallDecision::AllowedEarlierInTask);
     assert_eq!(calls[1].decision, CallDecision::AllowedByUser);
+}
+
+#[tokio::test]
+async fn a_click_on_send_saves_no_allow_for_later_sends_under_ask_once_per_task() {
+    let (hub, _dir, fake) = hub_with_fake().await;
+    active_gmail(
+        &hub,
+        &fake,
+        ToolApprovals {
+            change: ApprovalRule::AskOncePerTask,
+            ..ToolApprovals::default()
+        },
+    )
+    .await;
+    let (_task, session) = test_task_session(&hub).await;
+    let session_id = session.id;
+    let send = |to: &'static str| {
+        let hub = hub.clone();
+        tokio::spawn(async move {
+            hub.call_tool(
+                session_id,
+                "run_connector_tool",
+                json!({"connector": "gmail_work", "tool": "GMAIL_SEND_EMAIL", "arguments": {"recipient_email": to}}),
+            )
+            .await
+        })
+    };
+    let first = send("a@example.com");
+    let card = pending_card(&hub).await;
+    answer(&hub, card.id, "allow").await;
+    assert_eq!(
+        first.await.unwrap().structured_content.unwrap()["status"],
+        "ran"
+    );
+    // A send to someone else asks again: the click covered one send.
+    let second = send("b@example.com");
+    let again = wait_for(async || {
+        hub.store
+            .read(|conn| work::pending_approvals(conn, None))
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+    })
+    .await;
+    assert_ne!(again.id, card.id);
+    assert_eq!(fake.executions().len(), 1, "the second send waits");
+    answer(&hub, again.id, "deny").await;
+    assert_eq!(
+        second.await.unwrap().structured_content.unwrap()["status"],
+        "denied"
+    );
+    // Another change that is not outgoing asks too: no grant for the kind.
+    let label = {
+        let hub = hub.clone();
+        tokio::spawn(async move {
+            hub.call_tool(
+                session_id,
+                "run_connector_tool",
+                json!({"connector": "gmail_work", "tool": "GMAIL_ADD_LABEL", "arguments": {}}),
+            )
+            .await
+        })
+    };
+    let third = pending_card(&hub).await;
+    answer(&hub, third.id, "deny").await;
+    assert_eq!(
+        label.await.unwrap().structured_content.unwrap()["status"],
+        "denied"
+    );
 }
 
 #[tokio::test]

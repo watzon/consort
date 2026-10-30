@@ -188,7 +188,7 @@ impl Hub {
                         preferred_workers: Vec::new(),
                         repo_ids: Vec::new(),
                         default_isolation: Isolation::Worktree,
-                        default_approval_mode: ApprovalMode::Ask,
+                        default_approval_mode: ApprovalMode::Auto,
                         allowed_local_mcp_servers: Vec::new(),
                         memory_enabled: true,
                         tags: Vec::new(),

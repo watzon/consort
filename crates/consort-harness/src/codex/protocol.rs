@@ -199,6 +199,10 @@ pub struct TurnStartParams {
     /// The reasoning effort, such as `high`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
+    /// A new model for this turn and the next ones. Sent only when it
+    /// changes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     /// The approval policy for this turn and the next ones, such as
     /// `untrusted`. Sent only when it changes.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -264,6 +268,32 @@ impl TurnError {
     /// Whether Codex says that the login is gone or expired.
     pub fn is_unauthorized(&self) -> bool {
         self.codex_error_info.as_ref().and_then(Value::as_str) == Some("unauthorized")
+    }
+
+    /// The kind of the failure. `codexErrorInfo` is structured data, so it
+    /// decides first: `usageLimitExceeded` and `rateLimitExceeded` are a
+    /// rate limit, and `unauthorized` is an expired sign-in. Without a
+    /// known value, the text decides (see [`crate::classify_failure`]).
+    pub fn failure(&self) -> crate::FailureInfo {
+        use crate::TurnErrorKind;
+        let by_text = || {
+            let text = match &self.additional_details {
+                Some(more) => format!("{} {more}", self.message),
+                None => self.message.clone(),
+            };
+            crate::classify_failure(&text)
+        };
+        match self.codex_error_info.as_ref().and_then(Value::as_str) {
+            Some("usageLimitExceeded" | "rateLimitExceeded") => crate::FailureInfo {
+                kind: TurnErrorKind::RateLimit,
+                resets_at: by_text().resets_at,
+            },
+            Some("unauthorized") => crate::FailureInfo {
+                kind: TurnErrorKind::ExpiredSignIn,
+                resets_at: None,
+            },
+            _ => by_text(),
+        }
     }
 }
 
@@ -864,6 +894,7 @@ mod tests {
             thread_id: "t".into(),
             input: vec![UserInput::text("hi")],
             effort: None,
+            model: None,
             approval_policy: None,
             sandbox_policy: None,
         };

@@ -1070,6 +1070,7 @@ mod tests {
             created_at: consort_proto::time::Timestamp::from_millis(at),
             proactive: None,
             suggestions: Vec::new(),
+            source_message_id: None,
         }
     }
 

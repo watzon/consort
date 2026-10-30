@@ -416,8 +416,13 @@ impl Hub {
             draft_arguments: None,
             not_my_voice: false,
             ask_rule: Some(rule),
+            replaced_by: None,
         };
         voice.apply(&mut card);
+        // An answer to a card of an outgoing call (a send or a draft) saves
+        // no allow: the grant covers the whole kind of the tool, so one
+        // click on Send would let later sends to anyone run without a card.
+        let saves_grant = card.outgoing.is_none();
         if let Err(err) = self
             .post_hub_card(
                 ctx,
@@ -431,7 +436,7 @@ impl Hub {
             return Err(err);
         }
         let wait = self.connectors.timings().approval_wait;
-        let status = match tokio::time::timeout(wait, &mut answer).await {
+        let mut status = match tokio::time::timeout(wait, &mut answer).await {
             Ok(Ok(status)) => Some(status),
             Ok(Err(_)) => None,
             Err(_) => {
@@ -444,12 +449,43 @@ impl Hub {
                 }
             }
         };
+        if status.is_none() {
+            // A message may have replaced the card at the moment the wait
+            // ended. Read the card again: a Replaced card must not return
+            // `waiting_for_user`, because nothing would run it later.
+            let closed = self
+                .store
+                .read(move |conn| crate::store::work::approval(conn, approval_id))
+                .await?
+                .is_some_and(|a| a.status == ApprovalStatus::Replaced);
+            if closed {
+                status = Some(ApprovalStatus::Replaced);
+            }
+        }
         let Some(status) = status else {
             return Ok(serde_json::to_value(RunConnectorToolResult::WaitingForUser {
                 approval_id,
                 message: "The user has not answered the approval card yet. Go on with other work. When the user answers, the hub runs the call and sends the result.".to_owned(),
             })?);
         };
+        // The user sent a message while the draft waited. The card closed,
+        // and the message is the result of this call. Nothing ran.
+        if status == ApprovalStatus::Replaced {
+            let approval = self
+                .store
+                .read(move |conn| crate::store::work::approval(conn, approval_id))
+                .await?;
+            let message = match approval.map(|a| a.details) {
+                Some(ApprovalDetails::Connector(card)) => {
+                    crate::connectors::replace::replaced_message(&card)
+                }
+                _ => "The user sent a message while your draft waited, and the card closed. Ask the user what they want, then write the draft again.".to_owned(),
+            };
+            return Ok(serde_json::to_value(RunConnectorToolResult::Replaced {
+                approval_id,
+                message,
+            })?);
+        }
         // The user may have edited the text on the card: the call runs with
         // the arguments of the card.
         let edited = if status == ApprovalStatus::Allowed {
@@ -463,7 +499,14 @@ impl Hub {
             arguments: &edited,
             ..record
         };
-        let mut result = self.answered_call(&record, &account, rule, status).await?;
+        let grant_rule = if saves_grant {
+            rule
+        } else {
+            ApprovalRule::AskEveryTime
+        };
+        let mut result = self
+            .answered_call(&record, &account, grant_rule, status)
+            .await?;
         self.redact_for_voice_task(voice_task, &connection, &mut result)
             .await?;
         Ok(serde_json::to_value(result)?)
@@ -732,7 +775,12 @@ impl Hub {
         // The rule that made the card ask, as the hub decided when it posted
         // the card. A proactive turn, a draft task, flags and a send in the
         // voice asked every time, so their late answer saves no allow.
-        let rule = card.ask_rule.unwrap_or(ApprovalRule::AskEveryTime);
+        // A card of an outgoing call saves no allow either.
+        let rule = if card.outgoing.is_some() {
+            ApprovalRule::AskEveryTime
+        } else {
+            card.ask_rule.unwrap_or(ApprovalRule::AskEveryTime)
+        };
         let result = self
             .answered_call(&record, &account, rule, approval.status)
             .await;
@@ -769,6 +817,7 @@ impl Hub {
                 format!("{} on {}: {message}", card.tool, connection.name)
             }
             Ok(RunConnectorToolResult::WaitingForUser { .. }) => String::new(),
+            Ok(RunConnectorToolResult::Replaced { message, .. }) => message,
             Err(err) => format!(
                 "The user allowed {} on {}, but it did not run: {}",
                 card.tool,

@@ -7,10 +7,10 @@ use consort_proto::{
         AccountCreate, AccountRemove, AccountSignOut, AccountUpdate, AcpRegistryList,
         ChannelArchive, ChannelCreate, ChannelDelete, ChannelMove, ChannelUpdate,
         DecisionAnswerRequest, GroupCreate, GroupUpdate, MessageDelete, MessageEdit, MessageList,
-        PreferencesSetFavoriteModel, ReadMark, SignInCancel, SignInStart, SignInSubmitCode,
-        TaskArchive, TaskInterrupt, TaskReopen, TaskResolve, TaskRetry, WorkerPairingCode,
-        WorkerRename, WorkerRevoke, WorkerSetPaused, WorkerSetTags, WorkerToolInstall,
-        WorkerToolsCheck,
+        PreferencesSetAccountFallback, PreferencesSetFavoriteModel, ReadMark, SignInCancel,
+        SignInStart, SignInSubmitCode, TaskArchive, TaskInterrupt, TaskReopen, TaskResolve,
+        TaskRetry, WorkerPairingCode, WorkerRename, WorkerRevoke, WorkerSetPaused, WorkerSetTags,
+        WorkerToolInstall, WorkerToolsCheck,
     },
     ids::{ChannelId, GroupId},
     model::{
@@ -105,6 +105,25 @@ pub(crate) fn proto_approval_mode(
         crate::view::ApprovalMode::AutoEdits => consort_proto::model::ApprovalMode::AutoEdits,
         crate::view::ApprovalMode::Auto => consort_proto::model::ApprovalMode::Auto,
         crate::view::ApprovalMode::FullAccess => consort_proto::model::ApprovalMode::FullAccess,
+    }
+}
+
+/// The `task.update` that sets the model of a task. The options carry the
+/// effort. The selection is never `null` here: the hub keeps the current
+/// model for a started task when a selection is cleared, so the client
+/// always names one.
+pub(crate) fn task_model_update(
+    task_id: consort_proto::ids::TaskId,
+    chosen: &SelectionView,
+) -> consort_proto::client_api::TaskUpdate {
+    consort_proto::client_api::TaskUpdate {
+        task_id,
+        title: None,
+        brief: None,
+        model_selection: Some(selection(&Some(chosen.clone()))),
+        placement: None,
+        approval_mode: None,
+        start_at: None,
     }
 }
 
@@ -592,6 +611,28 @@ async fn run(shared: Arc<Shared>, command: Command) -> Result<CommandOutput, Cli
                 })
                 .await?;
         }
+        Command::SetTaskModel { task_id, selection } => {
+            shared
+                .call(task_model_update(parse(&task_id, "task")?, &selection))
+                .await?;
+        }
+        Command::EditDraft {
+            message_id,
+            title,
+            body,
+        } => {
+            let result = shared
+                .call(consort_proto::client_api::DraftEdit {
+                    message_id: parse(&message_id, "message")?,
+                    title,
+                    body,
+                })
+                .await?;
+            if let Ok(mut cache) = shared.cache.lock() {
+                cache.merge_messages(vec![result.message]);
+            }
+            shared.publish();
+        }
         Command::StopTask { task_id } => {
             shared
                 .call(TaskInterrupt {
@@ -726,6 +767,11 @@ async fn run(shared: Arc<Shared>, command: Command) -> Result<CommandOutput, Cli
                     },
                     favorite,
                 })
+                .await?;
+        }
+        Command::SetAccountFallback { enabled } => {
+            shared
+                .call(PreferencesSetAccountFallback { enabled })
                 .await?;
         }
         Command::SetWorkerPaused { worker_id, paused } => {
@@ -1249,6 +1295,30 @@ mod tests {
         );
         assert_eq!(sent.options.get("thinking"), Some(&OptionValue::Bool(true)));
         assert_eq!(selection(&None), None);
+    }
+
+    #[test]
+    fn a_task_model_change_sends_only_the_selection_with_its_effort() {
+        let id = consort_proto::ids::TaskId::new();
+        let chosen = SelectionView {
+            account_label: "Claude Personal".into(),
+            model_id: "opus".into(),
+            model_name: "Opus 5.5".into(),
+            options: vec![("effort".into(), SelectionOption::Text("high".into()))],
+        };
+        let update = task_model_update(id, &chosen);
+        let wire = serde_json::to_value(&update).unwrap();
+        assert_eq!(wire["task_id"], id.to_string());
+        assert_eq!(wire["model_selection"]["account_label"], "Claude Personal");
+        assert_eq!(wire["model_selection"]["model"], "opus");
+        assert_eq!(wire["model_selection"]["options"]["effort"], "high");
+        let mut keys: Vec<&String> = wire.as_object().unwrap().keys().collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            ["model_selection", "task_id"],
+            "no other field changes"
+        );
     }
 
     #[test]

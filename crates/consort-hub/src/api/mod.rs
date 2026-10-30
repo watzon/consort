@@ -31,6 +31,7 @@ pub(crate) async fn dispatch(hub: &Hub, caller: Caller, request: ClientRequest) 
         R::GroupDelete(r) => to_value(&hub.group_delete(caller, r).await?),
         R::GroupReorder(r) => to_value(&hub.group_reorder(caller, r).await?),
         R::RepoCreate(r) => to_value(&hub.repo_create(caller, r).await?),
+        R::DraftEdit(r) => to_value(&hub.draft_edit(caller, r).await?),
         R::MessageSend(r) => to_value(&hub.message_send(caller, r).await?),
         R::MessageList(r) => to_value(&hub.message_list(caller, r).await?),
         R::MessageEdit(r) => to_value(&hub.message_edit(caller, r).await?),
@@ -107,6 +108,9 @@ pub(crate) async fn dispatch(hub: &Hub, caller: Caller, request: ClientRequest) 
         R::WorkerToolsCheck(r) => to_value(&hub.worker_tools_check(caller, r).await?),
         R::WorkerToolInstall(r) => to_value(&hub.worker_tool_install(caller, r).await?),
         R::AcpRegistryList(r) => to_value(&hub.acp_registry_list(caller, r).await?),
+        R::PreferencesSetAccountFallback(r) => {
+            to_value(&hub.preferences_set_account_fallback(caller, r).await?)
+        }
         R::PreferencesSetFavoriteModel(r) => {
             to_value(&hub.preferences_set_favorite_model(caller, r).await?)
         }

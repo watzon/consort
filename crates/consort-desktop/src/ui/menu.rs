@@ -61,7 +61,7 @@ pub enum MenuAction {
     RemoveAccount(String, String),
     PauseWorker(String, bool),
     RemoveWorker(String),
-    /// The Connectors and skills dialog of a channel.
+    /// Opens the Connectors tab of the Channel panel of a channel.
     ChannelExtensions(String),
     /// Sign a connection in again.
     ReconnectConnection(String),
@@ -76,8 +76,6 @@ pub enum MenuAction {
         consort_client::ToolKindView,
         consort_client::ApprovalRuleView,
     ),
-    /// Add a tag to a Use in, or take it away.
-    ToggleScopeTag(crate::extensions::UseInTarget, String),
     SetSkillEnabled(String, bool),
     SkillFiles(String),
     RemoveSkill(String),

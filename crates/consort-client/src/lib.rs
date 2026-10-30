@@ -9,6 +9,7 @@
 
 pub mod activity;
 pub mod admin;
+pub mod approval_text;
 pub mod blob;
 pub mod cache;
 pub mod chat;
@@ -16,6 +17,8 @@ pub mod command;
 pub mod connectors;
 pub mod convo;
 pub mod derive;
+pub mod document;
+pub mod drafts;
 pub mod error;
 pub mod extensions_view;
 pub mod files;
@@ -38,14 +41,17 @@ pub mod notify;
 pub mod offline;
 pub mod persist;
 pub mod picker;
+pub mod plan;
 pub mod proactivity;
 pub mod reduce;
 pub mod reduce_convo;
 pub mod routines;
 pub mod skills;
 pub mod store;
+pub mod task_model;
 #[cfg(test)]
 mod test_entities;
+pub mod turn_errors;
 pub mod update;
 pub mod uploads;
 pub mod view;
@@ -60,10 +66,12 @@ pub use command::{
     NewChannel, NewConnection, PastedBytes, SecretEnv, SecretText, SkillChanges,
 };
 pub use connectors::*;
+pub use drafts::{DraftOutcomeView, ShownDraftView, draft_title};
 pub use error::ClientError;
 pub use files::{AttachmentView, ChannelFileView, FilesListing};
 pub use skills::*;
 pub use store::Drafts;
+pub use turn_errors::{ErrorAction, ErrorCardView, TryAgainTarget, TurnErrorKindView, TurnFailed};
 pub use uploads::{UploadStatus, UploadTarget, UploadView};
 pub use view::*;
 
@@ -488,6 +496,23 @@ impl Client {
         }
     }
 
+    /// The window layout of this app. The mock and tests get the defaults.
+    pub fn load_layout(&self) -> store::LayoutSettings {
+        self.drafts
+            .as_ref()
+            .map(|store| store.load_layout())
+            .unwrap_or_default()
+    }
+
+    /// Saves the window layout in the client's folder. Does nothing when the
+    /// client has no folder.
+    pub fn save_layout(&self, layout: &store::LayoutSettings) -> Result<(), ClientError> {
+        match &self.drafts {
+            Some(store) => store.save_layout(layout),
+            None => Ok(()),
+        }
+    }
+
     /// Loads the replies of a task's thread when they are not loaded yet.
     pub async fn load_thread(&self, task_id: String) -> Result<(), ClientError> {
         self.run(Command::LoadThread { task_id }).await
@@ -508,6 +533,50 @@ impl Client {
 
     pub async fn retry_task(&self, task_id: String) -> Result<(), ClientError> {
         self.run(Command::RetryTask { task_id }).await
+    }
+
+    /// Sets the model and the options of a task that has started. The hub
+    /// refuses a Resolved or archived task, and a worker that does not have
+    /// the account. Use [`TaskThreadView::model_options`] to know which
+    /// picks start a new session.
+    pub async fn set_task_model(
+        &self,
+        task_id: String,
+        selection: SelectionView,
+    ) -> Result<(), ClientError> {
+        self.run(Command::SetTaskModel { task_id, selection }).await
+    }
+
+    /// Saves the user's change to the title or text of a draft card from
+    /// `show_draft`. Copy needs no call: the app copies the text itself.
+    pub async fn edit_draft(
+        &self,
+        message_id: String,
+        title: Option<String>,
+        body: Option<String>,
+    ) -> Result<(), ClientError> {
+        self.run(Command::EditDraft {
+            message_id,
+            title,
+            body,
+        })
+        .await
+    }
+
+    /// The Try again button of an error card.
+    ///
+    /// - A task retries: the hub starts a new session from the brief.
+    /// - A channel sends the last message of the user again, as a new
+    ///   message. The first one stays in the timeline, so it shows twice.
+    ///   A failed routine run or check-in has no message to send, and its
+    ///   card has no Try again.
+    pub async fn try_again(&self, target: TryAgainTarget) -> Result<(), ClientError> {
+        match target {
+            TryAgainTarget::Task { task_id } => self.retry_task(task_id).await,
+            TryAgainTarget::ResendMessage { channel_id, body } => {
+                self.send_message(channel_id, body).await
+            }
+        }
     }
 
     pub async fn stop_task(&self, task_id: String) -> Result<(), ClientError> {
@@ -544,6 +613,11 @@ impl Client {
             favorite,
         })
         .await
+    }
+
+    /// Allows work to move to another account at a usage limit, or stops it.
+    pub async fn set_account_fallback(&self, enabled: bool) -> Result<(), ClientError> {
+        self.run(Command::SetAccountFallback { enabled }).await
     }
 
     /// Makes an account on a worker and returns its ID.

@@ -152,6 +152,15 @@ pub enum RunConnectorToolResult {
         /// What happened.
         message: String,
     },
+    /// The user sent a message while the draft card waited. The hub closed
+    /// the card and the call did not run. Nothing was sent.
+    Replaced {
+        /// The approval card that the hub closed.
+        approval_id: ApprovalId,
+        /// What the user sent, what to do with it, and the text of the draft
+        /// when the user saved edits.
+        message: String,
+    },
 }
 
 /// `list_skills` result.

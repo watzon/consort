@@ -616,7 +616,7 @@ pub struct InstallCardView {
 /// like any approval.
 #[derive(Clone, Debug, PartialEq)]
 pub enum HubCardView {
-    Connector(ConnectorCardView),
+    Connector(Box<ConnectorCardView>),
     Management(ManagementCardView),
     ConnectService(ConnectCardView),
     SignIn(SignInCardView),
@@ -690,6 +690,25 @@ pub fn use_in_short(use_in: &UseInView, channels: &[ChannelView]) -> String {
                 n => format!("{n} channels"),
             }
         }
+    }
+}
+
+/// Whether the scope is this one channel and no other.
+pub fn use_in_is_only(use_in: &UseInView, channel_id: &str) -> bool {
+    matches!(use_in, UseInView::Channels(ids) if ids.len() == 1 && ids[0] == channel_id)
+}
+
+/// The short label of a chosen scope in the Use in control: "acme", "4
+/// channels" or "Tagged", which the tag chips follow.
+pub fn use_in_choice_label(use_in: &UseInView, channels: &[ChannelView]) -> String {
+    match use_in {
+        UseInView::EveryChannel => "Every channel".to_owned(),
+        UseInView::Tags(_) => "Tagged".to_owned(),
+        UseInView::Channels(ids) => match channel_names(ids, channels).as_slice() {
+            [] => "No channel".to_owned(),
+            [one] => one.clone(),
+            many => format!("{} channels", many.len()),
+        },
     }
 }
 
@@ -1199,6 +1218,18 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_scope_of_only_tutti_is_told_apart_from_a_longer_list() {
+        let only = UseInView::Channels(vec!["t".into()]);
+        assert!(use_in_is_only(&only, "t"));
+        assert!(!use_in_is_only(&only, "x"));
+        assert!(!use_in_is_only(
+            &UseInView::Channels(vec!["t".into(), "x".into()]),
+            "t"
+        ));
+        assert!(!use_in_is_only(&UseInView::EveryChannel, "t"));
     }
 
     #[test]

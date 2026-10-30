@@ -92,6 +92,8 @@ pub const CATEGORIES: [IconCategory; 6] = [
             e("bell", &["alert", "notification", "ring", "reminder"]),
             e("users", &["people", "team", "group", "family"]),
             e("user", &["person", "profile", "account", "me"]),
+            e("smile", &["face", "emoji", "happy", "react"]),
+            e("menu", &["lines", "hamburger", "list", "navigation"]),
             e("channel", &["hash", "tag", "topic"]),
             e("attach", &["paperclip", "clip", "attachment"]),
             e("quote", &["citation", "saying", "text"]),
@@ -301,7 +303,7 @@ mod tests {
         let unique: BTreeSet<String> = listed.iter().map(|n| (*n).to_owned()).collect();
         assert_eq!(listed.len(), unique.len(), "an icon is listed twice");
         assert_eq!(unique, files);
-        assert_eq!(listed.len(), 85);
+        assert_eq!(listed.len(), 87);
     }
 
     #[test]

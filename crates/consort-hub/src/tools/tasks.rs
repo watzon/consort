@@ -1,6 +1,6 @@
 //! Hub tools for tasks, decisions, workers and task sessions.
 
-use consort_proto::ids::{DecisionId, TaskId};
+use consort_proto::ids::{DecisionId, MessageId, TaskId};
 use consort_proto::model::{
     ApprovalMode, Author, Channel, ChannelFile, Decision, DecisionStatus, Isolation, MessageKind,
     PlacementRequest, TaskCreator, artifact_path, validate_decision,
@@ -325,6 +325,18 @@ impl Hub {
     ) -> Result<Value> {
         let (task_id, channel_id) = (args.task_id, ctx.channel.id);
         self.check_steer_task(ctx, task_id).await?;
+        if let Some(source_id) = args.user_message_id {
+            return self.forward_user_message(ctx, args, source_id).await;
+        }
+        let body = args
+            .body
+            .clone()
+            .filter(|b| !b.trim().is_empty())
+            .ok_or_else(|| {
+                HubError::invalid(
+                    "Give body, the instruction for the task, or user_message_id, the ID of the user's message to pass on.",
+                )
+            })?;
         let paths = args.attachments.clone();
         let (task, attachments) = self
             .store
@@ -339,13 +351,12 @@ impl Hub {
         let delivery = self
             .deliver_to_task(
                 task.id,
-                args.body.clone(),
+                body.clone(),
                 attachments.clone(),
                 Actor::Coordinator,
             )
             .await?;
         let session = ctx.session.clone();
-        let body = args.body;
         self.store
             .write(move |tx| {
                 let mut new = conversation::NewMessage::new(
@@ -364,6 +375,116 @@ impl Hub {
         to_value(&MessageTaskResult {
             task_id: args.task_id,
             delivery,
+        })
+    }
+
+    /// `message_task` with `user_message_id`: passes a message of the user
+    /// to a task. The hub reads the text from the stored message and never
+    /// from the arguments, so text from a web page or a task cannot pose as
+    /// the user's words. The task gets the text as a message from the user,
+    /// and the task thread shows it as a message of the user that records
+    /// its source.
+    async fn forward_user_message(
+        &self,
+        ctx: &ToolCtx,
+        args: MessageTaskArgs,
+        source_id: MessageId,
+    ) -> Result<Value> {
+        let (task_id, channel_id) = (args.task_id, ctx.channel.id);
+        let session_id = ctx.session.id;
+        let hub = self.clone();
+        if !args.attachments.is_empty() {
+            // The message reaches the task as the user's own. A file that
+            // the user did not attach must not ride on it.
+            return Err(HubError::invalid(
+                "With user_message_id the task gets the user's message with its own attachments only. Leave attachments out. To send files, use body with attachments and no user_message_id.",
+            ));
+        }
+        let delivered = self
+            .store
+            .write(move |tx| {
+                let task = work::task(tx.db(), task_id)?
+                    .filter(|t| t.channel_id == channel_id)
+                    .ok_or_else(|| HubError::not_found("This channel has no task with this ID."))?;
+                let source = conversation::message(tx.db(), source_id)?
+                    .filter(|m| m.channel_id == channel_id)
+                    .ok_or_else(|| {
+                        HubError::not_found(
+                            "This channel has no message with this ID. Use the ID of a message from the user in this channel.",
+                        )
+                    })?;
+                if source.author != Author::User
+                    || source.kind != MessageKind::Text
+                    || source.deleted_at.is_some()
+                {
+                    return Err(HubError::invalid(
+                        "Only a message from the user can go to a task this way. To give the task your own instruction, leave user_message_id out and set body.",
+                    ));
+                }
+                if source.thread_root_id == Some(task.card_message_id) {
+                    return Err(HubError::invalid(
+                        "This message is in the thread of the task already, so the task has it.",
+                    ));
+                }
+                if conversation::thread_has_copy_of(tx.db(), task.card_message_id, source.id)? {
+                    return Err(HubError::conflict(
+                        "This message is with the task already. Do not send it again.",
+                    ));
+                }
+                // Only a message that the coordinator is answering in this
+                // turn counts. A proactive turn has none, and an old message
+                // cannot replay an earlier answer such as "yes, go ahead".
+                // A copy (`source_message_id`) and a message in a task
+                // thread are not the user's words in the channel.
+                let in_task_thread = match source.thread_root_id {
+                    Some(root) => work::task_by_card(tx.db(), root)?.is_some(),
+                    None => false,
+                };
+                if source.source_message_id.is_some()
+                    || in_task_thread
+                    || !crate::proactivity::turn::user_message_in_turn(
+                        tx.db(),
+                        session_id,
+                        channel_id,
+                        source.id,
+                    )?
+                {
+                    return Err(HubError::invalid(
+                        "Only a message from the user in this turn can go to a task this way. This message is not one of them. Give the task your own instruction with body, and leave user_message_id out.",
+                    ));
+                }
+                let attachments = source.attachments.clone();
+                // The delivery comes first: when the task cannot take the
+                // message, nothing else changes.
+                let delivered = crate::ops::waiting::deliver_user_text(
+                    &hub,
+                    tx,
+                    task.id,
+                    &source.body,
+                    &attachments,
+                )?;
+                let mut copy = conversation::NewMessage::new(
+                    task.channel_id,
+                    Author::User,
+                    MessageKind::Text,
+                    source.body,
+                );
+                copy.thread_root_id = Some(task.card_message_id);
+                copy.author_task_id = Some(task.id);
+                copy.attachments = attachments;
+                copy.source_message_id = Some(source.id);
+                tx.insert_message(copy)?;
+                Ok((delivered, task.channel_id))
+            })
+            .await?;
+        let (delivered, task_channel) = delivered;
+        self.after_delivery(&delivered);
+        if delivered.status_changed {
+            self.kick_coordinator(task_channel);
+        }
+        to_value(&MessageTaskResult {
+            task_id,
+            delivery: delivered.delivery,
         })
     }
 

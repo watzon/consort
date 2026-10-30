@@ -418,6 +418,7 @@ fn closed_approval(m: &model::Message) -> ApprovalView {
         summary: closed_summary(&m.body, m.author_task_id.is_some()),
         folder: None,
         detail: None,
+        kind: crate::approval_text::ApprovalKind::Other,
         choices: Vec::new(),
         state: RequestState::Closed,
         answer: None,
@@ -538,7 +539,8 @@ fn approval_detail(details: &ApprovalDetails) -> (Option<String>, Option<String>
             }
             (None, Some(text))
         }
-        ApprovalDetails::Network { target } => (None, Some(format!("Network: {target}"))),
+        // The block holds the target alone: a URL or the words of a search.
+        ApprovalDetails::Network { target } => (None, Some(target.clone())),
         ApprovalDetails::Other { text } => (
             None,
             text.as_deref()
@@ -598,7 +600,7 @@ fn approval_detail(details: &ApprovalDetails) -> (Option<String>, Option<String>
 fn approval_view(cache: &Cache, a: &model::Approval) -> ApprovalView {
     let (folder, detail) = approval_detail(&a.details);
     let (card, button_labels) =
-        match crate::extensions_view::hub_card(&a.details, &a.options, cache) {
+        match crate::extensions_view::hub_card(&a.details, &a.options, a.status, cache) {
             Some((card, labels)) => (Some(Box::new(card)), labels),
             None => (None, Vec::new()),
         };
@@ -636,11 +638,15 @@ fn approval_view(cache: &Cache, a: &model::Approval) -> ApprovalView {
         summary: approval_summary(a),
         folder,
         detail,
+        kind: crate::approval_text::ApprovalKind::of(&a.details),
         choices,
         state: match a.status {
             ApprovalStatus::Pending => RequestState::Pending,
             ApprovalStatus::Allowed | ApprovalStatus::Denied => RequestState::Answered,
-            ApprovalStatus::Expired | ApprovalStatus::Canceled => RequestState::Expired,
+            // A replaced draft is closed too. the `outcome` of the draft card says why.
+            ApprovalStatus::Expired | ApprovalStatus::Canceled | ApprovalStatus::Replaced => {
+                RequestState::Expired
+            }
         },
         answer,
         allow_always_label,
@@ -677,6 +683,86 @@ fn decision_view(d: &model::Decision) -> DecisionView {
             .map(u32::from),
         answer_text: d.answer.as_ref().and_then(|a| a.text.clone()),
     }
+}
+
+/// Whether the timeline or the task thread of a failed send shows it as a
+/// dimmed message in the lane of the user. If not, the app must tell the
+/// user another way.
+fn failure_in_lane(
+    cache: &Cache,
+    f: &crate::cache::SendFailure,
+    task_by_card: &BTreeMap<String, &model::Task>,
+) -> bool {
+    match &f.thread_root_id {
+        Some(root) => task_by_card
+            .get(root)
+            .is_some_and(|t| t.archived_at.is_none()),
+        None => cache.channels.contains_key(&f.channel_id),
+    }
+}
+
+/// The refused state of a message in the lane of the user.
+fn refused_view(f: &crate::cache::SendFailure) -> RefusedView {
+    RefusedView {
+        failure_id: f.id.clone(),
+        reason: sentence(&f.message),
+        action: RefusedView::ACTION.to_owned(),
+    }
+}
+
+/// The card of a `turn_failed` notice in a channel. `index` is the place of
+/// the notice in `messages`, the messages of the channel, oldest first.
+///
+/// - Quiet: a newer message of the user is in the channel. The failure is
+///   old news then, and the notice shows as one line.
+/// - Try again: the last text message of the user before the notice. A
+///   notice that no message of the user started (a failed routine run) has
+///   none, and the card has no Try again.
+fn channel_error_card(
+    messages: &[&model::Message],
+    index: usize,
+    body: &str,
+    now: i64,
+) -> Option<crate::turn_errors::ErrorCardView> {
+    use crate::turn_errors::{TryAgainTarget, error_card, parse_turn_failed};
+    let failed = parse_turn_failed(body)?;
+    let is_user_text =
+        |m: &&&model::Message| m.author == Author::User && m.kind == MessageKind::Text;
+    let quiet = messages[index + 1..].iter().any(|m| is_user_text(&m));
+    let try_again = messages[..index]
+        .iter()
+        .rev()
+        .find(|m| is_user_text(m))
+        .map(|m| TryAgainTarget::ResendMessage {
+            channel_id: m.channel_id.to_string(),
+            body: m.body.clone(),
+        });
+    Some(error_card(&failed, try_again, quiet, now))
+}
+
+/// The card of a `turn_failed` notice in a task thread.
+///
+/// - Quiet: a message of the user is newer than the notice, or the task is
+///   no longer Failed (a retry started it again).
+/// - Try again: retry the task.
+fn task_error_card(
+    task: &model::Task,
+    thread: &[&model::Message],
+    notice: &model::Message,
+    now: i64,
+) -> Option<crate::turn_errors::ErrorCardView> {
+    use crate::turn_errors::{TryAgainTarget, error_card, parse_turn_failed};
+    let failed = parse_turn_failed(&notice.body)?;
+    let newer_user_message = thread.iter().any(|m| {
+        m.author == Author::User
+            && m.kind == MessageKind::Text
+            && (m.created_at, m.id) > (notice.created_at, notice.id)
+    });
+    let quiet = newer_user_message || task.status != PS::Failed;
+    let try_again = Some(TryAgainTarget::Task {
+        task_id: task.id.to_string(),
+    });
+    Some(error_card(&failed, try_again, quiet, now))
 }
 
 /// The kind and the text of a notice message. The hub writes the body as
@@ -1202,7 +1288,7 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                 last_day = key;
             }
         };
-        for m in &messages {
+        for (index, m) in messages.iter().enumerate() {
             let at = m.created_at.as_millis();
             let after_marker = marker_at.is_none_or(|at| (m.created_at, m.id) > at);
             // A system notice is not something to read: it never counts.
@@ -1309,6 +1395,12 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                 let memory = (kind == "memory_saved")
                     .then(|| memory_saved(&m.body))
                     .flatten();
+                let error = (kind == "turn_failed")
+                    .then(|| channel_error_card(&messages, index, &m.body, now))
+                    .flatten();
+                let draft = (kind == crate::drafts::DRAFT_KIND)
+                    .then(|| crate::drafts::parse_shown_draft(&m.id.to_string(), &m.body))
+                    .flatten();
                 items.push(TimelineItem::Notice(NoticeView {
                     message_id: m.id.to_string(),
                     time_label: format::time_label(at),
@@ -1316,6 +1408,8 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                     kind,
                     text,
                     memory,
+                    error,
+                    draft,
                 }));
             } else {
                 items.push(TimelineItem::Message(MessageView {
@@ -1335,6 +1429,8 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                     last_reply_label: crate::reduce_convo::last_reply(m, now),
                     proactive: None,
                     suggestions: Vec::new(),
+                    source_message_id: m.source_message_id.map(|id| id.to_string()),
+                    refused: None,
                 }));
             }
         }
@@ -1356,6 +1452,24 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                 ..MessageView::default()
             }));
         }
+        // A message that the hub refused stays in the lane of the user, at
+        // the end, dimmed, with the reason (see `RefusedView`).
+        for f in cache
+            .send_failures
+            .iter()
+            .filter(|f| f.channel_id == channel.id && f.thread_root_id.is_none())
+        {
+            items.push(TimelineItem::Message(MessageView {
+                id: format!("refused-{}", f.id),
+                channel_id: channel.id.clone(),
+                speaker: Speaker::You,
+                time_label: format::time_label(f.created_at),
+                created_at: f.created_at,
+                body: f.body.clone(),
+                refused: Some(refused_view(f)),
+                ..MessageView::default()
+            }));
+        }
         unread.insert(channel.id.clone(), count);
         timelines.push(TimelineView {
             channel_id: channel.id.clone(),
@@ -1373,6 +1487,7 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
         let mut replies: Vec<&model::Message> =
             replies_by_root.get(&root).cloned().unwrap_or_default();
         replies.sort_by_key(|m| m.created_at);
+        let thread_messages = replies.clone();
         let mut posts = Vec::new();
         let (mut decisions, mut approvals) = (0, 0);
         for m in replies {
@@ -1397,7 +1512,18 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                 }),
                 MessageKind::Notice => {
                     let (kind, text) = notice_parts(&m.body);
-                    Some(PostBody::Notice { kind, text })
+                    let error = (kind == "turn_failed")
+                        .then(|| task_error_card(task, &thread_messages, m, now))
+                        .flatten();
+                    let draft = (kind == crate::drafts::DRAFT_KIND)
+                        .then(|| crate::drafts::parse_shown_draft(&m.id.to_string(), &m.body))
+                        .flatten();
+                    Some(PostBody::Notice {
+                        kind,
+                        text,
+                        error,
+                        draft,
+                    })
                 }
                 _ => Some(PostBody::Text(m.body.clone())),
             };
@@ -1416,6 +1542,8 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                     time_label: format::time_label(m.created_at.as_millis()),
                     bodies,
                     pending: false,
+                    source_message_id: m.source_message_id.map(|id| id.to_string()),
+                    refused: None,
                 });
             }
         }
@@ -1438,10 +1566,29 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                 time_label: format::time_label(p.created_at),
                 bodies,
                 pending: true,
+                source_message_id: None,
+                refused: None,
+            });
+        }
+        for f in cache
+            .send_failures
+            .iter()
+            .filter(|f| f.thread_root_id.as_deref() == Some(root.to_string().as_str()))
+        {
+            posts.push(ThreadPost {
+                id: format!("refused-{}", f.id),
+                speaker: Speaker::You,
+                time_label: format::time_label(f.created_at),
+                bodies: vec![PostBody::Text(f.body.clone())],
+                pending: false,
+                source_message_id: None,
+                refused: Some(refused_view(f)),
             });
         }
         // Folds the session's commands and file changes into one line, as
         // the first post.
+        let mut plan = None;
+        let mut plan_at: Option<i64> = None;
         if let Some(session) = task.current_session_id {
             let (mut commands, mut files) = (0, std::collections::BTreeSet::new());
             let mut lines = Vec::new();
@@ -1467,6 +1614,14 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                             lines.push(line(format!("Changed {path}")));
                         }
                     }
+                    // The plan is a card of its own, not a line. The plan
+                    // item that changed last is the plan.
+                    ItemSummary::Plan { steps, updated_at } => {
+                        if plan_at.is_none_or(|at| *updated_at >= at) {
+                            plan_at = Some(*updated_at);
+                            plan = crate::plan::PlanView::of(steps);
+                        }
+                    }
                 }
             }
             if commands + files.len() > 0 {
@@ -1490,6 +1645,8 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                             items: lines,
                         }],
                         pending: false,
+                        source_message_id: None,
+                        refused: None,
                     },
                 );
             }
@@ -1503,6 +1660,7 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
             .get(&task.channel_id.to_string())
             .map(|c| c.default_isolation)
             .unwrap_or_default();
+        let task_worker: Option<&model::Worker> = worker.copied();
         threads.push(TaskThreadView {
             task_id: task.id.to_string(),
             title: task.title.clone(),
@@ -1531,6 +1689,15 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
             text_is_preview: cache.task_previews.contains(&task.id.to_string()),
             approval_mode: approval_mode(task.approval_mode),
             model_label: task_model_label(cache, task),
+            selection: task_selection(cache, task).map(|s| selection_view(cache, s)),
+            runs_on: task_worker.map(|w| format!("Runs on {}", w.name)),
+            can_change_model: task.status != PS::Resolved,
+            model_options: crate::task_model::model_options(
+                task_worker,
+                task.current_session_id.is_some(),
+                task_selection(cache, task).map(|s| s.account_label.as_str()),
+            ),
+            plan,
         });
     }
 
@@ -1719,6 +1886,7 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
         workers,
         tags: Vec::new(),
         model_groups,
+        account_fallback: cache.preferences.account_fallback,
         favorite_models: cache
             .preferences
             .favorite_models
@@ -1751,6 +1919,9 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                     "{} Put your text back in the message box, then send it again.",
                     sentence(&f.message)
                 ),
+                reason: sentence(&f.message),
+                action: RefusedView::ACTION.to_owned(),
+                in_lane: failure_in_lane(cache, f, &task_by_card),
             })
             .collect(),
         connections: {
@@ -1902,19 +2073,30 @@ pub(crate) fn sentence(text: &str) -> String {
 }
 
 /// The model of a task in words, from the task's own selection, its
-/// channel's default or the Tutti default. The task keeps the model it
-/// started with, so the thread shows it and does not offer to change it.
+/// channel's default or the Tutti default. The thread also offers to
+/// change it (`TaskThreadView::model_options`).
 fn task_model_label(cache: &Cache, task: &model::Task) -> Option<String> {
-    let channel = cache.channels.get(&task.channel_id.to_string());
-    let tutti = cache.channels.values().find(|c| c.kind == PK::Tutti);
-    let chosen = task
-        .model_selection
-        .as_ref()
-        .or(channel.and_then(|c| c.task_selection.as_ref()))
-        .or(tutti.and_then(|c| c.task_selection.as_ref()))?;
+    let chosen = task_selection(cache, task)?;
     let view = selection_view(cache, chosen);
     let effort = model_effort(cache, &chosen.account_label, &chosen.model);
     Some(crate::picker::selection_words(&view, effort.as_ref()))
+}
+
+/// The selection that the task runs with: its own, else the default of its
+/// channel, else the default of Tutti.
+fn task_selection<'a>(
+    cache: &'a Cache,
+    task: &'a model::Task,
+) -> Option<&'a model::ModelSelection> {
+    let channel = cache.channels.get(&task.channel_id.to_string());
+    let tutti = cache.channels.values().find(|c| c.kind == PK::Tutti);
+    task.model_selection
+        .as_ref()
+        .or(channel.and_then(|c| c.task_selection.as_ref()))
+        .or(tutti.and_then(|c| c.task_selection.as_ref()))
+        // As on the hub: with no choice for tasks, what the assistant runs on.
+        .or(channel.and_then(|c| c.coordinator_selection.as_ref()))
+        .or(tutti.and_then(|c| c.coordinator_selection.as_ref()))
 }
 
 /// The effort levels of a model, from the first worker that reports it.
@@ -2093,6 +2275,7 @@ mod tests {
             created_at: Timestamp::from_millis(at),
             proactive: None,
             suggestions: Vec::new(),
+            source_message_id: None,
         }
     }
 
@@ -2988,6 +3171,82 @@ mod tests {
         assert!(!items[0].item_id.is_empty());
     }
 
+    /// A plan item becomes the checklist of the thread, and it is not a
+    /// line of the activity chip. A later write of the same plan replaces
+    /// it, and a plan that changed later wins over an older one.
+    #[test]
+    fn a_plan_item_becomes_the_checklist_of_the_thread() {
+        let mut w = world();
+        let session = w
+            .cache
+            .tasks
+            .get(&w.task.to_string())
+            .and_then(|t| t.current_session_id)
+            .expect("session");
+        let plan_item = |id: &consort_proto::ids::ItemId, steps: serde_json::Value, at: i64| {
+            let item: consort_proto::model::SessionItem =
+                serde_json::from_value(serde_json::json!({
+                    "id": id,
+                    "session_id": session,
+                    "turn_id": "turn-1",
+                    "kind": "plan",
+                    "payload": {"steps": steps},
+                    "status": "in_progress",
+                    "created_at": NOW,
+                    "updated_at": at
+                }))
+                .expect("item");
+            EntityPayload::SessionItem(item)
+        };
+        let id = consort_proto::ids::ItemId::new();
+        let steps = |first: &str, second: &str| {
+            serde_json::json!([
+                {"text": "Find the documents", "status": first},
+                {"text": "Read the plan", "status": second},
+            ])
+        };
+        w.cache.apply(FeedEntry::upsert(
+            1,
+            Timestamp::from_millis(NOW),
+            plan_item(&id, steps("in_progress", "pending"), NOW),
+        ));
+        let state = view(&w.cache);
+        let thread = state.thread(&w.task.to_string()).expect("thread");
+        let plan = thread.plan.as_ref().expect("a plan");
+        assert_eq!(plan.heading(), "0 of 2 done");
+        assert_eq!(plan.current(), Some("Find the documents"));
+        assert!(
+            thread
+                .posts
+                .iter()
+                .all(|p| !matches!(p.bodies.first(), Some(PostBody::Activity { .. }))),
+            "the plan is not an activity line"
+        );
+        // The harness writes the plan again under the same ID.
+        w.cache.apply(FeedEntry::upsert(
+            2,
+            Timestamp::from_millis(NOW),
+            plan_item(&id, steps("completed", "in_progress"), NOW + 1_000),
+        ));
+        // An older plan item with another ID does not take its place.
+        w.cache.apply(FeedEntry::upsert(
+            3,
+            Timestamp::from_millis(NOW),
+            plan_item(
+                &consort_proto::ids::ItemId::new(),
+                steps("pending", "pending"),
+                NOW - 5_000,
+            ),
+        ));
+        let state = view(&w.cache);
+        let plan = state
+            .thread(&w.task.to_string())
+            .and_then(|t| t.plan.clone())
+            .expect("a plan");
+        assert_eq!(plan.heading(), "1 of 2 done");
+        assert_eq!(plan.current(), Some("Read the plan"));
+    }
+
     /// Finding 14: the detail block names the real action, whatever the
     /// summary says.
     #[test]
@@ -3020,6 +3279,7 @@ mod tests {
         assert!(text.contains("Tool: refund_all"), "{text}");
         assert!(text.contains("Server: payments"), "{text}");
         assert!(text.contains("\"scope\": \"everyone\""), "{text}");
+        assert_eq!(card.kind, crate::approval_text::ApprovalKind::Tool);
 
         if let Some(a) = w.cache.approvals.get_mut(&id.to_string()) {
             a.summary = "Fetch the docs".into();
@@ -3029,7 +3289,8 @@ mod tests {
         }
         let card = detail(&w);
         assert_eq!(card.summary, "Fetch the docs");
-        assert_eq!(card.detail.as_deref(), Some("Network: evil.example.com"));
+        assert_eq!(card.detail.as_deref(), Some("evil.example.com"));
+        assert_eq!(card.kind, crate::approval_text::ApprovalKind::Network);
 
         if let Some(a) = w.cache.approvals.get_mut(&id.to_string()) {
             a.details = ApprovalDetails::Other {
@@ -3161,6 +3422,209 @@ mod tests {
         );
     }
 
+    fn user_text(w: &World, root: Option<MessageId>, body: &str, at: i64) -> Message {
+        let mut m = message(
+            MessageId::new(),
+            w.sayso,
+            Author::User,
+            MessageKind::Text,
+            root,
+            at,
+        );
+        m.body = body.to_owned();
+        m.in_timeline = root.is_none();
+        m
+    }
+
+    fn rate_limit_body() -> String {
+        serde_json::json!({
+            "kind": "turn_failed",
+            "text": "The turn failed. Try again.",
+            "error_kind": "rate_limit",
+            "resets_at": NOW + 86_400_000,
+            "account": "Claude Work",
+            "raw": "usage limit reached",
+        })
+        .to_string()
+    }
+
+    fn channel_error(state: &ViewState, channel: &ChannelId) -> crate::turn_errors::ErrorCardView {
+        state
+            .timeline(&channel.to_string())
+            .expect("timeline")
+            .items
+            .iter()
+            .find_map(|i| match i {
+                TimelineItem::Notice(n) => n.error.clone(),
+                _ => None,
+            })
+            .expect("a notice with an error card")
+    }
+
+    #[test]
+    fn a_failed_channel_turn_gets_an_error_card_that_tries_again_with_the_last_message() {
+        use crate::turn_errors::{ErrorAction, TryAgainTarget, TurnErrorKindView};
+        let mut w = world();
+        let ask = user_text(&w, None, "Summarize my week", NOW - 20_000);
+        let failed = notice(&w, None, &rate_limit_body(), NOW - 10_000);
+        w.cache.messages.insert(ask.id.to_string(), ask);
+        w.cache.messages.insert(failed.id.to_string(), failed);
+        let card = channel_error(&view(&w.cache), &w.sayso);
+        assert_eq!(card.kind, TurnErrorKindView::RateLimit);
+        assert_eq!(card.title, "Claude Work reached its weekly limit");
+        assert_eq!(card.details, "usage limit reached");
+        assert!(!card.quiet);
+        assert_eq!(
+            card.actions,
+            vec![ErrorAction::ChooseAnotherModel, ErrorAction::TryAgain]
+        );
+        assert_eq!(
+            card.try_again,
+            Some(TryAgainTarget::ResendMessage {
+                channel_id: w.sayso.to_string(),
+                body: "Summarize my week".into(),
+            })
+        );
+
+        // A newer message of the user makes the failure old news: one quiet
+        // line with no buttons.
+        let newer = user_text(&w, None, "Never mind", NOW - 5_000);
+        w.cache.messages.insert(newer.id.to_string(), newer);
+        let card = channel_error(&view(&w.cache), &w.sayso);
+        assert!(card.quiet);
+        assert!(card.actions.is_empty());
+        assert_eq!(card.summary, "Claude Work reached its weekly limit");
+    }
+
+    #[test]
+    fn a_failed_channel_turn_with_no_message_of_the_user_has_no_try_again() {
+        let mut w = world();
+        let failed = notice(&w, None, &rate_limit_body(), NOW - 10_000);
+        w.cache.messages.insert(failed.id.to_string(), failed);
+        let card = channel_error(&view(&w.cache), &w.sayso);
+        assert_eq!(card.try_again, None);
+        assert!(
+            !card
+                .actions
+                .contains(&crate::turn_errors::ErrorAction::TryAgain),
+            "a routine run has no message to send again"
+        );
+    }
+
+    #[test]
+    fn an_old_turn_failed_notice_reads_as_an_unknown_error() {
+        use crate::turn_errors::{ErrorAction, TurnErrorKindView};
+        let mut w = world();
+        let failed = notice(
+            &w,
+            None,
+            r#"{"kind":"turn_failed","text":"The assistant stopped: boom"}"#,
+            NOW - 10_000,
+        );
+        w.cache.messages.insert(failed.id.to_string(), failed);
+        let card = channel_error(&view(&w.cache), &w.sayso);
+        assert_eq!(card.kind, TurnErrorKindView::Unknown);
+        assert_eq!(card.title, "The assistant stopped with an error");
+        assert_eq!(card.details, "The assistant stopped: boom");
+        assert!(card.actions.iter().all(|a| *a == ErrorAction::TryAgain));
+    }
+
+    fn thread_error(state: &ViewState, task: &TaskId) -> crate::turn_errors::ErrorCardView {
+        state
+            .thread(&task.to_string())
+            .expect("thread")
+            .posts
+            .iter()
+            .flat_map(|p| p.bodies.iter())
+            .find_map(|b| match b {
+                PostBody::Notice { error, .. } => error.clone(),
+                _ => None,
+            })
+            .expect("a notice with an error card")
+    }
+
+    #[test]
+    fn a_task_error_card_is_quiet_after_a_newer_message_or_a_retry() {
+        use crate::turn_errors::TryAgainTarget;
+        let mut w = world();
+        w.cache
+            .tasks
+            .get_mut(&w.task.to_string())
+            .expect("task")
+            .status = PS::Failed;
+        let body = serde_json::json!({
+            "kind": "turn_failed",
+            "text": "The turn failed.",
+            "error_kind": "worker_restarted",
+        })
+        .to_string();
+        let failed = notice(&w, Some(w.card), &body, NOW - 10_000);
+        w.cache.messages.insert(failed.id.to_string(), failed);
+
+        let card = thread_error(&view(&w.cache), &w.task);
+        assert_eq!(card.title, "The worker restarted during this turn");
+        assert!(!card.quiet);
+        assert_eq!(
+            card.try_again,
+            Some(TryAgainTarget::Task {
+                task_id: w.task.to_string()
+            })
+        );
+
+        // A retry moves the task out of Failed.
+        w.cache
+            .tasks
+            .get_mut(&w.task.to_string())
+            .expect("task")
+            .status = PS::Working;
+        assert!(thread_error(&view(&w.cache), &w.task).quiet);
+
+        // A newer message of the user does the same for a task that stays
+        // Failed.
+        w.cache
+            .tasks
+            .get_mut(&w.task.to_string())
+            .expect("task")
+            .status = PS::Failed;
+        assert!(!thread_error(&view(&w.cache), &w.task).quiet);
+        let reply = user_text(&w, Some(w.card), "Try the other branch", NOW - 5_000);
+        w.cache.messages.insert(reply.id.to_string(), reply);
+        assert!(thread_error(&view(&w.cache), &w.task).quiet);
+    }
+
+    #[test]
+    fn a_draft_notice_shows_the_text_that_the_assistant_showed() {
+        let mut w = world();
+        let body = serde_json::json!({
+            "kind": "draft",
+            "text": "Draft: Claim form",
+            "title": "Claim form",
+            "to": "Dr. Meyer's office",
+            "body": "Dear Dr. Meyer,",
+        })
+        .to_string();
+        let shown = notice(&w, Some(w.card), &body, NOW - 10_000);
+        let id = shown.id.to_string();
+        w.cache.messages.insert(id.clone(), shown);
+        let state = view(&w.cache);
+        let draft = state
+            .thread(&w.task.to_string())
+            .expect("thread")
+            .posts
+            .iter()
+            .flat_map(|p| p.bodies.iter())
+            .find_map(|b| match b {
+                PostBody::Notice { draft, .. } => draft.clone(),
+                _ => None,
+            })
+            .expect("a draft");
+        assert_eq!(draft.message_id, id);
+        assert_eq!(draft.title, "Claim form");
+        assert_eq!(draft.to.as_deref(), Some("Dr. Meyer's office"));
+        assert_eq!(draft.body, "Dear Dr. Meyer,");
+        assert!(!draft.edited);
+    }
+
     #[test]
     fn a_notice_in_a_thread_is_a_notice_post() {
         let mut w = world();
@@ -3180,8 +3644,67 @@ mod tests {
             vec![PostBody::Notice {
                 kind: "answer_not_delivered".into(),
                 text: "Your answer did not reach the task.".into(),
+                draft: None,
+                error: None,
             }]
         );
+    }
+
+    #[test]
+    fn a_copy_of_a_user_message_in_a_thread_carries_its_source() {
+        let mut w = world();
+        let source = message(
+            MessageId::new(),
+            w.sayso,
+            Author::User,
+            MessageKind::Text,
+            None,
+            NOW - 20_000,
+        );
+        let mut copy = message(
+            MessageId::new(),
+            w.sayso,
+            Author::User,
+            MessageKind::Text,
+            Some(w.card),
+            NOW - 10_000,
+        );
+        copy.body = "Use SQLite.".to_owned();
+        copy.source_message_id = Some(source.id);
+        let plain = message(
+            MessageId::new(),
+            w.sayso,
+            Author::User,
+            MessageKind::Text,
+            Some(w.card),
+            NOW - 5_000,
+        );
+        w.cache
+            .messages
+            .insert(source.id.to_string(), source.clone());
+        w.cache.messages.insert(copy.id.to_string(), copy.clone());
+        w.cache.messages.insert(plain.id.to_string(), plain.clone());
+        let state = view(&w.cache);
+        let thread = state.thread(&w.task.to_string()).expect("thread");
+        let post = thread
+            .posts
+            .iter()
+            .find(|p| p.id == copy.id.to_string())
+            .expect("the copy");
+        assert_eq!(post.speaker, Speaker::You);
+        assert_eq!(post.source_message_id, Some(source.id.to_string()));
+        let other = thread
+            .posts
+            .iter()
+            .find(|p| p.id == plain.id.to_string())
+            .expect("a plain reply");
+        assert_eq!(other.source_message_id, None);
+        // The timeline message itself has no source.
+        let timeline = state.timeline(&w.sayso.to_string()).expect("timeline");
+        assert!(timeline.items.iter().all(|i| match i {
+            TimelineItem::Message(m) => m.source_message_id.is_none(),
+            _ => true,
+        }));
     }
 
     /// Finding 7 of review cycle 2: a channel that never loaded showed as
@@ -3237,6 +3760,7 @@ mod tests {
             body: "Please retry".into(),
             channel_name: String::new(),
             message: "That task does not exist".into(),
+            created_at: 1_000,
         });
         let state = view(&w.cache);
         let failure = &state.send_failures[0];
@@ -3248,6 +3772,74 @@ mod tests {
         assert_eq!(failure.body, "Please retry");
         assert!(failure.message.starts_with("That task does not exist."));
         assert!(failure.message.contains("Put your text back"));
+        // The lane shows the reason alone, and the toast keeps the next step.
+        assert_eq!(failure.reason, "That task does not exist.");
+        assert_eq!(failure.action, "Put back in the message box");
+        assert!(failure.in_lane);
+    }
+
+    /// A message that the hub refused shows in the lane of the user, dimmed,
+    /// with the reason and the action. That holds in the timeline and in the
+    /// task thread, and it is the last item of the lane.
+    #[test]
+    fn a_refused_message_shows_in_the_lane_of_the_user_with_the_reason_and_the_action() {
+        let mut w = world();
+        let push = |w: &mut World, id: &str, root: Option<String>, body: &str| {
+            w.cache.send_failures.push(crate::cache::SendFailure {
+                id: id.into(),
+                channel_id: w.sayso.to_string(),
+                thread_root_id: root,
+                body: body.into(),
+                channel_name: String::new(),
+                message: "That channel is archived".into(),
+                created_at: 5_000,
+            });
+        };
+        push(&mut w, "c-1", None, "Please deploy");
+        let root = Some(w.card.to_string());
+        push(&mut w, "c-2", root, "Please retry");
+        let state = view(&w.cache);
+
+        let timeline = state
+            .timelines
+            .iter()
+            .find(|t| t.channel_id == w.sayso.to_string())
+            .expect("timeline");
+        let Some(TimelineItem::Message(last)) = timeline.items.last() else {
+            panic!("a message is the last item");
+        };
+        assert_eq!(last.speaker, Speaker::You);
+        assert_eq!(last.body, "Please deploy");
+        let refused = last.refused.as_ref().expect("refused");
+        assert_eq!(refused.failure_id, "c-1");
+        assert_eq!(refused.reason, "That channel is archived.");
+        assert_eq!(refused.action, "Put back in the message box");
+
+        let thread = state.thread(&w.task.to_string()).expect("thread");
+        let post = thread.posts.last().expect("a post");
+        assert_eq!(post.speaker, Speaker::You);
+        assert_eq!(post.bodies, vec![PostBody::Text("Please retry".into())]);
+        assert_eq!(
+            post.refused.as_ref().map(|r| r.failure_id.as_str()),
+            Some("c-2")
+        );
+        assert!(state.send_failures.iter().all(|f| f.in_lane));
+    }
+
+    #[test]
+    fn a_refused_message_of_a_gone_channel_is_not_in_the_lane() {
+        let mut w = world();
+        w.cache.send_failures.push(crate::cache::SendFailure {
+            id: "c-3".into(),
+            channel_id: "chn_gone".into(),
+            thread_root_id: None,
+            body: "Hello".into(),
+            channel_name: "old".into(),
+            message: "That channel does not exist".into(),
+            created_at: 1,
+        });
+        let state = view(&w.cache);
+        assert!(!state.send_failures[0].in_lane);
     }
 
     /// Review cycle 3, finding 1: the thread had no brief and no review
@@ -3592,6 +4184,134 @@ mod tests {
                 .flat_map(|w| w.accounts.iter())
                 .find(|a| a.label == label)
                 .expect("account row")
+        }
+
+        fn with_models(
+            mut a: HarnessAccount,
+            switch_model: bool,
+            models: &[(&str, &str)],
+        ) -> HarnessAccount {
+            a.capabilities.switch_model = switch_model;
+            a.models = models
+                .iter()
+                .map(|(id, name)| ModelInfo {
+                    id: (*id).into(),
+                    name: (*name).into(),
+                    options: vec![],
+                })
+                .collect();
+            a
+        }
+
+        /// A started task shows where it runs and what each pick of the
+        /// worker costs: the same account on a harness that switches keeps
+        /// the session, and every other pick starts a new one.
+        #[test]
+        fn a_started_task_shows_its_worker_its_model_and_which_picks_start_a_new_session() {
+            let mut w = world();
+            let mut bigboi = worker("bigboi", &[], &[]);
+            let mut signed_out = account("Claude Spare", "claude", PA::SignedOut);
+            signed_out.models = vec![ModelInfo {
+                id: "opus".into(),
+                name: "Opus 5.5".into(),
+                options: vec![],
+            }];
+            inventory(&mut bigboi).accounts = vec![
+                with_models(
+                    account("Claude Work", "claude", PA::SignedIn),
+                    true,
+                    &[("opus", "Opus 5.5"), ("sonnet", "Sonnet 5.5")],
+                ),
+                with_models(
+                    account("Codex Personal", "codex", PA::SignedIn),
+                    true,
+                    &[("gpt", "GPT-5.5")],
+                ),
+                signed_out,
+            ];
+            let worker_id = bigboi.id;
+            w.cache.workers.insert(bigboi.id.to_string(), bigboi);
+            let task = w.cache.tasks.get_mut(&w.task.to_string()).expect("task");
+            task.worker_id = Some(worker_id);
+            task.current_session_id = Some(consort_proto::ids::SessionId::new());
+            task.model_selection = Some(ModelSelection {
+                account_label: "Claude Work".into(),
+                model: "opus".into(),
+                options: Default::default(),
+            });
+            let state = view(&w.cache);
+            let thread = state.thread(&w.task.to_string()).expect("thread");
+            assert_eq!(thread.runs_on.as_deref(), Some("Runs on bigboi"));
+            assert!(thread.can_change_model);
+            let selection = thread.selection.as_ref().expect("selection");
+            assert_eq!(
+                (
+                    selection.account_label.as_str(),
+                    selection.model_id.as_str()
+                ),
+                ("Claude Work", "opus")
+            );
+            let picks: Vec<(&str, &str, bool)> = thread
+                .model_options
+                .iter()
+                .map(|o| {
+                    (
+                        o.account_label.as_str(),
+                        o.model_id.as_str(),
+                        o.starts_new_session,
+                    )
+                })
+                .collect();
+            assert_eq!(
+                picks,
+                vec![
+                    ("Claude Work", "opus", false),
+                    ("Claude Work", "sonnet", false),
+                    ("Codex Personal", "gpt", true),
+                ],
+                "a signed out account is not offered"
+            );
+            assert_eq!(thread.model_options[0].note, None);
+            assert_eq!(
+                thread.model_options[2].note.as_deref(),
+                Some(crate::task_model::NEW_SESSION_NOTE)
+            );
+        }
+
+        #[test]
+        fn a_harness_that_cannot_switch_starts_a_new_session_even_for_the_same_account() {
+            let mut w = world();
+            let mut bigboi = worker("bigboi", &[], &[]);
+            inventory(&mut bigboi).accounts = vec![with_models(
+                account("Codex Personal", "codex", PA::SignedIn),
+                false,
+                &[("gpt", "GPT-5.5"), ("mini", "GPT Mini")],
+            )];
+            let worker_id = bigboi.id;
+            w.cache.workers.insert(bigboi.id.to_string(), bigboi);
+            let task = w.cache.tasks.get_mut(&w.task.to_string()).expect("task");
+            task.worker_id = Some(worker_id);
+            task.current_session_id = Some(consort_proto::ids::SessionId::new());
+            task.model_selection = Some(ModelSelection {
+                account_label: "Codex Personal".into(),
+                model: "gpt".into(),
+                options: Default::default(),
+            });
+            let state = view(&w.cache);
+            let thread = state.thread(&w.task.to_string()).expect("thread");
+            assert!(thread.model_options.iter().all(|o| o.starts_new_session));
+        }
+
+        #[test]
+        fn a_resolved_task_cannot_change_its_model_and_an_unplaced_task_runs_nowhere_yet() {
+            let mut w = world();
+            let task = w.cache.tasks.get_mut(&w.task.to_string()).expect("task");
+            task.status = PS::Resolved;
+            let state = view(&w.cache);
+            let thread = state.thread(&w.task.to_string()).expect("thread");
+            assert!(!thread.can_change_model);
+            assert_eq!(thread.runs_on, None);
+            assert!(thread.model_options.is_empty());
         }
 
         #[test]

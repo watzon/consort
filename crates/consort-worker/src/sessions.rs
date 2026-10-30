@@ -16,8 +16,8 @@ use consort_proto::error::{ErrorBody, ErrorCode};
 use consort_proto::frame::FrameId;
 use consort_proto::ids::{AccountId, ItemId, RequestId, SessionId};
 use consort_proto::model::{
-    ApprovalDetails, ApprovalMode, Capabilities, FileRef, RequestOptionKind, SessionState,
-    Sha256Hash,
+    ApprovalDetails, ApprovalMode, Capabilities, FileRef, RequestOptionKind, SessionRole,
+    SessionState, Sha256Hash,
 };
 use consort_proto::tools::{ToolCallResult, ToolDefinition};
 use consort_proto::worker_link::{
@@ -54,12 +54,14 @@ pub(crate) enum Job {
         request_id: RequestId,
         option_id: String,
     },
-    /// Deny an approval that is too long to show in full. `reason` goes to
-    /// the model as a steer when the harness can steer.
-    DenyTooLong {
+    /// Deny an approval without showing it to the user. `reason` goes to
+    /// the model as a steer when the harness can steer, because the harness
+    /// gives the model only "denied". `why` is for the log.
+    DenyWithReason {
         request_id: RequestId,
         option_id: Option<String>,
         reason: String,
+        why: &'static str,
     },
     /// The harness reported the session as lost. Close what is left of it.
     HarnessLost,
@@ -240,6 +242,18 @@ fn too_long_reason(body: &RequestBody) -> String {
     .to_owned()
 }
 
+/// What the worker tells the model when it denies an approval in a
+/// coordinator session. A coordinator does its work through hub tools. Shell,
+/// web and file changes belong to a task.
+pub(crate) const COORDINATOR_DENIED_REASON: &str = "The coordinator does not run shell commands, use the web or change files, so the worker denied this request. Start a task with the start_task tool. The task does this work.";
+
+/// Whether the worker denies this request in a coordinator session, without
+/// a card. Every approval is denied: the caller has already allowed the
+/// listed hub tools. A question goes to the user as usual.
+fn coordinator_denies(opened: &consort_proto::worker_link::RequestOpened) -> bool {
+    matches!(opened.body, RequestBody::Approval(_))
+}
+
 /// A name for an approval mode in a message.
 fn mode_name(mode: ApprovalMode) -> &'static str {
     match mode {
@@ -250,6 +264,15 @@ fn mode_name(mode: ApprovalMode) -> &'static str {
     }
 }
 
+/// What the pump denies without asking the user.
+#[derive(Debug, Clone, Copy)]
+struct PumpPolicy {
+    /// Worker policy: no shell commands (`policy.allow_shell = false`).
+    deny_commands: bool,
+    /// The session is a coordinator: it does no shell, web or file work.
+    coordinator: bool,
+}
+
 /// Reads harness events until the harness closes the channel.
 async fn pump(
     core: Arc<Core>,
@@ -257,9 +280,13 @@ async fn pump(
     account_id: AccountId,
     mut events: EventReceiver,
     jobs: mpsc::UnboundedSender<Job>,
-    deny_commands: bool,
+    policy: PumpPolicy,
     hub_tools: ToolCache,
 ) {
+    let PumpPolicy {
+        deny_commands,
+        coordinator,
+    } = policy;
     let mut coalescer = Coalescer::default();
     let item_details = crate::item_details::ItemDetails::new(&core.consort_home);
     let interval = Duration::from_millis(OUTPUT_DELTA_INTERVAL_MS);
@@ -328,10 +355,24 @@ async fn pump(
                             core.record_event(session_id, &ready);
                         }
                         deadline = None;
-                        let _ = jobs.send(Job::DenyTooLong {
+                        let _ = jobs.send(Job::DenyWithReason {
                             request_id: opened.request_id.clone(),
                             option_id: deny_option(&opened.options),
                             reason,
+                            why: "the approval is too long to show",
+                        });
+                        continue;
+                    }
+                    // A coordinator session runs in Ask and does no shell,
+                    // web or file work. The worker denies the request at
+                    // once, and the user sees no card for it.
+                    if coordinator && coordinator_denies(opened) {
+                        deadline = None;
+                        let _ = jobs.send(Job::DenyWithReason {
+                            request_id: opened.request_id.clone(),
+                            option_id: deny_option(&opened.options),
+                            reason: COORDINATOR_DENIED_REASON.to_owned(),
+                            why: "a coordinator session does no shell, web or file work",
                         });
                         continue;
                     }
@@ -619,6 +660,43 @@ impl Runtime {
         }
     }
 
+    /// Changes the model and the options in the open session, for a turn
+    /// that carries a model change. A harness that cannot do it, or that
+    /// refuses the model, makes the worker refuse the turn with
+    /// `unsupported`: the hub then starts a new session in the same
+    /// workspace. The turn has not run, so nothing is lost.
+    async fn apply_model_change(
+        &mut self,
+        change: &consort_proto::worker_link::SessionModelChange,
+    ) -> Result<(), ErrorBody> {
+        let session_id = self.session_id;
+        let harness = self.harness()?;
+        if !harness.capabilities().switch_model {
+            return Err(ErrorBody::new(
+                ErrorCode::Unsupported,
+                "This harness cannot change its model in a running session.",
+            ));
+        }
+        harness
+            .set_model(&change.model, &change.options)
+            .await
+            .map_err(|err| {
+                ErrorBody::new(
+                    ErrorCode::Unsupported,
+                    format!("The harness did not change its model: {err}"),
+                )
+            })?;
+        tracing::info!(session = %session_id, model = %change.model, "the session runs another model");
+        if let Err(err) =
+            self.core
+                .store
+                .set_session_model(session_id, &change.model, &change.options)
+        {
+            tracing::warn!(session = %session_id, error = %err, "could not save the new model of a session");
+        }
+        Ok(())
+    }
+
     /// Opens the harness for a new or resumed session.
     async fn open(
         &mut self,
@@ -672,13 +750,20 @@ impl Runtime {
         if !config.policy.allow_shell {
             max = max.min(ApprovalMode::AutoEdits);
         }
-        let mode = effective_mode(start.approval_mode, max, &capabilities).ok_or_else(|| {
+        // A coordinator session always runs in Ask, whatever the hub sends.
+        // It does no shell, web or file work (see `coordinator_denies`).
+        let requested = if start.role == SessionRole::Coordinator {
+            ApprovalMode::Ask
+        } else {
+            start.approval_mode
+        };
+        let mode = effective_mode(requested, max, &capabilities).ok_or_else(|| {
             ErrorBody::new(
                 ErrorCode::PolicyDenied,
                 format!(
                     "{} cannot run at or below the approval mode {:?}",
                     account.label,
-                    start.approval_mode.capped_by(max)
+                    requested.capped_by(max)
                 ),
             )
         })?;
@@ -783,7 +868,11 @@ impl Runtime {
             model: start.model.clone(),
             options: start.options.clone(),
             approval_mode: mode,
-            allow_shell: config.policy.allow_shell,
+            // A coordinator runs no shell, whatever the worker policy says.
+            // Every harness removes the shell at the source, so a command
+            // that the harness would run without asking cannot run.
+            allow_shell: config.policy.allow_shell && start.role != SessionRole::Coordinator,
+            coordinator: start.role == SessionRole::Coordinator,
             system_prompt_append,
             mcp_servers: servers,
             env: BTreeMap::new(),
@@ -850,7 +939,10 @@ impl Runtime {
             start.account_id,
             events,
             self.jobs.clone(),
-            !config.policy.allow_shell,
+            PumpPolicy {
+                deny_commands: !config.policy.allow_shell,
+                coordinator: start.role == SessionRole::Coordinator,
+            },
             hub_tools,
         )));
         core.inventory_changed();
@@ -1129,12 +1221,21 @@ impl Runtime {
                     self.refresh_channel_files(turn.channel_files).await;
                     self.save_attachments(&turn.turn).await;
                 }
-                let result = match self.prepare_turn_mode(turn.approval_mode).await {
-                    Ok(()) => match self.harness() {
-                        Ok(h) => h.turn(turn.turn).await.map_err(harness_body),
+                // The model first: for Claude Code it sets the permission
+                // mode again, and the mode of this turn follows.
+                let changed = match &turn.model_change {
+                    Some(change) if self.harness.is_some() => self.apply_model_change(change).await,
+                    _ => Ok(()),
+                };
+                let result = match changed {
+                    Err(e) => Err(e),
+                    Ok(()) => match self.prepare_turn_mode(turn.approval_mode).await {
+                        Ok(()) => match self.harness() {
+                            Ok(h) => h.turn(turn.turn).await.map_err(harness_body),
+                            Err(e) => Err(e),
+                        },
                         Err(e) => Err(e),
                     },
-                    Err(e) => Err(e),
                 };
                 (
                     result.and_then(|turn_id| {
@@ -1315,14 +1416,15 @@ pub(crate) async fn run_session(
                         .await;
                 }
             }
-            Job::DenyTooLong {
+            Job::DenyWithReason {
                 request_id,
                 option_id,
                 reason,
+                why,
             } => {
                 let can_steer = runtime.capabilities.steer;
                 if let Ok(h) = runtime.harness() {
-                    tracing::info!(session = %session_id, "the worker denies an approval that is too long to show");
+                    tracing::info!(session = %session_id, why, "the worker denies an approval");
                     let _ = h
                         .respond(
                             request_id,

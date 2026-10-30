@@ -14,6 +14,7 @@ use super::events::{Ctx, Effects, finish_session, mark_lost_in_tx, queue_stop};
 use crate::error::{HubError, Result};
 use crate::hub::{HUB_VERSION, Hub};
 use crate::ops::flow::{deliver_without_steer, transition};
+use crate::ops::model_switch::detach_session;
 use crate::store::coordinator as coord_store;
 use crate::store::{Tx, machine, work};
 
@@ -370,6 +371,51 @@ pub(crate) fn session_start_failed_tx(
     Ok(ctx.fx)
 }
 
+/// The worker refused a `session.turn` that carried a model change, with
+/// `unsupported`: the harness cannot switch its model in a running session,
+/// or it refused the model. The turn did not run, so nothing is lost. The
+/// old session ends, the text of the turn waits in the inbox, and a new
+/// session on the new model takes it (see `ops::model_switch`). Without a
+/// task that this session drives, it is an ordinary refused turn.
+pub(crate) fn model_change_refused_tx(
+    hub: &Hub,
+    tx: &mut Tx<'_>,
+    turn: &consort_proto::worker_link::SessionTurn,
+    error: ErrorBody,
+) -> Result<Effects> {
+    let session_id = turn.session_id;
+    let Some(session) = work::session(tx.db(), session_id)? else {
+        return Ok(Effects::default());
+    };
+    let drives = match session.task_id {
+        Some(task_id) if session.role == SessionRole::Task && !session.state.is_final() => {
+            work::task(tx.db(), task_id)?.is_some_and(|t| {
+                t.current_session_id == Some(session_id)
+                    && matches!(t.status, TaskStatus::Working | TaskStatus::NeedsInput)
+            })
+        }
+        _ => false,
+    };
+    let Some(task_id) = session.task_id.filter(|_| drives) else {
+        return turn_command_failed_tx(hub, tx, session_id, error);
+    };
+    tracing::info!(%session_id, %error, "the harness did not switch its model, so the task gets a new session");
+    // The messages that waited behind this turn come after its text.
+    let waiting = work::task_inbox(tx.db(), task_id)?;
+    tx.clear_task_inbox(task_id)?;
+    tx.push_task_inbox(task_id, &turn.turn.text, &turn.turn.attachments)?;
+    for entry in waiting {
+        tx.push_task_inbox(task_id, &entry.text, &entry.attachments)?;
+    }
+    // A task that moved from Ready for review for this turn stays Working:
+    // the new session takes the text.
+    let mut runtime = work::session_runtime(tx.db(), session_id)?;
+    runtime.turn_open = false;
+    runtime.turn_from_review = false;
+    tx.save_session_runtime(session_id, &runtime)?;
+    detach_session(hub, tx, task_id, None)
+}
+
 /// The worker refused a `session.turn`.
 ///
 /// No turn runs then. A coordinator puts the events of the turn back in the
@@ -503,6 +549,7 @@ pub(crate) fn steer_command_failed_tx(
     match result {
         Ok(delivered) => {
             fx.pump.push(delivered.worker_id);
+            fx.switch_tasks.extend(delivered.switch_task);
             if delivered.status_changed {
                 fx.kick.push(task.channel_id);
             }

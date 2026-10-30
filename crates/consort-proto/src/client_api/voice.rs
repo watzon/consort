@@ -1,13 +1,14 @@
 //! Client requests for "Write in my voice": the settings (`voice.get`,
 //! `voice.set`), learning (`voice.learn`), Reset (`voice.reset`), "Try it"
 //! (`voice.try`), "Not how I write" (`voice.feedback`), and Edit on the
-//! card of a draft or send tool (`approval.edit`).
+//! card of a draft or send tool (`approval.edit`), and Edit on a `show_draft`
+//! card (`draft.edit`).
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::ApprovalId;
+use crate::ids::{ApprovalId, MessageId};
 use crate::model::{Disclosure, VoiceSample, VoiceSettings, VoiceSource};
 
 /// The most characters in a "Try it" request.
@@ -88,4 +89,19 @@ pub struct ApprovalEdit {
     /// The new text of each field that changed, by argument key. Only the
     /// card's `editable` keys are allowed.
     pub fields: BTreeMap<String, String>,
+}
+
+/// `draft.edit`: change the text of a card from `show_draft`. The hub saves
+/// the new text in the card. It keeps the text that the assistant wrote, so
+/// the card can show that the user edited it. Copy needs no request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DraftEdit {
+    /// The message of the card.
+    pub message_id: MessageId,
+    /// The new title. Leave it out to keep the title.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// The new body. Leave it out to keep the body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
 }

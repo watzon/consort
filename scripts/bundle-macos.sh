@@ -5,6 +5,7 @@
 #   scripts/bundle-macos.sh --target x86_64-apple-darwin
 #   scripts/bundle-macos.sh --binary target/debug/consort-desktop --no-archive
 #   scripts/bundle-macos.sh --dmg                also make a dmg
+#   scripts/bundle-macos.sh --bundle-id dev.consort.desktop.dev
 #
 # Output goes to dist/ (change it with --out):
 #   Consort.app
@@ -20,8 +21,8 @@
 #   APPLE_TEAM_ID            the team ID
 #   APPLE_APP_PASSWORD       an app-specific password for that Apple ID
 #
-# The bundle ID is the one constant below. The version comes from
-# [workspace.package] in Cargo.toml.
+# The bundle ID is the constant below, unless --bundle-id changes it. The
+# version comes from [workspace.package] in Cargo.toml.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -40,6 +41,7 @@ while [ "$#" -gt 0 ]; do
     --target) target="$2"; shift 2 ;;
     --binary) binary="$2"; shift 2 ;;
     --out) out="$2"; shift 2 ;;
+    --bundle-id) BUNDLE_ID="$2"; shift 2 ;;
     --no-archive) archive=0; shift ;;
     --dmg) dmg=1; shift ;;
     -h | --help) sed -n '2,/^set -euo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; exit 0 ;;

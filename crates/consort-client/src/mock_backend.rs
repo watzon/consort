@@ -120,6 +120,8 @@ impl MockBackend {
                     time_label: time,
                     bodies,
                     pending: false,
+                    source_message_id: None,
+                    refused: None,
                 });
                 if let Some(task) = state.tasks.iter_mut().find(|t| t.id == task_id)
                     && task.status == TaskStatus::Review
@@ -424,6 +426,26 @@ impl MockBackend {
                     task.status_reason = None;
                 }
             }
+            Command::SetTaskModel { task_id, selection } => {
+                let thread = state
+                    .threads
+                    .iter_mut()
+                    .find(|t| t.task_id == task_id)
+                    .ok_or_else(not_found)?;
+                if !thread.can_change_model {
+                    return Err(ClientError::Other(
+                        "The task is resolved. Mark it as not done first, then change its model."
+                            .into(),
+                    ));
+                }
+                thread.model_label = Some(selection.label());
+                thread.selection = Some(selection);
+            }
+            Command::EditDraft {
+                message_id,
+                title,
+                body,
+            } => edit_mock_draft(&mut state, &message_id, title, body)?,
             Command::StopTask { task_id } => set_status(&mut state, &task_id, TaskStatus::Review)?,
             Command::AnswerApproval {
                 approval_id,
@@ -505,6 +527,9 @@ impl MockBackend {
             Command::SetWorkerTags { worker_id, tags } => {
                 let tags = checked_tags(&tags)?;
                 worker_mut(&mut state, &worker_id)?.tags = tags;
+            }
+            Command::SetAccountFallback { enabled } => {
+                state.account_fallback = enabled;
             }
             Command::SetFavoriteModel {
                 account_label,
@@ -1028,6 +1053,50 @@ fn worker_mut<'a>(
         .iter_mut()
         .find(|w| w.id == worker_id)
         .ok_or_else(not_found)
+}
+
+/// Changes the title or text of a draft card, as the hub does: the first
+/// change keeps the text that the assistant wrote.
+fn edit_mock_draft(
+    state: &mut ViewState,
+    message_id: &str,
+    title: Option<String>,
+    body: Option<String>,
+) -> Result<(), ClientError> {
+    let timeline_drafts = state
+        .timelines
+        .iter_mut()
+        .flat_map(|t| t.items.iter_mut())
+        .filter_map(|item| match item {
+            TimelineItem::Notice(n) => n.draft.as_mut(),
+            _ => None,
+        });
+    let thread_drafts = state
+        .threads
+        .iter_mut()
+        .flat_map(|t| t.posts.iter_mut())
+        .flat_map(|p| p.bodies.iter_mut())
+        .filter_map(|b| match b {
+            PostBody::Notice { draft, .. } => draft.as_mut(),
+            _ => None,
+        });
+    let draft = timeline_drafts
+        .chain(thread_drafts)
+        .find(|d| d.message_id == message_id)
+        .ok_or_else(not_found)?;
+    if let Some(title) = title {
+        draft.title = title;
+    }
+    if let Some(body) = body
+        && body != draft.body
+    {
+        draft
+            .original_body
+            .get_or_insert_with(|| draft.body.clone());
+        draft.body = body;
+        draft.edited = true;
+    }
+    Ok(())
 }
 
 fn set_status(state: &mut ViewState, task_id: &str, status: TaskStatus) -> Result<(), ClientError> {

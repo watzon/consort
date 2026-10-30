@@ -32,6 +32,35 @@ pub struct VoiceGuideResult {
     pub message: String,
 }
 
+/// The most characters of the `title` of `show_draft`.
+pub const SHOW_DRAFT_TITLE_MAX_CHARS: usize = 200;
+/// The most bytes of the `to` line of `show_draft`.
+pub const SHOW_DRAFT_TO_MAX_BYTES: usize = 1_000;
+/// The most bytes of the `body` of `show_draft` (64 KiB).
+pub const SHOW_DRAFT_BODY_MAX_BYTES: usize = 64 * 1024;
+
+/// `show_draft`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ShowDraftArgs {
+    /// A short title for the card, such as the subject of an email.
+    pub title: String,
+    /// Who the text is for, in plain words, such as "The landlord" or "Dr.
+    /// Meyer's office". Leave it out when the text has no addressee.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+    /// The text that the user sends themself, as it should go out.
+    pub body: String,
+}
+
+/// The result of `show_draft`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShowDraftResult {
+    /// The message that holds the draft.
+    pub message_id: crate::ids::MessageId,
+    /// What happens next.
+    pub message: String,
+}
+
 /// `voice_sample`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct VoiceSampleArgs {

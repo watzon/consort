@@ -98,9 +98,12 @@ impl UpdateConfig {
             .join("updates");
         let settings_path =
             crate::store::Store::default_location().map(|store| store.dir().join("updates.json"));
-        let installable = std::env::current_exe()
-            .map(|exe| apply::Install::detect(&exe).is_some())
-            .unwrap_or(false);
+        // `scripts/dev.sh` runs a debug build from a bundle. A release must
+        // not replace it.
+        let installable = !cfg!(debug_assertions)
+            && std::env::current_exe()
+                .map(|exe| apply::Install::detect(&exe).is_some())
+                .unwrap_or(false);
         Some(UpdateConfig {
             api_base: "https://api.github.com".to_owned(),
             repo: super::RELEASES_REPO.to_owned(),

@@ -4,7 +4,7 @@
 //! voice commands on the mock state.
 //!
 //! The example data is the designs': the user is Chris, the mail account is
-//! chris@bitstormtech.com, the Slack workspace is Work, and Dana is the
+//! chris@example.com, the Slack workspace is Work, and Dana is the
 //! contact in the draft.
 
 use crate::connectors::{CardFieldView, ConnectorCardView, HubCardView, ToolKindView};
@@ -47,7 +47,7 @@ pub const SCREENS: &[&str] = &[
 /// The style guide of the design, as `voice.md`. Public posts has no
 /// source in this build, so it stays empty and says so.
 pub const GUIDE: &str = r#"# Voice
-sources: gmail chris@bitstormtech.com (sent, 90 days), slack work (public channels)
+sources: gmail chris@example.com (sent, 90 days), slack work (public channels)
 learned: 214 sent mails and 380 Slack messages
 
 ## Core
@@ -99,7 +99,7 @@ fn sources() -> Vec<VoiceSourceRow> {
             connection_id: GMAIL.into(),
             kind: Some(VoiceSourceKind::Mail),
             monogram: "G".into(),
-            title: "Gmail, chris@bitstormtech.com".into(),
+            title: "Gmail, chris@example.com".into(),
             detail: "Sent mail, last 90 days".into(),
             ticked: true,
             include_private: false,
@@ -123,7 +123,7 @@ pub fn off_view() -> VoiceView {
         enabled: false,
         sources: sources(),
         learn_from_edits: true,
-        sources_line: "Gmail, chris@bitstormtech.com (sent mail, last 90 days) and Slack, Work (public channels). Your edits to drafts also teach it.".into(),
+        sources_line: "Gmail, chris@example.com (sent mail, last 90 days) and Slack, Work (public channels). Your edits to drafts also teach it.".into(),
         ..VoiceView::default()
     }
 }
@@ -244,59 +244,69 @@ pub fn draft_approval() -> ApprovalView {
     ApprovalView {
         id: DRAFT_APPROVAL.into(),
         task_id: Some(REPLY_TASK.into()),
-        summary: "Send email in Gmail, chris@bitstormtech.com".into(),
+        summary: "Send email in Gmail, chris@example.com".into(),
         choices: vec![ApprovalChoice::AllowOnce, ApprovalChoice::Deny],
         state: RequestState::Pending,
-        card: Some(Box::new(HubCardView::Connector(ConnectorCardView {
-            connection_id: GMAIL.into(),
-            connection_name: "Gmail Work".into(),
-            service_name: "Gmail".into(),
-            logo: crate::mock_extensions::logo("gmail", "Gmail"),
-            tool: "GMAIL_SEND_EMAIL".into(),
-            kind: ToolKindView::Change,
-            fields: vec![
-                CardFieldView {
-                    label: "To".into(),
-                    value: "Dana Reyes, dana@example.com".into(),
-                },
-                CardFieldView {
-                    label: "Subject".into(),
-                    value: "Venue for the team offsite".into(),
-                },
-                CardFieldView {
-                    label: "Body".into(),
-                    value: body.into(),
-                },
-            ],
-            rule_note: "Create and change tools ask every time".into(),
-            draft: Some(DraftCardView {
-                draft_only: false,
-                voice_line: voice_line(Some("email.formal")),
-                in_voice: true,
-                flags: vec![
-                    flag("Friday at 3 PM", "Date"),
-                    flag("works for me", "Agreement"),
-                ],
-                editable: vec![
-                    EditableFieldView {
-                        key: "subject".into(),
+        card: Some(Box::new(HubCardView::Connector(Box::new(
+            ConnectorCardView {
+                connection_id: GMAIL.into(),
+                connection_name: "Gmail Work".into(),
+                service_name: "Gmail".into(),
+                logo: crate::mock_extensions::logo("gmail", "Gmail"),
+                tool: "GMAIL_SEND_EMAIL".into(),
+                kind: ToolKindView::Change,
+                fields: vec![
+                    CardFieldView {
+                        label: "To".into(),
+                        value: "Dana Reyes, dana@example.com".into(),
+                    },
+                    CardFieldView {
                         label: "Subject".into(),
                         value: "Venue for the team offsite".into(),
                     },
-                    EditableFieldView {
-                        key: "body".into(),
+                    CardFieldView {
                         label: "Body".into(),
                         value: body.into(),
                     },
                 ],
-                edited: false,
-                not_my_voice: false,
-                review_hash: MOCK_REVIEW_HASH.into(),
-            }),
-        }))),
+                rule_note: "Create and change tools ask every time".into(),
+                draft: Some(DraftCardView {
+                    draft_only: false,
+                    voice_line: voice_line(Some("email.formal")),
+                    in_voice: true,
+                    flags: vec![
+                        flag("Friday at 3 PM", "Date"),
+                        flag("works for me", "Agreement"),
+                    ],
+                    editable: vec![
+                        EditableFieldView {
+                            key: "subject".into(),
+                            label: "Subject".into(),
+                            value: "Venue for the team offsite".into(),
+                        },
+                        EditableFieldView {
+                            key: "body".into(),
+                            label: "Body".into(),
+                            value: body.into(),
+                        },
+                    ],
+                    edited: false,
+                    not_my_voice: false,
+                    review_hash: MOCK_REVIEW_HASH.into(),
+                    title: "Venue for the team offsite".into(),
+                    to: Some("Dana Reyes, dana@example.com".into()),
+                    connection_line: "Sends with Gmail Work".into(),
+                    subject: Some("Venue for the team offsite".into()),
+                    body: body.into(),
+                    allow_label: "Send".into(),
+                    deny_label: "Not now".into(),
+                    outcome: None,
+                }),
+            },
+        )))),
         button_labels: vec![
-            (ApprovalChoice::AllowOnce, "Allow".into()),
-            (ApprovalChoice::Deny, "Don't".into()),
+            (ApprovalChoice::AllowOnce, "Send".into()),
+            (ApprovalChoice::Deny, "Not now".into()),
         ],
         ..ApprovalView::default()
     }
@@ -311,6 +321,11 @@ fn reply_thread() -> TaskThreadView {
         status_detail: "1 approval".into(),
         brief: "Reply to Dana about the venue for the team offsite.".into(),
         model_label: Some("Opus 5.5, Claude Work, High effort".into()),
+        selection: Some(crate::mock::selection(
+            "Claude Work",
+            "claude-opus-5-5",
+            "Opus 5.5",
+        )),
         posts: vec![
             ThreadPost {
                 id: "pst_reply_dana_1".into(),
@@ -320,6 +335,8 @@ fn reply_thread() -> TaskThreadView {
                     "I wrote the reply to Dana. Check the marked lines, then approve it.".into(),
                 )],
                 pending: false,
+                source_message_id: None,
+                refused: None,
             },
             ThreadPost {
                 id: "pst_reply_dana_2".into(),
@@ -327,6 +344,8 @@ fn reply_thread() -> TaskThreadView {
                 time_label: "9:20 AM".into(),
                 bodies: vec![PostBody::Approval(draft_approval())],
                 pending: false,
+                source_message_id: None,
+                refused: None,
             },
         ],
         ..TaskThreadView::default()

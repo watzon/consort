@@ -80,6 +80,7 @@ fn card(context: &str, draft: &str, sent: &str) -> Approval {
             draft_arguments: Some(json!({"to": "dana@example.com", "body": draft})),
             not_my_voice: false,
             ask_rule: None,
+            replaced_by: None,
         })),
         options: Vec::new(),
         status: ApprovalStatus::Allowed,

@@ -269,35 +269,99 @@ impl ConsortApp {
             })
     }
 
-    /// The toast at the bottom. Its text is selectable. An error has a mark
-    /// and stays until the user dismisses it. An info notice times out. The
-    /// text scrolls when it is long, so the close button never leaves the
-    /// window. A message that the hub refused has a button that puts its text
-    /// back in the message box. More errors wait behind this one.
-    pub fn render_notice(&self, notice: Notice, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+    /// The stack of corner notifications (Paper E3 and E4). It is 360 px
+    /// wide at the right, with a 16 px margin, and sits 124 px above the
+    /// bottom of the window, so it clears the composer. Three show at most,
+    /// the newest at the bottom. In the compact layout, and in a window where
+    /// the stack would cover the chat column (`ConsortApp::notices_compact`),
+    /// it takes the full width with the same margin and sits 88 px from the
+    /// top, under the top bar. The errors over three wait, and a line says
+    /// how many.
+    pub fn render_notice_stack(&self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+        let c = &t.colors;
+        let compact = self.notices_compact(t);
+        let waiting = self.notices.waiting();
+        let cards: Vec<AnyElement> = self
+            .notices
+            .visible()
+            .cloned()
+            .map(|notice| self.render_notice(notice, t, cx))
+            .collect();
+        div()
+            .id("notice-stack")
+            .debug_selector(|| "notice-stack".into())
+            .absolute()
+            .flex()
+            .flex_col()
+            .gap(t.space.sm)
+            .when(compact, |d| {
+                d.top(t.layout.notice_compact_top)
+                    .left(t.space.lg)
+                    .right(t.space.lg)
+            })
+            .when(!compact, |d| {
+                d.bottom(t.layout.notice_bottom)
+                    .right(t.space.lg)
+                    .w(t.layout.notice_width)
+            })
+            .when(waiting > 0, |d| {
+                d.child(div().flex().justify_end().child(text(
+                    if waiting == 1 {
+                        "1 more error waits".to_owned()
+                    } else {
+                        format!("{waiting} more errors wait")
+                    },
+                    detail(t),
+                    c.text_tertiary,
+                )))
+            })
+            .children(cards)
+            .into_any_element()
+    }
+
+    /// One corner notification, on `surface.raised` with `shadow.float`. An
+    /// error has the `failed` icon, a title in UI semibold, text in UI
+    /// `text.secondary` and a button when the notice has one. It stays until
+    /// the user dismisses it. Information is one line with the `info` icon,
+    /// and leaves after 6 seconds. The text is selectable, and scrolls when
+    /// it is long, so the close button never leaves the window.
+    fn render_notice(&self, notice: Notice, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
         let c = &t.colors;
         let is_error = notice.kind == NoticeKind::Error;
-        let waiting = self.notices.waiting();
-        let failure = notice.failure.clone();
         let serial = notice.serial;
+        let title = notice.title().to_owned();
+        let body = notice.text().map(str::to_owned);
         let text_block = div()
             .id(SharedString::from(format!("notice-scroll-{serial}")))
             .flex()
             .flex_col()
-            .gap(t.space.sm)
-            .flex_1()
-            .min_w_0()
+            .gap(t.space.xxs)
+            .w_full()
+            .pt(t.space.xxs)
             .max_h(t.layout.error_text_max_height)
             .overflow_y_scroll()
             .child(selectable(
-                SharedString::from(format!("notice-text-{serial}")),
-                notice.message,
-                t.text.ui,
+                SharedString::from(format!("notice-title-{serial}")),
+                title,
+                if is_error {
+                    t.text.ui_strong
+                } else {
+                    t.text.ui
+                },
                 c.text_primary,
             ))
+            .when_some(body, |d, body| {
+                d.child(selectable(
+                    SharedString::from(format!("notice-text-{serial}")),
+                    body,
+                    t.text.ui,
+                    c.text_secondary,
+                ))
+            })
             .when_some(notice.detail, |d, body| {
                 d.child(
                     div()
+                        .mt(t.space.xs)
                         .p(t.space.sm)
                         .rounded(t.radius.md)
                         .bg(c.surface_card)
@@ -309,97 +373,74 @@ impl ConsortApp {
                         )),
                 )
             });
+        // The button stays under the text and out of its scroll, so that a
+        // long text never hides it.
+        let action_row = notice.action.map(|action| {
+            let row = format!("notice-action-row-{serial}");
+            div()
+                .flex()
+                .pt(t.space.sm)
+                .debug_selector(move || row)
+                .child(
+                    button(
+                        SharedString::from(format!("notice-action-{serial}")),
+                        action.label(),
+                        ButtonKind::Secondary,
+                        t,
+                    )
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.run_notice_action(serial, window, cx)
+                    })),
+                )
+        });
+        let glyph = if is_error {
+            icon("failed", t.icon.size, c.status_failed)
+        } else {
+            icon("info", t.icon.size, c.text_secondary)
+        };
+        let selector = format!("notice-{serial}");
         div()
-            .absolute()
-            .bottom(t.space.xl)
-            .left_0()
-            .right_0()
+            .id(SharedString::from(selector.clone()))
+            .debug_selector(move || selector)
             .flex()
-            .justify_center()
-            .px(t.space.xl)
+            .items_start()
+            .gap(t.space.sm + t.space.xxs)
+            .py(t.space.sm + t.space.xxs)
+            .pl(t.space.md)
+            .pr(t.space.sm)
+            .bg(c.surface_raised)
+            // An error has no line of its own: its icon carries the color.
+            .border(t.border_width)
+            .border_color(if is_error {
+                gpui_kit::transparent_black()
+            } else {
+                c.border_strong
+            })
+            .rounded(t.radius.lg)
+            .shadow(t.shadow_float())
+            .child(div().flex_none().pt(t.space.xs).child(glyph))
             .child(
                 div()
-                    .id("notice")
                     .flex()
                     .flex_col()
-                    .gap(t.space.sm)
-                    .w_full()
-                    .max_w(t.layout.timeline_max_width)
-                    .py(t.space.sm)
-                    .pl(t.space.md)
-                    .pr(t.space.xs)
-                    .bg(c.surface_raised)
-                    .border(t.border_width)
-                    .border_color(if is_error {
-                        c.status_failed
-                    } else {
-                        c.border_strong
-                    })
-                    .rounded(t.radius.lg)
-                    .shadow(t.shadow_float())
-                    .child(
-                        div()
-                            .flex()
-                            .items_start()
-                            .gap(t.space.sm)
-                            .when(is_error, |d| {
-                                d.child(div().flex_none().pt(t.space.xxs).child(icon(
-                                    "circle-alert",
-                                    t.icon.size,
-                                    c.status_failed,
-                                )))
-                            })
-                            .child(text_block)
-                            .child(
-                                icon_button(
-                                    "notice-close",
-                                    "x",
-                                    t.space.xl,
-                                    t.icon.dense,
-                                    c.text_secondary,
-                                    c.hover_raised,
-                                    t,
-                                    cx,
-                                )
-                                .on_click(cx.listener(|this, _, _, cx| this.dismiss_notice(cx))),
-                            ),
-                    )
-                    .when(failure.is_some() || waiting > 0, |d| {
-                        d.child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(t.space.md)
-                                .pr(t.space.sm)
-                                .when_some(failure, |d, id| {
-                                    d.child(
-                                        button(
-                                            "notice-restore",
-                                            "Put text back in the box",
-                                            ButtonKind::Secondary,
-                                            t,
-                                        )
-                                        .on_click(
-                                            cx.listener(move |this, _, window, cx| {
-                                                this.restore_failed_text(&id, window, cx)
-                                            }),
-                                        ),
-                                    )
-                                })
-                                .child(div().flex_1())
-                                .when(waiting > 0, |d| {
-                                    d.child(text(
-                                        if waiting == 1 {
-                                            "1 more error waits".to_owned()
-                                        } else {
-                                            format!("{waiting} more errors wait")
-                                        },
-                                        detail(t),
-                                        c.text_tertiary,
-                                    ))
-                                }),
-                        )
-                    }),
+                    .flex_1()
+                    .min_w_0()
+                    .child(text_block)
+                    .children(action_row),
+            )
+            .child(
+                icon_button(
+                    SharedString::from(format!("notice-close-{serial}")),
+                    "close",
+                    t.space.xl,
+                    t.icon.dense,
+                    c.text_tertiary,
+                    c.hover_raised,
+                    t,
+                    cx,
+                )
+                .debug_selector(move || format!("notice-close-{serial}"))
+                .on_click(cx.listener(move |this, _, _, cx| this.dismiss_notice(serial, cx))),
             )
             .into_any_element()
     }
@@ -423,7 +464,6 @@ impl ConsortApp {
             Dialog::ConnectionActivity(id) => Some(self.connection_activity_dialog(id, t, cx)),
             Dialog::ConfirmRemoveSkill(id) => Some(self.confirm_remove_skill_dialog(id, t, cx)),
             Dialog::SkillFiles(id) => Some(self.skill_files_dialog(id, t, cx)),
-            Dialog::ChannelExtensions(id) => Some(self.channel_extensions_dialog(id, t, cx)),
             Dialog::AccountSettings(w, a) => {
                 Some(self.account_settings_dialog(w, a, t, window, cx))
             }
@@ -441,7 +481,6 @@ impl ConsortApp {
             | Dialog::ConnectionActivity(_)
             | Dialog::ConfirmRemoveSkill(_)
             | Dialog::SkillFiles(_)
-            | Dialog::ChannelExtensions(_)
             | Dialog::PairClient
             | Dialog::Voice(_)
             | Dialog::AccountSettings(..) => match ext_parts.take() {
@@ -756,6 +795,8 @@ impl ConsortApp {
             .flex_col()
             .gap(t.space.lg + t.space.xxs)
             .w(width)
+            // A small window: the page margin at each side.
+            .max_w(window.viewport_size().width - t.space.page)
             .p(t.space.xl)
             .bg(c.surface_raised)
             .border(t.border_width)

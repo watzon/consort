@@ -22,7 +22,7 @@ use crate::model::{
     AcpAccountSpec, ApprovalDetails, ApprovalMode, BlobRef, ConnectorContextEntry, FileRef,
     Inventory, Isolation, ModelOptions, RequestOption, SecretEnv, SessionItem, SessionRole,
     SessionState, Sha256Hash, SignInMethod, SignInState, SkillBundle, SkillBundleRef,
-    SkillContextEntry, ToolId, Usage, ValidationError, render_connectors_block,
+    SkillContextEntry, ToolId, TurnErrorKind, Usage, ValidationError, render_connectors_block,
     render_skills_block,
 };
 use crate::time::Timestamp;
@@ -198,6 +198,14 @@ pub enum SessionEvent {
         /// The error text, when the turn failed.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+        /// What kind of failure it was, when the adapter could tell from
+        /// structured data or from a known text. `None` reads as unknown. An
+        /// older worker sends none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error_kind: Option<TurnErrorKind>,
+        /// For a rate limit: when the limit resets, when the harness says.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resets_at: Option<Timestamp>,
     },
     /// The worker opened the session again after the worker restarted. A
     /// turn or a request that was open before the restart is gone.
@@ -520,6 +528,25 @@ pub struct SessionTurn {
     /// an older hub sends.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_mode: Option<ApprovalMode>,
+    /// A new model and options for this turn and the turns after it, in the
+    /// same session. The worker applies them before the turn starts, so the
+    /// session keeps its context. When the harness cannot do this, or the
+    /// harness refuses the change, the worker refuses the turn with
+    /// `unsupported`, and the hub starts a new session in the same
+    /// workspace. `None` means no change, and it is what an older hub
+    /// sends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_change: Option<SessionModelChange>,
+}
+
+/// A model change inside a session, in [`SessionTurn::model_change`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionModelChange {
+    /// The model ID. Empty means the harness default.
+    pub model: String,
+    /// The model options, such as `effort`.
+    #[serde(default)]
+    pub options: ModelOptions,
 }
 
 /// The result of [`SessionTurn`].
@@ -791,6 +818,63 @@ impl HubToWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A worker from before `error_kind` sends none, and the hub reads the
+    /// failure as unknown. A kind that this hub does not know reads as
+    /// `Unknown` too, and a turn with no kind writes no field.
+    #[test]
+    fn a_turn_end_without_a_kind_reads_and_a_new_kind_reads_as_unknown() {
+        let old: SessionEvent = serde_json::from_value(serde_json::json!({
+            "type": "turn.ended", "turn_id": "t1", "reason": "failed", "error": "boom"
+        }))
+        .unwrap();
+        assert!(matches!(
+            old,
+            SessionEvent::TurnEnded {
+                error_kind: None,
+                resets_at: None,
+                ..
+            }
+        ));
+        let newer: SessionEvent = serde_json::from_value(serde_json::json!({
+            "type": "turn.ended", "turn_id": "t1", "reason": "failed",
+            "error_kind": "quota_of_the_future", "resets_at": 1_793_300_000_000_i64
+        }))
+        .unwrap();
+        assert!(matches!(
+            newer,
+            SessionEvent::TurnEnded {
+                error_kind: Some(TurnErrorKind::Unknown),
+                resets_at: Some(_),
+                ..
+            }
+        ));
+        let value = serde_json::to_value(&old).unwrap();
+        assert!(value.get("error_kind").is_none() && value.get("resets_at").is_none());
+    }
+
+    /// An older hub sends no `model_change`, and a turn without one writes
+    /// no field, so an older worker still reads it.
+    #[test]
+    fn a_session_turn_without_a_model_change_reads_and_writes_without_the_field() {
+        let old: SessionTurn = serde_json::from_value(serde_json::json!({
+            "session_id": ses(), "turn": {"text": "Hi", "attachments": []}
+        }))
+        .unwrap();
+        assert_eq!(old.model_change, None);
+        let value = serde_json::to_value(&old).unwrap();
+        assert!(value.get("model_change").is_none());
+        let with = SessionTurn {
+            model_change: Some(SessionModelChange {
+                model: "opus".into(),
+                options: Default::default(),
+            }),
+            ..old
+        };
+        let back: SessionTurn =
+            serde_json::from_value(serde_json::to_value(&with).unwrap()).unwrap();
+        assert_eq!(back, with);
+    }
     use crate::frame::{Frame, FrameId, MessageFamily, Request};
     use crate::model::{
         AssistantMessagePayload, ItemPayload, ItemStatus, RequestOptionKind, WorkerPolicy,
@@ -865,6 +949,8 @@ mod tests {
                 turn_id: TurnId::new("t1"),
                 reason: TurnEndReason::Failed,
                 error: Some("harness exited".into()),
+                error_kind: None,
+                resets_at: None,
             },
             SessionEvent::Error {
                 code: "harness_exited".into(),
@@ -926,6 +1012,8 @@ mod tests {
             turn_id: TurnId::new("t2"),
             reason: TurnEndReason::Completed,
             error: None,
+            error_kind: None,
+            resets_at: None,
         };
         assert_eq!(
             serde_json::to_value(&ended).unwrap(),
@@ -1290,6 +1378,7 @@ They are installed as skills. Use one when the task fits it."
                 turn: TurnInput::default(),
                 channel_files: None,
                 approval_mode: None,
+                model_change: None,
             }
             .into(),
             SessionSteer {

@@ -1,6 +1,6 @@
 # Icons
 
-`source.mjs` holds the clean geometry of 84 icons on a 24 px grid.
+`source.mjs` holds the clean geometry of 86 icons on a 24 px grid.
 `build.mjs` redraws each icon by hand-like strokes. It makes three versions of each icon (0, 1 and 2). The app plays them in turn at 8 fps for the shimmer.
 
 ## Run

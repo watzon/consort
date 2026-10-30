@@ -331,6 +331,23 @@ pub enum Command {
     RetryTask {
         task_id: String,
     },
+    /// Sets the model and the options (such as effort) of a task that has
+    /// started. The hub saves them at once and a running turn goes on. The
+    /// next turn uses them. When the pick needs another account, another
+    /// provider or a harness that cannot switch, the hub ends the session
+    /// and starts a new one in the same workspace. See
+    /// [`crate::TaskModelOption::starts_new_session`].
+    SetTaskModel {
+        task_id: String,
+        selection: crate::view::SelectionView,
+    },
+    /// Saves the user's change to a draft card that `show_draft` posted.
+    /// `None` keeps the title or the body as it is.
+    EditDraft {
+        message_id: String,
+        title: Option<String>,
+        body: Option<String>,
+    },
     StopTask {
         task_id: String,
     },
@@ -375,6 +392,10 @@ pub enum Command {
         account_label: String,
         model_id: String,
         favorite: bool,
+    },
+    /// Allows work to move to another account at a usage limit, or stops it.
+    SetAccountFallback {
+        enabled: bool,
     },
     SetWorkerPaused {
         worker_id: String,

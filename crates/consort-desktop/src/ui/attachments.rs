@@ -934,6 +934,8 @@ impl ConsortApp {
         let f = t.component.files;
         let chat = t.component.chat;
         let mine = lane == Lane::You;
+        // The card of the open document has the selected ground.
+        let selected = self.document_is_open(&att.sha256);
         let id: SharedString = format!("file-{owner_id}-{index}").into();
         let group: SharedString = format!("file-group-{owner_id}-{index}").into();
         let selector = id.to_string();
@@ -1004,7 +1006,9 @@ impl ConsortApp {
             .pl(f.bubble_pad_left)
             .pr(t.space.sm)
             .rounded(chat.bubble_radius)
-            .bg(if mine {
+            .bg(if selected {
+                c.surface_selected
+            } else if mine {
                 c.accent_surface
             } else {
                 c.surface_card
@@ -1061,9 +1065,7 @@ impl ConsortApp {
             )
             .on_click(cx.listener({
                 let att = att.clone();
-                move |this, _, _, cx| {
-                    this.open_blob(att.sha256.clone(), att.size, att.name.clone(), cx)
-                }
+                move |this, _, _, cx| this.click_attachment(&att, cx)
             }))
             .on_mouse_down(
                 MouseButton::Right,

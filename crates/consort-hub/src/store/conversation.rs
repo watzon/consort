@@ -107,6 +107,8 @@ pub struct NewMessage {
     pub attachments: Vec<BlobRef>,
     /// The client that sent the message and its idempotency key.
     pub origin: Option<(ClientId, String)>,
+    /// The timeline message that this message copies into a task thread.
+    pub source_message_id: Option<MessageId>,
 }
 
 impl NewMessage {
@@ -128,6 +130,7 @@ impl NewMessage {
             body: body.into(),
             attachments: Vec::new(),
             origin: None,
+            source_message_id: None,
         }
     }
 }
@@ -138,6 +141,18 @@ pub fn message(conn: &Connection, id: MessageId) -> Result<Option<Message>> {
         "SELECT data FROM messages WHERE id = ?1",
         [id.to_string()],
     )
+}
+
+/// Whether the thread of `root` holds a copy of `source` that is not
+/// deleted. The hub makes the copy when the coordinator passes a user
+/// message to a task (`message_task` with `user_message_id`).
+pub fn thread_has_copy_of(conn: &Connection, root: MessageId, source: MessageId) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM messages WHERE thread_root_id = ?1 AND deleted_at IS NULL
+            AND json_extract(data, '$.source_message_id') = ?2)",
+        [root.to_string(), source.to_string()],
+        |row| row.get::<_, bool>(0),
+    )?)
 }
 
 pub fn message_or_404(conn: &Connection, id: MessageId) -> Result<Message> {
@@ -432,6 +447,7 @@ impl Tx<'_> {
             created_at: now,
             proactive: None,
             suggestions: Vec::new(),
+            source_message_id: new.source_message_id,
         };
         self.db().execute(
             "INSERT INTO messages (id, channel_id, thread_root_id, in_timeline, created_at,

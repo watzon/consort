@@ -106,6 +106,56 @@ pub fn still_mark(size: Pixels, t: &Tokens) -> AnyElement {
         .into_any_element()
 }
 
+/// The frame of the mark in a sidebar row at a clock tick: the sharp frames
+/// of its state. At rest, or under Reduce motion, it shows the first frame.
+pub fn row_frame(state: MarkState, tick: u64, dark: bool, reduce_motion: bool) -> SharedString {
+    let phase = MarkPhase::from(state);
+    let frame = if phase == MarkPhase::Idle || reduce_motion {
+        0
+    } else {
+        tick
+    };
+    frame_path(phase, frame, dark, true)
+}
+
+/// Loads the frames of the Tutti row before they show, so a frame never
+/// draws empty while its image loads.
+pub fn load_row_frames(
+    state: MarkState,
+    t: &Tokens,
+    window: &mut gpui_kit::Window,
+    cx: &mut gpui_kit::App,
+) {
+    let phase = MarkPhase::from(state);
+    if phase == MarkPhase::Idle || cx.reduce_motion() {
+        return;
+    }
+    for n in 0..phase.frames() {
+        let _ = window.use_asset::<gpui_kit::ImgResourceLoader>(
+            &gpui_kit::Resource::Embedded(frame_path(phase, n, t.is_dark(), true)),
+            cx,
+        );
+    }
+}
+
+/// The Three voices mark of the Tutti row: it moves while work runs or waits
+/// for the user, and it rests otherwise.
+pub fn row_mark(state: MarkState, size: Pixels, t: &Tokens, cx: &gpui_kit::App) -> AnyElement {
+    let reduce = cx.reduce_motion();
+    let tick = cx
+        .try_global::<crate::ui::motion::FrameClock>()
+        .map_or(0, |clock| {
+            if state != MarkState::Idle && !reduce {
+                clock.mark_used();
+            }
+            clock.tick()
+        });
+    img(row_frame(state, tick, t.is_dark(), reduce))
+        .size(size)
+        .flex_none()
+        .into_any_element()
+}
+
 /// Follows the activity of the open channel and decides what the mark
 /// shows: Working ends with Done for `motion.done_hold`, then the new state.
 /// Each phase starts at its first frame.
@@ -191,6 +241,31 @@ impl MarkPlayer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_row_mark_moves_only_while_something_happens() {
+        let row = |state, tick, reduce| row_frame(state, tick, true, reduce).to_string();
+        assert_eq!(
+            row(MarkState::Idle, 5, false),
+            "mark/dark-sharp/idle-00.svg"
+        );
+        assert_eq!(
+            row(MarkState::Working, 5, false),
+            "mark/dark-sharp/working-05.svg"
+        );
+        assert_eq!(
+            row(MarkState::Working, 6, false),
+            "mark/dark-sharp/working-06.svg"
+        );
+        assert_eq!(
+            row(MarkState::NeedsYou, 5, false),
+            "mark/dark-sharp/needs-05.svg"
+        );
+        assert_eq!(
+            row(MarkState::Working, 5, true),
+            "mark/dark-sharp/working-00.svg"
+        );
+    }
 
     #[test]
     fn frame_paths_name_the_generated_files() {

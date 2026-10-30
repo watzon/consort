@@ -161,6 +161,8 @@ impl ConsortApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        self.layout.window_width = window.viewport_size().width;
+        let compact = self.layout.window_width < t.layout.compact_width;
         let c = &t.colors;
         let sb = t.component.sidebar;
         let mut nav = div().flex().flex_col().gap(t.space.xxs);
@@ -211,7 +213,8 @@ impl ConsortApp {
             .flex()
             .flex_col()
             .flex_none()
-            .w(t.layout.sidebar_width)
+            .when(compact, |d| d.w_full())
+            .when(!compact, |d| d.w(t.layout.sidebar_width))
             .h_full()
             .px(sb.inset)
             .bg(c.surface_sidebar)
@@ -246,11 +249,58 @@ impl ConsortApp {
             SettingsSection::Proactivity => self.render_proactivity(t, window, cx),
             SettingsSection::Voice => self.render_voice(t, window, cx),
         };
+        if !compact {
+            return div()
+                .flex()
+                .size_full()
+                .child(sidebar)
+                .child(content)
+                .into_any_element();
+        }
+        // A small window has room for one of them: the list of sections, or
+        // one section with Back to the list.
+        if self.layout.settings_list {
+            return div().size_full().child(sidebar).into_any_element();
+        }
         div()
             .flex()
+            .flex_col()
             .size_full()
-            .child(sidebar)
-            .child(content)
+            .child(
+                div()
+                    .relative()
+                    .flex_none()
+                    .h(title_bar_height(t))
+                    .child(div().absolute().top_0().left_0().size_full().drag_zone())
+                    .child(
+                        div()
+                            .id("settings-list-back")
+                            .debug_selector(|| "settings-list-back".into())
+                            .absolute()
+                            .top(crate::ui::window_layout::top_on_light_line(
+                                t.component.composer_chip,
+                                t,
+                            ))
+                            .left(crate::ui::window_layout::closed_left(t))
+                            .occlude()
+                            .flex()
+                            .items_center()
+                            .gap(t.space.xs)
+                            .h(t.component.composer_chip)
+                            .pl(t.space.xs)
+                            .pr(t.space.sm)
+                            .rounded(t.radius.md)
+                            .cursor_pointer()
+                            .hover(|s| s.bg(c.hover_canvas))
+                            .child(icon("chevron-left", t.icon.size, c.text_secondary))
+                            .child(text("Settings", t.text.ui, c.text_primary))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.layout.settings_list = true;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(div().flex_1().min_h_0().w_full().child(content))
             .into_any_element()
     }
 
@@ -262,7 +312,12 @@ impl ConsortApp {
             .min_w_0()
             .overflow_y_scroll()
             .pt(t.space.page - t.space.sm)
-            .px(t.layout.speaker_gutter)
+            .when(self.layout.window_width < t.layout.compact_width, |d| {
+                d.px(t.space.lg)
+            })
+            .when(self.layout.window_width >= t.layout.compact_width, |d| {
+                d.px(t.layout.speaker_gutter)
+            })
             .pb(t.space.page)
     }
 
@@ -709,10 +764,7 @@ impl ConsortApp {
         limits = limits
             .child(limit_row(
                 "Highest approval mode",
-                &format!(
-                    "Tasks on {name} ask before anything riskier than {}.",
-                    risk(current_mode)
-                ),
+                &mode_limit_help(&name, current_mode),
                 select.into_any_element(),
                 true,
                 t,
@@ -966,13 +1018,21 @@ fn mode_key(mode: ApprovalMode) -> &'static str {
     }
 }
 
-fn risk(mode: ApprovalMode) -> &'static str {
-    match mode {
+/// What the highest approval mode lets tasks on a worker do without asking.
+/// Auto is not the same on every harness, so its text says what each one
+/// does.
+fn mode_limit_help(name: &str, mode: ApprovalMode) -> String {
+    let anything_riskier_than = match mode {
         ApprovalMode::Ask => "reading files",
         ApprovalMode::AutoEdits => "editing files",
-        ApprovalMode::Auto => "running commands in its workspace",
+        ApprovalMode::Auto => {
+            return format!(
+                "On Claude Code, tasks on {name} ask only for destructive actions and for actions outside the workspace. On Gemini CLI and OpenCode, they still ask before commands."
+            );
+        }
         ApprovalMode::FullAccess => "anything outside its allowed folders",
-    }
+    };
+    format!("Tasks on {name} ask before anything riskier than {anything_riskier_than}.")
 }
 
 fn section_block(
@@ -1266,6 +1326,28 @@ mod tests {
         assert_eq!(code_span("ls"), "`ls`");
         assert_eq!(code_span("a`b"), "``a`b``");
         assert_eq!(code_span("`x"), "`` `x ``");
+    }
+
+    #[test]
+    fn the_worker_limit_text_says_what_auto_does_on_each_harness() {
+        let auto = mode_limit_help("MacBook", ApprovalMode::Auto);
+        assert!(auto.contains("On Claude Code"), "{auto}");
+        assert!(
+            auto.contains("destructive actions and for actions outside the workspace"),
+            "{auto}"
+        );
+        assert!(
+            auto.contains("On Gemini CLI and OpenCode, they still ask before commands"),
+            "{auto}"
+        );
+        assert!(
+            !auto.contains("running commands in its workspace"),
+            "{auto}"
+        );
+        assert_eq!(
+            mode_limit_help("MacBook", ApprovalMode::AutoEdits),
+            "Tasks on MacBook ask before anything riskier than editing files."
+        );
     }
 
     #[test]

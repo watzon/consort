@@ -237,11 +237,13 @@ fn restart_says_why_when_the_app_cannot_replace_itself(cx: &mut TestAppContext) 
     // The test program runs from a build folder, so the install is refused.
     click(cx, "update-restart");
     settle(cx, 300);
-    let message = app.read_with(cx, |a, _| a.notices.current().map(|n| n.message.clone()));
+    let message = app.read_with(cx, |a, _| {
+        a.notices.visible().last().map(|n| n.message.clone())
+    });
     let message = message.expect("an error notice");
     assert!(message.contains("cannot replace itself"), "{message}");
     // A second try works the same: the click is not stuck.
     click(cx, "update-restart");
     settle(cx, 300);
-    assert!(app.read_with(cx, |a, _| a.notices.current().is_some()));
+    assert!(app.read_with(cx, |a, _| a.notices.visible().last().is_some()));
 }

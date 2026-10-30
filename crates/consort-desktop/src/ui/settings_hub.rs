@@ -5,8 +5,9 @@ use consort_client::LoadState;
 use consort_client::admin::{BackupFrequency, HubStatusView, LastBackupView};
 use consort_theme::{Tokens, TypeExt as _};
 use gpui_kit::{
-    AnyElement, ClipboardItem, Context, Div, Focusable as _, IntoElement, ParentElement,
-    StatefulInteractiveElement as _, Styled, Window, div, prelude::FluentBuilder as _, relative,
+    AnyElement, ClipboardItem, Context, Div, Focusable as _, InteractiveElement as _, IntoElement,
+    ParentElement, StatefulInteractiveElement as _, Styled, Window, div,
+    prelude::FluentBuilder as _, relative,
 };
 
 use crate::admin::{KEEP_SELECT, TIME_SELECT, WEEKDAY_SELECT, select_options};
@@ -44,6 +45,7 @@ impl ConsortApp {
                 column(t)
                     .child(header("Hub", line, None, t))
                     .child(self.hub_connection(&hub, t, cx))
+                    .child(self.hub_accounts(t, cx))
                     .child(hub_storage(&hub, t))
                     .child(self.hub_backup(&hub, t, window, cx)),
             )
@@ -73,6 +75,49 @@ impl ConsortApp {
             ),
         };
         header("Hub", div(), None, t).child(div()).child(body)
+    }
+
+    /// Whether work moves to another account at a usage limit.
+    fn hub_accounts(&self, t: &Tokens, cx: &mut Context<Self>) -> Div {
+        let c = &t.colors;
+        let on = self.state.account_fallback;
+        div()
+            .flex()
+            .flex_col()
+            .gap(t.space.md)
+            .child(section_title("Accounts", t))
+            .child(
+                rows(t).child(
+                    row(false, t)
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .flex_1()
+                                .min_w_0()
+                                .child(text(
+                                    "Move to another account at a usage limit",
+                                    t.text.ui,
+                                    c.text_primary,
+                                ))
+                                .child(hint(
+                                    "A chat or a task goes on with another signed-in account of the same harness that has the same model. It stays there until the session ends.",
+                                    t,
+                                )),
+                        )
+                        .child(
+                            crate::ui::settings::switch("account-fallback", on, t)
+                                .debug_selector(|| "account-fallback".into())
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    let client = this.client.clone();
+                                    this.spawn_command(cx, async move {
+                                        client.set_account_fallback(!on).await
+                                    });
+                                    cx.notify();
+                                })),
+                        ),
+                ),
+            )
     }
 
     fn hub_connection(&self, hub: &HubStatusView, t: &Tokens, cx: &mut Context<Self>) -> Div {

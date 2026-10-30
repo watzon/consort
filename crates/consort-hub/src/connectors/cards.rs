@@ -174,7 +174,10 @@ impl Hub {
                 Some(task_id) => {
                     let text = render_events(std::slice::from_ref(&event));
                     match deliver_in_tx(&hub, tx, task_id, &text, &[], Actor::System) {
-                        Ok(delivered) => Ok((Some(delivered.worker_id), delivered.status_changed)),
+                        Ok(delivered) => {
+                            let changed = delivered.status_changed;
+                            Ok((Some(delivered), changed))
+                        }
                         Err(err) => {
                             tracing::warn!(error = %err, "could not give a card answer to its task");
                             Ok((None, false))
@@ -187,8 +190,8 @@ impl Hub {
                 }
             })
             .await?;
-        if let Some(worker) = worker {
-            self.pump_worker(worker);
+        if let Some(delivered) = worker {
+            self.after_delivery(&delivered);
         }
         if kick {
             self.kick_coordinator(channel_id);

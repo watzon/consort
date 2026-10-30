@@ -932,7 +932,7 @@ pub fn approval_caption(mode: crate::view::ApprovalMode) -> &'static str {
             "The task edits files without asking. It asks before it runs a command. A worker can set a lower limit."
         }
         M::Auto => {
-            "The task edits and runs commands without asking, inside the harness sandbox. A worker can set a lower limit."
+            "On Claude Code, the task asks only for destructive actions and for actions outside the workspace. On Codex, it runs commands in the harness sandbox. On Gemini CLI and OpenCode, it still asks before commands. A worker can set a lower limit."
         }
         M::FullAccess => {
             "The task runs without asking and without a sandbox. A worker can set a lower limit."
@@ -969,6 +969,14 @@ mod tests {
             emoji: emoji.into(),
             created_at: Timestamp::from_millis(1),
         }
+    }
+
+    #[test]
+    fn the_auto_caption_says_what_auto_does_on_each_harness() {
+        let caption = approval_caption(crate::view::ApprovalMode::Auto);
+        assert!(caption.contains("On Claude Code"), "{caption}");
+        assert!(caption.contains("On Gemini CLI and OpenCode"), "{caption}");
+        assert!(!caption.contains("without asking, inside"), "{caption}");
     }
 
     #[test]

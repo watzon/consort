@@ -48,6 +48,9 @@ pub struct SendFailure {
     pub channel_name: String,
     /// What the hub said, with a next step.
     pub message: String,
+    /// When the user wrote the message, in Unix milliseconds. The lane of
+    /// the user shows the refused message with this time.
+    pub created_at: i64,
 }
 
 /// The part of a session item that the view reads. The cache keeps nothing
@@ -58,6 +61,13 @@ pub enum ItemSummary {
     Command(String),
     /// The paths of the changed files.
     Files(Vec<String>),
+    /// The steps of the plan of the harness, with their status, and when
+    /// the item last changed (Unix milliseconds). A session may hold more
+    /// than one plan item. The newest one is the plan that the thread shows.
+    Plan {
+        steps: Vec<consort_proto::model::PlanStep>,
+        updated_at: i64,
+    },
 }
 
 impl ItemSummary {
@@ -67,6 +77,10 @@ impl ItemSummary {
             ItemPayload::FileChange(f) => Some(ItemSummary::Files(
                 f.changes.iter().map(|c| c.path.clone()).collect(),
             )),
+            ItemPayload::Plan(plan) => Some(ItemSummary::Plan {
+                steps: plan.steps.clone(),
+                updated_at: item.updated_at.as_millis(),
+            }),
             _ => None,
         }
     }
@@ -302,6 +316,7 @@ impl Cache {
                 body: p.body,
                 channel_name,
                 message: reason.to_owned(),
+                created_at: p.created_at,
             });
         }
     }
@@ -493,6 +508,7 @@ impl Cache {
                 body: p.body,
                 channel_name: channel_name.clone(),
                 message: CHANNEL_DELETED.to_owned(),
+                created_at: p.created_at,
             });
         }
         self.has_older.remove(id);
@@ -1208,6 +1224,7 @@ mod tests {
             created_at: Timestamp::from_millis(1),
             proactive: None,
             suggestions: Vec::new(),
+            source_message_id: None,
         }
     }
 
@@ -1559,6 +1576,7 @@ mod tests {
     fn the_cache_applies_preferences_from_the_snapshot_and_the_feed() {
         use consort_proto::model::{FavoriteModel, Preferences};
         let prefs = |models: &[&str]| Preferences {
+            account_fallback: true,
             favorite_models: models
                 .iter()
                 .map(|m| FavoriteModel {

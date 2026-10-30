@@ -514,7 +514,7 @@ pub fn saved_line() -> TimelineItem {
             version: 4,
             created: false,
             suggested_by: "Price out roofline lighting".into(),
-        }),
+        }), draft: None, error: None,
     })
 }
 

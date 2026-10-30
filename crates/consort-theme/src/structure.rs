@@ -126,6 +126,14 @@ pub struct Icons {
 pub struct Layout {
     pub sidebar_width: f32,
     pub panel_width: f32,
+    /// The right panel never gets narrower than this.
+    pub panel_min_width: f32,
+    /// The chat column never gets narrower than this.
+    pub chat_min_width: f32,
+    /// Under this window width, the app is one column.
+    pub compact_width: f32,
+    /// The hit area of the edge that resizes the right panel.
+    pub resize_handle: f32,
     pub timeline_max_width: f32,
     pub speaker_gutter: f32,
     pub min_window: [f32; 2],
@@ -170,6 +178,14 @@ pub struct Layout {
     pub top_tint: [TintStop; 4],
     /// The fade at the bottom of the timeline, above the composer.
     pub fade_bottom: f32,
+    /// The width of a corner notification.
+    pub notice_width: f32,
+    /// How far the stack of corner notifications sits above the bottom of the
+    /// window. It clears the composer and its tool row.
+    pub notice_bottom: f32,
+    /// How far the stack sits under the top of the window in the compact
+    /// layout, under the top bar.
+    pub notice_compact_top: f32,
 }
 
 /// One stop of the top tint: a distance from the top in px, and the opacity
@@ -191,6 +207,8 @@ pub struct Opacity {
     pub danger_hover: f32,
     /// The border of a failed upload chip: `status.failed` at this share.
     pub failed_border: f32,
+    /// The border of an in-chat error card: `status.failed` at this share.
+    pub error_border: f32,
     /// The track of an upload progress bar: `status.working` at this share.
     pub progress_track: f32,
     /// The soft fill of the composer while files are dragged over the chat:
@@ -410,6 +428,9 @@ pub struct Proactivity {
     pub dab_rise: f32,
     /// How far the first dab sits below the line.
     pub dab_drop: f32,
+    /// How far a dab of the writing bubble rises when its turn in the wave
+    /// comes.
+    pub writing_lift: f32,
     /// The padding at the sides of the writing bubble.
     pub writing_pad_x: f32,
     /// The padding above and below the writing bubble.
@@ -584,6 +605,12 @@ pub struct Sidebar {
     /// A group label, the Workers label and a settings group label.
     pub label_text: TypeStyle,
     pub label_pad_y: f32,
+    /// The fixed height of a group label row.
+    pub label_row: f32,
+    /// Where the macOS traffic lights end, from the left of the window.
+    pub lights_end: f32,
+    /// The center line of the macOS traffic lights, from the top.
+    pub lights_center: f32,
     /// The space above a group.
     pub group_top: f32,
     /// The title bar strip at the top, where the macOS window buttons sit.
@@ -715,6 +742,14 @@ pub struct Chat {
     pub pill_pad_y: f32,
     /// The number column of a list in a brief.
     pub brief_number: f32,
+    /// The line under a message group, always kept.
+    pub footer_line: f32,
+    pub footer_button: f32,
+    /// The height of the Useful and Too noisy pair and of its chip.
+    pub feedback_pair: f32,
+    /// The line of a request after the answer (an approval, a draft): one
+    /// box with a glyph, the action, the answer and a chevron.
+    pub answered_line: f32,
 }
 
 /// The drawing of a theme in its card: a miniature sidebar, two lines of
@@ -804,6 +839,26 @@ mod tests {
         assert_eq!(s.component.brand_gap, 8.0);
         assert!((s.component.brand_mark / s.type_scale.heading.size - 1.2).abs() < 0.05);
         assert!(s.layout.error_text_max_height > s.type_scale.ui.line * 3.0);
+    }
+
+    /// Corner notifications (redesign note, item 10): 360 px wide, 124 px
+    /// above the bottom so the stack clears the composer, 88 px under the top
+    /// in the compact layout, and the in-chat error border at 40 percent.
+    #[test]
+    fn notice_tokens_keep_the_design_values() {
+        let s = super::structure();
+        assert_eq!(
+            (
+                s.layout.notice_width,
+                s.layout.notice_bottom,
+                s.layout.notice_compact_top
+            ),
+            (360.0, 124.0, 88.0)
+        );
+        assert_eq!(s.opacity.error_border, 0.4);
+        // The stack sits above the composer: the composer is a field and a
+        // tool row, so the gap is taller than both.
+        assert!(s.layout.notice_bottom > s.component.composer_chip * 2.0);
     }
 
     /// The chat redesign: the bubble width, the fades and the frame rate of
@@ -1078,6 +1133,7 @@ mod tests {
         assert_eq!((chat.bubble_radius, chat.bubble_tail), (16.0, 4.0));
         assert_eq!((chat.bubble_pad_x, chat.bubble_pad_y), (14.0, 10.0));
         assert_eq!((chat.composer_radius, chat.send_button), (16.0, 32.0));
+        assert_eq!(chat.answered_line, 36.0);
         assert_eq!((chat.top_action, chat.top_action_icon), (32.0, 18.0));
         assert_eq!(
             (chat.mark, chat.mark_small, chat.mark_top),

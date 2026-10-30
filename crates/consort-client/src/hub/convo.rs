@@ -404,6 +404,7 @@ async fn open_item(
                     crate::cache::ItemSummary::Files(paths) => {
                         (ItemKind::Diff, paths.first().cloned().unwrap_or_default())
                     }
+                    crate::cache::ItemSummary::Plan { .. } => (ItemKind::Output, "Plan".to_owned()),
                 });
             (
                 worker

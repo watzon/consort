@@ -24,6 +24,10 @@
 # this machine's LAN address to pair a worker on another machine. RUST_LOG
 # passes through. With --mock, only the app starts, with no hub. Press Ctrl+C
 # to stop the app and the hub.
+#
+# On macOS the app runs from a small bundle in the build folder, because macOS
+# takes the Dock icon, the menu name and notifications from a bundle. It has
+# its own bundle ID, so it stays apart from an installed Consort.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -41,9 +45,18 @@ echo "==> building"
 cargo build -p consort-cli -p consort-desktop
 bin="$(cd "${CARGO_TARGET_DIR:-target}" && pwd)/debug"
 
+app_bin="$bin/consort-desktop"
+if [[ "$(uname -s)" == Darwin ]]; then
+  # The folder name starts with "consort", so stop_earlier knows the app.
+  env -u APPLE_SIGNING_IDENTITY scripts/bundle-macos.sh \
+    --binary "$bin/consort-desktop" --no-archive \
+    --out "$bin/consort-dev-bundle" --bundle-id dev.consort.desktop.dev > /dev/null
+  app_bin="$bin/consort-dev-bundle/Consort.app/Contents/MacOS/Consort"
+fi
+
 for arg in "$@"; do
   if [[ "$arg" == --mock ]]; then
-    exec "$bin/consort-desktop" "$@"
+    exec "$app_bin" "$@"
   fi
 done
 
@@ -134,7 +147,7 @@ if [[ ! -f "$dev_dir/client/client.json" ]]; then
 fi
 
 echo "==> starting the app (log: $log, Ctrl+C stops the app and the hub)"
-CONSORT_CONFIG_DIR="$dev_dir/client" "$bin/consort-desktop" "$@" &
+CONSORT_CONFIG_DIR="$dev_dir/client" "$app_bin" "$@" &
 app_pid=$!
 echo "$app_pid" >> "$pid_file"
 wait "$app_pid" || true

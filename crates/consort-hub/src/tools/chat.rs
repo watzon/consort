@@ -39,7 +39,7 @@ const THREAD_ROOT_MAX_BYTES: usize = 48 * 1024;
 
 /// Sets the proactive mark and the suggestions of a message that a
 /// coordinator just posted, and stores it again when either is set.
-fn mark_message(
+pub(crate) fn mark_message(
     tx: &mut crate::store::Tx<'_>,
     mut message: Message,
     posting: crate::proactivity::tools::Posting,

@@ -25,7 +25,7 @@ use gpui_kit::{
 use crate::{
     countdown::{self, RetryCountdown},
     drafts::{self, InFlight, Kept},
-    notice::{INFO_TIMEOUT, NoticeKind, Notices},
+    notice::{INFO_TIMEOUT, NoticeAction, NoticeKind, Notices},
     read_marker::{self, MARK_RETRY, MarkInputs, UNLOADED_GRACE, Unloaded},
     ui::{
         links::LinkAction,
@@ -65,10 +65,13 @@ pub enum Panel {
     None,
     Tasks,
     Thread(String),
-    /// The Channel panel of the open channel: Files, Routines and Memory.
+    /// The Channel panel of the open channel: Files, Routines, Memory and
+    /// Connectors.
     Channel,
     /// The thread of a message, by the root's message ID.
     MessageThread(String),
+    /// A document opened from a file card: the text is in `ConsortApp::document`.
+    Document,
 }
 
 /// The tabs of the Channel panel.
@@ -77,6 +80,8 @@ pub enum ChannelTab {
     Files,
     Routines,
     Memory,
+    /// The connectors and skills of the channel, with their switches.
+    Connectors,
 }
 
 /// A picture opened large, with the other pictures of the same message or
@@ -163,8 +168,6 @@ pub enum Dialog {
     ConfirmRemoveSkill(String),
     /// The files of a skill.
     SkillFiles(String),
-    /// The connectors and skills of a channel.
-    ChannelExtensions(String),
     /// The settings of an account: the worker ID and the account ID.
     AccountSettings(String, String),
     /// Delete a channel file: the channel ID and the path.
@@ -295,6 +298,8 @@ pub struct ConsortApp {
     pub effort_menu: Option<OpenEffort>,
     pub inputs: Inputs,
     pub texts: TextCache,
+    /// The document that the Document panel shows.
+    pub document: Option<crate::ui::document::OpenDocument>,
     pub timeline: ListState,
     pub timeline_keys: Vec<String>,
     pub timeline_channel: String,
@@ -375,6 +380,20 @@ pub struct ConsortApp {
     pub brief_open: Vec<String>,
     /// The task threads whose review summary the user closed.
     pub summary_closed: Vec<String>,
+    /// The answered approvals that the user opened, by key. The key names
+    /// the approval and the place (the timeline or a thread), so each place
+    /// keeps its own state (`ui/approvals.rs`).
+    pub approvals_open: std::collections::BTreeSet<String>,
+    /// The in-chat error cards that the user opened, and their open Details,
+    /// one flag for each card and each place (`ui/errors.rs`).
+    pub errors_open: std::collections::BTreeSet<String>,
+    /// The waiting approvals whose command shows in full ("Show all").
+    pub approvals_all: std::collections::BTreeSet<String>,
+    /// How the window shares its width. See `crate::ui::window_layout`.
+    pub layout: crate::ui::window_layout::LayoutUi,
+    /// The chat row under the pointer and its timeline item. The footer of
+    /// a message group shows while this item is in the group.
+    pub chat_hover: Option<(usize, usize)>,
     /// The Archived list in the sidebar is open.
     pub archived_open: bool,
     /// The 8 fps timer of the stop motion runs (see [`FrameClock`]).
@@ -434,6 +453,7 @@ impl ConsortApp {
     pub fn new(client: Client, demo: bool, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let state = client.state();
         let drafts = client.load_drafts();
+        let client_layout = client.load_layout();
         let overdraw = Self::tokens(cx).layout.list_overdraw;
         let channel_id = state.tutti().map(|c| c.id.clone()).unwrap_or_default();
         let textarea = |placeholder: &str,
@@ -652,6 +672,7 @@ impl ConsortApp {
             effort_menu: None,
             inputs,
             texts: TextCache::default(),
+            document: None,
             timeline: ListState::new(0, ListAlignment::Bottom, overdraw),
             timeline_keys: Vec::new(),
             timeline_channel: String::new(),
@@ -671,6 +692,11 @@ impl ConsortApp {
             activity_open: Vec::new(),
             last_thread: None,
             editing: None,
+            layout: crate::ui::window_layout::LayoutUi::new(
+                client_layout,
+                window.viewport_size().width,
+            ),
+            chat_hover: None,
             narrow: false,
             loading_older: None,
             open_created: None,
@@ -695,6 +721,9 @@ impl ConsortApp {
             drafts_saving: false,
             brief_open: Vec::new(),
             summary_closed: Vec::new(),
+            approvals_open: std::collections::BTreeSet::new(),
+            errors_open: std::collections::BTreeSet::new(),
+            approvals_all: std::collections::BTreeSet::new(),
             archived_open: false,
             clock_ticker: false,
             chat_rows: Vec::new(),
@@ -887,15 +916,19 @@ impl ConsortApp {
     }
 
     /// Shows the messages that waited in the outbox and that the hub then
-    /// refused. Each one is an error notice with the text, and the notice has
-    /// a button that puts the text back in the message box. The client keeps
-    /// the failure until the user dismisses the notice, so a failure that
-    /// the user has not seen is never lost. Errors queue behind each other.
+    /// refused, when no lane shows them. A message with a channel or a task
+    /// on screen stays in the lane of the user, dimmed, with its reason and
+    /// "Put back in the message box" (`SendFailureView::in_lane`), so it
+    /// gets no notice. The others (the channel or the task is gone) are an
+    /// error notice with the text and a button that puts the text back in
+    /// the message box. The client keeps the failure until the user
+    /// dismisses it, so a failure that the user has not seen is never lost.
     fn report_send_failures(&mut self, cx: &mut Context<Self>) {
         let fresh: Vec<_> = self
             .state
             .send_failures
             .iter()
+            .filter(|f| !f.in_lane)
             .filter(|f| self.announced_failures.insert(f.id.clone()))
             .cloned()
             .collect();
@@ -918,21 +951,47 @@ impl ConsortApp {
         }
     }
 
-    /// Dismisses the notice on screen. The next error, if one waits, shows.
-    /// A failed send leaves the client with its notice.
-    pub fn dismiss_notice(&mut self, cx: &mut Context<Self>) {
-        if let Some(notice) = self.notices.dismiss()
-            && let Some(id) = notice.failure
-        {
-            let client = self.client.clone();
-            cx.spawn(async move |_, _| {
-                let _ = client
-                    .run(consort_client::Command::DismissSendFailure { id })
-                    .await;
-            })
-            .detach();
+    /// Dismisses one notice. The next error that waits, if there is one,
+    /// shows. A failed send leaves the client with its notice.
+    pub fn dismiss_notice(&mut self, serial: u64, cx: &mut Context<Self>) {
+        if let Some(id) = self.notices.dismiss(serial).and_then(|n| n.failure) {
+            self.dismiss_send_failure(id, cx);
         }
         cx.notify();
+    }
+
+    /// Tells the client that the user has seen a refused message, so the
+    /// client drops it. The lane of the user shows it until then.
+    pub fn dismiss_send_failure(&mut self, id: String, cx: &mut Context<Self>) {
+        let client = self.client.clone();
+        cx.spawn(async move |_, _| {
+            let _ = client
+                .run(consort_client::Command::DismissSendFailure { id })
+                .await;
+        })
+        .detach();
+    }
+
+    /// The button of a notice. Its notice goes first, so a second click
+    /// does nothing.
+    pub fn run_notice_action(&mut self, serial: u64, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(notice) = self.notices.get(serial).cloned() else {
+            return;
+        };
+        match notice.action {
+            Some(NoticeAction::PutBack) => {
+                if let Some(id) = notice.failure {
+                    self.restore_failed_text(&id, window, cx);
+                }
+            }
+            Some(NoticeAction::LoadOlder(channel_id)) => {
+                self.dismiss_notice(serial, cx);
+                if self.channel_id == channel_id {
+                    self.load_older(cx);
+                }
+            }
+            None => {}
+        }
     }
 
     /// Puts the text of a failed send back in the message box it came from,
@@ -975,7 +1034,10 @@ impl ConsortApp {
             input.set_value(drafts::append_text(&draft, &failure.body), window, cx);
             input.focus(window, cx);
         });
-        self.dismiss_notice(cx);
+        // The notice (when the failure has one) and the client's copy go.
+        self.notices.dismiss_failure(failure_id);
+        self.dismiss_send_failure(failure.id.clone(), cx);
+        cx.notify();
     }
 
     /// Acts on the state of the link: a refused client goes to onboarding
@@ -1143,9 +1205,20 @@ impl ConsortApp {
                 .map(|t| {
                     let brief = (!t.brief.trim().is_empty())
                         .then(|| format!("brief-{task_id}-{}", t.text_is_preview));
+                    // The plan card is under the newest post.
+                    let plan = t
+                        .plan
+                        .as_ref()
+                        .map(|p| format!("plan-{task_id}-{}", p.key()));
+                    // The writing bubble is under the plan, while the turn of
+                    // the task runs.
+                    let writing = consort_client::proactivity::is_task_writing(t)
+                        .then(|| format!("writing-{task_id}"));
                     brief
                         .into_iter()
                         .chain(t.posts.iter().map(|p| p.id.clone()))
+                        .chain(plan)
+                        .chain(writing)
                         .collect()
                 })
                 .unwrap_or_default(),
@@ -1331,8 +1404,8 @@ impl ConsortApp {
             "connectors-in-channel" | "channel-connectors" => {
                 self.open_channel(consort_client::mock_extensions::ACME.into(), window, cx);
                 if screen == "channel-connectors" {
-                    self.open_dialog(
-                        Dialog::ChannelExtensions(consort_client::mock_extensions::ACME.into()),
+                    self.open_channel_connectors(
+                        consort_client::mock_extensions::ACME.into(),
                         window,
                         cx,
                     );
@@ -1654,6 +1727,7 @@ impl ConsortApp {
         }
         self.channel_id = id;
         self.page = Page::Main;
+        self.layout.drawer_open = false;
         // The composer holds the draft of this channel from now on.
         self.sync_draft_inputs(window, cx);
         self.sync_lists();
@@ -1881,6 +1955,19 @@ impl ConsortApp {
             || self.mark_phase(cx).animates()
     }
 
+    /// True while a task or an assistant works or waits for the user.
+    fn work_shows(&self, cx: &gpui_kit::App) -> bool {
+        self.state.tasks.iter().any(|t| {
+            matches!(
+                t.status,
+                consort_client::TaskStatus::Working | consort_client::TaskStatus::NeedsInput
+            )
+        }) || matches!(
+            self.mark_phase(cx),
+            MarkPhase::Working | MarkPhase::NeedsYou
+        )
+    }
+
     /// What the mark shows now.
     pub fn mark_phase(&self, cx: &gpui_kit::App) -> MarkPhase {
         self.mark_forced
@@ -1913,6 +2000,7 @@ impl ConsortApp {
         if self.clock_ticker
             || !crate::ui::motion::clock_runs(
                 self.motion_may_show(cx),
+                self.work_shows(cx),
                 self.window_active,
                 cx.reduce_motion(),
             )
@@ -1930,6 +2018,7 @@ impl ConsortApp {
                     let clock = cx.global::<FrameClock>();
                     let runs = crate::ui::motion::clock_runs(
                         clock.used(),
+                        clock.fast() || this.work_shows(cx),
                         this.window_active,
                         cx.reduce_motion(),
                     );
@@ -1969,12 +2058,21 @@ impl ConsortApp {
         }
         self.loading_older = Some(channel_id.clone());
         let client = self.client.clone();
+        let channel = channel_id.clone();
         cx.spawn(async move |this, cx| {
             let result = client.load_older(channel_id).await;
             let _ = this.update(cx, |this, cx| {
                 this.loading_older = None;
                 if let Err(err) = result {
-                    this.show_error(err.to_string(), cx);
+                    // Older messages did not load: the notice says so, and
+                    // its button tries again.
+                    let message = format!("Could not load older messages. {err}");
+                    this.notices.show_with_action(
+                        NoticeKind::Error,
+                        message,
+                        NoticeAction::LoadOlder(channel),
+                    );
+                    cx.notify();
                 }
             });
         })
@@ -1989,7 +2087,12 @@ impl ConsortApp {
 
     pub fn open_settings(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
         self.page = Page::Settings;
+        self.layout.drawer_open = false;
+        self.layout.settings_list = false;
         self.settings_section = section;
+        // A choice in the Settings list shows the list, not a routine that
+        // was open in it.
+        self.knowledge.settings_routine = None;
         if section == SettingsSection::Workers {
             self.load_registry_for_logos(cx);
         }
@@ -2157,8 +2260,7 @@ impl ConsortApp {
             | Dialog::Connect
             | Dialog::ConfirmDisconnect(_)
             | Dialog::ConfirmRemoveSkill(_)
-            | Dialog::SkillFiles(_)
-            | Dialog::ChannelExtensions(_) => {}
+            | Dialog::SkillFiles(_) => {}
             Dialog::ConnectionActivity(id) => {
                 let id = id.clone();
                 self.load_activity(id, false, cx);
@@ -2762,9 +2864,7 @@ impl ConsortApp {
                 window,
                 cx,
             ),
-            MenuAction::ChannelExtensions(id) => {
-                self.open_dialog(Dialog::ChannelExtensions(id), window, cx)
-            }
+            MenuAction::ChannelExtensions(id) => self.open_channel_connectors(id, window, cx),
             MenuAction::ReconnectConnection(id) => self.reconnect(id, window, cx),
             MenuAction::Disconnect(id) => {
                 self.open_dialog(Dialog::ConfirmDisconnect(id), window, cx)
@@ -2788,10 +2888,6 @@ impl ConsortApp {
                 }
                 None => self.ext.connect.approvals = self.ext.connect.approvals.with(kind, rule),
             },
-            MenuAction::ToggleScopeTag(target, tag) => {
-                let use_in = crate::extensions::toggle_tag(&self.use_in_of(&target), &tag);
-                self.set_use_in(target, use_in, cx);
-            }
             MenuAction::SetSkillEnabled(id, enabled) => self.update_skill(
                 id,
                 consort_client::SkillChanges {
@@ -2917,6 +3013,10 @@ impl ConsortApp {
             cx.stop_propagation();
             return;
         }
+        if self.use_in_picker_key(key, cx) {
+            cx.stop_propagation();
+            return;
+        }
         if let Some(menu) = self.menu.as_mut() {
             match key {
                 "escape" => self.menu = None,
@@ -2949,9 +3049,17 @@ impl ConsortApp {
             if self.dialog.is_some() {
                 self.close_dialog(window, cx);
                 cx.stop_propagation();
+            } else if self.layout.drawer_open {
+                self.layout.drawer_open = false;
+                cx.notify();
+                cx.stop_propagation();
             } else if self.tag_field_open() {
                 // Escape closes the Add tag field of the worker, and only that.
                 self.close_tag_entry(window, cx);
+                cx.stop_propagation();
+            } else if self.page == Page::Settings && self.close_settings_routine(cx) {
+                // A routine open in Settings goes back to the list first.
+                // A second Escape leaves Settings.
                 cx.stop_propagation();
             } else if self.page == Page::Settings {
                 self.page = Page::Main;
@@ -2976,6 +3084,10 @@ impl ConsortApp {
             window.dispatch_action(edit.action(), cx);
             cx.stop_propagation();
             return;
+        }
+        if key == "\\" && command && self.page == Page::Main {
+            self.toggle_sidebar(cx);
+            cx.stop_propagation();
         }
         if key == "k" && command {
             if self.switcher.is_some() {
@@ -3102,6 +3214,7 @@ impl Render for ConsortApp {
             Page::Settings => self.render_settings(&t, window, cx),
             Page::Main => self.render_main(&t, window, cx),
         };
+        let has_notices = self.notices.visible().next().is_some();
         let menu = self.menu.clone();
         let picker = self.render_picker(&t, window, cx);
         let picker_tip = self.render_picker_tooltip(&t);
@@ -3142,11 +3255,12 @@ impl Render for ConsortApp {
                     })
                     // All icons opens over the dialog that opened it.
                     .children(self.render_icon_picker(&t, window, cx))
+                    .children(self.render_use_in_picker(&t, window, cx))
                     .when(self.lightbox.is_some(), |layer| {
                         layer.child(self.render_lightbox(&t, window, cx))
                     })
-                    .when_some(self.notices.current().cloned(), |layer, notice| {
-                        layer.child(self.render_notice(notice, &t, cx))
+                    .when(has_notices, |layer| {
+                        layer.child(self.render_notice_stack(&t, cx))
                     })
                     .when(self.switcher.is_some(), |layer| {
                         layer.child(self.render_switcher(&t, cx))

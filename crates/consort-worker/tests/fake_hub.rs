@@ -295,6 +295,7 @@ async fn pair_connect_run_a_session_and_resend_after_reconnect() {
                 },
                 channel_files: None,
                 approval_mode: None,
+                model_change: None,
             }
             .into(),
         )
@@ -339,6 +340,7 @@ async fn pair_connect_run_a_session_and_resend_after_reconnect() {
                 turn: TurnInput::default(),
                 channel_files: None,
                 approval_mode: None,
+                model_change: None,
             }
             .into(),
         )
@@ -445,6 +447,7 @@ async fn sessions_resume_after_a_worker_restart() {
                 },
                 channel_files: None,
                 approval_mode: None,
+                model_change: None,
             }
             .into(),
         )
@@ -534,6 +537,7 @@ async fn the_worker_allows_hub_tools_without_asking_the_hub() {
                 },
                 channel_files: None,
                 approval_mode: None,
+                model_change: None,
             }
             .into(),
         )
@@ -592,6 +596,143 @@ async fn the_worker_allows_hub_tools_without_asking_the_hub() {
     assert_eq!(
         hub_tool_closed,
         Some(consort_proto::worker_link::RequestOutcome::Allowed)
+    );
+    worker.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_coordinator_session_runs_in_ask_and_denies_every_approval_but_hub_tools() {
+    let hub = FakeHub::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    consort_worker::pair(&hub.url, CODE, dir.path(), None, vec![])
+        .await
+        .unwrap();
+    let mut toml = WorkerToml::load(dir.path()).unwrap();
+    let account = AccountConfig::default_for(HarnessKind::ClaudeCode);
+    let account_id = account.id;
+    toml.accounts = vec![account];
+    toml.save(dir.path()).unwrap();
+
+    let script = FakeScript {
+        turns: vec![vec![
+            FakeStep::ToolApproval {
+                request_id: "hub-1".into(),
+                server: "hub".into(),
+                tool: "post_update".into(),
+            },
+            FakeStep::Approval {
+                request_id: "cmd-1".into(),
+                command: "curl https://example.com".into(),
+            },
+            FakeStep::ToolApproval {
+                request_id: "other-1".into(),
+                server: "github".into(),
+                tool: "create_issue".into(),
+            },
+            FakeStep::Text("Done.".into()),
+        ]],
+    };
+    let fake = FakeHarness::new(HarnessKind::ClaudeCode, script);
+    let record = fake.record();
+    let mut harnesses: Harnesses = HashMap::new();
+    harnesses.insert(
+        HarnessKind::ClaudeCode,
+        Arc::new(fake.clone()) as Arc<dyn Harness>,
+    );
+    let worker = consort_worker::run_with(test_config(dir.path()), harnesses)
+        .await
+        .unwrap();
+    hub.wait_connected().await;
+    let session_id = SessionId::new();
+    let mut start = session_start(session_id, account_id);
+    // The hub asks for Auto. A coordinator runs in Ask anyway.
+    start.role = SessionRole::Coordinator;
+    start.task_id = None;
+    start.approval_mode = ApprovalMode::Auto;
+    start.turn = None;
+    assert!(hub.command("start-1", start.into()).await.result.is_ok());
+    assert_eq!(
+        record.lock().unwrap().opened[0].approval_mode,
+        ApprovalMode::Ask
+    );
+
+    let (url, token) = {
+        let r = record.lock().unwrap();
+        let hub_server = &r.opened[0].mcp_servers[0];
+        (
+            hub_server.url.clone(),
+            hub_server.bearer_token.clone().unwrap(),
+        )
+    };
+    let client = McpHttpClient::new(&url, &token).unwrap();
+    client
+        .post(&json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "1"}}}))
+        .await
+        .unwrap();
+    client
+        .post(&json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}))
+        .await
+        .unwrap();
+    let turn = hub
+        .command(
+            "turn-1",
+            SessionTurn {
+                session_id,
+                turn: TurnInput {
+                    text: "Fetch the page".into(),
+                    attachments: vec![],
+                },
+                channel_files: None,
+                approval_mode: None,
+                model_change: None,
+            }
+            .into(),
+        )
+        .await;
+    assert!(turn.result.is_ok());
+    hub.wait_for("the end of the turn", |h| {
+        h.events(session_id)
+            .iter()
+            .any(|e| matches!(e.event, SessionEvent::TurnEnded { .. }))
+            .then_some(())
+    })
+    .await;
+
+    // The hub tool is allowed. The command and the other server's tool are
+    // denied, and the user gets no card for them.
+    let answers: Vec<(String, Option<String>)> = record
+        .lock()
+        .unwrap()
+        .answers
+        .iter()
+        .map(|(id, answer)| (id.as_str().to_owned(), answer.option_id.clone()))
+        .collect();
+    assert_eq!(
+        answers,
+        vec![
+            ("hub-1".to_owned(), Some("allow".to_owned())),
+            ("cmd-1".to_owned(), Some("deny".to_owned())),
+            ("other-1".to_owned(), Some("deny".to_owned())),
+        ]
+    );
+    assert!(
+        hub.events(session_id)
+            .iter()
+            .all(|e| !matches!(e.event, SessionEvent::RequestOpened(_))),
+        "the user sees no card"
+    );
+    // The model learns why, so it starts a task.
+    let steers: Vec<String> = record
+        .lock()
+        .unwrap()
+        .steers
+        .iter()
+        .map(|t| t.text.clone())
+        .collect();
+    assert_eq!(steers.len(), 2, "{steers:?}");
+    assert!(
+        steers.iter().all(|t| t.contains("start_task")),
+        "{steers:?}"
     );
     worker.shutdown().await.unwrap();
 }

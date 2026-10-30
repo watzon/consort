@@ -135,6 +135,12 @@ pub struct HistoryView {
 pub struct KnowledgeState {
     /// The routine that the Channel panel shows in place of the list.
     pub routine_open: Option<String>,
+    /// The routine that Settings > Routines shows in place of the list (a
+    /// drill-in with Back).
+    pub settings_routine: Option<String>,
+    /// The scroll of the Settings > Routines list. It keeps its place while
+    /// a routine is open.
+    pub settings_routines_scroll: gpui_kit::ScrollHandle,
     pub routine_dialog: Option<RoutineDialog>,
     pub status_filter: StatusFilter,
     pub channel_filter: Option<String>,
@@ -465,8 +471,32 @@ impl ConsortApp {
         self.panel = Panel::Channel;
         self.channel_tab = ChannelTab::Routines;
         self.knowledge.routine_open = Some(routine_id.to_owned());
+        self.knowledge.settings_routine = None;
         self.load_runs(routine_id, cx);
         cx.notify();
+    }
+
+    /// Opens a routine in Settings > Routines, in place of the list. The
+    /// user stays in Settings. Back, or Escape, returns to the list.
+    pub fn open_routine_in_settings(&mut self, routine_id: &str, cx: &mut Context<Self>) {
+        if !self.state.routines.iter().any(|r| r.id == routine_id) {
+            return;
+        }
+        self.page = Page::Settings;
+        self.settings_section = SettingsSection::Routines;
+        self.knowledge.settings_routine = Some(routine_id.to_owned());
+        self.load_runs(routine_id, cx);
+        cx.notify();
+    }
+
+    /// Back from a routine in Settings > Routines to the list. Returns
+    /// false when no routine is open there.
+    pub fn close_settings_routine(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.knowledge.settings_routine.take().is_none() {
+            return false;
+        }
+        cx.notify();
+        true
     }
 
     /// Opens a note in the Channel panel: the channel of its scope, or the
@@ -944,8 +974,14 @@ impl ConsortApp {
                 })
                 .detach();
             }
+            // In Settings the history opens in Settings. Elsewhere it opens
+            // in the Channel panel.
             KnowledgeAction::RoutineHistory(routine_id) => {
-                self.open_routine(&routine_id, window, cx)
+                if self.page == Page::Settings {
+                    self.open_routine_in_settings(&routine_id, cx)
+                } else {
+                    self.open_routine(&routine_id, window, cx)
+                }
             }
             KnowledgeAction::EditRoutine(routine_id) => {
                 self.open_routine_dialog(Some(routine_id), "", window, cx)

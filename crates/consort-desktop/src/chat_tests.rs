@@ -115,40 +115,31 @@ fn tutti_draws_bubbles_in_two_lanes_with_time_separators(cx: &mut TestAppContext
                 _ => None,
             })
             .collect();
-        // The brief (title and text), your question, and the reply in two
-        // paragraphs.
+        // The brief (title and text), your question, and the reply. The
+        // reply has two paragraphs and is still one bubble.
         assert_eq!(
             lanes,
-            [
-                Lane::Assistant,
-                Lane::Assistant,
-                Lane::You,
-                Lane::Assistant,
-                Lane::Assistant
-            ]
+            [Lane::Assistant, Lane::Assistant, Lane::You, Lane::Assistant]
         );
         assert!(matches!(app.chat_rows.last(), Some(ChatRow::Card(_))));
     });
-    // The reply's two bubbles sit at the left, your bubble at the right, and
-    // no bubble is wider than the token.
+    // The reply sits at the left, your bubble at the right, and no bubble is
+    // wider than the token. A message is one bubble (DECISIONS 731), so the
+    // reply has no second bubble.
     let reply = cx
-        .debug_bounds("bubble-msg_tutti_reply.p1")
-        .expect("the reply's second bubble draws");
+        .debug_bounds("bubble-msg_tutti_reply.p0")
+        .expect("the reply draws");
+    assert!(
+        cx.debug_bounds("bubble-msg_tutti_reply.p1").is_none(),
+        "two paragraphs are one bubble"
+    );
     let yours = cx
         .debug_bounds("bubble-msg_tutti_you.p0")
         .expect("your bubble draws");
-    let first = cx
-        .debug_bounds("bubble-msg_tutti_reply.p0")
-        .expect("the reply's first bubble draws");
-    assert_eq!(reply.origin.x, first.origin.x, "one lane");
-    assert!(reply.origin.y > first.origin.y);
     assert!(yours.right() > reply.right(), "your lane is at the right");
     assert!(yours.origin.x > reply.origin.x);
     let max = app.read_with(cx, |_, cx| ConsortApp::tokens(cx).layout.bubble_max_width);
     assert!(reply.size.width <= max && yours.size.width <= max);
-    // Bubbles in a group are 4 px apart.
-    let gap = reply.origin.y - first.bottom();
-    assert!((gap - px(4.)).abs() < px(0.5), "gap {gap:?}");
 }
 
 #[gpui::test]
@@ -197,7 +188,10 @@ fn the_tasks_button_opens_the_panel_and_has_a_gold_dot_when_something_needs_you(
         cx.debug_bounds("tasks-needs-you").is_some(),
         "two tasks need you"
     );
-    assert!(cx.debug_bounds("new-task").is_some());
+    assert!(
+        cx.debug_bounds("new-task").is_none(),
+        "the Tasks panel has it"
+    );
     let tasks = cx.debug_bounds("tasks-button").expect("the Tasks button");
     cx.simulate_click(tasks.center(), Modifiers::default());
     cx.run_until_parked();
@@ -206,13 +200,6 @@ fn the_tasks_button_opens_the_panel_and_has_a_gold_dot_when_something_needs_you(
     cx.simulate_click(tasks.center(), Modifiers::default());
     cx.run_until_parked();
     app.read_with(cx, |app, _| assert_eq!(app.panel, Panel::None));
-    // New task opens the New task dialog.
-    let new_task = cx.debug_bounds("new-task").expect("New task");
-    cx.simulate_click(new_task.center(), Modifiers::default());
-    cx.run_until_parked();
-    app.read_with(cx, |app, _| {
-        assert_eq!(app.dialog, Some(crate::app::Dialog::NewTask))
-    });
 }
 
 #[gpui::test]
@@ -318,7 +305,7 @@ fn a_bubble_with_a_list_takes_the_full_width(cx: &mut TestAppContext) {
         };
         let mut list = reply.clone();
         list.id = "msg_tutti_list".to_owned();
-        list.body = "**Your accounts**\n\n- Gmail (your personal, bitstormtech and watzon.tech accounts): search, read, draft, reply, label.\n- Google Calendar".to_owned();
+        list.body = "**Your accounts**\n\n- Gmail (your personal and work accounts): search, read, draft, reply, label.\n- Google Calendar".to_owned();
         let mut short = reply;
         short.id = "msg_tutti_short".to_owned();
         short.body = "Done.".to_owned();
@@ -347,6 +334,38 @@ fn a_bubble_with_a_list_takes_the_full_width(cx: &mut TestAppContext) {
         .debug_bounds("bubble-msg_tutti_short.p0")
         .expect("the short bubble draws");
     assert!(short.size.width < max / 2., "{:?}", short.size.width);
+}
+
+/// The user often watches the work from another app.
+#[gpui::test]
+fn work_moves_in_a_window_without_the_focus_and_the_idle_mark_rests(cx: &mut TestAppContext) {
+    let (handle, app) = open(with_tutti(quiet(), MarkState::Working), cx);
+    let cx = &mut VisualTestContext::from_window(handle, cx);
+    cx.update(|_, cx| app.update(cx, |app, _| app.window_active = false));
+    draw(cx);
+    let tick = |cx: &mut VisualTestContext| cx.update(|_, cx| cx.global::<FrameClock>().tick());
+    let run = |cx: &mut VisualTestContext| {
+        for _ in 0..8 {
+            cx.executor().advance_clock(FRAME);
+            cx.run_until_parked();
+        }
+    };
+    let start = tick(cx);
+    run(cx);
+    assert!(tick(cx) > start, "the work moves");
+
+    cx.update(|_, cx| {
+        app.update(cx, |app, cx| {
+            app.state = with_tutti(quiet(), MarkState::Idle).into();
+            app.mark_forced = Some(MarkPhase::Idle);
+            cx.notify();
+        })
+    });
+    draw(cx);
+    run(cx);
+    let rested = tick(cx);
+    run(cx);
+    assert_eq!(tick(cx), rested, "nothing runs at rest");
 }
 
 #[gpui::test]
@@ -404,19 +423,21 @@ fn an_icon_button_shimmers_only_while_hovered(cx: &mut TestAppContext) {
         cx.run_until_parked();
     }
     assert_eq!(tick(cx), start, "an idle screen costs nothing");
-    // The pointer on the New task button: three versions in turn, 8 a second.
-    let button = cx.debug_bounds("new-task").expect("New task");
+    // The pointer on the Channel button: three versions in turn, 8 a second.
+    let button = cx
+        .debug_bounds("channel-button")
+        .expect("the Channel button");
     cx.simulate_mouse_move(button.center(), None, Modifiers::default());
     cx.run_until_parked();
     let hovered = cx.update(|_, cx| cx.global::<FrameClock>().hovered());
-    assert_eq!(hovered, Some("new-task".into()));
+    assert_eq!(hovered, Some("channel-button".into()));
     let from = tick(cx);
     let mut versions = Vec::new();
     for _ in 0..3 {
         cx.executor().advance_clock(FRAME);
         cx.run_until_parked();
         versions.push(cx.update(|_, cx| {
-            let id = gpui_kit::ElementId::from("new-task");
+            let id = gpui_kit::ElementId::from("channel-button");
             let live = crate::ui::motion::is_hovered(&id, cx);
             crate::ui::motion::shimmer_version(live, cx)
         }));
@@ -442,7 +463,7 @@ fn an_icon_button_shimmers_only_while_hovered(cx: &mut TestAppContext) {
     }
     assert_eq!(tick(cx), left);
     let version = cx.update(|_, cx| {
-        let id = gpui_kit::ElementId::from("new-task");
+        let id = gpui_kit::ElementId::from("channel-button");
         crate::ui::motion::shimmer_version(crate::ui::motion::is_hovered(&id, cx), cx)
     });
     assert_eq!(version, 0, "an icon that is not hovered shows version 0");
@@ -457,7 +478,9 @@ fn reduce_motion_stops_the_shimmer_of_a_hovered_button(cx: &mut TestAppContext) 
         app.update(cx, |app, _| app.window_active = true);
     });
     draw(cx);
-    let button = cx.debug_bounds("new-task").expect("New task");
+    let button = cx
+        .debug_bounds("channel-button")
+        .expect("the Channel button");
     cx.simulate_mouse_move(button.center(), None, Modifiers::default());
     cx.run_until_parked();
     let start = cx.update(|_, cx| cx.global::<FrameClock>().tick());
@@ -466,7 +489,7 @@ fn reduce_motion_stops_the_shimmer_of_a_hovered_button(cx: &mut TestAppContext) 
         cx.run_until_parked();
     }
     let (tick, version) = cx.update(|_, cx| {
-        let id = gpui_kit::ElementId::from("new-task");
+        let id = gpui_kit::ElementId::from("channel-button");
         (
             cx.global::<FrameClock>().tick(),
             crate::ui::motion::shimmer_version(crate::ui::motion::is_hovered(&id, cx), cx),

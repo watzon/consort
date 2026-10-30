@@ -11,15 +11,26 @@ mod admin;
 #[cfg(test)]
 mod admin_tests;
 mod app;
+#[cfg(test)]
+mod approvals_tests;
 mod assets;
 #[cfg(test)]
 mod chat_tests;
+#[cfg(test)]
+mod composer_tests;
 mod convo;
 #[cfg(test)]
 mod convo_tests;
 mod countdown;
+mod dictation;
+#[cfg(test)]
+mod document_tests;
 mod drafts;
+#[cfg(test)]
+mod drafts_tests;
 mod edit_keys;
+#[cfg(test)]
+mod errors_tests;
 #[cfg(test)]
 mod ext_tests;
 mod extensions;
@@ -33,7 +44,12 @@ mod keys_tests;
 mod knowledge;
 #[cfg(test)]
 mod knowledge_tests;
+mod layout;
+#[cfg(test)]
+mod layout_tests;
 mod notice;
+#[cfg(test)]
+mod notices_tests;
 mod notify_platform;
 #[cfg(test)]
 mod offline_tests;
@@ -43,6 +59,10 @@ mod proactivity;
 #[cfg(test)]
 mod proactivity_tests;
 mod read_marker;
+#[cfg(test)]
+mod tasks_tests;
+#[cfg(test)]
+mod test_support;
 mod ui;
 mod voice;
 #[cfg(test)]
@@ -223,7 +243,11 @@ fn main() {
                 }
             })
             .detach();
-            cx.activate(true);
+            // For a look at the app in the background. A window that comes
+            // forward takes the keyboard from the app that the user types in.
+            if std::env::var_os("CONSORT_NO_ACTIVATE").is_none() {
+                cx.activate(true);
+            }
             let tokens = consort_theme::ActiveTokens::tokens(cx).clone();
             let (min_w, min_h) = tokens.layout.min_window;
             let (width, height) = tokens.layout.default_window;

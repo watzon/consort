@@ -10,9 +10,10 @@
 //! - **Groups.** Bubbles that follow each other in the same lane form a
 //!   group. A time separator, a card or a notice ends a group. The last
 //!   bubble of a group gets the small corner on the speaker's side.
-//! - **Paragraphs.** An assistant message becomes one bubble for each
-//!   paragraph (see [`split_paragraphs`]). A list, a code block, a table or a
-//!   quote stays whole in the bubble of the paragraph before it.
+//! - **One bubble for each message.** A message is one bubble, whatever it
+//!   holds: paragraphs, a heading, a list, a table or a code block. The old
+//!   rule split an assistant message at each paragraph, so a long answer
+//!   looked like many messages (DECISIONS 731).
 //! - **Time separators.** See [`separator_before`].
 
 use markdown::{ParseOptions, mdast::Node};
@@ -121,6 +122,14 @@ pub enum ChatRow {
         item: usize,
         lane: Lane,
     },
+    /// The line under a message group, which is always there, so a hover
+    /// never moves the timeline. It acts on the last message of the group,
+    /// and shows while the pointer is on any item from `first` to `item`.
+    Actions {
+        first: usize,
+        item: usize,
+        lane: Lane,
+    },
 }
 
 impl ChatRow {
@@ -141,6 +150,7 @@ impl ChatRow {
             ChatRow::Card(c) => item_key(c.item).to_owned(),
             ChatRow::Notice { item, .. } => item_key(*item).to_owned(),
             ChatRow::Footer { item, .. } => format!("{}#f", item_key(*item)),
+            ChatRow::Actions { item, .. } => format!("{}#g", item_key(*item)),
         }
     }
 }
@@ -195,69 +205,6 @@ pub fn separator_before(
     }
 }
 
-/// Splits a message into the Markdown of its bubbles.
-///
-/// A paragraph or a heading starts a new bubble, except right after a
-/// heading, which keeps its first paragraph. A list, a code block, a table,
-/// a quote or a rule never starts a bubble: it stays whole in the bubble
-/// before it, with the paragraph that leads into it. Link reference
-/// definitions go to every bubble, so each part keeps its links. Text that
-/// does not parse stays one bubble.
-pub fn split_paragraphs(markdown: &str) -> Vec<String> {
-    let mut options = ParseOptions::gfm();
-    options.constructs.math_text = false;
-    options.constructs.math_flow = false;
-    let Ok(root) = markdown::to_mdast(markdown, &options) else {
-        return vec![markdown.to_owned()];
-    };
-    let Some(children) = root.children() else {
-        return vec![markdown.to_owned()];
-    };
-    // Each bubble is a range of the source text, so the Markdown of a part
-    // is exactly what the user or the assistant wrote.
-    let mut ranges: Vec<(usize, usize)> = Vec::new();
-    let mut definitions: Vec<&str> = Vec::new();
-    let mut previous_starts_bubble_body = false;
-    for child in children {
-        let Some(position) = child.position() else {
-            continue;
-        };
-        let (start, end) = (position.start.offset, position.end.offset);
-        let Some(source) = markdown.get(start..end) else {
-            return vec![markdown.to_owned()];
-        };
-        if matches!(child, Node::Definition(_)) {
-            definitions.push(source);
-            continue;
-        }
-        let starts = matches!(child, Node::Paragraph(_) | Node::Heading(_));
-        match ranges.last_mut() {
-            Some(last) if !(starts && !previous_starts_bubble_body) => last.1 = end,
-            _ => ranges.push((start, end)),
-        }
-        // A heading keeps the paragraph after it.
-        previous_starts_bubble_body = matches!(child, Node::Heading(_));
-    }
-    if ranges.len() <= 1 && definitions.is_empty() {
-        return vec![markdown.trim().to_owned()];
-    }
-    if ranges.is_empty() {
-        return vec![markdown.trim().to_owned()];
-    }
-    let refs = definitions.join("\n");
-    ranges
-        .into_iter()
-        .filter_map(|(start, end)| markdown.get(start..end))
-        .map(|part| {
-            if refs.is_empty() {
-                part.trim().to_owned()
-            } else {
-                format!("{}\n\n{refs}", part.trim())
-            }
-        })
-        .collect()
-}
-
 /// Whether a bubble's Markdown needs the full bubble width.
 ///
 /// A bubble fits its text, but the layout cannot measure the natural width
@@ -299,11 +246,23 @@ pub fn rows(items: &[TimelineItem]) -> Vec<ChatRow> {
     let mut last_bubble: Option<usize> = None;
     let mut after_separator = false;
 
-    fn close(out: &mut [ChatRow], last_bubble: &mut Option<usize>, open_lane: &mut Option<Lane>) {
+    // The messages of the open group: the first, and the last.
+    let mut group: Option<(usize, usize)> = None;
+    let mut after_proactive = false;
+
+    fn close(
+        out: &mut Vec<ChatRow>,
+        last_bubble: &mut Option<usize>,
+        open_lane: &mut Option<Lane>,
+        group: &mut Option<(usize, usize)>,
+    ) {
         if let Some(ix) = last_bubble.take()
             && let Some(ChatRow::Bubble(b)) = out.get_mut(ix)
         {
             b.last_in_group = true;
+        }
+        if let (Some(lane), Some((first, item))) = (*open_lane, group.take()) {
+            out.push(ChatRow::Actions { first, item, lane });
         }
         *open_lane = None;
     }
@@ -318,7 +277,7 @@ pub fn rows(items: &[TimelineItem]) -> Vec<ChatRow> {
             continue;
         };
         if let Some(label) = separator_before(day, previous_at, at, time_label) {
-            close(&mut out, &mut last_bubble, &mut open_lane);
+            close(&mut out, &mut last_bubble, &mut open_lane, &mut group);
             out.push(ChatRow::Separator {
                 key: format!("sep-{}", item.key()),
                 label,
@@ -341,25 +300,28 @@ pub fn rows(items: &[TimelineItem]) -> Vec<ChatRow> {
         match item {
             TimelineItem::Message(m) => {
                 let lane = lane_of(m.speaker);
-                if open_lane != Some(lane) {
-                    close(&mut out, &mut last_bubble, &mut open_lane);
+                // A proactive message is a group of its own, because the
+                // footer of a group rates only its last message.
+                let proactive = m.proactive.is_some();
+                if open_lane != Some(lane) || proactive || after_proactive {
+                    close(&mut out, &mut last_bubble, &mut open_lane, &mut group);
                 }
+                after_proactive = proactive;
+                group = Some((group.map_or(ix, |(first, _)| first), ix));
                 let mut parts: Vec<(String, bool)> = Vec::new();
                 if m.title.as_deref().is_some_and(|t| !t.trim().is_empty()) {
                     parts.push((String::new(), true));
                 }
-                // Your own words stay in one bubble, as you sent them. So
-                // does a morning brief.
-                if lane == Lane::Assistant && !crate::proactivity::is_brief(m) {
-                    parts.extend(
-                        split_paragraphs(&m.body)
-                            .into_iter()
-                            .filter(|p| !p.is_empty())
-                            .map(|p| (p, false)),
-                    );
-                } else {
-                    parts.push((m.body.clone(), false));
-                }
+                // A message is one bubble. Long text, a heading, a list, a
+                // table or a code block do not split it.
+                parts.push((
+                    if lane == Lane::You {
+                        m.body.clone()
+                    } else {
+                        m.body.trim().to_owned()
+                    },
+                    false,
+                ));
                 // A message with only files has no text bubble.
                 if lane == Lane::You || m.body.trim().is_empty() {
                     parts.retain(|(markdown, title)| *title || !markdown.trim().is_empty());
@@ -437,13 +399,13 @@ pub fn rows(items: &[TimelineItem]) -> Vec<ChatRow> {
                 }
             }
             TimelineItem::TaskCard(_) | TimelineItem::Approval(_) | TimelineItem::Decision(_) => {
-                close(&mut out, &mut last_bubble, &mut open_lane);
+                close(&mut out, &mut last_bubble, &mut open_lane, &mut group);
                 let spacing = spacing_for(false, after_separator, out.is_empty());
                 out.push(ChatRow::Card(CardRow { item: ix, spacing }));
                 after_separator = false;
             }
             TimelineItem::Notice(_) => {
-                close(&mut out, &mut last_bubble, &mut open_lane);
+                close(&mut out, &mut last_bubble, &mut open_lane, &mut group);
                 let spacing = spacing_for(false, after_separator, out.is_empty());
                 out.push(ChatRow::Notice { item: ix, spacing });
                 after_separator = false;
@@ -451,7 +413,7 @@ pub fn rows(items: &[TimelineItem]) -> Vec<ChatRow> {
             TimelineItem::Day(_) => {}
         }
     }
-    close(&mut out, &mut last_bubble, &mut open_lane);
+    close(&mut out, &mut last_bubble, &mut open_lane, &mut group);
     out
 }
 
@@ -523,54 +485,62 @@ mod tests {
             .collect()
     }
 
-    // Paragraph splitting
+    // One bubble for each message
 
-    #[test]
-    fn paragraphs_become_bubbles() {
-        let parts = split_paragraphs("One step is left.\n\nThe CI change is a patch.");
-        assert_eq!(parts, ["One step is left.", "The CI change is a patch."]);
+    /// The Markdown of the bubbles that one assistant message makes.
+    fn assistant_parts(body: &str) -> Vec<String> {
+        let rows = rows(&[msg("a", Speaker::Consort, 0, "9:12 AM", body)]);
+        bubbles(&rows).iter().map(|b| b.markdown.clone()).collect()
     }
 
     #[test]
-    fn a_list_stays_whole_with_the_paragraph_that_leads_into_it() {
-        let text = "Two tasks need you:\n\n1. Build the engine.\n2. Review the rules.\n\n   Still part of item two.\n\nThat is all.";
-        let parts = split_paragraphs(text);
-        assert_eq!(parts.len(), 2, "{parts:?}");
-        assert!(parts[0].starts_with("Two tasks need you:"));
-        assert!(parts[0].contains("2. Review the rules."));
-        assert!(parts[0].contains("Still part of item two."));
-        assert_eq!(parts[1], "That is all.");
-    }
-
-    #[test]
-    fn a_code_block_stays_whole_even_with_blank_lines_inside() {
-        let text = "Run this:\n\n```sh\ncargo build\n\ncargo test\n```\n\nThen tell me.";
-        let parts = split_paragraphs(text);
-        assert_eq!(parts.len(), 2, "{parts:?}");
-        assert!(parts[0].contains("cargo build\n\ncargo test"));
-        assert_eq!(parts[1], "Then tell me.");
-    }
-
-    #[test]
-    fn a_heading_keeps_its_first_paragraph() {
-        let parts = split_paragraphs("## What to check\n\nRead the report.\n\nThen decide.");
+    fn plain_paragraphs_stay_in_one_bubble() {
+        // The old rule made two bubbles here, and a long answer looked like
+        // many messages.
         assert_eq!(
-            parts,
-            ["## What to check\n\nRead the report.", "Then decide."]
+            assistant_parts("One step is left.\n\nThe CI change is a patch."),
+            ["One step is left.\n\nThe CI change is a patch."]
         );
     }
 
     #[test]
-    fn reference_links_keep_their_definition_in_every_part() {
-        let parts =
-            split_paragraphs("See [the PR][pr].\n\nAnd [it][pr] again.\n\n[pr]: https://x.test/1");
-        assert_eq!(parts.len(), 2);
-        assert!(parts.iter().all(|p| p.ends_with("[pr]: https://x.test/1")));
+    fn a_long_answer_with_many_paragraphs_is_one_bubble() {
+        let body = (1..=12)
+            .map(|n| format!("Paragraph {n} of the answer."))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        assert_eq!(assistant_parts(&body), [body]);
     }
 
     #[test]
-    fn one_paragraph_is_one_bubble() {
-        assert_eq!(split_paragraphs("  Hello.  "), ["Hello."]);
+    fn a_heading_a_list_a_table_and_a_code_block_stay_in_one_bubble() {
+        let text = "## What to check\n\nRead the report.\n\n1. Build the engine.\n2. Review the rules.\n\n   Still part of item two.\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n```sh\ncargo build\n\ncargo test\n```\n\nThen decide.";
+        let parts = assistant_parts(text);
+        assert_eq!(parts, [text]);
+    }
+
+    #[test]
+    fn a_bubble_with_text_around_a_block_needs_the_full_width() {
+        let rows = rows(&[msg(
+            "a",
+            Speaker::Consort,
+            0,
+            "9:12 AM",
+            "Two tasks:\n\n- One.\n- Two.\n\nThat is all.",
+        )]);
+        assert!(bubbles(&rows)[0].wide);
+    }
+
+    #[test]
+    fn reference_links_stay_with_their_text_in_the_one_bubble() {
+        let text = "See [the PR][pr].\n\nAnd [it][pr] again.\n\n[pr]: https://x.test/1";
+        assert_eq!(assistant_parts(text), [text]);
+    }
+
+    #[test]
+    fn a_message_is_trimmed_and_an_empty_one_still_gets_its_bubble() {
+        assert_eq!(assistant_parts("  Hello.  "), ["Hello."]);
+        assert_eq!(assistant_parts(""), [""]);
     }
 
     // Grouping
@@ -591,20 +561,20 @@ mod tests {
         ];
         let rows = rows(&items);
         let b = bubbles(&rows);
-        assert_eq!(b.len(), 4);
+        // One bubble for each message: the two paragraphs of `b` are one.
+        assert_eq!(b.len(), 3);
         assert_eq!(b[0].lane, Lane::You);
         assert!(b[0].last_in_group);
         assert_eq!(
             b[1..].iter().map(|b| b.lane).collect::<Vec<_>>(),
-            [Lane::Assistant; 3]
+            [Lane::Assistant; 2]
         );
         assert_eq!(
             b[1..].iter().map(|b| b.last_in_group).collect::<Vec<_>>(),
-            [false, false, true]
+            [false, true]
         );
         assert_eq!(b[1].spacing, Spacing::NewGroup);
         assert_eq!(b[2].spacing, Spacing::InGroup);
-        assert_eq!(b[3].spacing, Spacing::InGroup);
         assert_eq!(b[0].spacing, Spacing::AfterSeparator);
     }
 
@@ -624,8 +594,16 @@ mod tests {
             msg("b", Speaker::Consort, 2, "", "After."),
         ];
         let rows = rows(&items);
+        assert!(matches!(
+            rows[1],
+            ChatRow::Actions {
+                first: 0,
+                item: 0,
+                ..
+            }
+        ));
         assert!(
-            matches!(&rows[1], ChatRow::Card(c) if c.item == 1 && c.spacing == Spacing::NewGroup)
+            matches!(&rows[2], ChatRow::Card(c) if c.item == 1 && c.spacing == Spacing::NewGroup)
         );
         let b = bubbles(&rows);
         assert!(b[0].last_in_group, "the card ends the group before it");
@@ -645,10 +623,10 @@ mod tests {
         brief.speaker = Speaker::Consort;
         let rows = rows(&[TimelineItem::Message(brief)]);
         let b = bubbles(&rows);
-        assert_eq!(b.len(), 3);
+        assert_eq!(b.len(), 2);
         assert!(b[0].title && b[0].markdown.is_empty());
-        assert!(!b[1].with_items && b[2].with_items);
-        assert!(b[2].last_in_group);
+        assert!(!b[0].with_items && b[1].with_items);
+        assert!(b[1].last_in_group);
     }
 
     #[test]
@@ -656,14 +634,14 @@ mod tests {
         let first = [msg("a", Speaker::Consort, 0, "", "One.\n\nTwo.")];
         let rows_a = rows(&first);
         let keys: Vec<String> = rows_a.iter().map(|r| r.key(&first)).collect();
-        assert_eq!(keys, ["a#0", "a#1e"]);
+        assert_eq!(keys, ["a#0e", "a#g"]);
         let more = [
             msg("a", Speaker::Consort, 0, "", "One.\n\nTwo."),
             msg("b", Speaker::Consort, 1, "", "Three."),
         ];
         let rows_b = rows(&more);
         let keys: Vec<String> = rows_b.iter().map(|r| r.key(&more)).collect();
-        assert_eq!(keys, ["a#0", "a#1", "b#0e"]);
+        assert_eq!(keys, ["a#0", "b#0e", "b#g"]);
     }
 
     // Time separators
@@ -746,8 +724,46 @@ mod tests {
             }),
         ];
         let rows = rows(&items);
-        assert!(matches!(rows[1], ChatRow::Notice { item: 1, .. }));
+        assert!(matches!(rows[2], ChatRow::Notice { item: 1, .. }));
         assert!(bubbles(&rows)[0].last_in_group);
+    }
+
+    #[test]
+    fn a_group_has_one_footer_that_covers_all_its_messages() {
+        let items = [
+            msg("a", Speaker::Consort, 0, "", "One."),
+            msg("b", Speaker::Consort, 1, "", "Two."),
+            msg("c", Speaker::You, 2, "", "Three."),
+        ];
+        let footers: Vec<(usize, usize, Lane)> = rows(&items)
+            .iter()
+            .filter_map(|r| match r {
+                ChatRow::Actions { first, item, lane } => Some((*first, *item, *lane)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(footers, [(0, 1, Lane::Assistant), (2, 2, Lane::You)]);
+    }
+
+    #[test]
+    fn a_proactive_message_is_a_group_of_its_own() {
+        let TimelineItem::Message(mut proactive) = msg("b", Speaker::Consort, 1, "", "Two.") else {
+            panic!("a message")
+        };
+        proactive.proactive = Some(Default::default());
+        let items = [
+            msg("a", Speaker::Consort, 0, "", "One."),
+            TimelineItem::Message(proactive),
+            msg("c", Speaker::Consort, 2, "", "Three."),
+        ];
+        let footers: Vec<(usize, usize)> = rows(&items)
+            .iter()
+            .filter_map(|r| match r {
+                ChatRow::Actions { first, item, .. } => Some((*first, *item)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(footers, [(0, 0), (1, 1), (2, 2)]);
     }
 
     fn with_files(item: TimelineItem, names: &[&str]) -> TimelineItem {
@@ -795,6 +811,7 @@ mod tests {
                 ChatRow::Card(_) => "card".to_owned(),
                 ChatRow::Notice { .. } => "notice".to_owned(),
                 ChatRow::Footer { .. } => "footer".to_owned(),
+                ChatRow::Actions { .. } => "actions".to_owned(),
             })
             .collect();
         assert_eq!(
@@ -804,10 +821,13 @@ mod tests {
                 "Images([0, 1]) 1",
                 "File(2) 1",
                 "bubble 1",
+                "actions",
                 "bubble 2",
                 "File(0) 2",
+                "actions",
                 // A message with only a file has no empty text bubble.
                 "File(0) 3",
+                "actions",
             ]
         );
         // The rows of one message keep one group; each has its own key.
@@ -857,7 +877,7 @@ mod tests {
             .iter()
             .position(|r| matches!(r, ChatRow::Footer { item: 1, .. }))
             .unwrap();
-        assert!(matches!(&rows[at - 1], ChatRow::Bubble(b) if b.item == 1 && b.part == 1));
+        assert!(matches!(&rows[at - 1], ChatRow::Bubble(b) if b.item == 1 && b.part == 0));
         assert_eq!(rows[at].key(&items), "m2#f");
     }
 }

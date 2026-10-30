@@ -3,6 +3,7 @@
 //! commands, so buttons do what they will do against a real hub.
 
 use crate::{
+    approval_text::ApprovalKind,
     connectors::CatalogView,
     derive::{refresh, waiting_detail},
     skills::SkillDirectoryView,
@@ -16,7 +17,7 @@ const EXT4: &str = "chn_mac_ext4";
 const HOMELAB: &str = "chn_homelab";
 const LIGHTS: &str = "chn_house_lights";
 
-const T_SAYSO: &str = "tsk_0192f0c4-sayso-issues";
+pub const T_SAYSO: &str = "tsk_0192f0c4-sayso-issues";
 const T_SPAM: &str = "tsk_0192f0c4-spam-rules";
 const T_BACKUPS: &str = "tsk_0192f0c4-nightly-backups";
 const T_ROOF: &str = "tsk_0192f0c4-roofline";
@@ -136,6 +137,7 @@ fn sayso_approval() -> ApprovalView {
         detail: Some(text(
             "cargo build --release --target x86_64-pc-windows-msvc",
         )),
+        kind: ApprovalKind::Command,
         choices: vec![
             ApprovalChoice::AllowOnce,
             ApprovalChoice::AllowForTask,
@@ -350,7 +352,47 @@ pub fn model_groups() -> Vec<ModelGroupView> {
     ]
 }
 
-fn selection(account: &str, model_id: &str, model_name: &str) -> SelectionView {
+/// The model of the Sayso task: Codex on bigboi, with high effort.
+fn step(
+    text: &str,
+    status: consort_proto::model::PlanStepStatus,
+) -> consort_proto::model::PlanStep {
+    consort_proto::model::PlanStep {
+        text: text.into(),
+        status,
+    }
+}
+
+fn codex_task_model() -> SelectionView {
+    let mut chosen = selection("Codex Personal", "gpt-6.1-sol", "GPT-6.1-Sol");
+    chosen.options = vec![(
+        crate::picker::EFFORT.to_owned(),
+        SelectionOption::Text(text("high")),
+    )];
+    chosen
+}
+
+/// What the Sayso task can change to: the models of bigboi. The only
+/// account there is the one that runs the task, so no pick starts a new
+/// session.
+fn codex_task_options() -> Vec<TaskModelOption> {
+    [
+        ("gpt-5.5", "GPT-5.5"),
+        ("gpt-6.1-sol", "GPT-6.1-Sol"),
+        ("gpt-6-astra", "GPT-6-Astra"),
+    ]
+    .into_iter()
+    .map(|(id, name)| TaskModelOption {
+        account_label: text("Codex Personal"),
+        model_id: text(id),
+        model_name: text(name),
+        starts_new_session: false,
+        note: None,
+    })
+    .collect()
+}
+
+pub(crate) fn selection(account: &str, model_id: &str, model_name: &str) -> SelectionView {
     SelectionView {
         account_label: account.into(),
         model_id: model_id.into(),
@@ -1084,7 +1126,20 @@ fn post(id: &str, speaker: Speaker, time: &str, bodies: Vec<PostBody>) -> Thread
         time_label: time.into(),
         bodies,
         pending: false,
+        source_message_id: None,
+        refused: None,
     }
+}
+
+/// A real task always falls back to a model of its channel or of Tutti, so
+/// every task of the mock shows the chips of its composer.
+fn with_task_models(mut threads: Vec<TaskThreadView>) -> Vec<TaskThreadView> {
+    for thread in threads.iter_mut().filter(|t| t.selection.is_none()) {
+        thread.selection = Some(codex_task_model());
+        thread.model_options = codex_task_options();
+        thread.can_change_model = true;
+    }
+    threads
 }
 
 fn threads() -> Vec<TaskThreadView> {
@@ -1148,6 +1203,11 @@ fn threads() -> Vec<TaskThreadView> {
                     vec![PostBody::Decision(sayso_decision())],
                 ),
             ],
+            can_change_model: true,
+            runs_on: Some("Runs on bigboi".into()),
+            selection: Some(codex_task_model()),
+            model_options: codex_task_options(),
+            plan: None,
         },
         TaskThreadView {
             task_id: T_SPAM.into(),
@@ -1204,6 +1264,11 @@ fn threads() -> Vec<TaskThreadView> {
                     PostBody::Text(text("Copied 412 of 690 GB. About 20 minutes left.")),
                 ],
             )],
+            plan: crate::plan::PlanView::of(&[
+                step("Copy the shares from truenas", consort_proto::model::PlanStepStatus::InProgress),
+                step("Check the copy against the source", consort_proto::model::PlanStepStatus::Pending),
+                step("Write the result in the log", consort_proto::model::PlanStepStatus::Pending),
+            ]),
             ..TaskThreadView::default()
         },
         TaskThreadView {
@@ -1375,11 +1440,12 @@ pub fn view_state() -> ViewState {
         }],
         timelines: timelines(),
         tasks: tasks(),
-        threads: threads(),
+        threads: with_task_models(threads()),
         tasks_panel: TasksPanelView::default(),
         workers: workers(),
         tags: Vec::new(),
         model_groups: model_groups(),
+        account_fallback: true,
         favorite_models: favorite_models(),
         sign_ins: Vec::new(),
         acp_registry: AcpRegistryView::default(),
@@ -1418,7 +1484,7 @@ pub fn view_state() -> ViewState {
         .flat_map(|w| w.accounts.iter_mut())
         .find(|a| a.id == "acc_bigboi_claude")
     {
-        account.email = Some(text("cawatson1993@gmail.com"));
+        account.email = Some(text("chris@example.com"));
         account.extras = Some(crate::mock_extensions::claude_extras());
     }
     stamp_times(&mut state.timelines);
@@ -1465,6 +1531,7 @@ pub fn view_state_with_requests() -> ViewState {
                     detail: Some(text(
                         "/private/tmp/consort-e2e-data/worker/workspaces/tsk_0192f0c4-roofline/roofline-quotes.md",
                     )),
+                    kind: ApprovalKind::FileChange,
                     choices: vec![
                         ApprovalChoice::AllowOnce,
                         ApprovalChoice::AllowForTask,
@@ -1493,6 +1560,7 @@ pub fn view_state_with_requests() -> ViewState {
                 detail: Some(text(
                     "{\n  \"body\": \"Two kits work with Home Assistant without a cloud account.\"\n}",
                 )),
+                kind: ApprovalKind::Tool,
                 choices: vec![
                     ApprovalChoice::AllowOnce,
                     ApprovalChoice::AllowForTask,

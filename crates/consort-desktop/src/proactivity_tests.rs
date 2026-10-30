@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use crate::app::{ChannelTab, ConsortApp, SettingsSection};
+use crate::app::{ChannelTab, ConsortApp, Page, SettingsSection};
 use consort_client::mock_proactivity::{
     CHECK_IN, CHECK_IN_MESSAGE, FOLLOW_UP_QUOTE, FOLLOW_UP_SWITCH, HOMELAB, LIGHTS, READING, TUTTI,
 };
@@ -214,6 +214,48 @@ fn the_writing_bubble_shows_while_the_reply_is_owed(cx: &mut TestAppContext) {
     assert!(!has(cx2, "writing-bubble"));
 }
 
+/// The dabs of the writing bubble rise in turn on the clock. The bubble keeps
+/// its size, and under Reduce motion the dabs stay still.
+#[gpui::test]
+fn the_writing_bubble_moves_in_a_wave_and_keeps_its_size(cx: &mut TestAppContext) {
+    let (handle, app) = open(state("channel-writing"), cx);
+    let cx = &mut VisualTestContext::from_window(handle, cx);
+    screen(&app, "channel-writing", cx);
+    cx.update(|_, cx| app.update(cx, |app, _| app.window_active = true));
+    draw(cx);
+    let tops = |cx: &mut VisualTestContext| {
+        ["writing-dab-0", "writing-dab-1", "writing-dab-2"]
+            .map(|dab| cx.debug_bounds(dab).expect("the dab draws").origin.y)
+    };
+    let bubble = cx.debug_bounds("writing-bubble").expect("the bubble");
+    let mut seen = vec![tops(cx)];
+    for _ in 0..8 {
+        cx.executor().advance_clock(Duration::from_millis(125));
+        cx.run_until_parked();
+        draw(cx);
+        seen.push(tops(cx));
+        assert_eq!(cx.debug_bounds("writing-bubble"), Some(bubble));
+    }
+    for dab in 0..3 {
+        assert!(
+            seen.iter().any(|tops| tops[dab] != seen[0][dab]),
+            "dab {dab} moves"
+        );
+    }
+    assert_ne!(seen[2], seen[4], "the dabs do not rise together");
+
+    cx.update(|_, cx| cx.set_reduce_motion(true));
+    draw(cx);
+    let held = tops(cx);
+    for _ in 0..8 {
+        cx.executor().advance_clock(Duration::from_millis(125));
+        cx.run_until_parked();
+        draw(cx);
+        assert_eq!(tops(cx), held, "nothing moves under Reduce motion");
+    }
+    cx.update(|_, cx| cx.set_reduce_motion(false));
+}
+
 /// A proactive message has its mark, Useful and Too noisy on hover, and a
 /// click records the rating. The offer card draws with its three buttons.
 #[gpui::test]
@@ -235,7 +277,7 @@ fn proactive_messages_show_their_marks_feedback_and_the_offer(cx: &mut TestAppCo
     assert!(has(cx, "offer-card"));
     cx.update(|_, cx| {
         app.update(cx, |app, _| {
-            // The bubble row of the check-in.
+            // The footer of the check-in.
             let items = app
                 .state
                 .timeline(TUTTI)
@@ -245,8 +287,8 @@ fn proactive_messages_show_their_marks_feedback_and_the_offer(cx: &mut TestAppCo
                 .chat_rows
                 .iter()
                 .position(|r| {
-                    matches!(r, consort_client::chat::ChatRow::Bubble(b)
-                        if matches!(items.get(b.item), Some(TimelineItem::Message(m)) if m.id == CHECK_IN_MESSAGE))
+                    matches!(r, consort_client::chat::ChatRow::Actions { item, .. }
+                        if matches!(items.get(*item), Some(TimelineItem::Message(m)) if m.id == CHECK_IN_MESSAGE))
                 })
                 .expect("the check-in row");
             app.timeline.scroll_to_reveal_item(row)
@@ -260,6 +302,18 @@ fn proactive_messages_show_their_marks_feedback_and_the_offer(cx: &mut TestAppCo
             t.items.iter().any(|i| {
                 matches!(i, TimelineItem::Message(m) if m.id == CHECK_IN_MESSAGE
                     && m.proactive.as_ref().is_some_and(|p| p.rating == Some(ProactiveRating::TooNoisy)))
+            })
+        })
+    });
+    // The choice stays as one chip, and a click on it clears the choice.
+    draw(cx);
+    assert!(has(cx, "feedback-chip") && !has(cx, "feedback-pair"));
+    click(cx, "feedback-chip");
+    until(cx, &app, "the rating is gone", |app| {
+        app.state.timeline(TUTTI).is_some_and(|t| {
+            t.items.iter().any(|i| {
+                matches!(i, TimelineItem::Message(m) if m.id == CHECK_IN_MESSAGE
+                    && m.proactive.as_ref().is_some_and(|p| p.rating.is_none()))
             })
         })
     });
@@ -390,7 +444,7 @@ fn the_channel_settings_dialog_saves_the_level_with_save_changes(cx: &mut TestAp
     });
 }
 
-/// "Open message" in the log opens the channel and scrolls to the message,
+/// "Show in channel" in the log opens the channel and scrolls to the message,
 /// as a search result does. The channel has many newer messages, so the
 /// message is far from the end where a channel opens.
 #[gpui::test]
@@ -428,7 +482,7 @@ fn open_message_in_the_log_scrolls_to_the_message(cx: &mut TestAppContext) {
     draw(cx);
     assert!(!shown(cx), "the message starts out of view");
 
-    // Open the log from another channel, then use "Open message" of the
+    // Open the log from another channel, then use "Show in channel" of the
     // check-in (log entry 11).
     cx.update(|window, cx| {
         app.update(cx, |app, cx| {
@@ -459,6 +513,69 @@ fn open_message_in_the_log_scrolls_to_the_message(cx: &mut TestAppContext) {
     until(cx, &app, "the channel and the scroll", |app| {
         app.channel_id == TUTTI && app.convo.scroll_to.is_none()
     });
+    // The link says where it goes, so it leaves Settings.
+    app.read_with(cx, |app, _| assert_eq!(app.page, Page::Main));
     draw(cx);
     assert!(shown(cx), "the message is in view");
+}
+
+/// Scrolls Settings > Proactivity until a control shows.
+fn scroll_to(cx: &mut VisualTestContext, selector: &str) {
+    for _ in 0..20 {
+        if cx
+            .debug_bounds(Box::leak(selector.to_owned().into_boxed_str()))
+            .is_some_and(|b| b.center().y < px(850.) && b.center().y > px(0.))
+        {
+            return;
+        }
+        cx.simulate_event(gpui_kit::ScrollEvent {
+            position: point(px(900.), px(500.)),
+            delta: gpui_kit::ScrollDelta::Pixels(point(px(0.), px(-300.))),
+            ..Default::default()
+        });
+        draw(cx);
+    }
+    panic!("{selector} does not scroll into view");
+}
+
+/// "Edit check-in.md" stays in Settings: it opens the note in Settings >
+/// Memory.
+#[gpui::test]
+fn edit_check_in_opens_the_note_in_settings_memory(cx: &mut TestAppContext) {
+    let (handle, app) = open(state("proactivity"), cx);
+    let cx = &mut VisualTestContext::from_window(handle, cx);
+    screen(&app, "proactivity", cx);
+    app.read_with(cx, |app, _| assert_eq!(app.page, Page::Settings));
+    scroll_to(cx, "proactivity-edit-note");
+    click(cx, "proactivity-edit-note");
+    app.read_with(cx, |app, _| {
+        assert_eq!(app.page, Page::Settings);
+        assert_eq!(app.settings_section, SettingsSection::Memory);
+        assert_eq!(
+            app.knowledge.settings_note,
+            Some((
+                consort_client::memory::GLOBAL.to_owned(),
+                consort_client::proactivity::CHECK_IN_NOTE_PATH.to_owned()
+            ))
+        );
+    });
+}
+
+/// The brief's "Open routine" opens the routine in Settings > Routines.
+#[gpui::test]
+fn open_routine_of_the_brief_opens_in_settings_routines(cx: &mut TestAppContext) {
+    let (handle, app) = open(state("proactivity"), cx);
+    let cx = &mut VisualTestContext::from_window(handle, cx);
+    screen(&app, "proactivity", cx);
+    scroll_to(cx, "proactivity-open-brief");
+    click(cx, "proactivity-open-brief");
+    app.read_with(cx, |app, _| {
+        assert_eq!(app.page, Page::Settings);
+        assert_eq!(app.settings_section, SettingsSection::Routines);
+        assert_eq!(
+            app.knowledge.settings_routine.as_deref(),
+            Some(consort_client::mock_proactivity::BRIEF_ROUTINE)
+        );
+    });
+    assert!(has(cx, "routine-back"));
 }

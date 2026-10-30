@@ -23,6 +23,8 @@ fn signed_out_events() -> Vec<SessionEvent> {
             turn_id: "t1".into(),
             reason: TurnEndReason::Failed,
             error: Some("Authentication required.".to_owned()),
+            error_kind: None,
+            resets_at: None,
         },
     ]
 }
@@ -116,6 +118,8 @@ async fn a_signed_out_coordinator_moves_to_another_signed_in_account() {
                 turn_id: "t1".into(),
                 reason: TurnEndReason::Failed,
                 error: Some("Authentication required.".to_owned()),
+                error_kind: None,
+                resets_at: None,
             }],
         )
         .await;

@@ -1,12 +1,15 @@
 //! Approvals and decisions: the client API handlers.
 
 use consort_proto::client_api::*;
-use consort_proto::model::{ApprovalStatus, DecisionStatus};
+use consort_proto::ids::TaskId;
+use consort_proto::model::{ApprovalStatus, BlobRef, DecisionAnswer, DecisionStatus};
 use consort_proto::status::{Actor, TaskStatus};
+use consort_proto::tools::MessageDelivery;
 use consort_proto::turn_input::{WakeEvent, render_events};
 use consort_proto::worker_link::{HubToWorker, RequestAnswer, SessionRespond};
 
-use super::flow::{deliver_in_tx, transition};
+use super::flow::{Delivered, deliver_in_tx, transition};
+use crate::connectors::replace::{DraftScope, replace_waiting_drafts};
 use crate::error::{HubError, Result};
 use crate::hub::{Caller, Hub};
 use crate::store::work;
@@ -143,7 +146,13 @@ impl Hub {
                             answer: RequestAnswer { option_id, text },
                         }),
                     )?;
-                    worker_id = Some(session.worker_id);
+                    worker_id = Some(Delivered {
+                        delivery: MessageDelivery::Steer,
+                        worker_id: session.worker_id,
+                        status_changed: false,
+                        switch_task: None,
+                        replaced: Vec::new(),
+                    });
                     resume_if_nothing_waits(tx, decision.task_id)?;
                 } else {
                     // A decision from the ask_decision tool: the answer is input
@@ -167,7 +176,7 @@ impl Hub {
                                 deliver_in_tx(&hub, tx, task_id, &render_events(&[event]), &[], Actor::System)
                             };
                             match delivered {
-                                Ok(delivered) => worker_id = Some(delivered.worker_id),
+                                Ok(delivered) => worker_id = Some(delivered),
                                 Err(err) => tracing::warn!(error = %err, "could not give a decision answer to its task"),
                             }
                         }
@@ -180,14 +189,115 @@ impl Hub {
                 Ok((decision, worker_id, kick))
             })
             .await?;
-        if let Some(worker_id) = worker_id {
-            self.pump_worker(worker_id);
+        if let Some(delivered) = worker_id {
+            self.after_delivery(&delivered);
         }
         if let Some(channel) = kick {
             self.kick_coordinator(channel);
         }
         Ok(DecisionResult { decision })
     }
+}
+
+/// Gives the user's own text to the session of a task, and lets the text
+/// answer the one open decision of the task, when there is exactly one. The
+/// user's message in the task thread and the user's message that the
+/// coordinator passes on with `message_task` both come here.
+///
+/// - A decision from the `ask_decision` tool (no harness request): the text
+///   goes to the task as a message, and the decision closes as answered with
+///   the text. The task leaves Needs input when nothing else waits.
+/// - A decision from a harness question that takes free text: the text goes
+///   back with `session.respond`, as an answer in the app does. The harness
+///   waits for that answer, so a steer would not free it. A message with
+///   attachments, and a question that takes no free text, go to the task as
+///   a message and leave the question open.
+///
+/// An approval is never answered here: text is not an answer to it. With two
+/// open decisions the text could answer either, so both stay open.
+pub(crate) fn deliver_user_text(
+    hub: &Hub,
+    tx: &mut crate::store::Tx<'_>,
+    task_id: TaskId,
+    text: &str,
+    attachments: &[BlobRef],
+) -> Result<Delivered> {
+    // A draft card of the task waits: the text may change the draft. It goes
+    // to the tool call that waits, as the result, not to the session.
+    let replaced = replace_waiting_drafts(hub, tx, DraftScope::Task(task_id), text, attachments)?;
+    if !replaced.is_empty() {
+        let task = work::task_or_404(tx.db(), task_id)?;
+        let session_id = task
+            .current_session_id
+            .ok_or_else(|| HubError::conflict("The task has no session. Retry it first."))?;
+        let session = work::session_or_404(tx.db(), session_id)?;
+        return Ok(Delivered {
+            delivery: MessageDelivery::Steer,
+            worker_id: session.worker_id,
+            status_changed: false,
+            switch_task: None,
+            replaced,
+        });
+    }
+    let mut open = work::pending_decisions_of_task(tx.db(), task_id)?;
+    let lone = (open.len() == 1).then(|| open.remove(0));
+    if let Some(mut decision) = lone
+        .clone()
+        .filter(|d| d.request_id.is_some() && d.allow_free_text && attachments.is_empty())
+    {
+        let task = work::task_or_404(tx.db(), task_id)?;
+        let session = work::session_or_404(tx.db(), decision.session_id)?;
+        let request_id = decision
+            .request_id
+            .clone()
+            .ok_or_else(|| HubError::internal("the decision has no harness request"))?;
+        if session.state.is_final() {
+            return Err(HubError::conflict(
+                "The session of this task has ended, so it cannot take a message. Retry the task to start a new session, then send the message.",
+            ));
+        }
+        tx.queue_command(
+            session.worker_id,
+            &HubToWorker::SessionRespond(SessionRespond {
+                session_id: session.id,
+                request_id,
+                answer: RequestAnswer {
+                    option_id: None,
+                    text: Some(text.to_owned()),
+                },
+            }),
+        )?;
+        close_with_text(tx, &mut decision, text)?;
+        resume_if_nothing_waits(tx, Some(task.id))?;
+        return Ok(Delivered {
+            delivery: MessageDelivery::Steer,
+            worker_id: session.worker_id,
+            status_changed: false,
+            switch_task: None,
+            replaced: Vec::new(),
+        });
+    }
+    let delivered = deliver_in_tx(hub, tx, task_id, text, attachments, Actor::User)?;
+    if let Some(mut decision) = lone.filter(|d| d.request_id.is_none()) {
+        close_with_text(tx, &mut decision, text)?;
+        resume_if_nothing_waits(tx, Some(task_id))?;
+    }
+    Ok(delivered)
+}
+
+/// Closes a decision as answered with the user's text.
+fn close_with_text(
+    tx: &mut crate::store::Tx<'_>,
+    decision: &mut consort_proto::model::Decision,
+    text: &str,
+) -> Result<()> {
+    decision.status = DecisionStatus::Answered;
+    decision.answer = Some(DecisionAnswer {
+        option_index: None,
+        text: Some(text.to_owned()),
+    });
+    decision.answered_at = Some(tx.now());
+    tx.save_decision(decision)
 }
 
 /// When the last waiting approval or decision of a task closes, the task

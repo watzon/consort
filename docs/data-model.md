@@ -106,11 +106,11 @@ Turn IDs, harness request IDs and native references are opaque strings that the 
 | `purpose` | text, one line | |
 | `instructions` | markdown | |
 | `coordinator_selection` | model selection | Falls back to the Tutti channel's value |
-| `task_selection` | model selection | Default for new tasks in this channel |
+| `task_selection` | model selection | Default for new tasks in this channel. With none, a new task uses Tutti's `task_selection`, then the coordinator selection that the channel uses |
 | `preferred_workers` | list of worker IDs | Ordered. Placement tries these first |
 | `repo_ids` | list of repo IDs | The `channel_repos` join, in order. Part of the client view |
 | `default_isolation` | `in_place`, `worktree` or `clone` | A task that the assistant starts runs in place only when this is `in_place` |
-| `default_approval_mode` | `ask`, `auto_edits`, `auto` or `full_access` | Also the most that a task that the assistant starts gets |
+| `default_approval_mode` | `ask`, `auto_edits`, `auto` or `full_access` | Also the most that a task that the assistant starts gets. A new channel and a new Tutti start in `auto`. Hub migration 13 moved the existing Tutti from `ask` to `auto` once. The coordinator session of the channel always runs in `ask` |
 | `allowed_local_mcp_servers` | list of text | The local MCP servers, by name, that a task that the assistant starts may use. Empty by default. A task that the user starts is not limited by it |
 | `memory_enabled` | bool | |
 | `tags` | list of text | Requirements. A coordinator turn, a task or a routine run of the channel runs only on a worker that has every tag. Empty by default |
@@ -157,6 +157,7 @@ A repo is global, so two channels can attach the same repo.
 | `edited_at`, `deleted_at` | timestamp, optional | |
 | `created_at` | timestamp | |
 | `suggestions` | list, optional | Quick replies of an assistant message: `label` (at most 40 characters) and `action` (`send` or `type`). At most 4 |
+| `source_message_id` | message ID, optional | Set on a message of the user in a task thread that the hub copied from the timeline when the assistant passed it to the task (`message_task` with `user_message_id`). The copy has the stored body of the source. A client shows "Show in channel" for it. It is in the message JSON, not in a column |
 | `proactive` | object, optional | Set on a message that a proactive turn posted: `kind` (`check_in`, `brief`, `follow_up`, `stale_task`, `research`, `channel_created` or `feedback`), `notify`, and optional `reason` (a follow-up's reason), `offer` (true on an offer card) and `rating` (`useful` or `too_noisy`) |
 
 `reactions` holds `message_id`, `author`, `emoji` and `created_at`.
@@ -185,7 +186,7 @@ The hub has one user, so a message that is read on one client is read on all of 
 | `status_reason` | text, optional | For example "Waiting for bigboi to come online" |
 | `created_by` | `user`, `assistant` or `routine` | |
 | `card_message_id` | ID | The task card in the timeline. The task thread hangs from this message |
-| `model_selection` | model selection | |
+| `model_selection` | model selection | The user can change it after the task started, unless the task is Resolved or archived. The new value is saved at once. The next turn uses it (see [protocol.md](protocol.md#delivery-rules)) |
 | `placement` | placement request | See below |
 | `approval_mode` | approval mode | |
 | `start_at` | timestamp, optional | Set for Scheduled tasks |
@@ -299,7 +300,7 @@ The payload for each kind:
 | `summary` | text | One line for the card and the push notification |
 | `details` | JSON | Has a `kind`: `command`, `file_change`, `tool`, `network` or `other` from a harness, or a hub card kind: `connector`, `management`, `connect_service`, `sign_in` or `skill_install`. The other fields depend on the kind: command and folder, paths, tool name and arguments, or the facts of the card (see [Hub cards](#hub-cards)) |
 | `options` | list | From the harness, for example allow once, allow for this session, deny. Each has `id`, `label`, `kind` and `description` |
-| `status` | `pending`, `allowed`, `denied`, `expired` or `canceled` | |
+| `status` | `pending`, `allowed`, `denied`, `expired`, `canceled` or `replaced` | `replaced`: a draft card that the user's next message closed. The connector card keeps that message in `replaced_by` |
 | `answer_option_id` | text, optional | The option that the user chose |
 | `answered_at`, `answered_by_client_id` | timestamp, ID | |
 | `created_at` | timestamp | |
@@ -675,11 +676,17 @@ Only the hub and the user write `voice.md`. Every write goes through the parser:
 
 `voice_uses` keeps each `voice_guide` call: `session_id`, `context`, `at`, for 90 days.
 
+`account_limits` (schema 15) keeps the accounts that reached a usage limit: `account_id` and `until_at`, the time when the limit resets, or one hour later when the harness does not say. A row has no use after that time.
+
 `voice_tasks` (schema 12) keeps every task that learned the voice: `task_id` and `at`. The mark stays after Learn again, so an old voice task keeps its limits. Learn again, Turn off and Reset end the session of every voice task that still runs, and the task fails.
 
 `task_requests` (schema 12) keeps the user's own words that started a task: `task_id` and `text`, the user messages and typed answers of the coordinator turn that called `start_task`. The voice scan compares a task's drafts with this text and the user's replies in its thread, never with the brief.
 
-A connector card ([Hub cards](#hub-cards)) of a draft or send tool has `outgoing` (`draft` or `send`), `editable`, `voice` (`{context}`, none is "Neutral style"), `flags` (`{field, label, text, kind: date | time | weekday | price | agreement | hard_rule, start, end, rule?}`, byte offsets into the field; `field` is a path such as `blocks.0.text.text` for a nested value), `draft_arguments` (the assistant's arguments after an edit) and `not_my_voice`. Every connector card has `ask_rule`: the rule that made the hub ask.
+A connector card ([Hub cards](#hub-cards)) of a draft or send tool has `outgoing` (`draft` or `send`), `editable`, `voice` (`{context}`, none is "Neutral style"), `flags` (`{field, label, text, kind: date | time | weekday | price | agreement | hard_rule, start, end, rule?}`, byte offsets into the field; `field` is a path such as `blocks.0.text.text` for a nested value), `draft_arguments` (the assistant's arguments after an edit) and `not_my_voice`. Every connector card has `ask_rule`: the rule that made the hub ask. A card of an outgoing tool (`outgoing` is set) has the words Send (or Save draft for `draft`) and Not now. It has `replaced_by`, the text of the user's message, when that message closed the card with the status `replaced`.
+
+A card from `show_draft` is not an approval. It is a message of the kind `notice` with the JSON body `{"kind": "draft", "text", "title", "to"?, "body", "original_body"?}`. `original_body` is the first text of the assistant, kept after the user edits the card (see [protocol.md](protocol.md#drafts-that-the-user-sends)).
+
+A notice with `kind` `turn_failed` can also have `error_kind` (`rate_limit`, `expired_sign_in`, `worker_restarted` or `unknown`), `resets_at` (Unix milliseconds), `account` and `raw`. Notices from before these fields exist read as `unknown`.
 
 Every copy of a draft goes after 90 days. The maintenance purge deletes old `draft_pairs` and `voice_uses`, clears `arguments`, `draft_arguments`, `fields` and `flags` of old cards of draft and send tools, clears the arguments and the output of old `run_connector_tool` calls to such tools in session items, and replaces the brief of an old voice task with a short note. The connector call log keeps only a hash of the arguments, so it holds no copy.
 
@@ -690,6 +697,7 @@ The user's preferences are one record that every client shares. The hub stores i
 | Field | Type | Notes |
 |---|---|---|
 | `favorite_models` | list of `{account_label, model}` | The favorite models of the model picker, in the order that the user starred them. At most 200. Each field has at most 200 characters |
+| `account_fallback` | boolean | Work moves to another account at a usage limit. True by default |
 
 A favorite whose account is not signed in on any worker, or whose account no longer offers the model, stays in the list. The clients do not show it until the account or the model comes back. The feed `entity_id` of the record is `preferences`, and its entries have no channel.
 

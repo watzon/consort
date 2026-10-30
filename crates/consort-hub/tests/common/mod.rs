@@ -422,6 +422,7 @@ pub fn inventory(account_id: AccountId) -> Inventory {
             capabilities: Capabilities {
                 steer: true,
                 resume: true,
+                switch_model: true,
                 approval_modes: ApprovalMode::ALL.to_vec(),
                 ..Capabilities::default()
             },
@@ -509,6 +510,17 @@ impl FakeWorker {
         let mut again = Self::connect(hub, worker_id, key, account_id, sessions).await;
         again.seqs = seqs;
         again
+    }
+
+    /// Sends this inventory instead of the default one.
+    pub async fn send_custom_inventory(&mut self, inventory: Inventory) {
+        let inventory = serde_json::to_value(inventory.with_hash()).unwrap();
+        self.peer
+            .send(&Frame::Event(consort_proto::frame::EventFrame {
+                kind: "inventory".to_owned(),
+                body: inventory,
+            }))
+            .await;
     }
 
     pub async fn send_inventory(&mut self) {
@@ -774,6 +786,8 @@ pub fn turn_ended(id: &str, reason: TurnEndReason) -> SessionEvent {
         turn_id: id.into(),
         reason,
         error: None,
+        error_kind: None,
+        resets_at: None,
     }
 }
 

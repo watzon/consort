@@ -109,6 +109,7 @@ fn tools_of(toolkit: &str) -> Vec<Value> {
         "gmail" => vec![
             tool("GMAIL_FETCH_EMAILS", "Fetch emails", &["readOnlyHint"]),
             tool("GMAIL_SEND_EMAIL", "Send an email", &["createHint"]),
+            tool("GMAIL_ADD_LABEL", "Add a label", &["createHint"]),
             tool(
                 "GMAIL_CREATE_EMAIL_DRAFT",
                 "Save an email draft",

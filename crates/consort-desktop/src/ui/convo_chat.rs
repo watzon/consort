@@ -8,9 +8,9 @@ use consort_client::{
 };
 use consort_theme::{Tokens, TypeExt as _};
 use gpui_kit::{
-    AnyElement, Context, Div, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
-    ParentElement, SharedString, StatefulInteractiveElement as _, Styled, Window, div,
-    prelude::FluentBuilder as _,
+    AnyElement, AppContext as _, Context, Div, InteractiveElement, IntoElement, MouseButton,
+    MouseDownEvent, ParentElement, SharedString, StatefulInteractiveElement as _, Styled, Window,
+    div, prelude::FluentBuilder as _,
 };
 
 use crate::{
@@ -243,6 +243,135 @@ impl ConsortApp {
             .into_any_element()
     }
 
+    /// The line under a message group. It is always there, so a hover never
+    /// moves the timeline. On hover it has React, Reply in thread and Copy
+    /// at the edge of the bubble, then the time. A proactive message also has
+    /// Useful and Too noisy at the other edge, and a choice stays at rest.
+    pub fn render_group_footer(
+        &mut self,
+        first: usize,
+        item: usize,
+        you: bool,
+        t: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let chat = t.component.chat;
+        let line_row = div()
+            .flex()
+            .items_center()
+            .w_full()
+            .max_w(t.layout.bubble_max_width)
+            .h(chat.footer_line)
+            .gap(t.space.xxs);
+        let lane = div().flex().w_full().when(you, |d| d.justify_end());
+        let Some(consort_client::TimelineItem::Message(message)) = self
+            .state
+            .timeline(&self.channel_id)
+            .and_then(|tl| tl.items.get(item))
+            .cloned()
+        else {
+            return lane.child(line_row).into_any_element();
+        };
+        let hovered = self
+            .chat_hover
+            .is_some_and(|(_, hover)| (first..=item).contains(&hover))
+            || self.proactivity.hovered.as_deref() == Some(message.id.as_str());
+        let rating = message.proactive.as_ref().and_then(|m| m.rating);
+        let feedback = message.proactive.as_ref().and_then(|_| match rating {
+            Some(rating) => Some(self.render_feedback_chip(&message.id, rating, t, cx)),
+            None if hovered => Some(self.render_feedback_pair(&message.id, t, cx)),
+            None => None,
+        });
+        let mut row = line_row;
+        // A message on its way has no ID that the actions could use.
+        if hovered && !message.pending {
+            let actions = self.footer_actions(&message, t, cx);
+            let time = text(
+                message.time_label.clone(),
+                detail(t),
+                t.colors.text_tertiary,
+            )
+            .flex_none()
+            .px(t.space.xs);
+            if you {
+                row = row.justify_end().child(time);
+                for action in actions.into_iter().rev() {
+                    row = row.child(action);
+                }
+            } else {
+                for action in actions {
+                    row = row.child(action);
+                }
+                row = row.child(time);
+            }
+        }
+        if let Some(feedback) = feedback {
+            row = row.child(div().flex_1()).child(feedback);
+        }
+        lane.child(row).into_any_element()
+    }
+
+    /// React, Reply in thread and Copy, in this order.
+    fn footer_actions(
+        &self,
+        message: &MessageView,
+        t: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let c = &t.colors;
+        let chat = t.component.chat;
+        let button = |id: &'static str, name: &str, tip: &'static str, cx: &mut Context<Self>| {
+            let element: gpui_kit::ElementId = id.into();
+            let color = if crate::ui::motion::is_hovered(&element, cx) {
+                c.text_primary
+            } else {
+                c.text_tertiary
+            };
+            icon_button(
+                id,
+                name,
+                chat.footer_button,
+                t.icon.size,
+                color,
+                c.surface_selected,
+                t,
+                cx,
+            )
+            .debug_selector(move || id.to_owned())
+            .tooltip(move |_, cx| cx.new(|_| crate::ui::convo_sidebar::Tip(tip.into())).into())
+        };
+        let react_id = message.id.clone();
+        let reply_id = message.id.clone();
+        let body = message.body.clone();
+        vec![
+            button("footer-react", "smile", "React", cx)
+                .relative()
+                .child(self.triggers.track("footer-react"))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(bounds) = this.triggers.get("footer-react") {
+                        let anchor = OpenMenu::under(bounds, Vec::new(), false).anchor;
+                        this.convo.emoji_picker = Some((react_id.clone(), anchor));
+                        cx.notify();
+                    }
+                }))
+                .into_any_element(),
+            button("footer-reply", "message", "Reply in thread", cx)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.open_message_thread(reply_id.clone(), window, cx)
+                }))
+                .into_any_element(),
+            button("footer-copy", "copy", "Copy", cx)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.run_menu(
+                        MenuAction::Copy(crate::ui::timeline::plain_text(&body)),
+                        window,
+                        cx,
+                    )
+                }))
+                .into_any_element(),
+        ]
+    }
+
     /// The emoji picker behind More: every emoji by group. A click adds the
     /// reaction, or takes away one that you chose already.
     pub fn render_emoji_picker(
@@ -331,15 +460,9 @@ impl ConsortApp {
         let c = &t.colors;
         let chat = t.component.chat;
         let you = message.speaker == Speaker::You;
-        let parts: Vec<String> = if you {
-            vec![message.body.clone()]
-        } else {
-            consort_client::chat::split_paragraphs(&message.body)
-                .into_iter()
-                .filter(|p| !p.trim().is_empty())
-                .collect()
-        };
-        let max = t.layout.panel_width - t.space.page;
+        // A message is one bubble, as it is in the timeline (DECISIONS 731).
+        let parts: Vec<String> = vec![message.body.trim().to_owned()];
+        let max = self.right_panel_width(t) - t.space.page;
         let mut col = div()
             .flex()
             .flex_col()
@@ -426,16 +549,7 @@ impl ConsortApp {
             .map(|t| t.subtitle.clone())
             .unwrap_or_else(|| "Loading the replies".to_owned());
         let menu_root = root.clone();
-        let head = div()
-            .flex()
-            .flex_none()
-            .items_center()
-            .gap(t.space.sm)
-            .h(t.space.page + t.space.xs)
-            .pl(t.space.lg)
-            .pr(t.space.sm)
-            .border_b(t.border_width)
-            .border_color(c.border_subtle)
+        let head = crate::ui::parts::panel_header(t)
             .child(
                 div()
                     .flex()
@@ -612,7 +726,7 @@ impl ConsortApp {
             .flex()
             .flex_col()
             .flex_none()
-            .w(t.layout.panel_width)
+            .w(self.right_panel_width(t))
             .h_full()
             .bg(c.surface_sidebar)
             .border_l(t.border_width)

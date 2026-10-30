@@ -186,6 +186,19 @@ fn event_attachments(conn: &rusqlite::Connection, events: &[WakeEvent]) -> Resul
     Ok(out)
 }
 
+/// The turn text with the `<open_tasks>` block in front, when the turn has a
+/// message from the user and a task is open.
+fn with_open_tasks(open_tasks: String, events: &[WakeEvent], rendered: String) -> String {
+    let has_user_message = events
+        .iter()
+        .any(|e| matches!(e, WakeEvent::UserMessage { .. }));
+    if has_user_message && !open_tasks.is_empty() {
+        format!("{open_tasks}\n\n{rendered}")
+    } else {
+        rendered
+    }
+}
+
 fn turn_batch(events: &[(i64, WakeEvent)], room: usize) -> (Vec<i64>, Vec<WakeEvent>, String) {
     let shell = json_len(&render_events(&[]));
     let mut used = shell;
@@ -225,10 +238,18 @@ fn turn_batch(events: &[(i64, WakeEvent)], room: usize) -> (Vec<i64>, Vec<WakeEv
     (ids, taken, rendered)
 }
 
+/// The approval mode of every coordinator session, whatever the default
+/// approval mode of the channel. The channel's mode is for its tasks. A
+/// coordinator does no shell, web or file work: it starts a task for that,
+/// and the worker denies every approval of a coordinator session except a
+/// hub tool (see DECISIONS 700). So Ask is the least access that works.
+pub(crate) const COORDINATOR_APPROVAL_MODE: consort_proto::model::ApprovalMode =
+    consort_proto::model::ApprovalMode::Ask;
+
 /// The approval mode of a coordinator turn with these events. A proactive
-/// turn and the research pass run in Ask: every shell command and file edit
-/// of the coordinator's harness waits for the user, whatever the channel's
-/// default mode. Other turns use the session's mode.
+/// turn and the research pass run in Ask. A coordinator session runs in Ask
+/// already, so this keeps the rule if a session ever runs in another mode.
+/// Other turns use the session's mode.
 fn turn_approval_mode(events: &[WakeEvent]) -> Option<consort_proto::model::ApprovalMode> {
     crate::proactivity::turn::classify(events)
         .is_proactive()
@@ -350,6 +371,7 @@ struct Inputs {
     session: Option<Session>,
     workers: Vec<consort_proto::model::Worker>,
     open: HashMap<consort_proto::ids::WorkerId, u32>,
+    limited: std::collections::HashSet<consort_proto::ids::AccountId>,
     global_index: String,
     channel_index: String,
     context: String,
@@ -430,7 +452,19 @@ impl Hub {
         }
         if let Some(session) = inputs.session.clone() {
             let worker_id = session.worker_id;
-            let (event_ids, events, rendered) = turn_batch(&inputs.events, TURN_TEXT_MAX_BYTES);
+            // A turn with a user message gets the short list of open tasks,
+            // so the coordinator can tell that the message is about one.
+            // The first turn of a session has the list in its context.
+            let tasks = self
+                .store
+                .read(move |conn| work::tasks_in_channel(conn, channel_id, false))
+                .await?;
+            let open_tasks = prompts::turn_open_tasks(&tasks);
+            let (event_ids, events, rendered) = turn_batch(
+                &inputs.events,
+                TURN_TEXT_MAX_BYTES.saturating_sub(json_len(&open_tasks)),
+            );
+            let rendered = with_open_tasks(open_tasks, &events, rendered);
             let approval_mode = turn_approval_mode(&events);
             let started = self
                 .store
@@ -468,6 +502,7 @@ impl Hub {
                             },
                             channel_files,
                             approval_mode,
+                            model_change: None,
                         }),
                     )?;
                     Ok(true)
@@ -494,9 +529,10 @@ impl Hub {
             subject: Subject::Coordinator,
             workers: &inputs.workers,
             open_sessions: &inputs.open,
+            limited: &inputs.limited,
             selection: selection.as_ref(),
             request: &request,
-            approval_mode: inputs.channel.default_approval_mode,
+            approval_mode: COORDINATOR_APPROVAL_MODE,
             preferred_workers: &inputs.channel.preferred_workers,
             channel_tags: &inputs.channel.tags,
             repos: &[],
@@ -528,7 +564,6 @@ impl Hub {
         let turn_approval_mode = turn_approval_mode(&events);
         let first_turn = format!("{}\n\n{rendered}", inputs.context);
         let worker_id = placement.worker_id;
-        let channel = inputs.channel.clone();
         let started = self
             .store
             .write(move |tx| {
@@ -585,7 +620,7 @@ impl Hub {
                         account_id: placement.account_id,
                         model: placement.model,
                         options: placement.options,
-                        approval_mode: channel.default_approval_mode,
+                        approval_mode: COORDINATOR_APPROVAL_MODE,
                         workspace: WorkspaceSpec {
                             repos: Vec::new(),
                             isolation: Isolation::Worktree,
@@ -757,6 +792,10 @@ impl Hub {
                 };
                 let extensions_key =
                     crate::connectors::extensions::effective_set_key(conn, channel_id)?;
+                let limited = crate::store::machine::limited_accounts(
+                    conn,
+                    consort_proto::time::Timestamp::now(),
+                )?;
                 Ok(Some(Inputs {
                     channel,
                     tutti,
@@ -764,6 +803,7 @@ impl Hub {
                     session,
                     workers,
                     open,
+                    limited,
                     global_index: String::new(),
                     channel_index: String::new(),
                     context,

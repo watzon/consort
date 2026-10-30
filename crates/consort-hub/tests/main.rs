@@ -6,6 +6,7 @@
 
 mod common;
 
+mod account_fallback;
 mod accounts;
 mod admin_revoke;
 mod assistant_limits;
@@ -38,7 +39,10 @@ mod smaller_items;
 mod snapshot_and_feed;
 mod start_failures;
 mod task_lifecycle;
+mod task_model_change;
 mod task_session_guards;
+mod turn_error_kinds;
+mod user_replies;
 mod voice;
 mod wake_queue;
 mod workspace_release;

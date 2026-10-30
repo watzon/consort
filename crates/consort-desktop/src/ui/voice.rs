@@ -3,12 +3,10 @@
 //! offer (`HL7-0`), the card of a draft in your voice with its flags, the
 //! tick, Edit and "Not how I write" (`HTB-0`), and the voice dialogs.
 
-use consort_client::connectors::ConnectorCardView;
 use consort_client::voice::{
-    Disclosure, DraftCardView, GuideEdit, GuideSectionKind, GuideSectionView, VoiceSampleState,
-    VoiceSourceKind, VoiceSourceRow,
+    Disclosure, GuideEdit, GuideSectionKind, GuideSectionView, VoiceSampleState, VoiceSourceKind,
+    VoiceSourceRow,
 };
-use consort_client::{ApprovalChoice, ApprovalView, RequestState};
 use consort_theme::{Tokens, TypeExt as _};
 use gpui_kit::{
     AnyElement, Context, Div, Focusable as _, HighlightStyle, InteractiveElement as _, IntoElement,
@@ -22,23 +20,32 @@ use crate::ui::convo_dialogs::DialogParts;
 use crate::ui::dialogs::{field_block, input_box};
 use crate::ui::hub_blocked::needs_hub;
 use crate::ui::parts::{
-    ButtonKind, button, detail, focusable, icon, icon_text_button, selectable, text, textarea,
+    ButtonKind, button, detail, focusable, icon, icon_text_button, leaving_link, selectable, text,
+    textarea,
 };
 use crate::ui::settings::switch;
 use crate::voice::{VoiceDialog, example_key, rule_key};
 
 /// A checkbox: the accent fill with a check when ticked.
 pub fn checkbox(id: impl Into<SharedString>, on: bool, t: &Tokens) -> Stateful<Div> {
+    focusable(div().id(gpui_kit::ElementId::Name(id.into())), t)
+        .flex_none()
+        .rounded(t.radius.sm)
+        .cursor_pointer()
+        .child(check_mark(on, t))
+}
+
+/// The look of a checkbox, for a row that takes the click and the focus.
+pub fn check_mark(on: bool, t: &Tokens) -> Div {
     let c = &t.colors;
     let v = t.component.voice;
-    focusable(div().id(gpui_kit::ElementId::Name(id.into())), t)
+    div()
         .flex()
         .flex_none()
         .items_center()
         .justify_center()
         .size(v.check_box)
         .rounded(t.radius.sm)
-        .cursor_pointer()
         .when(on, |d| {
             d.bg(c.accent_fill)
                 .child(icon("check", v.check_icon, c.accent_on_fill))
@@ -132,6 +139,7 @@ pub fn flagged_text(
     id: impl Into<SharedString>,
     value: &str,
     ranges: &[(usize, usize)],
+    style: consort_theme::Type,
     t: &Tokens,
 ) -> Div {
     let c = &t.colors;
@@ -157,11 +165,11 @@ pub fn flagged_text(
         .collect();
     let id = id.into();
     if highlights.is_empty() {
-        return selectable(id, value.to_owned(), t.text.ui, c.text_primary);
+        return selectable(id, value.to_owned(), style, c.text_primary);
     }
     div()
         .relative()
-        .type_style(t.text.ui)
+        .type_style(style)
         .text_color(c.text_primary)
         .child(
             div()
@@ -531,13 +539,19 @@ impl ConsortApp {
                         )],
                         t,
                     ))
+                    // The task is in its channel, so this link leaves Settings.
                     .child(
-                        button("voice-open-task", "Open the task", ButtonKind::Quiet, t).on_click(
-                            cx.listener(move |this, _, window, cx| {
-                                this.page = crate::app::Page::Main;
-                                this.open_thread(task.clone(), window, cx);
-                            }),
-                        ),
+                        leaving_link("voice-open-task", "Show task", t)
+                            .debug_selector(|| "voice-open-task".into())
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                // The voice task runs in Tutti.
+                                let tutti = this
+                                    .state
+                                    .tutti()
+                                    .map(|ch| ch.id.clone())
+                                    .unwrap_or_default();
+                                this.show_task(&task, &tutti, window, cx);
+                            })),
                     )
             }
             None => crate::ui::admin_parts::row(true, t)
@@ -1096,351 +1110,6 @@ impl ConsortApp {
                 t,
             ))
             .child(group)
-    }
-
-    // The draft card -------------------------------------------------------
-
-    /// The fields, the voice line, the flags, the tick and the buttons of a
-    /// draft card, or its fields and Save changes in Edit.
-    pub fn render_draft_card(
-        &mut self,
-        approval: &ApprovalView,
-        card: &ConnectorCardView,
-        draft: &DraftCardView,
-        key: &str,
-        t: &Tokens,
-        cx: &mut Context<Self>,
-    ) -> Div {
-        let c = &t.colors;
-        let v = t.component.voice;
-        let pending = approval.state == RequestState::Pending;
-        let editing = pending
-            && self
-                .voice
-                .editing
-                .as_ref()
-                .is_some_and(|(id, k)| id == &approval.id && k == key);
-        let subject_key = draft
-            .editable
-            .iter()
-            .find(|f| f.key == "subject")
-            .map(|f| f.key.clone());
-        let body_field = draft.editable.iter().find(|f| f.key != "subject").cloned();
-        // The fields.
-        let mut fields = div()
-            .flex()
-            .flex_col()
-            .rounded(t.radius.md)
-            .border(t.border_width)
-            .border_color(c.border_subtle)
-            .bg(c.surface_raised);
-        let count = card.fields.len();
-        for (i, field) in card.fields.iter().enumerate() {
-            let label = text(field.label.clone(), detail(t), c.text_tertiary)
-                .line_height(t.text.ui.line)
-                .w(v.field_label)
-                .flex_none();
-            let is_subject = subject_key.is_some() && field.label == "Subject";
-            let is_body = body_field.as_ref().is_some_and(|b| b.label == field.label);
-            let value: AnyElement = if editing && is_subject {
-                let focused = false;
-                div()
-                    .flex_1()
-                    .child(
-                        input_box(&self.voice_inputs.subject, focused, t)
-                            .bg(c.surface_canvas)
-                            .min_h(v.subject_box),
-                    )
-                    .into_any_element()
-            } else if editing && is_body {
-                div()
-                    .flex_1()
-                    .min_h(v.body_box)
-                    .py(t.space.sm)
-                    .px(t.space.sm + t.space.xxs)
-                    .rounded(t.radius.md)
-                    .bg(c.surface_canvas)
-                    .border(t.border_width)
-                    .border_color(c.accent_text)
-                    .child(textarea(&self.voice_inputs.body, t.text.ui))
-                    .into_any_element()
-            } else {
-                flagged_text(
-                    format!("{key}-draft-field-{i}"),
-                    &field.value,
-                    &draft.ranges(&field.label),
-                    t,
-                )
-                .flex_1()
-                .min_w_0()
-                .into_any_element()
-            };
-            fields = fields.child(
-                div()
-                    .flex()
-                    .items_start()
-                    .gap(t.space.sm)
-                    .py(t.space.sm)
-                    .px(t.space.md)
-                    .when(i + 1 < count, |d| {
-                        d.border_b(t.border_width).border_color(c.border_subtle)
-                    })
-                    .child(label)
-                    .child(value),
-            );
-        }
-        let voice_line = div()
-            .flex()
-            .items_center()
-            .gap(t.space.xs + t.space.xxs)
-            .child(icon("quote", v.line_icon, c.text_tertiary))
-            .child(text(draft.voice_line.clone(), detail(t), c.text_tertiary));
-        let mut out = div()
-            .flex()
-            .flex_col()
-            .gap(t.space.md)
-            .child(fields)
-            .child(voice_line);
-        if editing {
-            let id = approval.id.clone();
-            let body_key = body_field.map(|b| b.key);
-            return out
-                .child(text(
-                    "Consort checks the text again when you save. It marks any date, price or agreement that is not in your request.",
-                    detail(t),
-                    c.text_tertiary,
-                ))
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(t.space.sm)
-                        .child(
-                            button(
-                                SharedString::from(format!("{key}-save")),
-                                "Save changes",
-                                ButtonKind::Primary,
-                                t,
-                            )
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.save_draft_edit(
-                                    id.clone(),
-                                    subject_key.clone(),
-                                    body_key.clone(),
-                                    cx,
-                                )
-                            })),
-                        )
-                        .child(
-                            button(
-                                SharedString::from(format!("{key}-cancel")),
-                                "Cancel",
-                                ButtonKind::Secondary,
-                                t,
-                            )
-                            .on_click(cx.listener(|this, _, _, cx| this.cancel_draft_edit(cx))),
-                        ),
-                );
-        }
-        // The flags.
-        if pending && !draft.flags.is_empty() {
-            let mut list = div().flex().flex_col().gap(t.space.sm);
-            for flag in &draft.flags {
-                list = list.child(
-                    div()
-                        .flex()
-                        .gap(t.space.sm + t.space.xxs)
-                        .child(
-                            div()
-                                .w(v.flag_bar)
-                                .flex_none()
-                                .rounded(t.radius.full)
-                                .bg(c.accent_text),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_baseline()
-                                        .gap(t.space.xs + t.space.xxs)
-                                        .child(text(
-                                            flag.text.clone(),
-                                            t.text.ui_strong,
-                                            c.text_primary,
-                                        ))
-                                        .child(text(
-                                            flag.kind_label.clone(),
-                                            detail(t),
-                                            c.text_tertiary,
-                                        )),
-                                )
-                                .child(text(flag.note.clone(), detail(t), c.accent_text)),
-                        ),
-                );
-            }
-            let hash = draft.review_hash.clone();
-            let checked = self.draft_checked(&approval.id, &hash);
-            let id = approval.id.clone();
-            out = out.child(list).child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(t.space.sm + t.space.xxs)
-                    .child(
-                        checkbox(format!("{key}-checked"), checked, t)
-                            .debug_selector(|| "draft-checked".into())
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.toggle_draft_checked(&id, &hash, cx)
-                            })),
-                    )
-                    .child(text(
-                        "I checked the marked lines",
-                        t.text.ui,
-                        c.text_primary,
-                    )),
-            );
-        }
-        if !pending {
-            return out.child(self.card_outcome_or_buttons(
-                approval,
-                &consort_client::HubCardView::Connector(card.clone()),
-                key,
-                t,
-                cx,
-            ));
-        }
-        // The buttons: Allow stays off until the tick, Edit, Don't, and
-        // "Not how I write" at the right.
-        let checked = self.draft_checked(&approval.id, &draft.review_hash);
-        let blocked = draft.allow_blocked(checked);
-        let checked_hash = checked.then(|| draft.review_hash.clone());
-        let offline = self.answers_blocked();
-        let allow_label = approval.choice_label(ApprovalChoice::AllowOnce);
-        let allow: AnyElement = if blocked {
-            div()
-                .id(SharedString::from(format!("{key}-allow")))
-                .debug_selector(|| "draft-allow-off".into())
-                .flex()
-                .flex_none()
-                .items_center()
-                .px(t.space.md)
-                .py(t.component.button_pad_y)
-                .rounded(t.radius.md)
-                .bg(c.surface_selected)
-                .type_style(t.text.ui_strong)
-                .text_color(c.text_tertiary)
-                .child(allow_label)
-                .into_any_element()
-        } else {
-            let id = approval.id.clone();
-            needs_hub(
-                button(
-                    SharedString::from(format!("{key}-allow")),
-                    allow_label,
-                    ButtonKind::Primary,
-                    t,
-                )
-                .debug_selector(|| "draft-allow".into())
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.answer_draft_card(
-                        id.clone(),
-                        ApprovalChoice::AllowOnce,
-                        checked_hash.clone(),
-                        window,
-                        cx,
-                    )
-                })),
-                offline,
-                t,
-            )
-            .into_any_element()
-        };
-        let edit = {
-            let id = approval.id.clone();
-            let card_key = key.to_owned();
-            let subject = draft
-                .editable
-                .iter()
-                .find(|f| f.key == "subject")
-                .map(|f| f.value.clone());
-            let body = draft
-                .editable
-                .iter()
-                .find(|f| f.key != "subject")
-                .map(|f| f.value.clone());
-            button(
-                SharedString::from(format!("{key}-edit")),
-                "Edit",
-                ButtonKind::Secondary,
-                t,
-            )
-            .debug_selector(|| "draft-edit".into())
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.start_draft_edit(
-                    id.clone(),
-                    card_key.clone(),
-                    subject.clone(),
-                    body.clone(),
-                    window,
-                    cx,
-                )
-            }))
-        };
-        let deny = {
-            let id = approval.id.clone();
-            needs_hub(
-                button(
-                    SharedString::from(format!("{key}-deny")),
-                    approval.choice_label(ApprovalChoice::Deny),
-                    ButtonKind::Quiet,
-                    t,
-                )
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.answer_approval(id.clone(), ApprovalChoice::Deny, window, cx)
-                })),
-                offline,
-                t,
-            )
-        };
-        let noted = draft.not_my_voice || self.voice.feedback.contains(&approval.id);
-        let feedback: AnyElement = if noted {
-            text(
-                "Noted. Consort asks what is wrong.",
-                detail(t),
-                c.text_tertiary,
-            )
-            .into_any_element()
-        } else {
-            let id = approval.id.clone();
-            focusable(
-                div().id(SharedString::from(format!("{key}-not-my-voice"))),
-                t,
-            )
-            .debug_selector(|| "not-my-voice".into())
-            .cursor_pointer()
-            .type_style(detail(t))
-            .text_color(c.text_tertiary)
-            .hover(|s| s.text_color(c.text_secondary))
-            .child("Not how I write")
-            .on_click(cx.listener(move |this, _, _, cx| this.not_my_voice(id.clone(), cx)))
-            .into_any_element()
-        };
-        out.child(
-            div()
-                .flex()
-                .items_center()
-                .gap(t.space.sm)
-                .child(allow)
-                .child(edit)
-                .child(deny)
-                .child(div().flex_1())
-                .when(draft.in_voice || !draft.flags.is_empty(), |d| {
-                    d.child(feedback)
-                }),
-        )
     }
 
     // The voice task card and the offer --------------------------------------

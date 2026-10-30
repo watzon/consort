@@ -10,10 +10,10 @@ use consort_client::{
 };
 use consort_theme::{Tokens, Type, TypeExt as _};
 use gpui_kit::{
-    AnyElement, App, Context, Div, Hsla, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, ParentElement, SharedString, StatefulInteractiveElement as _, Styled, Window,
-    base::SelectableText, component::text::TextView, div, img, linear_color_stop, linear_gradient,
-    list, prelude::FluentBuilder as _,
+    AnyElement, App, AppContext as _, Context, Div, Hsla, InteractiveElement, IntoElement,
+    MouseButton, MouseDownEvent, ParentElement, SharedString, StatefulInteractiveElement as _,
+    Styled, Window, base::SelectableText, component::text::TextView, div, img, linear_color_stop,
+    linear_gradient, list, prelude::FluentBuilder as _,
 };
 
 use crate::{
@@ -24,8 +24,7 @@ use crate::{
         links::click_action,
         mark::{MarkPhase, frame_path as mark_frame},
         markdown::{Segment, exact_selection, segments},
-        menu::{MenuAction, MenuItem, OpenMenu, TextTarget, text_edit_menu},
-        model_picker::{PickerTarget, TriggerStyle},
+        menu::{MenuAction, MenuItem, OpenMenu},
         motion::FrameClock,
         parts::{
             ButtonKind, button, detail, focusable, icon_button, line, selectable, status_glyph,
@@ -178,7 +177,7 @@ pub fn task_menu(
 
 /// Markdown as the reader sees it, for "Copy text". Code keeps every
 /// character.
-fn plain_text(markdown: &str) -> String {
+pub(crate) fn plain_text(markdown: &str) -> String {
     consort_client::format::plain_text(markdown)
 }
 
@@ -207,18 +206,35 @@ impl ConsortApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let panel_width = self.right_panel_width(t);
-        let column = (window.viewport_size().width
-            - t.layout.sidebar_width
-            - panel_width
-            - t.space.xl * 2.0)
+        self.layout.window_width = window.viewport_size().width;
+        let frame = self.layout_frame(t);
+        self.follow_frame(frame, t, cx);
+        let sidebar_width = if frame.sidebar {
+            t.layout.sidebar_width
+        } else {
+            gpui_kit::Pixels::ZERO
+        };
+        let beside = if frame.panel_over {
+            gpui_kit::Pixels::ZERO
+        } else {
+            gpui_kit::px(frame.panel)
+        };
+        let column = (self.layout.window_width - sidebar_width - beside - t.space.xl * 2.0)
             .min(t.layout.timeline_max_width);
         let narrow = column < t.layout.wide_timeline;
         if narrow != self.narrow {
             self.narrow = narrow;
             self.timeline.remeasure();
         }
-        let sidebar = self.render_sidebar(t, window, cx);
+        let sidebar = (frame.sidebar || self.layout.sliding || self.layout.drawer_open)
+            .then(|| self.render_sidebar(t, window, cx));
+        let (slot, drawer) = if self.layout.drawer_open {
+            (None, sidebar)
+        } else {
+            (sidebar, None)
+        };
+        let slot = self.render_sidebar_slot(slot, frame, t);
+        let buttons = self.render_sidebar_buttons(frame, t, cx);
         // No header: the timeline fills the column, and the Three voices
         // mark and the top actions float over its top fade.
         // A drop anywhere over the chat attaches the files to the composer.
@@ -242,8 +258,8 @@ impl ConsortApp {
                 this.drop_files(crate::app::DropOver::Chat, paths, cx);
             }))
             .child(self.render_timeline(t, window, cx))
-            .child(self.render_composer(t, cx))
-            .child(self.render_top_overlay(t, window, cx));
+            .child(self.render_composer(t, window, cx))
+            .child(self.render_top_overlay(frame, t, window, cx));
         let panel = match self.panel.clone() {
             Panel::None => None,
             Panel::Tasks => Some(self.render_tasks_panel(t, window, cx)),
@@ -252,21 +268,56 @@ impl ConsortApp {
             Panel::MessageThread(root) => {
                 Some(self.render_message_thread_panel(&root, t, window, cx))
             }
+            Panel::Document => Some(self.render_document_panel(t, window, cx)),
         };
+        let (panel_beside, panel_over) = match panel {
+            Some(panel) if frame.panel_over => (None, Some(self.render_panel_over(panel, t, cx))),
+            Some(panel) => (
+                Some(
+                    div()
+                        .relative()
+                        .flex_none()
+                        .h_full()
+                        .child(panel)
+                        .child(self.render_resize_handle(t, cx)),
+                ),
+                None,
+            ),
+            None => (None, None),
+        };
+        let drawer = drawer.map(|sidebar| self.render_drawer(sidebar, t, cx));
+        // A drawer has its buttons on top of it, and a full panel covers them.
         div()
+            .id("main-page")
+            .relative()
             .flex()
             .size_full()
-            .child(sidebar)
+            .on_drag_move::<crate::ui::window_layout::PanelResize>(cx.listener(
+                |this,
+                 event: &gpui_kit::DragMoveEvent<crate::ui::window_layout::PanelResize>,
+                 _,
+                 cx| {
+                    let t = ConsortApp::tokens(cx);
+                    this.drag_panel_edge(event.event.position.x, &t, cx);
+                },
+            ))
+            .child(slot)
             .child(column)
-            .children(panel)
+            .children(panel_beside)
+            .children(drawer)
+            .children(panel_over.is_none().then_some(buttons).flatten())
+            .children(panel_over)
             .into_any_element()
     }
 
     /// The top of the column, over the timeline: a strip that moves the
     /// window, the Three voices mark with its activity pill at the center,
-    /// and the Tasks, New task and Connectors buttons at the right.
+    /// and the Channel and Tasks toggles at the right. The whole zone belongs
+    /// to the window, not to the timeline: it takes the clicks, has the arrow
+    /// cursor and moves the window. In the compact layout it is the top bar.
     fn render_top_overlay(
         &mut self,
+        shape: crate::layout::Frame,
         t: &Tokens,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -303,12 +354,23 @@ impl ConsortApp {
             }
         }
         // The pill shows only while the assistant works.
-        let line = (phase == MarkPhase::Working).then(|| {
+        let line = (phase == MarkPhase::Working && !shape.compact).then(|| {
             activity
                 .line
                 .clone()
                 .filter(|l| !l.trim().is_empty())
                 .unwrap_or_else(|| "Working".to_owned())
+        });
+        // The compact top bar: the channel name under the mark opens the
+        // Channel panel.
+        let channel_name = shape.compact.then(|| {
+            let channel = state.channel(&self.channel_id);
+            let name = channel.map(|ch| ch.name.clone()).unwrap_or_default();
+            if channel.is_some_and(|ch| ch.kind == ChannelKind::Tutti) {
+                name
+            } else {
+                format!("# {name}")
+            }
         });
         let mark = div()
             .absolute()
@@ -352,6 +414,7 @@ impl ConsortApp {
                             div()
                                 .id("offline-try-again")
                                 .debug_selector(|| "offline-try-again".into())
+                                .occlude()
                                 .px(t.space.sm)
                                 .py(t.border_width)
                                 .rounded(t.radius.full)
@@ -368,6 +431,23 @@ impl ConsortApp {
                                 ))
                                 .on_click(cx.listener(|this, _, _, cx| this.try_again(cx))),
                         ),
+                )
+            })
+            .when_some(channel_name, |d, name| {
+                d.child(
+                    focusable(div().id("channel-pill"), t)
+                        .debug_selector(|| "channel-pill".into())
+                        .occlude()
+                        .py(chat.pill_pad_y)
+                        .px(chat.pill_pad_x)
+                        .rounded(t.radius.full)
+                        .bg(c.surface_card)
+                        .border(t.border_width)
+                        .border_color(c.border_subtle)
+                        .cursor_pointer()
+                        .hover(|s| s.bg(c.hover_card))
+                        .child(text(name, detail(t), c.text_secondary).whitespace_nowrap())
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_channel_panel(cx))),
                 )
             })
             .when_some(line, |d, line| {
@@ -425,51 +505,6 @@ impl ConsortApp {
             .debug_selector(|| "channel-button".into())
             .when(channel_open, |d| d.bg(c.surface_selected))
             .on_click(cx.listener(|this, _, _, cx| this.toggle_channel_panel(cx)));
-        let new_task = action("new-task", "compose", self, cx)
-            .debug_selector(|| "new-task".into())
-            .on_click(cx.listener(|this, _, window, cx| this.open_new_task(window, cx)));
-        // The connectors and skills of the channel, for a channel that has
-        // some, with the count of those that its sessions get.
-        let enabled = consort_client::channel_extensions(&state, &self.channel_id)
-            .map(|set| set.enabled_connector_ids().len() + set.enabled_skill_ids().len())
-            .unwrap_or(0);
-        let extensions_id = self.channel_id.clone();
-        let extensions = (enabled > 0).then(|| {
-            let id: gpui_kit::ElementId = "channel-extensions".into();
-            let hovered = crate::ui::motion::is_hovered(&id, cx);
-            let version = crate::ui::motion::shimmer_version(hovered, cx);
-            let hover_id = id.clone();
-            focusable(div().id(id), t)
-                .flex()
-                .flex_none()
-                .items_center()
-                .gap(t.space.xs)
-                .h(chat.top_action)
-                .px(t.space.sm)
-                .rounded(t.radius.md)
-                .cursor_pointer()
-                .hover(|s| s.bg(c.hover_canvas))
-                .on_hover(move |on, window, cx| {
-                    if let Some(clock) = cx.try_global::<FrameClock>() {
-                        clock.set_hovered(hover_id.clone(), *on);
-                    }
-                    window.refresh();
-                })
-                .child(crate::ui::parts::icon_version(
-                    "connector",
-                    version,
-                    chat.top_action_icon,
-                    c.text_secondary,
-                ))
-                .child(text(enabled.to_string(), t.text.ui, c.text_secondary))
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.open_dialog(
-                        crate::app::Dialog::ChannelExtensions(extensions_id.clone()),
-                        window,
-                        cx,
-                    )
-                }))
-        });
         let actions = div()
             .absolute()
             .top(t.space.md)
@@ -477,29 +512,79 @@ impl ConsortApp {
             .flex()
             .items_center()
             .gap(t.space.xs)
-            .children(extensions)
-            .child(channel_button)
-            .child(tasks)
-            .child(new_task);
+            .occlude();
+        let actions = if shape.compact {
+            actions
+                .child(
+                    focusable(div().id("compact-avatar"), t)
+                        .debug_selector(|| "compact-avatar".into())
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .justify_center()
+                        .size(t.component.sidebar.avatar)
+                        .rounded(t.radius.full)
+                        .bg(c.surface_selected)
+                        .cursor_pointer()
+                        .child(
+                            div()
+                                .type_style(t.text.caption)
+                                .font_weight(t.text.title.weight)
+                                .text_color(c.text_primary)
+                                .child(state.user.initials.clone()),
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.open_settings(crate::app::SettingsSection::Appearance, cx);
+                            this.layout.settings_list = true;
+                        })),
+                )
+                .child(tasks)
+        } else {
+            actions.child(channel_button).child(tasks)
+        };
+        let menu_button = shape.compact.then(|| {
+            div()
+                .absolute()
+                .top(crate::ui::window_layout::top_on_light_line(
+                    chat.top_action,
+                    t,
+                ))
+                .left(crate::ui::window_layout::closed_left(t))
+                .occlude()
+                .child(
+                    action("compact-menu", "menu", self, cx)
+                        .debug_selector(|| "compact-menu".into())
+                        .tooltip(|_, cx| {
+                            cx.new(|_| crate::ui::convo_sidebar::Tip("Menu".into()))
+                                .into()
+                        })
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx))),
+                )
+        });
         div()
+            .id("top-zone")
+            .debug_selector(|| "top-zone".into())
             .absolute()
             .top_0()
             .left_0()
             .right_0()
             .h(t.layout.content_top)
-            // The overlay must not take the clicks and the scroll of the
-            // timeline under it, apart from its own parts.
+            // The zone takes the clicks and the text cursor, not the timeline
+            // under it. A wheel over it still scrolls the timeline.
+            .block_mouse_except_scroll()
+            .cursor_default()
             .child(
                 div()
                     .absolute()
                     .top_0()
                     .left_0()
-                    .right_0()
-                    .h(t.space.page)
-                    .drag_area(),
+                    .size_full()
+                    .cursor_default()
+                    .drag_zone(),
             )
             .child(mark)
             .child(actions)
+            .children(menu_button)
             .into_any_element()
     }
 
@@ -540,7 +625,26 @@ impl ConsortApp {
                     let (top, content) = this.render_chat_row(&row, &t, window, cx);
                     let bubble =
                         (writing && ix + 1 == count).then(|| this.render_writing_bubble(&t, cx));
+                    // The pointer on any row of a message counts for the
+                    // footer of its group.
+                    let hover_item = match &row {
+                        ChatRow::Bubble(b) => Some(b.item),
+                        ChatRow::Attachment(a) => Some(a.item),
+                        ChatRow::Footer { item, .. } | ChatRow::Actions { item, .. } => Some(*item),
+                        _ => None,
+                    };
                     div()
+                        .id(("chat-row", ix))
+                        .when_some(hover_item, |d, item| {
+                            d.on_hover(cx.listener(move |this, on: &bool, _, cx| {
+                                if *on {
+                                    this.chat_hover = Some((ix, item));
+                                } else if this.chat_hover.is_some_and(|(row, _)| row == ix) {
+                                    this.chat_hover = None;
+                                }
+                                cx.notify();
+                            }))
+                        })
                         .w_full()
                         .flex()
                         .justify_center()
@@ -768,6 +872,10 @@ impl ConsortApp {
                 t.component.convo.reaction_gap,
                 self.render_message_footer(*item, *lane == Lane::You, t, cx),
             ),
+            ChatRow::Actions { first, item, lane } => (
+                gpui_kit::Pixels::ZERO,
+                self.render_group_footer(*first, *item, *lane == Lane::You, t, cx),
+            ),
             ChatRow::Notice { item, spacing: s } => {
                 let notice = self
                     .state
@@ -792,11 +900,55 @@ impl ConsortApp {
     /// is selectable. The hub writes the kind and the text; only the text
     /// shows.
     fn render_notice_line(
-        &self,
+        &mut self,
         notice: &consort_client::NoticeView,
         t: &Tokens,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        // The text that `show_draft` shows is a card, left, at the bubble
+        // width.
+        if let Some(draft) = &notice.draft {
+            let key = format!("{}-shown", notice.message_id);
+            let card = self.render_shown_draft(draft, &key, true, t, cx);
+            return div()
+                .flex()
+                .w_full()
+                .max_w(t.layout.bubble_max_width)
+                .child(card)
+                .into_any_element();
+        }
+        // A failed turn is a card in the assistant lane at the bubble width.
+        if let Some(card) = &notice.error {
+            let key = format!("err-{}", notice.message_id);
+            let place = crate::ui::errors::ErrorPlace::Channel(self.channel_id.clone());
+            let shows_card = !card.quiet || self.errors_open.contains(&key);
+            let element = self.render_error_card(card, &key, place, t, cx);
+            let time_id = format!("error-time-{key}");
+            return div()
+                .flex()
+                .flex_col()
+                .items_start()
+                .w_full()
+                .child(element)
+                // The footer line keeps its time, under the right end of the
+                // card. A quiet line has none.
+                .when(shows_card, |d| {
+                    d.child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .w_full()
+                            .max_w(t.layout.bubble_max_width)
+                            .pt(t.space.xxs)
+                            .child(div().debug_selector(move || time_id).child(text(
+                                notice.time_label.clone(),
+                                t.text.caption,
+                                t.colors.text_tertiary,
+                            ))),
+                    )
+                })
+                .into_any_element();
+        }
         if let Some(memory) = &notice.memory {
             return self.render_memory_saved_line(notice, memory, t, cx);
         }
@@ -951,8 +1103,12 @@ impl ConsortApp {
             .px(chat.bubble_pad_x)
             .type_style(t.text.body)
             .text_color(c.text_primary)
-            // A message that waits for the hub is a little faded.
+            // A message that waits for the hub is a little faded, and one
+            // that the hub refused is dimmed.
             .when(queued, |d| d.opacity(t.opacity.queued))
+            .when(message.refused.is_some(), |d| {
+                d.opacity(t.opacity.answered_dim)
+            })
             // The message menu with the quick emoji, before the text's own.
             .capture_any_mouse_down(
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
@@ -977,7 +1133,12 @@ impl ConsortApp {
                 ChatRow::Bubble(b) => b.item != row.item || b.part <= row.part,
                 _ => true,
             });
-        let note = if !last_part {
+        let refused = message
+            .refused
+            .clone()
+            .filter(|_| last_part)
+            .map(|refused| self.render_refused_note(&refused, &key, t, cx));
+        let note = if !last_part || refused.is_some() {
             None
         } else if message.pending {
             Some(pending_text(hub_down).to_owned())
@@ -987,19 +1148,13 @@ impl ConsortApp {
             None
         };
         // A message that the assistant posted on its own: its mark above the
-        // first bubble, Useful and Too noisy under the last one on hover,
-        // and quick replies under the newest message.
+        // first bubble, and quick replies under the newest message. Useful
+        // and Too noisy are in the footer of its group.
         let caption = message
             .proactive
             .as_ref()
             .filter(|m| row.part == 0 && m.show_caption)
             .map(|m| self.render_mark_caption(m, t));
-        let hovered = self.proactivity.hovered.as_deref() == Some(message.id.as_str());
-        let feedback = message
-            .proactive
-            .as_ref()
-            .filter(|m| last_part && (hovered || m.rating.is_some()))
-            .map(|m| self.render_feedback(&message.id, m.rating, t, cx));
         // Chips show only under the newest message: any reply hides them.
         let newest = self.state.timeline(&self.channel_id).and_then(|tl| {
             tl.items
@@ -1008,8 +1163,6 @@ impl ConsortApp {
         });
         let chips = (last_part && !message.suggestions.is_empty() && newest == Some(row.item))
             .then(|| self.render_chips(&message.suggestions, t, cx));
-        let hover_id = message.id.clone();
-        let proactive = message.proactive.is_some();
         let body = lane
             .when_some(caption, |d, caption| d.child(caption))
             .child(bubble)
@@ -1033,23 +1186,11 @@ impl ConsortApp {
                         .child(text(note, t.text.caption, c.text_tertiary)),
                 )
             })
-            .when_some(feedback, |d, feedback| d.child(feedback.pt(t.space.xs)))
+            .when_some(refused, |d, refused| d.child(refused))
             .when_some(chips, |d, chips| d.child(chips));
-        // The pointer over a proactive message shows its feedback actions,
-        // which sit under the bubble, inside this region.
         div()
             .id(SharedString::from(format!("message-{key}")))
             .w_full()
-            .when(proactive, |d| {
-                d.on_hover(cx.listener(move |this, on: &bool, _, cx| {
-                    if *on {
-                        this.proactivity.hovered = Some(hover_id.clone());
-                    } else if this.proactivity.hovered.as_deref() == Some(hover_id.as_str()) {
-                        this.proactivity.hovered = None;
-                    }
-                    cx.notify();
-                }))
-            })
             .child(body)
             .into_any_element()
     }
@@ -1213,23 +1354,14 @@ impl ConsortApp {
         };
         match item {
             TimelineItem::TaskCard(card) => self.render_task_card_row(&card, t, cx),
+            // An approval has no task line: its own card says "Needs you",
+            // and the line after the answer says the answer.
             TimelineItem::Approval(card) => {
-                let (state, color) = request_state(card.approval.state);
                 let element =
                     self.render_approval_card(&card.approval, &card.message_id, true, t, cx);
                 div()
                     .flex()
                     .flex_col()
-                    .child(self.task_line(
-                        &card.message_id,
-                        crate::ui::panels::request_glyph(card.approval.state),
-                        "Approval".to_owned(),
-                        state,
-                        color,
-                        None,
-                        t,
-                        cx,
-                    ))
                     .child(card_frame(element))
                     .into_any_element()
             }
@@ -1415,19 +1547,20 @@ impl ConsortApp {
     ) -> AnyElement {
         let c = &t.colors;
         let chat = t.component.chat;
-        let collapsed = card
-            .approval
-            .as_ref()
-            .is_none_or(|a| a.state == RequestState::Answered)
-            && matches!(card.status, TaskStatus::Resolved);
+        // While the task runs, waits for review or is resolved, the chat has
+        // the line alone. The thread holds the rest, Resolve too.
+        let collapsed = card.is_line_only();
         let open = self.panel == Panel::Thread(card.task_id.clone());
         let status = card.status;
-        let state = if collapsed && !card.summary.is_empty() {
+        let age = self
+            .state
+            .task(&card.task_id)
+            .map(|task| task.age_label.clone())
+            .unwrap_or_default();
+        let state = if matches!(status, TaskStatus::Resolved) && !card.summary.is_empty() {
             card.summary.clone()
-        } else if status == TaskStatus::NeedsInput {
-            "Needs you".to_owned()
         } else {
-            status.label().to_owned()
+            consort_client::plan::line_state(status, &age)
         };
         let place = card.channel_name.clone().map(|name| format!("in {name}"));
         let task_id = card.task_id.clone();
@@ -1438,12 +1571,16 @@ impl ConsortApp {
                 status,
                 card.title.clone(),
                 state,
-                crate::ui::parts::status_color(status, t),
+                task_line_color(status, t),
                 place,
                 t,
                 cx,
             )
             .id(SharedString::from(format!("task-line-{}", card.message_id)))
+            .debug_selector({
+                let id = format!("task-line-{}", card.message_id);
+                move || id.clone()
+            })
             .cursor_pointer()
             .on_click(
                 cx.listener(move |this, _, window, cx| {
@@ -1478,6 +1615,10 @@ impl ConsortApp {
         };
         let mut body = div()
             .id(SharedString::from(format!("card-{}", card.message_id)))
+            .debug_selector({
+                let id = format!("card-{}", card.message_id);
+                move || id.clone()
+            })
             .mt(t.space.xs + t.space.xxs)
             .w_full()
             .max_w(t.layout.bubble_max_width)
@@ -1510,7 +1651,7 @@ impl ConsortApp {
             .clone()
             .filter(|a| a.state != RequestState::Answered);
         if let Some(approval) = pending.clone()
-            && let Some(hub_card) = approval.card.clone()
+            && approval.card.is_some()
         {
             // A connector approval from the task: the hub card, inside the
             // task card.
@@ -1523,7 +1664,7 @@ impl ConsortApp {
                         .gap(t.space.sm)
                         .child(div().flex_1()),
                 ))
-                .child(self.render_hub_card(&approval, &hub_card, &key, false, t, cx))
+                .child(self.render_approval_card(&approval, &key, false, t, cx))
                 .child(
                     div()
                         .flex()
@@ -1534,19 +1675,24 @@ impl ConsortApp {
             // What asks, then the folder and the command, then the answers.
             let summary = selectable(
                 SharedString::from(format!("{}.summary", approval.id)),
-                approval.summary.clone(),
+                approval.title(),
                 t.text.ui,
                 c.text_secondary,
             )
             .flex_1()
             .min_w_0();
+            let key = format!("{}-approval", card.message_id);
+            let width = self.approval_card_width(true, t) - chat.bubble_pad_x * 2.0;
+            let block = self.render_approval_block(&approval, &key, width, true, t, cx);
             body = body
                 .child(place_chips(
                     div().flex().items_center().gap(t.space.sm).child(summary),
                 ))
-                .child(self.render_approval_detail(&approval, false, t, cx))
+                .child(block)
+                .child(self.render_approval_buttons(&approval, t, cx))
                 .child(
-                    self.render_approval_buttons(&approval, t, cx)
+                    div()
+                        .flex()
                         .child(div().flex_1())
                         .child(self.open_thread_link(&card.task_id, open, t, cx)),
                 );
@@ -1606,33 +1752,12 @@ impl ConsortApp {
                     .child(body)
                     .into_any_element();
             }
-            // The actions sit in one row at the bottom, as on an approval:
-            // Resolve for a task in review, and Open thread at the right.
-            let task_id = card.task_id.clone();
+            // Open thread sits at the right. Resolve is in the thread.
             body = body.child(
                 div()
                     .flex()
                     .items_center()
                     .gap(t.space.sm)
-                    .when(card.status == TaskStatus::Review, |d| {
-                        d.child(
-                            button(
-                                SharedString::from(format!("resolve-{}", card.message_id)),
-                                "Resolve",
-                                ButtonKind::Primary,
-                                t,
-                            )
-                            .on_click(cx.listener(
-                                move |this, _, window, cx| {
-                                    this.run_menu(
-                                        MenuAction::ResolveTask(task_id.clone()),
-                                        window,
-                                        cx,
-                                    )
-                                },
-                            )),
-                        )
-                    })
                     .child(div().flex_1())
                     .child(self.open_thread_link(&card.task_id, open, t, cx)),
             );
@@ -1678,204 +1803,16 @@ impl ConsortApp {
         .into_any_element()
     }
 
-    /// What an approval asks for: the summary line (when `with_summary`),
-    /// the folder it runs in, and the command, the files or the tool call in
-    /// a block. The folder always shows, in full, because the agent writes
-    /// the summary and can choose the folder (Codex lets the model do it).
-    pub fn render_approval_detail(
+    /// The composer of the chat: the shared component (`ui/composer.rs`),
+    /// with the state of the link above it.
+    fn render_composer(
         &mut self,
-        approval: &ApprovalView,
-        with_summary: bool,
         t: &Tokens,
+        window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Div {
+    ) -> AnyElement {
         let c = &t.colors;
-        let mut detail_box = div().flex().flex_col().gap(t.space.sm).min_w_0();
-        for part in detail_parts(approval, with_summary) {
-            detail_box = match part {
-                DetailPart::Summary(summary) => detail_box.child(
-                    div()
-                        .flex()
-                        .min_w_0()
-                        .type_style(t.text.ui)
-                        .text_color(c.text_secondary)
-                        .child(div().max_w_full().child(SelectableText::new(
-                            SharedString::from(format!("{}.summary", approval.id)),
-                            summary,
-                        ))),
-                ),
-                DetailPart::Folder(folder) => detail_box.child(
-                    // GPUI's baseline does not line up a 16 px label with a
-                    // 20 px mono line, so both get the mono line height.
-                    div()
-                        .flex()
-                        .items_start()
-                        .gap(t.space.sm)
-                        .min_w_0()
-                        .child(
-                            text("Folder", detail(t), c.text_tertiary)
-                                .flex_none()
-                                .line_height(t.text.mono.line),
-                        )
-                        .child(
-                            div()
-                                .min_w_0()
-                                .font_family(t.font_mono.clone())
-                                .type_style(t.text.mono)
-                                .text_color(c.text_primary)
-                                .child(SelectableText::new(
-                                    SharedString::from(format!("{}.folder", approval.id)),
-                                    folder,
-                                )),
-                        ),
-                ),
-                DetailPart::Command(command) => detail_box.child(
-                    div()
-                        .id(SharedString::from(format!("{}-command", approval.id)))
-                        .min_w_0()
-                        .bg(c.surface_raised)
-                        .border(t.border_width)
-                        .border_color(c.border_subtle)
-                        .rounded(t.radius.md)
-                        .py(t.space.sm)
-                        .px(t.space.md)
-                        .font_family(t.font_mono.clone())
-                        .type_style(t.text.mono)
-                        .text_color(c.text_primary)
-                        .child(SelectableText::new(
-                            SharedString::from(format!("{}.command", approval.id)),
-                            command.clone(),
-                        ))
-                        .on_mouse_down(
-                            MouseButton::Right,
-                            cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                                open_context_menu(
-                                    this,
-                                    event,
-                                    vec![MenuItem::new(
-                                        "Copy code",
-                                        MenuAction::Copy(command.clone()),
-                                    )],
-                                    window,
-                                    cx,
-                                )
-                            }),
-                        ),
-                ),
-            };
-        }
-        detail_box
-    }
-
-    pub fn render_approval_buttons(
-        &mut self,
-        approval: &ApprovalView,
-        t: &Tokens,
-        cx: &mut Context<Self>,
-    ) -> Div {
-        let blocked = self.answers_blocked();
-        let mut row = div().flex().flex_wrap().items_center().gap(t.space.sm);
-        for (i, choice) in approval.choices.iter().enumerate() {
-            let kind = match choice {
-                ApprovalChoice::AllowOnce => ButtonKind::Primary,
-                ApprovalChoice::AllowForTask => ButtonKind::Secondary,
-                ApprovalChoice::Deny => ButtonKind::Quiet,
-            };
-            let id = approval.id.clone();
-            let choice = *choice;
-            // The wide choice shows the harness's own words, which can be
-            // long. They wrap, so the user reads the whole scope.
-            let wide = choice == ApprovalChoice::AllowForTask;
-            row = row.child(crate::ui::hub_blocked::needs_hub(
-                button(
-                    SharedString::from(format!("{}-{i}", approval.id)),
-                    approval.choice_label(choice),
-                    kind,
-                    t,
-                )
-                .when(wide, |b| b.whitespace_normal().max_w_full().text_left())
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.answer_approval(id.clone(), choice, window, cx)
-                })),
-                blocked,
-                t,
-            ));
-        }
-        row
-    }
-
-    /// The composer: one rounded field with the send key inside at the
-    /// right, and under it a quiet row of tools: add, voice, the model and
-    /// effort chips, and where the assistant runs.
-    fn render_composer(&mut self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
-        let c = &t.colors;
-        let chat = t.component.chat;
         let state = self.state.clone();
-        let channel = state.channel(&self.channel_id);
-        // A channel without its own model says that it uses Tutti's.
-        let inherited = channel.is_some_and(|ch| {
-            ch.kind != ChannelKind::Tutti
-                && ch
-                    .coordinator_selection
-                    .as_ref()
-                    .is_some_and(|e| e.source == consort_client::SelectionSource::Tutti)
-        });
-        let hub_offline = state.saved_data.is_some();
-        let runs_on = channel
-            .and_then(|ch| ch.coordinator_worker.clone())
-            .filter(|w| !w.trim().is_empty());
-        let target = PickerTarget::Assistant(self.channel_id.clone());
-        let model_chip = channel.map(|_| {
-            self.render_model_trigger("composer-model", target.clone(), TriggerStyle::Chip, t, cx)
-        });
-        let effort_chip = channel.and_then(|_| {
-            self.render_effort_trigger("composer-effort", target.clone(), TriggerStyle::Chip, t, cx)
-        });
-        let input = crate::ui::parts::textarea(&self.inputs.composer, t.text.body);
-        let target = consort_client::UploadTarget::Composer {
-            channel_id: self.channel_id.clone(),
-        };
-        let chips = self.render_upload_chips(&target, t, cx);
-        let dropping = self
-            .drop_hover
-            .filter(|(over, _)| *over == crate::app::DropOver::Chat)
-            .map(|(_, count)| count)
-            .filter(|_| self.waiting().is_none());
-        let drop_zone = dropping.map(|count| self.render_drop_zone(count, t));
-        let paste_target = target.clone();
-        let add_target = target.clone();
-        let send = icon_button(
-            "send",
-            "send",
-            chat.send_button,
-            t.icon.size,
-            c.text_tertiary,
-            c.hover_card,
-            t,
-            cx,
-        )
-        .rounded(t.radius.lg)
-        .debug_selector(|| "send".into())
-        .on_click(cx.listener(|this, _, window, cx| {
-            this.send_message(window, cx);
-            // The button takes the focus. The composer gets it back, so
-            // the user can go on typing.
-            this.inputs
-                .composer
-                .update(cx, |input, cx| input.focus(window, cx));
-        }));
-        let tool = |id: &'static str, name: &str, cx: &App| {
-            icon_button(
-                id,
-                name,
-                t.component.composer_chip,
-                t.icon.size,
-                c.text_secondary,
-                c.hover_canvas,
-                t,
-                cx,
-            )
-        };
         // The line above the composer: the state of the link, and for an
         // offline link the reason and a countdown that ticks once a second.
         // With saved data on screen, the pill under the mark says that the
@@ -1898,202 +1835,63 @@ impl ConsortApp {
             }
             _ => None,
         };
-        div()
-            .flex()
-            .flex_col()
-            .flex_none()
-            .items_center()
-            .gap(t.space.xs + t.space.xxs)
-            .px(t.space.xl)
-            .pt(t.space.md)
-            .pb(t.space.lg)
-            .when_some(link, |d, (line_text, reason, offline)| {
-                d.child(
+        let above = link.map(|(line_text, reason, offline)| {
+            div()
+                .flex()
+                .items_start()
+                .gap(t.space.sm)
+                .w_full()
+                .max_w(t.layout.timeline_max_width)
+                .pb(t.space.xs)
+                .child(
                     div()
                         .flex()
-                        .items_start()
-                        .gap(t.space.sm)
-                        .w_full()
-                        .max_w(t.layout.timeline_max_width)
-                        .pb(t.space.xs)
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .h(detail(t).line)
-                                .child(status_glyph(
-                                    "link-state",
-                                    TaskStatus::Working,
-                                    t.icon.dense,
-                                    t,
-                                    cx,
-                                )),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .flex_1()
-                                .min_w_0()
-                                .child(text(line_text, detail(t), c.text_secondary))
-                                .when_some(reason, |col, reason| {
-                                    // The reason is an error detail, so the
-                                    // user can select it and copy it.
-                                    col.child(selectable(
-                                        SharedString::from(format!("link-reason-{reason}")),
-                                        reason,
-                                        detail(t),
-                                        c.text_tertiary,
-                                    ))
-                                }),
-                        )
-                        // Do not wait for the countdown.
-                        .when(offline, |row| {
-                            row.child(
-                                button("link-try-again", "Try again", ButtonKind::Quiet, t)
-                                    .on_click(cx.listener(|this, _, _, cx| this.try_again(cx))),
-                            )
+                        .items_center()
+                        .h(detail(t).line)
+                        .child(status_glyph(
+                            "link-state",
+                            TaskStatus::Working,
+                            t.icon.dense,
+                            t,
+                            cx,
+                        )),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_w_0()
+                        .child(text(line_text, detail(t), c.text_secondary))
+                        .when_some(reason, |col, reason| {
+                            // The reason is an error detail, so the user can
+                            // select it and copy it.
+                            col.child(selectable(
+                                SharedString::from(format!("link-reason-{reason}")),
+                                reason,
+                                detail(t),
+                                c.text_tertiary,
+                            ))
                         }),
                 )
-            })
-            .child(
-                div()
-                    .id("composer")
-                    .debug_selector(|| "composer".into())
-                    .flex()
-                    .flex_col()
-                    .gap(t.space.xs)
-                    .w_full()
-                    .max_w(t.layout.timeline_max_width)
-                    // No channel has loaded: the box takes no text.
-                    .when(self.waiting().is_some(), |d| d.opacity(t.opacity.busy))
-                    .p(t.space.sm)
-                    .bg(c.surface_card)
-                    .border(t.border_width)
-                    .border_color(c.border_strong)
-                    .rounded(chat.composer_radius)
-                    // Files dragged over the chat: the field is the drop
-                    // zone, with a dashed accent border and a soft fill.
-                    .when(dropping.is_some(), |d| {
-                        d.border(t.stroke)
-                            .border_dashed()
-                            .border_color(c.accent_text)
-                            .bg(c.accent_fill.opacity(t.opacity.drop_fill))
-                            .pb(t.space.md + t.space.xxs)
-                    })
-                    // A picture or a copied file on the clipboard attaches.
-                    // Text pastes as usual.
-                    .capture_action(cx.listener(
-                        move |this, _: &gpui_kit::base::input::Paste, _, cx| {
-                            if this.paste_files(paste_target.clone(), cx) {
-                                cx.stop_propagation();
-                            }
-                        },
-                    ))
-                    .children(chips)
-                    .child(
-                        div()
-                            .flex()
-                            .items_end()
-                            .gap(t.space.sm)
-                            .pl(t.space.sm)
-                            .child(
-                                div()
-                                    .id("composer-text")
-                                    .flex_1()
-                                    .min_w_0()
-                                    .py(t.space.xs)
-                                    .type_style(t.text.body)
-                                    .text_color(c.text_primary)
-                                    // Voice input is the system's dictation:
-                                    // it types into the focused box. The
-                                    // tooltip says how to start it.
-                                    .when_some(crate::convo::dictation_hint(), |d, hint| {
-                                        d.tooltip(move |_, cx| {
-                                            gpui_kit::AppContext::new(cx, |_| {
-                                                crate::ui::convo_sidebar::Tip(hint.into())
-                                            })
-                                            .into()
-                                        })
-                                    })
-                                    .child(input),
-                            )
-                            .child(send),
+                // Do not wait for the countdown.
+                .when(offline, |row| {
+                    row.child(
+                        button("link-try-again", "Try again", ButtonKind::Quiet, t)
+                            .on_click(cx.listener(|this, _, _, cx| this.try_again(cx))),
                     )
-                    .children(drop_zone)
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                            let items = text_edit_menu(TextTarget::Composer);
-                            this.open_menu(OpenMenu::at(event.position, items), cx);
-                            cx.stop_propagation();
-                        }),
-                    ),
-            )
-            .child(
-                div()
-                    .id("composer-tools")
-                    .debug_selector(|| "composer-tools".into())
-                    .flex()
-                    .items_center()
-                    .gap(t.space.xxs)
-                    .w_full()
-                    .max_w(t.layout.timeline_max_width)
-                    .px(t.space.xs)
-                    .child(
-                        tool("attach", "plus", cx)
-                            .debug_selector(|| "attach".into())
-                            .relative()
-                            .child(self.triggers.track("composer-attach"))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.open_add_menu("composer-attach", add_target.clone(), cx)
-                            })),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            .w(t.border_width)
-                            .h(t.icon.size)
-                            .mx(t.space.xs + t.space.xxs)
-                            .bg(c.border_strong),
-                    )
-                    .when(inherited, |d| {
-                        d.child(
-                            text(
-                                format!("Same as {}", crate::ui::TUTTI),
-                                detail(t),
-                                c.text_tertiary,
-                            )
-                            .flex_none()
-                            .pr(t.space.xs),
-                        )
-                    })
-                    .children(model_chip)
-                    .children(effort_chip)
-                    .child(div().flex_1())
-                    .when_some(runs_on.filter(|_| !hub_offline), |d, worker| {
-                        d.child(
-                            text(format!("Runs on {worker}"), detail(t), c.text_tertiary)
-                                .whitespace_nowrap()
-                                .id("runs-on")
-                                .debug_selector(|| "runs-on".into()),
-                        )
-                    })
-                    // Nothing runs while the hub is down. A message waits.
-                    .when(hub_offline, |d| {
-                        d.child(
-                            text(
-                                "Messages wait here until the hub is back",
-                                detail(t),
-                                c.text_tertiary,
-                            )
-                            .whitespace_nowrap()
-                            .id("queue-hint")
-                            .debug_selector(|| "queue-hint".into()),
-                        )
-                    }),
-            )
-            .into_any_element()
+                })
+                .into_any_element()
+        });
+        let column = self.chat_column_width(t);
+        self.render_composer_box(
+            crate::ui::composer::ComposerTarget::Channel,
+            column,
+            above,
+            t,
+            window,
+            cx,
+        )
     }
 }
 
@@ -2170,6 +1968,15 @@ fn answered_label(approval: &ApprovalView, choice: ApprovalChoice) -> String {
 /// Keeps `App` in the import list on every platform.
 #[allow(dead_code)]
 fn _app(_: &App) {}
+
+/// The color of the state words on a task line. Only the two statuses that
+/// wait for the user use the accent. Working is quiet, in `text.tertiary`.
+pub(crate) fn task_line_color(status: TaskStatus, t: &Tokens) -> Hsla {
+    match status {
+        TaskStatus::Working => t.colors.text_tertiary,
+        other => crate::ui::parts::status_color(other, t),
+    }
+}
 
 #[cfg(test)]
 mod tests {

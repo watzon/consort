@@ -211,12 +211,12 @@ The effective approval mode of a session is the lower of the requested mode and 
 |---|---|---|---|---|---|
 | Ask | `default` permission mode | Approval policy `untrusted`, sandbox `read-only` | `edit`, `bash` and `webfetch` are `ask` | `default` | Not supported in v1 |
 | Auto edits | `acceptEdits` | `on-request`, sandbox `workspace-write` | `edit` is `allow`, `bash` and `webfetch` are `ask` | `auto_edit` | Not supported in v1 |
-| Auto | `acceptEdits` (channel allowed tools are not built yet) | `never`, sandbox `workspace-write` | The same as Auto edits | `auto_edit` | Not supported in v1 |
+| Auto | `auto` (asks only for destructive actions and for actions outside the workspace). If the adapter or the model does not offer it, `acceptEdits` | `never`, sandbox `workspace-write` | The same as Auto edits | `auto_edit` | Not supported in v1 |
 | Full access | `bypassPermissions` | `never`, sandbox `danger-full-access` | `edit`, `bash` and `webfetch` are `allow` | `yolo` | Default behavior |
 
 The adapter tests check these values, and `tests/harness_modes.rs` in `consort-harness` checks the next rule for every adapter. OpenCode gets its mode in `OPENCODE_CONFIG_CONTENT` as a `permission` setting. Gemini CLI gets `--approval-mode`. Other ACP agents report Ask only.
 
-Full access is the only mode in which a harness runs commands with no prompt and no sandbox. Codex Auto runs commands with no prompt, but in its `workspace-write` sandbox. OpenCode, Gemini CLI and Pi have no sandbox, so a mode with no prompt is Full access for them. So in Auto, OpenCode and Gemini CLI ask before each command and each fetch, like Claude, and Pi runs only in Full access. A new worker caps sessions at Auto, so a Full access session needs `max_approval_mode = "full_access"` in `worker.toml`.
+Full access is the only mode in which a harness runs commands with no prompt and no sandbox. Codex Auto runs commands with no prompt, but in its `workspace-write` sandbox. OpenCode, Gemini CLI and Pi have no sandbox, so a mode with no prompt is Full access for them. So in Auto, OpenCode and Gemini CLI ask before each command and each fetch, and Pi runs only in Full access. Claude Code has a middle mode of its own (`auto`), so in Auto it asks only for destructive actions and for actions outside the workspace. A new worker caps sessions at Auto, so a Full access session needs `max_approval_mode = "full_access"` in `worker.toml`.
 
 A repo's own configuration can raise these limits, so below Full access the adapter keeps it out where the harness allows that:
 
@@ -228,24 +228,37 @@ A repo's own configuration can raise these limits, so below Full access the adap
 
 The worker's limits also apply to an approval that it would have to cut to send. If the details of an approval do not fit in an event (192 KiB), the worker denies it and does not send it, because the user would allow a command or a change that they cannot see in full. The session gets an `approval_too_long` error event that says what to do. When the harness can steer, the model gets the same text as a steer, because the harness tells the model only that the request was denied.
 
-If `allow_shell` is false in the worker policy, the worker caps the mode at Auto edits and denies each command approval itself. That is worker policy, so the adapter rule above still holds. A command that does not ask for approval still runs, so the adapters also remove the shell tools (`allow_shell` in `SessionSpec`):
+If `allow_shell` is false in the worker policy, the worker caps the mode at Auto edits and denies each command approval itself. That is worker policy, so the adapter rule above still holds. A command that does not ask for approval still runs, so the adapters also remove the shell tools (`allow_shell` in `SessionSpec`). A coordinator session always has `allow_shell` false and `SessionSpec.coordinator` true, whatever the policy says (DECISIONS 740). For a coordinator the adapters also remove the web tools:
 
-| Harness | How the shell tools go away |
-|---|---|
-| Claude (ACP) | `_meta.claudeCode.options.disallowedTools` is `Bash`, `PowerShell` and `Monitor` (the tools that run commands in Claude Agent SDK 0.3.312) |
-| Codex | `features.shell_tool` and `features.unified_exec` are false in the `thread/start` config. Tested with codex-cli 0.165.0: the model gets no `exec_command` and no `write_stdin` tool |
-| OpenCode | `bash` is `deny` in `OPENCODE_CONFIG_CONTENT` |
-| Gemini CLI | Not done yet. Only the worker's denial of each command approval applies |
+| Harness | Shell tools | Web tools (coordinator only) |
+|---|---|---|
+| Claude (ACP) | `_meta.claudeCode.options.disallowedTools` is `Bash`, `PowerShell` and `Monitor` (the tools that run commands in Claude Agent SDK 0.3.312) | `WebFetch` and `WebSearch` are added to `disallowedTools` |
+| Codex | `features.shell_tool` and `features.unified_exec` are false in the `thread/start` config. Tested with codex-cli 0.165.0: the model gets no `exec_command` and no `write_stdin` tool | `web_search` is `disabled` in the `thread/start` config |
+| OpenCode | `bash` is `deny` in `OPENCODE_CONFIG_CONTENT` | `webfetch` and `websearch` are `deny`, and `hub_*` is `allow`. The `hub_*` match was not tested with a real model |
+| Gemini CLI | A policy file in the runtime folder, passed with `--admin-policy`, denies `run_shell_command`. Tested with Gemini CLI 0.66.0 | The same file denies `google_web_search`, `web_fetch` and `codebase_investigator`, and allows the MCP server `hub` |
+| Other ACP agents | No removal at the source. The worker denies each approval request | Same |
+
+The worker allows a hub tool of a coordinator without a card only when the adapter names the tool in a field that the harness sets (for Claude, `_meta.claudeCode.toolName`). A title that the agent or the model chose does not count.
 
 ### A mode for one turn
 
-A `session.turn` (and the first turn of a `session.start`) can name an approval mode for that turn only. The hub does this for a coordinator's proactive turns and the research pass: they run in Ask, so the coordinator's own shell commands and file edits wait for the user, whatever the channel's default mode. The worker runs the turn at the lower of that mode and the session's own mode, and the next turn that names no mode goes back to the session's mode. It calls `HarnessSession::set_approval_mode` only when the mode changes, and never while a turn runs.
+A `session.turn` (and the first turn of a `session.start`) can name an approval mode for that turn only. The hub does this for a coordinator's proactive turns and the research pass: they run in Ask. A coordinator session runs in Ask anyway (DECISIONS 700), so today the turn mode and the session mode are the same, and the rule stays as a guard. The worker runs the turn at the lower of that mode and the session's own mode, and the next turn that names no mode goes back to the session's mode. It calls `HarnessSession::set_approval_mode` only when the mode changes, and never while a turn runs.
 
 | Adapter | How it changes the mode |
 |---|---|
 | Claude (ACP) | The same call that sets the mode at the start (`session/set_config_option` with the `mode` option, or `session/set_mode`), and the adapter reads the mode back. The new limit holds at once: the options that would raise the mode are removed, and a higher mode that the agent reports is set back |
 | Codex | `turn/start` takes `approvalPolicy` and `sandboxPolicy` (an object such as `{"type": "readOnly"}`). Codex keeps them for the next turns, so the adapter sends them only with the turn whose mode changed. A session that goes back to its mode gets the plain sandbox policy of that mode, without the extra settings of the user's Codex config |
 | OpenCode, Gemini CLI, other ACP agents, Pi | Not supported: they take their mode when they start. The worker refuses a stricter turn with `policy_denied`. A coordinator on such a harness runs proactive turns only when the channel's default mode is Ask already |
+
+### A model change in a running session
+
+A `session.turn` can carry a `model_change` (a model and its options). The worker calls `HarnessSession::set_model` before the turn, and only when `capabilities().switch_model` is true. It saves the new model in the stored start of the session, so a restart resumes with it. A harness that cannot switch, or a switch that fails, makes the worker refuse the turn with `unsupported`, and the hub starts a new session instead.
+
+| Adapter | How it changes the model |
+|---|---|
+| Claude (ACP), OpenCode | `session/set_config_option` with the `model` option, then the `effort` option. The adapter sets the model and its options before the mode, and sets the mode of a Claude session again after a later model change, because the new model decides which modes are on offer |
+| Codex | `turn/start` takes the model and the effort. Codex keeps them for the next turns |
+| Gemini CLI, other ACP agents, Pi | Not supported: `switch_model` is false |
 
 ### What an approval shows
 
@@ -261,9 +274,11 @@ Claude Code loads CLAUDE.md files only with the project settings. So the adapter
 
 After `session/new` or `session/load`, the adapter sets the Claude permission mode and reads it back from the `configOptions` of the answer. If the agent has no mode, does not offer the mode, refuses it or reports another mode, the open fails and the adapter stops the agent.
 
+One case does not fail: Auto. `claude-agent-acp` 0.99.0 always lists `auto`, but it keeps `acceptEdits` when the model does not support `auto` mode (`supportsAutoMode`), and Claude Code can refuse `auto` for an account. When the adapter does not offer `auto`, refuses it, or reports `acceptEdits` after the request, the session goes on in `acceptEdits` and the worker logs a warning (`claude_mode_fallback`). The same holds for a mode change in a running session. The session never falls back to a mode above the one the user chose. See DECISIONS 701.
+
 `claude-agent-acp` turns `bypassPermissions` off for root without `IS_SANDBOX`, and when the Claude settings set `disableBypassPermissionsMode`. A probe sends no `allowDangerouslySkipPermissions`, so its mode list shows whether the agent offers `bypassPermissions`. When it does not, the account's capabilities have no Full access, and the worker lowers a Full access request to Auto. When the setting changes after the probe, the open of a Full access session fails with that reason. The adapter then stops that agent, starts a new one in Auto with the limits of Auto, and the session's capabilities have no Full access. The worker then sends an `approval_mode_lowered` error event and removes Full access from the account in the inventory.
 
-The session must stay at or below the Claude mode of its approval mode. The modes rank `plan`, `dontAsk` and `default` lowest, then `acceptEdits`, `auto` and `bypassPermissions`. An unknown mode ranks highest. Two rules hold the session there:
+The session must stay at or below the Claude mode of its approval mode. The modes rank `plan`, `dontAsk` and `default` lowest, then `acceptEdits`, `auto` and `bypassPermissions`. So `auto` is allowed in Auto and Full access, and never in Ask and Auto edits. An unknown mode ranks highest. Two rules hold the session there:
 
 - The adapter removes each permission option that would set a higher mode. These are the options of `claude-agent-acp` 0.99.0 to leave plan mode, such as "Yes, and use auto mode" and "Yes, auto-accept edits" (both `allow_always`, so a client's "Allow for task" would pick them). For a file change, `allow-with-updates` can set `acceptEdits` for the session, so it counts as `acceptEdits`. A request always keeps an allow-once and a deny option.
 - When the agent reports a higher mode in a `current_mode_update` or a `config_option_update`, the adapter sets the mode back at once and sends a `mode_reset` error event. If the agent refuses, does not answer in 30 s, or still reports the higher mode, the adapter stops the agent and reports the session as `lost` with a `mode_reset_failed` error event.

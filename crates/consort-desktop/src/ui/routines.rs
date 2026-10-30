@@ -21,16 +21,15 @@ use gpui_kit::{
 };
 
 use crate::{
-    app::{ConsortApp, Dialog},
+    app::{ConsortApp, Dialog, Page},
     knowledge::{KnowledgeAction, StatusFilter, routine_menu},
     ui::{
         dialogs::{field_block, input_box},
         menu::{MenuAction, MenuItem, OpenMenu},
         parts::{
             ButtonKind, button, detail, focusable, glyph, icon, icon_button, icon_text_button,
-            line, selectable, text,
+            leaving_link, line, selectable, text,
         },
-        window_controls::DragArea as _,
     },
 };
 
@@ -438,7 +437,14 @@ impl ConsortApp {
                             .on_click(cx.listener(
                                 move |this, _, window, cx| {
                                     cx.stop_propagation();
-                                    this.open_routine(&history_id, window, cx)
+                                    match place {
+                                        RowPlace::Panel => {
+                                            this.open_routine(&history_id, window, cx)
+                                        }
+                                        RowPlace::Settings => {
+                                            this.open_routine_in_settings(&history_id, cx)
+                                        }
+                                    }
                                 },
                             )),
                         )
@@ -456,13 +462,24 @@ impl ConsortApp {
                                 .on_click(cx.listener(
                                     move |this, _, window, cx| {
                                         cx.stop_propagation();
-                                        this.open_channel_tab(crate::app::ChannelTab::Memory, cx);
-                                        this.open_note_in_panel(
-                                            &scope,
-                                            consort_client::proactivity::CHECK_IN_NOTE_PATH,
-                                            window,
-                                            cx,
-                                        );
+                                        let path = consort_client::proactivity::CHECK_IN_NOTE_PATH;
+                                        match place {
+                                            RowPlace::Panel => {
+                                                this.open_channel_tab(
+                                                    crate::app::ChannelTab::Memory,
+                                                    cx,
+                                                );
+                                                this.open_note_in_panel(&scope, path, window, cx);
+                                            }
+                                            // The note opens in Settings > Memory.
+                                            RowPlace::Settings => {
+                                                this.open_settings(
+                                                    crate::app::SettingsSection::Memory,
+                                                    cx,
+                                                );
+                                                this.open_note_in_settings(&scope, path, cx);
+                                            }
+                                        }
                                     },
                                 )),
                             )
@@ -545,7 +562,11 @@ impl ConsortApp {
                         )
                     })),
             )
-            .on_click(cx.listener(move |this, _, window, cx| this.open_routine(&id, window, cx)))
+            .on_click(cx.listener(move |this, _, window, cx| match place {
+                RowPlace::Panel => this.open_routine(&id, window, cx),
+                // A click in Settings stays in Settings.
+                RowPlace::Settings => this.open_routine_in_settings(&id, cx),
+            }))
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &MouseDownEvent, _, cx| {
@@ -567,6 +588,29 @@ impl ConsortApp {
         t: &Tokens,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        self.render_routine_page_in(routine, RowPlace::Panel, t, cx)
+    }
+
+    /// A routine opened in Settings > Routines, in place of the list. It has
+    /// Back at the top left and "Show in channel", which leaves Settings on
+    /// purpose.
+    pub fn render_settings_routine(
+        &mut self,
+        routine: &RoutineView,
+        t: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        self.render_routine_page_in(routine, RowPlace::Settings, t, cx)
+    }
+
+    /// The page of one routine, in the Channel panel or in Settings.
+    fn render_routine_page_in(
+        &mut self,
+        routine: &RoutineView,
+        place: RowPlace,
+        t: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let c = &t.colors;
         let k = t.component.knowledge;
         let now = consort_client::format::now_ms();
@@ -576,95 +620,125 @@ impl ConsortApp {
             .channel(&routine.channel_id)
             .map(|ch| ch.name.clone())
             .unwrap_or_default();
-        let (switch_id, run_id, edit_id) =
-            (routine.id.clone(), routine.id.clone(), routine.id.clone());
+        let (switch_id, run_id, edit_id, show_id) = (
+            routine.id.clone(),
+            routine.id.clone(),
+            routine.id.clone(),
+            routine.id.clone(),
+        );
         let enabled = routine.enabled;
         let more_routine = routine.clone();
-        let header = div()
+        let menu_routine = routine.clone();
+        let in_settings = place == RowPlace::Settings;
+        let title = div()
             .flex()
-            .flex_none()
-            .items_center()
-            .gap(t.space.xs)
-            .h(t.component.sidebar.title_bar)
-            .pl(t.space.sm)
-            .pr(t.space.sm)
-            .border_b(t.border_width)
-            .border_color(c.border_subtle)
-            .drag_area()
-            .child(
-                icon_button(
-                    "routine-back",
-                    "chevron-left",
-                    t.space.xxl,
-                    t.icon.size,
-                    c.text_secondary,
-                    c.hover_sidebar,
-                    t,
+            .flex_col()
+            .flex_1()
+            .min_w_0()
+            .child(line(routine.name.clone(), t.text.ui_strong, c.text_primary))
+            .child(line(
+                format!("Routine in {channel_name}"),
+                detail(t),
+                c.text_tertiary,
+            ));
+        let switch = small_switch("routine-page-switch", enabled, t)
+            .mr(t.space.xs)
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.run_knowledge_menu(
+                    KnowledgeAction::SetRoutineEnabled(switch_id.clone(), !enabled),
+                    window,
                     cx,
                 )
-                .debug_selector(|| "routine-back".into())
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.knowledge.routine_open = None;
-                    cx.notify();
-                })),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_w_0()
-                    .child(line(routine.name.clone(), t.text.ui_strong, c.text_primary))
-                    .child(line(
-                        format!("Routine in {channel_name}"),
-                        detail(t),
-                        c.text_tertiary,
-                    )),
-            )
-            .child(
-                small_switch("routine-page-switch", enabled, t)
-                    .mr(t.space.xs)
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.run_knowledge_menu(
-                            KnowledgeAction::SetRoutineEnabled(switch_id.clone(), !enabled),
-                            window,
-                            cx,
+            }));
+        let more = icon_button(
+            "routine-page-more",
+            "more-horizontal",
+            t.space.xxl,
+            t.icon.size,
+            c.text_secondary,
+            c.hover_sidebar,
+            t,
+            cx,
+        )
+        .on_click(
+            cx.listener(move |this, event: &gpui_kit::ClickEvent, _, cx| {
+                this.open_menu(
+                    OpenMenu::at(event.position(), routine_menu(&more_routine)),
+                    cx,
+                )
+            }),
+        );
+        let header = if in_settings {
+            // Back is at the top left of the content. "Show in channel"
+            // leaves Settings and says so.
+            div()
+                .flex()
+                .flex_col()
+                .flex_none()
+                .gap(t.space.lg)
+                .child(
+                    div().flex().child(
+                        icon_text_button("routine-back", "chevron-left", "Back", t)
+                            .debug_selector(|| "routine-back".into())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.close_settings_routine(cx);
+                            })),
+                    ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(t.space.md)
+                        .child(title)
+                        .child(
+                            leaving_link("routine-show-in-channel", "Show in channel", t)
+                                .debug_selector(|| "routine-show-in-channel".into())
+                                .mr(t.space.sm)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.open_routine(&show_id, window, cx)
+                                })),
                         )
+                        .child(switch)
+                        .child(more),
+                )
+        } else {
+            crate::ui::parts::panel_header(t)
+                .pl(t.space.sm)
+                .child(
+                    icon_button(
+                        "routine-back",
+                        "chevron-left",
+                        t.space.xxl,
+                        t.icon.size,
+                        c.text_secondary,
+                        c.hover_sidebar,
+                        t,
+                        cx,
+                    )
+                    .debug_selector(|| "routine-back".into())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.knowledge.routine_open = None;
+                        cx.notify();
                     })),
-            )
-            .child(
-                icon_button(
-                    "routine-page-more",
-                    "more-horizontal",
-                    t.space.xxl,
-                    t.icon.size,
-                    c.text_secondary,
-                    c.hover_sidebar,
-                    t,
-                    cx,
                 )
-                .on_click(cx.listener(
-                    move |this, event: &gpui_kit::ClickEvent, _, cx| {
-                        this.open_menu(
-                            OpenMenu::at(event.position(), routine_menu(&more_routine)),
-                            cx,
-                        )
-                    },
-                )),
-            )
-            .child(
-                icon_button(
-                    "channel-panel-close",
-                    "x",
-                    t.space.xxl,
-                    t.icon.size,
-                    c.text_secondary,
-                    c.hover_sidebar,
-                    t,
-                    cx,
+                .child(title)
+                .child(switch)
+                .child(more)
+                .child(
+                    icon_button(
+                        "channel-panel-close",
+                        "x",
+                        t.space.xxl,
+                        t.icon.size,
+                        c.text_secondary,
+                        c.hover_sidebar,
+                        t,
+                        cx,
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| this.close_panel(cx))),
                 )
-                .on_click(cx.listener(|this, _, _, cx| this.close_panel(cx))),
-            );
+        };
         let row = |label: &str, value: AnyElement| {
             div()
                 .flex()
@@ -688,7 +762,7 @@ impl ConsortApp {
             .gap(t.space.sm - t.space.xxs)
             .pt(t.space.md)
             .pb(t.space.md + t.space.xxs)
-            .px(t.space.lg)
+            .when(!in_settings, |d| d.px(t.space.lg))
             .border_b(t.border_width)
             .border_color(c.border_subtle)
             .child(row(
@@ -756,7 +830,7 @@ impl ConsortApp {
             .flex()
             .flex_col()
             .gap(t.space.xxs)
-            .px(t.space.sm)
+            .when(!in_settings, |d| d.px(t.space.sm))
             .pb(t.space.sm);
         if routine.runs_loaded && runs.is_empty() {
             list = list.child(div().px(t.space.sm).py(t.space.sm).child(text(
@@ -773,7 +847,52 @@ impl ConsortApp {
             )));
         }
         for run in runs {
-            list = list.child(self.run_row(run, &routine.schedule, &routine.channel_id, t, cx));
+            list =
+                list.child(self.run_row(run, &routine.schedule, &routine.channel_id, place, t, cx));
+        }
+        let runs_label = div()
+            .debug_selector(|| "routine-runs-label".into())
+            .flex()
+            .flex_none()
+            .items_baseline()
+            .gap(t.space.xs + t.space.xxs)
+            .pt(t.space.md + t.space.xxs)
+            .pb(t.space.xs + t.space.xxs)
+            .when(!in_settings, |d| d.px(t.space.lg))
+            .child(text("Run history", t.text.label, c.text_secondary))
+            .child(text("last 30 days", detail(t), c.text_tertiary));
+        // A right click on the page opens the menu of the routine, as on
+        // its row.
+        let on_right_click = cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+            this.open_menu(
+                OpenMenu::at(event.position, routine_menu(&menu_routine)),
+                cx,
+            );
+            cx.stop_propagation();
+        });
+        if in_settings {
+            return div()
+                .id("settings-routine-page")
+                .debug_selector(|| "settings-routine".into())
+                .flex_1()
+                .h_full()
+                .min_w_0()
+                .overflow_y_scroll()
+                .pt(t.space.page - t.space.sm)
+                .px(t.space.page)
+                .pb(t.space.page)
+                .on_mouse_down(MouseButton::Right, on_right_click)
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .max_w(t.component.settings_detail_max)
+                        .child(header)
+                        .child(div().pt(t.space.lg).child(summary))
+                        .child(runs_label)
+                        .child(list),
+                )
+                .into_any_element();
         }
         div()
             .id("channel-panel")
@@ -781,26 +900,15 @@ impl ConsortApp {
             .flex()
             .flex_col()
             .flex_none()
-            .w(t.layout.panel_width)
+            .w(self.right_panel_width(t))
             .h_full()
             .bg(c.surface_sidebar)
             .border_l(t.border_width)
             .border_color(c.border_subtle)
+            .on_mouse_down(MouseButton::Right, on_right_click)
             .child(header)
             .child(summary)
-            .child(
-                div()
-                    .debug_selector(|| "routine-runs-label".into())
-                    .flex()
-                    .flex_none()
-                    .items_baseline()
-                    .gap(t.space.xs + t.space.xxs)
-                    .pt(t.space.md + t.space.xxs)
-                    .pb(t.space.xs + t.space.xxs)
-                    .px(t.space.lg)
-                    .child(text("Run history", t.text.label, c.text_secondary))
-                    .child(text("last 30 days", detail(t), c.text_tertiary)),
-            )
+            .child(runs_label)
             .child(panel_scroll("routine-runs-scroll", list, t))
             .into_any_element()
     }
@@ -811,6 +919,7 @@ impl ConsortApp {
         run: &RoutineRunView,
         schedule: &consort_client::routines::RoutineSchedule,
         channel_id: &str,
+        place: RowPlace,
         t: &Tokens,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -824,34 +933,51 @@ impl ConsortApp {
                 RoutineRunStatus::Error | RoutineRunStatus::Skipped
             )
         });
-        let link: Option<(&str, AnyElement)> = match (&run.task_id, &run.message_id) {
+        // In the panel a run links to its message or task in place. In
+        // Settings the same link leaves Settings, so it says so.
+        let in_settings = place == RowPlace::Settings;
+        let link_id = SharedString::from(format!("run-link-{}", run.id));
+        let link_selector = link_id.to_string();
+        let link: Option<AnyElement> = match (&run.task_id, &run.message_id) {
             (Some(task_id), _) => {
-                let task_id = task_id.clone();
-                Some((
-                    "Task",
+                let (task_id, channel_id) = (task_id.clone(), channel_id.to_owned());
+                Some(if in_settings {
+                    leaving_link(link_id, "Show task", t)
+                        .debug_selector(move || link_selector)
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.show_task(&task_id, &channel_id, window, cx)
+                        }))
+                        .into_any_element()
+                } else {
                     div()
-                        .id(SharedString::from(format!("run-link-{}", run.id)))
+                        .id(link_id)
                         .cursor_pointer()
                         .child(text("Task", t.text.ui, c.text_secondary).underline())
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.open_thread(task_id.clone(), window, cx)
                         }))
-                        .into_any_element(),
-                ))
+                        .into_any_element()
+                })
             }
             (None, Some(message_id)) => {
                 let (channel_id, message_id) = (channel_id.to_owned(), message_id.clone());
-                Some((
-                    "Message",
+                Some(if in_settings {
+                    leaving_link(link_id, "Show in channel", t)
+                        .debug_selector(move || link_selector)
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.reveal_message(&channel_id, &message_id, window, cx)
+                        }))
+                        .into_any_element()
+                } else {
                     div()
-                        .id(SharedString::from(format!("run-link-{}", run.id)))
+                        .id(link_id)
                         .cursor_pointer()
                         .child(text("Message", t.text.ui, c.text_secondary).underline())
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.reveal_message(&channel_id, &message_id, window, cx)
                         }))
-                        .into_any_element(),
-                ))
+                        .into_any_element()
+                })
             }
             _ => None,
         };
@@ -920,10 +1046,32 @@ impl ConsortApp {
                     .flex()
                     .flex_none()
                     .justify_end()
-                    .w(k.run_link)
-                    .children(link.map(|(_, el)| el)),
+                    // The longer links of Settings take the room they need.
+                    .when(!in_settings, |d| d.w(k.run_link))
+                    .children(link),
             )
             .into_any_element()
+    }
+
+    /// Leaves Settings for a task: its channel opens, then its thread.
+    pub fn show_task(
+        &mut self,
+        task_id: &str,
+        fallback_channel: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let channel = self
+            .state
+            .task(task_id)
+            .map(|task| task.channel_id.clone())
+            .unwrap_or_else(|| fallback_channel.to_owned());
+        if self.state.channel(&channel).is_some() {
+            self.open_channel(channel, window, cx);
+        }
+        // The page changes even when the channel is not known.
+        self.page = Page::Main;
+        self.open_thread(task_id.to_owned(), window, cx);
     }
 
     /// Opens a channel and shows one of its messages in the timeline.
@@ -934,7 +1082,8 @@ impl ConsortApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.channel_id != channel_id {
+        // From Settings this leaves Settings, even for the open channel.
+        if self.channel_id != channel_id || self.page != Page::Main {
             self.open_channel(channel_id.to_owned(), window, cx);
         }
         let prefix = format!("{message_id}#");
@@ -957,6 +1106,13 @@ impl ConsortApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let c = &t.colors;
+        // A routine opens in place of the list, with Back.
+        if let Some(id) = self.knowledge.settings_routine.clone() {
+            match self.state.routines.iter().find(|r| r.id == id).cloned() {
+                Some(routine) => return self.render_settings_routine(&routine, t, cx),
+                None => self.knowledge.settings_routine = None,
+            }
+        }
         let query = self
             .knowledge_inputs
             .filter
@@ -1214,6 +1370,7 @@ impl ConsortApp {
             .h_full()
             .min_w_0()
             .overflow_y_scroll()
+            .track_scroll(&self.knowledge.settings_routines_scroll)
             .pt(t.space.page - t.space.sm)
             .px(t.space.page)
             .pb(t.space.page)

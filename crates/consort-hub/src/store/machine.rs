@@ -3,7 +3,7 @@
 use consort_proto::auth::PairingCode;
 use consort_proto::client_api::EntityPayload;
 use consort_proto::frame::FrameId;
-use consort_proto::ids::{ClientId, SessionId, WorkerId};
+use consort_proto::ids::{AccountId, ClientId, SessionId, WorkerId};
 use consort_proto::model::{Client, PairedBy, PushProvider, Worker, WorkerState};
 use consort_proto::time::Timestamp;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -67,6 +67,26 @@ fn origin_column(text: Option<String>) -> Option<Origin> {
 }
 
 // Workers ----------------------------------------------------------------
+
+/// The accounts that placement avoids now because they reached a usage limit.
+/// Empty when the user turned the move to another account off.
+pub fn limited_accounts(
+    conn: &Connection,
+    now: Timestamp,
+) -> Result<std::collections::HashSet<AccountId>> {
+    if !super::preferences::preferences(conn)?.account_fallback {
+        return Ok(std::collections::HashSet::new());
+    }
+    let mut stmt = conn.prepare("SELECT account_id FROM account_limits WHERE until_at > ?1")?;
+    let rows = stmt.query_map([now.as_millis()], |row| row.get::<_, String>(0))?;
+    let mut limited = std::collections::HashSet::new();
+    for row in rows {
+        if let Ok(id) = row?.parse() {
+            limited.insert(id);
+        }
+    }
+    Ok(limited)
+}
 
 pub fn worker(conn: &Connection, id: WorkerId) -> Result<Option<Worker>> {
     get_doc(
@@ -138,6 +158,22 @@ pub fn worker_records(conn: &Connection) -> Result<Vec<WorkerRecord>> {
 }
 
 impl Tx<'_> {
+    /// Saves that an account reached a usage limit, until the time when the
+    /// limit resets. Old rows go at the same time.
+    pub fn record_account_limit(&mut self, account_id: AccountId, until: Timestamp) -> Result<()> {
+        let now = self.now();
+        self.db().execute(
+            "DELETE FROM account_limits WHERE until_at <= ?1",
+            [now.as_millis()],
+        )?;
+        self.db().execute(
+            "INSERT INTO account_limits (account_id, until_at) VALUES (?1, ?2)
+             ON CONFLICT (account_id) DO UPDATE SET until_at = excluded.until_at",
+            params![account_id.to_string(), until.as_millis()],
+        )?;
+        Ok(())
+    }
+
     /// Records who made the pairing code that a new worker used.
     pub fn set_worker_paired_by(&mut self, id: WorkerId, by: Option<Origin>) -> Result<()> {
         self.db().execute(

@@ -1367,7 +1367,8 @@ impl ConsortApp {
                     t,
                 )
                 .on_click(cx.listener(move |this, _, window, cx| {
-                    this.open_dialog(Dialog::ChannelExtensions(ext_id.clone()), window, cx)
+                    this.close_dialog(window, cx);
+                    this.open_channel_connectors(ext_id.clone(), window, cx)
                 })),
             );
         let work = div()

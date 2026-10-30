@@ -197,15 +197,8 @@ impl ConsortApp {
                 .child(line(item.subtitle.clone(), detail(t), c.text_secondary))
                 .into_any_element(),
         };
-        let head = div()
-            .flex()
-            .flex_none()
-            .items_center()
-            .gap(t.space.sm)
-            .h(t.space.page + t.space.xs)
-            .px(t.space.sm)
-            .border_b(t.border_width)
-            .border_color(c.border_subtle)
+        let head = crate::ui::parts::panel_header(t)
+            .pl(t.space.sm)
             .child(
                 icon_button(
                     "item-back",

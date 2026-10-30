@@ -11,6 +11,7 @@ use consort_proto::worker_link::{HubToWorker, SessionSteer, SessionTurn, TurnInp
 use crate::error::{HubError, Result};
 use crate::hub::Hub;
 use crate::limits::{NOTICE_TEXT_MAX_BYTES, cut_text};
+use crate::ops::model_switch::{ModelPlan, detach_session, is_switching, plan_model};
 use crate::store::conversation::NewMessage;
 use crate::store::{Tx, machine, work};
 
@@ -19,7 +20,66 @@ pub(crate) fn notice_body(kind: &str, text: &str) -> String {
     serde_json::json!({ "kind": kind, "text": text }).to_string()
 }
 
+/// What a failed turn tells the user, for the `turn_failed` notice. All
+/// fields except the text are optional: an old worker sends no kind, and
+/// the notice then reads as `unknown`.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct TurnFailure {
+    pub kind: Option<consort_proto::model::TurnErrorKind>,
+    pub resets_at: Option<consort_proto::time::Timestamp>,
+    /// The name of the account that the turn ran on.
+    pub account: Option<String>,
+    /// The error text of the worker, unchanged.
+    pub raw: Option<String>,
+}
+
+/// The body of a `turn_failed` notice. `text` is the line that older
+/// clients show. The other fields are left out when empty.
+pub(crate) fn turn_failed_body(text: &str, failure: &TurnFailure) -> String {
+    let mut body = serde_json::json!({ "kind": "turn_failed", "text": text });
+    if let Some(object) = body.as_object_mut() {
+        if let Some(kind) = failure.kind {
+            object.insert("error_kind".to_owned(), kind.as_str().into());
+        }
+        if let Some(at) = failure.resets_at
+            && let Ok(value) = serde_json::to_value(at)
+        {
+            object.insert("resets_at".to_owned(), value);
+        }
+        if let Some(account) = &failure.account {
+            object.insert("account".to_owned(), account.clone().into());
+        }
+        if let Some(raw) = &failure.raw {
+            object.insert("raw".to_owned(), raw.clone().into());
+        }
+    }
+    body.to_string()
+}
+
 impl Tx<'_> {
+    /// Posts a `turn_failed` notice with the kind of the failure.
+    pub(crate) fn post_turn_failed(
+        &mut self,
+        channel_id: ChannelId,
+        thread_root: Option<MessageId>,
+        task_id: Option<TaskId>,
+        text: &str,
+        failure: &TurnFailure,
+    ) -> Result<Message> {
+        let text = cut_text(text, NOTICE_TEXT_MAX_BYTES);
+        let mut failure = failure.clone();
+        failure.raw = failure.raw.map(|raw| cut_text(&raw, NOTICE_TEXT_MAX_BYTES));
+        let mut new = NewMessage::new(
+            channel_id,
+            Author::System,
+            MessageKind::Notice,
+            turn_failed_body(&text, &failure),
+        );
+        new.thread_root_id = thread_root;
+        new.author_task_id = task_id;
+        self.insert_message(new)
+    }
+
     /// Posts a system notice, in a thread when `thread_root` is set.
     pub fn post_notice(
         &mut self,
@@ -115,11 +175,18 @@ pub(crate) fn transition(
 }
 
 /// What a delivery did, for the caller to finish after the commit.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct Delivered {
     pub delivery: MessageDelivery,
     pub worker_id: WorkerId,
     pub status_changed: bool,
+    /// The task moves to a new session on another model. The text waits in
+    /// its inbox. The caller calls [`Hub::after_delivery`] after the commit.
+    pub switch_task: Option<TaskId>,
+    /// Draft cards that the text replaced. The text went to the tool calls
+    /// that wait for them, not to the session. The caller calls
+    /// [`Hub::after_delivery`] after the commit.
+    pub replaced: Vec<consort_proto::ids::ApprovalId>,
 }
 
 /// Queues text for the session of a task: a new turn when no turn is open,
@@ -179,6 +246,20 @@ fn deliver(
         }
         TaskStatus::Working | TaskStatus::NeedsInput | TaskStatus::Review => {}
     }
+    // The task waits for its new session on another model: the text waits
+    // in the inbox, and the new session takes it.
+    if is_switching(&task)
+        && let Some(worker_id) = task.worker_id
+    {
+        tx.push_task_inbox(task_id, text, attachments)?;
+        return Ok(Delivered {
+            delivery: MessageDelivery::Queued,
+            worker_id,
+            status_changed: false,
+            switch_task: Some(task_id),
+            replaced: Vec::new(),
+        });
+    }
     let session_id = task
         .current_session_id
         .ok_or_else(|| HubError::conflict("The task has no session. Retry it first."))?;
@@ -194,6 +275,40 @@ fn deliver(
     } else {
         false
     };
+
+    // The task chose another model after this session started. The change
+    // goes with the next turn: in the same session when the harness can
+    // switch, else in a new session (the old one ends, the text waits).
+    let mut model_change = None;
+    if !runtime.turn_open {
+        match plan_model(tx.db(), &task, &session)? {
+            Ok(ModelPlan::Keep) => {}
+            Ok(ModelPlan::InSession(change)) => model_change = Some(change),
+            Ok(ModelPlan::NewSession) => {
+                task.updated_at = tx.now();
+                tx.save_task(&task)?;
+                // `detach_session` reads the task again, so the status
+                // change above is saved first.
+                detach_session(hub, tx, task_id, Some((text, attachments)))?;
+                return Ok(Delivered {
+                    delivery: MessageDelivery::Queued,
+                    worker_id: session.worker_id,
+                    status_changed,
+                    switch_task: Some(task_id),
+                    replaced: Vec::new(),
+                });
+            }
+            Err(reason) => {
+                tx.post_notice(
+                    task.channel_id,
+                    Some(task.card_message_id),
+                    Some(task.id),
+                    "model_not_changed",
+                    &format!("The task keeps its model for now. {reason}"),
+                )?;
+            }
+        }
+    }
 
     let steer = machine::worker(tx.db(), session.worker_id)?
         .and_then(|w| w.inventory)
@@ -231,6 +346,7 @@ fn deliver(
                 turn,
                 channel_files,
                 approval_mode: None,
+                model_change,
             }),
         )?;
         runtime.turn_open = true;
@@ -250,6 +366,8 @@ fn deliver(
         delivery,
         worker_id: session.worker_id,
         status_changed,
+        switch_task: None,
+        replaced: Vec::new(),
     })
 }
 
@@ -271,10 +389,20 @@ impl Hub {
                 Ok((delivered, task.channel_id))
             })
             .await?;
-        self.pump_worker(delivered.worker_id);
+        self.after_delivery(&delivered);
         if delivered.status_changed {
             self.kick_coordinator(channel);
         }
         Ok(delivered.delivery)
+    }
+
+    /// Finishes a delivery after its commit: pumps the worker and starts
+    /// the new session of a task that changed its model.
+    pub(crate) fn after_delivery(&self, delivered: &Delivered) {
+        self.pump_worker(delivered.worker_id);
+        if let Some(task_id) = delivered.switch_task {
+            self.spawn_switch(task_id);
+        }
+        self.signal_replaced(&delivered.replaced);
     }
 }

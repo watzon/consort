@@ -330,6 +330,7 @@ fn approval_status_str(status: ApprovalStatus) -> &'static str {
         ApprovalStatus::Denied => "denied",
         ApprovalStatus::Expired => "expired",
         ApprovalStatus::Canceled => "canceled",
+        ApprovalStatus::Replaced => "replaced",
     }
 }
 

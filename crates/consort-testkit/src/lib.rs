@@ -19,7 +19,8 @@ use consort_harness::{
 use consort_proto::ids::{ItemId, NativeRef, RequestId, TurnId};
 use consort_proto::model::{
     ApprovalDetails, ApprovalMode, AssistantMessagePayload, AuthState, CommandPayload, ItemPayload,
-    ItemStatus, ModelInfo, RequestOption, RequestOptionKind, SessionItem, SessionState,
+    ItemStatus, ModelInfo, ModelOptions, RequestOption, RequestOptionKind, SessionItem,
+    SessionState,
 };
 use consort_proto::time::Timestamp;
 use consort_proto::worker_link::{
@@ -63,6 +64,16 @@ pub enum FakeStep {
     Sleep(Duration),
     /// End the turn as failed.
     Fail(String),
+    /// End the turn as failed, with the kind and the reset time that the
+    /// adapter reports.
+    FailWith {
+        /// The error text.
+        message: String,
+        /// The kind.
+        kind: consort_proto::model::TurnErrorKind,
+        /// When a rate limit resets.
+        resets_at: Option<Timestamp>,
+    },
 }
 
 /// The script of a fake session.
@@ -104,6 +115,8 @@ pub struct FakeRecord {
     pub mode_changes: Vec<ApprovalMode>,
     /// The approval mode that each turn ran in, in order.
     pub turn_modes: Vec<ApprovalMode>,
+    /// Every model change of a session: the model and the options.
+    pub model_changes: Vec<(String, ModelOptions)>,
 }
 
 /// How [`FakeHarness::open`] fails, after [`FakeHarness::set_open_failure`].
@@ -142,6 +155,9 @@ pub struct FakeHarness {
     /// When set, the session cannot change its approval mode, like a
     /// harness that takes its mode only at start.
     pub fixed_mode: bool,
+    /// When set, every model change of a session fails, as when the
+    /// harness refuses the model.
+    pub fail_model_change: bool,
 }
 
 impl FakeHarness {
@@ -158,6 +174,7 @@ impl FakeHarness {
                 usage: false,
                 mcp_http: true,
                 approval_modes: ApprovalMode::ALL.to_vec(),
+                switch_model: true,
                 ..Capabilities::default()
             },
             fail_resume: false,
@@ -166,6 +183,7 @@ impl FakeHarness {
             session_capabilities: None,
             uses_managed_tools: false,
             fixed_mode: false,
+            fail_model_change: false,
         }
     }
 
@@ -301,6 +319,7 @@ impl Harness for FakeHarness {
                 steer_delay: self.steer_delay,
                 mode,
                 fixed_mode: self.fixed_mode,
+                fail_model_change: self.fail_model_change,
             }),
             rx,
         ))
@@ -324,6 +343,7 @@ struct FakeSession {
     /// The approval mode that the next turn runs in.
     mode: ApprovalMode,
     fixed_mode: bool,
+    fail_model_change: bool,
 }
 
 async fn play(
@@ -350,6 +370,8 @@ async fn play(
     .await;
     let mut reason = TurnEndReason::Completed;
     let mut error = None;
+    let mut error_kind = None;
+    let mut resets_at = None;
     for step in steps {
         if cancel.has_changed().unwrap_or(false) {
             reason = TurnEndReason::Interrupted;
@@ -456,12 +478,25 @@ async fn play(
                 error = Some(message);
                 break;
             }
+            FakeStep::FailWith {
+                message,
+                kind,
+                resets_at: at,
+            } => {
+                reason = TurnEndReason::Failed;
+                error = Some(message);
+                error_kind = Some(kind);
+                resets_at = at;
+                break;
+            }
         }
     }
     send(SessionEvent::TurnEnded {
         turn_id: turn,
         reason,
         error,
+        error_kind,
+        resets_at,
     })
     .await;
     send(SessionEvent::State {
@@ -529,6 +564,20 @@ impl HarnessSession for FakeSession {
             record.mode_changes.push(mode);
         }
         self.mode = mode;
+        Ok(())
+    }
+
+    async fn set_model(&mut self, model: &str, options: &ModelOptions) -> Result<(), HarnessError> {
+        if self.fail_model_change {
+            return Err(HarnessError::Protocol(
+                "the fake harness refused the model".to_owned(),
+            ));
+        }
+        if let Ok(mut record) = self.record.lock() {
+            record
+                .model_changes
+                .push((model.to_owned(), options.clone()));
+        }
         Ok(())
     }
 
@@ -655,6 +704,7 @@ mod tests {
             options: Default::default(),
             approval_mode: ApprovalMode::Ask,
             allow_shell: true,
+            coordinator: false,
             system_prompt_append: String::new(),
             mcp_servers: vec![],
             env: BTreeMap::new(),

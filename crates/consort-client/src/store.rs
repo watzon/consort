@@ -333,6 +333,44 @@ impl Store {
     }
 }
 
+/// The window layout that the user chose. It lives on this computer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct LayoutSettings {
+    /// The user hid the sidebar.
+    #[serde(default)]
+    pub sidebar_hidden: bool,
+    /// The width that the user dragged the right panel to.
+    #[serde(default)]
+    pub panel_width: Option<f32>,
+}
+
+impl Store {
+    fn layout_path(&self) -> PathBuf {
+        self.dir.join("layout.json")
+    }
+
+    /// The saved window layout. A missing or damaged file reads as the
+    /// defaults.
+    pub fn load_layout(&self) -> LayoutSettings {
+        let path = self.layout_path();
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return LayoutSettings::default();
+        };
+        serde_json::from_str(&text).unwrap_or_else(|err| {
+            tracing::warn!(path = %path.display(), error = %err, "the layout file is damaged, so the client uses the defaults");
+            LayoutSettings::default()
+        })
+    }
+
+    /// Saves the window layout through a temporary file and a rename.
+    pub fn save_layout(&self, layout: &LayoutSettings) -> Result<(), ClientError> {
+        let path = self.layout_path();
+        std::fs::create_dir_all(&self.dir).map_err(|e| storage_error(&self.dir, e))?;
+        let text = serde_json::to_string_pretty(layout).map_err(|e| storage_error(&path, e))?;
+        write_private(&path, &text).map_err(|e| storage_error(&path, e))
+    }
+}
+
 /// Writes a file that only this user can read, through a temporary file in
 /// the same folder and a rename, so a reader sees the old file or the new
 /// one and never half of it.

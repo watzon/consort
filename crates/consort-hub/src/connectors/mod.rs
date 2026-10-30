@@ -36,6 +36,7 @@ pub(crate) mod connections;
 pub(crate) mod extensions;
 pub(crate) mod key;
 pub(crate) mod logos;
+pub(crate) mod replace;
 pub(crate) mod run;
 
 use composio::{ApiKey, Client, KeyHealth, Tool, Toolkit};
@@ -232,6 +233,13 @@ impl Connectors {
             waiters.insert(approval_id, tx);
         }
         rx
+    }
+
+    /// Whether a call waits for the card.
+    pub(crate) fn waiter_exists(&self, approval_id: ApprovalId) -> bool {
+        self.waiters
+            .lock()
+            .is_ok_and(|w| w.contains_key(&approval_id))
     }
 
     /// Takes the waiter of a card. Whoever takes it owns the answer: the
@@ -842,6 +850,9 @@ pub(crate) mod fake;
 
 #[cfg(test)]
 mod flow_tests;
+
+#[cfg(test)]
+mod replace_tests;
 
 #[cfg(test)]
 mod proactive_tests;

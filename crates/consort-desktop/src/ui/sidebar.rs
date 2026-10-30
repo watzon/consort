@@ -1,4 +1,4 @@
-//! The sidebar: search, Tutti, the groups of channels, New channel, the
+//! The sidebar: Tutti, the groups of channels, New channel, the
 //! workers and the account. The macOS traffic lights sit in its title bar
 //! strip (`component.sidebar.title_bar`). The sizes come from
 //! `component.sidebar` in `design/structure.json`.
@@ -41,11 +41,13 @@ pub fn row(t: &Tokens) -> Div {
 /// A group label in the sidebar or the settings rail.
 pub fn group_label(t: &Tokens) -> Div {
     let sb = t.component.sidebar;
+    // A fixed height, so the buttons that show on hover never move a row.
     div()
         .flex()
+        .flex_none()
         .items_center()
         .gap(t.space.xs)
-        .py(sb.label_pad_y)
+        .h(sb.label_row)
         .px(sb.row_pad_x)
 }
 
@@ -53,7 +55,7 @@ impl ConsortApp {
     pub fn render_sidebar(
         &mut self,
         t: &Tokens,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let c = &t.colors;
@@ -62,26 +64,13 @@ impl ConsortApp {
         let sidebar = &state.sidebar;
         let selected = self.channel_id.clone();
 
-        let search = focusable(row(t).id("search"), t)
-            .debug_selector(|| "sidebar-search".into())
-            .cursor_pointer()
-            .hover(|s| s.bg(c.hover_sidebar))
-            .child(icon("search", sb.row_icon, c.text_secondary))
-            .child(text("Search", sb.row_text, c.text_secondary).flex_1())
-            .child(text(
-                if cfg!(target_os = "macos") {
-                    "⌘K"
-                } else {
-                    "Ctrl+K"
-                },
-                t.text.ui,
-                c.text_tertiary,
-            ))
-            .on_click(cx.listener(|this, _, window, cx| this.open_switcher(window, cx)));
-
         // Before the first snapshot, Tutti is an empty row. It would
         // open a channel with no ID, so it waits with the other channels.
         let waiting = self.waiting();
+        if !sidebar.tutti.id.is_empty() {
+            let mark = state.activity(&sidebar.tutti.id).state;
+            crate::ui::mark::load_row_frames(mark, t, window, cx);
+        }
         let tutti = (!sidebar.tutti.id.is_empty())
             .then(|| self.channel_row(&sidebar.tutti, true, &selected, t, cx));
 
@@ -91,7 +80,8 @@ impl ConsortApp {
             let group_id = group.id.clone();
             let hover_key = group.id.clone();
             let hovered = self.row_hovered(&group.id);
-            let buttons = hovered.then(|| self.group_buttons(&group.id, &group.name, t, cx));
+            let buttons = self.group_buttons(&group.id, &group.name, hovered, t, cx);
+            let menu_group = group.id.clone();
             let mut block = div()
                 .flex()
                 .flex_col()
@@ -123,7 +113,15 @@ impl ConsortApp {
                             t.icon.dense,
                             c.text_tertiary,
                         )))
-                        .children(buttons)
+                        .child(buttons)
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |this, event: &gpui_kit::MouseDownEvent, _, cx| {
+                                let items = this.group_menu_items(&menu_group);
+                                this.open_menu(OpenMenu::at(event.position, items), cx);
+                                cx.stop_propagation();
+                            }),
+                        )
                         .on_click(cx.listener(move |this, _, _, cx| {
                             let client = this.client.clone();
                             let group_id = group_id.clone();
@@ -271,17 +269,19 @@ impl ConsortApp {
                         .h(title_bar_height(t))
                         .flex_none()
                         .w_full()
-                        .drag_area(),
+                        .drag_zone(),
                 )
             })
-            .when(!cfg!(target_os = "macos"), |d| d.pt(sb.inset))
+            // Elsewhere the strip has only Search and Hide sidebar.
+            .when(!cfg!(target_os = "macos"), |d| {
+                d.child(div().h(title_bar_height(t)).flex_none().w_full())
+            })
             .child(
                 div()
                     .flex()
                     .flex_col()
                     .gap(t.space.xxs)
                     .pt(t.space.xs)
-                    .child(search)
                     .children(tutti),
             )
             .child(
@@ -396,8 +396,8 @@ impl ConsortApp {
         let id = channel.id.clone();
         let menu_id = channel.id.clone();
         let leading = if tutti {
-            // The Three voices mark, idle and sharp.
-            crate::ui::mark::still_mark(sb.row_icon, t)
+            // The Three voices mark. It moves while something happens.
+            crate::ui::mark::row_mark(self.state.activity(&channel.id).state, sb.row_icon, t, cx)
         } else {
             icon(&channel.icon, sb.row_icon, c.text_secondary).into_any_element()
         };
@@ -441,6 +441,14 @@ impl ConsortApp {
                 .when(self.row_hovered("tutti"), |d| {
                     d.child(self.tutti_plus(t, cx))
                 })
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(|this, event: &gpui_kit::MouseDownEvent, _, cx| {
+                        let items = crate::ui::convo_sidebar::new_menu_items();
+                        this.open_menu(OpenMenu::at(event.position, items), cx);
+                        cx.stop_propagation();
+                    }),
+                )
         })
         .when(!tutti || channel.status.is_some(), |d| d.child(status))
         .on_click(cx.listener(move |this, _, window, cx| this.open_channel(id.clone(), window, cx)))

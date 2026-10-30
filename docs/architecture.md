@@ -89,6 +89,8 @@ If the home network is down, the phone still reaches the hub. Chat, memory, rout
 
 Each channel has one coordinator session. The coordinator is the assistant in that channel. Its system prompt holds the channel's purpose, its instructions, the index of global memory and channel memory, and the rules for the hub tools.
 
+A coordinator does no shell, web or file work: it starts a task for that. The prompt says so, and the hub and the worker enforce it. A coordinator session always runs in Ask, whatever the default approval mode of the channel (that mode is for the channel's tasks), and the worker denies every approval request of the session except a call to a hub tool, with a steer that tells the model to start a task. Hub tools, including connector tools, keep their own rules. This refines [ADR 0013](adr/0013-the-assistant-is-proactive-within-limits.md): the coordinator asks nothing and refuses instead. See DECISIONS 700.
+
 The Tutti coordinator has three more tools: `list_channels`, `read_channel` and `message_channel`. With those, it can answer questions about any channel, and it can steer a channel by posting a message in that channel. It also has the management tools for channels, workers, accounts, connections and skills (see [Connectors, skills and management](#connectors-skills-and-management)). It writes only global memory. Channel coordinators read global memory and write only their own channel memory. That split comes straight from Duet: the main chat sees everything but owns only the facts about the user.
 
 Memory changes move up one level at a time. A task that learns something, such as "never push to main", calls `suggest_memory`. Its channel coordinator gets the suggestion in its next turn and decides whether to write a channel memory note. A channel coordinator that learns a fact about the user suggests it to the Tutti coordinator in the same way. So the assistant keeps one memory with one owner for each scope, and every note has a coordinator that chose to keep it.
@@ -97,7 +99,7 @@ Memory changes move up one level at a time. A task that learns something, such a
 
 A coordinator's assistant text is not posted on its own. The coordinator posts with `post_message` and `reply`. Three behaviors depend on that:
 
-- It can answer in several short messages, as Duet does.
+- It posts one message for one reply. It does not split a long reply, because a long result is a document that a task writes.
 - It can reply inside a thread instead of the timeline.
 - It can decide to say nothing when a task update needs no comment.
 
@@ -111,6 +113,8 @@ The hub's timeline and memory are the source of truth. A coordinator's harness s
 - the memory index (the notes stay readable through `memory_read`),
 - the open tasks with their status,
 - the last 50 timeline messages.
+
+The open tasks are not only in the context pack. Every later turn that has a message from the user starts with an `<open_tasks>` block (ID, title and status of at most 20 open tasks), so the coordinator can tell that a message is about a task and pass it on with `message_task` and `user_message_id` (see DECISIONS 702 and 704).
 
 Because the session is a cache, the user can change a channel's harness or model at any time. The next coordinator session starts on the new choice with the same context pack.
 
@@ -137,6 +141,20 @@ When the user turns on "Write in my voice", drafts that go out in the user's nam
 - **Edits.** Allowed draft cards become draft pairs. Five edited pairs of one context wake Tutti with `voice_edits`; "Not how I write" wakes it with `voice_feedback`. Tutti proposes rule changes as offers.
 
 The client shows Settings > Voice, the offer with "Open the full guide", the voice task's card with its steps, and the draft card with its flags, the tick, Edit and "Not how I write".
+
+### The account of a task
+
+A task runs on the first of these that exists: its own selection, the task selection of its channel, the task selection of Tutti, and the coordinator selection that its channel uses. The first two are choices of the user: when no worker can run them, the task waits or fails. The other two are defaults: when the task needs a worker without that account, the default rule of placement decides. When a task starts, the hub saves its account and model on the task, so a later change to the channel does not move it.
+
+### The move to another account at a usage limit
+
+A turn that fails with the kind `rate_limit` marks its account as limited in `account_limits`, until the limit resets. While `account_fallback` is on, placement does not choose a limited account when another signed-in account of the same harness has the same model and can keep the approval mode. The move never goes to another harness or another model.
+
+- **A task** gets the new account as its selection, and the hub ends its session and starts a new one on the same worker. The new session keeps the workspace and goes on from the brief and the task thread, as after a change of model. The task stays on that account.
+- **The assistant** gets a new session on the new account, and the events of the failed turn go back to the queue. The session stays on that account until it ends. A later session goes back to the chosen account when its limit has reset.
+- **Both accounts at their limit:** the task fails, or the channel shows the error, as with one account. No turn runs in a loop, because the move needs an account that is not limited.
+
+The thread or the channel gets an `account_fallback` notice that names both accounts.
 
 ### The model of the assistant
 

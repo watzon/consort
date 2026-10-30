@@ -252,6 +252,18 @@ _Avoid_: warning, risk marker, highlight
 A draft that the assistant wrote and the text that went out, which the hub keeps for 90 days. A pair that the user sent unchanged is the assistant's text and is never used for learning.
 _Avoid_: edit history, diff
 
+**Draft card**:
+A card with text that goes out in the user's name. A connector card of an outgoing tool shows a title (the subject, or "Email to <name>"), the To and connection lines, the text and the words Send and Not now (Save draft for a tool that only saves a draft). After the answer it says "Sent to <name>", "Not sent" or "Replaced by a new version", and the text that went out. A message of the user that arrives while the card waits closes it as "Replaced by a new version" and goes to the assistant, which writes the draft again or answers. A card from `show_draft` is for text that no connection can send. It waits for nobody, and the user edits it or copies it.
+_Avoid_: preview, send dialog
+
+**Task line**:
+The one line that stands for a task in the chat: the status glyph, the title and the state ("Working, 2 min", "Needs you", "Ready for review"). While the task runs, it has no card under it. A click opens the task thread. Resolve is in the thread.
+_Avoid_: task card (the card is only for a pending approval, a failed task or the voice task)
+
+**Plan**:
+The checklist that the harness makes for a task. The thread shows it as a card under the newest message, and its header says "Working, <current step>".
+_Avoid_: todo list, steps
+
 **Memory suggestion**:
 A note that a task or a channel coordinator proposes for memory, which the coordinator one level up accepts or rejects.
 _Avoid_: memory proposal, pending memory
@@ -291,7 +303,7 @@ A folder in the Agent Skills format, with a `SKILL.md`, that the hub installs fr
 _Avoid_: plugin, prompt, recipe, tool
 
 **Use in**:
-Where a connection or a skill can be used: every channel, the channels that have all of some tags, or a list of channels. Tutti matches only "every channel", unless it has tags of its own.
+Where a connection or a skill can be used: Tutti only, every channel, the channels that have all of some tags, or a list of channels. Tutti only is a list with only Tutti. Tutti matches tags only when it has tags of its own.
 _Avoid_: scope (in the UI), visibility, sharing
 
 **Channel exception**:

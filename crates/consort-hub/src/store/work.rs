@@ -699,6 +699,15 @@ pub fn approval_by_request(
     )
 }
 
+/// Pending approvals of one task.
+pub fn pending_approvals_of_task(conn: &Connection, task_id: TaskId) -> Result<Vec<Approval>> {
+    list_docs(
+        conn,
+        "SELECT data FROM approvals WHERE status = 'pending' AND task_id = ?1 ORDER BY rowid",
+        [task_id.to_string()],
+    )
+}
+
 /// Pending approvals, in one channel or in all.
 pub fn pending_approvals(
     conn: &Connection,

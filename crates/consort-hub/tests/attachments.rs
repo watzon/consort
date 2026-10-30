@@ -369,6 +369,8 @@ async fn start_task_attaches_channel_files_to_each_session_and_hides_its_own_art
                 turn_id: "t1".into(),
                 reason: TurnEndReason::Failed,
                 error: Some("boom".to_owned()),
+                error_kind: None,
+                resets_at: None,
             }],
         )
         .await;

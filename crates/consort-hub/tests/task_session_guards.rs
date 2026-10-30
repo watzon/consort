@@ -34,6 +34,8 @@ async fn retried_task(world: &mut World) -> (TaskId, SessionId, SessionId) {
                     turn_id: "t1".into(),
                     reason: TurnEndReason::Failed,
                     error: Some("boom".to_owned()),
+                    error_kind: None,
+                    resets_at: None,
                 },
             ],
         )
@@ -241,6 +243,8 @@ async fn a_refused_steer_for_a_task_that_failed_posts_a_notice() {
                 turn_id: "t1".into(),
                 reason: TurnEndReason::Failed,
                 error: Some("boom".to_owned()),
+                error_kind: None,
+                resets_at: None,
             }],
         )
         .await;

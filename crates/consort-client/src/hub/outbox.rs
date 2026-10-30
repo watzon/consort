@@ -156,6 +156,7 @@ impl Shared {
                         body: pending.body.clone(),
                         channel_name,
                         message,
+                        created_at: pending.created_at,
                     });
                 }
             }

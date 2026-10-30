@@ -1,8 +1,10 @@
 //! Regression test for review cycle 3, finding S1.
 //!
 //! A new worker caps sessions at Auto (`default_max_mode` in
-//! `consort-worker`). Settings tells the user that Auto asks before
-//! anything riskier than running commands in its workspace. OpenCode and
+//! `consort-worker`). Settings tells the user what Auto does on each
+//! harness: on Claude Code it asks only for destructive actions and for
+//! actions outside the workspace, and on Gemini CLI and OpenCode it still
+//! asks before commands. OpenCode and
 //! Gemini CLI have no sandbox, so a mode that lets commands run with no
 //! prompt is Full access for them. These tests make sure that only Full
 //! access maps to such a configuration, for every adapter.
@@ -48,9 +50,9 @@ fn auto_asks_before_commands_and_fetches_in_harnesses_with_no_sandbox() {
         gemini_mode(ApprovalMode::FullAccess)
     );
 
-    // Claude Auto asks before commands, and Codex Auto runs commands in a
-    // `workspace-write` sandbox.
-    assert_eq!(claude_mode(ApprovalMode::Auto), "acceptEdits");
+    // Claude Auto is Claude Code's own `auto` mode, and Codex Auto runs
+    // commands in a `workspace-write` sandbox.
+    assert_eq!(claude_mode(ApprovalMode::Auto), "auto");
     assert_eq!(
         codex_policy(ApprovalMode::Auto),
         ("never", "workspace-write")

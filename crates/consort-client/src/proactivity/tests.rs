@@ -44,6 +44,7 @@ fn message(channel: ChannelId, author: Author, at: i64, body: &str) -> model::Me
         created_at: Timestamp::from_millis(at),
         suggestions: Vec::new(),
         proactive: None,
+        source_message_id: None,
     }
 }
 
@@ -282,6 +283,119 @@ fn the_writing_bubble_shows_while_the_reply_is_owed() {
     cache.messages.insert(answer.id.to_string(), answer);
     let state = view(&cache);
     assert!(!is_writing(&state, &id.to_string()));
+}
+
+#[test]
+fn a_failed_turn_ends_the_writing_bubble_and_other_notices_do_not() {
+    let (mut cache, id) = cache_with(Vec::new());
+    let notice = |kind: &str, at: i64| {
+        let body = serde_json::json!({ "kind": kind, "text": "Some text" }).to_string();
+        let mut m = message(id, Author::System, at, &body);
+        m.kind = consort_proto::model::MessageKind::Notice;
+        m
+    };
+    let mine = message(id, Author::User, NOW - 4_000, "Yes");
+    cache.messages.insert(mine.id.to_string(), mine);
+    // A notice during the turn: the reply is still owed.
+    let saved = notice("memory_saved", NOW - 3_000);
+    cache.messages.insert(saved.id.to_string(), saved);
+    assert!(is_writing(&view(&cache), &id.to_string()));
+    // The turn failed: nothing more comes.
+    let failed = notice("turn_failed", NOW - 2_000);
+    cache.messages.insert(failed.id.to_string(), failed);
+    assert!(!is_writing(&view(&cache), &id.to_string()));
+    // The user tries again: a new reply is owed.
+    let again = message(id, Author::User, NOW - 1_000, "Try again");
+    cache.messages.insert(again.id.to_string(), again);
+    assert!(is_writing(&view(&cache), &id.to_string()));
+}
+
+fn thread_of(
+    status: crate::view::TaskStatus,
+    posts: Vec<crate::view::ThreadPost>,
+) -> crate::view::TaskThreadView {
+    crate::view::TaskThreadView {
+        task_id: "tsk_1".into(),
+        status,
+        posts,
+        ..crate::view::TaskThreadView::default()
+    }
+}
+
+fn notice_post(quiet: bool) -> crate::view::ThreadPost {
+    let card = crate::turn_errors::ErrorCardView {
+        quiet,
+        ..crate::turn_errors::ErrorCardView::default()
+    };
+    crate::view::ThreadPost {
+        id: "pst_failed".into(),
+        speaker: Speaker::System,
+        time_label: "9:00 AM".into(),
+        bodies: vec![crate::view::PostBody::Notice {
+            kind: "turn_failed".into(),
+            text: "The turn failed.".into(),
+            error: Some(card),
+            draft: None,
+        }],
+        pending: false,
+        source_message_id: None,
+        refused: None,
+    }
+}
+
+fn text_post(speaker: Speaker) -> crate::view::ThreadPost {
+    crate::view::ThreadPost {
+        id: "pst_text".into(),
+        speaker,
+        time_label: "9:00 AM".into(),
+        bodies: vec![crate::view::PostBody::Text("Reading the plan.".into())],
+        pending: false,
+        source_message_id: None,
+        refused: None,
+    }
+}
+
+#[test]
+fn the_writing_bubble_shows_in_a_task_thread_only_while_the_task_works() {
+    use crate::view::TaskStatus as S;
+    // A working task shows it, with posts or with none, under the newest
+    // message of the task or of the user.
+    assert!(is_task_writing(&thread_of(S::Working, Vec::new())));
+    assert!(is_task_writing(&thread_of(
+        S::Working,
+        vec![text_post(Speaker::Task)]
+    )));
+    assert!(is_task_writing(&thread_of(
+        S::Working,
+        vec![text_post(Speaker::You)]
+    )));
+    // Every other status means that the turn ended or waits for the user.
+    for status in [S::UpNext, S::NeedsInput, S::Review, S::Failed, S::Resolved] {
+        assert!(
+            !is_task_writing(&thread_of(status, Vec::new())),
+            "{status:?} shows no bubble"
+        );
+    }
+}
+
+#[test]
+fn a_live_failure_notice_ends_the_wait_and_a_quiet_one_does_not() {
+    use crate::view::TaskStatus as S;
+    // The notice came before the status moved to Failed: no more text comes.
+    assert!(!is_task_writing(&thread_of(
+        S::Working,
+        vec![text_post(Speaker::Task), notice_post(false)]
+    )));
+    // The user tried again: the old notice is quiet and a new turn runs.
+    assert!(is_task_writing(&thread_of(
+        S::Working,
+        vec![notice_post(true)]
+    )));
+    // A newer post after a live notice means that the turn went on.
+    assert!(is_task_writing(&thread_of(
+        S::Working,
+        vec![notice_post(false), text_post(Speaker::Task)]
+    )));
 }
 
 #[test]

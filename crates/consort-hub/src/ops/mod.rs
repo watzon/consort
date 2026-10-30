@@ -2,10 +2,12 @@
 
 pub(crate) mod accounts;
 mod conversation;
+pub(crate) mod drafts;
 pub(crate) mod flow;
 pub(crate) mod hooks;
 pub(crate) mod knowledge;
 pub(crate) mod machines;
+pub(crate) mod model_switch;
 mod preferences;
 pub(crate) mod registry;
 mod routines;

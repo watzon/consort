@@ -1,7 +1,8 @@
 //! The app side of connectors and skills: the state of their dialogs, the
 //! connect flow, and the hub cards that wait for the browser or a sign-in.
 //! The views are in `ui/connectors.rs`, `ui/skills.rs`,
-//! `ui/channel_extensions.rs` and `ui/hub_cards.rs`.
+//! `ui/channel_extensions.rs` (the Connectors tab of the Channel panel) and
+//! `ui/hub_cards.rs`.
 
 use consort_client::{
     ApprovalChoice, AuthKind, ChannelKind, Command, CommandOutput, ConnectionChanges,
@@ -184,6 +185,9 @@ pub struct ExtState {
     pub skill: Option<String>,
     pub connect: ConnectForm,
     pub add_skill: AddSkillForm,
+    /// The open Choose where to use it dialog.
+    pub use_in_picker: Option<UseInPicker>,
+    pub use_in_scroll: gpui_kit::ScrollHandle,
     pub files: SkillFilesForm,
     pub activity: ActivityForm,
     /// Connect cards that the user continued: the app opens the sign-in page
@@ -220,22 +224,61 @@ pub fn scope_tags(state: &ViewState) -> Vec<String> {
     channel
 }
 
-/// A Use in with one tag added or taken away. No tag left means every
-/// channel.
-pub fn toggle_tag(use_in: &UseInView, tag: &str) -> UseInView {
-    let mut tags = match use_in {
-        UseInView::Tags(tags) => tags.clone(),
-        _ => Vec::new(),
-    };
-    if let Some(at) = tags.iter().position(|t| t == tag) {
-        tags.remove(at);
+/// Adds a value to a list, or takes it away.
+pub fn toggle_in(list: &mut Vec<String>, value: &str) {
+    if let Some(at) = list.iter().position(|v| v == value) {
+        list.remove(at);
     } else {
-        tags.push(tag.to_owned());
+        list.push(value.to_owned());
     }
-    if tags.is_empty() {
-        UseInView::EveryChannel
-    } else {
-        UseInView::Tags(tags)
+}
+
+/// The tab of the Choose where to use it dialog.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UseInPickerTab {
+    Channels,
+    Tags,
+}
+
+/// The open Choose where to use it dialog. Both lists stay while the user
+/// moves between the tabs, and Save uses the list of the open tab.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UseInPicker {
+    pub target: UseInTarget,
+    pub tab: UseInPickerTab,
+    pub channels: Vec<String>,
+    pub tags: Vec<String>,
+}
+
+impl UseInPicker {
+    /// The dialog for a scope: the tab and the choice that it holds now.
+    pub fn new(target: UseInTarget, current: &UseInView) -> Self {
+        let (tab, channels, tags) = match current {
+            UseInView::Tags(tags) => (UseInPickerTab::Tags, Vec::new(), tags.clone()),
+            UseInView::Channels(ids) => (UseInPickerTab::Channels, ids.clone(), Vec::new()),
+            UseInView::EveryChannel => (UseInPickerTab::Channels, Vec::new(), Vec::new()),
+        };
+        Self {
+            target,
+            tab,
+            channels,
+            tags,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        match self.tab {
+            UseInPickerTab::Channels => self.channels.is_empty(),
+            UseInPickerTab::Tags => self.tags.is_empty(),
+        }
+    }
+
+    /// The scope that Save gives.
+    pub fn use_in(&self) -> UseInView {
+        match self.tab {
+            UseInPickerTab::Channels => UseInView::Channels(self.channels.clone()),
+            UseInPickerTab::Tags => UseInView::Tags(self.tags.clone()),
+        }
     }
 }
 
@@ -1399,15 +1442,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_tag_toggles_and_no_tag_means_every_channel() {
-        let work = toggle_tag(&UseInView::EveryChannel, "work");
-        assert_eq!(work, UseInView::Tags(vec!["work".into()]));
-        let both = toggle_tag(&work, "gpu");
-        assert_eq!(both, UseInView::Tags(vec!["work".into(), "gpu".into()]));
-        assert_eq!(
-            toggle_tag(&toggle_tag(&both, "gpu"), "work"),
-            UseInView::EveryChannel
-        );
+    fn the_use_in_picker_starts_from_the_scope_and_saves_the_open_tab() {
+        let mut picker = UseInPicker::new(UseInTarget::ConnectDialog, &UseInView::EveryChannel);
+        assert_eq!(picker.tab, UseInPickerTab::Channels);
+        assert!(picker.is_empty(), "every channel preselects nothing");
+        toggle_in(&mut picker.channels, "a");
+        toggle_in(&mut picker.channels, "b");
+        toggle_in(&mut picker.channels, "a");
+        assert_eq!(picker.use_in(), UseInView::Channels(vec!["b".into()]));
+        picker.tab = UseInPickerTab::Tags;
+        assert!(picker.is_empty(), "Save uses the open tab");
+        toggle_in(&mut picker.tags, "work");
+        assert_eq!(picker.use_in(), UseInView::Tags(vec!["work".into()]));
+        let again = UseInPicker::new(UseInTarget::ConnectDialog, &picker.use_in());
+        assert_eq!(again.tab, UseInPickerTab::Tags);
+        assert_eq!(again.tags, ["work"]);
     }
 
     #[test]

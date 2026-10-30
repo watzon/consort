@@ -116,7 +116,9 @@ fn an_answer_does_not_go_out_while_the_hub_is_offline(cx: &mut TestAppContext) {
     });
     settle(cx, 200);
     // The user sees why, and the approval still waits.
-    let notice = app.read_with(cx, |a, _| a.notices.current().map(|n| n.message.clone()));
+    let notice = app.read_with(cx, |a, _| {
+        a.notices.visible().last().map(|n| n.message.clone())
+    });
     assert_eq!(
         notice.as_deref(),
         Some(consort_client::offline::WAITING_FOR_HUB)

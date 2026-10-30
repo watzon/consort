@@ -350,6 +350,8 @@ fn add_made_line(timeline: &mut TimelineView, channel: &Channel) {
         kind: "channel_created".to_owned(),
         text: format!("You made the channel {}.", channel.name),
         memory: None,
+        draft: None,
+        error: None,
     });
     // After the day line of the first day, before every message.
     let at_index = timeline
@@ -364,7 +366,9 @@ fn add_made_line(timeline: &mut TimelineView, channel: &Channel) {
 /// and has not posted yet. That is when the user's message is the newest
 /// one and reached the hub, or when a new channel has no message yet and
 /// its assistant works on the greeting. A proactive turn in a channel with
-/// messages shows no bubble, because it may end in silence.
+/// messages shows no bubble, because it may end in silence. A failed turn
+/// owes nothing: its notice ends the wait. Other notices, such as a saved
+/// memory note, can come during a turn and do not.
 pub fn is_writing(view: &ViewState, channel_id: &str) -> bool {
     let Some(timeline) = view.timeline(channel_id) else {
         return false;
@@ -376,7 +380,7 @@ pub fn is_writing(view: &ViewState, channel_id: &str) -> bool {
                 | TimelineItem::Decision(_)
                 | TimelineItem::TaskCard(_)
                 | TimelineItem::Approval(_)
-        )
+        ) || matches!(item, TimelineItem::Notice(n) if n.kind == "turn_failed")
     });
     match newest {
         Some(TimelineItem::Message(m)) => m.speaker == Speaker::You && !m.pending,
@@ -386,6 +390,27 @@ pub fn is_writing(view: &ViewState, channel_id: &str) -> bool {
                 && view.activity(channel_id).state == crate::activity::MarkState::Working
         }
     }
+}
+
+/// Whether the writing bubble shows in the thread of a task: the task
+/// works, so its turn runs, and no event has ended the turn. A turn ends
+/// when the task leaves Working (it needs input, goes to review, fails or
+/// is resolved), and when a `turn_failed` notice that is still live is the
+/// newest post of the thread. A notice that is quiet (the user tried again,
+/// or the task is no longer Failed) is old, so it ends nothing.
+pub fn is_task_writing(thread: &crate::view::TaskThreadView) -> bool {
+    if thread.status != crate::view::TaskStatus::Working {
+        return false;
+    }
+    let live_failure = thread.posts.last().is_some_and(|post| {
+        post.bodies.iter().any(|body| {
+            matches!(
+                body,
+                crate::view::PostBody::Notice { error: Some(card), .. } if !card.quiet
+            )
+        })
+    });
+    !live_failure
 }
 
 // The morning brief ---------------------------------------------------------

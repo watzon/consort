@@ -1295,6 +1295,7 @@ pub(crate) mod tests {
             },
             channel_files: None,
             approval_mode: None,
+            model_change: None,
         }
         .into();
         let turn_id = FrameId::new("cmd-turn");
@@ -1458,6 +1459,7 @@ pub(crate) mod tests {
             turn: TurnInput::default(),
             channel_files: None,
             approval_mode: None,
+            model_change: None,
         }
         .into();
         lock(&core.inflight).insert("c9".to_owned());
@@ -2156,6 +2158,7 @@ pub(crate) mod tests {
             },
             channel_files: None,
             approval_mode: mode,
+            model_change: None,
         }
         .into();
         let id = format!("turn-{session_id}-{n}");
@@ -2227,6 +2230,116 @@ pub(crate) mod tests {
                 ApprovalMode::Auto
             ]
         );
+    }
+
+    /// Sends one turn that carries a model change and waits for the result.
+    async fn turn_with_model(
+        core: &Arc<Core>,
+        session_id: SessionId,
+        n: u32,
+        model: &str,
+    ) -> Result<(), consort_proto::error::ErrorBody> {
+        let turn: HubToWorker = SessionTurn {
+            session_id,
+            turn: TurnInput {
+                text: format!("Turn {n}"),
+                attachments: vec![],
+            },
+            channel_files: None,
+            approval_mode: None,
+            model_change: Some(consort_proto::worker_link::SessionModelChange {
+                model: model.to_owned(),
+                options: Default::default(),
+            }),
+        }
+        .into();
+        let id = format!("turn-{session_id}-{n}");
+        core.dispatch(request(&FrameId::new(&id), &turn));
+        wait_until("the turn result", || {
+            core.store.command_result(&id).unwrap().is_some()
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        match core.store.command_result(&id).unwrap() {
+            Some(crate::store::StoredResult::Ok { .. }) => Ok(()),
+            Some(crate::store::StoredResult::Err { error }) => Err(error),
+            None => unreachable!("waited for the result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_turn_with_a_model_change_sets_the_model_first_and_saves_it() {
+        use consort_proto::model::ApprovalMode;
+        let fake = FakeHarness::new(HarnessKind::ClaudeCode, FakeScript::reply("Hi."));
+        let record = fake.record();
+        let (_dir, core, account_id) = fake_worker(&fake);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        core.link.attach(tx);
+        let session_id = start_with_turn(&core, account_id, ApprovalMode::Auto).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        turn_with_model(&core, session_id, 1, "opus-next")
+            .await
+            .unwrap();
+        {
+            let record = record.lock().unwrap();
+            assert_eq!(record.model_changes.len(), 1);
+            assert_eq!(record.model_changes[0].0, "opus-next");
+            assert_eq!(record.turns.len(), 2, "the turn ran after the change");
+        }
+        // The stored start has the new model, so a restart resumes with it.
+        let stored = core.store.session(session_id).unwrap().unwrap();
+        assert_eq!(stored.start.model, "opus-next");
+    }
+
+    #[tokio::test]
+    async fn a_failed_model_change_refuses_the_turn_as_unsupported() {
+        use consort_proto::model::ApprovalMode;
+        let mut fake = FakeHarness::new(HarnessKind::ClaudeCode, FakeScript::reply("Hi."));
+        fake.fail_model_change = true;
+        let record = fake.record();
+        let (_dir, core, account_id) = fake_worker(&fake);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        core.link.attach(tx);
+        let session_id = start_with_turn(&core, account_id, ApprovalMode::Auto).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let before = core.store.session(session_id).unwrap().unwrap().start.model;
+        let err = turn_with_model(&core, session_id, 1, "opus-next")
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, consort_proto::error::ErrorCode::Unsupported);
+        assert_eq!(
+            record.lock().unwrap().turns.len(),
+            1,
+            "the turn did not run"
+        );
+        assert_eq!(
+            core.store.session(session_id).unwrap().unwrap().start.model,
+            before,
+            "the saved model did not change"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_harness_that_cannot_switch_its_model_refuses_the_turn_as_unsupported() {
+        use consort_proto::model::{ApprovalMode, Capabilities};
+        let mut fake = FakeHarness::new(HarnessKind::ClaudeCode, FakeScript::reply("Hi."));
+        fake.session_capabilities = Some(Capabilities {
+            switch_model: false,
+            ..Capabilities::default()
+        });
+        let record = fake.record();
+        let (_dir, core, account_id) = fake_worker(&fake);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        core.link.attach(tx);
+        let session_id = start_with_turn(&core, account_id, ApprovalMode::Auto).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let err = turn_with_model(&core, session_id, 1, "opus-next")
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, consort_proto::error::ErrorCode::Unsupported);
+        assert!(record.lock().unwrap().model_changes.is_empty());
+        // A turn without a change still runs.
+        turn_in_mode(&core, session_id, 2, None).await.unwrap();
     }
 
     #[tokio::test]

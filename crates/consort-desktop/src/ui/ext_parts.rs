@@ -12,7 +12,7 @@ use gpui_kit::{
 
 use crate::{
     app::ConsortApp,
-    extensions::{UseInTarget, scope_tags},
+    extensions::{UseInPicker, UseInTarget},
     ui::{
         menu::{MenuAction, MenuItem, OpenMenu},
         parts::{detail, focusable, icon, text},
@@ -157,9 +157,9 @@ fn use_in_key(target: &UseInTarget) -> &'static str {
     }
 }
 
-/// The Use in control: "Every channel" or "Channels tagged" with the tags.
-/// "Channels tagged" opens a menu of every tag, to add or take one away.
-/// `wide` makes the two segments fill the width, as in a dialog.
+/// The Use in control: "Tutti only", "Every channel", and a button that opens
+/// a dialog to choose channels or tags. The button shows the choice.
+/// `wide` makes the segments fill the width, as in a dialog.
 pub fn use_in_control(
     target: UseInTarget,
     current: &UseInView,
@@ -170,13 +170,18 @@ pub fn use_in_control(
 ) -> Div {
     let c = &t.colors;
     let key = use_in_key(&target);
+    let tutti_id = app.state.sidebar.tutti.id.clone();
+    let tutti = consort_client::use_in_is_only(current, &tutti_id);
     let every = matches!(current, UseInView::EveryChannel);
+    let chosen = !tutti && !every;
     let tags: Vec<String> = match current {
         UseInView::Tags(tags) => tags.clone(),
         _ => Vec::new(),
     };
-    let segment = |id: &str, active: bool| {
-        focusable(div().id(SharedString::from(format!("{key}-{id}"))), t)
+    let segment = |id: &'static str, active: bool| {
+        let selector = format!("{key}-{id}");
+        focusable(div().id(SharedString::from(selector.clone())), t)
+            .debug_selector(move || selector)
             .flex()
             .items_center()
             .justify_center()
@@ -190,9 +195,9 @@ pub fn use_in_control(
             .when(active, |d| d.bg(c.surface_selected))
             .when(!active, |d| d.hover(|s| s.bg(c.hover_card)))
     };
-    let label = |content: &str, active: bool| {
+    let label = |content: String, active: bool| {
         text(
-            content.to_owned(),
+            content,
             if active { t.text.ui_strong } else { t.text.ui },
             if active {
                 c.text_primary
@@ -201,9 +206,14 @@ pub fn use_in_control(
             },
         )
     };
+    let tutti_target = target.clone();
     let every_target = target.clone();
-    let tagged_target = target.clone();
-    let tagged = !tags.is_empty();
+    let choose_target = target.clone();
+    let choose_label = if chosen {
+        consort_client::use_in_choice_label(current, &app.state.channels)
+    } else {
+        "Choose channels or tags".to_owned()
+    };
     div()
         .relative()
         .flex()
@@ -212,49 +222,33 @@ pub fn use_in_control(
         .bg(c.surface_card)
         .rounded(t.radius.md)
         .when(wide, |d| d.w_full())
-        .child(app.triggers.track(key))
+        .child(
+            segment("tutti", tutti)
+                .child(label("Tutti only".to_owned(), tutti))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    let id = this.state.sidebar.tutti.id.clone();
+                    if !id.is_empty() {
+                        this.set_use_in(tutti_target.clone(), UseInView::Channels(vec![id]), cx);
+                    }
+                })),
+        )
         .child(
             segment("every", every)
-                .child(label("Every channel", every))
+                .child(label("Every channel".to_owned(), every))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.set_use_in(every_target.clone(), UseInView::EveryChannel, cx)
                 })),
         )
         .child(
-            segment("tagged", tagged)
-                .child(label("Channels tagged", tagged))
+            segment("choose", chosen)
+                .child(label(choose_label, chosen))
                 .children(tags.iter().map(|tag| scope_tag(tag, t)))
-                .when(!tagged, |d| {
-                    d.child(icon("chevron-down", t.icon.dense, c.text_tertiary))
-                })
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    let Some(bounds) = this.triggers.get(key) else {
-                        return;
-                    };
-                    let current = this.use_in_of(&tagged_target);
-                    let chosen: Vec<String> = match &current {
-                        UseInView::Tags(tags) => tags.clone(),
-                        _ => Vec::new(),
-                    };
-                    let all = scope_tags(&this.state);
-                    if all.is_empty() {
-                        this.show_notice(
-                            "No channel has a tag yet. Give a channel a tag with Worker tags in its menu, then choose it here.".into(),
-                            cx,
-                        );
-                        return;
-                    }
-                    let items: Vec<MenuItem> = all
-                        .iter()
-                        .map(|tag| {
-                            MenuItem::new(
-                                tag.clone(),
-                                MenuAction::ToggleScopeTag(tagged_target.clone(), tag.clone()),
-                            )
-                            .checked(chosen.contains(tag))
-                        })
-                        .collect();
-                    this.open_menu(OpenMenu::under(bounds, items, false), cx);
+                    let current = this.use_in_of(&choose_target);
+                    this.ext.use_in_picker =
+                        Some(UseInPicker::new(choose_target.clone(), &current));
+                    this.ext.use_in_scroll = gpui_kit::ScrollHandle::new();
+                    cx.notify();
                 })),
         )
 }

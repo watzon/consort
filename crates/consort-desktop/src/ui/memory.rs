@@ -29,7 +29,6 @@ use crate::{
             selectable, text,
         },
         routines::panel_scroll,
-        window_controls::DragArea as _,
     },
 };
 
@@ -344,17 +343,8 @@ impl ConsortApp {
         };
         let (edit_scope, edit_path) = (scope.to_owned(), path.to_owned());
         let (menu_scope, menu_path) = (scope.to_owned(), path.to_owned());
-        let header = div()
-            .flex()
-            .flex_none()
-            .items_center()
-            .gap(t.space.xs)
-            .h(t.component.sidebar.title_bar)
+        let header = crate::ui::parts::panel_header(t)
             .pl(t.space.sm)
-            .pr(t.space.sm)
-            .border_b(t.border_width)
-            .border_color(c.border_subtle)
-            .drag_area()
             .child(
                 icon_button(
                     "note-back",
@@ -476,7 +466,7 @@ impl ConsortApp {
             .flex()
             .flex_col()
             .flex_none()
-            .w(t.layout.panel_width)
+            .w(self.right_panel_width(t))
             .h_full()
             .bg(c.surface_sidebar)
             .border_l(t.border_width)

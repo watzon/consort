@@ -35,8 +35,9 @@ pub const CATALOG_REFRESH_MS: i64 = 24 * 60 * 60 * 1_000;
 /// Where a connection or a skill can be used. Serialized with a `kind`
 /// field.
 ///
-/// The Tutti channel matches only [`UseIn::EveryChannel`], unless it
-/// has tags of its own.
+/// The Tutti channel matches [`UseIn::EveryChannel`] and a list that names
+/// it. It matches tags only when it has tags of its own. A list with only
+/// Tutti is the "Tutti only" choice of the UI.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum UseIn {

@@ -33,6 +33,7 @@ fn spec(dir: &std::path::Path, mode: ApprovalMode) -> SessionSpec {
         options: Default::default(),
         approval_mode: mode,
         allow_shell: true,
+        coordinator: false,
         system_prompt_append: "You are a smoke test. Keep answers short.".into(),
         mcp_servers: Vec::new(),
         env: BTreeMap::new(),

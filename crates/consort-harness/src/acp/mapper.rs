@@ -225,12 +225,17 @@ fn raw_command_folder(raw: &Value) -> Option<&str> {
 /// The tool name of a tool call: the Claude tool name in `_meta` when there
 /// is one, else the title.
 fn tool_name(value: &Value, title: &str) -> String {
+    claude_tool_name(value).unwrap_or(title).to_owned()
+}
+
+/// The Claude tool name in `_meta`, which `claude-agent-acp` sets from the
+/// tool call itself. The title is not like it: the agent and the model
+/// choose the title, and for many tools it holds the arguments.
+fn claude_tool_name(value: &Value) -> Option<&str> {
     value
         .get("_meta")
         .and_then(|m| m.get("claudeCode"))
         .and_then(|c| str_field(c, "toolName"))
-        .unwrap_or(title)
-        .to_owned()
 }
 
 fn tool_payload(value: &Value, kind: &str, title: &str) -> ItemPayload {
@@ -528,6 +533,20 @@ impl AcpMapper {
     /// Closes the open items at the end of a turn and returns the
     /// `turn.ended` event last.
     pub fn end_turn(&mut self, reason: TurnEndReason, error: Option<String>) -> Vec<SessionEvent> {
+        let info = match (reason, error.as_deref()) {
+            (TurnEndReason::Failed, Some(text)) => crate::classify_failure(text),
+            _ => crate::FailureInfo::default(),
+        };
+        self.end_turn_as(reason, error, info)
+    }
+
+    /// Like [`Self::end_turn`], with the failure kind that the caller knows.
+    pub fn end_turn_as(
+        &mut self,
+        reason: TurnEndReason,
+        error: Option<String>,
+        info: crate::FailureInfo,
+    ) -> Vec<SessionEvent> {
         let mut events = Vec::new();
         self.close_text(&mut events);
         let item_status = match reason {
@@ -539,6 +558,8 @@ impl AcpMapper {
             turn_id: self.tracker.turn().clone(),
             reason,
             error,
+            error_kind: (info.kind != crate::TurnErrorKind::Unknown).then_some(info.kind),
+            resets_at: info.resets_at,
         });
         events
     }
@@ -586,10 +607,16 @@ impl AcpMapper {
                     .to_owned(),
             },
             _ => {
-                let name = tool_name(&merged, &title);
-                let (server, tool) = match split_mcp_name(&name) {
-                    Some((server, tool)) => (Some(server), tool),
-                    None => (None, name),
+                // The server comes only from the tool name in `_meta`. A
+                // title such as `mcp__hub__post_message` can come from any
+                // agent, and the worker allows a hub tool without a card by
+                // this name, so a title must not pass for one.
+                let (server, tool) = match claude_tool_name(&merged) {
+                    Some(name) => match split_mcp_name(name) {
+                        Some((server, tool)) => (Some(server), tool),
+                        None => (None, name.to_owned()),
+                    },
+                    None => (None, title.clone()),
                 };
                 ApprovalDetails::Tool {
                     server,

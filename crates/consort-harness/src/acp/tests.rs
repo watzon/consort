@@ -211,8 +211,19 @@ fn permission_requests_map_details_and_options() {
         "toolCall": {"toolCallId": "y", "title": "mcp__github__create_issue", "rawInput": {"title": "Bug"}},
         "options": []
     }));
+    // A title is chosen by the agent and the model, so it never names a
+    // server. The worker allows a hub tool without a card by the server.
     assert!(
-        matches!(&tool.body, RequestBody::Approval(ApprovalDetails::Tool { server: Some(s), tool, .. }) if s == "github" && tool == "create_issue")
+        matches!(&tool.body, RequestBody::Approval(ApprovalDetails::Tool { server: None, tool, .. }) if tool == "mcp__github__create_issue")
+    );
+    // The tool name that Claude Code sets in `_meta` does name the server.
+    let claude = m.map_permission(RequestId::new("acp-4"), &json!({
+        "toolCall": {"toolCallId": "z", "title": "Create an issue", "rawInput": {"title": "Bug"},
+                     "_meta": {"claudeCode": {"toolName": "mcp__github__create_issue"}}},
+        "options": []
+    }));
+    assert!(
+        matches!(&claude.body, RequestBody::Approval(ApprovalDetails::Tool { server: Some(s), tool, .. }) if s == "github" && tool == "create_issue")
     );
 }
 
@@ -576,6 +587,7 @@ mod fake_agent {
                 .collect(),
             approval_mode: ApprovalMode::Ask,
             allow_shell: true,
+            coordinator: false,
             system_prompt_append: "You are a coordinator.".into(),
             mcp_servers: vec![McpServerSpec {
                 name: "hub".into(),
@@ -605,6 +617,11 @@ mod fake_agent {
         ignore_cancel: bool,
         /// The mode option offers `bypassPermissions`.
         bypass: bool,
+        /// The mode option does not offer `auto`.
+        no_auto: bool,
+        /// `session/set_config_option` for `mode` fails when the value is
+        /// `auto`, like Claude Code does for an account without it.
+        refuse_auto: bool,
         /// The first permission request is the one to leave plan mode.
         plan_exit: bool,
         /// After the first permission answer, the agent reports this mode.
@@ -618,6 +635,12 @@ mod fake_agent {
         silent: bool,
         /// The agent reports `promptCapabilities.image`.
         images: bool,
+        /// The model `haiku` has no `auto` mode: choosing it drops `auto`
+        /// to `acceptEdits`, and the mode option does not offer `auto`
+        /// while it is the model, like the Claude Code adapter.
+        no_auto_on_haiku: bool,
+        /// Choosing this model fails.
+        refuse_model: Option<&'static str>,
     }
 
     /// The config options of the fake session.
@@ -633,8 +656,10 @@ mod fake_agent {
                 json!({"value": "default", "name": "Default"}),
                 json!({"value": "acceptEdits", "name": "Accept edits"}),
                 json!({"value": "plan", "name": "Plan"}),
-                json!({"value": "auto", "name": "Auto"}),
             ];
+            if !behavior.no_auto {
+                choices.push(json!({"value": "auto", "name": "Auto"}));
+            }
             if behavior.bypass {
                 choices.push(json!({"value": "bypassPermissions", "name": "Bypass permissions"}));
             }
@@ -655,6 +680,7 @@ mod fake_agent {
         behavior: Behavior,
     ) {
         let mut mode = "acceptEdits".to_owned();
+        let mut model_now = "opus".to_owned();
         let mut mode_sets = 0;
         let (read, mut write) = tokio::io::split(stream);
         let mut lines = BufReader::new(read).lines();
@@ -700,8 +726,35 @@ mod fake_agent {
                     .await;
                 }
                 Some("session/set_config_option") => {
+                    if msg["params"]["configId"] == "model" {
+                        let value = msg["params"]["value"].as_str().unwrap_or_default();
+                        if behavior.refuse_model == Some(value) {
+                            send(&mut write, json!({"jsonrpc": "2.0", "id": id.clone(), "error": {"code": -32602, "message": "Model is not available"}})).await;
+                            continue;
+                        }
+                        model_now = value.to_owned();
+                        if behavior.no_auto_on_haiku && model_now == "haiku" && mode == "auto" {
+                            mode = "acceptEdits".to_owned();
+                        }
+                    }
+                    let behavior = Behavior {
+                        no_auto: behavior.no_auto
+                            || (behavior.no_auto_on_haiku && model_now == "haiku"),
+                        ..behavior
+                    };
                     if msg["params"]["configId"] == "mode" {
+                        if behavior.no_auto_on_haiku
+                            && model_now == "haiku"
+                            && msg["params"]["value"] == "auto"
+                        {
+                            send(&mut write, json!({"jsonrpc": "2.0", "id": id.clone(), "error": {"code": -32602, "message": "Auto mode is not available"}})).await;
+                            continue;
+                        }
                         mode_sets += 1;
+                        if behavior.refuse_auto && msg["params"]["value"] == "auto" {
+                            send(&mut write, json!({"jsonrpc": "2.0", "id": id.clone(), "error": {"code": -32602, "message": "Auto mode is not available"}})).await;
+                            continue;
+                        }
                         if behavior.refuse_reset && mode_sets > 1 {
                             send(&mut write, json!({"jsonrpc": "2.0", "id": id.clone(), "error": {"code": -32603, "message": "Internal error"}})).await;
                             continue;
@@ -739,10 +792,17 @@ mod fake_agent {
                         // OAuth token: an internal error that carries the
                         // API error in its data.
                         "Expire401" => Some((-32603, "Internal error")),
+                        // A rate limit, as the API error in the data.
+                        "Limit" => Some((-32603, "Internal error")),
                         _ => None,
                     };
                     if let Some((code, message)) = failure {
                         let mut error = json!({"code": code, "message": message});
+                        if text == "Limit" {
+                            error["data"] = json!({
+                                "details": "API Error: 429 {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"Weekly limit reached\"}} {\"resetsAt\": 1760000500}"
+                            });
+                        }
                         if text == "Expire401" {
                             error["data"] = json!({
                                 "kind": "authentication_failed",
@@ -1132,8 +1192,26 @@ mod fake_agent {
         );
         assert!(matches!(
             turn.last(),
-            Some(SessionEvent::TurnEnded { reason: TurnEndReason::Failed, error: Some(error), .. })
+            Some(SessionEvent::TurnEnded { reason: TurnEndReason::Failed, error: Some(error), error_kind: None, resets_at: None, .. })
                 if error.contains("Internal error")
+        ));
+
+        // An expired sign-in has its kind.
+        let turn = events_of_turn(&mut session, &mut events, "Expire").await;
+        assert!(matches!(
+            turn.last(),
+            Some(SessionEvent::TurnEnded { error_kind: Some(kind), .. })
+                if *kind == consort_proto::model::TurnErrorKind::ExpiredSignIn
+        ));
+
+        // A rate limit that the API error names has its kind and its reset
+        // time, read from the data of the error.
+        let turn = events_of_turn(&mut session, &mut events, "Limit").await;
+        assert!(matches!(
+            turn.last(),
+            Some(SessionEvent::TurnEnded { reason: TurnEndReason::Failed, error_kind: Some(kind), resets_at: Some(at), .. })
+                if *kind == consort_proto::model::TurnErrorKind::RateLimit
+                    && at.as_millis() == 1_760_000_500_000
         ));
         session.close().await.unwrap();
     }
@@ -1203,6 +1281,128 @@ mod fake_agent {
         let (read, write) = tokio::io::split(client_side);
         let result = connect(kind, spec, write, read, None, StderrTail::empty()).await;
         (result, log)
+    }
+
+    /// The `model`, `effort` and `mode` values that were set, in order, as
+    /// `model=x`.
+    fn config_sets(log: &Arc<Mutex<Vec<Value>>>) -> Vec<String> {
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter(|m| m["method"] == "session/set_config_option")
+            .map(|m| {
+                format!(
+                    "{}={}",
+                    m["params"]["configId"].as_str().unwrap(),
+                    m["params"]["value"].as_str().unwrap()
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn the_open_sets_the_model_before_the_mode() {
+        let mut auto = spec();
+        auto.approval_mode = ApprovalMode::Auto;
+        let (result, log) = connect_with(HarnessKind::ClaudeCode, auto, Behavior::default()).await;
+        let (session, _events, _ready) = result.unwrap();
+        let session: Box<dyn HarnessSession> = Box::new(session);
+        assert_eq!(
+            config_sets(&log),
+            vec!["model=sonnet", "effort=high", "mode=auto"]
+        );
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_model_without_auto_opens_in_accept_edits_and_does_not_fail() {
+        // The model comes first, so the adapter has dropped `auto` before the
+        // mode is set. The open asks for nothing it cannot get.
+        let mut auto = spec();
+        auto.approval_mode = ApprovalMode::Auto;
+        auto.model = "haiku".into();
+        let behavior = Behavior {
+            no_auto_on_haiku: true,
+            ..Behavior::default()
+        };
+        let (result, log) = connect_with(HarnessKind::ClaudeCode, auto, behavior).await;
+        let (session, _events, _ready) = result.unwrap();
+        let session: Box<dyn HarnessSession> = Box::new(session);
+        assert_eq!(config_sets(&log), vec!["model=haiku"]);
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_model_change_in_the_session_sets_the_mode_again() {
+        let mut auto = spec();
+        auto.approval_mode = ApprovalMode::Auto;
+        let behavior = Behavior {
+            no_auto_on_haiku: true,
+            ..Behavior::default()
+        };
+        let (result, log) = connect_with(HarnessKind::ClaudeCode, auto, behavior).await;
+        let (session, _events, _ready) = result.unwrap();
+        assert!(session.capabilities().switch_model);
+        let mut session: Box<dyn HarnessSession> = Box::new(session);
+        assert_eq!(
+            config_sets(&log),
+            vec!["model=sonnet", "effort=high", "mode=auto"]
+        );
+
+        // To a model without `auto`: the adapter drops the mode and refuses
+        // `auto`. The change works, and the session goes on in
+        // `acceptEdits`.
+        session
+            .set_model("haiku", &ModelOptions::new())
+            .await
+            .unwrap();
+        let sets = config_sets(&log);
+        assert_eq!(sets[3..], ["model=haiku", "mode=auto"], "{sets:?}");
+
+        // Back to a model with `auto`: the mode is set again, and now it
+        // sticks. Without this, the session would stay in `acceptEdits`.
+        let options: ModelOptions = [("effort".to_owned(), OptionValue::Text("high".into()))]
+            .into_iter()
+            .collect();
+        session.set_model("sonnet", &options).await.unwrap();
+        let sets = config_sets(&log);
+        assert_eq!(
+            sets[5..],
+            ["model=sonnet", "effort=high", "mode=auto"],
+            "{sets:?}"
+        );
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_model_change_that_the_agent_refuses_fails_and_the_session_stays_open() {
+        let behavior = Behavior {
+            refuse_model: Some("haiku"),
+            ..Behavior::default()
+        };
+        let (result, _log) = connect_with(HarnessKind::ClaudeCode, spec(), behavior).await;
+        let (session, _events, _ready) = result.unwrap();
+        let mut session: Box<dyn HarnessSession> = Box::new(session);
+        let err = session
+            .set_model("haiku", &ModelOptions::new())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("haiku"), "{err}");
+        // A model that the option does not offer fails too.
+        let err = session
+            .set_model("gpt-9", &ModelOptions::new())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("gpt-9"), "{err}");
+        session.close().await.unwrap();
+    }
+
+    #[test]
+    fn only_the_checked_agents_report_a_model_switch() {
+        assert!(static_capabilities(HarnessKind::ClaudeCode).switch_model);
+        assert!(static_capabilities(HarnessKind::OpenCode).switch_model);
+        assert!(!static_capabilities(HarnessKind::GeminiCli).switch_model);
+        assert!(!static_capabilities(HarnessKind::Acp).switch_model);
     }
 
     #[tokio::test]
@@ -1536,12 +1736,27 @@ mod fake_agent {
         next_matching(&mut events, |e| matches!(e, SessionEvent::TurnEnded { .. })).await;
         session.close().await.unwrap();
 
-        // Auto edits and Auto map to `acceptEdits`, so auto mode and bypass
-        // go, and "auto-accept edits" stays.
-        let (session, _events, opened) = plan_exit_request(ApprovalMode::Auto).await;
+        // Auto edits maps to `acceptEdits`, so auto mode and bypass go, and
+        // "auto-accept edits" stays.
+        let (session, _events, opened) = plan_exit_request(ApprovalMode::AutoEdits).await;
         assert_eq!(
             ids(&opened),
             vec!["exit-plan-accept-edits", "exit-plan-default", "reject"]
+        );
+        session.close().await.unwrap();
+
+        // Auto maps to Claude Code's `auto` mode, so auto mode stays and
+        // only bypass goes.
+        let (session, _events, opened) = plan_exit_request(ApprovalMode::Auto).await;
+        assert_eq!(
+            ids(&opened),
+            vec![
+                "exit-plan-clear-auto",
+                "exit-plan-auto",
+                "exit-plan-accept-edits",
+                "exit-plan-default",
+                "reject"
+            ]
         );
         session.close().await.unwrap();
 
@@ -1619,6 +1834,120 @@ mod fake_agent {
         session.close().await.unwrap();
     }
 
+    /// The values of the `mode` option that the worker set, in order.
+    fn mode_sets(log: &Arc<Mutex<Vec<Value>>>) -> Vec<String> {
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter(|m| {
+                m["method"] == "session/set_config_option" && m["params"]["configId"] == "mode"
+            })
+            .map(|m| m["params"]["value"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn auto_opens_claude_in_its_own_auto_mode() {
+        let mut auto = spec();
+        auto.approval_mode = ApprovalMode::Auto;
+        let (result, log) = connect_with(HarnessKind::ClaudeCode, auto, Behavior::default()).await;
+        let (session, _events, _ready) = result.unwrap();
+        let session: Box<dyn HarnessSession> = Box::new(session);
+        assert_eq!(mode_sets(&log), vec!["auto"]);
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn auto_falls_back_to_accept_edits_when_claude_has_no_auto_mode() {
+        // The adapter does not offer `auto`: the open asks for nothing it
+        // cannot get, and the session goes on in `acceptEdits`.
+        let mut auto = spec();
+        auto.approval_mode = ApprovalMode::Auto;
+        let behavior = Behavior {
+            no_auto: true,
+            ..Behavior::default()
+        };
+        let (result, log) = connect_with(HarnessKind::ClaudeCode, auto.clone(), behavior).await;
+        let (session, _events, _ready) = result.unwrap();
+        let session: Box<dyn HarnessSession> = Box::new(session);
+        assert!(mode_sets(&log).is_empty(), "{:?}", mode_sets(&log));
+        session.close().await.unwrap();
+
+        // The account refuses `auto`: the open does not fail.
+        let behavior = Behavior {
+            refuse_auto: true,
+            ..Behavior::default()
+        };
+        let (result, log) = connect_with(HarnessKind::ClaudeCode, auto.clone(), behavior).await;
+        let (session, _events, _ready) = result.unwrap();
+        let session: Box<dyn HarnessSession> = Box::new(session);
+        assert_eq!(mode_sets(&log), vec!["auto"]);
+        session.close().await.unwrap();
+
+        // The adapter answers but keeps `acceptEdits`, as it does when the
+        // model does not support `auto`.
+        let behavior = Behavior {
+            ignore_mode: true,
+            ..Behavior::default()
+        };
+        let (result, _log) = connect_with(HarnessKind::ClaudeCode, auto, behavior).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_mode_change_to_auto_accepts_the_fallback_of_the_adapter() {
+        // The fake keeps `acceptEdits` for every change after the open, as
+        // the adapter does for a model without `auto` mode.
+        let behavior = Behavior {
+            ignore_mode: true,
+            ..Behavior::default()
+        };
+        let mut edits = spec();
+        edits.approval_mode = ApprovalMode::AutoEdits;
+        let (result, _log) = connect_with(HarnessKind::ClaudeCode, edits, behavior).await;
+        let (session, _events, _ready) = result.unwrap();
+        let mut session: Box<dyn HarnessSession> = Box::new(session);
+        assert!(session.set_approval_mode(ApprovalMode::Auto).await.is_ok());
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn auto_mode_is_only_a_move_up_from_auto() {
+        // Auto edits: a move to `auto` is set back.
+        let behavior = Behavior {
+            escalate: Some("auto"),
+            ..Behavior::default()
+        };
+        let mut edits = spec();
+        edits.approval_mode = ApprovalMode::AutoEdits;
+        let (result, log) = connect_with(HarnessKind::ClaudeCode, edits, behavior).await;
+        let (session, mut events, _ready) = result.unwrap();
+        let mut session: Box<dyn HarnessSession> = Box::new(session);
+        allow_first_request(&mut session, &mut events).await;
+        let reset = next_matching(&mut events, |e| matches!(e, SessionEvent::Error { .. })).await;
+        assert!(
+            matches!(&reset, SessionEvent::Error { code, message } if code == "mode_reset" && message.contains("`auto`") && message.contains("`acceptEdits`")),
+            "{reset:?}"
+        );
+        assert_eq!(mode_sets(&log), vec!["acceptEdits"]);
+        session.close().await.unwrap();
+
+        // Auto: the session is in `auto` already, and nothing is set back.
+        let behavior = Behavior {
+            escalate: Some("auto"),
+            ..Behavior::default()
+        };
+        let mut auto = spec();
+        auto.approval_mode = ApprovalMode::Auto;
+        let (result, log) = connect_with(HarnessKind::ClaudeCode, auto, behavior).await;
+        let (session, mut events, _ready) = result.unwrap();
+        let mut session: Box<dyn HarnessSession> = Box::new(session);
+        allow_first_request(&mut session, &mut events).await;
+        next_matching(&mut events, |e| matches!(e, SessionEvent::TurnEnded { .. })).await;
+        assert_eq!(mode_sets(&log), vec!["auto"], "only the open sets a mode");
+        session.close().await.unwrap();
+    }
+
     #[tokio::test]
     async fn a_claude_session_changes_its_mode_for_a_turn_and_back() {
         let mut auto = spec();
@@ -1637,14 +1966,14 @@ mod fake_agent {
             })
             .map(|m| m["params"]["value"].as_str().unwrap().to_owned())
             .collect();
-        // The fake agent starts in `acceptEdits`, so the open sets nothing.
-        assert_eq!(sets, vec!["default", "acceptEdits"]);
+        // The fake agent starts in `acceptEdits`, so the open sets `auto`.
+        assert_eq!(sets, vec!["auto", "default", "auto"]);
         session.close().await.unwrap();
 
         // A mode that the agent does not take fails, so the worker refuses
         // the turn.
         let mut auto = spec();
-        auto.approval_mode = ApprovalMode::Auto;
+        auto.approval_mode = ApprovalMode::AutoEdits;
         let behavior = Behavior {
             refuse_reset: true,
             ..Behavior::default()
@@ -1654,7 +1983,12 @@ mod fake_agent {
         let mut session: Box<dyn HarnessSession> = Box::new(session);
         // The fake refuses every mode change after the first one.
         session.set_approval_mode(ApprovalMode::Ask).await.unwrap();
-        assert!(session.set_approval_mode(ApprovalMode::Auto).await.is_err());
+        assert!(
+            session
+                .set_approval_mode(ApprovalMode::AutoEdits)
+                .await
+                .is_err()
+        );
         session.close().await.unwrap();
     }
 
@@ -2088,6 +2422,7 @@ fn the_skill_folder_goes_into_the_opencode_config() {
         options: Default::default(),
         approval_mode: ApprovalMode::Auto,
         allow_shell: true,
+        coordinator: false,
         system_prompt_append: String::new(),
         mcp_servers: vec![],
         env: BTreeMap::new(),
@@ -2129,6 +2464,7 @@ fn claude_meta_keeps_repo_settings_and_the_shell_out() {
         options: Default::default(),
         approval_mode: ApprovalMode::AutoEdits,
         allow_shell: false,
+        coordinator: false,
         system_prompt_append: "You are a task.".into(),
         mcp_servers: vec![],
         env: BTreeMap::new(),
@@ -2378,4 +2714,105 @@ fn auth_methods_become_sign_in_methods() {
     assert!(offers_logout(&init));
     assert!(!offers_logout(&json!({"agentCapabilities": {}})));
     assert!(sign_in_methods_from_init(&json!({}), "x").is_empty());
+}
+
+/// A spec for the tests of the coordinator rules.
+fn coordinator_spec(dir: &std::path::Path, allow_shell: bool, coordinator: bool) -> SessionSpec {
+    SessionSpec {
+        session_id: SessionId::new(),
+        workspace: dir.to_path_buf(),
+        runtime_dir: dir.join("runtime"),
+        model: String::new(),
+        options: Default::default(),
+        approval_mode: ApprovalMode::Ask,
+        allow_shell,
+        coordinator,
+        system_prompt_append: String::new(),
+        mcp_servers: vec![],
+        env: BTreeMap::new(),
+        extras_enabled: true,
+        skills: None,
+        resume: None,
+        process_watcher: None,
+    }
+}
+
+#[test]
+fn a_claude_coordinator_loses_the_shell_and_the_web() {
+    let dir = tempfile::tempdir().unwrap();
+    let meta = claude_meta(&coordinator_spec(dir.path(), false, true));
+    assert_eq!(
+        meta["claudeCode"]["options"]["disallowedTools"],
+        json!(["Bash", "PowerShell", "Monitor", "WebFetch", "WebSearch"])
+    );
+    // A task keeps the web.
+    let meta = claude_meta(&coordinator_spec(dir.path(), false, false));
+    assert_eq!(
+        meta["claudeCode"]["options"]["disallowedTools"],
+        json!(["Bash", "PowerShell", "Monitor"])
+    );
+}
+
+#[test]
+fn a_gemini_coordinator_gets_a_policy_that_denies_shell_and_web_and_allows_hub_tools() {
+    let dir = tempfile::tempdir().unwrap();
+    let found = |name: &str| (name == "gemini").then(|| PathBuf::from("/bin/gemini"));
+    let account = AccountConfig::default_for(HarnessKind::GeminiCli);
+    let spec = coordinator_spec(dir.path(), false, true);
+    let process = agent_process_spec(HarnessKind::GeminiCli, &account, &spec, &found).unwrap();
+    let flag = process
+        .args
+        .iter()
+        .find_map(|a| a.strip_prefix("--admin-policy="))
+        .expect("an admin policy flag");
+    let policy = std::fs::read_to_string(flag).unwrap();
+    for tool in [
+        "run_shell_command",
+        "google_web_search",
+        "web_fetch",
+        "codebase_investigator",
+    ] {
+        assert!(policy.contains(&format!("\"{tool}\"")), "{policy}");
+    }
+    assert!(policy.contains("decision = \"deny\""), "{policy}");
+    assert!(
+        policy.contains("mcpName = \"hub\"\ntoolName = \"*\"\ndecision = \"allow\""),
+        "{policy}"
+    );
+    // The mode flag stays, and Gemini still asks in Ask mode for the rest.
+    assert!(process.args.contains(&"default".to_owned()));
+
+    // A task with the shell on needs no policy.
+    let spec = coordinator_spec(dir.path(), true, false);
+    let process = agent_process_spec(HarnessKind::GeminiCli, &account, &spec, &found).unwrap();
+    assert!(
+        !process.args.iter().any(|a| a.starts_with("--admin-policy")),
+        "{:?}",
+        process.args
+    );
+    // A task without the shell only loses the shell.
+    let policy = crate::approval::gemini_policy(false, false).unwrap();
+    assert!(policy.contains("run_shell_command"), "{policy}");
+    assert!(!policy.contains("google_web_search"), "{policy}");
+    assert!(!policy.contains("mcpName"), "{policy}");
+}
+
+#[test]
+fn an_opencode_coordinator_denies_the_web_and_allows_hub_tools() {
+    let found = |name: &str| (name == "opencode").then(|| PathBuf::from("/bin/opencode"));
+    let account = AccountConfig::default_for(HarnessKind::OpenCode);
+    let dir = tempfile::tempdir().unwrap();
+    let spec = coordinator_spec(dir.path(), false, true);
+    let process = agent_process_spec(HarnessKind::OpenCode, &account, &spec, &found).unwrap();
+    let config: Value = serde_json::from_str(&process.env["OPENCODE_CONFIG_CONTENT"]).unwrap();
+    assert_eq!(config["permission"]["bash"], "deny");
+    assert_eq!(config["permission"]["webfetch"], "deny");
+    assert_eq!(config["permission"]["websearch"], "deny");
+    assert_eq!(config["permission"]["hub_*"], "allow");
+    // A task keeps the web, as its mode says.
+    let spec = coordinator_spec(dir.path(), true, false);
+    let process = agent_process_spec(HarnessKind::OpenCode, &account, &spec, &found).unwrap();
+    let config: Value = serde_json::from_str(&process.env["OPENCODE_CONFIG_CONTENT"]).unwrap();
+    assert_eq!(config["permission"]["webfetch"], "ask");
+    assert!(config["permission"].get("websearch").is_none());
 }

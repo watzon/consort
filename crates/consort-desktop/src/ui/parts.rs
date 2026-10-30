@@ -136,7 +136,15 @@ pub fn status_glyph(
         return glyph(glyph_name, size, color).into_any_element();
     };
     let version = crate::ui::motion::shimmer_version(live, cx);
-    icon_version(name, version, size, color).into_any_element()
+    let glyph = icon_version(name, version, size, color);
+    if status == TaskStatus::Working {
+        // The shimmer is too small to see at this size. The turn shows the work.
+        let angle = crate::ui::motion::spinner_angle(live, cx);
+        return glyph
+            .with_transformation(gpui_kit::Transformation::rotate(gpui_kit::radians(angle)))
+            .into_any_element();
+    }
+    glyph.into_any_element()
 }
 
 /// The icon of a status, or `None` for the two statuses that have a Consort
@@ -266,6 +274,26 @@ pub fn button(
     kind: ButtonKind,
     t: &Tokens,
 ) -> Stateful<Div> {
+    button_shell(id, kind, t)
+        .whitespace_nowrap()
+        .child(label.into())
+}
+
+/// A button whose label wraps inside it, for a label that comes from outside,
+/// such as a harness's own words. The caller gives it a width.
+pub fn wrapping_button(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    kind: ButtonKind,
+    t: &Tokens,
+) -> Stateful<Div> {
+    button_shell(id, kind, t)
+        .whitespace_normal()
+        .text_center()
+        .child(div().w_full().min_w_0().child(label.into()))
+}
+
+fn button_shell(id: impl Into<ElementId>, kind: ButtonKind, t: &Tokens) -> Stateful<Div> {
     let c = &t.colors;
     let base = focusable(div().id(id), t)
         .flex()
@@ -276,9 +304,7 @@ pub fn button(
         .px(t.space.md)
         .rounded(t.radius.md)
         .type_style(t.text.ui_strong)
-        .cursor_pointer()
-        .whitespace_nowrap()
-        .child(label.into());
+        .cursor_pointer();
     // Every kind is 30 px high: 20 px of text plus 5 px above and below. The
     // secondary button's border takes 1 px of each.
     let pad = t.component.button_pad_y;
@@ -314,6 +340,33 @@ pub fn button(
                 .hover(move |s| s.bg(fill).opacity(dim))
         }
     }
+}
+
+/// A link that leaves the place where the user is, such as "Show in channel"
+/// or "Show task": an underlined label and the `external-link` icon. Every
+/// link that leaves Settings uses it, so the user can tell it from a control
+/// that stays. The caller adds the click handler. The keyboard can focus it.
+pub fn leaving_link(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    t: &Tokens,
+) -> Stateful<Div> {
+    let c = &t.colors;
+    focusable(div().id(id), t)
+        .flex()
+        .flex_none()
+        .items_center()
+        .gap(t.space.xs + t.space.xxs)
+        .cursor_pointer()
+        .whitespace_nowrap()
+        .child(
+            div()
+                .type_style(t.text.ui)
+                .text_color(c.text_primary)
+                .underline()
+                .child(label.into()),
+        )
+        .child(icon("external-link", t.icon.dense, c.text_secondary))
 }
 
 /// A secondary button with an icon before its label, such as Upload or
@@ -461,6 +514,36 @@ pub fn editor_style(t: &Tokens) -> gpui_kit::base::input::InputEditorStyle {
         background: c.canvas_clear,
         ..Default::default()
     }
+}
+
+/// The header of every right panel: one height, the same insets and a line
+/// under it. A header with Back at its left sets a smaller left inset.
+pub fn panel_header(t: &Tokens) -> Div {
+    use crate::ui::window_controls::DragArea as _;
+    div()
+        .debug_selector(|| "panel-header".into())
+        .flex()
+        .flex_none()
+        .items_center()
+        .gap(t.space.xs)
+        .h(t.component.sidebar.title_bar)
+        .pl(t.space.lg)
+        .pr(t.space.sm)
+        .border_b(t.border_width)
+        .border_color(t.colors.border_subtle)
+        .drag_area()
+}
+
+/// The row of tabs under a panel header.
+pub fn panel_tabs(tabs: Div, t: &Tokens) -> Div {
+    div()
+        .debug_selector(|| "panel-tabs".into())
+        .flex()
+        .flex_none()
+        .px(t.space.lg)
+        .pt(t.space.md)
+        .pb(t.space.xs)
+        .child(tabs)
 }
 
 #[cfg(test)]

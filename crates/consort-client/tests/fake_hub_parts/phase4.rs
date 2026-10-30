@@ -254,6 +254,7 @@ fn add_text(hub: &Shared, body: &str) -> MessageId {
         created_at: Timestamp::now(),
         proactive: None,
         suggestions: Vec::new(),
+        source_message_id: None,
     });
     id
 }
@@ -346,6 +347,7 @@ async fn a_message_thread_loads_and_a_reply_goes_to_its_root() {
             created_at: Timestamp::now(),
             proactive: None,
             suggestions: Vec::new(),
+            source_message_id: None,
         });
     }
     let root = root.to_string();

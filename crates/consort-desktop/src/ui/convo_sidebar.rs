@@ -116,14 +116,23 @@ impl ConsortApp {
         .into_any_element()
     }
 
-    /// The "..." and "+" of a group row, while the pointer is on it.
+    /// The "..." and "+" of a group row, while the pointer is on it. Their
+    /// slots are always there, so the name and the row do not move.
     pub fn group_buttons(
         &self,
         group_id: &str,
         group_name: &str,
+        hovered: bool,
         t: &Tokens,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        if !hovered {
+            let button = t.component.sidebar.row_icon + t.space.xs;
+            return div()
+                .flex_none()
+                .w(button * 2.0 + t.space.xxs)
+                .into_any_element();
+        }
         let menu_group = group_id.to_owned();
         let add_group = group_id.to_owned();
         div()

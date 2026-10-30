@@ -172,6 +172,10 @@ pub struct Capabilities {
     pub mcp_http: bool,
     /// The approval modes that the adapter can enforce.
     pub approval_modes: Vec<ApprovalMode>,
+    /// The session can change its model and options between turns, and
+    /// keep its context. An older worker reports none, which reads as
+    /// false, so the hub then starts a new session for a model change.
+    pub switch_model: bool,
 }
 
 impl Capabilities {
@@ -528,6 +532,17 @@ pub enum PairedBy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An inventory from before `switch_model` has no such field. The hub
+    /// then reads the account as one that cannot switch its model, and
+    /// starts a new session for a model change.
+    #[test]
+    fn capabilities_from_before_switch_model_read_as_cannot_switch() {
+        let old: Capabilities = serde_json::from_value(serde_json::json!({"steer": true})).unwrap();
+        assert!(old.steer);
+        assert!(!old.switch_model);
+        assert!(!Capabilities::default().switch_model);
+    }
     use crate::model::{ToolId, ToolState};
 
     fn account(label: &str, auth_state: AuthState) -> HarnessAccount {

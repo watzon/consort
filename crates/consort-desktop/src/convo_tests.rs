@@ -9,7 +9,7 @@ use crate::app::{ConsortApp, Dialog, Field, Panel, TasksTab};
 use crate::convo::ConvoAction;
 use crate::ui::menu::MenuAction;
 use consort_client::{
-    Client, TimelineItem, ViewState,
+    Client, ViewState,
     convo::{ItemDetailState, SearchLoad, SearchScope},
     mock_convo,
 };
@@ -101,7 +101,7 @@ fn the_message_menu_has_the_quick_emoji_and_a_second_click_removes_one(cx: &mut 
     assert!(cx.debug_bounds("bubble-msg_tutti_reply.p0").is_some());
     // A right click on the bubble opens the message menu with the bar.
     let bubble = cx
-        .debug_bounds("bubble-msg_tutti_reply.p1")
+        .debug_bounds("bubble-msg_tutti_reply.p0")
         .expect("the bubble");
     cx.simulate_event(gpui_kit::MouseDownEvent {
         button: gpui_kit::MouseButton::Right,
@@ -733,20 +733,80 @@ fn about_opens_from_the_settings_rail_and_shows_the_update(cx: &mut TestAppConte
     );
 }
 
+/// The mic button sits between add and the divider. A click focuses the box
+/// and asks the system to start dictation. When the system does not start it,
+/// the hint shows as an information notice (DECISIONS 738). The real start
+/// cannot run in a headless window, so the test gives the answer of the
+/// platform call.
 #[gpui::test]
-fn the_composer_has_no_voice_button_and_dictation_has_a_hint(cx: &mut TestAppContext) {
-    let (handle, _app) = open(mock(), cx);
+fn the_mic_button_focuses_the_box_and_shows_the_hint_when_dictation_does_not_start(
+    cx: &mut TestAppContext,
+) {
+    let (handle, app) = open(mock(), cx);
     let cx = &mut VisualTestContext::from_window(handle, cx);
     assert!(cx.debug_bounds("composer").is_some());
-    assert!(cx.debug_bounds("voice").is_none());
-    if cfg!(target_os = "macos") {
-        assert!(
-            crate::convo::dictation_hint()
-                .unwrap()
-                .contains("Dictation")
+    let add = cx.debug_bounds("composer-attach").expect("add");
+    let mic = cx.debug_bounds("voice").expect("the mic button");
+    let tools = cx.debug_bounds("composer-tools").expect("the tool row");
+    let model = cx.debug_bounds("composer-model").expect("the model chip");
+    assert!(add.right() <= mic.left(), "the mic is after add");
+    assert!(
+        mic.right() < model.left(),
+        "and before the divider and chips"
+    );
+    assert_eq!(mic.size, add.size, "the same size as add");
+    assert_eq!(mic.center().y, add.center().y, "in the same row");
+    assert!(tools.contains(&mic.center()));
+    // The system does not start dictation: the hint shows.
+    let input = app.read_with(cx, |app, _| app.inputs.composer.clone());
+    // Put the focus on another box first, so the click must move it.
+    let other = app.read_with(cx, |app, _| app.inputs.reply.clone());
+    cx.update(|window, cx| other.update(cx, |input, cx| input.focus(window, cx)));
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            app.click_mic(input.clone(), false, window, cx)
+        })
+    });
+    draw(cx);
+    app.read_with(cx, |app, _| {
+        let shown: Vec<_> = app.notices.visible().collect();
+        assert_eq!(shown.len(), 1);
+        assert_eq!(shown[0].kind, crate::notice::NoticeKind::Info);
+        assert_eq!(
+            shown[0].message,
+            crate::convo::dictation_hint().unwrap_or(crate::dictation::NO_DICTATION)
         );
-    }
-    let _ = TimelineItem::Day;
+    });
+    let focused = cx.update(|window, cx| {
+        use gpui_kit::Focusable as _;
+        input.read(cx).focus_handle(cx).is_focused(window)
+    });
+    assert!(focused, "the box has the focus, so dictation types into it");
+}
+
+/// A dictation that the system starts shows no notice.
+#[gpui::test]
+fn a_started_dictation_shows_no_hint(cx: &mut TestAppContext) {
+    let (handle, app) = open(mock(), cx);
+    let cx = &mut VisualTestContext::from_window(handle, cx);
+    let input = app.read_with(cx, |app, _| app.inputs.composer.clone());
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| app.click_mic(input.clone(), true, window, cx))
+    });
+    draw(cx);
+    app.read_with(cx, |app, _| assert!(app.notices.visible().next().is_none()));
+}
+
+/// The real click on the button uses the platform call, which Consort does
+/// not wire (`dictation.rs`), so the hint shows.
+#[gpui::test]
+fn a_click_on_the_mic_button_shows_the_hint(cx: &mut TestAppContext) {
+    let (handle, app) = open(mock(), cx);
+    let cx = &mut VisualTestContext::from_window(handle, cx);
+    let mic = cx.debug_bounds("voice").expect("the mic button");
+    cx.simulate_click(mic.center(), gpui_kit::Modifiers::default());
+    draw(cx);
+    app.read_with(cx, |app, _| assert_eq!(app.notices.visible().count(), 1));
 }
 
 #[gpui::test]

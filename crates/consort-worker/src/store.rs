@@ -376,6 +376,26 @@ impl Store {
         })
     }
 
+    /// Sets the model and the options in a session's stored start, after a
+    /// `session.turn` changed them. A resumed session then opens with the
+    /// new model. Only these fields change.
+    pub fn set_session_model(
+        &self,
+        id: SessionId,
+        model: &str,
+        options: &consort_proto::model::ModelOptions,
+    ) -> Result<(), WorkerError> {
+        let options =
+            serde_json::to_string(options).map_err(|e| WorkerError::Config(e.to_string()))?;
+        self.with(|c| {
+            c.execute(
+                "UPDATE sessions SET start = json_set(start, '$.model', ?2, '$.options', json(?3)) WHERE session_id = ?1",
+                params![id.to_string(), model, options],
+            )
+            .map(|_| ())
+        })
+    }
+
     /// Sets a session's native reference.
     pub fn set_native_ref(&self, id: SessionId, native: &NativeRef) -> Result<(), WorkerError> {
         self.with(|c| {

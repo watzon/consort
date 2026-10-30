@@ -25,11 +25,23 @@ pub struct FavoriteModel {
 }
 
 /// The user's preferences. Every client reads the same record.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Preferences {
     /// The favorite models, in the order that the user starred them.
     pub favorite_models: Vec<FavoriteModel>,
+    /// When an account reaches a usage limit, work moves to another signed-in
+    /// account of the same harness that has the same model.
+    pub account_fallback: bool,
+}
+
+impl Default for Preferences {
+    fn default() -> Self {
+        Self {
+            favorite_models: Vec::new(),
+            account_fallback: true,
+        }
+    }
 }
 
 impl Preferences {

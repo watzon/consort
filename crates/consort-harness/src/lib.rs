@@ -39,7 +39,9 @@ pub use account::{AccountConfig, AccountRuntime};
 pub use attachments::turn_text;
 pub use consort_proto::ids::{NativeRef, RequestId, SessionId, TurnId};
 pub use consort_proto::model::SignInMethod;
-pub use consort_proto::model::{ApprovalMode, AuthState, Capabilities, ModelInfo, ModelOptions};
+pub use consort_proto::model::{
+    ApprovalMode, AuthState, Capabilities, ModelInfo, ModelOptions, TurnErrorKind,
+};
 pub use consort_proto::worker_link::{RequestAnswer as Answer, SessionEvent, TurnInput};
 pub use consort_tools::ToolId;
 pub use items::ItemTracker;
@@ -227,6 +229,12 @@ pub struct SessionSpec {
     /// it is false, the adapter removes the harness's shell tools where the
     /// harness allows that (see `docs/harness-adapters.md`).
     pub allow_shell: bool,
+    /// The session is a coordinator. It does no shell, web or file work (a
+    /// task does it), and its hub tools need no approval. The adapter turns
+    /// off the harness's web tools where the harness allows that (see
+    /// `docs/harness-adapters.md`). The worker also denies every approval
+    /// request of a coordinator, as a second guard.
+    pub coordinator: bool,
     /// Text to append to the harness's system prompt.
     pub system_prompt_append: String,
     /// The MCP servers to give the session. The hub endpoint is first.
@@ -365,6 +373,18 @@ pub trait HarnessSession: Send {
         Err(HarnessError::Unsupported("change the approval mode"))
     }
 
+    /// Changes the model and the options for the next turns, while no turn
+    /// runs. The session keeps its context. An empty `model` leaves the
+    /// model as it is. The worker calls it only when `capabilities().switch_model`
+    /// is true, before a turn that carries a model change. It fails when the
+    /// harness refuses the model or an option, and the worker then refuses
+    /// the turn, so the hub starts a new session. An adapter whose harness
+    /// cannot do this returns [`HarnessError::Unsupported`].
+    async fn set_model(&mut self, model: &str, options: &ModelOptions) -> Result<(), HarnessError> {
+        let _ = (model, options);
+        Err(HarnessError::Unsupported("change the model"))
+    }
+
     /// Answers an open request.
     async fn respond(&mut self, request: RequestId, answer: Answer) -> Result<(), HarnessError>;
 
@@ -427,6 +447,105 @@ pub fn login_expired_text(message: &str) -> bool {
     ]
     .iter()
     .any(|marker| lower.contains(marker))
+}
+
+/// What the worker knows about why a turn failed: the kind, and for a rate
+/// limit the time when it resets, when the harness says.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FailureInfo {
+    /// The kind. `Unknown` when nothing identifies the failure.
+    pub kind: TurnErrorKind,
+    /// When the limit resets. Set only for a rate limit.
+    pub resets_at: Option<consort_proto::time::Timestamp>,
+}
+
+/// The kind of a failed turn from the error text of the harness. This is the
+/// one place that reads error text. An adapter that has structured data
+/// (Codex sends `codexErrorInfo`) uses it first and calls this only as a
+/// fallback. The markers are the words of Claude Code's API errors and
+/// usage messages. A text that matches none is `Unknown`: the function never
+/// guesses.
+///
+/// The reset time comes from the epoch seconds that Claude Code puts after
+/// a bar (`Claude AI usage limit reached|1760000000`) or from a
+/// `resetsAt` or `resets_at` field in the JSON of the error. A time in
+/// words, such as "resets 3pm", has no time zone here, so it gives none.
+pub fn classify_failure(message: &str) -> FailureInfo {
+    let lower = message.to_ascii_lowercase();
+    if login_expired_text(message) {
+        return FailureInfo {
+            kind: TurnErrorKind::ExpiredSignIn,
+            resets_at: None,
+        };
+    }
+    let limited = [
+        "usage limit reached",
+        "usage_limit_reached",
+        "usage limit exceeded",
+        "usagelimitexceeded",
+        "hit your limit",
+        "reached your usage limit",
+        "reached your weekly limit",
+        "weekly limit reached",
+        "5-hour limit reached",
+        "rate_limit_error",
+        "ratelimitexceeded",
+        "rate limit exceeded",
+        "api error: 429",
+        "429 too many requests",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+        // "You've hit your weekly limit", "hit your session limit".
+        || (lower.contains("hit your") && lower.contains(" limit"))
+        // The JSON that the Claude adapter puts after its text.
+        || lower
+            .replace(['\\', ' '], "")
+            .contains("\"errorkind\":\"rate_limit\"");
+    if !limited {
+        return FailureInfo::default();
+    }
+    FailureInfo {
+        kind: TurnErrorKind::RateLimit,
+        resets_at: reset_time(message),
+    }
+}
+
+/// The reset time in a rate limit text. See [`classify_failure`].
+fn reset_time(message: &str) -> Option<consort_proto::time::Timestamp> {
+    // Epoch seconds or milliseconds. Seconds before 2001 and after 2286 are
+    // not a reset time.
+    let from_number = |digits: &str| {
+        let value: i64 = digits.parse().ok()?;
+        let millis = match digits.len() {
+            10 => value.checked_mul(1_000)?,
+            13 => value,
+            _ => return None,
+        };
+        Some(consort_proto::time::Timestamp::from_millis(millis))
+    };
+    // JSON inside a JSON string has escaped quotes.
+    let message = message.replace('\\', "");
+    let lower = message.to_ascii_lowercase();
+    for key in ["\"resetsat\"", "\"resets_at\""] {
+        if let Some(at) = lower.find(key) {
+            let rest = message[at + key.len()..].trim_start();
+            if let Some(rest) = rest.strip_prefix(':') {
+                let digits: String = rest
+                    .trim_start()
+                    .chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect();
+                if let Some(time) = from_number(&digits) {
+                    return Some(time);
+                }
+            }
+        }
+    }
+    let at = lower.find("limit reached|")?;
+    let rest = &message[at + "limit reached|".len()..];
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    from_number(&digits)
 }
 
 /// What to tell the user when a harness account is not signed in. `message`
@@ -534,6 +653,59 @@ mod tests {
         // The detail has the word that the app reads as Expired.
         assert!(LOGIN_EXPIRED_MESSAGE.contains("expired"));
         assert!(LOGIN_EXPIRED_MESSAGE.contains("Sign in again"));
+    }
+
+    #[test]
+    fn failure_kinds_come_from_known_texts_and_never_from_a_guess() {
+        let limit = classify_failure("Claude AI usage limit reached|1760000000");
+        assert_eq!(limit.kind, TurnErrorKind::RateLimit);
+        assert_eq!(
+            limit.resets_at,
+            Some(consort_proto::time::Timestamp::from_millis(
+                1_760_000_000_000
+            ))
+        );
+        let api = classify_failure(
+            "API Error: 429 {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"Slow down\"},\"resetsAt\": 1760000500}",
+        );
+        assert_eq!(api.kind, TurnErrorKind::RateLimit);
+        assert_eq!(
+            api.resets_at,
+            Some(consort_proto::time::Timestamp::from_millis(
+                1_760_000_500_000
+            ))
+        );
+        // A limit in words has no time zone, so it has no reset time.
+        let weekly = classify_failure(
+            "Internal error: You've hit your weekly limit · resets 4am (America/Denver): {\n  \"errorKind\": \"rate_limit\"\n}",
+        );
+        assert_eq!(weekly.kind, TurnErrorKind::RateLimit);
+        let only_json = classify_failure("Internal error: {\"errorKind\":\"rate_limit\"}");
+        assert_eq!(only_json.kind, TurnErrorKind::RateLimit);
+        let words = classify_failure("You've hit your limit. It resets 3pm (Europe/Berlin).");
+        assert_eq!(words.kind, TurnErrorKind::RateLimit);
+        assert_eq!(words.resets_at, None);
+        // A number that is not a time is not read as one.
+        let bad = classify_failure("usage limit reached|12345");
+        assert_eq!(bad.kind, TurnErrorKind::RateLimit);
+        assert_eq!(bad.resets_at, None);
+        // An expired login is an expired sign-in.
+        assert_eq!(
+            classify_failure("Failed to authenticate. API Error: 401 authentication_error").kind,
+            TurnErrorKind::ExpiredSignIn
+        );
+        // Anything else is unknown, also when it only looks close.
+        for other in [
+            "",
+            "Internal error",
+            "overloaded_error",
+            "The file rate_limit.rs was not found",
+            "Request 4290 failed",
+            "codex app-server exited",
+            "the harness returned an error: connection reset",
+        ] {
+            assert_eq!(classify_failure(other), FailureInfo::default(), "{other}");
+        }
     }
 
     #[test]

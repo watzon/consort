@@ -196,6 +196,49 @@ pub enum MessageKind {
     Notice,
 }
 
+/// What kind of failure ended a turn. The worker sends it when the harness
+/// says so in structured data, or when the error text is a known one. A
+/// failure that nothing identifies is `Unknown`. The hub puts it in the
+/// `turn_failed` notice, so a client can write a title and offer the
+/// actions that fit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnErrorKind {
+    /// The account reached a usage limit or a rate limit.
+    RateLimit,
+    /// The sign-in of the account expired, or the account is signed out.
+    ExpiredSignIn,
+    /// The worker restarted during the turn.
+    WorkerRestarted,
+    /// Anything else. Also what a kind from a newer peer reads as.
+    #[default]
+    #[serde(other)]
+    Unknown,
+}
+
+impl TurnErrorKind {
+    /// The name in the JSON body of a `turn_failed` notice.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RateLimit => "rate_limit",
+            Self::ExpiredSignIn => "expired_sign_in",
+            Self::WorkerRestarted => "worker_restarted",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// The kind with this name. A name that is not known reads as
+    /// `Unknown`.
+    pub fn from_name(name: &str) -> Self {
+        match name {
+            "rate_limit" => Self::RateLimit,
+            "expired_sign_in" => Self::ExpiredSignIn,
+            "worker_restarted" => Self::WorkerRestarted,
+            _ => Self::Unknown,
+        }
+    }
+}
+
 /// A reaction on a message.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Reaction {
@@ -257,6 +300,11 @@ pub struct Message {
     /// Set on a message that a proactive turn posted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proactive: Option<ProactiveMark>,
+    /// Set on a user message in a task thread that the hub copied from the
+    /// timeline: the ID of the timeline message. A client shows "Show in
+    /// channel" for it. The copy has the same body as the source message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_message_id: Option<MessageId>,
 }
 
 impl Message {
@@ -285,6 +333,43 @@ mod tests {
 
     /// The main channel was called Everything. New data says `tutti`, and
     /// stored data and older peers still say `everything`.
+    /// A message from before `source_message_id` has no such field, and a
+    /// message without a source does not write one.
+    #[test]
+    fn a_message_without_a_source_reads_and_writes_without_the_field() {
+        let message = Message {
+            id: MessageId::new(),
+            channel_id: ChannelId::new(),
+            thread_root_id: None,
+            author: Author::User,
+            author_session_id: None,
+            author_task_id: None,
+            author_routine_id: None,
+            kind: MessageKind::Text,
+            body: "Hi".into(),
+            attachments: Vec::new(),
+            in_timeline: false,
+            client_message_id: None,
+            reply_count: 0,
+            last_reply_at: None,
+            reactions: Vec::new(),
+            edited_at: None,
+            deleted_at: None,
+            created_at: Timestamp::from_millis(1),
+            suggestions: Vec::new(),
+            proactive: None,
+            source_message_id: None,
+        };
+        let mut json = serde_json::to_value(&message).unwrap();
+        assert!(json.get("source_message_id").is_none(), "{json}");
+        let back: Message = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(back, message);
+        let source = MessageId::new();
+        json["source_message_id"] = serde_json::json!(source);
+        let with_source: Message = serde_json::from_value(json).unwrap();
+        assert_eq!(with_source.source_message_id, Some(source));
+    }
+
     #[test]
     fn the_tutti_kind_reads_the_old_name_and_writes_the_new_one() {
         let new: ChannelKind = serde_json::from_str("\"tutti\"").unwrap();

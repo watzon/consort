@@ -6,7 +6,7 @@ Path shorthand used below:
 
 - `PI` = `/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent` (installed Pi 1.2.0)
 - `PI_DEPS` = `PI/node_modules/@earendil-works` (sub-packages that ship with it)
-- `OMP_BIN` = `/Users/watzon/Library/Application Support/Tern/omp/versions/18.13.3` (installed omp)
+- `OMP_BIN` = `~/Library/Application Support/Tern/omp/versions/18.13.3` (installed omp)
 
 Labels: **FACT** means a source states it or I observed it. **INFERENCE** means my conclusion from facts.
 
@@ -161,7 +161,7 @@ Your three must-haves:
 
 ## 9. Oh My Pi
 
-**FACT, what it is:** `omp` is a hard fork of Pi, not an extension pack and not a wrapper. README (`gh api repos/can1357/oh-my-pi/readme`): "Built by Stencil Labs . Fork of Pi by @mariozechner", tagline "A coding agent with the IDE wired in", "60+ providers, 31 built-in tools, 14 lsp ops, 28 dap ops, ~80k lines of Rust core". The local binary at `OMP_BIN` is a 217 MB arm64 Mach-O executable (Bun-compiled). Strings in it point to `github.com/can1357/oh-my-pi` and packages `@oh-my-pi/pi-natives` and `@oh-my-pi/pi-catalog`. It is managed by "Tern" (`~/Library/Application Support/Tern/omp/manager.json`: `{"manager":"tern","name":"Tern"}`; `state.json` shows `installed.version 18.13.3`, link `/Users/watzon/.local/bin/omp`).
+**FACT, what it is:** `omp` is a hard fork of Pi, not an extension pack and not a wrapper. README (`gh api repos/can1357/oh-my-pi/readme`): "Built by Stencil Labs . Fork of Pi by @mariozechner", tagline "A coding agent with the IDE wired in", "60+ providers, 31 built-in tools, 14 lsp ops, 28 dap ops, ~80k lines of Rust core". The local binary at `OMP_BIN` is a 217 MB arm64 Mach-O executable (Bun-compiled). Strings in it point to `github.com/can1357/oh-my-pi` and packages `@oh-my-pi/pi-natives` and `@oh-my-pi/pi-catalog`. It is managed by "Tern" (`~/Library/Application Support/Tern/omp/manager.json`: `{"manager":"tern","name":"Tern"}`; `state.json` shows `installed.version 18.13.3`, link `~/.local/bin/omp`).
 
 **FACT, divergence from Pi:** `docs/porting-from-pi-mono.md` records the "Last Sync Point" with upstream Pi as 2026-03-22. So omp does not track Pi 1.x. Its monorepo has its own `packages/ai`, `agent`, `coding-agent`, `tui`, `natives` (Rust), `catalog`, `collab-web`, `stats`, `wire`, `mnemopi`, and more. Package name `@oh-my-pi/pi-coding-agent` 18.13.3, MIT.
 

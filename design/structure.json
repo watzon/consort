@@ -27,9 +27,13 @@
   "layout": {
     "sidebar_width": 288,
     "panel_width": 400,
+    "panel_min_width": 320,
+    "chat_min_width": 480,
+    "compact_width": 760,
+    "resize_handle": 8,
     "timeline_max_width": 720,
     "speaker_gutter": 64,
-    "min_window": [960, 600],
+    "min_window": [420, 560],
     "default_window": [1440, 900],
     "wide_timeline": 600,
     "list_overdraw": 400,
@@ -50,9 +54,13 @@
       { "at": 86, "alpha": 0.8 },
       { "at": 108, "alpha": 0 }
     ],
-    "fade_bottom": 32
+    "fade_bottom": 32,
+    "notice_width": 360,
+    "notice_bottom": 124,
+    "notice_compact_top": 88
   },
-  "opacity": { "answered_dim": 0.6, "busy": 0.7, "danger_hover": 0.9, "failed_border": 0.45, "progress_track": 0.22, "drop_fill": 0.06, "nav_disabled": 0.4, "you_tile": 0.36, "offline_dim": 0.45, "offline_mark": 0.7, "queued": 0.75 },
+  "opacity": { "answered_dim": 0.6, "busy": 0.7, "danger_hover": 0.9, "failed_border": 0.45,
+    "error_border": 0.4, "progress_track": 0.22, "drop_fill": 0.06, "nav_disabled": 0.4, "you_tile": 0.36, "offline_dim": 0.45, "offline_mark": 0.7, "queued": 0.75 },
   "component": {
     "settings_label": 160,
     "settings_segmented": 336,
@@ -175,6 +183,9 @@
       "row_text": { "size": 15, "line": 22, "weight": 400, "tracking": 0 },
       "label_text": { "size": 13, "line": 18, "weight": 500, "tracking": 0 },
       "label_pad_y": 6,
+      "label_row": 30,
+      "lights_end": 84,
+      "lights_center": 23,
       "group_top": 20,
       "title_bar": 52,
       "worker_text": { "size": 14, "line": 20, "weight": 400, "tracking": 0 },
@@ -184,7 +195,7 @@
       "account_pad_bottom": 6
     },
     "update_notice": { "pad_y": 9, "pad_left": 12, "pad_right": 10, "gap": 10, "margin_bottom": 8, "action_pad_x": 8, "action_pad_y": 2 },
-    "chat": { "bubble_radius": 16, "bubble_tail": 4, "bubble_pad_x": 14, "bubble_pad_y": 10, "composer_radius": 16, "send_button": 32, "top_action": 32, "top_action_icon": 18, "task_connector": 14, "mark": 56, "mark_small": 16, "mark_top": 4, "pill_pad_x": 10, "pill_pad_y": 3, "brief_number": 16 },
+    "chat": { "bubble_radius": 16, "bubble_tail": 4, "bubble_pad_x": 14, "bubble_pad_y": 10, "composer_radius": 16, "send_button": 32, "top_action": 32, "top_action_icon": 18, "task_connector": 14, "mark": 56, "mark_small": 16, "mark_top": 4, "pill_pad_x": 10, "pill_pad_y": 3, "brief_number": 16, "footer_line": 24, "footer_button": 24, "feedback_pair": 22, "answered_line": 36 },
     "theme_preview": { "bar": 4, "bar_gap": 5, "sidebar": 32, "sidebar_item": 20, "text_line": 76, "title": 48, "chip": 6, "card": 28, "button": 22, "button_radius": 2 },
     "convo": {
       "reaction_chip": 24, "reaction_pad_x": 8, "reaction_gap": 4,
@@ -199,7 +210,7 @@
       "dialog_about": 440, "about_mark": 80, "wordmark": { "size": 28, "line": 34, "weight": 700, "tracking": 0 },
       "icon_choice": 38, "icon_picker_width": 560, "icon_tile": 40, "icon_tile_icon": 20, "icon_tile_gap": 6, "icon_list_height": 300, "brief_box": 96, "instructions_box": 100, "root_ring": 1, "drag_line": 2
     },
-    "proactivity": { "level_select": 112, "time_box": 72, "zone_select": 168, "filter_select": 146, "log_time": 68, "log_place": 112, "log_result": 176, "log_pad_y": 10, "count_bar": 4, "mark_icon": 14, "mark_gap": 6, "mark_indent": 4, "reason_indent": 20, "chip_pad_x": 14, "chip_pad_y": 5, "chip_gap": 6, "feedback_pad_x": 8, "feedback_pad_y": 2, "dab": 10, "dab_gap": 5, "dab_rise": 3, "dab_drop": 2, "writing_pad_x": 16, "writing_pad_y": 13, "offer_pad_top": 12, "offer_pad": 14, "brief_group_gap": 6 },
+    "proactivity": { "level_select": 112, "time_box": 72, "zone_select": 168, "filter_select": 146, "log_time": 68, "log_place": 112, "log_result": 176, "log_pad_y": 10, "count_bar": 4, "mark_icon": 14, "mark_gap": 6, "mark_indent": 4, "reason_indent": 20, "chip_pad_x": 14, "chip_pad_y": 5, "chip_gap": 6, "feedback_pad_x": 8, "feedback_pad_y": 2, "dab": 10, "dab_gap": 5, "dab_rise": 3, "dab_drop": 2, "writing_lift": 3, "writing_pad_x": 16, "writing_pad_y": 13, "offer_pad_top": 12, "offer_pad": 14, "brief_group_gap": 6 },
     "voice": { "remove_slot": 84, "rule_dot": 4, "source_tile": 32, "check_box": 16, "check_icon": 12, "radio_dot": 8, "sample_dot": 7, "flag_bar": 2, "field_label": 52, "subject_box": 30, "body_box": 150, "line_icon": 12, "rule_pad_y": 8, "example_pad_y": 10 }
   },
   "derive": { "hover_delta_l": 0.035, "active_delta_l": 0.07, "selection_alpha": 0.28, "status_tint_alpha": 0.16, "scrim_alpha": { "dark": 0.55, "light": 0.3 }, "lightbox_alpha": 0.92 }

@@ -51,7 +51,11 @@ pub use proactivity::{
     CancelFollowUpArgs, FollowUpLaterArgs, FollowUpResult, NoReplyNeededArgs, SetProactivityArgs,
     SetProactivityResult,
 };
-pub use voice::{ProposeVoiceRuleArgs, VoiceGuideArgs, VoiceGuideResult, VoiceSampleArgs};
+pub use voice::{
+    ProposeVoiceRuleArgs, SHOW_DRAFT_BODY_MAX_BYTES, SHOW_DRAFT_TITLE_MAX_CHARS,
+    SHOW_DRAFT_TO_MAX_BYTES, ShowDraftArgs, ShowDraftResult, VoiceGuideArgs, VoiceGuideResult,
+    VoiceSampleArgs,
+};
 
 /// The kind of session that a tool is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -472,8 +476,20 @@ pub struct StartTaskArgs {
 pub struct MessageTaskArgs {
     /// The task.
     pub task_id: TaskId,
-    /// The message, in markdown.
-    pub body: String,
+    /// Your instruction to the task, in markdown. Leave it out when you set
+    /// `user_message_id`. The task then gets the user's own words.
+    #[serde(default)]
+    pub body: Option<String>,
+    /// The ID of a message from the user in this channel that the task must
+    /// get as it is. The hub sends the stored text of that message to the
+    /// task as a message from the user, and the task thread shows it as the
+    /// user's message. Use it when the user's message is about this task. It
+    /// must be the ID of a `user_message` event of this turn. The hub refuses
+    /// an ID of any other message (an older one too), the call in a turn that
+    /// you started on your own, and a second send of the same message to the
+    /// same task. Leave `attachments` out when you set it.
+    #[serde(default)]
+    pub user_message_id: Option<MessageId>,
     /// Channel file paths to attach.
     #[serde(default)]
     pub attachments: Vec<String>,
@@ -719,6 +735,9 @@ hub_tools! {
     /// `run_connector_tool`.
     RunConnectorTool("run_connector_tool", RunConnectorToolArgs, EVERY_SESSION,
         "Run one connector tool with its arguments. When the connection's rule asks the user, the user sees a card with the arguments and allows or denies the call. The result has a status: ran, waiting_for_user or denied. When the connector needs a new sign-in, ask the user to reconnect it in Settings > Connectors."),
+    /// `show_draft`.
+    ShowDraft("show_draft", ShowDraftArgs, EVERY_SESSION,
+        "Show the user a text that they send themself, in a card with Edit and Copy. Use it when no connection can send the text: a claim form, a phone call, a letter. The card does not wait and does not stop your turn. When a connection can send the text, use run_connector_tool, not this. Never write text in the user's name as a plain chat message. After the card, write one short message about it, or none."),
     /// `voice_guide`. The hub lists it only while "Write in my voice" is
     /// on.
     VoiceGuide("voice_guide", VoiceGuideArgs, EVERY_SESSION,
@@ -733,7 +752,7 @@ hub_tools! {
     // Coordinators.
     /// `post_message`.
     PostMessage("post_message", PostMessageArgs, COORDINATORS,
-        "Post a message in the channel timeline. You can post several short messages in one turn. To attach channel files, give their paths from files_list."),
+        "Post a message in the channel timeline. Post one message for one reply, also when it has headings or a list. To attach channel files, such as the document that a task published, give their paths from files_list."),
     /// `reply`.
     Reply("reply", ReplyArgs, COORDINATORS,
         "Reply in the thread of a message. Set in_timeline to also show the reply in the timeline. To attach channel files, give their paths from files_list."),
@@ -766,7 +785,7 @@ hub_tools! {
         "Start a task. The task runs in its own session on a worker and reports in its own thread. Placement uses the channel defaults for anything that you leave out. To give the task channel files, put their paths in attachments."),
     /// `message_task`.
     MessageTask("message_task", MessageTaskArgs, COORDINATORS,
-        "Send a message to a task. It starts a new turn, or steers the running turn when the harness can steer. To attach channel files, give their paths from files_list."),
+        "Send a message to a task. It starts a new turn, or steers the running turn when the harness can steer. To pass on a message from the user, set user_message_id to the ID of that message and leave body out: the task gets the user's own words, and the user sees them in the task thread. A message about an open task goes to that task this way. Do not start a second task for it. The ID must be a user_message event of this turn, and attachments must be empty. Without user_message_id (an older message, or a turn that you started on your own), give body: it is your instruction in your own words, and the thread shows it as your message. A resolved task takes no message. To attach channel files, give their paths from files_list, with body only."),
     /// `list_tasks`.
     ListTasks("list_tasks", ListTasksArgs, COORDINATORS,
         "List the tasks in this channel. A long brief or review summary is cut to a preview here. Use read_task for the full task."),
@@ -1403,6 +1422,32 @@ pub struct PublishArtifactResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_replaced_call_result_round_trips_with_its_status() {
+        let result = RunConnectorToolResult::Replaced {
+            approval_id: crate::ids::ApprovalId::new(),
+            message: "The user sent this while your draft waited: x.".into(),
+        };
+        let value = serde_json::to_value(&result).unwrap();
+        assert_eq!(value["status"], "replaced");
+        let back: RunConnectorToolResult = serde_json::from_value(value).unwrap();
+        assert_eq!(back, result);
+    }
+
+    #[test]
+    fn show_draft_is_a_tool_for_every_session_with_a_schema() {
+        let tool = HubTool::ShowDraft;
+        assert_eq!(tool.name(), "show_draft");
+        for audience in ToolAudience::ALL {
+            assert!(tool.audiences().contains(&audience), "{audience:?}");
+        }
+        let args: ShowDraftArgs = serde_json::from_value(json!({
+            "title": "Claim", "body": "Dear Dr. Meyer"
+        }))
+        .unwrap();
+        assert_eq!(args.to, None);
+    }
     use crate::model::UseIn;
     use serde_json::json;
 
@@ -1436,6 +1481,7 @@ mod tests {
             "list_workers",
             "ask_decision",
             "search",
+            "show_draft",
         ];
         let coordinator = [
             "post_message",
@@ -1751,6 +1797,33 @@ mod tests {
         let value = serde_json::to_value(&args).unwrap();
         let back = HubToolCall::parse("publish_artifact", value).unwrap();
         assert_eq!(back, HubToolCall::PublishArtifact(args));
+    }
+
+    #[test]
+    fn message_task_takes_a_body_or_the_id_of_a_user_message() {
+        let task = "tsk_00000000-0000-0000-0000-000000000001";
+        let message = "msg_00000000-0000-0000-0000-000000000002";
+        // An older call with only a body still parses.
+        let HubToolCall::MessageTask(args) = HubToolCall::parse(
+            "message_task",
+            json!({"task_id": task, "body": "Use tabs."}),
+        )
+        .unwrap() else {
+            panic!("not message_task");
+        };
+        assert_eq!(args.body.as_deref(), Some("Use tabs."));
+        assert_eq!(args.user_message_id, None);
+        // A call with only the ID parses too. The hub checks that one of the
+        // two is there.
+        let HubToolCall::MessageTask(args) = HubToolCall::parse(
+            "message_task",
+            json!({"task_id": task, "user_message_id": message}),
+        )
+        .unwrap() else {
+            panic!("not message_task");
+        };
+        assert_eq!(args.body, None);
+        assert_eq!(args.user_message_id, Some(message.parse().unwrap()));
     }
 
     #[test]

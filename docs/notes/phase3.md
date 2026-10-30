@@ -98,7 +98,7 @@ Windows: GPUI posts toasts with the app identity that `main.rs` now sets (`dev.c
 3. **The switch is the shared settings switch** (32 by 18 px), not the 36 by 20 px of the artboard. Every settings page uses the same switch.
 4. **The setup code has no letter spacing.** GPUI text styles in the theme have no tracking. The size is the design's 34/42.
 5. **The confirm row uses `tint.failed`** (16 percent), the nearest token to the design's 7 percent mix.
-6. **The status line under the title shows the host of the hub URL** ("The hub runs on hub.watzon.tech"), because the hub has no machine name to show ("the hub VPS" in the design).
+6. **The status line under the title shows the host of the hub URL** ("The hub runs on hub.example.com"), because the hub has no machine name to show ("the hub VPS" in the design).
 7. **The design copy "or scan it with a phone" stays.** The approved decision says the Clients list does not show the mobile app before phase 6. No phone app can scan the code yet, but the approved artboard has the line, and the QR code is ready for phase 6.
 
 ## Checked by hand

@@ -51,9 +51,9 @@ These come from the user's experience with GPUI. Follow them in every view.
    - A message: the six quick emoji and More above the items, then Copy text, Copy as Markdown, Reply in thread, Quote in reply. Your own message also has Edit and Delete. A reply in a thread has no Reply in thread.
    - A code or command block: Copy code.
    - A task card or task row: Open thread, Resolve (Ready for review only) or Not done (resolved only), Retry (failed, or Ready for review or Resolved whose session ended), Stop (working only), Archive (failed or resolved only), Copy task ID, Delete.
-   - A channel row: Rename, Instructions, Model, Worker tags, Connectors and skills, Change icon, Move to group, Archive, Delete. Rename, Instructions, Model and Worker tags open the channel settings dialog. Change icon opens the All icons dialog.
-   - The "+" of the Tutti row (a left click): New channel, New group.
-   - A group row (its "..." button, a left click): New channel, Rename, Delete group.
+   - A channel row: Rename, Instructions, Model, Worker tags, Connectors and skills, Change icon, Move to group, Archive, Delete. Rename, Instructions, Model and Worker tags open the channel settings dialog. Connectors and skills opens the Connectors tab of the Channel panel. Change icon opens the All icons dialog.
+   - The "+" of the Tutti row (a left click) and the Tutti row (a right click): New channel, New group.
+   - A group row (its "..." button, a left click, or a right click on the row): New channel, Rename, Delete group.
    - A connection row (Settings > Connectors): Reconnect, Activity, Copy handle, Disconnect.
    - A skill row (Settings > Skills): Turn off (Turn on when it is off), View files, Remove.
    - A skill source row (Settings > Skills): Remove. Only a source that the user added has it.
@@ -64,7 +64,7 @@ These come from the user's experience with GPUI. Follow them in every view.
    - An attachment chip in the composer or the reply box: Try again (failed only), Remove.
    - A file row (Channel panel > Files): Open, Download, Rename, Move, Delete. A folder row and a task row of the artifacts have no menu.
    - The add button of the composer and the reply box (a left click): Upload from this computer, Choose from channel files.
-   - A routine row and a routine opened in the panel: Run now, Run history, Edit, Turn off (Turn on when it is off), Delete. A check-in has no Edit: the hub sets its prompt.
+   - A routine row and a routine opened in the panel or in Settings: Run now, Run history, Edit, Turn off (Turn on when it is off), Delete. A check-in has no Edit: the hub sets its prompt.
    - A memory note (in a tree, on its page and in Settings > Memory): Version history, Copy path, Rename, Delete.
 3. **The chat never has a hard edge.** The top and bottom of the timeline fade into the canvas, so text never stops at a sharp line. GPUI has no blur filter for elements, so use layered gradients. At the top, a progressive tint `layout.top_tint` (the canvas at 97 percent at the top, 94 percent at the bottom of the mark, 80 percent at the bottom of the pill, and clear at 108 px, drawn as three gradient layers) lies under the Three voices mark, the activity pill and the top actions; content under it stays faintly visible. At rest the first item starts at `layout.content_top` (98 px). Above the composer, `layout.fade_bottom` (32 px). Lists that scroll inside a panel or a dialog fade at their edges too.
 4. **Dropdowns flip.** Any menu, popover or select that can run past the window edge opens downward when there is room and upward when there is not. Use GPUI's anchored positioning with anchor switching, not a fixed offset.

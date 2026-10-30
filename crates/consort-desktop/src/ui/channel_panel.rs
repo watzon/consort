@@ -1,5 +1,5 @@
 //! The Channel panel: the channel's name and purpose, and the tabs Files,
-//! Routines and Memory. It shares the right side with the Tasks panel, one
+//! Routines, Memory and Connectors. It shares the right side with the Tasks panel, one
 //! at a time. A routine or a memory note opens in place of the panel, with
 //! a back button (`ui/routines.rs`, `ui/memory.rs`).
 //!
@@ -25,7 +25,6 @@ use crate::{
             ButtonKind, button, detail, focusable, icon, icon_button, icon_text_button, line,
             status_color, status_glyph, text,
         },
-        window_controls::DragArea as _,
     },
 };
 
@@ -99,15 +98,7 @@ impl ConsortApp {
             .iter()
             .filter(|f| f.channel_id == self.channel_id)
             .count();
-        let header = div()
-            .flex()
-            .flex_none()
-            .items_center()
-            .gap(t.space.xs)
-            .h(t.component.sidebar.title_bar)
-            .pl(t.space.lg)
-            .pr(t.space.sm)
-            .drag_area()
+        let header = crate::ui::parts::panel_header(t)
             .child(
                 div()
                     .flex()
@@ -151,6 +142,12 @@ impl ConsortApp {
             (ChannelTab::Files, "Files", Some(file_count), true),
             (ChannelTab::Routines, "Routines", Some(routine_count), true),
             (ChannelTab::Memory, "Memory", Some(note_count), true),
+            (
+                ChannelTab::Connectors,
+                "Connectors",
+                Some(self.connectors_tab_count(&self.channel_id)),
+                true,
+            ),
         ];
         let mut segmented = div()
             .flex()
@@ -215,6 +212,10 @@ impl ConsortApp {
                 self.render_memory_tab(&name, t, cx),
                 crate::ui::memory::memory_hint(&name, tutti),
             ),
+            ChannelTab::Connectors => (
+                self.render_connectors_tab(tutti, t, cx),
+                format!("Changes apply to the next session in {name}."),
+            ),
         };
         div()
             .id("channel-panel")
@@ -222,7 +223,7 @@ impl ConsortApp {
             .flex()
             .flex_col()
             .flex_none()
-            .w(t.layout.panel_width)
+            .w(self.right_panel_width(t))
             .h_full()
             .bg(c.surface_sidebar)
             .border_l(t.border_width)
@@ -239,14 +240,7 @@ impl ConsortApp {
                 this.drop_files(DropOver::Files, paths, cx);
             }))
             .child(header)
-            .child(
-                div()
-                    .flex()
-                    .flex_none()
-                    .py(t.space.xs)
-                    .px(t.space.lg)
-                    .child(segmented),
-            )
+            .child(crate::ui::parts::panel_tabs(segmented, t))
             .child(body)
             .child(
                 div()
@@ -761,7 +755,7 @@ impl ConsortApp {
                     };
                     this.open_lightbox(vec![image], 0, caption, cx);
                 } else {
-                    this.open_blob(open.sha256.clone(), open.size, open.name.clone(), cx);
+                    this.click_channel_file(&open, cx);
                 }
             }))
             .on_mouse_down(

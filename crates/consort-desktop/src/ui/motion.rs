@@ -81,9 +81,37 @@ impl FrameClock {
 }
 
 /// True when the frame timer must run: the last draw showed something that
-/// moves, the window has the focus, and Reduce motion is off.
-pub fn clock_runs(used: bool, window_active: bool, reduce_motion: bool) -> bool {
-    used && window_active && !reduce_motion
+/// moves and Reduce motion is off. Work in progress (`working`) moves also in
+/// a window without the focus, because the user often watches it from another
+/// app. The idle mark moves only in the active window, so an app at rest uses
+/// no power.
+pub fn clock_runs(used: bool, working: bool, window_active: bool, reduce_motion: bool) -> bool {
+    used && !reduce_motion && (window_active || working)
+}
+
+/// The steps of one turn of the working spinner. At 8 frames a second, a turn
+/// takes 1.5 seconds.
+const SPIN_STEPS: u64 = 12;
+
+/// The angle of the working spinner at a clock tick, in radians.
+pub fn spin_angle(tick: u64) -> f32 {
+    (tick % SPIN_STEPS) as f32 / SPIN_STEPS as f32 * std::f32::consts::TAU
+}
+
+/// The angle of a spinner now. A spinner that is not live, or any spinner
+/// under Reduce motion, stands still. A live one tells the clock that the
+/// draw moves.
+pub fn spinner_angle(live: bool, cx: &App) -> f32 {
+    if !live || cx.reduce_motion() {
+        return 0.0;
+    }
+    match cx.try_global::<FrameClock>() {
+        Some(clock) => {
+            clock.mark_used();
+            spin_angle(clock.tick())
+        }
+        None => 0.0,
+    }
 }
 
 /// The version (0, 1 or 2) that a shimmering icon shows now. An icon that
@@ -100,6 +128,27 @@ pub fn shimmer_version(live: bool, cx: &App) -> usize {
         }
         None => 0,
     }
+}
+
+/// How far one dab of the writing bubble is up now, from 0 to 1. The dabs rise
+/// one after another, two frames apart, and the wave takes 8 frames (one
+/// second). The shimmer of a 10 px dab is too small to see, so the rise is what
+/// shows the work. Under Reduce motion a dab stays down.
+pub fn writing_lift(dab: u64, cx: &App) -> f32 {
+    if cx.reduce_motion() {
+        return 0.0;
+    }
+    cx.try_global::<FrameClock>()
+        .map_or(0.0, |clock| wave_lift(clock.tick(), dab))
+}
+
+/// One step of the wave of [`writing_lift`], which is a pure function of the
+/// clock.
+fn wave_lift(tick: u64, dab: u64) -> f32 {
+    const WAVE: [f32; 8] = [0.0, 0.6, 1.0, 0.6, 0.0, 0.0, 0.0, 0.0];
+    let steps = WAVE.len() as u64;
+    let delay = dab.wrapping_mul(2) % steps;
+    WAVE[((tick % steps + steps - delay) % steps) as usize]
 }
 
 /// True when the icon button with this ID is under the pointer.
@@ -140,11 +189,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_clock_runs_only_for_motion_on_screen_in_an_active_window() {
-        assert!(clock_runs(true, true, false));
-        assert!(!clock_runs(false, true, false), "nothing moves on screen");
-        assert!(!clock_runs(true, false, false), "the window is not active");
-        assert!(!clock_runs(true, true, true), "Reduce motion is on");
+    fn the_dabs_rise_one_after_another_and_the_wave_loops() {
+        assert_eq!(wave_lift(2, 0), 1.0, "the first dab is up on frame 2");
+        assert_eq!(wave_lift(2, 1), 0.0, "the next dab is still down");
+        assert_eq!(wave_lift(4, 1), 1.0);
+        assert_eq!(wave_lift(6, 2), 1.0);
+        for dab in 0..3 {
+            for tick in 0..8 {
+                assert_eq!(wave_lift(tick, dab), wave_lift(tick + 8, dab));
+            }
+        }
+    }
+
+    #[test]
+    fn the_clock_runs_for_work_in_any_window_and_for_the_rest_only_in_an_active_one() {
+        assert!(clock_runs(true, false, true, false));
+        assert!(
+            !clock_runs(false, true, true, false),
+            "nothing moves on screen"
+        );
+        assert!(
+            clock_runs(true, true, false, false),
+            "work shows without the focus"
+        );
+        assert!(
+            !clock_runs(true, false, false, false),
+            "the idle mark rests"
+        );
+        assert!(!clock_runs(true, true, true, true), "Reduce motion is on");
+    }
+
+    #[test]
+    fn the_spinner_turns_once_in_twelve_steps() {
+        assert_eq!(spin_angle(0), 0.0);
+        assert_eq!(spin_angle(12), 0.0);
+        let quarter = spin_angle(3) - std::f32::consts::FRAC_PI_2;
+        assert!(quarter.abs() < 0.001, "{quarter}");
+        let angles: std::collections::BTreeSet<u32> =
+            (0..12).map(|tick| spin_angle(tick).to_bits()).collect();
+        assert_eq!(angles.len(), 12, "every step shows a new angle");
     }
 
     #[test]

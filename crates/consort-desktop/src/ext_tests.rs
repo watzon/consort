@@ -62,7 +62,6 @@ fn every_connector_and_skill_page_and_dialog_opens(cx: &mut TestAppContext) {
         Dialog::ConfirmDisconnect(mx::CON_GITHUB.into()),
         Dialog::AddSkill,
         Dialog::ConfirmRemoveSkill(mx::SKL_PDF.into()),
-        Dialog::ChannelExtensions(mx::ACME.into()),
         Dialog::AccountSettings("wrk_bigboi".into(), "acc_bigboi_claude".into()),
     ];
     for dialog in dialogs {
@@ -226,26 +225,70 @@ fn hub_cards_answer_with_their_options(cx: &mut TestAppContext) {
     });
 }
 
-/// A switch in the channel dialog turns a connector on in the channel, and
+/// A wide window, so the Channel panel has its full width.
+fn open_wide(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<ConsortApp>) {
+    cx.executor().allow_parking();
+    cx.update(|cx| {
+        gpui_kit::init(cx);
+        consort_theme::init(cx);
+    });
+    let options = WindowOptions {
+        window_bounds: Some(gpui_kit::WindowBounds::Windowed(gpui_kit::Bounds {
+            origin: gpui_kit::point(gpui_kit::px(0.), gpui_kit::px(0.)),
+            size: gpui_kit::size(gpui_kit::px(1440.), gpui_kit::px(900.)),
+        })),
+        ..WindowOptions::default()
+    };
+    let (handle, app) = cx
+        .update(|cx| {
+            gpui_kit::open_window(options, cx, |window, cx| {
+                cx.new(|cx| {
+                    ConsortApp::new(
+                        Client::mock_with(consort_client::mock::view_state()).expect("mock"),
+                        true,
+                        window,
+                        cx,
+                    )
+                })
+            })
+        })
+        .expect("open the window");
+    (handle, app)
+}
+
+fn bounds(cx: &mut VisualTestContext, selector: &str) -> gpui_kit::Bounds<gpui_kit::Pixels> {
+    let name: &'static str = Box::leak(selector.to_owned().into_boxed_str());
+    cx.debug_bounds(name)
+        .unwrap_or_else(|| panic!("{selector} draws"))
+}
+
+fn click(cx: &mut VisualTestContext, selector: &str) {
+    let at = bounds(cx, selector).center();
+    cx.simulate_click(at, gpui_kit::Modifiers::default());
+    settle(cx);
+}
+
+fn enabled_connectors(app: &Entity<ConsortApp>, cx: &mut VisualTestContext) -> Vec<String> {
+    app.read_with(cx, |app, _| {
+        consort_client::channel_extensions(&app.state, mx::ACME)
+            .expect("acme")
+            .enabled_connector_ids()
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect()
+    })
+}
+
+/// A switch in the Connectors tab turns a connector on in the channel, and
 /// the effective set follows.
 #[gpui::test]
 fn the_channel_switch_turns_a_connector_on_in_the_channel(cx: &mut TestAppContext) {
-    let (handle, app) = open_app(cx, consort_client::mock::view_state());
+    let (handle, app) = open_wide(cx);
     let cx = &mut VisualTestContext::from_window(handle, cx);
-    let enabled = |app: &Entity<ConsortApp>, cx: &mut VisualTestContext| {
-        app.read_with(cx, |app, _| {
-            consort_client::channel_extensions(&app.state, mx::ACME)
-                .expect("acme")
-                .enabled_connector_ids()
-                .iter()
-                .map(|s| (*s).to_owned())
-                .collect::<Vec<_>>()
-        })
-    };
-    assert!(!enabled(&app, cx).contains(&mx::CON_GMAIL_PERSONAL.to_owned()));
+    assert!(!enabled_connectors(&app, cx).contains(&mx::CON_GMAIL_PERSONAL.to_owned()));
     cx.update(|window, cx| {
         app.update(cx, |app, cx| {
-            app.open_dialog(Dialog::ChannelExtensions(mx::ACME.into()), window, cx);
+            app.open_channel_connectors(mx::ACME.into(), window, cx);
             app.set_channel_item(
                 mx::ACME.into(),
                 mx::CON_GMAIL_PERSONAL.into(),
@@ -256,7 +299,83 @@ fn the_channel_switch_turns_a_connector_on_in_the_channel(cx: &mut TestAppContex
         })
     });
     settle(cx);
-    assert!(enabled(&app, cx).contains(&mx::CON_GMAIL_PERSONAL.to_owned()));
+    assert!(enabled_connectors(&app, cx).contains(&mx::CON_GMAIL_PERSONAL.to_owned()));
+}
+
+/// The Connectors tab opens from the channel row menu, lists the connectors
+/// and skills of the channel, turns one off with its switch, and Manage all
+/// in Settings opens Settings > Connectors.
+#[gpui::test]
+fn the_connectors_tab_lists_the_items_and_the_switch_turns_one_off(cx: &mut TestAppContext) {
+    let (handle, app) = open_wide(cx);
+    let cx = &mut VisualTestContext::from_window(handle, cx);
+    // The menu item opens the channel, the panel and the tab.
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            app.run_menu(
+                crate::ui::menu::MenuAction::ChannelExtensions(mx::ACME.into()),
+                window,
+                cx,
+            )
+        })
+    });
+    settle(cx);
+    app.read_with(cx, |app, _| {
+        assert_eq!(app.page, Page::Main);
+        assert_eq!(app.channel_id, mx::ACME);
+        assert_eq!(app.panel, crate::app::Panel::Channel);
+        assert_eq!(app.channel_tab, crate::app::ChannelTab::Connectors);
+        assert!(app.dialog.is_none());
+    });
+    let on = enabled_connectors(&app, cx);
+    assert!(!on.is_empty(), "the channel has a connector on");
+    let skills_on = app.read_with(cx, |app, _| {
+        consort_client::channel_extensions(&app.state, mx::ACME)
+            .expect("acme")
+            .enabled_skill_ids()
+            .len()
+    });
+    // The tab lists the items, each with its switch.
+    for id in &on {
+        bounds(cx, &format!("channel-item-{id}"));
+    }
+    app.read_with(cx, |app, _| {
+        assert_eq!(app.connectors_tab_count(mx::ACME), on.len() + skills_on)
+    });
+    bounds(cx, "channel-add-connector");
+    // The rows stay inside the panel.
+    let panel = bounds(cx, "channel-panel");
+    let first = bounds(cx, &format!("channel-item-{}", on[0]));
+    assert!(first.right() <= panel.right());
+    // A click on the switch turns the connector off in this channel.
+    click(cx, &format!("channel-item-{}", on[0]));
+    assert!(!enabled_connectors(&app, cx).contains(&on[0]));
+    assert_eq!(enabled_connectors(&app, cx).len(), on.len() - 1);
+    // Manage all in Settings opens Settings > Connectors.
+    click(cx, "channel-manage-connectors");
+    app.read_with(cx, |app, _| {
+        assert_eq!(app.page, Page::Settings);
+        assert_eq!(app.settings_section, SettingsSection::Connectors);
+    });
+}
+
+/// Add a connector opens the Add connector dialog, and the dialog of the
+/// channel settings leads to the tab.
+#[gpui::test]
+fn the_connectors_tab_opens_the_add_connector_dialog(cx: &mut TestAppContext) {
+    let (handle, app) = open_wide(cx);
+    let cx = &mut VisualTestContext::from_window(handle, cx);
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            app.open_channel_connectors(mx::ACME.into(), window, cx)
+        })
+    });
+    settle(cx);
+    click(cx, "channel-add-connector");
+    app.read_with(cx, |app, _| {
+        assert_eq!(app.dialog.as_ref(), Some(&Dialog::AddConnector));
+        assert_eq!(app.page, Page::Main);
+    });
 }
 
 /// The account dialog turns the provider extras off.
@@ -581,4 +700,163 @@ fn the_activity_dialog_says_when_the_calls_do_not_load(cx: &mut TestAppContext) 
         assert_eq!(app.ext.activity.calls.len(), 3);
     });
     assert!(cx.debug_bounds("activity-retry").is_none());
+}
+
+/// The Use in that the first skill of the mock has now.
+fn skill_use_in(cx: &mut VisualTestContext, app: &Entity<ConsortApp>) -> UseInView {
+    app.read_with(cx, |app, _| {
+        app.state
+            .skill(mx::SKL_RESEARCH)
+            .expect("the skill")
+            .use_in
+            .clone()
+    })
+}
+
+fn picker_open(cx: &mut VisualTestContext, app: &Entity<ConsortApp>) -> bool {
+    app.read_with(cx, |app, _| app.ext.use_in_picker.is_some())
+}
+
+#[gpui::test]
+fn use_in_has_tutti_only_every_channel_and_a_dialog_for_the_rest(cx: &mut TestAppContext) {
+    let (handle, app) = open_app(cx, consort_client::mock::view_state());
+    let cx = &mut VisualTestContext::from_window(handle, cx);
+    cx.update(|_, cx| app.update(cx, |app, cx| app.open_settings(SettingsSection::Skills, cx)));
+    settle(cx);
+    let (tutti, channel) = app.read_with(cx, |app, _| {
+        let tutti = app.state.sidebar.tutti.id.clone();
+        let channel = app
+            .state
+            .channels
+            .iter()
+            .find(|c| c.id != tutti)
+            .expect("a channel")
+            .id
+            .clone();
+        (tutti, channel)
+    });
+
+    // Tutti only: the list has Tutti and no other channel.
+    click(cx, "use-in-skill-tutti");
+    let only = skill_use_in(cx, &app);
+    assert_eq!(only, UseInView::Channels(vec![tutti.clone()]));
+    app.read_with(cx, |app, _| {
+        let names = consort_client::matching_channels(&only, &app.state.channels);
+        assert_eq!(names.len(), 1);
+        assert_eq!(names[0].id, tutti);
+    });
+
+    click(cx, "use-in-skill-every");
+    assert_eq!(skill_use_in(cx, &app), UseInView::EveryChannel);
+
+    // An empty choice has no Save.
+    click(cx, "use-in-skill-choose");
+    assert!(picker_open(cx, &app));
+    click(cx, "use-in-save");
+    assert!(picker_open(cx, &app), "nothing is chosen yet");
+    assert_eq!(skill_use_in(cx, &app), UseInView::EveryChannel);
+
+    // Channels, with Tutti in the list.
+    let row = format!("use-in-row-{channel}");
+    click(cx, &row);
+    click(cx, &format!("use-in-row-{tutti}"));
+    assert_eq!(
+        skill_use_in(cx, &app),
+        UseInView::EveryChannel,
+        "nothing changes until Save"
+    );
+    click(cx, "use-in-save");
+    assert!(!picker_open(cx, &app));
+    assert_eq!(
+        skill_use_in(cx, &app),
+        UseInView::Channels(vec![channel.clone(), tutti.clone()])
+    );
+
+    // It opens on what is chosen. Cancel keeps the scope.
+    click(cx, "use-in-skill-choose");
+    click(cx, &row);
+    click(cx, "use-in-cancel");
+    assert!(!picker_open(cx, &app));
+    assert_eq!(
+        skill_use_in(cx, &app),
+        UseInView::Channels(vec![channel.clone(), tutti.clone()])
+    );
+
+    // Tags replace the channels. The card keeps its place on either tab.
+    click(cx, "use-in-skill-choose");
+    let on_channels = bounds(cx, "use-in-picker");
+    click(cx, "use-in-tab-tags");
+    assert_eq!(bounds(cx, "use-in-picker"), on_channels);
+    click(cx, "use-in-row-work");
+    click(cx, "use-in-save");
+    assert_eq!(
+        skill_use_in(cx, &app),
+        UseInView::Tags(vec!["work".to_owned()])
+    );
+    click(cx, "use-in-skill-choose");
+    app.read_with(cx, |app, _| {
+        let picker = app.ext.use_in_picker.as_ref().expect("open");
+        assert_eq!(picker.tab, crate::extensions::UseInPickerTab::Tags);
+        assert_eq!(picker.tags, ["work"]);
+    });
+}
+
+#[gpui::test]
+fn the_use_in_dialog_opens_over_the_connect_dialog_and_closes_alone(cx: &mut TestAppContext) {
+    let (handle, app) = open_app(cx, consort_client::mock::view_state());
+    let cx = &mut VisualTestContext::from_window(handle, cx);
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            app.open_settings(SettingsSection::Connectors, cx);
+            app.open_dialog(Dialog::AddConnector, window, cx);
+        })
+    });
+    settle(cx);
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            let github = app
+                .state
+                .connector_catalog
+                .services
+                .iter()
+                .find(|s| s.slug == "github")
+                .cloned()
+                .expect("GitHub in the catalog");
+            app.open_connect(github, None, true, window, cx);
+        })
+    });
+    settle(cx);
+    let connect_use_in =
+        |cx: &mut VisualTestContext| app.read_with(cx, |app, _| app.ext.connect.use_in.clone());
+    let before = connect_use_in(cx);
+
+    click(cx, "use-in-connect-choose");
+    assert!(picker_open(cx, &app));
+    cx.simulate_keystrokes("escape");
+    settle(cx);
+    assert!(!picker_open(cx, &app), "Escape closes the Use in dialog");
+    app.read_with(cx, |app, _| {
+        assert_eq!(
+            app.dialog,
+            Some(Dialog::Connect),
+            "the dialog under it stays"
+        );
+    });
+    assert_eq!(connect_use_in(cx), before);
+
+    // A click outside the card closes only the Use in dialog too.
+    click(cx, "use-in-connect-choose");
+    let card = bounds(cx, "use-in-picker");
+    cx.simulate_click(
+        gpui_kit::point(card.origin.x, card.origin.y)
+            - gpui_kit::point(gpui_kit::px(8.), gpui_kit::px(8.)),
+        gpui_kit::Modifiers::default(),
+    );
+    settle(cx);
+    assert!(!picker_open(cx, &app));
+    app.read_with(cx, |app, _| assert_eq!(app.dialog, Some(Dialog::Connect)));
+
+    click(cx, "use-in-connect-tutti");
+    let tutti = app.read_with(cx, |app, _| app.state.sidebar.tutti.id.clone());
+    assert_eq!(connect_use_in(cx), UseInView::Channels(vec![tutti]));
 }

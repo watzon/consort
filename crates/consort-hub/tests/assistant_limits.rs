@@ -56,8 +56,11 @@ async fn worker_has_home_assistant(world: &mut World) {
 async fn an_ask_channel_coordinator_cannot_start_a_full_access_task_in_place() {
     let mut world = World::start().await;
     worker_has_home_assistant(&mut world).await;
-    // The Tutti channel defaults to Ask and a worktree, and allows no
-    // local MCP server.
+    // The Tutti channel is in Ask here (a new Tutti starts in Auto, but the
+    // user can set it back), uses a worktree, and allows no local MCP server.
+    let mut update = ChannelUpdate::new(world.tutti);
+    update.default_approval_mode = Some(ApprovalMode::Ask);
+    world.client.request(update).await.unwrap();
     let coordinator = world
         .start_coordinator("Summarize this web page for me")
         .await;
@@ -116,6 +119,56 @@ async fn an_ask_channel_coordinator_cannot_start_a_full_access_task_in_place() {
             &["task_limited", "Full access", "in place", "home-assistant"],
         )
         .await;
+}
+
+#[tokio::test]
+async fn tutti_starts_in_auto_and_a_task_from_a_normal_turn_gets_it() {
+    let mut world = World::start().await;
+    let tutti = world.client.request(ChannelUpdate::new(world.tutti)).await;
+    assert_eq!(
+        tutti.unwrap().channel.default_approval_mode,
+        ApprovalMode::Auto
+    );
+    let coordinator = world.start_coordinator("Check the build").await;
+    // The coordinator session itself always runs in Ask. The channel's mode
+    // is for its tasks.
+    assert_eq!(coordinator.approval_mode, ApprovalMode::Ask);
+
+    // The coordinator leaves the mode out: the task gets the channel's Auto.
+    let started = world
+        .worker
+        .tool_json(
+            coordinator.session_id,
+            "start_task",
+            json!({"title": "Build", "brief": "Run the build."}),
+        )
+        .await;
+    assert!(started.get("notes").is_none(), "{started}");
+    let start = world.worker.accept_session_start().await;
+    assert_eq!(start.approval_mode, ApprovalMode::Auto);
+
+    // Asking for more than the channel allows is still lowered to Auto.
+    let started = world
+        .worker
+        .tool_json(
+            coordinator.session_id,
+            "start_task",
+            json!({"title": "More", "brief": "Do more.", "approval_mode": "full_access"}),
+        )
+        .await;
+    assert_eq!(started["notes"].as_array().unwrap().len(), 1, "{started}");
+    let start = world.worker.accept_session_start().await;
+    assert_eq!(start.approval_mode, ApprovalMode::Auto);
+}
+
+#[tokio::test]
+async fn a_full_access_channel_still_has_a_coordinator_in_ask() {
+    let mut world = World::start().await;
+    let mut update = ChannelUpdate::new(world.tutti);
+    update.default_approval_mode = Some(ApprovalMode::FullAccess);
+    world.client.request(update).await.unwrap();
+    let coordinator = world.start_coordinator("Hello").await;
+    assert_eq!(coordinator.approval_mode, ApprovalMode::Ask);
 }
 
 #[tokio::test]

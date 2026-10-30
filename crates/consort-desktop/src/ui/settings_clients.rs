@@ -501,7 +501,7 @@ mod tests {
     #[test]
     fn the_qr_code_holds_the_pairing_text() {
         let (width, modules) =
-            qr_modules(r#"{"code":"KQ7M-4XPD","hub_url":"wss://hub.watzon.tech:7443"}"#).unwrap();
+            qr_modules(r#"{"code":"KQ7M-4XPD","hub_url":"wss://hub.example.com:7443"}"#).unwrap();
         assert_eq!(modules.len(), width * width);
         assert!(width >= 21, "a QR code is at least 21 modules wide");
         // The three finder patterns: the top-left corner is dark.

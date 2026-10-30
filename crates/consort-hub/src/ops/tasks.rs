@@ -4,12 +4,13 @@ use consort_proto::client_api::*;
 use consort_proto::frame::Empty;
 use consort_proto::ids::SessionId;
 use consort_proto::ids::TaskId;
-use consort_proto::model::Isolation;
 use consort_proto::model::{
     Author, Channel, MessageKind, Repo, Session, SessionRole, SessionState, Task, Usage,
     ValidationError,
 };
+use consort_proto::model::{Isolation, ModelSelection};
 use consort_proto::status::{Actor, TaskStatus};
+use consort_proto::time::Timestamp;
 use consort_proto::worker_link::{
     HubToWorker, InventoryRefresh, ItemDetail, ItemDetailResult, SessionInterrupt, SessionStart,
     TurnInput, WorkspaceRelease, WorkspaceRepo, WorkspaceSpec,
@@ -17,6 +18,7 @@ use consort_proto::worker_link::{
 
 use super::flow::transition;
 use super::hooks::NewTask;
+use super::model_switch::check_selection_for_started_task;
 use crate::error::{HubError, Result};
 use crate::hub::{Caller, Hub};
 use crate::limits::{BRIEF_MAX_BYTES, check_text};
@@ -128,10 +130,12 @@ impl Hub {
                 let workers = machine::workers(conn)?;
                 let open = work::open_session_counts(conn)?;
                 let repos = conversation::repos(conn)?;
-                Ok(Some((task, channel, workers, open, repos)))
+                let tutti = conversation::tutti_channel(conn)?;
+                let limited = machine::limited_accounts(conn, Timestamp::now())?;
+                Ok(Some((task, channel, workers, open, repos, tutti, limited)))
             })
             .await?;
-        let Some((task, channel, workers, open, all_repos)) = inputs else {
+        let Some((task, channel, workers, open, all_repos, tutti, limited)) = inputs else {
             return Ok(());
         };
 
@@ -148,15 +152,23 @@ impl Hub {
             .placement
             .isolation
             .unwrap_or(channel.default_isolation);
-        let selection = task
+        let chosen = task
             .model_selection
             .clone()
             .or_else(|| channel.task_selection.clone());
+        // With no choice for tasks, a task runs on what the assistant runs
+        // on. This is a default and not a choice of the user: when the task
+        // needs a worker without that account, the default rule decides.
+        let inherited = tutti
+            .task_selection
+            .clone()
+            .or_else(|| channel.effective_coordinator_selection(&tutti).cloned());
         let input = PlacementInput {
             subject: Subject::Task,
             workers: &workers,
             open_sessions: &open,
-            selection: selection.as_ref(),
+            limited: &limited,
+            selection: None,
             request: &task.placement,
             approval_mode: task.approval_mode,
             preferred_workers: &channel.preferred_workers,
@@ -164,7 +176,18 @@ impl Hub {
             repos: &repos,
             isolation,
         };
-        match place(&input) {
+        let on = |selection: &'_ ModelSelection| {
+            place(&PlacementInput {
+                selection: Some(selection),
+                ..input
+            })
+        };
+        let placed = match (&chosen, &inherited) {
+            (Some(selection), _) => on(selection),
+            (None, Some(selection)) => on(selection).or_else(|_| place(&input)),
+            (None, None) => place(&input),
+        };
+        match placed {
             Ok(placement) => {
                 self.start_task_session(task, channel, placement, &repos, isolation)
                     .await
@@ -255,6 +278,7 @@ impl Hub {
             .as_ref()
             .map(|r| r.local_mcp_servers.clone())
             .unwrap_or_default();
+        let account_label = placement.account_label.clone();
         let changed = self
             .store
             .write(move |tx| {
@@ -330,6 +354,13 @@ impl Hub {
                 task.current_session_id = Some(session.id);
                 task.session_ended = false;
                 task.worker_id = Some(worker_id);
+                // The task stays on this account and model until the user
+                // changes it, also when the channel changes later.
+                task.model_selection = Some(ModelSelection {
+                    account_label,
+                    model: session.model.clone(),
+                    options: session.options.clone(),
+                });
                 tx.save_task(&task)?;
                 Ok(true)
             })
@@ -354,7 +385,9 @@ impl Hub {
                 tracing::warn!(error = %err, task_id = %task.id, "could not place a task");
             }
         }
-        Ok(())
+        // A task that waits for its new session on another model may have
+        // lost its start with a restart of the hub.
+        self.start_switched_sessions().await
     }
 
     /// Moves scheduled tasks whose time has come to Up next and places them.
@@ -423,14 +456,24 @@ impl Hub {
                 let mut task = work::task_or_404(tx.db(), id)?;
                 let not_started = matches!(task.status, TaskStatus::Scheduled | TaskStatus::UpNext);
                 let wants_run_change = request.brief.is_some()
-                    || request.model_selection.is_some()
                     || request.placement.is_some()
                     || request.approval_mode.is_some()
                     || request.start_at.is_some();
                 if wants_run_change && !not_started {
                     return Err(HubError::conflict(
-                        "The task already started. You can change only its title now.",
+                        "The task already started. You can change only its title and its model now.",
                     ));
+                }
+                // A started task takes a new model. It is saved now, a
+                // running turn is not cut, and the next turn uses it.
+                if let (false, Some(selection)) = (not_started, request.model_selection.as_ref())
+                    && let Err(reason) = check_selection_for_started_task(
+                        tx.db(),
+                        &task,
+                        selection.as_ref(),
+                    )?
+                {
+                    return Err(HubError::conflict(reason));
                 }
                 if let Some(title) = request.title {
                     let title = title.trim().to_owned();

@@ -412,6 +412,7 @@ pub fn install_source(
 pub fn hub_card(
     details: &ApprovalDetails,
     options: &[model::RequestOption],
+    status: model::ApprovalStatus,
     cache: &Cache,
 ) -> Option<(HubCardView, Vec<(ApprovalChoice, String)>)> {
     if !details.is_hub_card() {
@@ -424,7 +425,7 @@ pub fn hub_card(
             let rule = connection
                 .map(|c| rule_view(c.approvals.rule_for(card.tool_kind)))
                 .unwrap_or(ApprovalRuleView::AskEveryTime);
-            HubCardView::Connector(ConnectorCardView {
+            HubCardView::Connector(Box::new(ConnectorCardView {
                 connection_id: card.connection_id.to_string(),
                 connection_name: card.connection_name.clone(),
                 service_name: card.service_name.clone(),
@@ -444,8 +445,8 @@ pub fn hub_card(
                     })
                     .collect(),
                 rule_note: rule_note(kind, rule),
-                draft: crate::voice::draft_card(card),
-            })
+                draft: crate::voice::draft_card(card, status),
+            }))
         }
         ApprovalDetails::Management(card) => HubCardView::Management(ManagementCardView {
             tool: card.tool.clone(),
@@ -552,9 +553,16 @@ mod tests {
             draft_arguments: None,
             not_my_voice: false,
             ask_rule: None,
+            replaced_by: None,
         }));
         let options = details.hub_card_options().unwrap();
-        let (card, labels) = hub_card(&details, &options, &Cache::default()).unwrap();
+        let (card, labels) = hub_card(
+            &details,
+            &options,
+            model::ApprovalStatus::Pending,
+            &Cache::default(),
+        )
+        .unwrap();
         let HubCardView::Connector(card) = card else {
             panic!("a connector card");
         };
@@ -568,7 +576,113 @@ mod tests {
             ]
         );
         let harness = ApprovalDetails::Other { text: None };
-        assert!(hub_card(&harness, &[], &Cache::default()).is_none());
+        assert!(
+            hub_card(
+                &harness,
+                &[],
+                model::ApprovalStatus::Pending,
+                &Cache::default()
+            )
+            .is_none()
+        );
+    }
+
+    fn outgoing_card(outgoing: model::OutgoingKind) -> ApprovalDetails {
+        ApprovalDetails::Connector(Box::new(model::ConnectorCard {
+            connection_id: consort_proto::ids::ConnectionId::new(),
+            connection_name: "Gmail Work".into(),
+            service_name: "Gmail".into(),
+            tool: "GMAIL_SEND_EMAIL".into(),
+            tool_kind: ToolKind::Change,
+            fields: vec![
+                DisplayField {
+                    label: "To".into(),
+                    value: "Dana Smith <dana@acme.dev>".into(),
+                },
+                DisplayField {
+                    label: "Body".into(),
+                    value: "See you Friday.".into(),
+                },
+            ],
+            arguments: serde_json::json!({"to": "dana@acme.dev", "body": "See you Friday."}),
+            outgoing: Some(outgoing),
+            editable: vec!["body".into()],
+            voice: None,
+            flags: Vec::new(),
+            draft_arguments: None,
+            not_my_voice: false,
+            ask_rule: None,
+            replaced_by: None,
+        }))
+    }
+
+    fn draft_of(
+        details: &ApprovalDetails,
+        status: model::ApprovalStatus,
+    ) -> (crate::voice::DraftCardView, Vec<(ApprovalChoice, String)>) {
+        let options = details.hub_card_options().unwrap();
+        let (card, labels) = hub_card(details, &options, status, &Cache::default()).unwrap();
+        let HubCardView::Connector(card) = card else {
+            panic!("a connector card");
+        };
+        (card.draft.expect("a draft card"), labels)
+    }
+
+    /// An outgoing card has a title, To and connection lines, the text, the
+    /// words Send and Not now, and no outcome while it waits.
+    #[test]
+    fn an_outgoing_card_has_its_title_lines_text_and_words() {
+        let details = outgoing_card(model::OutgoingKind::Send);
+        let (draft, labels) = draft_of(&details, model::ApprovalStatus::Pending);
+        assert_eq!(draft.title, "Email to Dana Smith", "no subject");
+        assert_eq!(draft.to.as_deref(), Some("Dana Smith <dana@acme.dev>"));
+        assert_eq!(draft.connection_line, "Sends with Gmail Work");
+        assert_eq!(draft.subject, None);
+        assert_eq!(draft.body, "See you Friday.");
+        assert_eq!(
+            (draft.allow_label.as_str(), draft.deny_label.as_str()),
+            ("Send", "Not now")
+        );
+        assert_eq!(draft.outcome, None);
+        assert_eq!(
+            labels,
+            vec![
+                (ApprovalChoice::AllowOnce, "Send".to_owned()),
+                (ApprovalChoice::Deny, "Not now".to_owned())
+            ]
+        );
+    }
+
+    #[test]
+    fn a_closed_outgoing_card_says_what_happened_and_what_went_out() {
+        let details = outgoing_card(model::OutgoingKind::Send);
+        let sent = draft_of(&details, model::ApprovalStatus::Allowed)
+            .0
+            .outcome
+            .unwrap();
+        assert_eq!(sent.text, "Sent to Dana Smith");
+        assert_eq!(sent.final_text.as_deref(), Some("See you Friday."));
+        let denied = draft_of(&details, model::ApprovalStatus::Denied)
+            .0
+            .outcome
+            .unwrap();
+        assert_eq!(denied.text, "Not sent");
+        let replaced = draft_of(&details, model::ApprovalStatus::Replaced)
+            .0
+            .outcome
+            .unwrap();
+        assert_eq!(replaced.text, "Replaced by a new version");
+        assert_eq!(replaced.final_text, None);
+    }
+
+    #[test]
+    fn a_card_that_saves_a_draft_says_save_draft_and_not_now() {
+        let details = outgoing_card(model::OutgoingKind::Draft);
+        let (draft, labels) = draft_of(&details, model::ApprovalStatus::Pending);
+        assert_eq!(draft.allow_label, "Save draft");
+        assert_eq!(draft.connection_line, "Saves a draft in Gmail Work");
+        assert_eq!(labels[0].1, "Save draft");
+        assert_eq!(labels[1].1, "Not now");
     }
 
     #[test]

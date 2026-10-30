@@ -17,8 +17,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use consort_proto::ids::{NativeRef, RequestId, TurnId};
 use consort_proto::model::{
-    ApprovalMode, AuthState, Capabilities, ModelInfo, OptionChoice, OptionDescriptor, OptionValue,
-    SessionState,
+    ApprovalMode, AuthState, Capabilities, ModelInfo, ModelOptions, OptionChoice, OptionDescriptor,
+    OptionValue, SessionState,
 };
 use consort_proto::worker_link::{RequestOutcome, SessionEvent, TurnEndReason, TurnInput};
 use serde_json::{Value, json};
@@ -90,6 +90,9 @@ pub fn codex_capabilities() -> Capabilities {
         // the app-server schema of codex-cli 0.166.0).
         images: true,
         approval_modes: ApprovalMode::ALL.to_vec(),
+        // `turn/start` takes `model` and `effort` for this turn and the
+        // next ones.
+        switch_model: true,
         ..Capabilities::default()
     }
 }
@@ -172,6 +175,10 @@ pub fn thread_config(
 /// account (see [`extras_off_config`]).
 pub fn session_config(spec: &SessionSpec) -> serde_json::Map<String, Value> {
     let mut config = thread_config(&spec.mcp_servers, spec.allow_shell);
+    if spec.coordinator {
+        let (key, value) = crate::approval::CODEX_WEB_SEARCH_OFF;
+        config.insert(key.to_owned(), Value::String(value.to_owned()));
+    }
     if !spec.extras_enabled {
         merge_config(&mut config, extras_off_config());
     }
@@ -658,6 +665,7 @@ pub(crate) async fn start_thread(
         workspace: spec.workspace.clone(),
         pending: HashMap::new(),
         effort,
+        new_model: None,
         counter: 0,
         mode: spec.approval_mode,
         applied_mode: spec.approval_mode,
@@ -681,6 +689,11 @@ enum Command {
     },
     SetMode {
         mode: ApprovalMode,
+        reply: oneshot::Sender<Result<(), HarnessError>>,
+    },
+    SetModel {
+        model: String,
+        effort: Option<String>,
         reply: oneshot::Sender<Result<(), HarnessError>>,
     },
     Steer {
@@ -737,6 +750,9 @@ struct Actor {
     workspace: std::path::PathBuf,
     pending: HashMap<RequestId, Pending>,
     effort: Option<String>,
+    /// A model that the next `turn/start` sends once. Codex keeps it for
+    /// the turns after it.
+    new_model: Option<String>,
     counter: u64,
     /// The approval mode of the next turn, and the mode that Codex has
     /// now. A `turn/start` sends the policies when they differ: Codex keeps
@@ -796,6 +812,18 @@ impl Actor {
                                 Err(HarnessError::Protocol("a turn is running".to_owned()))
                             } else {
                                 self.mode = mode;
+                                Ok(())
+                            };
+                            let _ = reply.send(result);
+                        }
+                        Command::SetModel { model, effort, reply } => {
+                            let result = if self.mapper.current_turn().is_some() {
+                                Err(HarnessError::Protocol("a turn is running".to_owned()))
+                            } else {
+                                if !model.is_empty() {
+                                    self.new_model = Some(model);
+                                }
+                                self.effort = effort;
                                 Ok(())
                             };
                             let _ = reply.send(result);
@@ -918,6 +946,8 @@ impl Actor {
                 turn_id: TurnId::new(turn),
                 reason: TurnEndReason::Failed,
                 error: Some(turn_error.to_owned()),
+                error_kind: None,
+                resets_at: None,
             })
             .await;
         }
@@ -952,12 +982,14 @@ impl Actor {
                     thread_id: self.thread_id.clone(),
                     input: turn_input(input, &self.workspace),
                     effort: self.effort.clone(),
+                    model: self.new_model.clone(),
                     approval_policy,
                     sandbox_policy,
                 },
             )
             .await?;
         self.applied_mode = self.mode;
+        self.new_model = None;
         self.mapper.turn_accepted(&response.turn.id);
         Ok(TurnId::new(response.turn.id))
     }
@@ -1278,6 +1310,21 @@ impl HarnessSession for CodexSession {
     /// `turn/start`, so the next turn sends the new ones.
     async fn set_approval_mode(&mut self, mode: ApprovalMode) -> Result<(), HarnessError> {
         self.call(|reply| Command::SetMode { mode, reply }).await
+    }
+
+    /// Codex takes `model` and `effort` with each `turn/start`, so the next
+    /// turn sends the new ones.
+    async fn set_model(&mut self, model: &str, options: &ModelOptions) -> Result<(), HarnessError> {
+        let effort = match options.get("effort") {
+            Some(OptionValue::Text(e)) => Some(e.clone()),
+            _ => None,
+        };
+        self.call(|reply| Command::SetModel {
+            model: model.to_owned(),
+            effort,
+            reply,
+        })
+        .await
     }
 
     async fn respond(&mut self, request: RequestId, answer: Answer) -> Result<(), HarnessError> {

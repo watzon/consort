@@ -648,7 +648,7 @@ mod tests {
 
     fn info(last: Option<BackupRecord>, running: Option<BackupProgress>) -> HubInfo {
         HubInfo {
-            hub_url: "https://hub.watzon.tech:7443".into(),
+            hub_url: "https://hub.example.com:7443".into(),
             hub_version: "0.6.0".into(),
             protocol_versions: vec![1],
             data_dir: "/var/lib/consort".into(),
@@ -712,7 +712,7 @@ mod tests {
         let view = hub_view(&cache, true, now);
         assert_eq!(
             view.summary,
-            "Connected. The hub runs on hub.watzon.tech and keeps every channel, task and memory note."
+            "Connected. The hub runs on hub.example.com and keeps every channel, task and memory note."
         );
         assert_eq!(view.protocol, "1");
         assert_eq!(view.protocol_line, "This app also speaks protocol 1.");

@@ -304,6 +304,7 @@ async fn a_turn_refreshes_the_channel_files_and_uses_the_cache() {
             },
             channel_files: files,
             approval_mode: None,
+            model_change: None,
         };
         let hub = rig.hub.clone();
         let id = id.to_owned();

@@ -586,3 +586,31 @@ async fn a_gemini_session_gets_its_own_home_that_goes_with_the_session() {
     assert!(!account_home.path().join(".gemini/skills").exists());
     rig.worker.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn a_coordinator_session_has_no_shell_and_a_task_session_keeps_it() {
+    let rig = rig(HarnessKind::ClaudeCode).await;
+    // The worker policy allows the shell. The coordinator gets none anyway,
+    // so a command that the harness would run without asking cannot run.
+    let coordinator = SessionId::new();
+    let response = rig
+        .hub
+        .command(
+            "start-c",
+            start(coordinator, rig.account_id, extensions(vec![])).into(),
+        )
+        .await;
+    assert!(response.result.is_ok(), "{:?}", response.result);
+    let spec = opened(&rig.record, 0);
+    assert!(!spec.allow_shell);
+    assert!(spec.coordinator);
+
+    let task = SessionId::new();
+    let mut task_start = start(task, rig.account_id, extensions(vec![]));
+    task_start.role = SessionRole::Task;
+    let response = rig.hub.command("start-t", task_start.into()).await;
+    assert!(response.result.is_ok(), "{:?}", response.result);
+    let spec = opened(&rig.record, 1);
+    assert!(spec.allow_shell);
+    assert!(!spec.coordinator);
+}

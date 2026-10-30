@@ -44,7 +44,7 @@ pub use connector::{
 };
 pub use conversation::{
     Author, Channel, ChannelKind, ChannelRepo, Group, Message, MessageKind, Reaction, ReadMarker,
-    Repo,
+    Repo, TurnErrorKind,
 };
 pub use knowledge::{
     ARTIFACTS_DIR, ChannelFile, ExpectedHash, FileRef, MEMORY_DELETED_KEEP_DAYS,

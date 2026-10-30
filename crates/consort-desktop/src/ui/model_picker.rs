@@ -48,6 +48,10 @@ pub enum PickerTarget {
     SettingsAssistant,
     /// "Model and effort" in the New task dialog.
     NewTask,
+    /// The model of a task that has started, by task ID, in the task
+    /// thread. A choice calls `Client::set_task_model`. The picker offers
+    /// only the models of the worker that holds the task.
+    Task(String),
 }
 
 /// The part of the picker that the arrow keys move in. The search field
@@ -99,6 +103,8 @@ pub struct OpenEffort {
 pub enum TriggerStyle {
     /// A compact chip, for the composer.
     Chip,
+    /// The chip with no account name, for a composer with little room.
+    ChipShort,
     /// A full-width select field, for a dialog.
     Field,
 }
@@ -155,6 +161,73 @@ impl ConsortApp {
                 .and_then(|d| d.form.selection.clone()),
             PickerTarget::SettingsAssistant => self.convo.settings.selection.clone(),
             PickerTarget::NewTask => self.convo.new_task.selection.clone(),
+            PickerTarget::Task(id) => self.state.thread(id).and_then(|th| th.selection.clone()),
+        }
+    }
+
+    /// The groups that the picker of a target offers. A task offers only
+    /// the models of its worker, because the hub refuses any other.
+    pub fn picker_groups(&self, target: &PickerTarget) -> Vec<ModelGroupView> {
+        let PickerTarget::Task(id) = target else {
+            return self.state.model_groups.clone();
+        };
+        let options = self
+            .state
+            .thread(id)
+            .map(|th| th.model_options.as_slice())
+            .unwrap_or_default();
+        self.state
+            .model_groups
+            .iter()
+            .filter_map(|group| {
+                let models: Vec<_> = group
+                    .models
+                    .iter()
+                    .filter(|m| {
+                        options
+                            .iter()
+                            .any(|o| o.account_label == group.account_label && o.model_id == m.id)
+                    })
+                    .cloned()
+                    .collect();
+                (!models.is_empty()).then(|| ModelGroupView {
+                    models,
+                    ..group.clone()
+                })
+            })
+            .collect()
+    }
+
+    /// The note that a pick of a task shows under its row, such as "This
+    /// starts a new session in the same folder."
+    pub(crate) fn task_note(
+        &self,
+        target: &PickerTarget,
+        account: &str,
+        model_id: &str,
+    ) -> Option<String> {
+        let PickerTarget::Task(id) = target else {
+            return None;
+        };
+        self.state
+            .thread(id)?
+            .model_options
+            .iter()
+            .find(|o| o.account_label == account && o.model_id == model_id)?
+            .note
+            .clone()
+    }
+
+    /// Whether the chips of a target show but do not open. A task that the
+    /// hub will not change (it is Resolved) or that has no model list yet
+    /// is locked.
+    pub fn picker_locked(&self, target: &PickerTarget) -> bool {
+        match target {
+            PickerTarget::Task(id) => self
+                .state
+                .thread(id)
+                .is_none_or(|th| !th.can_change_model || th.model_options.is_empty()),
+            _ => false,
         }
     }
 
@@ -175,6 +248,8 @@ impl ConsortApp {
                 .is_some_and(|d| d.form.selection.is_some()),
             PickerTarget::SettingsAssistant => self.convo.settings.selection.is_some(),
             PickerTarget::NewTask => self.convo.new_task.selection.is_some(),
+            // A task always has a model of its own.
+            PickerTarget::Task(_) => false,
         }
     }
 
@@ -210,6 +285,18 @@ impl ConsortApp {
             }
             PickerTarget::SettingsAssistant => self.convo.settings.selection = selection,
             PickerTarget::NewTask => self.convo.new_task.selection = selection,
+            PickerTarget::Task(id) => {
+                // The hub saves the pick at once and a running turn goes
+                // on. The thread shows the new pick when the hub answers.
+                if let Some(selection) = selection {
+                    let client = self.client.clone();
+                    let id = id.clone();
+                    self.spawn_command(
+                        cx,
+                        async move { client.set_task_model(id, selection).await },
+                    );
+                }
+            }
         }
         cx.notify();
     }
@@ -229,20 +316,30 @@ impl ConsortApp {
             .as_ref()
             .map(|p| p.view.clone())
             .unwrap_or(PickerView::Favorites);
-        let rows = picker::view_rows(
-            &self.state.model_groups,
-            &self.state.favorite_models,
-            &view,
-            &query,
-        );
+        let groups = self.open_groups();
+        let rows = picker::view_rows(&groups, &self.state.favorite_models, &view, &query);
         (rows, searching)
+    }
+
+    /// The groups of the open picker: every group, or only the models of
+    /// the task's worker.
+    fn open_groups(&self) -> Vec<ModelGroupView> {
+        match self.picker.as_ref() {
+            Some(open) => self.picker_groups(&open.target),
+            None => self.state.model_groups.clone(),
+        }
     }
 
     /// The row to put the keyboard on in some rows: the current model, else
     /// the first row.
-    fn first_highlight(&self, target: &PickerTarget, rows: &[RowRef]) -> Option<usize> {
+    fn first_highlight(
+        &self,
+        target: &PickerTarget,
+        groups: &[ModelGroupView],
+        rows: &[RowRef],
+    ) -> Option<usize> {
         self.picker_selection(target)
-            .and_then(|s| row_of(&self.state.model_groups, rows, &s))
+            .and_then(|s| row_of(groups, rows, &s))
             .or_else(|| (!rows.is_empty()).then_some(0))
     }
 
@@ -264,11 +361,11 @@ impl ConsortApp {
             input.focus(window, cx);
         });
         let current = self.picker_selection(&target);
-        let groups = &self.state.model_groups;
+        let groups = self.picker_groups(&target);
         let favorites = &self.state.favorite_models;
-        let view = picker::initial_view(groups, favorites, current.as_ref());
-        let rows = picker::view_rows(groups, favorites, &view, "");
-        let highlighted = self.first_highlight(&target, &rows);
+        let view = picker::initial_view(&groups, favorites, current.as_ref());
+        let rows = picker::view_rows(&groups, favorites, &view, "");
+        let highlighted = self.first_highlight(&target, &groups, &rows);
         self.picker = Some(OpenPicker {
             target,
             anchor,
@@ -297,19 +394,27 @@ impl ConsortApp {
     }
 
     pub fn close_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.picker.take().is_some() {
-            self.focus_after_popover(window, cx);
+        if let Some(open) = self.picker.take() {
+            self.focus_after_popover(&open.target, window, cx);
         }
         cx.notify();
     }
 
-    /// After a popover closes, the focus goes back to the composer when no
-    /// dialog is open, else to the app.
-    fn focus_after_popover(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// After a popover closes, the focus goes back to the message box of its
+    /// target when no dialog is open (the reply box for a task), else to the
+    /// app.
+    fn focus_after_popover(
+        &mut self,
+        target: &PickerTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.dialog.is_none() {
-            self.inputs
-                .composer
-                .update(cx, |input, cx| input.focus(window, cx));
+            let input = match target {
+                PickerTarget::Task(_) => &self.inputs.reply,
+                _ => &self.inputs.composer,
+            };
+            input.update(cx, |input, cx| input.focus(window, cx));
         } else {
             self.focus.focus(window, cx);
         }
@@ -321,13 +426,9 @@ impl ConsortApp {
         let Some(target) = self.picker.as_ref().map(|p| p.target.clone()) else {
             return;
         };
-        let rows = picker::view_rows(
-            &self.state.model_groups,
-            &self.state.favorite_models,
-            &view,
-            "",
-        );
-        let highlighted = self.first_highlight(&target, &rows);
+        let groups = self.picker_groups(&target);
+        let rows = picker::view_rows(&groups, &self.state.favorite_models, &view, "");
+        let highlighted = self.first_highlight(&target, &groups, &rows);
         if let Some(open) = self.picker.as_mut() {
             open.view = view;
             open.highlighted = highlighted;
@@ -339,7 +440,7 @@ impl ConsortApp {
 
     /// Moves the rail selection by `delta` buttons, and shows that view.
     fn step_rail(&mut self, delta: isize, cx: &mut Context<Self>) {
-        let rail = picker::rail(&self.state.model_groups);
+        let rail = picker::rail(&self.open_groups());
         let Some(open) = self.picker.as_ref() else {
             return;
         };
@@ -359,7 +460,7 @@ impl ConsortApp {
         let Some(row) = rows.get(n).copied() else {
             return;
         };
-        let groups = &self.state.model_groups;
+        let groups = &self.picker_groups(&open.target);
         let previous = self.picker_selection(&open.target);
         let chosen = picker::choose_model(
             previous.as_ref(),
@@ -399,7 +500,7 @@ impl ConsortApp {
         };
         let (rows, searching) = self.picker_rows(cx);
         let len = rows.len();
-        let has_rail = !searching && !self.state.model_groups.is_empty();
+        let has_rail = !searching && !self.open_groups().is_empty();
         let on_rail = has_rail && matches!(open.focus, PickerFocus::Rail { .. });
         let key = event.keystroke.key.as_str();
         match key {
@@ -464,7 +565,7 @@ impl ConsortApp {
         let highlighted = if searching {
             (!rows.is_empty()).then_some(0)
         } else {
-            self.first_highlight(&target, &rows)
+            self.first_highlight(&target, &self.picker_groups(&target), &rows)
         };
         if let Some(open) = self.picker.as_mut() {
             open.highlighted = highlighted;
@@ -518,8 +619,8 @@ impl ConsortApp {
     }
 
     pub fn close_effort(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.effort_menu.take().is_some() {
-            self.focus_after_popover(window, cx);
+        if let Some(open) = self.effort_menu.take() {
+            self.focus_after_popover(&open.target, window, cx);
         }
         cx.notify();
     }
@@ -589,10 +690,12 @@ impl ConsortApp {
     ) -> AnyElement {
         let c = &t.colors;
         let selection = self.picker_selection(&target);
-        let open = self
-            .picker
-            .as_ref()
-            .is_some_and(|p| p.target == target && self.dialog_allows(&p.target));
+        let locked = self.picker_locked(&target);
+        let open = !locked
+            && self
+                .picker
+                .as_ref()
+                .is_some_and(|p| p.target == target && self.dialog_allows(&p.target));
         let logo = selection
             .as_ref()
             .and_then(|s| self.state.account_logo(&s.account_label).cloned());
@@ -621,6 +724,11 @@ impl ConsortApp {
             }
             None => ("Choose a model".to_owned(), String::new()),
         };
+        let account = if style == TriggerStyle::ChipShort {
+            String::new()
+        } else {
+            account
+        };
         let target_click = target.clone();
         let body = div()
             .flex()
@@ -643,7 +751,8 @@ impl ConsortApp {
                 ))
             });
         let trigger = match style {
-            TriggerStyle::Chip => focusable(div().id(id), t)
+            TriggerStyle::Chip | TriggerStyle::ChipShort => focusable(div().id(id), t)
+                .debug_selector(move || id.into())
                 .relative()
                 .flex()
                 .items_center()
@@ -652,12 +761,15 @@ impl ConsortApp {
                 .px(t.space.sm)
                 .min_w_0()
                 .rounded(t.radius.md)
-                .cursor_pointer()
+                .when(!locked, |d| d.cursor_pointer())
                 .when(open, |d| d.bg(c.surface_selected))
-                .when(!open, |d| d.hover(|s| s.bg(c.hover_card)))
+                .when(!open && !locked, |d| d.hover(|s| s.bg(c.hover_card)))
                 .child(self.triggers.track(id))
                 .child(body)
-                .child(icon("chevron-down", t.space.md, c.text_secondary)),
+                // A locked chip shows the choice and does not open.
+                .when(!locked, |d| {
+                    d.child(icon("chevron-down", t.space.md, c.text_secondary))
+                }),
             TriggerStyle::Field => focusable(div().id(id), t)
                 .relative()
                 .flex()
@@ -678,9 +790,11 @@ impl ConsortApp {
                 .child(icon("chevrons-up-down", t.icon.dense, c.text_secondary)),
         };
         trigger
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.open_picker_under(id, target_click.clone(), window, cx)
-            }))
+            .when(!locked, |d| {
+                d.on_click(cx.listener(move |this, _, window, cx| {
+                    this.open_picker_under(id, target_click.clone(), window, cx)
+                }))
+            })
             .into_any_element()
     }
 
@@ -688,7 +802,7 @@ impl ConsortApp {
     /// only while its dialog is open.
     fn dialog_allows(&self, target: &PickerTarget) -> bool {
         match target {
-            PickerTarget::Assistant(_) => true,
+            PickerTarget::Assistant(_) | PickerTarget::Task(_) => true,
             PickerTarget::SettingsAssistant => {
                 matches!(self.dialog, Some(crate::app::Dialog::ChannelSettings(_)))
             }
@@ -701,11 +815,35 @@ impl ConsortApp {
 
     fn trigger_type(style: TriggerStyle, strong: bool, t: &Tokens) -> consort_theme::Type {
         match (style, strong) {
-            (TriggerStyle::Chip, true) => t.text.label,
-            (TriggerStyle::Chip, false) => detail(t),
+            (TriggerStyle::Chip | TriggerStyle::ChipShort, true) => t.text.label,
+            (TriggerStyle::Chip | TriggerStyle::ChipShort, false) => detail(t),
             (TriggerStyle::Field, true) => t.text.ui_strong,
             (TriggerStyle::Field, false) => t.text.ui,
         }
+    }
+
+    /// What the model chip of a target says in the composer: the model name,
+    /// the account name, and whether the chip has a provider logo. The
+    /// composer measures these to decide what fits.
+    pub fn chip_texts(&self, target: &PickerTarget) -> (String, String, bool) {
+        match self.picker_selection(target) {
+            Some(s) => {
+                let logo = self.state.account_logo(&s.account_label).is_some();
+                if s.model_id.is_empty() {
+                    (s.account_label, String::new(), logo)
+                } else {
+                    (s.model_name, s.account_label, logo)
+                }
+            }
+            None => ("Choose a model".to_owned(), String::new(), false),
+        }
+    }
+
+    /// The words on the effort chip of a target, `None` when the model has
+    /// no effort option.
+    pub fn effort_chip_label(&self, target: &PickerTarget) -> Option<String> {
+        let (selection, effort, _) = self.target_effort(target)?;
+        Some(effort.chip_label(selection.effort()))
     }
 
     /// The effort trigger of a target. `None` when the model has no effort
@@ -721,13 +859,16 @@ impl ConsortApp {
         let c = &t.colors;
         let (selection, effort, _) = self.target_effort(&target)?;
         let label = effort.chip_label(selection.effort());
-        let open = self
-            .effort_menu
-            .as_ref()
-            .is_some_and(|e| e.target == target);
+        let locked = self.picker_locked(&target);
+        let open = !locked
+            && self
+                .effort_menu
+                .as_ref()
+                .is_some_and(|e| e.target == target);
         let target_click = target.clone();
         let trigger = match style {
-            TriggerStyle::Chip => focusable(div().id(id), t)
+            TriggerStyle::Chip | TriggerStyle::ChipShort => focusable(div().id(id), t)
+                .debug_selector(move || id.into())
                 .relative()
                 .flex()
                 .flex_none()
@@ -736,13 +877,15 @@ impl ConsortApp {
                 .h(t.component.composer_chip)
                 .px(t.space.sm)
                 .rounded(t.radius.md)
-                .cursor_pointer()
+                .when(!locked, |d| d.cursor_pointer())
                 .when(open, |d| d.bg(c.surface_selected))
-                .when(!open, |d| d.hover(|s| s.bg(c.hover_card)))
+                .when(!open && !locked, |d| d.hover(|s| s.bg(c.hover_card)))
                 .child(self.triggers.track(id))
                 .child(icon("signal", t.icon.dense, c.text_secondary))
                 .child(text(label, detail(t), c.text_secondary))
-                .child(icon("chevron-down", t.space.md, c.text_secondary)),
+                .when(!locked, |d| {
+                    d.child(icon("chevron-down", t.space.md, c.text_secondary))
+                }),
             TriggerStyle::Field => focusable(div().id(id), t)
                 .relative()
                 .flex()
@@ -772,9 +915,11 @@ impl ConsortApp {
         };
         Some(
             trigger
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.open_effort(id, target_click.clone(), window, cx)
-                }))
+                .when(!locked, |d| {
+                    d.on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_effort(id, target_click.clone(), window, cx)
+                    }))
+                })
                 .into_any_element(),
         )
     }
@@ -804,7 +949,7 @@ impl ConsortApp {
             }
         }
         let c = &t.colors;
-        let groups = self.state.model_groups.clone();
+        let groups = self.picker_groups(&open.target);
         let (rows, searching) = self.picker_rows(cx);
         let current = self.picker_selection(&open.target);
         let query = self.picker_query(cx).trim().to_owned();
@@ -1070,9 +1215,8 @@ impl ConsortApp {
         let open = self.picker.as_ref()?;
         let index = open.rail_hover?;
         let bounds = open.rail_scroll.bounds_for_item(rail_child(index))?;
-        let item = picker::rail(&self.state.model_groups)
-            .into_iter()
-            .nth(index)?;
+        let groups = self.open_groups();
+        let item = picker::rail(&groups).into_iter().nth(index)?;
         let (title, detail_text) = match &item.view {
             PickerView::Favorites => ("Favorites".to_owned(), "From every account".to_owned()),
             PickerView::Account(label) => (
@@ -1148,10 +1292,12 @@ impl ConsortApp {
                 .is_some_and(|s| s.account_label == group.account_label && s.model_id == model.id);
             let highlighted = open.highlighted == Some(n);
             let favorite = self.state.is_favorite(&group.account_label, &model.id);
+            let note = self.task_note(&open.target, &group.account_label, &model.id);
             list = list.child(self.render_model_row(
                 n,
                 group,
                 model,
+                note,
                 RowLook {
                     wide,
                     selected,
@@ -1230,11 +1376,13 @@ impl ConsortApp {
     /// One model row: the name, then (in an account) the effort range or
     /// (in Favorites and search) the provider logo before the name and the
     /// account name after it, then the star and the check.
+    #[allow(clippy::too_many_arguments)]
     fn render_model_row(
         &self,
         n: usize,
         group: &ModelGroupView,
         model: &consort_client::ModelChoiceView,
+        note: Option<String>,
         look: RowLook,
         t: &Tokens,
         cx: &mut Context<Self>,
@@ -1302,11 +1450,10 @@ impl ConsortApp {
         let range = (!wide)
             .then(|| model.effort.as_ref().map(EffortView::range_label))
             .flatten();
+        let row_id = format!("model-row-{}-{}", group.account_label, model.id);
         div()
-            .id(SharedString::from(format!(
-                "model-row-{}-{}",
-                group.account_label, model.id
-            )))
+            .id(SharedString::from(row_id.clone()))
+            .debug_selector(move || row_id.clone())
             .group("picker-row")
             .flex()
             .flex_none()
@@ -1325,22 +1472,39 @@ impl ConsortApp {
             .when(!selected && highlighted, |d| d.bg(c.hover_raised))
             .when(!selected, |d| d.hover(|s| s.bg(c.hover_raised)))
             .map(|d| {
+                // The note of a task pick sits under the name.
+                let with_note = |first: AnyElement| {
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_w_0()
+                        .child(first)
+                        .when_some(note.clone(), |d, note| {
+                            d.child(
+                                text(note, t.text.caption, muted)
+                                    .debug_selector(move || format!("pick-note-{n}")),
+                            )
+                        })
+                        .into_any_element()
+                };
                 if wide {
                     d.child(provider_logo(&group.logo, t.icon.dense, c.text_primary))
-                        .child(
+                        .child(with_note(
                             div()
                                 .flex()
-                                .flex_1()
                                 .min_w_0()
                                 .items_center()
                                 .gap(t.space.sm)
                                 .child(name.flex_none())
-                                .child(line(group.account_label.clone(), t.text.caption, muted)),
-                        )
+                                .child(line(group.account_label.clone(), t.text.caption, muted))
+                                .into_any_element(),
+                        ))
                 } else {
-                    d.child(name.flex_1()).when_some(range, |d, range| {
-                        d.child(text(range, t.text.caption, muted))
-                    })
+                    d.child(with_note(name.into_any_element()))
+                        .when_some(range, |d, range| {
+                            d.child(text(range, t.text.caption, muted))
+                        })
                 }
             })
             .child(star)

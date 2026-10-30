@@ -27,7 +27,7 @@ use crate::{ClientError, Command, CommandOutput, format};
 const MB: u64 = 1024 * 1024;
 const GB: u64 = 1024 * MB;
 /// The hub address of the designs.
-pub const MOCK_HUB_URL: &str = "wss://hub.watzon.tech:7443";
+pub const MOCK_HUB_URL: &str = "wss://hub.example.com:7443";
 /// The pairing code of the designs.
 pub const MOCK_PAIRING_CODE: &str = "KQ7M-4XPD";
 

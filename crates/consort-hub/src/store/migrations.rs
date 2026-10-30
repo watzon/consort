@@ -20,6 +20,9 @@ pub const MIGRATIONS: &[&str] = &[
     include_str!("schema_v10.sql"),
     include_str!("schema_v11.sql"),
     include_str!("schema_v12.sql"),
+    include_str!("schema_v13.sql"),
+    include_str!("schema_v14.sql"),
+    include_str!("schema_v15.sql"),
 ];
 
 pub fn current_version() -> i64 {
@@ -345,5 +348,123 @@ mod tests {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA user_version = 999").unwrap();
         assert!(matches!(migrate(&mut conn), Err(HubError::Startup(_))));
+    }
+    /// Version 13 moves Tutti from Ask to Auto, and only Tutti, and only
+    /// when it is still in Ask.
+    #[test]
+    fn version_13_moves_tutti_from_ask_to_auto_once() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        for sql in &MIGRATIONS[..12] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.execute_batch("PRAGMA user_version = 12").unwrap();
+        let insert = |conn: &Connection, id: &str, kind: &str, mode: &str| {
+            conn.execute(
+                "INSERT INTO channels (id, kind, position, data) VALUES (?1, ?2, 0, ?3)",
+                rusqlite::params![
+                    id,
+                    kind,
+                    format!(
+                        "{{\"kind\":\"{kind}\",\"name\":\"x\",\"default_approval_mode\":\"{mode}\"}}"
+                    )
+                ],
+            )
+            .unwrap();
+        };
+        insert(&conn, "chn_tutti", "tutti", "ask");
+        insert(&conn, "chn_std", "standard", "ask");
+        conn.execute(
+            "INSERT INTO feed (at, channel_id, entity, entity_id, op, payload) VALUES (1, 'chn_tutti', 'channel', 'chn_tutti', 'upsert', '{\"kind\":\"tutti\",\"default_approval_mode\":\"ask\"}')",
+            [],
+        )
+        .unwrap();
+        migrate(&mut conn).unwrap();
+        let mode = |conn: &Connection, id: &str| -> String {
+            conn.query_row(
+                "SELECT json_extract(data, '$.default_approval_mode') FROM channels WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(mode(&conn, "chn_tutti"), "auto");
+        assert_eq!(
+            mode(&conn, "chn_std"),
+            "ask",
+            "other channels keep their mode"
+        );
+        let feed: String = conn
+            .query_row(
+                "SELECT json_extract(payload, '$.default_approval_mode') FROM feed",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(feed, "auto");
+
+        // A Tutti that the user already set to another mode keeps it, and
+        // a Tutti that moved back to Ask after the migration stays there.
+        let mut kept = Connection::open_in_memory().unwrap();
+        for sql in &MIGRATIONS[..12] {
+            kept.execute_batch(sql).unwrap();
+        }
+        kept.execute_batch("PRAGMA user_version = 12").unwrap();
+        insert(&kept, "chn_tutti", "tutti", "auto_edits");
+        migrate(&mut kept).unwrap();
+        assert_eq!(mode(&kept, "chn_tutti"), "auto_edits");
+        kept.execute(
+            "UPDATE channels SET data = json_set(data, '$.default_approval_mode', 'ask')",
+            [],
+        )
+        .unwrap();
+        migrate(&mut kept).unwrap();
+        assert_eq!(mode(&kept, "chn_tutti"), "ask", "the migration runs once");
+    }
+
+    /// A hub at version 13 (it moved Tutti to Auto, but a client with a saved
+    /// feed position never saw the change) gets a new feed row for Tutti
+    /// after every old row, with the current payload.
+    #[test]
+    fn version_14_adds_a_feed_row_for_tutti_after_the_old_rows() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        for sql in &MIGRATIONS[..13] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.execute_batch("PRAGMA user_version = 13").unwrap();
+        conn.execute(
+            "INSERT INTO channels (id, kind, position, data) VALUES ('chn_tutti', 'tutti', 0, '{\"kind\":\"tutti\",\"default_approval_mode\":\"auto\"}')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO channels (id, kind, position, data) VALUES ('chn_std', 'standard', 1, '{\"kind\":\"standard\"}')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO feed (at, channel_id, entity, entity_id, op, payload) VALUES (1, 'chn_tutti', 'channel', 'chn_tutti', 'upsert', '{\"kind\":\"tutti\",\"default_approval_mode\":\"auto\"}')",
+            [],
+        )
+        .unwrap();
+        let saved: i64 = conn
+            .query_row("SELECT max(seq) FROM feed", [], |r| r.get(0))
+            .unwrap();
+        migrate(&mut conn).unwrap();
+        let rows: Vec<(String, String, String, String)> = conn
+            .prepare("SELECT entity, entity_id, op, payload FROM feed WHERE seq > ?1")
+            .unwrap()
+            .query_map([saved], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect();
+        assert_eq!(rows.len(), 1, "one new row, for Tutti only: {rows:?}");
+        let (entity, id, op, payload) = &rows[0];
+        assert_eq!(
+            (entity.as_str(), id.as_str(), op.as_str()),
+            ("channel", "chn_tutti", "upsert")
+        );
+        assert!(payload.contains("\"default_approval_mode\":\"auto\""));
     }
 }

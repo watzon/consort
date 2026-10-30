@@ -2,6 +2,7 @@
 
 use consort_client::{
     DecisionView, PostBody, RequestState, Speaker, TaskStatus, TaskView, ThreadPost,
+    plan::PlanStepState,
 };
 use consort_theme::{Tokens, TypeExt as _};
 use gpui_kit::{
@@ -12,12 +13,11 @@ use gpui_kit::{
 
 use crate::{
     app::{ConsortApp, Panel, TasksTab},
-    ui::window_controls::DragArea as _,
     ui::{
-        menu::{MenuAction, OpenMenu, TextTarget, text_edit_menu},
+        menu::{MenuAction, OpenMenu},
         parts::{
-            ButtonKind, button, detail, focusable, icon, icon_button, line, selectable,
-            status_color, status_glyph, text,
+            ButtonKind, button, detail, focusable, icon, icon_button, leaving_link, line,
+            selectable, status_color, status_glyph, text,
         },
         timeline::{open_context_menu, task_menu},
     },
@@ -34,45 +34,16 @@ pub(crate) fn request_glyph(state: RequestState) -> TaskStatus {
 }
 
 /// The panel frame: 400 px, `surface.sidebar`, a border at the left.
-fn frame(t: &Tokens) -> Div {
+fn frame(width: gpui_kit::Pixels, t: &Tokens) -> Div {
     div()
         .flex()
         .flex_col()
         .flex_none()
-        .w(t.layout.panel_width)
+        .w(width)
         .h_full()
         .bg(t.colors.surface_sidebar)
         .border_l(t.border_width)
         .border_color(t.colors.border_subtle)
-}
-
-/// The 52 px panel header.
-fn header(t: &Tokens) -> Div {
-    div()
-        .flex()
-        .flex_none()
-        .items_center()
-        .h(t.space.page + t.space.xs)
-        .border_b(t.border_width)
-        .border_color(t.colors.border_subtle)
-        .drag_area()
-}
-
-/// What an approval card says after the user answered. The wide choice
-/// repeats the harness's own words, so the card keeps the scope that the user
-/// saw on the button.
-pub fn answered_text(approval: &consort_client::ApprovalView, in_task: bool) -> String {
-    use consort_client::ApprovalChoice;
-    match approval.answer {
-        Some(ApprovalChoice::AllowOnce) => "You allowed it once.".to_owned(),
-        Some(ApprovalChoice::AllowForTask) => match approval.allow_always_label.as_deref() {
-            Some(label) if !label.trim().is_empty() => format!("You chose: {}", label.trim()),
-            _ if in_task => "You allowed it for this task.".to_owned(),
-            _ => "You allowed it from now on.".to_owned(),
-        },
-        Some(ApprovalChoice::Deny) => "You denied it.".to_owned(),
-        None => "Answered.".to_owned(),
-    }
 }
 
 /// How a section of the thread panel looks: its label, its toggle and where
@@ -233,12 +204,9 @@ impl ConsortApp {
                     .child(text(line_text, t.text.ui, c.text_secondary)),
             );
         }
-        frame(t)
+        frame(self.right_panel_width(t), t)
             .child(
-                header(t)
-                    .gap(t.space.xs)
-                    .pl(t.space.lg)
-                    .pr(t.space.sm)
+                crate::ui::parts::panel_header(t)
                     .child(
                         div()
                             .type_style(t.text.title)
@@ -284,14 +252,7 @@ impl ConsortApp {
                         .on_click(cx.listener(|this, _, _, cx| this.close_panel(cx))),
                     ),
             )
-            .child(
-                div()
-                    .flex()
-                    .px(t.space.lg)
-                    .pt(t.space.md)
-                    .pb(t.space.xs)
-                    .child(segmented),
-            )
+            .child(crate::ui::parts::panel_tabs(segmented, t))
             .child(
                 div()
                     .id("tasks-scroll")
@@ -383,7 +344,7 @@ impl ConsortApp {
         &mut self,
         task_id: &str,
         t: &Tokens,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         if let Some(item) = self
@@ -393,7 +354,7 @@ impl ConsortApp {
             .clone()
             .filter(|i| i.task_id == task_id)
         {
-            return self.render_item_view(item, t, _window, cx);
+            return self.render_item_view(item, t, window, cx);
         }
         let c = &t.colors;
         let state = self.state.clone();
@@ -406,11 +367,15 @@ impl ConsortApp {
             .as_ref()
             .map(|t| t.status_detail.clone())
             .unwrap_or_default();
+        let header_status = consort_client::plan::header_status(
+            status,
+            thread.as_ref().and_then(|t| t.plan.as_ref()),
+        );
         let mode_tag = thread.as_ref().map(|t| t.approval_mode.tag());
         let menu_task = task_id.to_owned();
         let more_trigger = self.triggers.clone();
 
-        let head = header(t)
+        let head = crate::ui::parts::panel_header(t)
             .gap(t.space.sm)
             .pl(t.space.sm)
             .pr(t.space.sm)
@@ -447,7 +412,17 @@ impl ConsortApp {
                             .items_center()
                             .gap(t.space.xs + t.space.xxs)
                             .child(status_glyph("thread-status", status, t.space.md, t, cx))
-                            .child(text(status.label(), detail(t), status_color(status, t)))
+                            .child(line(
+                                header_status.clone(),
+                                detail(t),
+                                // Only the two statuses that wait for the
+                                // user use the accent. Working is quiet.
+                                if status == TaskStatus::Working {
+                                    c.text_tertiary
+                                } else {
+                                    status_color(status, t)
+                                },
+                            ))
                             .when(!status_detail.is_empty(), |d| {
                                 d.child(line(status_detail, detail(t), c.text_tertiary))
                             })
@@ -504,7 +479,7 @@ impl ConsortApp {
         // user can copy it, and it scrolls when it is long.
         let reason = thread
             .as_ref()
-            .and_then(|th| th.reason.clone())
+            .and_then(|th| th.reason.as_deref().map(reason_text))
             .map(|reason| {
                 let body = div()
                     .id("thread-reason")
@@ -572,6 +547,13 @@ impl ConsortApp {
                 let t = ConsortApp::tokens(cx);
                 let post = if this.thread_has_brief() && ix == 0 {
                     this.render_brief_bubbles(&t, cx)
+                } else if this.thread_is_plan(ix) {
+                    this.render_plan_card(&t, cx)
+                } else if this.thread_is_writing(ix) {
+                    div()
+                        .flex()
+                        .child(this.render_writing_bubble(&t, cx))
+                        .into_any_element()
                 } else {
                     this.thread_post(ix)
                         .map(|post| this.render_post(&post, &t, window, cx))
@@ -588,129 +570,15 @@ impl ConsortApp {
         )
         .size_full();
 
-        // The task keeps the model that it started with. The thread shows it
-        // as text, with no way to change it.
-        let model_label = self
-            .state
-            .thread(task_id)
-            .and_then(|th| th.model_label.clone());
-        let reply_target = consort_client::UploadTarget::Reply {
-            task_id: task_id.to_owned(),
-        };
-        let reply_chips = self.render_upload_chips(&reply_target, t, cx);
-        let paste_target = reply_target.clone();
-        let add_target = reply_target.clone();
-        let dropping = self
-            .drop_hover
-            .is_some_and(|(over, _)| over == crate::app::DropOver::Reply);
-        let reply = div()
-            .flex_none()
-            .px(t.space.lg)
-            .pb(t.space.xl)
-            .child(
-                div()
-                    .id("reply-box")
-                    .debug_selector(|| "reply-box".into())
-                    .flex()
-                    .flex_col()
-                    .gap(t.space.xs)
-                    .py(t.space.sm)
-                    .px(t.space.sm)
-                    .bg(c.surface_card)
-                    .border(t.border_width)
-                    .border_color(c.border_strong)
-                    .rounded(t.radius.lg)
-                    .when(dropping, |d| {
-                        d.border(t.stroke)
-                            .border_dashed()
-                            .border_color(c.accent_text)
-                            .bg(c.accent_fill.opacity(t.opacity.drop_fill))
-                    })
-                    .capture_action(cx.listener(
-                        move |this, _: &gpui_kit::base::input::Paste, _, cx| {
-                            if this.paste_files(paste_target.clone(), cx) {
-                                cx.stop_propagation();
-                            }
-                        },
-                    ))
-                    // The reply box has the same menu as the composer.
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(|this, event: &MouseDownEvent, _, cx| {
-                            let items = text_edit_menu(TextTarget::Reply);
-                            this.open_menu(OpenMenu::at(event.position, items), cx);
-                            cx.stop_propagation();
-                        }),
-                    )
-                    .children(reply_chips)
-                    .child(
-                        div()
-                            .min_w_0()
-                            .px(t.space.xs + t.space.xxs)
-                            .type_style(t.text.ui)
-                            .child(crate::ui::parts::textarea(&self.inputs.reply, t.text.ui)),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                icon_button(
-                                    "reply-attach",
-                                    "plus",
-                                    t.space.xl + t.space.xs,
-                                    t.icon.size,
-                                    c.text_secondary,
-                                    c.hover_card,
-                                    t,
-                                    cx,
-                                )
-                                .debug_selector(|| "reply-attach".into())
-                                .relative()
-                                .child(self.triggers.track("reply-attach"))
-                                .on_click(cx.listener(
-                                    move |this, _, _, cx| {
-                                        this.open_add_menu("reply-attach", add_target.clone(), cx)
-                                    },
-                                )),
-                            )
-                            .child(
-                                focusable(div().id("reply-send"), t)
-                                    .size(t.space.xl + t.space.xs)
-                                    .flex_none()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded(t.radius.md)
-                                    .bg(c.surface_raised)
-                                    .border(t.border_width)
-                                    .border_color(c.border_strong)
-                                    .cursor_pointer()
-                                    .hover(|s| s.bg(c.hover_raised))
-                                    .child(icon("corner-down-left", t.icon.dense, c.text_primary))
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.send_reply(window, cx)
-                                    })),
-                            ),
-                    ),
-            )
-            .when_some(model_label, |d, label| {
-                d.child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(t.space.xs + t.space.xxs)
-                        .pt(t.space.sm)
-                        .px(t.space.md)
-                        .child(icon("signal", t.icon.dense, c.text_tertiary))
-                        .child(line(
-                            format!("Runs with {label}"),
-                            crate::ui::parts::detail(t),
-                            c.text_tertiary,
-                        )),
-                )
-            });
+        let column = self.right_panel_width(t);
+        let reply = self.render_composer_box(
+            crate::ui::composer::ComposerTarget::Task(task_id.to_owned()),
+            column,
+            None,
+            t,
+            window,
+            cx,
+        );
 
         let fade = |top: bool| {
             let (from, to, angle) = (
@@ -781,6 +649,7 @@ impl ConsortApp {
                                 },
                                 t,
                             )
+                            .debug_selector(|| "review-action".into())
                             .on_click(cx.listener(
                                 move |this, _, window, cx| {
                                     let action = if resolved {
@@ -797,8 +666,9 @@ impl ConsortApp {
             _ => None,
         };
 
-        frame(t)
+        frame(self.right_panel_width(t), t)
             .id("thread-panel")
+            .debug_selector(|| "thread-panel".into())
             .on_drag_move::<gpui_kit::ExternalPaths>(cx.listener(
                 |this, event: &gpui_kit::DragMoveEvent<gpui_kit::ExternalPaths>, _, cx| {
                     let inside = event.bounds.contains(&event.event.position);
@@ -921,6 +791,106 @@ impl ConsortApp {
             .cloned()
     }
 
+    /// The row after the posts is the plan card, when the harness made a
+    /// plan. It sits under the newest message.
+    fn thread_is_plan(&self, ix: usize) -> bool {
+        self.thread_keys
+            .get(ix)
+            .is_some_and(|k| k.starts_with("plan-"))
+    }
+
+    /// The last row of the thread is the writing bubble while the turn of
+    /// the task runs. It sits under the plan card.
+    fn thread_is_writing(&self, ix: usize) -> bool {
+        ix + 1 == self.thread_keys.len()
+            && self
+                .thread_keys
+                .last()
+                .is_some_and(|k| k.starts_with("writing-"))
+    }
+
+    /// The plan of the task as a checklist: done steps in `text.tertiary`
+    /// with the check, the current step in `text.primary` with the working
+    /// glyph, and the next steps with the open ring. The plan is not
+    /// repeated as an activity line.
+    fn render_plan_card(&mut self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
+        let c = &t.colors;
+        let Panel::Thread(task_id) = &self.panel else {
+            return div().into_any_element();
+        };
+        let Some(plan) = self.state.thread(task_id).and_then(|th| th.plan.clone()) else {
+            return div().into_any_element();
+        };
+        let mut card = div()
+            .id("thread-plan")
+            .debug_selector(|| "thread-plan".into())
+            .flex()
+            .flex_col()
+            .gap(t.space.sm)
+            .w_full()
+            .min_w_0()
+            .py(t.space.md)
+            .px(t.space.md + t.space.xxs)
+            .rounded(t.radius.lg)
+            .border(t.border_width)
+            .border_color(c.border_subtle)
+            .bg(c.surface_card)
+            .child(text(plan.heading(), detail(t), c.text_tertiary));
+        for (i, step) in plan.steps.iter().enumerate() {
+            let (glyph, color): (AnyElement, _) = match step.state {
+                PlanStepState::Done => (
+                    icon("done", t.icon.dense, c.status_done).into_any_element(),
+                    c.text_tertiary,
+                ),
+                PlanStepState::Current => (
+                    status_glyph(
+                        SharedString::from(format!("plan-step-{i}")),
+                        TaskStatus::Working,
+                        t.icon.dense,
+                        t,
+                        cx,
+                    ),
+                    c.text_primary,
+                ),
+                PlanStepState::Next => (
+                    status_glyph(
+                        SharedString::from(format!("plan-step-{i}")),
+                        TaskStatus::UpNext,
+                        t.icon.dense,
+                        t,
+                        cx,
+                    ),
+                    c.text_secondary,
+                ),
+            };
+            card = card.child(
+                div()
+                    .flex()
+                    .items_start()
+                    .gap(t.space.sm + t.space.xxs)
+                    .debug_selector({
+                        let id = format!("plan-step-row-{i}");
+                        move || id.clone()
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .h(t.text.ui.line)
+                            .child(glyph),
+                    )
+                    .child(div().flex_1().min_w_0().child(selectable(
+                        SharedString::from(format!("plan-step-text-{task_id}-{i}")),
+                        step.text.clone(),
+                        t.text.ui,
+                        color,
+                    ))),
+            );
+        }
+        card.into_any_element()
+    }
+
     /// The first row of the thread is the brief.
     fn thread_has_brief(&self) -> bool {
         self.thread_keys
@@ -938,7 +908,11 @@ impl ConsortApp {
         let c = &t.colors;
         let chat = t.component.chat;
         let you = post.speaker == Speaker::You;
-        let max = t.layout.panel_width - t.space.page;
+        let task_id = match &self.panel {
+            Panel::Thread(id) => id.clone(),
+            _ => String::new(),
+        };
+        let max = self.right_panel_width(t) - t.space.page;
         // The thread is bubbles, as the timeline (`BDH-0`): the task's words
         // at the left, yours at the right.
         let mut col = div()
@@ -983,12 +957,12 @@ impl ConsortApp {
                 PostBody::Activity { summary, items } => {
                     self.render_activity_chip(&key, summary, items, t, cx)
                 }
+                // The card says "Needs you" itself, and the line after the
+                // answer says the answer, so there is no line above it.
                 PostBody::Approval(approval) => div()
                     .flex()
                     .flex_col()
                     .w_full()
-                    .gap(t.space.xs + t.space.xxs)
-                    .child(self.request_line(&key, "Approval", approval.state, t, cx))
                     .child(self.render_approval_card(approval, &key, false, t, cx))
                     .into_any_element(),
                 PostBody::Decision(decision) => div()
@@ -1000,6 +974,27 @@ impl ConsortApp {
                     .child(self.render_decision(decision, &key, true, t, cx))
                     .into_any_element(),
                 // A system notice: quiet, selectable, no speaker of its own.
+                PostBody::Notice {
+                    draft: Some(draft), ..
+                } => div()
+                    .flex()
+                    .w_full()
+                    .child(self.render_shown_draft(draft, &format!("{key}-shown"), false, t, cx))
+                    .into_any_element(),
+                // A failed turn is a card, as it is in the timeline.
+                PostBody::Notice {
+                    error: Some(card), ..
+                } => div()
+                    .flex()
+                    .w_full()
+                    .child(self.render_error_card(
+                        card,
+                        &format!("err-{key}"),
+                        crate::ui::errors::ErrorPlace::Task(task_id.clone()),
+                        t,
+                        cx,
+                    ))
+                    .into_any_element(),
                 PostBody::Notice { text: notice, .. } => div()
                     .w_full()
                     .flex()
@@ -1015,6 +1010,29 @@ impl ConsortApp {
             };
             col = col.child(element);
         }
+        // The words of the user that the assistant passed on to the task:
+        // a link back to the message in the channel.
+        if you
+            && let Some(source) = post.source_message_id.clone()
+            && let Panel::Thread(task_id) = &self.panel
+            && let Some(channel_id) = self.state.task(task_id).map(|t| t.channel_id.clone())
+        {
+            let link_id = format!("show-in-channel-{}", post.id);
+            col = col.child(
+                leaving_link(SharedString::from(link_id.clone()), "Show in channel", t)
+                    .debug_selector(move || link_id.clone())
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_message(
+                            channel_id.clone(),
+                            source.clone(),
+                            None,
+                            None,
+                            window,
+                            cx,
+                        )
+                    })),
+            );
+        }
         if post.pending {
             col = col.child(text(
                 crate::ui::timeline::pending_text(matches!(
@@ -1026,82 +1044,22 @@ impl ConsortApp {
                 c.text_tertiary,
             ));
         }
-        col.into_any_element()
-    }
-
-    /// An approval card: what asks, the detail, and the buttons or the answer.
-    /// Task threads and the timeline both use it.
-    /// An approval card. `chat` gives it the corners of a card in the
-    /// chat (see [`crate::ui::parts::card_corners`]).
-    pub fn render_approval_card(
-        &mut self,
-        approval: &consort_client::ApprovalView,
-        key: &str,
-        chat: bool,
-        t: &Tokens,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        if let Some(hub_card) = approval.card.clone() {
-            return self.render_hub_card(approval, &hub_card, key, chat, t, cx);
-        }
-        let c = &t.colors;
-        let answered = approval.state == RequestState::Answered;
-        let card = crate::ui::parts::card_corners(div(), chat, t)
-            .flex()
-            .flex_col()
-            .flex_1()
-            .min_w_0()
-            .gap(t.space.sm + t.space.xxs)
-            .pt(t.space.md)
-            .pb(t.space.md + t.space.xxs)
-            .px(t.space.md + t.space.xxs)
-            .bg(c.surface_card)
-            .border(t.border_width)
-            .border_color(c.border_subtle)
-            .child(
+        // A reply that the hub refused stays in the lane of the user, dimmed,
+        // with the reason under it and "Put back in the message box".
+        match &post.refused {
+            Some(refused) => {
+                let note = self.render_refused_note(refused, &post.id, t, cx);
                 div()
                     .flex()
-                    .items_center()
-                    .gap(t.space.sm + t.space.xxs)
-                    .child(status_glyph(
-                        SharedString::from(format!("{key}-glyph")),
-                        request_glyph(approval.state),
-                        t.icon.size,
-                        t,
-                        cx,
-                    ))
-                    .child(
-                        selectable(
-                            SharedString::from(format!("{key}-summary")),
-                            approval.summary.clone(),
-                            t.text.ui_strong,
-                            c.text_primary,
-                        )
-                        .flex_1()
-                        .min_w_0(),
-                    ),
-            )
-            .child(self.render_approval_detail(approval, false, t, cx));
-        let task = approval.task_id.is_some();
-        let card = if answered {
-            card.child(selectable(
-                SharedString::from(format!("{key}-answer")),
-                answered_text(approval, task),
-                t.text.ui,
-                c.text_secondary,
-            ))
-        } else if approval.state == RequestState::Expired {
-            card.child(text(
-                "This request closed before anyone answered it.",
-                t.text.ui,
-                c.text_secondary,
-            ))
-        } else if approval.state == RequestState::Closed {
-            card.child(text("This request is closed.", t.text.ui, c.text_secondary))
-        } else {
-            card.child(self.render_approval_buttons(approval, t, cx))
-        };
-        card.into_any_element()
+                    .flex_col()
+                    .items_end()
+                    .w_full()
+                    .child(col.opacity(t.opacity.answered_dim))
+                    .child(note)
+                    .into_any_element()
+            }
+            None => col.into_any_element(),
+        }
     }
 
     /// A decision card. In a task thread, Answer later closes the panel. In
@@ -1406,4 +1364,10 @@ impl ConsortApp {
             .child(footer)
             .into_any_element()
     }
+}
+
+/// The reason on the failed or waiting task, without Markdown marks. The
+/// banner shows plain text and agents write the reason in Markdown.
+pub(crate) fn reason_text(reason: &str) -> String {
+    crate::ui::timeline::plain_text(reason)
 }

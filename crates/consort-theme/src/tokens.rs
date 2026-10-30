@@ -236,6 +236,10 @@ pub struct Motion {
 pub struct Layout {
     pub sidebar_width: Pixels,
     pub panel_width: Pixels,
+    pub panel_min_width: Pixels,
+    pub chat_min_width: Pixels,
+    pub compact_width: Pixels,
+    pub resize_handle: Pixels,
     pub timeline_max_width: Pixels,
     pub speaker_gutter: Pixels,
     pub min_window: (Pixels, Pixels),
@@ -271,6 +275,14 @@ pub struct Layout {
     /// [`Layout::top_tint_height`].
     pub top_tint: [TintStop; 4],
     pub fade_bottom: Pixels,
+    /// The width of a corner notification.
+    pub notice_width: Pixels,
+    /// The gap between the bottom of the window and the stack of corner
+    /// notifications. It clears the composer.
+    pub notice_bottom: Pixels,
+    /// The gap between the top of the window and the stack in the compact
+    /// layout.
+    pub notice_compact_top: Pixels,
 }
 
 /// One stop of the top tint: a distance from the top, and the opacity of
@@ -299,6 +311,8 @@ pub struct Opacity {
     /// A danger button under the pointer.
     pub danger_hover: f32,
     pub failed_border: f32,
+    /// The border of an in-chat error card.
+    pub error_border: f32,
     pub progress_track: f32,
     pub drop_fill: f32,
     pub nav_disabled: f32,
@@ -461,6 +475,7 @@ pub struct Proactivity {
     pub dab_gap: Pixels,
     pub dab_rise: Pixels,
     pub dab_drop: Pixels,
+    pub writing_lift: Pixels,
     pub writing_pad_x: Pixels,
     pub writing_pad_y: Pixels,
     pub offer_pad_top: Pixels,
@@ -575,6 +590,9 @@ pub struct Sidebar {
     pub row_text: Type,
     pub label_text: Type,
     pub label_pad_y: Pixels,
+    pub label_row: Pixels,
+    pub lights_end: Pixels,
+    pub lights_center: Pixels,
     pub group_top: Pixels,
     pub title_bar: Pixels,
     pub worker_text: Type,
@@ -614,6 +632,10 @@ pub struct Chat {
     pub pill_pad_x: Pixels,
     pub pill_pad_y: Pixels,
     pub brief_number: Pixels,
+    pub footer_line: Pixels,
+    pub footer_button: Pixels,
+    pub feedback_pair: Pixels,
+    pub answered_line: Pixels,
 }
 
 /// The drawing of a theme in its card.
@@ -782,6 +804,9 @@ impl Components {
                 row_text: Type::new(&sb.row_text, scale),
                 label_text: Type::new(&sb.label_text, scale),
                 label_pad_y: px(sb.label_pad_y),
+                label_row: px(sb.label_row),
+                lights_end: px(sb.lights_end),
+                lights_center: px(sb.lights_center),
                 group_top: px(sb.group_top),
                 title_bar: px(sb.title_bar),
                 worker_text: Type::new(&sb.worker_text, scale),
@@ -857,6 +882,10 @@ impl Components {
                 pill_pad_x: px(c.chat.pill_pad_x),
                 pill_pad_y: px(c.chat.pill_pad_y),
                 brief_number: px(c.chat.brief_number),
+                footer_line: px(c.chat.footer_line),
+                footer_button: px(c.chat.footer_button),
+                feedback_pair: px(c.chat.feedback_pair),
+                answered_line: px(c.chat.answered_line),
             },
             proactivity: {
                 let p = &c.proactivity;
@@ -883,6 +912,7 @@ impl Components {
                     dab_gap: px(p.dab_gap),
                     dab_rise: px(p.dab_rise),
                     dab_drop: px(p.dab_drop),
+                    writing_lift: px(p.writing_lift),
                     writing_pad_x: px(p.writing_pad_x),
                     writing_pad_y: px(p.writing_pad_y),
                     offer_pad_top: px(p.offer_pad_top),
@@ -1027,6 +1057,10 @@ impl Tokens {
             layout: Layout {
                 sidebar_width: px(s.layout.sidebar_width),
                 panel_width: px(s.layout.panel_width),
+                panel_min_width: px(s.layout.panel_min_width),
+                chat_min_width: px(s.layout.chat_min_width),
+                compact_width: px(s.layout.compact_width),
+                resize_handle: px(s.layout.resize_handle),
                 timeline_max_width: px(s.layout.timeline_max_width),
                 speaker_gutter: px(s.layout.speaker_gutter),
                 min_window: (px(s.layout.min_window[0]), px(s.layout.min_window[1])),
@@ -1052,12 +1086,16 @@ impl Tokens {
                     alpha: stop.alpha,
                 }),
                 fade_bottom: px(s.layout.fade_bottom),
+                notice_width: px(s.layout.notice_width),
+                notice_bottom: px(s.layout.notice_bottom),
+                notice_compact_top: px(s.layout.notice_compact_top),
             },
             opacity: Opacity {
                 answered_dim: s.opacity.answered_dim,
                 busy: s.opacity.busy,
                 danger_hover: s.opacity.danger_hover,
                 failed_border: s.opacity.failed_border,
+                error_border: s.opacity.error_border,
                 progress_track: s.opacity.progress_track,
                 drop_fill: s.opacity.drop_fill,
                 nav_disabled: s.opacity.nav_disabled,

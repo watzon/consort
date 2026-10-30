@@ -223,6 +223,83 @@ fn an_unauthorized_turn_reports_signed_out_before_it_ends() {
 }
 
 #[test]
+fn a_failed_turn_reports_its_kind_from_structured_data_first() {
+    let ended = |m: &mut CodexMapper, id: &str, error: Value| {
+        m.turn_accepted(id);
+        let events = m.map_notification(
+            "turn/completed",
+            &json!({"threadId": "th", "turn": {"id": id, "items": [], "status": "failed", "error": error}}),
+        );
+        events
+            .into_iter()
+            .find_map(|e| match e {
+                SessionEvent::TurnEnded {
+                    error_kind,
+                    resets_at,
+                    ..
+                } => Some((error_kind, resets_at)),
+                _ => None,
+            })
+            .expect("a turn.ended event")
+    };
+    let mut m = CodexMapper::new(SessionId::new());
+    // The structured value decides, whatever the text says.
+    assert_eq!(
+        ended(
+            &mut m,
+            "t1",
+            json!({"message": "Stopped.", "codexErrorInfo": "usageLimitExceeded"})
+        )
+        .0,
+        Some(consort_proto::model::TurnErrorKind::RateLimit)
+    );
+    assert_eq!(
+        ended(
+            &mut m,
+            "t2",
+            json!({"message": "Slow down.", "codexErrorInfo": "rateLimitExceeded"})
+        )
+        .0,
+        Some(consort_proto::model::TurnErrorKind::RateLimit)
+    );
+    assert_eq!(
+        ended(
+            &mut m,
+            "t3",
+            json!({"message": "Sign in.", "codexErrorInfo": "unauthorized"})
+        )
+        .0,
+        Some(consort_proto::model::TurnErrorKind::ExpiredSignIn)
+    );
+    // A known text is the fallback, with its reset time.
+    let (kind, resets) = ended(
+        &mut m,
+        "t4",
+        json!({"message": "usage limit reached|1760000000"}),
+    );
+    assert_eq!(kind, Some(consort_proto::model::TurnErrorKind::RateLimit));
+    assert_eq!(
+        resets,
+        Some(consort_proto::time::Timestamp::from_millis(
+            1_760_000_000_000
+        ))
+    );
+    // Nothing known is unknown, and sent as no kind.
+    assert_eq!(
+        ended(
+            &mut m,
+            "t5",
+            json!({"message": "boom", "codexErrorInfo": "badRequest"})
+        ),
+        (None, None)
+    );
+    assert_eq!(
+        ended(&mut m, "t6", json!({"message": "boom"})),
+        (None, None)
+    );
+}
+
+#[test]
 fn approvals_and_questions() {
     let m = CodexMapper::new(SessionId::new());
     let cmd = m.command_approval(
@@ -322,6 +399,7 @@ fn thread_params_follow_the_approval_table_and_mcp_config() {
         options: Default::default(),
         approval_mode: ApprovalMode::AutoEdits,
         allow_shell: true,
+        coordinator: false,
         system_prompt_append: "Be brief.".into(),
         mcp_servers: vec![McpServerSpec {
             name: "hub".into(),
@@ -381,6 +459,7 @@ fn extras_off_stops_apps_plugins_and_cloud_skills_for_one_thread() {
         options: Default::default(),
         approval_mode: ApprovalMode::Auto,
         allow_shell: false,
+        coordinator: false,
         system_prompt_append: String::new(),
         mcp_servers: vec![],
         env: BTreeMap::new(),
@@ -566,6 +645,7 @@ mod fake_server {
             options: Default::default(),
             approval_mode: ApprovalMode::Ask,
             allow_shell: true,
+            coordinator: false,
             system_prompt_append: String::new(),
             mcp_servers: vec![],
             env: BTreeMap::new(),
@@ -664,6 +744,7 @@ mod fake_server {
                 .collect(),
             approval_mode: ApprovalMode::Ask,
             allow_shell: true,
+            coordinator: false,
             system_prompt_append: String::new(),
             mcp_servers: vec![],
             env: BTreeMap::new(),
@@ -864,6 +945,7 @@ mod fake_server {
             options: Default::default(),
             approval_mode: ApprovalMode::Auto,
             allow_shell: true,
+            coordinator: false,
             system_prompt_append: String::new(),
             mcp_servers: vec![],
             env: BTreeMap::new(),
@@ -913,6 +995,69 @@ mod fake_server {
         );
     }
 
+    #[tokio::test]
+    async fn a_model_change_goes_with_the_next_turn_once() {
+        let (client_side, server_side) = tokio::io::duplex(1 << 16);
+        let log = Arc::new(Mutex::new(Vec::new()));
+        tokio::spawn(run_quick_server(server_side, log.clone()));
+        let (read, write) = tokio::io::split(client_side);
+        let (client, inbound) = RpcClient::start(write, read);
+        let spec = SessionSpec {
+            session_id: SessionId::new(),
+            workspace: "/w".into(),
+            runtime_dir: "/r".into(),
+            model: "gpt-5.4".into(),
+            options: [("effort".to_owned(), OptionValue::Text("low".into()))]
+                .into_iter()
+                .collect(),
+            approval_mode: ApprovalMode::Auto,
+            allow_shell: true,
+            coordinator: false,
+            system_prompt_append: String::new(),
+            mcp_servers: vec![],
+            env: BTreeMap::new(),
+            extras_enabled: true,
+            skills: None,
+            resume: None,
+            process_watcher: None,
+        };
+        let (session, mut events) =
+            start_thread(spec, serde_json::Map::new(), client, inbound, None)
+                .await
+                .unwrap();
+        assert!(session.capabilities().switch_model);
+        let mut session: Box<dyn HarnessSession> = Box::new(session);
+        let mut turn = async |session: &mut Box<dyn HarnessSession>, text: &str| {
+            session
+                .turn(TurnInput {
+                    text: text.into(),
+                    attachments: vec![],
+                })
+                .await
+                .unwrap();
+            next_matching(&mut events, |e| matches!(e, SessionEvent::TurnEnded { .. })).await;
+        };
+        turn(&mut session, "First").await;
+        let options: ModelOptions = [("effort".to_owned(), OptionValue::Text("high".into()))]
+            .into_iter()
+            .collect();
+        session.set_model("gpt-5.5", &options).await.unwrap();
+        turn(&mut session, "Second").await;
+        turn(&mut session, "Third").await;
+        let log = log.lock().unwrap();
+        let starts: Vec<&Value> = log.iter().filter(|m| m["method"] == "turn/start").collect();
+        assert_eq!(starts.len(), 3);
+        assert!(starts[0]["params"].get("model").is_none());
+        assert_eq!(starts[0]["params"]["effort"], "low");
+        assert_eq!(starts[1]["params"]["model"], "gpt-5.5");
+        assert_eq!(starts[1]["params"]["effort"], "high");
+        assert!(
+            starts[2]["params"].get("model").is_none(),
+            "Codex keeps the model for the next turns"
+        );
+        assert_eq!(starts[2]["params"]["effort"], "high");
+    }
+
     /// An app-server that accepts `turn/interrupt` but never ends the turn.
     async fn run_stuck_server(stream: tokio::io::DuplexStream) {
         let (read, mut write) = tokio::io::split(stream);
@@ -952,6 +1097,7 @@ mod fake_server {
             options: Default::default(),
             approval_mode: ApprovalMode::Ask,
             allow_shell: true,
+            coordinator: false,
             system_prompt_append: String::new(),
             mcp_servers: vec![],
             env: BTreeMap::new(),
@@ -1090,4 +1236,30 @@ fn image_attachments_become_local_image_items() {
         json!({"type": "localImage", "path": png_path.to_string_lossy()})
     );
     assert!(codex_capabilities().images);
+}
+
+#[test]
+fn a_codex_coordinator_turns_the_web_search_off() {
+    let mut spec = SessionSpec {
+        session_id: SessionId::new(),
+        workspace: "/w".into(),
+        runtime_dir: "/r".into(),
+        model: String::new(),
+        options: Default::default(),
+        approval_mode: ApprovalMode::Ask,
+        allow_shell: false,
+        coordinator: true,
+        system_prompt_append: String::new(),
+        mcp_servers: vec![],
+        env: BTreeMap::new(),
+        extras_enabled: true,
+        skills: None,
+        resume: None,
+        process_watcher: None,
+    };
+    let config = session_config(&spec);
+    assert_eq!(config["web_search"], "disabled");
+    assert_eq!(config["features"]["shell_tool"], false);
+    spec.coordinator = false;
+    assert!(session_config(&spec).get("web_search").is_none());
 }

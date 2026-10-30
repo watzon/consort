@@ -5,12 +5,14 @@
 use std::time::Instant;
 
 use consort_proto::ids::{ApprovalId, ChannelId, DecisionId, ItemId, SessionId, WorkerId};
+use consort_proto::model::TurnErrorKind;
 use consort_proto::model::{
     Approval, ApprovalDetails, ApprovalStatus, AuthState, Author, COMMAND_OUTPUT_TAIL_BYTES,
     Channel, Decision, DecisionOption, DecisionStatus, ErrorPayload, ItemPayload, ItemStatus,
     MessageKind, Session, SessionItem, SessionRole, SessionState, Task, tail_of,
 };
 use consort_proto::status::{Actor, TaskStatus};
+use consort_proto::time::Timestamp;
 use consort_proto::tools::HubTool;
 use consort_proto::turn_input::WakeEvent;
 use consort_proto::worker_link::{
@@ -26,7 +28,8 @@ use crate::limits::{
     MESSAGE_BODY_MAX_BYTES, NOTICE_TEXT_MAX_BYTES, REVIEW_SUMMARY_MAX_BYTES, TURN_TEXT_MAX_BYTES,
     cut_text, json_len,
 };
-use crate::ops::flow::transition;
+use crate::ops::flow::{TurnFailure, transition};
+use crate::ops::model_switch::{ModelPlan, plan_model};
 use crate::ops::waiting::resume_if_nothing_waits;
 use crate::store::Tx;
 use crate::store::conversation::{self, NewMessage};
@@ -62,6 +65,9 @@ pub(crate) struct Effects {
     /// Channels whose coordinator turn the worker refused. They try again
     /// after the start backoff.
     pub turn_refused: Vec<ChannelId>,
+    /// Tasks that wait for a new session on another model. See
+    /// `ops::model_switch`.
+    pub switch_tasks: Vec<consort_proto::ids::TaskId>,
 }
 
 impl Effects {
@@ -89,6 +95,7 @@ impl Effects {
         self.start_failed.extend(other.start_failed);
         self.start_ok.extend(other.start_ok);
         self.turn_refused.extend(other.turn_refused);
+        self.switch_tasks.extend(other.switch_tasks);
     }
 }
 
@@ -101,6 +108,8 @@ pub(crate) struct Ctx<'h> {
     pub runtime: SessionRuntime,
     pub fx: Effects,
     task_dirty: bool,
+    /// What the worker said about the failed turn that this batch ends.
+    failure: TurnFailure,
 }
 
 impl<'h> Ctx<'h> {
@@ -120,6 +129,7 @@ impl<'h> Ctx<'h> {
             runtime,
             fx: Effects::default(),
             task_dirty: false,
+            failure: TurnFailure::default(),
         })
     }
 
@@ -133,6 +143,19 @@ impl<'h> Ctx<'h> {
         }
         self.task_dirty = false;
         Ok(())
+    }
+
+    /// The failure of this batch, with the name of the account of the
+    /// session.
+    fn failure_with_account(&self, tx: &Tx<'_>) -> Result<TurnFailure> {
+        let mut failure = self.failure.clone();
+        failure.account = crate::store::machine::worker(tx.db(), self.session.worker_id)?
+            .and_then(|w| w.inventory)
+            .and_then(|inv| {
+                inv.account(self.session.account_id)
+                    .map(|a| a.label.clone())
+            });
+        Ok(failure)
     }
 
     /// Sets the status reason of a failed task of this session. `persist`
@@ -271,6 +294,9 @@ impl Hub {
         for channel in fx.kick {
             self.kick_coordinator(channel);
         }
+        for task_id in fx.switch_tasks {
+            self.spawn_switch(task_id);
+        }
         for worker in fx.pump {
             self.pump_worker(worker);
         }
@@ -391,7 +417,26 @@ fn apply_event(tx: &mut Tx<'_>, ctx: &mut Ctx<'_>, event: &SessionEvent) -> Resu
             ctx.session.usage = usage.clone();
             Ok(())
         }
-        SessionEvent::TurnEnded { reason, error, .. } => {
+        SessionEvent::TurnEnded {
+            reason,
+            error,
+            error_kind,
+            resets_at,
+            ..
+        } => {
+            ctx.failure = TurnFailure {
+                kind: *error_kind,
+                resets_at: *resets_at,
+                account: None,
+                raw: error.clone(),
+            };
+            if *reason == TurnEndReason::Failed && *error_kind == Some(TurnErrorKind::RateLimit) {
+                let now = tx.now().as_millis();
+                let until = resets_at
+                    .filter(|at| at.as_millis() > now)
+                    .unwrap_or_else(|| Timestamp::from_millis(now + LIMIT_WITHOUT_RESET_MS));
+                tx.record_account_limit(ctx.session.account_id, until)?;
+            }
             on_turn_ended(tx, ctx, *reason, error.as_deref())
         }
         SessionEvent::Reopened => on_reopened(tx, ctx),
@@ -466,6 +511,10 @@ fn on_reopened(tx: &mut Tx<'_>, ctx: &mut Ctx<'_>) -> Result<()> {
                 "The worker restarted before the assistant finished. Send your message again."
             }
             SessionRole::Task => "The worker restarted during this turn. Retry the task.",
+        };
+        ctx.failure = TurnFailure {
+            kind: Some(consort_proto::model::TurnErrorKind::WorkerRestarted),
+            ..TurnFailure::default()
         };
         on_turn_ended(tx, ctx, TurnEndReason::Failed, Some(text))?;
     } else if ctx.session.role == SessionRole::Task && ctx.drives_task() {
@@ -608,12 +657,13 @@ fn release_coordinator(tx: &mut Tx<'_>, ctx: &mut Ctx<'_>, started: bool) -> Res
         if ctx.runtime.tools_called.is_empty() {
             tx.requeue_wakes_first(ctx.channel.id, &row.turn_events)?;
         } else {
-            tx.post_notice(
+            let failure = ctx.failure_with_account(tx)?;
+            tx.post_turn_failed(
                 ctx.channel.id,
                 None,
                 None,
-                "turn_failed",
                 "The assistant stopped before it finished. It had already started to act, so the hub does not give it the same messages again. Check what it did, and send your message again if something is missing.",
+                &failure,
             )?;
             tx.end_turn_runs(
                 &row.turn_events,
@@ -729,6 +779,90 @@ fn account_signed_out(tx: &Tx<'_>, session: &Session) -> Result<bool> {
         }))
 }
 
+/// How long an account counts as limited when the harness does not say when
+/// its limit resets. A later turn on the account finds out again.
+const LIMIT_WITHOUT_RESET_MS: i64 = 60 * 60 * 1000;
+
+/// True when the turn that just ended failed because of a usage limit.
+fn hit_usage_limit(ctx: &Ctx<'_>, reason: TurnEndReason) -> bool {
+    reason == TurnEndReason::Failed && ctx.failure.kind == Some(TurnErrorKind::RateLimit)
+}
+
+/// Ends a coordinator session whose account reached a usage limit, as for a
+/// signed-out account. The new session stays on `next` until it ends.
+fn replace_limited_coordinator(tx: &mut Tx<'_>, ctx: &mut Ctx<'_>, next: &str) -> Result<()> {
+    let reason = "The account of the session reached its usage limit.";
+    ctx.session.end_reason = Some(reason.to_owned());
+    finish_session(tx, ctx, SessionState::Lost)?;
+    queue_stop(ctx.hub, tx, &mut ctx.fx, &ctx.session, reason)?;
+    let (label, _) = account_and_worker(tx, &ctx.session)?;
+    ctx.fx.kick(ctx.channel.id);
+    tx.post_notice(
+        ctx.channel.id,
+        None,
+        None,
+        "account_fallback",
+        &format!("{label} reached its usage limit, so the assistant moved to {next}."),
+    )?;
+    Ok(())
+}
+
+/// Moves a task to another account when its account reached a usage limit.
+/// The new session keeps the workspace and goes on from the task thread.
+/// Returns false when no other account can take the task.
+fn move_limited_task(hub: &Hub, tx: &mut Tx<'_>, ctx: &mut Ctx<'_>) -> Result<bool> {
+    if ctx.session.state.is_final() {
+        return Ok(false);
+    }
+    let Some(task) = ctx.task.as_ref() else {
+        return Ok(false);
+    };
+    let (channel_id, card, task_id, mode) = (
+        task.channel_id,
+        task.card_message_id,
+        task.id,
+        task.approval_mode,
+    );
+    let limited = crate::store::machine::limited_accounts(tx.db(), tx.now())?;
+    let selection = crate::store::machine::worker(tx.db(), ctx.session.worker_id)?
+        .and_then(|w| w.inventory)
+        .and_then(|inventory| {
+            crate::placement::fallback_selection(
+                &inventory,
+                ctx.session.account_id,
+                &ctx.session.model,
+                &ctx.session.options,
+                mode,
+                &limited,
+            )
+        });
+    let Some(selection) = selection else {
+        return Ok(false);
+    };
+    let (label, _) = account_and_worker(tx, &ctx.session)?;
+    tx.post_notice(
+        channel_id,
+        Some(card),
+        Some(task_id),
+        "account_fallback",
+        &format!(
+            "{label} reached its usage limit, so this task moved to {}. It stays there.",
+            selection.account_label
+        ),
+    )?;
+    if let Some(task) = ctx.task.as_mut() {
+        task.model_selection = Some(selection);
+    }
+    ctx.runtime.review_summary = None;
+    end_for_new_session(
+        hub,
+        tx,
+        ctx,
+        "The account of the session reached its usage limit.",
+    )?;
+    Ok(true)
+}
+
 /// Ends a coordinator session whose account is signed out. The events of
 /// its turn go back to the queue, and placement chooses a new session on an
 /// account that is signed in. When no account fits, the events wait, and the
@@ -761,24 +895,35 @@ fn replace_signed_out_coordinator(tx: &mut Tx<'_>, ctx: &mut Ctx<'_>) -> Result<
 /// True when placement finds a worker and an account for a new coordinator
 /// session of the channel now.
 fn coordinator_can_start(tx: &Tx<'_>, channel: &Channel) -> Result<bool> {
-    let tutti = conversation::tutti_channel(tx.db())?;
-    let workers = crate::store::machine::workers(tx.db())?;
-    let open = work::open_session_counts(tx.db())?;
+    Ok(coordinator_placement(tx, channel).is_ok())
+}
+
+/// Where a new coordinator session of the channel goes now.
+fn coordinator_placement(
+    tx: &Tx<'_>,
+    channel: &Channel,
+) -> std::result::Result<crate::placement::Placement, crate::placement::PlacementError> {
+    let failed =
+        |err: crate::error::HubError| crate::placement::PlacementError::Wait(err.to_string());
+    let tutti = conversation::tutti_channel(tx.db()).map_err(failed)?;
+    let workers = crate::store::machine::workers(tx.db()).map_err(failed)?;
+    let open = work::open_session_counts(tx.db()).map_err(failed)?;
+    let limited = crate::store::machine::limited_accounts(tx.db(), tx.now()).map_err(failed)?;
     let selection = channel.effective_coordinator_selection(&tutti).cloned();
     let request = consort_proto::model::PlacementRequest::default();
-    Ok(crate::placement::place(&crate::placement::PlacementInput {
+    crate::placement::place(&crate::placement::PlacementInput {
         subject: crate::placement::Subject::Coordinator,
         workers: &workers,
         open_sessions: &open,
+        limited: &limited,
         selection: selection.as_ref(),
         request: &request,
-        approval_mode: channel.default_approval_mode,
+        approval_mode: crate::coordinator::COORDINATOR_APPROVAL_MODE,
         preferred_workers: &channel.preferred_workers,
         channel_tags: &channel.tags,
         repos: &[],
         isolation: consort_proto::model::Isolation::Worktree,
     })
-    .is_ok())
 }
 
 fn on_item(tx: &mut Tx<'_>, ctx: &mut Ctx<'_>, mut item: SessionItem) -> Result<()> {
@@ -1020,6 +1165,15 @@ fn coordinator_turn_ended(
     {
         return replace_signed_out_coordinator(tx, ctx);
     }
+    // A failed turn at a usage limit goes to another account of the harness,
+    // when one can take it. Its events go back to the queue.
+    if hit_usage_limit(ctx, reason)
+        && !ctx.session.state.is_final()
+        && let Ok(next) = coordinator_placement(tx, &ctx.channel)
+        && next.account_id != ctx.session.account_id
+    {
+        return replace_limited_coordinator(tx, ctx, &next.account_label);
+    }
     // Which thread did the turn answer? One user message in a thread means a
     // reply in that thread.
     let thread = {
@@ -1074,7 +1228,8 @@ fn coordinator_turn_ended(
     };
     if reason == TurnEndReason::Failed {
         let text = error.unwrap_or("The assistant stopped with an error. Send your message again.");
-        tx.post_notice(ctx.channel.id, None, None, "turn_failed", text)?;
+        let failure = ctx.failure_with_account(tx)?;
+        tx.post_turn_failed(ctx.channel.id, None, None, text, &failure)?;
     }
     tx.end_turn_runs(
         &row.turn_events,
@@ -1116,11 +1271,39 @@ fn task_turn_ended(
         ctx.runtime.review_summary = None;
         return Ok(());
     }
+    if hit_usage_limit(ctx, reason) && move_limited_task(ctx.hub, tx, ctx)? {
+        return Ok(());
+    }
     if reason == TurnEndReason::Failed {
-        let text = error
+        let raw = error
             .unwrap_or("The turn failed. Retry the task.")
             .to_owned();
         ctx.runtime.review_summary = None;
+        // The thread gets a notice with the kind, so the client can show
+        // the cause and the actions that fit.
+        if let Some(task) = ctx.task.as_ref() {
+            let failure = ctx.failure_with_account(tx)?;
+            tx.post_turn_failed(
+                task.channel_id,
+                Some(task.card_message_id),
+                Some(task.id),
+                &raw,
+                &failure,
+            )?;
+        }
+        // The notice keeps what the harness said. The reason on the task
+        // says what happened and what to do.
+        let text = if hit_usage_limit(ctx, reason) {
+            let account = ctx
+                .failure_with_account(tx)?
+                .account
+                .unwrap_or_else(|| "The account".to_owned());
+            format!(
+                "{account} reached its usage limit. Try again after it resets, or choose another account."
+            )
+        } else {
+            raw
+        };
         return ctx.move_task(tx, TaskStatus::Failed, Some(text), None);
     }
 
@@ -1129,6 +1312,29 @@ fn task_turn_ended(
     // after it.
     let inbox = work::task_inbox(tx.db(), task_id)?;
     if !inbox.is_empty() && !ctx.session.state.is_final() {
+        // The user chose another model while the turn ran. The change goes
+        // with this turn: in the same session when the harness can switch,
+        // else the session ends here, the messages stay in the inbox, and
+        // a new session takes them.
+        let mut model_change = None;
+        if let Some(task) = ctx.task.as_ref() {
+            match plan_model(tx.db(), task, &ctx.session)? {
+                Ok(ModelPlan::Keep) => {}
+                Ok(ModelPlan::InSession(change)) => model_change = Some(change),
+                Ok(ModelPlan::NewSession) => {
+                    return end_for_new_session(ctx.hub, tx, ctx, "The user chose another model.");
+                }
+                Err(reason) => {
+                    tx.post_notice(
+                        task.channel_id,
+                        Some(task.card_message_id),
+                        Some(task.id),
+                        "model_not_changed",
+                        &format!("The task keeps its model for now. {reason}"),
+                    )?;
+                }
+            }
+        }
         let (taken, turn) = inbox_batch(&inbox, TURN_TEXT_MAX_BYTES);
         tx.delete_task_inbox(&taken)?;
         let channel_files =
@@ -1140,6 +1346,7 @@ fn task_turn_ended(
                 turn,
                 channel_files,
                 approval_mode: None,
+                model_change,
             }),
         )?;
         ctx.runtime.turn_open = true;
@@ -1240,6 +1447,24 @@ pub(crate) fn queue_stop(
     Ok(())
 }
 
+/// The session of a task ends because the task chose another model. The
+/// messages stay in the inbox. The task keeps its status and loses its
+/// current session, so the end does not fail it, and the new session starts
+/// after the commit.
+fn end_for_new_session(hub: &Hub, tx: &mut Tx<'_>, ctx: &mut Ctx<'_>, reason: &str) -> Result<()> {
+    if let Some(task) = ctx.task.as_mut() {
+        task.current_session_id = None;
+        task.updated_at = tx.now();
+        ctx.task_dirty = true;
+        ctx.fx.switch_tasks.push(task.id);
+    }
+    ctx.session.end_reason = Some(reason.to_owned());
+    finish_session(tx, ctx, SessionState::Ended)?;
+    let session = ctx.session.clone();
+    queue_stop(hub, tx, &mut ctx.fx, &session, reason)?;
+    Ok(())
+}
+
 /// Ends a session that is still open because the hub no longer needs it,
 /// for example the old session of a task that is retried. Its pending
 /// requests are canceled and the worker gets `session.stop`. Returns the
@@ -1264,7 +1489,7 @@ pub(crate) fn end_session_by_hub(
 /// The inbox messages that go into one turn: their row IDs, and the turn
 /// with the joined text and all their attachments. A first message that
 /// alone does not fit is cut.
-fn inbox_batch(inbox: &[work::InboxMessage], room: usize) -> (Vec<i64>, TurnInput) {
+pub(crate) fn inbox_batch(inbox: &[work::InboxMessage], room: usize) -> (Vec<i64>, TurnInput) {
     const GAP: &str = "\n\n";
     let mut taken = Vec::new();
     let mut text = String::new();
@@ -1472,6 +1697,7 @@ mod tests {
             },
             channel_files: None,
             approval_mode: None,
+            model_change: None,
         })
     }
 
@@ -1565,6 +1791,8 @@ mod tests {
                         turn_id: "t1".into(),
                         reason: TurnEndReason::Completed,
                         error: None,
+                        error_kind: None,
+                        resets_at: None,
                     },
                 }],
             },

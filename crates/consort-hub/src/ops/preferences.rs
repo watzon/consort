@@ -1,6 +1,8 @@
 //! The user's preferences, which every client shares.
 
-use consort_proto::client_api::{PreferencesResult, PreferencesSetFavoriteModel};
+use consort_proto::client_api::{
+    PreferencesResult, PreferencesSetAccountFallback, PreferencesSetFavoriteModel,
+};
 use consort_proto::model::{FAVORITE_FIELD_MAX_CHARS, FAVORITE_MODELS_MAX};
 
 use crate::error::{HubError, Result};
@@ -8,6 +10,27 @@ use crate::hub::{Caller, Hub};
 use crate::store::preferences;
 
 impl Hub {
+    /// Allows the move to another account at a usage limit, or stops it. A
+    /// request that changes nothing writes nothing.
+    pub(crate) async fn preferences_set_account_fallback(
+        &self,
+        _caller: &Caller,
+        request: PreferencesSetAccountFallback,
+    ) -> Result<PreferencesResult> {
+        let preferences = self
+            .store
+            .write(move |tx| {
+                let mut preferences = preferences::preferences(tx.db())?;
+                if preferences.account_fallback != request.enabled {
+                    preferences.account_fallback = request.enabled;
+                    tx.save_preferences(&preferences)?;
+                }
+                Ok(preferences)
+            })
+            .await?;
+        Ok(PreferencesResult { preferences })
+    }
+
     /// Adds or removes one favorite model. A request that changes nothing
     /// writes nothing and sends no feed entry. The account and the model do
     /// not have to exist now: a favorite stays when an account is signed out

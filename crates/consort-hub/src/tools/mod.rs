@@ -11,7 +11,7 @@ use crate::error::{HubError, Result};
 use crate::hub::{Hub, ToolCtx};
 use crate::store::{conversation, work};
 
-mod chat;
+pub(crate) mod chat;
 mod management;
 mod routines;
 mod tasks;
@@ -189,6 +189,7 @@ impl Hub {
             C::VoiceGuide(a) => self.tool_voice_guide(ctx, a).await,
             C::VoiceSample(a) => self.tool_voice_sample(ctx, a).await,
             C::ProposeVoiceRule(a) => self.tool_propose_voice_rule(ctx, a).await,
+            C::ShowDraft(a) => self.tool_show_draft(ctx, a).await,
             C::SearchSkills(a) => self.tool_search_skills(a).await,
             C::AddSkill(a) => self.tool_add_skill(ctx, a).await,
             other => self.tool_management(ctx, other).await,

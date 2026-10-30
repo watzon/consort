@@ -286,6 +286,7 @@ fn seed(hub: &mut Hub) {
         created_at: ts(now - 5_000),
         proactive: None,
         suggestions: Vec::new(),
+        source_message_id: None,
     });
     hub.task = Some(Task {
         id: task_id,
@@ -1333,6 +1334,7 @@ async fn session(hub: Shared, mut socket: WebSocket) {
                     created_at: Timestamp::now(),
                     proactive: None,
                     suggestions: Vec::new(),
+                    source_message_id: None,
                 };
                 if silent {
                     // The hub stores the message, but the answer and the
@@ -1421,6 +1423,30 @@ async fn session(hub: Shared, mut socket: WebSocket) {
                 let channel = h.channel.clone().unwrap();
                 req.respond_ok(&consort_proto::client_api::ChannelResult { channel })
                     .unwrap()
+            }
+            "task.update" | "task.retry" => {
+                let mut h = hub.lock().unwrap();
+                h.recorded.push((req.kind.clone(), req.body.clone()));
+                let task = h.task.clone().unwrap();
+                req.respond_ok(&TaskResult { task }).unwrap()
+            }
+            "draft.edit" => {
+                let body: api::DraftEdit = req.decode_as().unwrap();
+                let mut h = hub.lock().unwrap();
+                h.recorded.push((req.kind.clone(), req.body.clone()));
+                let mut message = h.messages[0].clone();
+                message.id = body.message_id;
+                message.kind = MessageKind::Notice;
+                message.in_timeline = true;
+                message.body = serde_json::json!({
+                    "kind": "draft",
+                    "text": "A draft.",
+                    "title": body.title.unwrap_or_else(|| "Claim".into()),
+                    "body": body.body.clone().unwrap_or_default(),
+                    "original_body": "Dear Dr. Meyer,",
+                })
+                .to_string();
+                req.respond_ok(&MessageResult { message }).unwrap()
             }
             "task.archive" => {
                 let mut h = hub.lock().unwrap();
@@ -2064,6 +2090,7 @@ fn text_message(channel_id: ChannelId, body: &str, at: i64, root: Option<Message
         created_at: ts(at),
         proactive: None,
         suggestions: Vec::new(),
+        source_message_id: None,
     }
 }
 
@@ -3920,6 +3947,7 @@ async fn connectors_and_hub_cards_use_their_requests() {
             draft_arguments: None,
             not_my_voice: false,
             ask_rule: None,
+            replaced_by: None,
         }));
         approval.options = details.hub_card_options().unwrap();
         approval.details = details;
@@ -4474,6 +4502,7 @@ async fn an_install_card_closes_when_the_skill_is_added_from_it() {
             created_at: ts(Timestamp::now().as_millis() - 3_000),
             proactive: None,
             suggestions: Vec::new(),
+            source_message_id: None,
         });
         let approval = h.approval.as_mut().unwrap();
         approval.task_id = None;
@@ -6140,6 +6169,7 @@ async fn the_voice_page_and_the_draft_card_use_their_requests() {
             draft_arguments: None,
             not_my_voice: false,
             ask_rule: None,
+            replaced_by: None,
         }));
         approval.options = details.hub_card_options().unwrap();
         approval.details = details;
@@ -6245,4 +6275,113 @@ async fn the_voice_page_and_the_draft_card_use_their_requests() {
         "Reply to Dana, say yes"
     );
     assert_eq!(recorded_of(&hub, "voice.feedback").len(), 1);
+}
+
+/// Try again on an error card: a task retries, and a channel sends the last
+/// message of the user again as a new message.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn try_again_retries_a_task_and_resends_a_channel_message() {
+    let (url, hub) = start_hub().await;
+    let dir = tempfile::tempdir().unwrap();
+    let client = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
+    let task_id = client.state().tasks[0].id.clone();
+    client
+        .try_again(consort_client::TryAgainTarget::Task {
+            task_id: task_id.clone(),
+        })
+        .await
+        .unwrap();
+    let retried = recorded_of(&hub, "task.retry");
+    assert_eq!(retried.len(), 1);
+    assert_eq!(retried[0]["task_id"], task_id.as_str());
+
+    let tutti = tutti_id(&client);
+    client
+        .try_again(consort_client::TryAgainTarget::ResendMessage {
+            channel_id: tutti,
+            body: "Summarize my week".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(hub.lock().unwrap().sent_bodies, ["Summarize my week"]);
+}
+
+/// A started task takes a new model with `task.update`: the selection with
+/// its effort, and nothing else.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_task_model_sends_task_update_with_the_selection_and_the_effort() {
+    let (url, hub) = start_hub().await;
+    let dir = tempfile::tempdir().unwrap();
+    let client = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
+    let task_id = client.state().tasks[0].id.clone();
+    client
+        .set_task_model(
+            task_id.clone(),
+            consort_client::SelectionView {
+                account_label: "Claude Personal".into(),
+                model_id: "opus".into(),
+                model_name: "Opus 5.5".into(),
+                options: vec![(
+                    "effort".into(),
+                    consort_client::SelectionOption::Text("high".into()),
+                )],
+            },
+        )
+        .await
+        .unwrap();
+    let sent = recorded_of(&hub, "task.update");
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0]["task_id"], task_id.as_str());
+    assert_eq!(
+        sent[0]["model_selection"]["account_label"],
+        "Claude Personal"
+    );
+    assert_eq!(sent[0]["model_selection"]["model"], "opus");
+    assert_eq!(sent[0]["model_selection"]["options"]["effort"], "high");
+    assert!(sent[0].get("title").is_none() && sent[0].get("brief").is_none());
+}
+
+/// The user edits a card from `show_draft`: the client sends `draft.edit`
+/// and shows the answer of the hub, with the text that the assistant wrote.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn edit_draft_sends_draft_edit_and_shows_the_saved_text() {
+    let (url, hub) = start_hub().await;
+    let dir = tempfile::tempdir().unwrap();
+    let client = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
+    let message_id = MessageId::new().to_string();
+    // The snapshot of the channel replaces the cache, so it must be in
+    // before the answer of the hub is merged.
+    let tutti = tutti_id(&client);
+    wait_for(&client, "the timeline", |s| {
+        s.timeline(&tutti).is_some_and(|t| t.loaded)
+    })
+    .await;
+    client
+        .edit_draft(message_id.clone(), None, Some("Dear Sir,".into()))
+        .await
+        .unwrap();
+    let sent = recorded_of(&hub, "draft.edit");
+    assert_eq!(sent[0]["message_id"], message_id.as_str());
+    assert_eq!(sent[0]["body"], "Dear Sir,");
+    assert!(sent[0].get("title").is_none());
+    let state = wait_for(&client, "the edited draft", |s| {
+        s.timelines
+            .iter()
+            .flat_map(|t| t.items.iter())
+            .any(|i| matches!(i, TimelineItem::Notice(n) if n.draft.is_some()))
+    })
+    .await;
+    let draft = state
+        .timelines
+        .iter()
+        .flat_map(|t| t.items.iter())
+        .find_map(|i| match i {
+            TimelineItem::Notice(n) => n.draft.clone(),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(draft.body, "Dear Sir,");
+    assert!(draft.edited);
+    assert_eq!(draft.original_body.as_deref(), Some("Dear Dr. Meyer,"));
+    assert_eq!(draft.message_id, message_id);
 }

@@ -141,7 +141,7 @@ pub struct VoiceSourceRow {
     pub kind: Option<VoiceSourceKind>,
     /// The letter in the tile, such as "G".
     pub monogram: String,
-    /// "Gmail, chris@bitstormtech.com".
+    /// "Gmail, chris@example.com".
     pub title: String,
     /// "Sent mail, last 90 days".
     pub detail: String,
@@ -514,6 +514,19 @@ pub struct FlagView {
     pub end: usize,
 }
 
+impl FlagView {
+    /// The line under the text of the draft: the phrase and why it is
+    /// marked. "Thursday at 9 AM is not in your request. Check it."
+    pub fn line(&self) -> String {
+        match self.note.as_str() {
+            "Not in your request. Check it." => {
+                format!("{} is not in your request. Check it.", self.text)
+            }
+            note => format!("{}. {note}", self.text.trim_end_matches('.')),
+        }
+    }
+}
+
 /// A text field that Edit changes.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct EditableFieldView {
@@ -541,6 +554,24 @@ pub struct DraftCardView {
     /// The hash of the arguments and flags that the user checks. A tick
     /// holds only for this hash, so a new scan clears it.
     pub review_hash: String,
+    /// The subject, or "Email to <name>" when there is none. See
+    /// [`crate::drafts::draft_title`].
+    pub title: String,
+    /// The value of the To field, when the tool has one.
+    pub to: Option<String>,
+    /// "Sends with Gmail Work", or "Saves a draft in Gmail Work".
+    pub connection_line: String,
+    /// The subject, when the tool has one.
+    pub subject: Option<String>,
+    /// The text of the message, as it is now (after any edit).
+    pub body: String,
+    /// The words of the answer that runs the tool: "Send", or "Save draft"
+    /// for a tool that saves a draft.
+    pub allow_label: String,
+    /// The words of the other answer: "Not now".
+    pub deny_label: String,
+    /// What happened, after the card closes. `None` while it waits.
+    pub outcome: Option<crate::drafts::DraftOutcomeView>,
 }
 
 impl DraftCardView {
@@ -548,6 +579,15 @@ impl DraftCardView {
     /// ticked.
     pub fn allow_blocked(&self, checked: bool) -> bool {
         !self.flags.is_empty() && !checked
+    }
+
+    /// The words of the tick that takes the place of the hint.
+    pub fn check_label(&self) -> &'static str {
+        if self.flags.len() > 1 {
+            "I checked the marked lines"
+        } else {
+            "I checked the marked line"
+        }
     }
 
     /// The flag ranges inside one field, by its label.
@@ -573,8 +613,9 @@ pub fn voice_line(context: Option<&str>) -> String {
 
 /// The voice parts of a connector card. `None` for a tool that does not
 /// draft or send.
-pub fn draft_card(card: &ConnectorCard) -> Option<DraftCardView> {
+pub fn draft_card(card: &ConnectorCard, status: model::ApprovalStatus) -> Option<DraftCardView> {
     let outgoing = card.outgoing?;
+    let (to, subject) = crate::drafts::card_to_and_subject(card);
     let label_of = |key: &str| {
         card.fields
             .iter()
@@ -618,6 +659,20 @@ pub fn draft_card(card: &ConnectorCard) -> Option<DraftCardView> {
         edited: card.edited(),
         not_my_voice: card.not_my_voice,
         review_hash: card.review_hash(),
+        title: crate::drafts::draft_title(subject.as_deref(), to.as_deref()),
+        to,
+        connection_line: match outgoing {
+            OutgoingKind::Send => format!("Sends with {}", card.connection_name),
+            OutgoingKind::Draft => format!("Saves a draft in {}", card.connection_name),
+        },
+        subject,
+        body: crate::drafts::card_body(card),
+        allow_label: match outgoing {
+            OutgoingKind::Send => "Send".to_owned(),
+            OutgoingKind::Draft => "Save draft".to_owned(),
+        },
+        deny_label: "Not now".to_owned(),
+        outcome: crate::drafts::outcome(card, status),
     })
 }
 

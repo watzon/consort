@@ -124,7 +124,7 @@ fn the_sidebar_and_the_settings_rail_use_the_larger_scale(cx: &mut TestAppContex
         (sayso, app.state.workers[0].id.clone())
     });
     assert_eq!(bounds(cx, "sidebar").size.width, px(288.));
-    assert_eq!(bounds(cx, "sidebar-search").size.height, px(36.));
+    assert_eq!(bounds(cx, "sidebar-search").size.height, px(28.));
     assert_eq!(
         bounds(cx, &format!("sidebar-channel-{sayso}")).size.height,
         px(36.)
@@ -234,7 +234,7 @@ fn the_chips_show_each_state_and_a_failed_upload_stops_the_send(cx: &mut TestApp
             "the text stays"
         );
         assert_eq!(app.state.uploads.len(), 5, "the chips stay");
-        let error = app.notices.current().map(|n| n.message.clone());
+        let error = app.notices.visible().last().map(|n| n.message.clone());
         assert!(
             error
                 .as_deref()
@@ -344,6 +344,17 @@ fn the_light_box_opens_steps_and_closes(cx: &mut TestAppContext) {
     let (handle, app) = open(files_state(), cx);
     let cx = &mut VisualTestContext::from_window(handle, cx);
     open_lights(&app, cx);
+    // The list opens at its end, which can leave the picture under the top
+    // of the window.
+    cx.update(|_, cx| {
+        app.update(cx, |app, _| {
+            app.timeline.scroll_to(gpui::ListOffset {
+                item_ix: 0,
+                offset_in_item: px(0.),
+            })
+        })
+    });
+    draw(cx);
     let front = bounds(cx, "image-msg_lights_photos-0");
     cx.simulate_click(front.center(), Modifiers::default());
     draw(cx);

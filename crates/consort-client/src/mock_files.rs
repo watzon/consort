@@ -418,6 +418,7 @@ pub fn with_files(mut state: ViewState) -> ViewState {
                 ]),
             ],
             pending: false,
+            source_message_id: None, refused: None,
         });
     }
     crate::mock::stamp_times(&mut state.timelines);

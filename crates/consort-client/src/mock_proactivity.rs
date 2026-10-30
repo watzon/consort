@@ -513,6 +513,8 @@ pub fn reading_items(step: &str) -> Vec<TimelineItem> {
             kind: "channel_created".into(),
             text: "You made the channel reading.".into(),
             memory: None,
+            draft: None,
+            error: None,
         }),
         TimelineItem::Message(greeting),
     ];

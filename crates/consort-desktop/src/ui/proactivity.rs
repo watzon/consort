@@ -25,7 +25,7 @@ use crate::proactivity::{
 };
 use crate::ui::admin_parts::{column, header, page, rows, section_title, select};
 use crate::ui::mark::still_mark;
-use crate::ui::parts::{ButtonKind, button, detail, icon, text};
+use crate::ui::parts::{ButtonKind, button, detail, icon, leaving_link, text};
 use crate::ui::settings::{segmented, switch};
 
 /// The label of a level select: the level, and "Default for this channel"
@@ -430,7 +430,6 @@ impl ConsortApp {
                     )
                     .child(text(view.notify_line.clone(), detail(t), c.text_tertiary)),
             );
-        let tutti = self.state.tutti().map(|ch| ch.id.clone());
         let watch = setting_row(
             "What to watch",
             "Every check-in in Tutti reads the check-in note: what to watch and what to skip. You can also say it in chat, for example \"skip receipts\".",
@@ -440,6 +439,7 @@ impl ConsortApp {
         .child(
             div()
                 .id("proactivity-edit-note")
+                .debug_selector(|| "proactivity-edit-note".into())
                 .flex()
                 .flex_none()
                 .items_center()
@@ -447,9 +447,7 @@ impl ConsortApp {
                 .cursor_pointer()
                 .child(icon("edit", t.icon.dense, c.text_primary))
                 .child(text("Edit check-in.md", t.text.ui, c.text_primary).underline())
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.open_check_in_note(tutti.clone(), window, cx)
-                })),
+                .on_click(cx.listener(|this, _, _, cx| this.open_check_in_note(cx))),
         );
         let mut today_rows = rows(t).child(counts).child(watch);
         if let Some((routine_id, brief_line)) = view.brief.clone() {
@@ -457,20 +455,13 @@ impl ConsortApp {
                 setting_row("Morning brief", brief_line, true, t).child(
                     div()
                         .id("proactivity-open-brief")
+                        .debug_selector(|| "proactivity-open-brief".into())
                         .flex_none()
                         .cursor_pointer()
                         .child(text("Open routine", t.text.ui, c.text_primary).underline())
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            let channel = this
-                                .state
-                                .routines
-                                .iter()
-                                .find(|r| r.id == routine_id)
-                                .map(|r| r.channel_id.clone());
-                            if let Some(channel) = channel {
-                                this.open_channel(channel, window, cx);
-                                this.open_routine(&routine_id, window, cx);
-                            }
+                        // The routine opens in Settings > Routines.
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.open_routine_in_settings(&routine_id, cx)
                         })),
                 ),
             );
@@ -734,15 +725,17 @@ impl ConsortApp {
                     .child(text(row.detail.clone(), t.text.ui, c.text_secondary).max_w_full())
                     .when_some(message, |d, (message_id, root)| {
                         d.child(
-                            div()
-                                .id(SharedString::from(format!("log-open-{}", row.id)))
-                                .debug_selector({
-                                    let selector = format!("log-open-{}", row.id);
-                                    move || selector
-                                })
-                                .cursor_pointer()
-                                .child(text("Open message", t.text.ui, c.text_primary).underline())
-                                .on_click(cx.listener(move |this, _, window, cx| {
+                            leaving_link(
+                                SharedString::from(format!("log-open-{}", row.id)),
+                                "Show in channel",
+                                t,
+                            )
+                            .debug_selector({
+                                let selector = format!("log-open-{}", row.id);
+                                move || selector
+                            })
+                            .on_click(cx.listener(
+                                move |this, _, window, cx| {
                                     this.open_logged_message(
                                         channel.clone(),
                                         message_id.clone(),
@@ -750,14 +743,15 @@ impl ConsortApp {
                                         window,
                                         cx,
                                     )
-                                })),
+                                },
+                            )),
                         )
                     }),
             )
     }
 
-    /// "Open message" opens the channel and scrolls to the message, or opens
-    /// the task thread when the message is a reply in one.
+    /// "Show in channel" opens the channel and scrolls to the message, or
+    /// opens the task thread when the message is a reply in one.
     pub fn open_logged_message(
         &mut self,
         channel_id: String,
@@ -776,23 +770,15 @@ impl ConsortApp {
         self.open_message(channel_id, message_id, root, task_id, window, cx);
     }
 
-    /// "Edit check-in.md": Tutti's note in global memory.
-    pub fn open_check_in_note(
-        &mut self,
-        tutti: Option<String>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(tutti) = tutti {
-            self.open_channel(tutti, window, cx);
-            self.open_channel_tab(crate::app::ChannelTab::Memory, cx);
-            self.open_note_in_panel(
-                consort_client::memory::GLOBAL,
-                consort_client::proactivity::CHECK_IN_NOTE_PATH,
-                window,
-                cx,
-            );
-        }
+    /// "Edit check-in.md": Tutti's note in global memory. It opens in
+    /// Settings > Memory, so the user stays in Settings.
+    pub fn open_check_in_note(&mut self, cx: &mut Context<Self>) {
+        self.open_settings(crate::app::SettingsSection::Memory, cx);
+        self.open_note_in_settings(
+            consort_client::memory::GLOBAL,
+            consort_client::proactivity::CHECK_IN_NOTE_PATH,
+            cx,
+        );
     }
 
     // The timeline ---------------------------------------------------------
@@ -825,54 +811,82 @@ impl ConsortApp {
             })
     }
 
-    /// Useful and Too noisy under a proactive message: on hover, and after
-    /// the user rated it.
-    pub fn render_feedback(
+    /// Useful and Too noisy, as a bordered pair of text buttons. There is no
+    /// icon that says "too noisy" clearly.
+    pub fn render_feedback_pair(
         &self,
         message_id: &str,
-        rating: Option<ProactiveRating>,
         t: &Tokens,
         cx: &mut Context<Self>,
-    ) -> Div {
+    ) -> gpui_kit::Stateful<Div> {
         let c = &t.colors;
         let p = t.component.proactivity;
-        let action = |label: &'static str, value: ProactiveRating| {
-            let chosen = rating == Some(value);
-            let id = message_id.to_owned();
-            div()
-                .id(SharedString::from(format!(
-                    "feedback-{message_id}-{}",
-                    value.as_str()
-                )))
-                .debug_selector(move || format!("feedback-{}", value.as_str()))
-                .flex()
-                .items_center()
-                .py(p.feedback_pad_y)
-                .px(p.feedback_pad_x)
-                .rounded(t.radius.md)
-                .cursor_pointer()
-                .when(chosen, |d| d.bg(c.surface_selected))
-                .hover(|s| s.bg(c.surface_selected))
-                .child(text(
-                    label,
-                    t.text.label,
-                    if chosen {
-                        c.text_primary
-                    } else {
-                        c.text_secondary
-                    },
-                ))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.rate_message(id.clone(), value, rating, cx)
-                }))
+        let action =
+            |label: &'static str, value: ProactiveRating| {
+                let id = message_id.to_owned();
+                div()
+                    .id(SharedString::from(format!(
+                        "feedback-{message_id}-{}",
+                        value.as_str()
+                    )))
+                    .debug_selector(move || format!("feedback-{}", value.as_str()))
+                    .flex()
+                    .items_center()
+                    .px(p.feedback_pad_x)
+                    .cursor_pointer()
+                    .hover(|s| s.bg(c.surface_selected))
+                    .child(text(label, t.text.label, c.text_secondary))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.rate_message(id.clone(), value, None, cx)
+                    }))
+            };
+        div()
+            .id("feedback-pair")
+            .debug_selector(|| "feedback-pair".into())
+            .flex()
+            .flex_none()
+            .items_stretch()
+            .h(t.component.chat.feedback_pair)
+            .rounded(t.radius.md)
+            .border(t.border_width)
+            .border_color(c.border_strong)
+            .overflow_hidden()
+            .child(action("Useful", ProactiveRating::Useful))
+            .child(div().w(t.border_width).bg(c.border_strong))
+            .child(action("Too noisy", ProactiveRating::TooNoisy))
+    }
+
+    /// The choice that the user made, at rest, in the same place as the
+    /// pair. A click clears it.
+    pub fn render_feedback_chip(
+        &self,
+        message_id: &str,
+        rating: ProactiveRating,
+        t: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> gpui_kit::Stateful<Div> {
+        let c = &t.colors;
+        let id = message_id.to_owned();
+        let label = match rating {
+            ProactiveRating::Useful => "Useful",
+            ProactiveRating::TooNoisy => "Too noisy",
         };
         div()
+            .id("feedback-chip")
+            .debug_selector(|| "feedback-chip".into())
             .flex()
+            .flex_none()
             .items_center()
-            .gap(t.space.xs)
-            .pl(t.space.xxs)
-            .child(action("Useful", ProactiveRating::Useful))
-            .child(action("Too noisy", ProactiveRating::TooNoisy))
+            .h(t.component.chat.feedback_pair)
+            .px(t.component.proactivity.feedback_pad_x)
+            .rounded(t.radius.md)
+            .bg(c.surface_selected)
+            .cursor_pointer()
+            .hover(|s| s.bg(c.hover_raised))
+            .child(text(label, t.text.label, c.text_primary))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.rate_message(id.clone(), rating, Some(rating), cx)
+            }))
     }
 
     /// The quick-reply chips under the newest assistant message. "I will
@@ -924,15 +938,21 @@ impl ConsortApp {
     }
 
     /// The writing bubble: three dabs of the mark at 10 px in the assistant
-    /// lane. They shimmer on the shared mark clock and stand still with
-    /// Reduce motion.
+    /// lane. They shimmer and rise in a wave on the shared mark clock, and
+    /// stand still with Reduce motion. The rise does not change the layout, so
+    /// the bubble and the timeline stay still.
     pub fn render_writing_bubble(&self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
         let c = &t.colors;
         let p = t.component.proactivity;
         let chat = t.component.chat;
         let version = crate::ui::motion::shimmer_version(true, cx);
-        let dab = |name: &str, offset: gpui_kit::Pixels| {
+        let dab = |name: &str, index: u64, offset: gpui_kit::Pixels| {
+            let lift = p.writing_lift * crate::ui::motion::writing_lift(index, cx);
+            let selector = format!("writing-dab-{index}");
             div()
+                .debug_selector(move || selector)
+                .relative()
+                .top(-lift)
                 .flex_none()
                 .mt(offset)
                 .child(img(SharedString::from(dab_asset(name, version))).size(p.dab))
@@ -948,9 +968,9 @@ impl ConsortApp {
             .rounded(chat.bubble_radius)
             .rounded_bl(chat.bubble_tail)
             .bg(c.surface_card)
-            .child(dab("gold", p.dab_drop))
-            .child(dab("verdigris", -p.dab_rise))
-            .child(dab("lapis", t.border_width))
+            .child(dab("gold", 0, p.dab_drop))
+            .child(dab("verdigris", 1, -p.dab_rise))
+            .child(dab("lapis", 2, t.border_width))
             .into_any_element()
     }
 

@@ -492,6 +492,8 @@ async fn a_failed_turn_fails_the_task_and_retry_starts_a_new_session() {
                     turn_id: "t1".into(),
                     reason: TurnEndReason::Failed,
                     error: Some("The model refused.".to_owned()),
+                    error_kind: None,
+                    resets_at: None,
                 },
             ],
         )

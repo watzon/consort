@@ -20,7 +20,7 @@ use agent_client_protocol::{
 use async_trait::async_trait;
 use consort_proto::ids::{NativeRef, RequestId, TurnId};
 use consort_proto::model::{
-    ApprovalDetails, ApprovalMode, AuthState, Capabilities, ModelInfo, OptionChoice,
+    ApprovalDetails, ApprovalMode, AuthState, Capabilities, ModelInfo, ModelOptions, OptionChoice,
     OptionDescriptor, OptionValue, RequestOption, SessionState,
 };
 use consort_proto::worker_link::{
@@ -32,8 +32,9 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::account::prepare_home;
 use crate::approval::{
-    CLAUDE_SHELL_TOOLS, OPENCODE_NO_PROJECT_CONFIG, claude_mode, claude_mode_allowed,
-    claude_option_mode, gemini_mode, opencode_permission,
+    CLAUDE_SHELL_TOOLS, CLAUDE_WEB_TOOLS, OPENCODE_NO_PROJECT_CONFIG, claude_mode,
+    claude_mode_allowed, claude_mode_fallback, claude_option_mode, gemini_mode, gemini_policy,
+    opencode_coordinator_permission, opencode_permission,
 };
 use crate::attachments::{ACP_IMAGE_MAX_BYTES, ImageDelivery, ImageLimits, base64, prepare_turn};
 use crate::process::{self, ProcessSpec, StderrTail, resolve_program};
@@ -268,6 +269,9 @@ pub fn prompt_blocks(
 /// `docs/notes/phase1-backend.md`).
 pub fn static_capabilities(kind: HarnessKind) -> Capabilities {
     match kind {
+        // `switch_model`: `session/set_config_option` for `model` changes
+        // the model of a running Claude Code session (the probe uses it to
+        // read the options of each model).
         HarnessKind::ClaudeCode => Capabilities {
             steer: true,
             resume: true,
@@ -275,12 +279,14 @@ pub fn static_capabilities(kind: HarnessKind) -> Capabilities {
             mcp_http: true,
             images: true,
             approval_modes: ApprovalMode::ALL.to_vec(),
+            switch_model: true,
             ..Capabilities::default()
         },
         HarnessKind::OpenCode => Capabilities {
             resume: true,
             images: true,
             approval_modes: ApprovalMode::ALL.to_vec(),
+            switch_model: true,
             ..Capabilities::default()
         },
         // Auto is `auto_edit`, the same as Auto edits, and Full access is
@@ -525,8 +531,15 @@ fn claude_meta_for(spec: &SessionSpec, probe: bool) -> Value {
             options.insert("allowDangerouslySkipPermissions".to_owned(), json!(false));
         }
     }
+    let mut disallowed: Vec<&str> = Vec::new();
     if !spec.allow_shell {
-        options.insert("disallowedTools".to_owned(), json!(CLAUDE_SHELL_TOOLS));
+        disallowed.extend(CLAUDE_SHELL_TOOLS);
+    }
+    if spec.coordinator {
+        disallowed.extend(CLAUDE_WEB_TOOLS);
+    }
+    if !disallowed.is_empty() {
+        options.insert("disallowedTools".to_owned(), json!(disallowed));
     }
     // Provider extras off: inline settings and one env variable, for this
     // session only. The profile's own settings file stays as it is (see
@@ -782,6 +795,11 @@ enum Command {
     },
     SetMode {
         mode: ApprovalMode,
+        reply: oneshot::Sender<Result<(), HarnessError>>,
+    },
+    SetModel {
+        model: String,
+        options: ModelOptions,
         reply: oneshot::Sender<Result<(), HarnessError>>,
     },
     Close,
@@ -1092,20 +1110,48 @@ impl Actor {
             let Some(id) = option.get("id").and_then(Value::as_str).map(str::to_owned) else {
                 return Err(refuse("the mode option has no ID".to_owned()));
             };
-            if let Some(updated) = self
-                .set_option(cx, session, &option, mode)
-                .await
-                .map_err(refuse)?
-            {
-                *options = updated;
+            let read = |options: &[Value]| {
+                find_option(options, "mode", &["mode"])
+                    .and_then(|o| o.get("currentValue"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            };
+            let mut failure = None;
+            match self.set_option(cx, session, &option, mode).await {
+                Ok(Some(updated)) => *options = updated,
+                Ok(None) => {}
+                Err(why) => failure = Some(why),
             }
-            let current = find_option(options, "mode", &["mode"])
-                .and_then(|o| o.get("currentValue"))
-                .and_then(Value::as_str);
-            if current != Some(mode) {
+            let mut current = read(options);
+            if current.as_deref() != Some(mode)
+                && let Some(fallback) = claude_mode_fallback(mode)
+            {
+                // The adapter keeps `acceptEdits` when the model does not
+                // support `auto`. When it refuses `auto`, or does not offer
+                // it, ask for `acceptEdits` and go on.
+                if current.as_deref() != Some(fallback) {
+                    let option = find_option(options, "mode", &["mode"])
+                        .cloned()
+                        .unwrap_or(option);
+                    match self.set_option(cx, session, &option, fallback).await {
+                        Ok(Some(updated)) => *options = updated,
+                        Ok(None) => {}
+                        Err(why) => failure = Some(why),
+                    }
+                    current = read(options);
+                }
+                if current.as_deref() == Some(fallback) {
+                    warn_mode_fallback(&self.spec.session_id, mode, fallback, failure.as_deref());
+                    return Ok((bypass, ModeSetter::ConfigOption(id)));
+                }
+            }
+            if let Some(why) = failure {
+                return Err(refuse(why));
+            }
+            if current.as_deref() != Some(mode) {
                 return Err(refuse(format!(
                     "the agent reports `{}`",
-                    current.unwrap_or("no mode")
+                    current.as_deref().unwrap_or("no mode")
                 )));
             }
             return Ok((bypass, ModeSetter::ConfigOption(id)));
@@ -1126,28 +1172,47 @@ impl Actor {
         if mode == "bypassPermissions" && !bypass {
             return Err(no_bypass());
         }
-        if modes.get("currentModeId").and_then(Value::as_str) == Some(mode) {
+        let current = modes.get("currentModeId").and_then(Value::as_str);
+        if current == Some(mode) {
             return Ok((bypass, ModeSetter::SetMode));
         }
-        if !offered(mode) {
-            return Err(refuse("the agent does not offer it".to_owned()));
-        }
+        let fallback = claude_mode_fallback(mode);
+        let set = async |target: &str| {
+            request(
+                cx,
+                "session/set_mode",
+                json!({"sessionId": session.as_str(), "modeId": target}),
+            )
+            .await
+            .map_err(|e| e.to_string())
+        };
         // A successful `session/set_mode` sets the mode. ACP has no way to
         // read the mode back in the answer.
-        request(
-            cx,
-            "session/set_mode",
-            json!({"sessionId": session.as_str(), "modeId": mode}),
-        )
-        .await
-        .map_err(|e| refuse(e.to_string()))?;
+        let failure = if offered(mode) {
+            match set(mode).await {
+                Ok(_) => return Ok((bypass, ModeSetter::SetMode)),
+                Err(why) => why,
+            }
+        } else {
+            "the agent does not offer it".to_owned()
+        };
+        let Some(fallback) = fallback else {
+            return Err(refuse(failure));
+        };
+        if current != Some(fallback) {
+            if !offered(fallback) {
+                return Err(refuse(failure));
+            }
+            set(fallback).await.map_err(refuse)?;
+        }
+        warn_mode_fallback(&self.spec.session_id, mode, fallback, Some(&failure));
         Ok((bypass, ModeSetter::SetMode))
     }
 
-    /// Sets the approval mode, the model and the options. Returns the config
-    /// options as the agent last reported them, and for Claude Code what
-    /// [`Self::set_claude_mode`] learned. Fails when the approval mode cannot
-    /// be set.
+    /// Sets the model, the options and the approval mode, in this order.
+    /// Returns the config options as the agent last reported them, and for
+    /// Claude Code what [`Self::set_claude_mode`] learned. Fails when the
+    /// approval mode cannot be set.
     async fn configure(
         &self,
         cx: &ConnectionTo<Agent>,
@@ -1155,13 +1220,10 @@ impl Actor {
         response: &Value,
         mut options: Vec<Value>,
     ) -> Result<(Vec<Value>, Option<(bool, ModeSetter)>), HarnessError> {
-        let mut mode = None;
-        if self.kind == HarnessKind::ClaudeCode {
-            mode = Some(
-                self.set_claude_mode(cx, session, response, &mut options)
-                    .await?,
-            );
-        }
+        // The model and the options go first. Claude Code drops `auto` to
+        // `acceptEdits` when the chosen model does not support it, and the
+        // list of modes follows the model. So the mode is set after the
+        // model, and it is set again after every later model change.
         if !self.spec.model.is_empty()
             && let Some(option) = find_option(&options, "model", &["model"]).cloned()
             && let Some(updated) = self
@@ -1187,7 +1249,112 @@ impl Actor {
                 options = updated;
             }
         }
+        let mut mode = None;
+        if self.kind == HarnessKind::ClaudeCode {
+            mode = Some(
+                self.set_claude_mode(cx, session, response, &mut options)
+                    .await?,
+            );
+        }
         Ok((options, mode))
+    }
+
+    /// Changes the model and the options of the open session, then sets the
+    /// permission mode of a Claude session again. The model decides which
+    /// modes the adapter offers: it keeps `acceptEdits` when the new model
+    /// has no `auto`, and a later model that has `auto` does not bring it
+    /// back by itself. Any failure of the model or of an option the user
+    /// picked fails the call, so the hub can start a new session. The mode
+    /// may stay at the fallback, as it does at the open.
+    #[allow(clippy::too_many_arguments)]
+    async fn change_model(
+        &self,
+        cx: &ConnectionTo<Agent>,
+        session: &NativeRef,
+        config_options: &mut Vec<Value>,
+        mode_setter: &ModeSetter,
+        limit: ApprovalMode,
+        model: &str,
+        wanted: &ModelOptions,
+    ) -> Result<(), HarnessError> {
+        let failed = HarnessError::Protocol;
+        if !model.is_empty() {
+            let option = find_option(config_options, "model", &["model"])
+                .cloned()
+                .ok_or_else(|| failed("the agent has no model option".to_owned()))?;
+            if let Some(updated) = self
+                .set_option(cx, session, &option, model)
+                .await
+                .map_err(failed)?
+            {
+                *config_options = updated;
+            }
+        }
+        for (key, value) in wanted {
+            let OptionValue::Text(value) = value else {
+                continue;
+            };
+            // The effort levels follow the model, so the option comes from
+            // the list that the model change returned.
+            let option = if key == "effort" {
+                find_option(
+                    config_options,
+                    "thought_level",
+                    &["effort", "thought_level"],
+                )
+            } else {
+                config_options
+                    .iter()
+                    .find(|o| o.get("id").and_then(Value::as_str) == Some(key.as_str()))
+            };
+            if let Some(option) = option.cloned()
+                && let Some(updated) = self
+                    .set_option(cx, session, &option, value)
+                    .await
+                    .map_err(failed)?
+            {
+                *config_options = updated;
+            }
+        }
+        if self.kind != HarnessKind::ClaudeCode {
+            return Ok(());
+        }
+        let target = claude_mode(limit);
+        let current = find_option(config_options, "mode", &["mode"])
+            .and_then(|o| o.get("currentValue"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        if current.as_deref() == Some(target) {
+            return Ok(());
+        }
+        let Some(message) = mode_reset_message(session, mode_setter, target) else {
+            return Ok(());
+        };
+        match tokio::time::timeout(MODE_RESET_TIMEOUT, cx.send_request(message).block_task()).await
+        {
+            Err(_) => Err(HarnessError::Timeout(
+                "the agent did not set the permission mode after the model change".to_owned(),
+            )),
+            Ok(Ok(answer)) => {
+                mode_answer(&answer, target)?;
+                if let Some(updated) = answer.get("configOptions").and_then(Value::as_array) {
+                    *config_options = updated.clone();
+                }
+                Ok(())
+            }
+            // The adapter refuses a mode that the model lacks. When it
+            // already runs the fallback, the session goes on with it.
+            Ok(Err(err)) if current.as_deref() == claude_mode_fallback(target) => {
+                warn_mode_fallback(
+                    &self.spec.session_id,
+                    target,
+                    claude_mode_fallback(target).unwrap_or(target),
+                    Some(&err.to_string()),
+                );
+                Ok(())
+            }
+            Ok(Err(err)) => Err(protocol_error(&err)),
+        }
     }
 
     async fn run(
@@ -1198,12 +1365,13 @@ impl Actor {
         ready: oneshot::Sender<Result<Ready, HarnessError>>,
     ) -> Result<(), agent_client_protocol::Error> {
         let opened = self.open(&cx, &mut incoming).await;
-        let (native, mode_setter) = match opened {
+        let (native, mode_setter, mut config_options) = match opened {
             Ok(r) => {
                 let native = r.native_ref.clone();
                 let setter = r.mode_setter.clone();
+                let options = r.config_options.clone();
                 let _ = ready.send(Ok(r));
-                (native, setter)
+                (native, setter, options)
             }
             Err(err) => {
                 let _ = ready.send(Err(err));
@@ -1360,6 +1528,16 @@ impl Actor {
                                 let _ = reply.send(result);
                             });
                         }
+                        Command::SetModel { model, options, reply } => {
+                            if running.is_some() || resetting.is_some() {
+                                let _ = reply.send(Err(HarnessError::Protocol("a turn is running".to_owned())));
+                                continue;
+                            }
+                            let result = self
+                                .change_model(&cx, &native, &mut config_options, &mode_setter, limit, &model, &options)
+                                .await;
+                            let _ = reply.send(result);
+                        }
                         Command::Respond { request: request_id, answer, reply } => {
                             let Some(permission) = pending.remove(&request_id) else {
                                 let _ = reply.send(Err(HarnessError::UnknownRequest(request_id.to_string())));
@@ -1391,6 +1569,11 @@ impl Actor {
                     match message {
                         Incoming::Update(params) => {
                             if let Some(update) = params.get("update") {
+                                if update.get("sessionUpdate").and_then(Value::as_str) == Some("config_option_update")
+                                    && let Some(options) = update.get("configOptions").and_then(Value::as_array)
+                                {
+                                    config_options = options.clone();
+                                }
                                 if watch_mode
                                     && resetting.is_none()
                                     && let Some(mode) = reported_mode(update)
@@ -1478,7 +1661,14 @@ impl Actor {
                                 message: hint.clone(),
                             })
                             .await;
-                            mapper.end_turn(TurnEndReason::Failed, Some(hint))
+                            mapper.end_turn_as(
+                                TurnEndReason::Failed,
+                                Some(hint),
+                                crate::FailureInfo {
+                                    kind: crate::TurnErrorKind::ExpiredSignIn,
+                                    resets_at: None,
+                                },
+                            )
                         }
                         // Claude Code's `claude auth status` reports no expiry,
                         // so an expired login passes the probe and fails here
@@ -1496,12 +1686,24 @@ impl Actor {
                                 message: crate::LOGIN_EXPIRED_MESSAGE.to_owned(),
                             })
                             .await;
-                            mapper.end_turn(
+                            mapper.end_turn_as(
                                 TurnEndReason::Failed,
                                 Some(crate::LOGIN_EXPIRED_MESSAGE.to_owned()),
+                                crate::FailureInfo {
+                                    kind: crate::TurnErrorKind::ExpiredSignIn,
+                                    resets_at: None,
+                                },
                             )
                         }
-                        Err(err) => mapper.end_turn(TurnEndReason::Failed, Some(err.to_string())),
+                        Err(err) => {
+                            // The data of the error often holds the API
+                            // error, so the kind reads both.
+                            let info = crate::classify_failure(&format!(
+                                "{err} {}",
+                                err.data.as_ref().map(ToString::to_string).unwrap_or_default()
+                            ));
+                            mapper.end_turn_as(TurnEndReason::Failed, Some(err.to_string()), info)
+                        }
                     };
                     self.emit_all(events).await;
                     self.emit(SessionEvent::State { state: SessionState::Idle }).await;
@@ -1654,12 +1856,32 @@ fn mode_answer(answer: &Value, target: &str) -> Result<(), HarnessError> {
         .and_then(Value::as_str);
     if now == Some(target) {
         Ok(())
+    } else if now.is_some() && now == claude_mode_fallback(target) {
+        // The adapter keeps the fallback when the model does not support the
+        // mode (see [`claude_mode_fallback`]).
+        tracing::warn!(%target, now = ?now, "the agent kept a lower permission mode than the one asked for");
+        Ok(())
     } else {
         Err(HarnessError::ModeUnavailable(format!(
             "the agent reports `{}`, not `{target}`",
             now.unwrap_or("no mode")
         )))
     }
+}
+
+/// Logs that a Claude session runs in the fallback of the mode that the
+/// approval mode asks for. The session goes on, and it asks more often than
+/// the user chose.
+fn warn_mode_fallback(
+    session: &consort_proto::ids::SessionId,
+    mode: &str,
+    fallback: &str,
+    why: Option<&str>,
+) {
+    tracing::warn!(
+        %session, %mode, %fallback, why = why.unwrap_or("the agent kept the fallback"),
+        "Claude Code does not offer this permission mode for this account or model; the session uses the fallback"
+    );
 }
 
 /// The text of the `mode_reset_failed` error.
@@ -1687,6 +1909,28 @@ pub fn agent_process_spec(
         spec.skills.as_ref(),
         resolve,
     )?;
+    let mut launch = launch;
+    if kind == HarnessKind::OpenCode
+        && spec.coordinator
+        && let Some(text) = launch.env.get("OPENCODE_CONFIG_CONTENT")
+        && let Ok(mut config) = serde_json::from_str::<Value>(text)
+    {
+        opencode_coordinator_permission(&mut config);
+        launch
+            .env
+            .insert("OPENCODE_CONFIG_CONTENT".to_owned(), config.to_string());
+    }
+    if kind == HarnessKind::GeminiCli
+        && let Some(policy) = gemini_policy(spec.allow_shell, spec.coordinator)
+    {
+        let path = spec.runtime_dir.join("consort-policy.toml");
+        std::fs::create_dir_all(&spec.runtime_dir)
+            .and_then(|()| std::fs::write(&path, policy))
+            .map_err(|e| HarnessError::Spawn(format!("could not write the Gemini policy: {e}")))?;
+        launch
+            .args
+            .push(format!("--admin-policy={}", path.display()));
+    }
     env.extend(launch.env);
     // The environment of the session's skills, such as the Gemini home of
     // the session (see `crate::skills`).
@@ -1932,6 +2176,7 @@ impl Harness for AcpHarness {
             options: Default::default(),
             approval_mode: ApprovalMode::Ask,
             allow_shell: true,
+            coordinator: false,
             system_prompt_append: String::new(),
             mcp_servers: Vec::new(),
             env: BTreeMap::new(),
@@ -2122,6 +2367,17 @@ impl HarnessSession for AcpSession {
         self.call(|reply| Command::SetMode { mode, reply }).await
     }
 
+    /// Changes the model with `session/set_config_option`, then sets the
+    /// Claude permission mode again (see `Actor::change_model`).
+    async fn set_model(&mut self, model: &str, options: &ModelOptions) -> Result<(), HarnessError> {
+        self.call(|reply| Command::SetModel {
+            model: model.to_owned(),
+            options: options.clone(),
+            reply,
+        })
+        .await
+    }
+
     async fn respond(&mut self, request: RequestId, answer: Answer) -> Result<(), HarnessError> {
         self.call(|reply| Command::Respond {
             request,
@@ -2273,6 +2529,7 @@ async fn auth_op(
         options: Default::default(),
         approval_mode: ApprovalMode::Ask,
         allow_shell: true,
+        coordinator: false,
         system_prompt_append: String::new(),
         mcp_servers: Vec::new(),
         env: BTreeMap::new(),

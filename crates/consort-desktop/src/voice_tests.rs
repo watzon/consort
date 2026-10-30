@@ -5,9 +5,9 @@
 
 use std::time::Duration;
 
-use crate::app::{ConsortApp, Dialog, SettingsSection};
+use crate::app::{ConsortApp, Dialog, Page, Panel, SettingsSection};
 use crate::voice::VoiceDialog;
-use consort_client::mock_voice::{DRAFT_APPROVAL, GMAIL, MOCK_REVIEW_HASH, SLACK};
+use consort_client::mock_voice::{DRAFT_APPROVAL, GMAIL, MOCK_REVIEW_HASH, REPLY_TASK, SLACK};
 use consort_client::voice::{Disclosure, GuideEdit};
 use consort_client::{Client, ViewState};
 use gpui::{AnyWindowHandle, TestAppContext, VisualTestContext};
@@ -240,4 +240,27 @@ fn a_draft_card_keeps_allow_off_until_the_tick(cx: &mut TestAppContext) {
 
     click(cx, "not-my-voice");
     assert!(app.read_with(cx, |app, _| app.voice.feedback.contains(DRAFT_APPROVAL)));
+}
+
+/// The voice task link in Settings > Voice says "Show task". It leaves
+/// Settings on purpose and opens the task thread.
+#[gpui::test]
+fn show_task_leaves_settings_for_the_voice_task(cx: &mut TestAppContext) {
+    let mut view = state("voice-approval");
+    view.voice.learning = Some(consort_client::voice::VoiceLearningView {
+        task_id: REPLY_TASK.into(),
+        title: "Learn my voice".into(),
+        line: "Learning from your sources".into(),
+        status: consort_client::TaskStatus::Working,
+    });
+    let (handle, app) = open(view, cx);
+    let cx = &mut VisualTestContext::from_window(handle, cx);
+    cx.update(|_, cx| app.update(cx, |app, cx| app.open_settings(SettingsSection::Voice, cx)));
+    draw(cx);
+    app.read_with(cx, |app, _| assert_eq!(app.page, Page::Settings));
+    click(cx, "voice-open-task");
+    app.read_with(cx, |app, _| {
+        assert_eq!(app.page, Page::Main);
+        assert_eq!(app.panel, Panel::Thread(REPLY_TASK.into()));
+    });
 }

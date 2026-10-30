@@ -876,15 +876,6 @@ impl ConsortApp {
         });
     }
 
-    /// The width of the right panel: 560 px while it shows a task item.
-    pub fn right_panel_width(&self, t: &consort_theme::Tokens) -> gpui_kit::Pixels {
-        match &self.panel {
-            Panel::None => gpui_kit::Pixels::ZERO,
-            Panel::Thread(task) if self.item_open_for(task) => t.component.convo.panel_wide,
-            _ => t.layout.panel_width,
-        }
-    }
-
     /// Whether the open item belongs to this task.
     pub fn item_open_for(&self, task_id: &str) -> bool {
         self.state

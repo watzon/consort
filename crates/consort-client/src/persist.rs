@@ -794,6 +794,7 @@ mod tests {
             created_at: at(5),
             proactive: None,
             suggestions: Vec::new(),
+            source_message_id: None,
         }
     }
 
@@ -1034,6 +1035,20 @@ mod tests {
                 "itm_2".into(),
                 ItemSummary::Files(vec!["src/main.rs".into(), "Cargo.toml".into()]),
             );
+        cache
+            .session_items
+            .entry(session.to_string())
+            .or_default()
+            .insert(
+                "itm_3".into(),
+                ItemSummary::Plan {
+                    steps: vec![consort_proto::model::PlanStep {
+                        text: "Read the plan".into(),
+                        status: consort_proto::model::PlanStepStatus::InProgress,
+                    }],
+                    updated_at: 78,
+                },
+            );
         cache.session_activity.insert(
             session.to_string(),
             SessionActivity {
@@ -1048,6 +1063,7 @@ mod tests {
         cache.channels_loaded.insert(channel_id.to_string());
         cache.loaded_threads.insert(card.to_string());
         cache.preferences = Preferences {
+            account_fallback: true,
             favorite_models: vec![FavoriteModel {
                 account_label: "Claude Work".into(),
                 model: "opus-5.5".into(),
@@ -1250,8 +1266,9 @@ mod tests {
         let (mut file, saved) = CacheFile::open(&path, &owner()).unwrap();
         assert!(saved.is_none(), "a new file holds no data");
         let written = save(&mut file, &cache, 1_800_000_000_000);
-        // One row for each entity: 20 kinds, and two session items.
-        assert_eq!(written, 21);
+        // One row for each entity: 20 kinds, and three session items (a
+        // command, a file change and a plan).
+        assert_eq!(written, 22);
         drop(file);
 
         let (_, saved) = CacheFile::open(&path, &owner()).unwrap();

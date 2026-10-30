@@ -41,6 +41,9 @@ pub struct ViewState {
     /// whose account or model is gone stays here, and the picker hides it
     /// (see [`crate::picker::favorite_rows`]).
     pub favorite_models: Vec<FavoriteModelView>,
+    /// Work moves to another account of the same harness when its account
+    /// reaches a usage limit. From the hub's preferences.
+    pub account_fallback: bool,
     /// The sign-ins that this client started, newest last. A sign-in that
     /// another client started does not show (see DECISIONS row 269).
     pub sign_ins: Vec<SignInView>,
@@ -111,8 +114,17 @@ pub struct SendFailureView {
     pub channel_name: String,
     /// The text that the user wrote.
     pub body: String,
-    /// What happened and what to do next.
+    /// What happened and what to do next. This is the text for a toast.
     pub message: String,
+    /// What the hub said, as one sentence, without the next step. The lane
+    /// shows it under the dimmed message.
+    pub reason: String,
+    /// "Put back in the message box".
+    pub action: String,
+    /// The timeline or the task thread shows the message, dimmed, in the
+    /// lane of the user. The app then needs no toast. When it is false
+    /// (the channel or the task is gone), only the toast shows it.
+    pub in_lane: bool,
 }
 
 impl ViewState {
@@ -657,6 +669,12 @@ pub struct NoticeView {
     pub text: String,
     /// For a `memory_saved` notice: the note that the assistant saved.
     pub memory: Option<MemorySavedView>,
+    /// For a `turn_failed` notice: the card with the title, what to do and
+    /// the details. Old notices read as an unknown error.
+    pub error: Option<crate::turn_errors::ErrorCardView>,
+    /// For a `draft` notice: the text that the assistant showed with
+    /// `show_draft`.
+    pub draft: Option<crate::drafts::ShownDraftView>,
 }
 
 /// The memory saved line: the assistant saved a memory note. The timeline
@@ -752,6 +770,30 @@ pub struct MessageView {
     /// Quick replies. Only the newest assistant message has them, until
     /// the user answers.
     pub suggestions: Vec<crate::proactivity::SuggestionView>,
+    /// The ID of the timeline message that the hub copied into a task thread
+    /// as this message. The app shows "Show in channel" for it. Only a
+    /// message of the user in a task thread has it.
+    pub source_message_id: Option<String>,
+    /// Set when the hub refused the message. It shows in the lane of the
+    /// user, dimmed, with the reason and the action.
+    pub refused: Option<RefusedView>,
+}
+
+/// The state of a message that the hub refused.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RefusedView {
+    /// The ID of the failure. [`crate::Command::DismissSendFailure`] takes
+    /// it, and the app finds the text to put back with it.
+    pub failure_id: String,
+    /// What the hub said, as one sentence.
+    pub reason: String,
+    /// The label of the action: "Put back in the message box".
+    pub action: String,
+}
+
+impl RefusedView {
+    /// The label of the action that puts the text back.
+    pub const ACTION: &'static str = "Put back in the message box";
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -798,6 +840,25 @@ pub struct TaskCardView {
     pub note: Option<String>,
 }
 
+impl TaskCardView {
+    /// The card is the task line alone. While a task runs, waits for review
+    /// or is resolved, the chat says it in one line, and the thread holds
+    /// the rest (Resolve is there too, DECISIONS 117 and 718). The card keeps
+    /// its body when something needs the user's eyes in the chat: an approval
+    /// that waits, the reason of a failed task, or the steps and the note of
+    /// the voice task.
+    pub fn is_line_only(&self) -> bool {
+        let waits = self
+            .approval
+            .as_ref()
+            .is_some_and(|a| a.state != RequestState::Answered);
+        !(waits
+            || self.status == TaskStatus::Failed
+            || !self.steps.is_empty()
+            || self.note.is_some())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum ApprovalChoice {
     #[default]
@@ -840,6 +901,9 @@ pub struct ApprovalView {
     pub folder: Option<String>,
     /// The command or the change, shown in a selectable block.
     pub detail: Option<String>,
+    /// What the action is. The title falls back to a line for it when the
+    /// summary only repeats the command ([`ApprovalView::title`]).
+    pub kind: crate::approval_text::ApprovalKind,
     pub choices: Vec<ApprovalChoice>,
     pub state: RequestState,
     /// The answer, once given.
@@ -1008,6 +1072,10 @@ pub enum PostBody {
     Notice {
         kind: String,
         text: String,
+        /// For a `turn_failed` notice.
+        error: Option<crate::turn_errors::ErrorCardView>,
+        /// For a `draft` notice.
+        draft: Option<crate::drafts::ShownDraftView>,
     },
     /// The files attached to the post.
     Attachments(Vec<crate::files::AttachmentView>),
@@ -1040,6 +1108,13 @@ pub struct ThreadPost {
     pub bodies: Vec<PostBody>,
     /// The post is still on its way to the hub.
     pub pending: bool,
+    /// The ID of the timeline message that the hub copied into this thread
+    /// as this post: the user's message that the assistant passed on to the
+    /// task. The app shows "Show in channel" for it.
+    pub source_message_id: Option<String>,
+    /// Set when the hub refused the post. It shows in the lane of the user,
+    /// dimmed, with the reason and the action.
+    pub refused: Option<RefusedView>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -1068,6 +1143,38 @@ pub struct TaskThreadView {
     /// effort". The thread composer shows it. `None` when the task has no
     /// selection and its channel and Tutti have none.
     pub model_label: Option<String>,
+    /// The model and options that the task has now, to mark in the picker.
+    /// `None` when the task, its channel and Tutti have none.
+    pub selection: Option<SelectionView>,
+    /// "Runs on <worker>", once a worker holds the task. `None` before.
+    pub runs_on: Option<String>,
+    /// The thread may offer to change the model: the task is not Resolved.
+    /// The hub refuses a Resolved task, and the message says to mark it as
+    /// not done first.
+    pub can_change_model: bool,
+    /// The models of the worker that holds the task, for the picker. The
+    /// hub refuses an account that this worker does not have, so these are
+    /// the only picks that work. Empty when the worker is not known.
+    pub model_options: Vec<TaskModelOption>,
+    /// The plan of the harness as a checklist, for the card under the
+    /// newest message. `None` when the harness made no plan.
+    pub plan: Option<crate::plan::PlanView>,
+}
+
+/// One pick of the model picker in a task thread.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TaskModelOption {
+    pub account_label: String,
+    pub model_id: String,
+    pub model_name: String,
+    /// The pick ends the session and starts a new one in the same
+    /// workspace, on the same worker. This is the client's guess from what
+    /// the worker reported. The hub decides when the task gets the next
+    /// turn.
+    pub starts_new_session: bool,
+    /// What the picker says under the pick: the new session note. `None`
+    /// when the session goes on.
+    pub note: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]

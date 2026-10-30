@@ -20,7 +20,7 @@
 //! first check that removed the last candidate.
 
 use std::cmp::Reverse;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use consort_proto::error::{ErrorBody, ErrorCode};
 use consort_proto::ids::{AccountId, RepoId, WorkerId};
@@ -48,6 +48,8 @@ pub(crate) struct PlacementInput<'a> {
     pub workers: &'a [Worker],
     /// Open sessions by worker, counted by the hub.
     pub open_sessions: &'a HashMap<WorkerId, u32>,
+    /// The accounts that reached a usage limit. See [`choose_account`].
+    pub limited: &'a HashSet<AccountId>,
     /// The model selection that the channel or the task chose. `None` means
     /// the default rule: the best harness account and its first model.
     pub selection: Option<&'a ModelSelection>,
@@ -312,8 +314,13 @@ fn evaluate<'a>(
     worker: &'a Worker,
     inventory: &'a Inventory,
 ) -> Result<Candidate<'a>, Rejection> {
-    let (account, model, options) = choose_account(inventory, input.selection, input.approval_mode)
-        .map_err(Rejection::Account)?;
+    let (account, model, options) = choose_account(
+        inventory,
+        input.selection,
+        input.approval_mode,
+        input.limited,
+    )
+    .map_err(Rejection::Account)?;
     if let Some(require) = &effective_require(input)
         && !meets_require(require, worker, inventory)
     {
@@ -332,11 +339,55 @@ fn evaluate<'a>(
     })
 }
 
-/// Chooses the account, the model and the model options on one worker.
+/// Another account for work that runs the model on `account`: same harness,
+/// signed in, with the same model, able to keep the mode, and not limited.
+fn other_account<'a>(
+    inventory: &'a Inventory,
+    account: &HarnessAccount,
+    model: &str,
+    approval_mode: ApprovalMode,
+    limited: &HashSet<AccountId>,
+) -> Option<&'a HarnessAccount> {
+    inventory.accounts.iter().find(|a| {
+        a.account_id != account.account_id
+            && a.harness == account.harness
+            && a.can_run(model)
+            && enforces_mode(a, approval_mode)
+            && !limited.contains(&a.account_id)
+    })
+}
+
+/// The selection that a session moves to when its account reached a usage
+/// limit, or `None` when no other account can take the work.
+pub(crate) fn fallback_selection(
+    inventory: &Inventory,
+    account_id: AccountId,
+    model: &str,
+    options: &ModelOptions,
+    approval_mode: ApprovalMode,
+    limited: &HashSet<AccountId>,
+) -> Option<ModelSelection> {
+    if !limited.contains(&account_id) {
+        return None;
+    }
+    let account = inventory.account(account_id)?;
+    let other = other_account(inventory, account, model, approval_mode, limited)?;
+    Some(ModelSelection {
+        account_label: other.label.clone(),
+        model: model.to_owned(),
+        options: options.clone(),
+    })
+}
+
+/// Chooses the account, the model and the model options on one worker. An
+/// account in `limited` gives way to another account of the same harness
+/// with the same model. When no such account exists, it stays, and the turn
+/// shows the limit to the user.
 fn choose_account<'a>(
     inventory: &'a Inventory,
     selection: Option<&ModelSelection>,
     approval_mode: ApprovalMode,
+    limited: &HashSet<AccountId>,
 ) -> Result<(&'a HarnessAccount, String, ModelOptions), AccountProblem> {
     match selection {
         Some(selection) => {
@@ -349,7 +400,15 @@ fn choose_account<'a>(
                 .filter(|a| a.label == selection.account_label && a.can_run(&selection.model))
                 .peekable();
             let first_label = matching.peek().map(|a| a.label.clone());
-            match matching.find(|a| enforces_mode(a, approval_mode)) {
+            let chosen = matching.find(|a| enforces_mode(a, approval_mode)).map(|a| {
+                if limited.contains(&a.account_id) {
+                    other_account(inventory, a, &selection.model, approval_mode, limited)
+                        .unwrap_or(a)
+                } else {
+                    a
+                }
+            });
+            match chosen {
                 Some(account) => Ok((account, selection.model.clone(), selection.options.clone())),
                 None => {
                     Err(
@@ -377,7 +436,7 @@ fn choose_account<'a>(
                 .iter()
                 .copied()
                 .filter(|a| enforces_mode(a, approval_mode))
-                .min_by_key(|a| harness_rank(a));
+                .min_by_key(|a| (harness_rank(a), limited.contains(&a.account_id)));
             match best {
                 Some(account) => match account.models.first() {
                     Some(model) => Ok((account, model.id.clone(), ModelOptions::new())),
@@ -389,6 +448,26 @@ fn choose_account<'a>(
             }
         }
     }
+}
+
+/// The account, model and options that a model selection means on one
+/// worker. `Err` holds a plain reason, for a message to the user.
+pub(crate) fn resolve_selection<'a>(
+    inventory: &'a Inventory,
+    selection: &ModelSelection,
+    approval_mode: ApprovalMode,
+) -> Result<(&'a HarnessAccount, String, ModelOptions), String> {
+    choose_account(inventory, Some(selection), approval_mode, &HashSet::new()).map_err(|problem| {
+        match problem {
+            AccountProblem::Missing => format!(
+                "The worker has no signed-in account \"{}\" with the model \"{}\".",
+                selection.account_label, selection.model
+            ),
+            AccountProblem::Mode { label } => format!(
+                "The account \"{label}\" on the worker cannot keep the approval mode of this task."
+            ),
+        }
+    })
 }
 
 /// Whether the account can enforce a mode that is at most the requested one.
@@ -905,6 +984,7 @@ mod tests {
 
     /// Owns the input of one placement call.
     struct Case {
+        limited: HashSet<AccountId>,
         subject: Subject,
         workers: Vec<Worker>,
         open_sessions: HashMap<WorkerId, u32>,
@@ -923,6 +1003,7 @@ mod tests {
                 subject: Subject::Task,
                 workers,
                 open_sessions: HashMap::new(),
+                limited: HashSet::new(),
                 selection: None,
                 request: PlacementRequest::default(),
                 approval_mode: ApprovalMode::Ask,
@@ -954,6 +1035,7 @@ mod tests {
                 subject: self.subject,
                 workers: &self.workers,
                 open_sessions: &self.open_sessions,
+                limited: &self.limited,
                 selection: self.selection.as_ref(),
                 request: &self.request,
                 approval_mode: self.approval_mode,
@@ -1137,6 +1219,48 @@ mod tests {
     }
 
     // Candidates -------------------------------------------------------------
+
+    #[test]
+    fn a_limited_account_gives_way_to_another_with_the_same_model() {
+        let first = account("Personal 1", "claude", &["opus"]);
+        let second = account("Personal 2", "claude", &["opus"]);
+        let mut case =
+            Case::task(vec![worker("w", vec![first.clone(), second])]).select("Personal 1", "opus");
+        assert_eq!(case.run().unwrap().account_label, "Personal 1");
+        case.limited.insert(first.account_id);
+        let moved = case.run().unwrap();
+        assert_eq!(moved.account_label, "Personal 2");
+        assert_eq!(moved.model, "opus");
+    }
+
+    #[test]
+    fn a_limited_account_stays_when_no_account_of_its_harness_has_the_model() {
+        let first = account("Personal 1", "claude", &["opus"]);
+        let no_model = account("Personal 2", "claude", &["sonnet"]);
+        let other_harness = account("Codex", "codex", &["opus"]);
+        let mut case = Case::task(vec![worker(
+            "w",
+            vec![first.clone(), no_model, other_harness],
+        )])
+        .select("Personal 1", "opus");
+        case.limited.insert(first.account_id);
+        assert_eq!(case.run().unwrap().account_label, "Personal 1");
+    }
+
+    #[test]
+    fn the_default_rule_skips_a_limited_account_of_the_same_rank_only() {
+        let first = account("Claude Code 1", "claude", &["opus"]);
+        let second = account("Claude Code 2", "claude", &["opus"]);
+        let codex = account("Codex", "codex", &["gpt"]);
+        let mut case = Case::task(vec![worker(
+            "w",
+            vec![first.clone(), second.clone(), codex],
+        )]);
+        case.limited.insert(first.account_id);
+        assert_eq!(case.run().unwrap().account_label, "Claude Code 2");
+        case.limited.insert(second.account_id);
+        assert_eq!(case.run().unwrap().account_label, "Claude Code 1");
+    }
 
     #[test]
     fn revoked_workers_are_ignored() {

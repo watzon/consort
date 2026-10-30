@@ -421,6 +421,7 @@ mod tests {
             created_at: Timestamp::now(),
             proactive: None,
             suggestions: Vec::new(),
+            source_message_id: None,
         }
     }
 

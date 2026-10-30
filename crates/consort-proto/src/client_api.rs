@@ -75,7 +75,7 @@ pub use skills::{
     SkillUpdate, SkillVersion,
 };
 pub use voice::{
-    ApprovalEdit, VOICE_TRY_MAX_CHARS, VoiceFeedback, VoiceGet, VoiceLearn, VoiceReset,
+    ApprovalEdit, DraftEdit, VOICE_TRY_MAX_CHARS, VoiceFeedback, VoiceGet, VoiceLearn, VoiceReset,
     VoiceResult, VoiceSet, VoiceTry,
 };
 
@@ -1710,6 +1710,15 @@ pub struct PreferencesSetFavoriteModel {
     pub favorite: bool,
 }
 
+/// `preferences.set_account_fallback`: allow work to move to another account
+/// when its account reaches a usage limit, or stop it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreferencesSetAccountFallback {
+    /// True to allow the move.
+    pub enabled: bool,
+}
+
 /// The preferences after a change.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreferencesResult {
@@ -1894,8 +1903,12 @@ message_family! {
         VoiceFeedback("voice.feedback", VoiceFeedback => Empty),
         /// Change the text fields of a connector card before the answer.
         ApprovalEdit("approval.edit", ApprovalEdit => ApprovalResult),
+        /// Change the title or the text of a `show_draft` card.
+        DraftEdit("draft.edit", DraftEdit => MessageResult),
         /// Star a model, or take the star away.
         PreferencesSetFavoriteModel("preferences.set_favorite_model", PreferencesSetFavoriteModel => PreferencesResult),
+        /// Allow the move to another account at a usage limit, or stop it.
+        PreferencesSetAccountFallback("preferences.set_account_fallback", PreferencesSetAccountFallback => PreferencesResult),
         /// Get a bearer token for the blob endpoints.
         AuthHttpToken("auth.http_token", AuthHttpToken => HttpToken),
         /// Store the Composio key on the hub.
@@ -2133,6 +2146,7 @@ mod tests {
             created_at: Timestamp::from_millis(1_000),
             proactive: None,
             suggestions: Vec::new(),
+            source_message_id: None,
         }
     }
 
@@ -2849,11 +2863,18 @@ mod tests {
                 fields: [("body".to_owned(), "Hi Dana,".to_owned())].into(),
             }
             .into(),
+            DraftEdit {
+                message_id: MessageId::new(),
+                title: Some("Claim form".into()),
+                body: Some("Dear Sir or Madam,".into()),
+            }
+            .into(),
             MessageRate {
                 message_id: MessageId::new(),
                 rating: Some(crate::model::ProactiveRating::TooNoisy),
             }
             .into(),
+            PreferencesSetAccountFallback { enabled: false }.into(),
             PreferencesSetFavoriteModel {
                 model: FavoriteModel {
                     account_label: "Claude Personal".into(),
@@ -3367,8 +3388,10 @@ mod tests {
             "voice.try",
             "voice.feedback",
             "approval.edit",
+            "draft.edit",
             "auth.http_token",
             "preferences.set_favorite_model",
+            "preferences.set_account_fallback",
             "composio.set_key",
             "composio.remove_key",
             "composio.status",
@@ -3699,6 +3722,7 @@ mod tests {
             request
         );
         let preferences = Preferences {
+            account_fallback: true,
             favorite_models: vec![favorite],
         };
         let result = PreferencesResult {

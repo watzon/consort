@@ -16,12 +16,13 @@ use serde_json::Value;
 
 use super::events::Effects;
 use super::lifecycle::{
-    answer_command_failed_tx, session_start_failed_tx, session_started_tx, steer_command_failed_tx,
-    turn_command_failed_tx,
+    answer_command_failed_tx, model_change_refused_tx, session_start_failed_tx, session_started_tx,
+    steer_command_failed_tx, turn_command_failed_tx,
 };
 use super::{CallError, WorkerLink};
 use crate::error::{HubError, Result};
 use crate::hub::Hub;
+use crate::ops::model_switch::model_applied_tx;
 use crate::store::Tx;
 use crate::store::machine::{self, QueuedCommand};
 
@@ -329,6 +330,11 @@ fn apply_command_result(
         (HubToWorker::SessionStart(start), Err(error)) => {
             session_start_failed_tx(hub, tx, start.session_id, error)
         }
+        (HubToWorker::SessionTurn(turn), Err(error))
+            if turn.model_change.is_some() && error.code == ErrorCode::Unsupported =>
+        {
+            model_change_refused_tx(hub, tx, &turn, error)
+        }
         (HubToWorker::SessionTurn(turn), Err(error)) => {
             turn_command_failed_tx(hub, tx, turn.session_id, error)
         }
@@ -345,6 +351,10 @@ fn apply_command_result(
             Ok(Effects::default())
         }
         (HubToWorker::SessionTurn(turn), Ok(_)) => {
+            // The worker set the model of the turn. The session runs it now.
+            if let Some(change) = &turn.model_change {
+                model_applied_tx(tx, turn.session_id, change)?;
+            }
             // A coordinator turn that the worker took ends the backoff of
             // refused turns.
             let mut fx = Effects::default();
@@ -628,6 +638,7 @@ mod tests {
             },
             channel_files: None,
             approval_mode: None,
+            model_change: None,
         });
         let worker_id = session.worker_id;
         let id = hub

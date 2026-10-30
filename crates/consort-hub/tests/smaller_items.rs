@@ -207,6 +207,8 @@ async fn a_login_that_a_turn_found_expired_marks_the_account_and_stops_the_coord
                     turn_id: "t1".into(),
                     reason: TurnEndReason::Failed,
                     error: Some("The login expired. Sign in again.".to_owned()),
+                    error_kind: None,
+                    resets_at: None,
                 },
             ],
         )

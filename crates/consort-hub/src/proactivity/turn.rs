@@ -142,6 +142,27 @@ pub(crate) fn turn_of_session(
     Ok((classify(&row.turn_events), row))
 }
 
+/// Whether `message_id` is a message of the user that the open turn of this
+/// coordinator session got as an event. A proactive turn has no such event.
+/// Only a message of the user that the coordinator is answering now may go
+/// to a task with the user's authority: an older message could replay an
+/// earlier "yes".
+pub(crate) fn user_message_in_turn(
+    conn: &Connection,
+    session_id: SessionId,
+    channel_id: ChannelId,
+    message_id: MessageId,
+) -> Result<bool> {
+    let row = coord_store::coordinator(conn, channel_id)?;
+    if row.session_id != Some(session_id) || !row.turn_open {
+        return Ok(false);
+    }
+    Ok(row
+        .turn_events
+        .iter()
+        .any(|event| matches!(event, WakeEvent::UserMessage { id, .. } if *id == message_id)))
+}
+
 /// The tools that a proactive turn may not use: they widen access, add a
 /// connector, turn on scripts, or change settings.
 fn widens_access(tool: HubTool) -> bool {
@@ -481,6 +502,7 @@ pub(crate) fn check_in_routine(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hub::Hub;
     use consort_proto::ids::RoutineId;
 
     fn user() -> WakeEvent {
@@ -669,5 +691,63 @@ mod tests {
         for tool in HubTool::ALL {
             assert!(check_tool(&TurnKind::Normal, *tool).is_ok());
         }
+    }
+
+    #[tokio::test]
+    async fn a_message_counts_only_as_an_event_of_the_open_turn_of_the_session() {
+        let (hub, _dir) = crate::hub::test_hub().await;
+        let channel_id = hub
+            .store
+            .read(crate::store::conversation::tutti_channel)
+            .await
+            .unwrap()
+            .id;
+        let session = SessionId::new();
+        let old = MessageId::new();
+        let current = MessageId::new();
+        let event = |id| WakeEvent::UserMessage {
+            id,
+            thread: None,
+            at: Timestamp::from_millis(1),
+            text: "yes".into(),
+        };
+        let save = |hub: &Hub, session_id, turn_open, events: Vec<WakeEvent>| {
+            let hub = hub.clone();
+            async move {
+                hub.store
+                    .write(move |tx| {
+                        tx.save_coordinator(&CoordinatorRow {
+                            channel_id,
+                            session_id,
+                            turn_open,
+                            turn_started_at: Some(tx.now()),
+                            turn_events: events,
+                        })
+                    })
+                    .await
+                    .unwrap();
+            }
+        };
+        let check = |hub: &Hub, id| {
+            let hub = hub.clone();
+            async move {
+                hub.store
+                    .read(move |conn| user_message_in_turn(conn, session, channel_id, id))
+                    .await
+                    .unwrap()
+            }
+        };
+        save(&hub, Some(session), true, vec![event(current)]).await;
+        assert!(check(&hub, current).await);
+        // An older message of the user is not an event of this turn.
+        assert!(!check(&hub, old).await);
+        // A proactive turn has no message of the user.
+        save(&hub, Some(session), true, vec![follow_up()]).await;
+        assert!(!check(&hub, current).await);
+        // A closed turn, and another session, take nothing.
+        save(&hub, Some(session), false, vec![event(current)]).await;
+        assert!(!check(&hub, current).await);
+        save(&hub, Some(SessionId::new()), true, vec![event(current)]).await;
+        assert!(!check(&hub, current).await);
     }
 }

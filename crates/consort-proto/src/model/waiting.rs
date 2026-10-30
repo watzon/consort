@@ -199,6 +199,11 @@ pub struct ConnectorCard {
     /// an older hub saves nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ask_rule: Option<ApprovalRule>,
+    /// For a card in the status `replaced`: the message that the user sent
+    /// while the draft waited. The tool call that waited gives it to the
+    /// assistant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaced_by: Option<String>,
 }
 
 impl ConnectorCard {
@@ -346,16 +351,23 @@ impl ApprovalDetails {
     }
 
     /// The two options of a hub card, with the button text of the design:
-    /// Allow and Don't for a connector or management card, Continue in
-    /// browser and Not now for a connect card, Sign in and Not now for a
-    /// sign-in card, and Add and Not now for an install card. `None` for an
-    /// approval from a harness.
+    /// Send and Not now for a connector card that sends text in the user's
+    /// name, Save draft and Not now for one that saves a draft, Allow and
+    /// Don't for any other connector card and for a management card,
+    /// Continue in browser and Not now for a connect card, Sign in and Not
+    /// now for a sign-in card, and Add and Not now for an install card.
+    /// `None` for an approval from a harness.
     pub fn hub_card_options(&self) -> Option<Vec<RequestOption>> {
-        let (allow, deny) = match self.kind() {
-            ApprovalKind::Connector | ApprovalKind::Management => ("Allow", "Don't"),
-            ApprovalKind::ConnectService => ("Continue in browser", "Not now"),
-            ApprovalKind::SignIn => ("Sign in", "Not now"),
-            ApprovalKind::SkillInstall => ("Add", "Not now"),
+        let (allow, deny) = match self {
+            Self::Connector(card) => match card.outgoing {
+                Some(OutgoingKind::Send) => ("Send", "Not now"),
+                Some(OutgoingKind::Draft) => ("Save draft", "Not now"),
+                None => ("Allow", "Don't"),
+            },
+            Self::Management(_) => ("Allow", "Don't"),
+            Self::ConnectService(_) => ("Continue in browser", "Not now"),
+            Self::SignIn(_) => ("Sign in", "Not now"),
+            Self::SkillInstall(_) => ("Add", "Not now"),
             _ => return None,
         };
         Some(vec![
@@ -430,6 +442,10 @@ pub enum ApprovalStatus {
     Expired,
     /// The harness withdrew it, for example after an interrupt.
     Canceled,
+    /// The user sent a message while a draft card waited, and the hub closed
+    /// the card. The assistant gets the message and writes the draft again.
+    /// Only a draft card ends this way.
+    Replaced,
 }
 
 /// A harness request for permission to do one action.
@@ -675,6 +691,16 @@ impl Decision {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_replaced_approval_status_uses_its_snake_case_name() {
+        assert_eq!(
+            serde_json::to_value(ApprovalStatus::Replaced).unwrap(),
+            serde_json::json!("replaced")
+        );
+        let back: ApprovalStatus = serde_json::from_value(serde_json::json!("replaced")).unwrap();
+        assert_eq!(back, ApprovalStatus::Replaced);
+    }
     use serde_json::json;
 
     fn option(label: &str) -> DecisionOption {
@@ -816,6 +842,7 @@ mod tests {
                 draft_arguments: None,
                 not_my_voice: false,
                 ask_rule: None,
+                replaced_by: None,
             })),
             ApprovalDetails::Management(Box::new(ManagementCard {
                 tool: "update_connection".into(),
@@ -900,6 +927,26 @@ mod tests {
         };
         assert!(!harness.is_hub_card());
         assert_eq!(harness.hub_card_options(), None);
+    }
+
+    #[test]
+    fn an_outgoing_connector_card_says_send_or_save_draft_and_not_now() {
+        let labels = |outgoing: Option<OutgoingKind>| {
+            let mut details = hub_cards().remove(0);
+            if let ApprovalDetails::Connector(card) = &mut details {
+                card.outgoing = outgoing;
+            }
+            details
+                .hub_card_options()
+                .unwrap()
+                .into_iter()
+                .map(|o| o.label)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(labels(Some(OutgoingKind::Send)), ["Send", "Not now"]);
+        assert_eq!(labels(Some(OutgoingKind::Draft)), ["Save draft", "Not now"]);
+        // Any other connector card keeps Allow and Don't.
+        assert_eq!(labels(None), ["Allow", "Don't"]);
     }
 
     #[test]

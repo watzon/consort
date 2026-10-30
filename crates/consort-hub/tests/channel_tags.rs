@@ -332,6 +332,8 @@ async fn a_replacement_coordinator_respects_the_tags_after_a_sign_out() {
                 turn_id: "t1".into(),
                 reason: TurnEndReason::Failed,
                 error: Some("Authentication required.".to_owned()),
+                error_kind: None,
+                resets_at: None,
             }],
         )
         .await;

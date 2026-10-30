@@ -1,21 +1,24 @@
-//! The Connectors and skills dialog of a channel, and the account settings
-//! dialog with the provider extras toggle.
+//! The Connectors tab of the Channel panel, and the account settings dialog
+//! with the provider extras toggle.
 
 use consort_client::{ChannelItemView, channel_extensions};
 use consort_theme::{Tokens, TypeExt as _};
 use gpui_kit::{
     AnyElement, Context, Div, InteractiveElement, IntoElement, ParentElement, SharedString,
-    StatefulInteractiveElement as _, Styled, Window, div, prelude::FluentBuilder as _,
+    StatefulInteractiveElement as _, Styled, Window, div, linear_color_stop, linear_gradient,
+    prelude::FluentBuilder as _,
 };
 
 use crate::{
-    app::{ConsortApp, Field},
+    app::{ChannelTab, ConsortApp, Dialog, Field, Page, SettingsSection},
     ui::{
         add_account::AccountDialogParts,
         dialogs::input_box,
         ext_parts::{hint, service_logo},
         menu::MenuAction,
-        parts::{ButtonKind, button, detail, focusable, provider_logo, text},
+        parts::{
+            ButtonKind, button, detail, focusable, icon_text_button, line, provider_logo, text,
+        },
         settings::switch,
     },
 };
@@ -41,7 +44,7 @@ fn account_kind(harness: &str, provider: &str) -> String {
 }
 
 impl ConsortApp {
-    /// One row of the channel dialog: the logo, the name, the line, and a
+    /// One row of the Connectors tab: the logo, the name, the line, and a
     /// switch for an item the scope gives, or Change for one it does not.
     fn channel_item_row(
         &mut self,
@@ -57,7 +60,9 @@ impl ConsortApp {
         let channel = channel_id.to_owned();
         let enabled = item.enabled;
         let control: AnyElement = if item.given {
-            switch(&format!("channel-item-{}", item.id), enabled, t)
+            let selector = format!("channel-item-{}", item.id);
+            switch(&selector.clone(), enabled, t)
+                .debug_selector(move || selector)
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.set_channel_item(channel.clone(), id.clone(), connector, !enabled, cx)
                 }))
@@ -100,37 +105,91 @@ impl ConsortApp {
                     .flex_1()
                     .min_w_0()
                     .child(if connector {
-                        text(item.name.clone(), t.text.ui_strong, name_color)
+                        line(item.name.clone(), t.text.ui_strong, name_color)
                     } else {
-                        div()
-                            .type_style(t.text.ui)
+                        line(item.name.clone(), t.text.ui, name_color)
                             .font_family(t.font_mono.clone())
-                            .text_color(name_color)
-                            .child(item.name.clone())
                     })
                     .child(text(item.detail.clone(), detail(t), c.text_tertiary)),
             )
             .child(div().flex_none().child(control))
     }
 
-    /// The Connectors and skills dialog of a channel.
-    pub fn channel_extensions_dialog(
+    /// Opens the channel, its panel and the Connectors tab.
+    pub fn open_channel_connectors(
         &mut self,
-        channel_id: &str,
+        channel_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.channel_id != channel_id || self.page != Page::Main {
+            self.open_channel(channel_id, window, cx);
+        }
+        self.open_channel_tab(ChannelTab::Connectors, cx);
+    }
+
+    /// The count of the Connectors tab: what a session in the channel gets.
+    pub fn connectors_tab_count(&self, channel_id: &str) -> usize {
+        channel_extensions(&self.state, channel_id)
+            .map(|set| set.enabled_connector_ids().len() + set.enabled_skill_ids().len())
+            .unwrap_or(0)
+    }
+
+    /// The Add a connector button: the Add connector dialog, or the setup in
+    /// Settings > Connectors while the hub has no Composio key.
+    fn add_connector_from_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.state.composio.key_present {
+            self.open_dialog(Dialog::AddConnector, window, cx);
+        } else {
+            self.open_settings(SettingsSection::Connectors, cx);
+        }
+    }
+
+    /// The body of the Connectors tab of the Channel panel: the connectors
+    /// and the skills of the open channel, each with its switch.
+    pub fn render_connectors_tab(
+        &mut self,
+        tutti: bool,
         t: &Tokens,
         cx: &mut Context<Self>,
-    ) -> AccountDialogParts {
+    ) -> Div {
         let c = &t.colors;
-        let Some(set) = channel_extensions(&self.state, channel_id) else {
-            return (
-                "This channel is gone".to_owned(),
-                "It may have been deleted in another client. Close this dialog.".to_owned(),
-                t.layout.dialog_width,
-                div(),
-                div(),
-                None,
-            );
+        let channel_id = self.channel_id.clone();
+        let Some(set) = channel_extensions(&self.state, &channel_id) else {
+            return div().flex_1().p(t.space.lg).child(hint(
+                "This channel is gone. It may have been deleted in another client.",
+                t,
+            ));
         };
+        let toolbar =
+            div()
+                .flex()
+                .flex_none()
+                .flex_wrap()
+                .items_center()
+                .gap(t.space.xs + t.space.xxs)
+                .pt(t.space.sm + t.space.xxs)
+                .pb(t.space.xs + t.space.xxs)
+                .px(t.space.lg)
+                .child(
+                    icon_text_button("channel-add-connector", "plus", "Add a connector", t)
+                        .debug_selector(|| "channel-add-connector".into())
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.add_connector_from_panel(window, cx)
+                        })),
+                )
+                .child(
+                    button(
+                        "channel-manage-connectors",
+                        "Manage all in Settings",
+                        ButtonKind::Quiet,
+                        t,
+                    )
+                    .debug_selector(|| "channel-manage-connectors".into())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.open_settings(SettingsSection::Connectors, cx)
+                    })),
+                );
         let frame = || {
             div()
                 .flex()
@@ -144,13 +203,13 @@ impl ConsortApp {
         let n = set.connectors.len();
         for (i, item) in set.connectors.iter().enumerate() {
             connectors =
-                connectors.child(self.channel_item_row(channel_id, item, true, i + 1 == n, t, cx));
+                connectors.child(self.channel_item_row(&channel_id, item, true, i + 1 == n, t, cx));
         }
         let mut skills = frame();
         let n = set.skills.len();
         for (i, item) in set.skills.iter().enumerate() {
             skills =
-                skills.child(self.channel_item_row(channel_id, item, false, i + 1 == n, t, cx));
+                skills.child(self.channel_item_row(&channel_id, item, false, i + 1 == n, t, cx));
         }
         let section = |title: &str, list: Div, empty: &str, has: bool| {
             div()
@@ -164,14 +223,24 @@ impl ConsortApp {
                     div().child(hint(empty.to_owned(), t))
                 })
         };
-        let body = div()
+        let intro = if tutti {
+            "What Tutti can use. Each one comes from its Use in setting.".to_owned()
+        } else {
+            "These come from the Use in setting of each one. Turn one off to keep it out of this channel only.".to_owned()
+        };
+        let list = div()
+            .id("channel-connectors-list")
             .flex()
             .flex_col()
             .gap(t.space.lg)
+            .px(t.space.lg)
+            .pt(t.space.sm)
+            .pb(t.space.lg)
+            .child(hint(intro, t))
             .child(section(
                 "Connectors",
                 connectors,
-                "No connectors yet. Add one in Settings > Connectors.",
+                "No connectors yet. Choose Add a connector.",
                 !set.connectors.is_empty(),
             ))
             .child(section(
@@ -179,34 +248,50 @@ impl ConsortApp {
                 skills,
                 "No skills yet. Add one in Settings > Skills.",
                 !set.skills.is_empty(),
-            ));
-        let actions = div()
+            ))
+            .overflow_y_scroll();
+        div()
+            .debug_selector(|| "connectors-tab".into())
             .flex()
-            .items_center()
-            .gap(t.space.sm)
-            .pt(t.space.lg)
-            .border_t(t.border_width)
-            .border_color(c.border_subtle)
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .child(toolbar)
             .child(
-                text(
-                    format!("Changes apply to the next session in {}.", set.channel_name),
-                    detail(t),
-                    c.text_tertiary,
-                )
-                .flex_1(),
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .child(list.size_full())
+                    // The list scrolls inside the panel with soft edges, as
+                    // the Files tab does.
+                    .child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .right_0()
+                            .h(t.space.sm)
+                            .bg(linear_gradient(
+                                180.,
+                                linear_color_stop(c.surface_sidebar, 0.),
+                                linear_color_stop(c.sidebar_clear, 1.),
+                            )),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .bottom_0()
+                            .left_0()
+                            .right_0()
+                            .h(t.layout.fade_bottom)
+                            .bg(linear_gradient(
+                                0.,
+                                linear_color_stop(c.surface_sidebar, 0.),
+                                linear_color_stop(c.sidebar_clear, 1.),
+                            )),
+                    ),
             )
-            .child(
-                button("dialog-confirm", "Done", ButtonKind::Primary, t)
-                    .on_click(cx.listener(|this, _, window, cx| this.close_dialog(window, cx))),
-            );
-        (
-            format!("Connectors and skills in {}", set.channel_name),
-            "These come from the \"Use in\" setting of each one. Turn one off to keep it out of this channel only.".to_owned(),
-            t.layout.dialog_account,
-            body,
-            actions,
-            None,
-        )
     }
 
     /// The settings of one account: its name and the provider extras.

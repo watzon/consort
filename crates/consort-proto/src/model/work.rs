@@ -38,12 +38,16 @@ pub enum Isolation {
 )]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalMode {
-    /// Ask before edits and commands. The default.
+    /// Ask before edits and commands. The safe fallback of the type. New
+    /// channels and Tutti are created in Auto (see DECISIONS 699).
     #[default]
     Ask,
     /// Edit files without asking. Ask before commands.
     AutoEdits,
-    /// Run without asking inside the harness sandbox.
+    /// Run without asking where the harness has a middle mode. Claude Code
+    /// asks only for destructive actions and for actions outside the
+    /// workspace. Codex runs commands in its sandbox. Gemini CLI and OpenCode
+    /// still ask before commands.
     Auto,
     /// Run without asking and without a sandbox.
     FullAccess,

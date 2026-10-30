@@ -3,7 +3,8 @@
 use consort_proto::client_api::{EntityPayload, FeedChange, FeedEntry};
 use consort_proto::ids::{ConnectionId, DecisionId};
 use consort_proto::model::{
-    CommitmentFlag, DisplayField, MemoryAuthor, MemoryNote, ToolKind, UseIn, VoiceUse,
+    ApprovalStatus, CommitmentFlag, DisplayField, MemoryAuthor, MemoryNote, ToolKind, UseIn,
+    VoiceUse,
 };
 use consort_proto::time::Timestamp;
 use serde_json::json;
@@ -180,6 +181,7 @@ fn card(voice: Option<&str>, flags: Vec<CommitmentFlag>) -> ConnectorCard {
         draft_arguments: None,
         not_my_voice: false,
         ask_rule: None,
+        replaced_by: None,
     }
 }
 
@@ -194,7 +196,11 @@ fn a_draft_card_has_the_voice_line_the_flags_and_its_fields_for_edit() {
         end: 23,
         rule: None,
     };
-    let view = draft_card(&card(Some("email.formal"), vec![flag])).unwrap();
+    let view = draft_card(
+        &card(Some("email.formal"), vec![flag]),
+        ApprovalStatus::Pending,
+    )
+    .unwrap();
     assert_eq!(view.voice_line, "Written in your voice (Formal email)");
     assert!(view.in_voice);
     assert_eq!(view.flags[0].kind_label, "Date");
@@ -211,12 +217,12 @@ fn a_draft_card_has_the_voice_line_the_flags_and_its_fields_for_edit() {
     assert_eq!(keys, vec![("subject", "Subject"), ("body", "Body")]);
     assert!(!view.edited);
 
-    let neutral = draft_card(&card(None, Vec::new())).unwrap();
+    let neutral = draft_card(&card(None, Vec::new()), ApprovalStatus::Pending).unwrap();
     assert_eq!(neutral.voice_line, "Neutral style");
     assert!(!neutral.allow_blocked(false));
     let mut read = card(None, Vec::new());
     read.outgoing = None;
-    assert!(draft_card(&read).is_none());
+    assert!(draft_card(&read, ApprovalStatus::Pending).is_none());
 }
 
 #[test]
@@ -276,4 +282,31 @@ fn changes_become_one_set_request() {
     assert_eq!(request.enabled, Some(true));
     assert_eq!(request.disclosure, Some(Disclosure::Footer));
     assert!(request.sources.is_none());
+}
+
+#[test]
+fn a_flag_says_why_the_phrase_is_marked_and_the_tick_counts_the_flags() {
+    let flag = |text: &str, note: &str| FlagView {
+        field: "Body".into(),
+        text: text.into(),
+        kind_label: "Date".into(),
+        note: note.into(),
+        start: 0,
+        end: text.len(),
+    };
+    assert_eq!(
+        flag("Thursday at 9 AM", "Not in your request. Check it.").line(),
+        "Thursday at 9 AM is not in your request. Check it."
+    );
+    assert_eq!(
+        flag("Friday.", "Breaks your rule: Never promise a date.").line(),
+        "Friday. Breaks your rule: Never promise a date."
+    );
+    let mut card = DraftCardView {
+        flags: vec![flag("a", "x")],
+        ..DraftCardView::default()
+    };
+    assert_eq!(card.check_label(), "I checked the marked line");
+    card.flags.push(flag("b", "x"));
+    assert_eq!(card.check_label(), "I checked the marked lines");
 }

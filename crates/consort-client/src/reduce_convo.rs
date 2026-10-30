@@ -107,6 +107,8 @@ fn message_view(
         last_reply_label: last_reply(m, now),
         proactive: None,
         suggestions: Vec::new(),
+        source_message_id: m.source_message_id.map(|id| id.to_string()),
+        refused: None,
     }
 }
 

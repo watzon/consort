@@ -263,8 +263,8 @@ async fn a_late_answer_saves_an_allow_only_when_the_card_asked_once_per_task() {
     allow_late(&hub, &fake, 1).await;
     assert!(!has_session_grant(&hub, session).await);
 
-    // In a normal turn, the same late answer saves the allow, as the rule
-    // says.
+    // In a normal turn, a late answer to a send saves no allow either: the
+    // card of an outgoing call never saves one.
     let normal = coordinator_session(&hub, tutti(&hub).await, "acp").await;
     let sent = call(
         &hub,
@@ -275,5 +275,18 @@ async fn a_late_answer_saves_an_allow_only_when_the_card_asked_once_per_task() {
     .await;
     assert_eq!(sent["status"], "waiting_for_user");
     allow_late(&hub, &fake, 2).await;
-    assert!(has_session_grant(&hub, normal).await);
+    assert!(!has_session_grant(&hub, normal).await);
+
+    // A change that is not outgoing saves the allow, as the rule says.
+    let labels = coordinator_session(&hub, tutti(&hub).await, "acp").await;
+    let labeled = call(
+        &hub,
+        labels,
+        "run_connector_tool",
+        json!({"connector": "gmail_work", "tool": "GMAIL_ADD_LABEL", "arguments": {}}),
+    )
+    .await;
+    assert_eq!(labeled["status"], "waiting_for_user");
+    allow_late(&hub, &fake, 3).await;
+    assert!(has_session_grant(&hub, labels).await);
 }

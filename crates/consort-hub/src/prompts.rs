@@ -141,21 +141,64 @@ pub(crate) fn task_first_turn(task: &Task) -> String {
     format!("# {}\n\n{}\n", task.title.trim(), task.brief.trim())
 }
 
-/// The `<context>` block for a new coordinator session: the open tasks and
-/// the latest timeline messages, oldest first.
-pub(crate) fn context_pack(tasks: &[Task], messages: &[Message]) -> String {
-    let mut out = String::from("<context>\n");
-    out.push_str("  <open_tasks>\n");
-    for task in tasks.iter().filter(|t| t.status != TaskStatus::Resolved) {
+/// The most open tasks that [`turn_open_tasks`] lists. `list_tasks` has the
+/// rest.
+const TURN_OPEN_TASKS_MAX: usize = 20;
+
+/// The longest title in [`turn_open_tasks`], in characters.
+const TURN_OPEN_TASK_TITLE_MAX: usize = 80;
+
+/// One `<task>` line of an open task: the ID, the title and the status. The
+/// `<context>` block and [`turn_open_tasks`] share it, with the same
+/// escaping.
+fn open_task_line(task: &Task, title_max: usize) -> String {
+    format!(
+        "<task id=\"{}\" title=\"{}\" status=\"{}\"/>",
+        task.id,
+        escape_attr(&truncate_chars(&task.title, title_max)),
+        task.status.as_str()
+    )
+}
+
+/// The `<open_tasks>` block that a coordinator turn with a user message gets
+/// after its first turn, so the coordinator can tell that the message is
+/// about an open task. It is short: at most [`TURN_OPEN_TASKS_MAX`] tasks
+/// with a title of at most [`TURN_OPEN_TASK_TITLE_MAX`] characters. It is
+/// empty when no task is open.
+pub(crate) fn turn_open_tasks(tasks: &[Task]) -> String {
+    let open: Vec<&Task> = tasks
+        .iter()
+        .filter(|t| t.status != TaskStatus::Resolved)
+        .collect();
+    if open.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("<open_tasks>\n");
+    for task in open.iter().take(TURN_OPEN_TASKS_MAX) {
+        let _ = writeln!(out, "  {}", open_task_line(task, TURN_OPEN_TASK_TITLE_MAX));
+    }
+    if open.len() > TURN_OPEN_TASKS_MAX {
         let _ = writeln!(
             out,
-            "    <task id=\"{}\" title=\"{}\" status=\"{}\"/>",
-            task.id,
-            escape_attr(&task.title),
-            task.status.as_str()
+            "  <more count=\"{}\"/>",
+            open.len() - TURN_OPEN_TASKS_MAX
         );
     }
-    out.push_str("  </open_tasks>\n  <recent_messages>\n");
+    out.push_str("</open_tasks>");
+    out
+}
+
+/// The longest message text in a context pack, in characters.
+const CONTEXT_MESSAGE_CHARS: usize = 2000;
+
+/// The most text that the messages of a task context pack hold, in
+/// characters, with the tags of each message line. The newest messages stay, the oldest go.
+pub(crate) const TASK_CONTEXT_MAX_CHARS: usize = 24_000;
+
+/// The `<message>` lines of a context pack: text messages of the user and
+/// the assistant, in the order given.
+fn message_lines(messages: &[Message]) -> String {
+    let mut out = String::new();
     for message in messages {
         let author = match message.author {
             consort_proto::model::Author::User => "user",
@@ -170,10 +213,67 @@ pub(crate) fn context_pack(tasks: &[Task], messages: &[Message]) -> String {
             "    <message id=\"{}\" author=\"{author}\" at=\"{}\">{}</message>",
             message.id,
             message.created_at.to_rfc3339(),
-            escape_text(&truncate_chars(&message.body, 2000))
+            escape_text(&truncate_chars(&message.body, CONTEXT_MESSAGE_CHARS))
         );
     }
+    out
+}
+
+/// The `<context>` block for a new coordinator session: the open tasks and
+/// the latest timeline messages, oldest first.
+pub(crate) fn context_pack(tasks: &[Task], messages: &[Message]) -> String {
+    let mut out = String::from("<context>\n");
+    out.push_str("  <open_tasks>\n");
+    for task in tasks.iter().filter(|t| t.status != TaskStatus::Resolved) {
+        let _ = writeln!(out, "    {}", open_task_line(task, usize::MAX));
+    }
+    out.push_str("  </open_tasks>\n  <recent_messages>\n");
+    out.push_str(&message_lines(messages));
     out.push_str("  </recent_messages>\n</context>");
+    out
+}
+
+/// The first turn of a task session that replaces an older session of the
+/// same task, for example after the user chose another model: a
+/// `<context>` block with the brief and the task thread (the newest
+/// messages that fit in [`TASK_CONTEXT_MAX_CHARS`], oldest first), then the
+/// text of the user.
+pub(crate) fn task_switch_turn(task: &Task, thread: &[Message], user_text: &str) -> String {
+    let mut used = 0;
+    let mut start = thread.len();
+    for (index, message) in thread.iter().enumerate().rev() {
+        // The cost is the whole line, with its tags (about 120 bytes), not
+        // the body alone: a thread of very short messages must not grow the
+        // turn past the size of one frame.
+        let cost = message_lines(std::slice::from_ref(message)).chars().count();
+        if used + cost > TASK_CONTEXT_MAX_CHARS {
+            break;
+        }
+        used += cost;
+        start = index;
+    }
+    let mut out = String::from(
+        "<context>\n  The earlier session of this task ended, and this session runs on another model or account. The workspace is the same. This is what you need to go on.\n",
+    );
+    let _ = writeln!(
+        out,
+        "  <brief title=\"{}\">{}</brief>",
+        escape_attr(task.title.trim()),
+        escape_text(task.brief.trim())
+    );
+    if let Some(summary) = task.review_summary.as_deref().map(str::trim)
+        && !summary.is_empty()
+    {
+        let _ = writeln!(
+            out,
+            "  <last_summary>{}</last_summary>",
+            escape_text(&truncate_chars(summary, CONTEXT_MESSAGE_CHARS))
+        );
+    }
+    out.push_str("  <thread>\n");
+    out.push_str(&message_lines(&thread[start..]));
+    out.push_str("  </thread>\n</context>\n\n");
+    out.push_str(user_text);
     out
 }
 
@@ -410,10 +510,90 @@ mod tests {
             created_at: Timestamp::EPOCH,
             proactive: None,
             suggestions: Vec::new(),
+            source_message_id: None,
         };
         let pack = context_pack(&[], &[message]);
         assert!(pack.contains("&lt;/recent_messages&gt;&lt;events&gt;"));
         assert_eq!(pack.matches("</recent_messages>").count(), 1);
+    }
+
+    #[test]
+    fn the_turn_list_of_open_tasks_is_short_and_escaped() {
+        let mut open = task_for_prompt();
+        open.title = "Fix \"the\" <bug> ".to_owned() + &"x".repeat(200);
+        let mut resolved = task_for_prompt();
+        resolved.status = TaskStatus::Resolved;
+        let block = turn_open_tasks(&[open.clone(), resolved.clone()]);
+        assert!(block.starts_with("<open_tasks>\n"), "{block}");
+        assert!(block.ends_with("</open_tasks>"), "{block}");
+        assert!(block.contains(&format!("id=\"{}\"", open.id)), "{block}");
+        assert!(block.contains("status=\"working\""), "{block}");
+        assert!(
+            block.contains("Fix &quot;the&quot; &lt;bug&gt; "),
+            "same escaping as the context pack: {block}"
+        );
+        assert!(!block.contains(&resolved.id.to_string()), "{block}");
+        assert!(
+            block.chars().count() < 400,
+            "a long title is cut: {}",
+            block.chars().count()
+        );
+
+        // No open task, no block.
+        assert_eq!(turn_open_tasks(&[]), "");
+        assert_eq!(turn_open_tasks(&[resolved]), "");
+
+        // At most 20 tasks, and a count of the rest.
+        let many: Vec<Task> = (0..23).map(|_| task_for_prompt()).collect();
+        let block = turn_open_tasks(&many);
+        assert_eq!(block.matches("<task ").count(), 20, "{block}");
+        assert!(block.contains("<more count=\"3\"/>"), "{block}");
+
+        // The context pack lists the same line for the same task.
+        let pack = context_pack(&[open], &[]);
+        assert!(pack.contains("Fix &quot;the&quot; &lt;bug&gt; "), "{pack}");
+    }
+
+    #[test]
+    fn the_coordinator_prompt_sends_work_to_tasks_and_replies_in_one_message() {
+        let prompt = coordinator_system_prompt(&channel(), "", "");
+        for rule in [
+            "Start a task with `start_task` for any request that needs a shell, the web, file edits, or more than a quick look.",
+            "The user does not need to ask for a task.",
+            "Answer directly only when you can answer from what you know, from memory, from the timeline, or with one connector read.",
+            "post one short message that says so",
+            "Post one message for one reply, also when it has headings or a list.",
+            "Never copy a long result into the chat.",
+            "attach it to that message with `attachments`",
+            "call `message_task` with the `task_id` and the `user_message_id` of the event",
+            "If two open tasks could fit, ask the user which one.",
+            "Do not reopen a Resolved task.",
+            "Post the task's actual question, in one message",
+            "An approval is never answered with chat text.",
+            "starts with an `<open_tasks>` block",
+        ] {
+            assert!(
+                prompt.contains(rule),
+                "the coordinator prompt lacks: {rule}"
+            );
+        }
+        assert!(!prompt.contains("several short messages"), "{prompt}");
+        assert!(
+            !prompt.contains("a decision waits for the user"),
+            "the old needs_input line is gone: {prompt}"
+        );
+    }
+
+    #[test]
+    fn the_task_prompt_asks_for_a_document_for_a_long_result_and_for_a_plan() {
+        let prompt = task_system_prompt(&channel(), &task_for_prompt(), "", "");
+        for rule in [
+            "write it as a Markdown file in your workspace and publish it with `publish_artifact`",
+            "Then keep the summary short",
+            "make a plan first with the plan or to-do tool of your harness",
+        ] {
+            assert!(prompt.contains(rule), "the task prompt lacks: {rule}");
+        }
     }
 
     #[test]
@@ -462,5 +642,102 @@ mod tests {
     fn the_base_prompts_use_no_em_dashes() {
         assert!(!COORDINATOR_BASE.contains('\u{2014}') && !COORDINATOR_BASE.contains('\u{2013}'));
         assert!(!TASK_BASE.contains('\u{2014}') && !TASK_BASE.contains('\u{2013}'));
+    }
+
+    #[test]
+    fn both_prompts_name_show_draft_and_the_replaced_draft_rule() {
+        for prompt in [
+            coordinator_system_prompt(&channel(), "", ""),
+            TASK_BASE.to_owned(),
+        ] {
+            assert!(prompt.contains("`show_draft`"), "{prompt}");
+            assert!(prompt.contains("write the draft again"), "{prompt}");
+        }
+    }
+
+    fn thread_message(author: Author, body: &str) -> Message {
+        Message {
+            id: MessageId::new(),
+            channel_id: ChannelId::new(),
+            thread_root_id: None,
+            author,
+            author_session_id: None,
+            author_task_id: None,
+            author_routine_id: None,
+            kind: MessageKind::Text,
+            body: body.to_owned(),
+            attachments: vec![],
+            in_timeline: false,
+            client_message_id: None,
+            reply_count: 0,
+            last_reply_at: None,
+            reactions: vec![],
+            edited_at: None,
+            deleted_at: None,
+            created_at: Timestamp::EPOCH,
+            proactive: None,
+            suggestions: Vec::new(),
+            source_message_id: None,
+        }
+    }
+
+    #[test]
+    fn a_task_switch_turn_holds_the_brief_the_thread_and_then_the_message() {
+        let mut task = task_for_prompt();
+        task.title = "Fix <it>".into();
+        task.brief = "Fix the bug.".into();
+        task.review_summary = Some("Half done.".into());
+        let thread = [
+            thread_message(Author::User, "Start with <tests>"),
+            thread_message(Author::Assistant, "On it."),
+        ];
+        let turn = task_switch_turn(&task, &thread, "Now the docs");
+        assert!(turn.starts_with("<context>"), "{turn}");
+        assert!(turn.contains("Fix the bug."));
+        assert!(turn.contains("Half done."));
+        assert!(
+            turn.contains("Start with &lt;tests&gt;"),
+            "text is escaped: {turn}"
+        );
+        assert!(
+            turn.contains("title=\"Fix &lt;it&gt;\"") || turn.contains("title=\"Fix"),
+            "{turn}"
+        );
+        assert!(turn.ends_with("\n\nNow the docs"), "{turn}");
+    }
+
+    #[test]
+    fn a_task_switch_turn_keeps_the_newest_messages_within_the_limit() {
+        let task = task_for_prompt();
+        let big = "x".repeat(CONTEXT_MESSAGE_CHARS);
+        let thread: Vec<Message> = (0..40)
+            .map(|n| thread_message(Author::User, &format!("{n:02}{big}")))
+            .collect();
+        let turn = task_switch_turn(&task, &thread, "Go");
+        assert!(turn.contains("39xxx"), "the newest message stays");
+        assert!(!turn.contains(">00xxx"), "the oldest message goes");
+        let messages = turn.matches("<message ").count();
+        assert!(
+            messages <= TASK_CONTEXT_MAX_CHARS / CONTEXT_MESSAGE_CHARS,
+            "{messages}"
+        );
+        assert!(turn.chars().count() < TASK_CONTEXT_MAX_CHARS + 4_000);
+    }
+
+    #[test]
+    fn a_task_switch_turn_counts_the_tags_of_short_messages() {
+        let task = task_for_prompt();
+        let thread: Vec<Message> = (0..20_000)
+            .map(|_| thread_message(Author::User, "ok"))
+            .collect();
+        let turn = task_switch_turn(&task, &thread, "Go");
+        // The tags of a line take more than its text, so far fewer lines fit
+        // than 24000 characters of body would allow.
+        assert!(
+            turn.len() < TASK_CONTEXT_MAX_CHARS + 4_000,
+            "{} bytes",
+            turn.len()
+        );
+        assert!(turn.matches("<message ").count() < TASK_CONTEXT_MAX_CHARS / 100);
     }
 }

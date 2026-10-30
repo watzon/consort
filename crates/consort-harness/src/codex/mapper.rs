@@ -295,6 +295,12 @@ impl CodexMapper {
                         .error
                         .as_ref()
                         .is_some_and(TurnError::is_unauthorized);
+                    let info = n
+                        .turn
+                        .error
+                        .as_ref()
+                        .map(TurnError::failure)
+                        .unwrap_or_default();
                     let mut error = n.turn.error.map(|e| match e.additional_details {
                         Some(more) => format!("{} {more}", e.message),
                         None => e.message,
@@ -314,6 +320,10 @@ impl CodexMapper {
                         turn_id: TurnId::new(n.turn.id),
                         reason,
                         error,
+                        error_kind: (reason == TurnEndReason::Failed
+                            && info.kind != crate::TurnErrorKind::Unknown)
+                            .then_some(info.kind),
+                        resets_at: info.resets_at,
                     });
                     events.push(SessionEvent::State {
                         state: SessionState::Idle,

@@ -9,17 +9,16 @@ use consort_proto::client_api::*;
 use consort_proto::frame::Empty;
 use consort_proto::ids::{ChannelId, GroupId, MessageId, RepoId};
 use consort_proto::model::{
-    Author, BlobRef, Channel, ChannelKind, Group, Message, MessageKind, Reaction, ReadMarker, Repo,
-    normalize_tags,
+    ApprovalMode, Author, BlobRef, Channel, ChannelKind, Group, Message, MessageKind, Reaction,
+    ReadMarker, Repo, normalize_tags,
 };
-use consort_proto::status::Actor;
 use consort_proto::tools::SearchResult;
 use consort_proto::turn_input::WakeEvent;
 use rusqlite::Connection;
 
 use crate::error::{HubError, Result};
 use crate::hub::{Caller, Hub};
-use crate::ops::flow::{Delivered, deliver_in_tx};
+use crate::ops::flow::Delivered;
 use crate::store::conversation::{self, NewMessage};
 use crate::store::{Tx, knowledge, work};
 
@@ -186,6 +185,12 @@ enum Sent {
         message: Message,
         delivered: Option<(Delivered, ChannelId)>,
     },
+    /// The message replaced waiting draft cards of the coordinator. It goes
+    /// to the tool calls that wait for them, not to the wake queue.
+    Consumed {
+        message: Message,
+        replaced: Vec<consort_proto::ids::ApprovalId>,
+    },
 }
 
 impl Hub {
@@ -286,7 +291,9 @@ impl Hub {
                     preferred_workers: Vec::new(),
                     repo_ids: request.repo_ids,
                     default_isolation: request.default_isolation.unwrap_or_default(),
-                    default_approval_mode: request.default_approval_mode.unwrap_or_default(),
+                    default_approval_mode: request
+                        .default_approval_mode
+                        .unwrap_or(ApprovalMode::Auto),
                     allowed_local_mcp_servers: Vec::new(),
                     memory_enabled: request.memory_enabled.unwrap_or(true),
                     tags,
@@ -788,6 +795,19 @@ impl Hub {
                     None => None,
                 };
                 let Some(task) = task else {
+                    // A draft card of the coordinator waits: the text may
+                    // change the draft, so it is the result of the tool call
+                    // that waits, not a new wake event.
+                    let replaced = crate::connectors::replace::replace_waiting_drafts(
+                        &hub,
+                        tx,
+                        crate::connectors::replace::DraftScope::Coordinator(channel_id),
+                        &message.body,
+                        &message.attachments,
+                    )?;
+                    if !replaced.is_empty() {
+                        return Ok(Sent::Consumed { message, replaced });
+                    }
                     tx.queue_wake(
                         channel_id,
                         &WakeEvent::UserMessage {
@@ -805,13 +825,14 @@ impl Hub {
                 // The delivery to the task session goes into the same
                 // transaction, so a stored message always has its turn,
                 // steer or inbox entry, also when the hub stops right after.
-                match deliver_in_tx(
+                // A text that answers the one open decision of the task
+                // closes it (see `deliver_user_text`).
+                match crate::ops::waiting::deliver_user_text(
                     &hub,
                     tx,
                     task.id,
                     &message.body,
                     &message.attachments,
-                    Actor::User,
                 ) {
                     Ok(delivered) => Ok(Sent::New {
                         message,
@@ -836,11 +857,15 @@ impl Hub {
             .await?;
         match sent {
             Sent::Repeat(message) => Ok(MessageResult { message }),
+            Sent::Consumed { message, replaced } => {
+                self.signal_replaced(&replaced);
+                Ok(MessageResult { message })
+            }
             Sent::New {
                 message,
                 delivered: Some((delivered, task_channel)),
             } => {
-                self.pump_worker(delivered.worker_id);
+                self.after_delivery(&delivered);
                 if delivered.status_changed {
                     self.kick_coordinator(task_channel);
                 }
@@ -1162,10 +1187,7 @@ mod tests {
             first.default_isolation,
             consort_proto::model::Isolation::Worktree
         );
-        assert_eq!(
-            first.default_approval_mode,
-            consort_proto::model::ApprovalMode::Ask
-        );
+        assert_eq!(first.default_approval_mode, ApprovalMode::Auto);
         assert!(first.memory_enabled);
         assert!(first.archived_at.is_none());
         assert_eq!((first.position, second.position), (0, 1));

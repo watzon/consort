@@ -9,7 +9,7 @@ use consort_client::{
 };
 use consort_theme::{Tokens, TypeExt as _};
 use gpui_kit::{
-    AnyElement, Context, Div, IntoElement, ParentElement, SharedString,
+    AnyElement, Context, Div, InteractiveElement, IntoElement, ParentElement, SharedString,
     StatefulInteractiveElement as _, Styled, div, prelude::FluentBuilder as _,
 };
 
@@ -57,20 +57,56 @@ impl ConsortApp {
         t: &Tokens,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        self.render_hub_card_with(approval, card, key, Some(chat), t, cx)
+    }
+
+    /// The body of a hub card with no frame of its own, for the box of an
+    /// answered line that the user opened.
+    pub fn render_hub_card_body(
+        &mut self,
+        approval: &ApprovalView,
+        card: &HubCardView,
+        key: &str,
+        t: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        self.render_hub_card_with(approval, card, key, None, t, cx)
+    }
+
+    /// `chat` is `None` for a body with no frame.
+    fn render_hub_card_with(
+        &mut self,
+        approval: &ApprovalView,
+        card: &HubCardView,
+        key: &str,
+        chat: Option<bool>,
+        t: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let c = &t.colors;
         let pending = approval.state == RequestState::Pending;
         let whole = card;
         let mut frame = div()
+            .debug_selector({
+                let id = format!("{key}-hub");
+                move || id.clone()
+            })
             .flex()
             .flex_col()
             .flex_1()
             .min_w_0()
-            .gap(t.space.md)
-            .p(t.space.lg)
-            .bg(c.surface_card)
-            .border(t.border_width)
-            .border_color(c.border_subtle);
-        frame = crate::ui::parts::card_corners(frame, chat, t);
+            .gap(t.space.md);
+        if let Some(chat) = chat {
+            frame = crate::ui::parts::card_corners(
+                frame
+                    .p(t.space.lg)
+                    .bg(c.surface_card)
+                    .border(t.border_width)
+                    .border_color(c.border_subtle),
+                chat,
+                t,
+            );
+        }
         let glyph = status_glyph(
             SharedString::from(format!("{key}-glyph")),
             glyph_status(approval.state),
@@ -96,21 +132,14 @@ impl ConsortApp {
                         .child(glyph)
                         .child(service_logo(&card.logo, t.icon.dense, t))
                         .child(summary)
-                        // A draft card says why it asks in its voice line
-                        // and flags, so the rule note stays off.
-                        .when(card.draft.is_none(), |d| {
-                            d.child(text(
-                                card.rule_note.clone(),
-                                t.text.caption,
-                                c.text_tertiary,
-                            ))
-                        }),
+                        .child(text(
+                            card.rule_note.clone(),
+                            t.text.caption,
+                            c.text_tertiary,
+                        )),
                 );
-                // A draft or send tool: the voice line, the flags, Edit and
-                // "Not how I write".
-                if let Some(draft) = card.draft.clone() {
-                    frame = frame.child(self.render_draft_card(approval, card, &draft, key, t, cx));
-                } else {
+                // A draft card is a card of its own (`ui/drafts.rs`).
+                {
                     let mut fields = div()
                         .flex()
                         .flex_col()
@@ -526,6 +555,39 @@ impl ConsortApp {
             offline,
             t,
         ))
+    }
+
+    /// Whether the outcome of an answered card still moves: the browser sign-in
+    /// of a connection that is connecting, and a sign-in that runs. Its
+    /// buttons must stay in sight, so the card does not shrink to a line.
+    pub(crate) fn hub_outcome_is_live(&self, approval: &ApprovalView, card: &HubCardView) -> bool {
+        if approval.state != RequestState::Answered || approval.answer == Some(ApprovalChoice::Deny)
+        {
+            return false;
+        }
+        match card {
+            HubCardView::ConnectService(connect) => connect
+                .connection_id
+                .as_ref()
+                .and_then(|id| self.state.connection(id))
+                .is_some_and(|connection| {
+                    matches!(connection.status, ConnectionStatusView::Connecting { .. })
+                }),
+            HubCardView::SignIn(sign_in) => sign_in
+                .sign_in_id
+                .as_ref()
+                .and_then(|id| self.state.sign_in(id))
+                .is_some_and(|running| {
+                    !matches!(
+                        running.step,
+                        consort_client::SignInStep::Succeeded { .. }
+                            | consort_client::SignInStep::Failed { .. }
+                            | consort_client::SignInStep::Cancelled
+                            | consort_client::SignInStep::Expired
+                    )
+                }),
+            _ => false,
+        }
     }
 
     /// The line of an answered card.
