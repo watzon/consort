@@ -90,6 +90,15 @@ pub fn maybe_bounds(cx: &mut VisualTestContext, selector: &str) -> Option<Bounds
     cx.debug_bounds(name)
 }
 
+/// The height of the title bar that Windows and Linux can draw above the app.
+pub fn title_bar(cx: &mut VisualTestContext) -> Pixels {
+    if has(cx, "window-title-bar") {
+        bounds(cx, "window-title-bar").size.height
+    } else {
+        px(0.)
+    }
+}
+
 pub fn has(cx: &mut VisualTestContext, selector: &str) -> bool {
     maybe_bounds(cx, selector).is_some()
 }

@@ -1,7 +1,10 @@
 //! The redesign of 2026-10-30 in a headless window: the frame of the main
 //! page, the sidebar rows, the top zone and the footer of a message group.
 
-use crate::app::{ConsortApp, Panel};
+use crate::{
+    app::{ConsortApp, Panel},
+    test_support::title_bar,
+};
 use consort_client::Client;
 use gpui::{AnyWindowHandle, TestAppContext, VisualTestContext};
 use gpui_kit::{
@@ -212,7 +215,7 @@ fn the_top_zone_takes_the_pointer_from_the_timeline(cx: &mut TestAppContext) {
     let cx = &mut VisualTestContext::from_window(handle, cx);
     let t = cx.update(|_, cx| ConsortApp::tokens(cx));
     let zone = bounds(cx, "top-zone");
-    assert_eq!(zone.top(), px(0.));
+    assert_eq!(zone.top(), title_bar(cx));
     assert_eq!(zone.size.height, t.layout.content_top);
     assert_eq!(zone.left(), t.layout.sidebar_width);
 }

@@ -128,6 +128,7 @@ pub fn title_bar(t: &Tokens, window: &Window) -> Option<AnyElement> {
     let maximized = window.is_maximized();
     Some(
         div()
+            .debug_selector(|| "window-title-bar".into())
             .flex()
             .flex_none()
             .items_center()
@@ -179,6 +180,11 @@ pub trait DragArea: Styled + InteractiveElement + Sized {
         let this = self.window_control_area(WindowControlArea::Drag);
         #[cfg(target_os = "linux")]
         let this = this.on_mouse_down(MouseButton::Left, |event, window, _| {
+            // A focusable control inside the area got this press first. A
+            // move here would take the click from that control.
+            if window.default_prevented() {
+                return;
+            }
             if event.click_count >= 2 {
                 window.zoom_window();
             } else {

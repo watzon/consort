@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use crate::{
     app::ConsortApp,
-    test_support::{bounds, click, draw, has, open, open_sized, settle},
+    test_support::{bounds, click, draw, has, open, open_sized, settle, title_bar},
 };
 use consort_client::mock;
 use gpui::{TestAppContext, VisualTestContext};
@@ -175,9 +175,9 @@ fn the_stack_is_full_width_under_the_top_bar_in_the_compact_layout(cx: &mut Test
     assert_eq!(stack.left(), t.space.lg, "16 px margin at the left");
     assert_eq!(window.width - stack.right(), t.space.lg, "and at the right");
     assert_eq!(
-        stack.top(),
+        stack.top() - title_bar(cx),
         t.layout.notice_compact_top,
-        "88 px from the top"
+        "88 px under the title bar"
     );
     assert!(
         stack.top() > bounds(cx, "compact-menu").bottom(),
@@ -198,7 +198,7 @@ fn a_window_of_760_to_1100_px_uses_the_compact_position(cx: &mut TestAppContext)
     );
     let t = cx.update(|_, cx| ConsortApp::tokens(cx));
     let stack = bounds(cx, "notice-stack");
-    assert_eq!(stack.top(), t.layout.notice_compact_top);
+    assert_eq!(stack.top() - title_bar(cx), t.layout.notice_compact_top);
     assert_eq!(stack.left(), t.space.lg);
     assert!(
         stack.size.width > t.layout.notice_width,
