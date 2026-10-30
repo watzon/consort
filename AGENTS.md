@@ -32,7 +32,7 @@ Dependency direction: `proto` and `theme` depend on no other Consort crate. `cli
 ## Rust rules
 
 - Edition 2024, Rust 1.98.1 (see `rust-toolchain.toml`). `unsafe_code` is forbidden in every crate.
-- `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace` must pass before a change is done. Format with `cargo fmt`.
+- `scripts/check.sh` must pass before a change is done. It runs `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and the tests with `cargo nextest run` (install it with `brew install cargo-nextest` or `cargo install cargo-nextest --locked`). While you work, check only the crates you change: `scripts/check.sh consort-hub consort-proto`. Format with `cargo fmt`.
 - Library crates return typed errors (`thiserror`). Only binaries and tests use `anyhow`.
 - No `unwrap` or `expect` outside tests, except for an invariant that a comment proves.
 - Pin GPUI Kit and other fast-moving crates to exact versions (`=x.y.z`) in the workspace `Cargo.toml`.
