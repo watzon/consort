@@ -84,14 +84,48 @@ pub enum RoutineAction {
     },
 }
 
-/// The result of the last run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// The result of a run.
+///
+/// A run is `running` until its work ends: the coordinator turn that got the
+/// routine's prompt, or the task that the run started (until the task is
+/// Ready for review, Resolved or Failed). A run that the hub did not start is
+/// `skipped`: the last run of the same routine still ran, or the hub was
+/// offline at the run time for 1 hour or more.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RoutineRunStatus {
     /// The run worked.
+    #[default]
     Ok,
     /// The run failed.
     Error,
+    /// The hub did not start the run. `error` says why.
+    Skipped,
+    /// The run started and its work did not end yet.
+    Running,
+}
+
+impl RoutineRunStatus {
+    /// The text that the wire uses.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Error => "error",
+            Self::Skipped => "skipped",
+            Self::Running => "running",
+        }
+    }
+
+    /// Reads the wire text. Unknown text is `None`.
+    pub fn parse(text: &str) -> Option<Self> {
+        Some(match text {
+            "ok" => Self::Ok,
+            "error" => Self::Error,
+            "skipped" => Self::Skipped,
+            "running" => Self::Running,
+            _ => return None,
+        })
+    }
 }
 
 /// A prompt that the hub runs on a schedule in one channel.
@@ -119,19 +153,47 @@ pub struct Routine {
     pub last_run_status: Option<RoutineRunStatus>,
 }
 
-/// One run of a routine.
+/// One run of a routine. It is a feed entity, so a client sees a run start
+/// and end.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoutineRun {
+    /// The run number. It is unique in the hub and grows with each run.
+    #[serde(default)]
+    pub id: u64,
     /// The routine.
     pub routine_id: RoutineId,
-    /// When the run started.
+    /// The channel of the routine when the run started.
+    pub channel_id: ChannelId,
+    /// When the run started. For a skipped run, the time when it was due.
     pub started_at: Timestamp,
-    /// The message that the run caused, for a coordinator turn.
+    /// When the work of the run ended. Empty while it runs.
+    #[serde(default)]
+    pub ended_at: Option<Timestamp>,
+    /// The result.
+    #[serde(default)]
+    pub status: RoutineRunStatus,
+    /// True for a run that the user started with Run now.
+    #[serde(default)]
+    pub manual: bool,
+    /// The first message that the assistant posted in the timeline in the
+    /// run's turn, for a coordinator turn.
     pub message_id: Option<MessageId>,
     /// The task that the run created, for a `start_task` action.
     pub task_id: Option<TaskId>,
-    /// The error, when the run failed.
+    /// Why the run failed or was skipped, with the next step.
     pub error: Option<String>,
+}
+
+impl RoutineRun {
+    /// The feed `entity_id` of this run: its number.
+    pub fn entity_id(&self) -> String {
+        self.id.to_string()
+    }
+
+    /// Whether the work of the run has not ended yet.
+    pub fn is_running(&self) -> bool {
+        self.status == RoutineRunStatus::Running
+    }
 }
 
 #[cfg(test)]
@@ -179,6 +241,51 @@ mod tests {
             .validate()
             .is_err()
         );
+    }
+
+    #[test]
+    fn run_shapes() {
+        let routine: RoutineId = "rtn_00000000-0000-0000-0000-000000000005".parse().unwrap();
+        let channel: ChannelId = "chn_00000000-0000-0000-0000-000000000001".parse().unwrap();
+        let run = RoutineRun {
+            id: 7,
+            routine_id: routine,
+            channel_id: channel,
+            started_at: Timestamp::from_millis(1_000),
+            ended_at: None,
+            status: RoutineRunStatus::Skipped,
+            manual: true,
+            message_id: None,
+            task_id: None,
+            error: Some("The last run was still going.".into()),
+        };
+        let value = serde_json::to_value(&run).unwrap();
+        assert_eq!(value["status"], "skipped");
+        assert_eq!(value["manual"], true);
+        assert_eq!(serde_json::from_value::<RoutineRun>(value).unwrap(), run);
+        // A run from an older hub has no status, number or end.
+        let old: RoutineRun = serde_json::from_value(json!({
+            "routine_id": routine, "channel_id": channel, "started_at": "2026-11-01T08:00:00Z",
+            "message_id": null, "task_id": null, "error": null
+        }))
+        .unwrap();
+        assert_eq!(
+            (old.id, old.status, old.manual),
+            (0, RoutineRunStatus::Ok, false)
+        );
+        for status in [
+            RoutineRunStatus::Ok,
+            RoutineRunStatus::Error,
+            RoutineRunStatus::Skipped,
+            RoutineRunStatus::Running,
+        ] {
+            assert_eq!(RoutineRunStatus::parse(status.as_str()), Some(status));
+            assert_eq!(
+                serde_json::to_value(status).unwrap(),
+                json!(status.as_str())
+            );
+        }
+        assert_eq!(RoutineRunStatus::parse("done"), None);
     }
 
     #[test]

@@ -602,6 +602,13 @@ fn release_coordinator(tx: &mut Tx<'_>, ctx: &mut Ctx<'_>, started: bool) -> Res
                 "turn_failed",
                 "The assistant stopped before it finished. It had already started to act, so the hub does not give it the same messages again. Check what it did, and send your message again if something is missing.",
             )?;
+            tx.end_turn_runs(
+                &row.turn_events,
+                ctx.channel.id,
+                ctx.session.id,
+                row.turn_started_at,
+                Some("The assistant stopped before it finished. Check what it did, then select Run now if something is missing."),
+            )?;
         }
     }
     row.session_id = None;
@@ -1009,10 +1016,24 @@ fn coordinator_turn_ended(
             tx.insert_message(new)?;
         }
     }
+    let failure = match reason {
+        TurnEndReason::Completed => None,
+        TurnEndReason::Interrupted => Some("The turn was stopped before it finished."),
+        TurnEndReason::Failed => {
+            Some(error.unwrap_or("The assistant stopped with an error. Send your message again."))
+        }
+    };
     if reason == TurnEndReason::Failed {
         let text = error.unwrap_or("The assistant stopped with an error. Send your message again.");
         tx.post_notice(ctx.channel.id, None, None, "turn_failed", text)?;
     }
+    tx.end_turn_runs(
+        &row.turn_events,
+        ctx.channel.id,
+        ctx.session.id,
+        row.turn_started_at,
+        failure,
+    )?;
     row.turn_open = false;
     row.turn_started_at = None;
     row.turn_events.clear();

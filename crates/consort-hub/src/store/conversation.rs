@@ -145,6 +145,19 @@ pub fn message_or_404(conn: &Connection, id: MessageId) -> Result<Message> {
         .ok_or_else(|| HubError::not_found(format!("The message {id} does not exist.")))
 }
 
+/// The newest root message of a channel's timeline that is not deleted.
+pub fn newest_timeline_message(
+    conn: &Connection,
+    channel_id: ChannelId,
+) -> Result<Option<Message>> {
+    get_doc(
+        conn,
+        "SELECT data FROM messages WHERE channel_id = ?1 AND thread_root_id IS NULL
+            AND deleted_at IS NULL ORDER BY created_at DESC, rowid DESC LIMIT 1",
+        [channel_id.to_string()],
+    )
+}
+
 /// The message that a client already sent with this idempotency key.
 pub fn message_by_client_id(
     conn: &Connection,
@@ -326,6 +339,15 @@ impl Tx<'_> {
         }
         for note in super::knowledge::memory_notes(self.db(), MemoryScope::Channel(id))? {
             deletes.push((EntityKind::MemoryNote, note.entity_id()));
+        }
+        // The notes in Recently deleted go too.
+        for note in
+            super::knowledge::deleted_memory_list(self.db(), Some(MemoryScope::Channel(id)))?
+        {
+            deletes.push((
+                EntityKind::MemoryNote,
+                consort_proto::model::memory_note_entity_id(note.scope, &note.path),
+            ));
         }
 
         let db = self.db();

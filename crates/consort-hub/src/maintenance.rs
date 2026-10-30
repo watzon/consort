@@ -1,5 +1,5 @@
 //! Periodic work: due tasks, revokes from the hub machine, the feed
-//! retention, stuck coordinator turns, quiet task turns and expired
+//! retention, the purge of old deleted memory notes, stuck coordinator turns, quiet task turns and expired
 //! commands and idle sign-ins.
 
 use std::time::Duration;
@@ -9,6 +9,10 @@ use tokio::task::JoinHandle;
 use crate::hub::Hub;
 
 const STUCK_TURN_MS: i64 = 2 * 60 * 60 * 1000;
+
+/// How long a deleted memory note stays in Recently deleted.
+const MEMORY_DELETED_KEEP_MS: i64 =
+    consort_proto::model::MEMORY_DELETED_KEEP_DAYS * 24 * 60 * 60 * 1000;
 /// How often, in seconds, the hub reads the revokes that a command on the
 /// hub machine wrote.
 const REVOKE_CHECK_TICKS: u64 = 2;
@@ -60,6 +64,14 @@ pub(crate) fn spawn(hub: &Hub) -> JoinHandle<()> {
                     .write(|tx| {
                         let pruned = tx.prune_feed()?;
                         tx.delete_expired_pairing_codes()?;
+                        let before = tx.now().plus_millis(-MEMORY_DELETED_KEEP_MS);
+                        let purged = tx.purge_deleted_memory(before)?;
+                        if purged > 0 {
+                            tracing::info!(
+                                purged,
+                                "removed memory notes that were deleted 30 days ago"
+                            );
+                        }
                         Ok(pruned)
                     })
                     .await;

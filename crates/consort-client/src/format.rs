@@ -93,6 +93,21 @@ pub fn file_date_label(ms: i64, now_ms: i64) -> String {
     }
 }
 
+/// "20:41": the local time on a 24-hour clock, as the routine and memory
+/// designs show times.
+pub fn clock_24(ms: i64) -> String {
+    local(ms)
+        .map(|t| t.format("%-H:%M").to_string())
+        .unwrap_or_default()
+}
+
+/// "Oct 27, 20:14": the local date and time on a 24-hour clock.
+pub fn local_date_time(ms: i64) -> String {
+    local(ms)
+        .map(|t| t.format("%b %-d, %-H:%M").to_string())
+        .unwrap_or_default()
+}
+
 /// The local day of a time, to group messages under day labels.
 pub fn day_key(ms: i64) -> String {
     local(ms)

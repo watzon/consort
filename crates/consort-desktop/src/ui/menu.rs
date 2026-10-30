@@ -107,6 +107,8 @@ pub enum MenuAction {
     RenameFile(String, String),
     MoveFile(String, String),
     DeleteFile(String, String),
+    /// A routine or memory item, or a select of their dialogs.
+    Knowledge(crate::knowledge::KnowledgeAction),
 }
 
 /// The menu of an attachment in a message or a thread post: Open, Save, and

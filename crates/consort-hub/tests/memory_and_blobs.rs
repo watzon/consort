@@ -75,7 +75,13 @@ async fn a_memory_write_with_a_stale_hash_is_refused() {
         .unwrap()
         .note;
     assert_eq!(read.content, "# Kevin\nLikes coffee.");
-    let list = client.request(MemoryList { scope: None }).await.unwrap();
+    let list = client
+        .request(MemoryList {
+            scope: None,
+            deleted: false,
+        })
+        .await
+        .unwrap();
     assert_eq!(list.notes.len(), 1);
     let history = client
         .request(MemoryHistory {

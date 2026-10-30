@@ -377,7 +377,7 @@ fn the_light_box_opens_steps_and_closes(cx: &mut TestAppContext) {
 /// The Channel panel: it opens from `#`, takes the place of the Tasks
 /// panel, lists folders, files and the artifacts of each task, opens a
 /// folder, and its row menu deletes a file after a confirm step. Routines
-/// and Memory wait for phase 2.
+/// and Memory are tabs of the same panel.
 #[gpui::test]
 fn the_channel_panel_lists_files_and_deletes_from_its_menu(cx: &mut TestAppContext) {
     let (handle, app) = open(files_state(), cx);
@@ -397,9 +397,15 @@ fn the_channel_panel_lists_files_and_deletes_from_its_menu(cx: &mut TestAppConte
     let artifacts = bounds(cx, &format!("artifact-task-{ROOF_TASK}"));
     assert!(photos.origin.y < wiring.origin.y && wiring.origin.y < artifacts.origin.y);
 
-    // Routines waits for phase 2: its tab takes no click.
+    // The Routines tab takes a click, and Files comes back.
     let routines = bounds(cx, "channel-tab-Routines");
     cx.simulate_click(routines.center(), Modifiers::default());
+    draw(cx);
+    app.read_with(cx, |app, _| {
+        assert_eq!(app.channel_tab, ChannelTab::Routines)
+    });
+    let files = bounds(cx, "channel-tab-Files");
+    cx.simulate_click(files.center(), Modifiers::default());
     draw(cx);
     app.read_with(cx, |app, _| assert_eq!(app.channel_tab, ChannelTab::Files));
 

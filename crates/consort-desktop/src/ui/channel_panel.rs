@@ -1,7 +1,7 @@
 //! The Channel panel: the channel's name and purpose, and the tabs Files,
 //! Routines and Memory. It shares the right side with the Tasks panel, one
-//! at a time. Only Files is built. Routines and Memory come with phase 2,
-//! so their tabs are disabled and say so on hover.
+//! at a time. A routine or a memory note opens in place of the panel, with
+//! a back button (`ui/routines.rs`, `ui/memory.rs`).
 //!
 //! The Files tab lists folders, then files, then the artifacts of each task.
 //! It uploads with a button or a drop on the panel, and each file row has
@@ -10,9 +10,9 @@
 use consort_client::{ChannelFileView, UploadStatus, UploadTarget, files::FilesListing};
 use consort_theme::{Tokens, TypeExt as _};
 use gpui_kit::{
-    AnyElement, AppContext as _, Context, Div, ExternalPaths, InteractiveElement, IntoElement,
-    MouseButton, MouseDownEvent, ParentElement, SharedString, StatefulInteractiveElement as _,
-    Styled, Window, div, linear_color_stop, linear_gradient, prelude::FluentBuilder as _,
+    AnyElement, Context, Div, ExternalPaths, InteractiveElement, IntoElement, MouseButton,
+    MouseDownEvent, ParentElement, SharedString, StatefulInteractiveElement as _, Styled, Window,
+    div, linear_color_stop, linear_gradient, prelude::FluentBuilder as _,
 };
 
 use crate::{
@@ -28,9 +28,6 @@ use crate::{
         window_controls::DragArea as _,
     },
 };
-
-/// What a disabled tab says on hover.
-pub const PHASE_2: &str = "Comes with phase 2";
 
 impl ConsortApp {
     /// Loads the files of the open channel when they are not loaded.
@@ -72,6 +69,20 @@ impl ConsortApp {
     ) -> AnyElement {
         let c = &t.colors;
         self.load_channel_files(cx);
+        // A routine or a note opens in place of the tabs.
+        if self.channel_tab == ChannelTab::Routines
+            && let Some(id) = self.knowledge.routine_open.clone()
+        {
+            match self.state.routines.iter().find(|r| r.id == id).cloned() {
+                Some(routine) => return self.render_routine_page(&routine, t, cx),
+                None => self.knowledge.routine_open = None,
+            }
+        }
+        if self.channel_tab == ChannelTab::Memory
+            && let Some((scope, path)) = self.knowledge.panel_note.clone()
+        {
+            return self.render_note_page(&scope, &path, t, _window, cx);
+        }
         let channel = self.state.channel(&self.channel_id).cloned();
         let name = channel
             .as_ref()
@@ -127,10 +138,19 @@ impl ConsortApp {
                 )
                 .on_click(cx.listener(|this, _, _, cx| this.close_panel(cx))),
             );
+        let routine_count = self
+            .state
+            .routines
+            .iter()
+            .filter(|r| r.channel_id == self.channel_id)
+            .count();
+        let scope = self.memory_scope(&self.channel_id.clone());
+        self.load_memory(&scope, false, cx);
+        let note_count = self.notes_of(&scope).len();
         let tabs = [
             (ChannelTab::Files, "Files", Some(file_count), true),
-            (ChannelTab::Routines, "Routines", None, false),
-            (ChannelTab::Memory, "Memory", None, false),
+            (ChannelTab::Routines, "Routines", Some(routine_count), true),
+            (ChannelTab::Memory, "Memory", Some(note_count), true),
         ];
         let mut segmented = div()
             .flex()
@@ -166,27 +186,36 @@ impl ConsortApp {
                 .when_some(count.filter(|n| *n > 0), |d, n| {
                     d.child(text(n.to_string(), t.text.ui, c.text_tertiary))
                 });
-            segmented = segmented.child(if built {
+            segmented = segmented.child(
                 focusable(tab_el, t)
                     .cursor_pointer()
                     .when(!active, |d| d.hover(|s| s.bg(c.hover_card)))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.channel_tab = tab;
-                        cx.notify();
-                    }))
-            } else {
-                // The tab waits for phase 2. It takes no click.
-                tab_el.tooltip(|_, cx| {
-                    cx.new(|_| crate::ui::channel_panel::Tooltip(PHASE_2.into()))
-                        .into()
-                })
-            });
+                    .on_click(cx.listener(move |this, _, _, cx| this.open_channel_tab(tab, cx))),
+            );
         }
         let dropping = self
             .drop_hover
             .filter(|(over, _)| *over == DropOver::Files)
             .map(|(_, n)| n);
-        let body = self.render_files_tab(&listing, &name, dropping, t, cx);
+        let tutti = channel
+            .as_ref()
+            .is_some_and(|ch| ch.kind == consort_client::ChannelKind::Tutti);
+        let (body, hint) = match self.channel_tab {
+            ChannelTab::Files => (
+                self.render_files_tab(&listing, &name, dropping, t, cx),
+                format!(
+                    "Drop files on this panel to upload them to {name}. Tasks in this channel can read every file."
+                ),
+            ),
+            ChannelTab::Routines => (
+                self.render_routines_tab(&name, t, cx),
+                crate::ui::routines::ROUTINES_HINT.to_owned(),
+            ),
+            ChannelTab::Memory => (
+                self.render_memory_tab(&name, t, cx),
+                crate::ui::memory::memory_hint(&name, tutti),
+            ),
+        };
         div()
             .id("channel-panel")
             .debug_selector(|| "channel-panel".into())
@@ -227,13 +256,7 @@ impl ConsortApp {
                     .px(t.space.lg)
                     .border_t(t.border_width)
                     .border_color(c.border_subtle)
-                    .child(text(
-                        format!(
-                            "Drop files on this panel to upload them to {name}. Tasks in this channel can read every file."
-                        ),
-                        detail(t),
-                        c.text_tertiary,
-                    )),
+                    .child(text(hint, detail(t), c.text_tertiary)),
             )
             .into_any_element()
     }
@@ -1057,25 +1080,4 @@ fn column(value: String, width: gpui_kit::Pixels, t: &Tokens) -> Div {
         .w(width)
         .flex_none()
         .text_right()
-}
-
-/// A plain tooltip: one line of text on `surface.raised`.
-pub struct Tooltip(pub SharedString);
-
-impl gpui_kit::Render for Tooltip {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let t = ConsortApp::tokens(cx);
-        div()
-            .py(t.space.xs)
-            .px(t.space.sm)
-            .rounded(t.radius.md)
-            .bg(t.colors.surface_raised)
-            .border(t.border_width)
-            .border_color(t.colors.border_subtle)
-            .shadow(t.shadow_float())
-            .font_family(t.font_sans.clone())
-            .type_style(t.text.label)
-            .text_color(t.colors.text_secondary)
-            .child(self.0.clone())
-    }
 }

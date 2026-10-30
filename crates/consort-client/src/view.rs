@@ -75,6 +75,15 @@ pub struct ViewState {
     pub channel_files: Vec<crate::files::ChannelFileView>,
     /// The channels whose files are loaded.
     pub files_loaded: Vec<String>,
+    /// Every routine of every channel. See [`crate::routines`].
+    pub routines: Vec<crate::routines::RoutineView>,
+    /// The memory notes of the loaded scopes, also the ones in Recently
+    /// deleted. See [`crate::memory`].
+    pub memory_notes: Vec<crate::memory::MemoryNoteView>,
+    /// The memory scopes (`global` or a channel ID) whose notes are loaded.
+    pub memory_loaded: Vec<String>,
+    /// The scopes whose Recently deleted notes are loaded.
+    pub memory_deleted_loaded: Vec<String>,
 }
 
 /// A message that the hub refused after it left the composer.
@@ -624,6 +633,23 @@ pub struct NoticeView {
     /// The kind, such as `turn_failed`. Empty when the body did not parse.
     pub kind: String,
     pub text: String,
+    /// For a `memory_saved` notice: the note that the assistant saved.
+    pub memory: Option<MemorySavedView>,
+}
+
+/// The memory saved line: the assistant saved a memory note. The timeline
+/// shows it as a quiet line with the note path as a link.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct MemorySavedView {
+    /// `global` or a channel ID.
+    pub scope: String,
+    pub path: String,
+    pub version: u64,
+    /// True when the write made the note.
+    pub created: bool,
+    /// The title of the task or the name of the channel whose memory
+    /// suggestion the note keeps. Empty when it came from no suggestion.
+    pub suggested_by: String,
 }
 
 /// An approval that the coordinator posted in the timeline.

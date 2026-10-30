@@ -203,6 +203,8 @@ mod tests {
             version: 1,
             updated_by: MemoryAuthor::User,
             updated_at: Timestamp::EPOCH,
+            suggested_by: None,
+            deleted_at: None,
         }
     }
 

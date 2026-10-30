@@ -13,9 +13,14 @@ use consort_proto::model::{
 };
 use consort_proto::tools::{FilesListResult, MemoryListResult};
 
+use consort_proto::ids::ChannelId;
+use consort_proto::model::{Author, MessageKind};
+use consort_proto::turn_input::SuggestionSource;
+
 use crate::error::{HubError, Result};
 use crate::hub::{Caller, Hub};
-use crate::store::{conversation, knowledge};
+use crate::store::conversation::NewMessage;
+use crate::store::{Tx, conversation, knowledge};
 
 /// The most bytes in the content of a memory note.
 pub(crate) const MEMORY_NOTE_MAX_BYTES: usize = 256 * 1024;
@@ -28,13 +33,16 @@ impl Hub {
     /// notes through this function, so the checks are the same. The caller
     /// decides who may write the scope. This function checks the path, the
     /// size, and that a channel scope names a channel.
+    ///
+    /// A write by a coordinator session also posts the memory saved line in
+    /// that coordinator's channel (`saved_line`), in the same transaction.
     pub(crate) async fn write_memory_note(
         &self,
         scope: MemoryScope,
         path: String,
         content: String,
         expected: ExpectedHash,
-        by: MemoryAuthor,
+        source: WriteSource,
     ) -> Result<MemoryNote> {
         validate_memory_path(&path)?;
         if content.len() > MEMORY_NOTE_MAX_BYTES {
@@ -54,9 +62,128 @@ impl Hub {
                         ));
                     }
                 }
-                tx.write_memory(scope, &path, &content, &expected, by)
+                let before = knowledge::memory_note(tx.db(), scope, &path)?;
+                let note = tx.write_memory(
+                    scope,
+                    &path,
+                    &content,
+                    &expected,
+                    source.by,
+                    source.suggested_by,
+                )?;
+                let changed = before.as_ref().is_none_or(|b| b.version != note.version);
+                if changed && let Some(channel_id) = source.saved_line {
+                    post_memory_saved(tx, channel_id, &note, before.is_none())?;
+                }
+                Ok(note)
             })
             .await
+    }
+}
+
+/// Who writes a memory note, and where the hub shows the write.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct WriteSource {
+    pub by: MemoryAuthor,
+    /// The memory suggestion that the write keeps.
+    pub suggested_by: Option<SuggestionSource>,
+    /// The channel whose timeline gets the memory saved line. Set for a
+    /// coordinator's write.
+    pub saved_line: Option<ChannelId>,
+}
+
+impl WriteSource {
+    /// A write by the user, from a client. It gets no line.
+    pub(crate) fn user() -> Self {
+        Self {
+            by: MemoryAuthor::User,
+            suggested_by: None,
+            saved_line: None,
+        }
+    }
+}
+
+/// The notice kind of the memory saved line.
+pub(crate) const MEMORY_SAVED: &str = "memory_saved";
+
+/// The name of the task or channel that made a memory suggestion: the task
+/// title or the channel name. Empty when it is gone.
+fn suggestion_name(conn: &rusqlite::Connection, source: SuggestionSource) -> Result<String> {
+    Ok(match source {
+        SuggestionSource::Task(id) => crate::store::work::task(conn, id)?
+            .map(|t| t.title)
+            .unwrap_or_default(),
+        SuggestionSource::Channel(id) => conversation::channel(conn, id)?
+            .map(|c| c.name)
+            .unwrap_or_default(),
+    })
+}
+
+/// Posts the memory saved line in a channel's timeline: a notice with the
+/// note, its version and the suggestion that it keeps. When the newest
+/// timeline message is the line for the same note, the hub updates that
+/// line, so a turn that writes a note twice shows one line.
+fn post_memory_saved(
+    tx: &mut Tx<'_>,
+    channel_id: ChannelId,
+    note: &MemoryNote,
+    created: bool,
+) -> Result<()> {
+    let session = match note.updated_by {
+        MemoryAuthor::Session(id) => Some(id),
+        MemoryAuthor::User => None,
+    };
+    let newest = conversation::newest_timeline_message(tx.db(), channel_id)?;
+    let same_line = newest.filter(|m| {
+        m.kind == MessageKind::Notice
+            && m.author_session_id == session
+            && serde_json::from_str::<serde_json::Value>(&m.body).is_ok_and(|body| {
+                body["kind"] == MEMORY_SAVED
+                    && body["scope"] == note.scope.to_string()
+                    && body["path"] == note.path
+            })
+    });
+    // A line that said "saved the new note" keeps saying it.
+    let created = created
+        || same_line.as_ref().is_some_and(|m| {
+            serde_json::from_str::<serde_json::Value>(&m.body)
+                .is_ok_and(|body| body["created"] == true)
+        });
+    let verb = if created {
+        "Saved the new memory note"
+    } else {
+        "Updated the memory note"
+    };
+    let name = match note.suggested_by {
+        Some(source) => suggestion_name(tx.db(), source)?,
+        None => String::new(),
+    };
+    let text = if name.is_empty() {
+        format!("{verb} {}", note.path)
+    } else {
+        format!("{verb} {}, from a suggestion by {name}", note.path)
+    };
+    let body = serde_json::json!({
+        "kind": MEMORY_SAVED,
+        "text": text,
+        "scope": note.scope,
+        "path": note.path,
+        "version": note.version,
+        "created": created,
+        "suggested_by": note.suggested_by,
+        "suggested_by_name": name,
+    })
+    .to_string();
+    match same_line {
+        Some(mut line) => {
+            line.body = body;
+            tx.save_message(&line)
+        }
+        None => {
+            let mut new = NewMessage::new(channel_id, Author::System, MessageKind::Notice, body);
+            new.author_session_id = session;
+            tx.insert_message(new).map(|_| ())
+        }
     }
 }
 
@@ -70,7 +197,13 @@ impl Hub {
     ) -> Result<MemoryListResult> {
         let notes = self
             .store
-            .read(move |conn| knowledge::memory_list(conn, request.scope))
+            .read(move |conn| {
+                if request.deleted {
+                    knowledge::deleted_memory_list(conn, request.scope)
+                } else {
+                    knowledge::memory_list(conn, request.scope)
+                }
+            })
             .await?;
         Ok(MemoryListResult { notes })
     }
@@ -105,8 +238,41 @@ impl Hub {
                 request.path,
                 request.content,
                 request.expected_sha256,
-                MemoryAuthor::User,
+                WriteSource::user(),
             )
+            .await?;
+        Ok(MemoryNoteResult { note })
+    }
+
+    pub(crate) async fn memory_restore(
+        &self,
+        _caller: &Caller,
+        request: MemoryRestore,
+    ) -> Result<MemoryNoteResult> {
+        let note = self
+            .store
+            .write(move |tx| tx.restore_memory(request.scope, &request.path))
+            .await?;
+        Ok(MemoryNoteResult { note })
+    }
+
+    pub(crate) async fn memory_move(
+        &self,
+        _caller: &Caller,
+        request: MemoryMove,
+    ) -> Result<MemoryNoteResult> {
+        let to = request.to_path.trim().to_owned();
+        validate_memory_path(&to)?;
+        let note = self
+            .store
+            .write(move |tx| {
+                tx.move_memory(
+                    request.scope,
+                    &request.from_path,
+                    &to,
+                    &request.expected_sha256,
+                )
+            })
             .await?;
         Ok(MemoryNoteResult { note })
     }
@@ -410,7 +576,13 @@ mod tests {
             .note;
         assert_eq!(read.content, "Likes coffee.");
         let all = hub
-            .memory_list(&user(), MemoryList { scope: None })
+            .memory_list(
+                &user(),
+                MemoryList {
+                    scope: None,
+                    deleted: false,
+                },
+            )
             .await
             .unwrap();
         assert_eq!(all.notes.len(), 2);
@@ -419,6 +591,7 @@ mod tests {
                 &user(),
                 MemoryList {
                     scope: Some(channel),
+                    deleted: false,
                 },
             )
             .await

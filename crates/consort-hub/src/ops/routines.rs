@@ -172,6 +172,23 @@ impl Hub {
             .write(move |tx| {
                 let now = tx.now();
                 let mut routine = routine_in_scope(tx.db(), scope, update.routine_id)?;
+                if let Some(channel_id) = update.channel_id
+                    && channel_id != routine.channel_id
+                {
+                    if scope.is_some() {
+                        return Err(HubError::invalid(
+                            "A session cannot move a routine to another channel. Ask the user to move it.",
+                        ));
+                    }
+                    let channel = conversation::channel_or_404(tx.db(), channel_id)?;
+                    if channel.archived_at.is_some() {
+                        return Err(HubError::conflict(format!(
+                            "The channel {} is archived. Restore the channel before you move a routine to it.",
+                            channel.name
+                        )));
+                    }
+                    routine.channel_id = channel_id;
+                }
 
                 let schedule_changed = update
                     .schedule
@@ -341,6 +358,7 @@ mod tests {
     fn update_request(routine_id: RoutineId) -> RoutineUpdate {
         RoutineUpdate {
             routine_id,
+            channel_id: None,
             name: None,
             schedule: None,
             prompt: None,
@@ -789,6 +807,8 @@ mod tests {
             )
             .await
             .unwrap();
+            // The next run waits until this one ends.
+            crate::scheduler::testing::end_running(&hub, created.id).await;
         }
         let all = hub
             .routine_runs(

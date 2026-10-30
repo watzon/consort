@@ -71,6 +71,8 @@ gethostname = "1"
 croner = "4"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 chrono-tz = "0.10"
+# The time zone of this computer, for the routine schedule picker.
+iana-time-zone = "=0.1.65"
 # Encrypts the Composio key at rest (connectors, added by the hub agent)
 aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
 

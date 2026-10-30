@@ -45,9 +45,9 @@ pub use conversation::{
     Repo,
 };
 pub use knowledge::{
-    ARTIFACTS_DIR, ChannelFile, ExpectedHash, FileRef, MEMORY_PATH_MAX_BYTES, MemoryActor,
-    MemoryAuthor, MemoryNote, MemoryNoteSummary, MemoryScope, ScopeParseError, artifact_path,
-    memory_note_entity_id, validate_memory_path,
+    ARTIFACTS_DIR, ChannelFile, ExpectedHash, FileRef, MEMORY_DELETED_KEEP_DAYS,
+    MEMORY_PATH_MAX_BYTES, MemoryActor, MemoryAuthor, MemoryNote, MemoryNoteSummary, MemoryScope,
+    ScopeParseError, artifact_path, memory_note_entity_id, validate_memory_path,
 };
 pub use machine::{
     AuthState, Capabilities, Checkout, CheckoutInfo, Client, ClientKind, ExtrasGroup,

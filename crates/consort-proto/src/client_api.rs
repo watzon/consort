@@ -249,6 +249,8 @@ pub enum EntityKind {
     ChannelFile,
     /// [`Routine`].
     Routine,
+    /// [`RoutineRun`]. The `entity_id` is the run number.
+    RoutineRun,
     /// [`Worker`].
     Worker,
     /// [`Client`].
@@ -292,6 +294,8 @@ pub enum EntityPayload {
     ChannelFile(ChannelFile),
     /// A routine.
     Routine(Routine),
+    /// One run of a routine.
+    RoutineRun(RoutineRun),
     /// A worker.
     Worker(Worker),
     /// A client.
@@ -322,6 +326,7 @@ impl EntityPayload {
             Self::MemoryNote(_) => EntityKind::MemoryNote,
             Self::ChannelFile(_) => EntityKind::ChannelFile,
             Self::Routine(_) => EntityKind::Routine,
+            Self::RoutineRun(_) => EntityKind::RoutineRun,
             Self::Worker(_) => EntityKind::Worker,
             Self::Client(_) => EntityKind::Client,
             Self::SignIn(_) => EntityKind::SignIn,
@@ -352,6 +357,7 @@ impl EntityPayload {
             Self::MemoryNote(e) => memory_note_entity_id(e.scope, &e.path),
             Self::ChannelFile(e) => e.entity_id(),
             Self::Routine(e) => e.id.to_string(),
+            Self::RoutineRun(e) => e.entity_id(),
             Self::Worker(e) => e.id.to_string(),
             Self::Client(e) => e.id.to_string(),
             Self::SignIn(e) => e.id.to_string(),
@@ -378,6 +384,7 @@ impl EntityPayload {
             },
             Self::ChannelFile(e) => Some(e.channel_id),
             Self::Routine(e) => Some(e.channel_id),
+            Self::RoutineRun(e) => Some(e.channel_id),
             Self::Group(_)
             | Self::Repo(_)
             | Self::SessionItem(_)
@@ -1093,6 +1100,35 @@ pub struct MemoryList {
     /// Only this scope. Empty means every scope.
     #[serde(default)]
     pub scope: Option<MemoryScope>,
+    /// True lists only the notes in Recently deleted, newest deletion
+    /// first. False lists only the notes that are not deleted.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub deleted: bool,
+}
+
+/// `memory.restore`: brings a note back from Recently deleted, with its
+/// content and version as they were.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryRestore {
+    /// The scope.
+    pub scope: MemoryScope,
+    /// The path.
+    pub path: String,
+}
+
+/// `memory.move`: renames a note in its scope. The versions move with it.
+/// Fails with `stale_write` when the stored hash differs, and with
+/// `conflict` when a note that is not deleted has the new path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MemoryMove {
+    /// The scope.
+    pub scope: MemoryScope,
+    /// The current path.
+    pub from_path: String,
+    /// The new path. It must end in `.md`.
+    pub to_path: String,
+    /// The hash that the client read.
+    pub expected_sha256: Sha256Hash,
 }
 
 /// `memory.read`.
@@ -1230,6 +1266,9 @@ pub struct RoutineCreate {
 pub struct RoutineUpdate {
     /// The routine.
     pub routine_id: RoutineId,
+    /// Move the routine to this channel. Only a client may move a routine.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_id: Option<ChannelId>,
     /// The new name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -1647,6 +1686,10 @@ message_family! {
         MemoryDelete("memory.delete", MemoryDelete => Empty),
         /// A memory note's versions.
         MemoryHistory("memory.history", MemoryHistory => MemoryHistoryResult),
+        /// Bring a memory note back from Recently deleted.
+        MemoryRestore("memory.restore", MemoryRestore => MemoryNoteResult),
+        /// Rename a memory note.
+        MemoryMove("memory.move", MemoryMove => MemoryNoteResult),
         /// List channel files.
         FilesList("files.list", FilesList => FilesListResult),
         /// Add a channel file.
@@ -1972,10 +2015,37 @@ mod tests {
             version: 1,
             updated_by: MemoryAuthor::User,
             updated_at: Timestamp::from_millis(1),
+            suggested_by: None,
+            deleted_at: None,
         };
+        // A note that is not deleted and not from a suggestion leaves out
+        // the two fields, as an older hub wrote it.
+        let value = serde_json::to_value(&note).unwrap();
+        assert!(value.get("deleted_at").is_none() && value.get("suggested_by").is_none());
+        let mut kept = note.clone();
+        kept.suggested_by = Some(crate::turn_input::SuggestionSource::Channel(chn()));
+        kept.deleted_at = Some(Timestamp::from_millis(2));
+        let value = serde_json::to_value(&kept).unwrap();
+        assert_eq!(value["suggested_by"], chn().to_string());
+        assert_eq!(serde_json::from_value::<MemoryNote>(value).unwrap(), kept);
         let payload = EntityPayload::MemoryNote(note);
         assert_eq!(payload.entity_id(), "global:people/kevin.md");
         assert_eq!(payload.channel_id(), None);
+        let run = EntityPayload::RoutineRun(RoutineRun {
+            id: 12,
+            routine_id: "rtn_00000000-0000-0000-0000-000000000005".parse().unwrap(),
+            channel_id: chn(),
+            started_at: Timestamp::from_millis(1),
+            ended_at: None,
+            status: crate::model::RoutineRunStatus::Running,
+            manual: false,
+            message_id: None,
+            task_id: None,
+            error: None,
+        });
+        assert_eq!(run.entity_id(), "12");
+        assert_eq!(run.channel_id(), Some(chn()));
+        assert_eq!(run.kind(), EntityKind::RoutineRun);
         let marker = EntityPayload::ReadMarker(ReadMarker {
             channel_id: chn(),
             thread_root_id: None,
@@ -2226,6 +2296,7 @@ mod tests {
             .into(),
             MemoryList {
                 scope: Some(MemoryScope::Global),
+                deleted: true,
             }
             .into(),
             MemoryRead {
@@ -2249,6 +2320,18 @@ mod tests {
             MemoryHistory {
                 scope: MemoryScope::Global,
                 path: "a.md".into(),
+            }
+            .into(),
+            MemoryRestore {
+                scope: MemoryScope::Global,
+                path: "a.md".into(),
+            }
+            .into(),
+            MemoryMove {
+                scope: MemoryScope::Global,
+                from_path: "a.md".into(),
+                to_path: "b/a.md".into(),
+                expected_sha256: "a".repeat(64).parse().unwrap(),
             }
             .into(),
             FilesList {
@@ -2286,6 +2369,7 @@ mod tests {
             .into(),
             RoutineUpdate {
                 routine_id: rtn,
+                channel_id: Some(chn()),
                 name: None,
                 schedule: None,
                 prompt: None,

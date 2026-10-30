@@ -377,6 +377,10 @@ pub struct MemoryWriteArgs {
     pub content: String,
     /// The sha256 of the note that you read, or `not_exists` for a new note.
     pub expected_sha256: ExpectedHash,
+    /// When this write keeps a memory suggestion, the `from` of that
+    /// suggestion. The user then sees which task or channel suggested it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_suggestion: Option<crate::turn_input::SuggestionSource>,
 }
 
 /// `memory_delete`.
@@ -718,7 +722,7 @@ hub_tools! {
         "Get a thread: the root message and a page of its replies, oldest first. When has_more is true, older replies exist: call again with before set to the ID of the oldest reply that you got."),
     /// `memory_write`.
     MemoryWrite("memory_write", MemoryWriteArgs, COORDINATORS,
-        "Write a memory note in your own memory. Give the sha256 that you read, or not_exists for a new note. If the note changed since you read it, the write fails with stale_write: read it again and retry."),
+        "Write a memory note in your own memory. Give the sha256 that you read, or not_exists for a new note. If the note changed since you read it, the write fails with stale_write: read it again and retry. When the write keeps a memory suggestion, set from_suggestion to the suggestion's `from`. The user sees each write as a line in the channel."),
     /// `memory_delete`.
     MemoryDelete("memory_delete", MemoryDeleteArgs, COORDINATORS,
         "Delete a memory note in your own memory. Give the sha256 that you read."),
@@ -1563,6 +1567,20 @@ mod tests {
             write,
             HubToolCall::MemoryWrite(MemoryWriteArgs {
                 expected_sha256: ExpectedHash::NotExists,
+                from_suggestion: None,
+                ..
+            })
+        ));
+        let task = "tsk_00000000-0000-0000-0000-000000000003";
+        let kept = HubToolCall::parse(
+            "memory_write",
+            json!({"path": "a.md", "content": "A.", "expected_sha256": "not_exists", "from_suggestion": task}),
+        )
+        .unwrap();
+        assert!(matches!(
+            kept,
+            HubToolCall::MemoryWrite(MemoryWriteArgs {
+                from_suggestion: Some(crate::turn_input::SuggestionSource::Task(_)),
                 ..
             })
         ));

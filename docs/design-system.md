@@ -270,9 +270,22 @@ The sizes are in `component.files` of `structure.json`. The values come from the
 
 ### The Channel panel
 
-The `#` top action opens the Channel panel. It shares the right side with the Tasks panel: only one of them is open at a time. It is 400 px wide, with the channel name and purpose in its header, and the tabs Files, Routines and Memory. Routines and Memory come with phase 2. Until then their tabs are disabled, and they say "Comes with phase 2" on hover.
+The `#` top action opens the Channel panel. It shares the right side with the Tasks panel: only one of them is open at a time. It is 400 px wide, with the channel name and purpose in its header, and the tabs Files, Routines and Memory, each with its count. A routine or a memory note opens in place of the tabs, with a back button in the header.
 
 The Files tab lists folders first, then files, then a section Artifacts with one group per task (the status glyph, the task name and its status). Each row has the size in a `size_col` (64 px) column and the date ("Today" or "Oct 24") in a `date_col` (52 px) column. The row menu is Open, Download, Rename, Move, then Delete in `status.failed`, and Delete asks first. Upload and a drop on the panel put files in the open folder. An empty channel shows its empty state, which is also a drop zone. The list scrolls inside the panel with fades.
+
+### Routines and memory
+
+The sizes are in `component.knowledge` of `structure.json`. The values come from the phase 2 Paper artboards.
+
+- **A routine row** has the `routine` icon, three lines and a small switch: the name, the schedule in words with the action ("Every day at 17:30, asks the assistant"), and a `status_dot` (6 px) with the last result and the next run. The dot is `status.done` for a run that worked, `status.failed` for a failure (the result is `status.failed` too), `status.working` while a run runs, and a ring for a routine that is off ("Off. It does not run until you turn it on."). On hover the row is `surface.card` and shows Run now, Run history and the row menu. Its menu is Run now, Run history, Edit, Turn off (Turn on), then Delete in `status.failed`.
+- **The small switch** is `switch_w` by `switch_h` (32 by 18 px) with a `switch_thumb` (14 px) thumb: `accent.text` with an `accent.on_fill` thumb when on, `border.strong` with a `text.tertiary` thumb when off.
+- **A routine opened in the panel** shows its summary with a `summary_label` (80 px) label column, Run now and Edit, and the run history of the last 30 days. A run row has the result glyph, the time (with "Run now" for a manual run), the result word, a `run_duration` (64 px) column and a `run_link` (76 px) column with Message or Task. A failed run is on `surface.card` and shows its error as selectable text.
+- **The routine dialog** is `layout.dialog_wide` (560 px). Name and a `channel_field` (190 px) Channel select share a row. The schedule presets are round chips: `accent.text` border and text on `tint.accent` when chosen. The time field is `time_field` (84 px), the interval field `every_field` (72 px) with a `unit_field` (120 px) select, and a Weekly day is a `day_button` (50 px). The time zone select opens a `zone_popover` (340 px) with a search and a `zone_list` (280 px) list, and the date field opens a calendar of `calendar_cell` (32 px) days. Each error sits under its field in `status.failed` with the `failed` glyph. Save stays off while a field has an error.
+- **The memory tree** indents one `tree_indent` (22 px) per folder level. Note names are mono. A note that the assistant just changed has a `status_dot` in `accent.text` and "Just now".
+- **The note editor** is mono on `surface.canvas`, at least `editor_min_height` (320 px). The stale-write message is on `tint.failed` with a `status.failed` border at `opacity.failed_border`. It keeps the text and offers Load the new version and Save my version.
+- **The version history** has a `version_list` (240 px) list and a preview. A changed line has a `change_bar` (3 px) bar in `status.working` on `tint.working`, not red or green, because a change is not an error.
+- **The memory saved line** sits in the assistant lane: the `memory` icon at `line_icon` (14 px), the words in `text.tertiary` and the note path in mono as a link.
 
 Settings > Workers uses these sizes from `component` in `structure.json`:
 

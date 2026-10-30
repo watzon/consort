@@ -1386,6 +1386,10 @@ pub fn view_state() -> ViewState {
         uploads: Vec::new(),
         channel_files: crate::mock_files::channel_files(),
         files_loaded: vec![text(LIGHTS), text(EXT4)],
+        routines: crate::mock_routines::routines(),
+        memory_notes: crate::mock_routines::memory_notes(),
+        memory_loaded: vec![text(crate::memory::GLOBAL), text(LIGHTS), text(SAYSO)],
+        memory_deleted_loaded: vec![text(crate::memory::GLOBAL), text(LIGHTS), text(SAYSO)],
     };
     stamp_times(&mut state.timelines);
     if let Some(account) = state

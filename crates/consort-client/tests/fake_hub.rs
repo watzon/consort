@@ -137,6 +137,24 @@ struct Hub {
     sent_attachments: Vec<Vec<consort_proto::model::BlobRef>>,
     /// The channel files.
     files: Vec<consort_proto::model::ChannelFile>,
+    /// The routines and their runs.
+    routines: Vec<consort_proto::model::Routine>,
+    runs: Vec<consort_proto::model::RoutineRun>,
+    /// The memory notes, also the deleted ones, and every version.
+    notes: Vec<consort_proto::model::MemoryNote>,
+    versions: Vec<consort_proto::model::MemoryNote>,
+}
+
+fn note_hash(content: &str) -> consort_proto::model::Sha256Hash {
+    use sha2::{Digest, Sha256};
+    consort_proto::model::Sha256Hash::from_bytes(Sha256::digest(content.as_bytes()).into())
+}
+
+fn stale() -> ErrorBody {
+    ErrorBody::new(
+        ErrorCode::StaleWrite,
+        "The note changed since you read it. Read it again, then retry the write.",
+    )
 }
 
 /// What the real hub writes at the end of a cut text.
@@ -810,6 +828,7 @@ async fn session(hub: Shared, mut socket: WebSocket) {
                             tasks_cut,
                             tasks_has_more,
                             approvals: h.approval.clone().into_iter().collect(),
+                            routines: h.routines.clone(),
                             ..Snapshot::default()
                         })
                         .unwrap()
@@ -959,6 +978,226 @@ async fn session(hub: Shared, mut socket: WebSocket) {
                         "That file does not exist.",
                     )),
                 }
+            }
+            "routine.create" => {
+                let body: api::RoutineCreate = req.decode_as().unwrap();
+                let mut h = hub.lock().unwrap();
+                let routine = consort_proto::model::Routine {
+                    id: consort_proto::ids::RoutineId::new(),
+                    channel_id: body.channel_id,
+                    name: body.name,
+                    schedule: body.schedule,
+                    prompt: body.prompt,
+                    action: body.action,
+                    enabled: body.enabled,
+                    next_run_at: Some(ts(Timestamp::now().as_millis() + 3_600_000)),
+                    last_run_at: None,
+                    last_run_status: None,
+                };
+                h.routines.push(routine.clone());
+                req.respond_ok(&consort_proto::tools::RoutineResult {
+                    routine,
+                    notes: Vec::new(),
+                })
+                .unwrap()
+            }
+            "routine.update" => {
+                let body: api::RoutineUpdate = req.decode_as().unwrap();
+                let mut h = hub.lock().unwrap();
+                let routine = h
+                    .routines
+                    .iter_mut()
+                    .find(|r| r.id == body.routine_id)
+                    .unwrap();
+                if let Some(enabled) = body.enabled {
+                    routine.enabled = enabled;
+                }
+                if let Some(name) = body.name {
+                    routine.name = name;
+                }
+                if let Some(channel_id) = body.channel_id {
+                    routine.channel_id = channel_id;
+                }
+                let routine = routine.clone();
+                req.respond_ok(&consort_proto::tools::RoutineResult {
+                    routine,
+                    notes: Vec::new(),
+                })
+                .unwrap()
+            }
+            "routine.delete" => {
+                let body: api::RoutineDelete = req.decode_as().unwrap();
+                let mut h = hub.lock().unwrap();
+                h.routines.retain(|r| r.id != body.routine_id);
+                req.respond_ok(&Empty {}).unwrap()
+            }
+            "routine.runs" => {
+                let body: api::RoutineRuns = req.decode_as().unwrap();
+                let h = hub.lock().unwrap();
+                let mut runs: Vec<_> = h
+                    .runs
+                    .iter()
+                    .filter(|r| r.routine_id == body.routine_id)
+                    .cloned()
+                    .collect();
+                runs.reverse();
+                req.respond_ok(&api::RoutineRunsResult { runs }).unwrap()
+            }
+            "routine.run_now" => {
+                // The run starts, then its turn ends: two feed entries after
+                // the answer.
+                let body: api::RoutineRunNow = req.decode_as().unwrap();
+                let events = {
+                    let mut h = hub.lock().unwrap();
+                    let routine = h
+                        .routines
+                        .iter()
+                        .find(|r| r.id == body.routine_id)
+                        .cloned()
+                        .unwrap();
+                    let mut run = consort_proto::model::RoutineRun {
+                        id: h.runs.len() as u64 + 1,
+                        routine_id: routine.id,
+                        channel_id: routine.channel_id,
+                        started_at: Timestamp::now(),
+                        ended_at: None,
+                        status: consort_proto::model::RoutineRunStatus::Running,
+                        manual: true,
+                        message_id: None,
+                        task_id: None,
+                        error: None,
+                    };
+                    let started = feed(&mut h, EntityPayload::RoutineRun(run.clone()));
+                    run.status = consort_proto::model::RoutineRunStatus::Ok;
+                    run.ended_at = Some(Timestamp::now());
+                    run.message_id = Some(MessageId::new());
+                    h.runs.push(run.clone());
+                    let ended = feed(&mut h, EntityPayload::RoutineRun(run));
+                    vec![started, ended]
+                };
+                send(&mut socket, req.respond_ok(&Empty {}).unwrap()).await;
+                for event in events {
+                    send(&mut socket, event).await;
+                }
+                continue;
+            }
+            "memory.list" => {
+                let body: api::MemoryList = req.decode_as().unwrap();
+                let h = hub.lock().unwrap();
+                let notes = h
+                    .notes
+                    .iter()
+                    .filter(|n| body.scope.is_none_or(|s| s == n.scope))
+                    .filter(|n| n.deleted_at.is_some() == body.deleted)
+                    .map(|n| n.summary())
+                    .collect();
+                req.respond_ok(&consort_proto::tools::MemoryListResult { notes })
+                    .unwrap()
+            }
+            "memory.read" => {
+                let body: api::MemoryRead = req.decode_as().unwrap();
+                let h = hub.lock().unwrap();
+                match h.notes.iter().find(|n| {
+                    n.scope == body.scope && n.path == body.path && n.deleted_at.is_none()
+                }) {
+                    Some(note) => req
+                        .respond_ok(&api::MemoryNoteResult { note: note.clone() })
+                        .unwrap(),
+                    None => req.respond_error(ErrorBody::new(ErrorCode::NotFound, "No note.")),
+                }
+            }
+            "memory.write" => {
+                let body: api::MemoryWrite = req.decode_as().unwrap();
+                let mut h = hub.lock().unwrap();
+                let current = h
+                    .notes
+                    .iter()
+                    .find(|n| {
+                        n.scope == body.scope && n.path == body.path && n.deleted_at.is_none()
+                    })
+                    .map(|n| n.sha256.clone());
+                if !body.expected_sha256.matches(current.as_ref()) {
+                    req.respond_error(stale())
+                } else {
+                    let version = h
+                        .versions
+                        .iter()
+                        .filter(|v| v.scope == body.scope && v.path == body.path)
+                        .count() as u64
+                        + 1;
+                    let note = consort_proto::model::MemoryNote {
+                        scope: body.scope,
+                        path: body.path.clone(),
+                        sha256: note_hash(&body.content),
+                        content: body.content,
+                        version,
+                        updated_by: consort_proto::model::MemoryAuthor::User,
+                        updated_at: Timestamp::now(),
+                        suggested_by: None,
+                        deleted_at: None,
+                    };
+                    h.notes
+                        .retain(|n| !(n.scope == body.scope && n.path == body.path));
+                    h.notes.push(note.clone());
+                    h.versions.push(note.clone());
+                    req.respond_ok(&api::MemoryNoteResult { note }).unwrap()
+                }
+            }
+            "memory.delete" => {
+                let body: api::MemoryDelete = req.decode_as().unwrap();
+                let event = {
+                    let mut h = hub.lock().unwrap();
+                    let note = h
+                        .notes
+                        .iter_mut()
+                        .find(|n| n.scope == body.scope && n.path == body.path)
+                        .unwrap();
+                    note.deleted_at = Some(Timestamp::now());
+                    let note = note.clone();
+                    feed(&mut h, EntityPayload::MemoryNote(note))
+                };
+                send(&mut socket, req.respond_ok(&Empty {}).unwrap()).await;
+                event
+            }
+            "memory.restore" => {
+                let body: api::MemoryRestore = req.decode_as().unwrap();
+                let mut h = hub.lock().unwrap();
+                let note = h
+                    .notes
+                    .iter_mut()
+                    .find(|n| n.scope == body.scope && n.path == body.path)
+                    .unwrap();
+                note.deleted_at = None;
+                let note = note.clone();
+                req.respond_ok(&api::MemoryNoteResult { note }).unwrap()
+            }
+            "memory.move" => {
+                let body: api::MemoryMove = req.decode_as().unwrap();
+                let mut h = hub.lock().unwrap();
+                let note = h
+                    .notes
+                    .iter_mut()
+                    .find(|n| n.scope == body.scope && n.path == body.from_path)
+                    .unwrap();
+                note.path = body.to_path.clone();
+                let note = note.clone();
+                for v in h.versions.iter_mut().filter(|v| v.path == body.from_path) {
+                    v.path = body.to_path.clone();
+                }
+                req.respond_ok(&api::MemoryNoteResult { note }).unwrap()
+            }
+            "memory.history" => {
+                let body: api::MemoryHistory = req.decode_as().unwrap();
+                let h = hub.lock().unwrap();
+                let mut versions: Vec<_> = h
+                    .versions
+                    .iter()
+                    .filter(|v| v.scope == body.scope && v.path == body.path)
+                    .cloned()
+                    .collect();
+                versions.reverse();
+                req.respond_ok(&api::MemoryHistoryResult { versions })
+                    .unwrap()
             }
             "files.delete" => {
                 let body: api::FilesDelete = req.decode_as().unwrap();
@@ -4761,4 +5000,216 @@ async fn a_skill_zip_goes_up_before_the_preview() {
         .unwrap_err();
     assert!(err.to_string().contains("not a zip file"), "{err}");
     assert_eq!(blob_log(&hub).len(), before);
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2: routines and memory.
+
+fn tutti_channel_id(client: &Client) -> String {
+    tutti_id(client)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn routines_save_run_turn_off_and_delete_with_their_runs_in_the_view() {
+    let (url, hub) = start_hub().await;
+    let dir = tempfile::tempdir().unwrap();
+    let client = paired_client(&url, dir.path(), options(quick())).await;
+    let channel = tutti_channel_id(&client);
+
+    let mut form =
+        consort_client::routines::RoutineForm::new(&channel, consort_client::format::now_ms());
+    form.name = "Sunset check".into();
+    form.prompt = "Check the sunset time.".into();
+    form.schedule.time = "17:30".into();
+    form.schedule.time_zone = "Europe/Berlin".into();
+    let saved = client
+        .run_for(Command::SaveRoutine {
+            routine_id: None,
+            form,
+        })
+        .await
+        .unwrap();
+    let consort_client::CommandOutput::RoutineSaved(id) = saved else {
+        panic!("no routine ID");
+    };
+    {
+        let h = hub.lock().unwrap();
+        assert_eq!(h.routines.len(), 1);
+        assert_eq!(
+            h.routines[0].schedule,
+            consort_proto::model::RoutineSchedule::Cron {
+                expression: "30 17 * * *".into(),
+                time_zone: "Europe/Berlin".into(),
+            }
+        );
+    }
+    let state = wait_for(&client, "the routine", |s| s.routines.len() == 1).await;
+    assert_eq!(state.routines[0].name, "Sunset check");
+
+    // The runs load, then Run now brings a run that starts and ends.
+    client
+        .run(Command::LoadRoutineRuns {
+            routine_id: id.clone(),
+        })
+        .await
+        .unwrap();
+    client
+        .run(Command::RunRoutineNow {
+            routine_id: id.clone(),
+        })
+        .await
+        .unwrap();
+    let state = wait_for(&client, "the run", |s| {
+        s.routines.first().is_some_and(|r| {
+            r.runs_loaded
+                && r.runs.len() == 1
+                && r.runs[0].status == consort_proto::model::RoutineRunStatus::Ok
+        })
+    })
+    .await;
+    assert!(state.routines[0].runs[0].manual);
+    assert!(state.routines[0].runs[0].message_id.is_some());
+
+    client
+        .run(Command::SetRoutineEnabled {
+            routine_id: id.clone(),
+            enabled: false,
+        })
+        .await
+        .unwrap();
+    wait_for(&client, "the routine off", |s| {
+        s.routines.first().is_some_and(|r| !r.enabled)
+    })
+    .await;
+    client
+        .run(Command::DeleteRoutine { routine_id: id })
+        .await
+        .unwrap();
+    wait_for(&client, "no routine", |s| s.routines.is_empty()).await;
+    assert!(hub.lock().unwrap().routines.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn memory_loads_writes_with_the_stale_check_and_comes_back_from_recently_deleted() {
+    let (url, _hub) = start_hub().await;
+    let dir = tempfile::tempdir().unwrap();
+    let client = paired_client(&url, dir.path(), options(quick())).await;
+    let global = consort_client::memory::GLOBAL.to_owned();
+
+    client
+        .run(Command::LoadMemory {
+            scope: global.clone(),
+            deleted: false,
+        })
+        .await
+        .unwrap();
+    let write = |content: &str, expected: Option<String>| Command::WriteMemoryNote {
+        scope: global.clone(),
+        path: "people/kevin".into(),
+        content: content.into(),
+        expected_sha256: expected,
+    };
+    let consort_client::CommandOutput::MemoryNote(first) =
+        client.run_for(write("Kevin.", None)).await.unwrap()
+    else {
+        panic!("no note");
+    };
+    assert_eq!(first.path, "people/kevin.md");
+    let state = wait_for(&client, "the note", |s| {
+        s.memory_notes.iter().any(|n| n.path == "people/kevin.md")
+    })
+    .await;
+    assert!(state.memory_loaded.contains(&global));
+
+    // A second writer saved first: the old hash is stale, and the hub says so.
+    client
+        .run(write("Kevin likes tea.", Some(first.sha256.clone())))
+        .await
+        .unwrap();
+    let stale = client
+        .run(write("Kevin likes coffee.", Some(first.sha256.clone())))
+        .await
+        .unwrap_err();
+    assert!(matches!(stale, ClientError::Hub { ref code, .. } if code == "stale_write"));
+
+    // The history has both versions, newest first.
+    let consort_client::CommandOutput::MemoryHistory(versions) = client
+        .run_for(Command::LoadMemoryHistory {
+            scope: global.clone(),
+            path: "people/kevin.md".into(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("no history");
+    };
+    assert_eq!(versions.len(), 2);
+    assert_eq!(versions[0].content.as_deref(), Some("Kevin likes tea."));
+
+    // Delete moves it to Recently deleted. Restore brings it back.
+    let consort_client::CommandOutput::MemoryNote(current) = client
+        .run_for(Command::ReadMemoryNote {
+            scope: global.clone(),
+            path: "people/kevin.md".into(),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("no note");
+    };
+    client
+        .run(Command::DeleteMemoryNote {
+            scope: global.clone(),
+            path: "people/kevin.md".into(),
+            sha256: current.sha256.clone(),
+        })
+        .await
+        .unwrap();
+    wait_for(&client, "the deleted note", |s| {
+        s.memory_notes
+            .iter()
+            .any(|n| n.path == "people/kevin.md" && n.deleted_at.is_some())
+    })
+    .await;
+    client
+        .run(Command::LoadMemory {
+            scope: global.clone(),
+            deleted: true,
+        })
+        .await
+        .unwrap();
+    client
+        .run(Command::RestoreMemoryNote {
+            scope: global.clone(),
+            path: "people/kevin.md".into(),
+        })
+        .await
+        .unwrap();
+    wait_for(&client, "the restored note", |s| {
+        s.memory_notes
+            .iter()
+            .any(|n| n.path == "people/kevin.md" && n.deleted_at.is_none())
+    })
+    .await;
+
+    // A rename moves it.
+    client
+        .run(Command::MoveMemoryNote {
+            scope: global.clone(),
+            from_path: "people/kevin.md".into(),
+            to_path: "family/kevin.md".into(),
+            sha256: current.sha256,
+        })
+        .await
+        .unwrap();
+    let state = wait_for(&client, "the moved note", |s| {
+        s.memory_notes.iter().any(|n| n.path == "family/kevin.md")
+    })
+    .await;
+    assert!(
+        !state
+            .memory_notes
+            .iter()
+            .any(|n| n.path == "people/kevin.md")
+    );
 }

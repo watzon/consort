@@ -80,6 +80,7 @@ impl Hub {
             None => Vec::new(),
         };
         let update = RoutineUpdate {
+            channel_id: None,
             routine_id: args.routine_id,
             name: args.name,
             schedule: args.schedule,

@@ -696,6 +696,33 @@ pub fn notice_parts(body: &str) -> (String, String) {
     }
 }
 
+/// The note of a `memory_saved` notice body (protocol.md, "The memory
+/// saved line"). `None` when the body does not name a note.
+pub fn memory_saved(body: &str) -> Option<crate::view::MemorySavedView> {
+    #[derive(serde::Deserialize)]
+    struct Parsed {
+        scope: String,
+        path: String,
+        #[serde(default)]
+        version: u64,
+        #[serde(default)]
+        created: bool,
+        #[serde(default)]
+        suggested_by_name: Option<String>,
+    }
+    let parsed: Parsed = serde_json::from_str(body).ok()?;
+    if parsed.path.is_empty() {
+        return None;
+    }
+    Some(crate::view::MemorySavedView {
+        scope: parsed.scope,
+        path: parsed.path,
+        version: parsed.version,
+        created: parsed.created,
+        suggested_by: parsed.suggested_by_name.unwrap_or_default(),
+    })
+}
+
 fn speaker(m: &model::Message) -> Speaker {
     match m.author {
         Author::User => Speaker::You,
@@ -807,6 +834,119 @@ fn attachment_views(
 }
 
 /// The files of the loaded channels, for the Files tab.
+/// The routines, by channel and then by name.
+fn routine_views(cache: &Cache) -> Vec<crate::routines::RoutineView> {
+    use crate::routines::{RoutineActionView, RoutineRunView, RoutineView};
+    let mut out: Vec<RoutineView> = cache
+        .routines
+        .values()
+        .map(|r| {
+            let id = r.id.to_string();
+            let runs = cache
+                .routine_runs
+                .get(&id)
+                .map(|runs| {
+                    runs.values()
+                        .rev()
+                        .map(|run| RoutineRunView {
+                            id: run.id,
+                            routine_id: id.clone(),
+                            started_at: run.started_at.as_millis(),
+                            ended_at: run.ended_at.map(|t| t.as_millis()),
+                            status: run.status,
+                            manual: run.manual,
+                            message_id: run.message_id.map(|m| m.to_string()),
+                            task_id: run.task_id.map(|t| t.to_string()),
+                            error: run.error.clone(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            RoutineView {
+                runs_loaded: cache.runs_loaded.contains(&id),
+                id,
+                channel_id: r.channel_id.to_string(),
+                name: r.name.clone(),
+                enabled: r.enabled,
+                schedule: r.schedule.clone(),
+                prompt: r.prompt.clone(),
+                action: match &r.action {
+                    model::RoutineAction::CoordinatorTurn => RoutineActionView::Ask,
+                    model::RoutineAction::StartTask {
+                        title,
+                        model_selection,
+                        ..
+                    } => RoutineActionView::Task {
+                        title: title.clone(),
+                        selection: model_selection.as_ref().map(|s| selection_view(cache, s)),
+                    },
+                },
+                next_run_at: r.next_run_at.map(|t| t.as_millis()),
+                last_run_at: r.last_run_at.map(|t| t.as_millis()),
+                last_run_status: r.last_run_status,
+                runs,
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        (&a.channel_id, a.name.to_lowercase(), &a.id).cmp(&(
+            &b.channel_id,
+            b.name.to_lowercase(),
+            &b.id,
+        ))
+    });
+    out
+}
+
+/// The title of a task or the name of a channel that made a memory
+/// suggestion. Empty when the cache does not hold it.
+fn suggestion_name(cache: &Cache, source: &consort_proto::turn_input::SuggestionSource) -> String {
+    use consort_proto::turn_input::SuggestionSource;
+    match source {
+        SuggestionSource::Task(id) => cache
+            .tasks
+            .get(&id.to_string())
+            .map(|t| t.title.clone())
+            .unwrap_or_default(),
+        SuggestionSource::Channel(id) => cache
+            .channels
+            .get(&id.to_string())
+            .map(shown_name)
+            .unwrap_or_default(),
+    }
+}
+
+/// The memory notes in the cache, as views.
+fn memory_note_views(cache: &Cache) -> Vec<crate::memory::MemoryNoteView> {
+    cache
+        .memory_notes
+        .values()
+        .map(|cached| memory_note_view(cache, &cached.note, cached.has_content))
+        .collect()
+}
+
+/// One memory note as a view. `has_content` says whether `note.content` is
+/// its text.
+pub(crate) fn memory_note_view(
+    cache: &Cache,
+    note: &model::MemoryNote,
+    has_content: bool,
+) -> crate::memory::MemoryNoteView {
+    crate::memory::MemoryNoteView {
+        scope: note.scope.to_string(),
+        path: note.path.clone(),
+        content: has_content.then(|| note.content.clone()),
+        sha256: note.sha256.to_string(),
+        version: note.version,
+        by_user: note.updated_by == model::MemoryAuthor::User,
+        updated_at: note.updated_at.as_millis(),
+        suggested_by: note
+            .suggested_by
+            .map(|source| (source.to_string(), suggestion_name(cache, &source))),
+        deleted_at: note.deleted_at.map(|t| t.as_millis()),
+    }
+}
+
 fn channel_file_views(cache: &Cache, now: i64) -> Vec<crate::files::ChannelFileView> {
     cache
         .channel_files
@@ -1139,12 +1279,16 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                 }));
             } else if m.kind == MessageKind::Notice {
                 let (kind, text) = notice_parts(&m.body);
+                let memory = (kind == "memory_saved")
+                    .then(|| memory_saved(&m.body))
+                    .flatten();
                 items.push(TimelineItem::Notice(NoticeView {
                     message_id: m.id.to_string(),
                     time_label: format::time_label(at),
                     created_at: at,
                     kind,
                     text,
+                    memory,
                 }));
             } else {
                 items.push(TimelineItem::Message(MessageView {
@@ -1605,6 +1749,10 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
         uploads: Vec::new(),
         channel_files: channel_file_views(cache, now),
         files_loaded: cache.files_loaded.iter().cloned().collect(),
+        routines: routine_views(cache),
+        memory_notes: memory_note_views(cache),
+        memory_loaded: cache.memory_loaded.iter().cloned().collect(),
+        memory_deleted_loaded: cache.memory_deleted_loaded.iter().cloned().collect(),
     };
     state.activity = channel_activities(cache, &state);
     // Collapsed groups and unread counts come from the hub, so seed the

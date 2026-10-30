@@ -11,6 +11,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use super::common::{Sha256Hash, ValidationError, validate_relative_path};
 use crate::ids::{ChannelId, SessionId, TaskId};
 use crate::time::Timestamp;
+use crate::turn_input::SuggestionSource;
 
 /// Where a memory note lives: global memory, or one channel's memory.
 /// Serialized as `"global"` or a channel ID.
@@ -129,7 +130,20 @@ pub struct MemoryNote {
     pub updated_by: MemoryAuthor,
     /// When.
     pub updated_at: Timestamp,
+    /// The task or channel whose memory suggestion this version keeps.
+    /// Empty when the version did not come from a suggestion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggested_by: Option<SuggestionSource>,
+    /// When the user or the assistant deleted the note. A deleted note
+    /// stays in Recently deleted for [`MEMORY_DELETED_KEEP_DAYS`] days, and
+    /// `memory.restore` brings it back. Sessions do not see it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deleted_at: Option<Timestamp>,
 }
+
+/// How many days a deleted memory note stays in Recently deleted. Then the
+/// hub removes it and its versions.
+pub const MEMORY_DELETED_KEEP_DAYS: i64 = 30;
 
 impl MemoryNote {
     /// The note without its content.
@@ -141,6 +155,8 @@ impl MemoryNote {
             version: self.version,
             updated_by: self.updated_by,
             updated_at: self.updated_at,
+            suggested_by: self.suggested_by,
+            deleted_at: self.deleted_at,
         }
     }
 
@@ -170,6 +186,12 @@ pub struct MemoryNoteSummary {
     pub updated_by: MemoryAuthor,
     /// When.
     pub updated_at: Timestamp,
+    /// The source of the memory suggestion that this version keeps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggested_by: Option<SuggestionSource>,
+    /// When the note was deleted. Set only in the list of Recently deleted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deleted_at: Option<Timestamp>,
 }
 
 /// The hash that a write expects: the stored note's hash, or `not_exists`

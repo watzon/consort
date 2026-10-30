@@ -9,8 +9,9 @@ use consort_proto::{
     ids::{ChannelId, TaskId},
     model::{
         AcpRegistryAgent, Approval, BlobRef, Channel, ChannelFile, Connection, Decision, Group,
-        ItemPayload, Message, MessageKind, PREFERENCES_ENTITY_ID, Preferences, ReadMarker, Repo,
-        SessionItem, SignIn, Skill, Task, Worker,
+        ItemPayload, MemoryNote, MemoryNoteSummary, Message, MessageKind, PREFERENCES_ENTITY_ID,
+        Preferences, ReadMarker, Repo, Routine, RoutineRun, SessionItem, SignIn, Skill, Task,
+        Worker,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -91,6 +92,22 @@ pub struct Cache {
     /// The channels whose files are in the cache: from a channel snapshot
     /// or from `files.list`.
     pub files_loaded: BTreeSet<String>,
+    /// Every routine, by ID, from the snapshots and the feed.
+    pub routines: BTreeMap<String, Routine>,
+    /// The runs of the routines whose runs are loaded, by routine ID and run
+    /// number.
+    pub routine_runs: BTreeMap<String, BTreeMap<u64, RoutineRun>>,
+    /// The routines whose runs are in the cache, from `routine.runs`. Feed
+    /// entries for the runs of other routines are dropped, so a partial
+    /// list never looks whole.
+    pub runs_loaded: BTreeSet<String>,
+    /// The memory notes of the loaded scopes, by feed entity ID
+    /// (`<scope>:<path>`). A note in Recently deleted has `deleted_at`.
+    pub memory_notes: BTreeMap<String, CachedNote>,
+    /// The memory scopes (`global` or a channel ID) whose notes are loaded.
+    pub memory_loaded: BTreeSet<String>,
+    /// The scopes whose Recently deleted notes are loaded.
+    pub memory_deleted_loaded: BTreeSet<String>,
     /// The blobs in the local blob cache: the hash and the file.
     pub local_blobs: BTreeMap<String, String>,
     pub tasks: BTreeMap<String, Task>,
@@ -151,6 +168,41 @@ pub struct Cache {
     /// What the client asked the hub about connectors and skills. These are
     /// not feed entities, so a reload keeps them.
     pub extensions: Extensions,
+}
+
+/// A memory note in the cache. A list gives only the summary, so the text
+/// is there only after a read, a write or a feed entry.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CachedNote {
+    pub note: MemoryNote,
+    /// `note.content` is the text of `note.sha256`.
+    pub has_content: bool,
+}
+
+impl CachedNote {
+    fn full(note: MemoryNote) -> Self {
+        Self {
+            note,
+            has_content: true,
+        }
+    }
+
+    fn summary(summary: MemoryNoteSummary) -> Self {
+        Self {
+            note: MemoryNote {
+                scope: summary.scope,
+                path: summary.path,
+                content: String::new(),
+                sha256: summary.sha256,
+                version: summary.version,
+                updated_by: summary.updated_by,
+                updated_at: summary.updated_at,
+                suggested_by: summary.suggested_by,
+                deleted_at: summary.deleted_at,
+            },
+            has_content: false,
+        }
+    }
 }
 
 /// The parts of the connector and skill views that the client loads on
@@ -345,6 +397,23 @@ impl Cache {
         let prefix = format!("{id}:");
         self.channel_files.retain(|k, _| !k.starts_with(&prefix));
         self.files_loaded.remove(id);
+        let gone: Vec<String> = self
+            .routines
+            .iter()
+            .filter(|(_, r)| in_channel(&r.channel_id))
+            .map(|(k, _)| k.clone())
+            .collect();
+        for routine in gone {
+            removed = true;
+            self.routines.remove(&routine);
+            self.routine_runs.remove(&routine);
+            self.runs_loaded.remove(&routine);
+        }
+        let before = self.memory_notes.len();
+        self.memory_notes.retain(|k, _| !k.starts_with(&prefix));
+        removed |= self.memory_notes.len() != before;
+        self.memory_loaded.remove(id);
+        self.memory_deleted_loaded.remove(id);
         self.messages.retain(|_, m| {
             let keep = !in_channel(&m.channel_id);
             if !keep {
@@ -486,6 +555,9 @@ impl Cache {
         snapshot
             .channel_files
             .retain(|f| !self.changed_after(EntityKind::ChannelFile, &f.entity_id(), at));
+        snapshot
+            .routines
+            .retain(|r| !self.changed_after(EntityKind::Routine, &r.id.to_string(), at));
         if self.changed_after(EntityKind::Preferences, PREFERENCES_ENTITY_ID, at) {
             snapshot.preferences = None;
         }
@@ -587,6 +659,87 @@ impl Cache {
                 self.channel_files.insert(f.entity_id(), f);
             }
         }
+        for r in snapshot.routines {
+            self.routines.insert(r.id.to_string(), r);
+        }
+    }
+
+    /// Replaces the runs of a routine with the answer to `routine.runs`. A
+    /// feed entry that changed a run after `asked_at` wins.
+    pub fn load_routine_runs(&mut self, routine_id: &str, runs: Vec<RoutineRun>, asked_at: u64) {
+        let kept: BTreeMap<u64, RoutineRun> = self
+            .routine_runs
+            .remove(routine_id)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(id, _)| self.changed_after(EntityKind::RoutineRun, &id.to_string(), asked_at))
+            .collect();
+        let mut fresh: BTreeMap<u64, RoutineRun> = runs.into_iter().map(|r| (r.id, r)).collect();
+        fresh.extend(kept);
+        self.routine_runs.insert(routine_id.to_owned(), fresh);
+        self.runs_loaded.insert(routine_id.to_owned());
+    }
+
+    /// Replaces the notes of a scope with the answer to `memory.list`: the
+    /// notes that are not deleted, or (with `deleted`) the ones in Recently
+    /// deleted. A feed entry that changed a note after `asked_at` wins. A
+    /// note keeps its text when its hash did not change.
+    pub fn load_memory(
+        &mut self,
+        scope: &str,
+        notes: Vec<MemoryNoteSummary>,
+        deleted: bool,
+        asked_at: u64,
+    ) {
+        let prefix = format!("{scope}:");
+        let fresh: BTreeSet<String> = notes
+            .iter()
+            .map(|n| consort_proto::model::memory_note_entity_id(n.scope, &n.path))
+            .collect();
+        let stale: Vec<String> = self
+            .memory_notes
+            .iter()
+            .filter(|(k, n)| {
+                k.starts_with(&prefix)
+                    && n.note.deleted_at.is_some() == deleted
+                    && !fresh.contains(*k)
+                    && !self.changed_after(EntityKind::MemoryNote, k, asked_at)
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
+        for key in stale {
+            self.memory_notes.remove(&key);
+        }
+        for summary in notes {
+            let key = consort_proto::model::memory_note_entity_id(summary.scope, &summary.path);
+            if self.changed_after(EntityKind::MemoryNote, &key, asked_at) {
+                continue;
+            }
+            let mut cached = CachedNote::summary(summary);
+            if let Some(old) = self.memory_notes.get(&key)
+                && old.has_content
+                && old.note.sha256 == cached.note.sha256
+            {
+                cached.note.content = old.note.content.clone();
+                cached.has_content = true;
+            }
+            self.memory_notes.insert(key, cached);
+        }
+        if deleted {
+            self.memory_deleted_loaded.insert(scope.to_owned());
+        } else {
+            self.memory_loaded.insert(scope.to_owned());
+        }
+    }
+
+    /// Adds or replaces one full note, as from `memory.read`, `memory.write`
+    /// or `memory.restore`, unless a feed entry changed it after `asked_at`.
+    pub fn merge_memory_note(&mut self, note: MemoryNote, asked_at: u64) {
+        let key = note.entity_id();
+        if self.changed_after(EntityKind::MemoryNote, &key, asked_at) {
+            return;
+        }
+        self.memory_notes.insert(key, CachedNote::full(note));
     }
 
     /// Adds or replaces one connection, as from the answer to
@@ -828,7 +981,41 @@ impl Cache {
                     }
                     self.channel_files.insert(key, file);
                 }
-                // Memory notes, routines and clients have no view yet.
+                EntityPayload::Routine(routine) => {
+                    let id = routine.id.to_string();
+                    if self.routines.get(&id) == Some(&routine) {
+                        return false;
+                    }
+                    self.routines.insert(id, routine);
+                }
+                EntityPayload::RoutineRun(run) => {
+                    // Only the runs of a routine whose runs are loaded.
+                    let routine = run.routine_id.to_string();
+                    if !self.runs_loaded.contains(&routine) {
+                        return false;
+                    }
+                    let runs = self.routine_runs.entry(routine).or_default();
+                    if runs.get(&run.id) == Some(&run) {
+                        return false;
+                    }
+                    runs.insert(run.id, run);
+                }
+                EntityPayload::MemoryNote(note) => {
+                    // Only the notes of a scope whose notes are loaded.
+                    let scope = note.scope.to_string();
+                    let list = if note.deleted_at.is_some() {
+                        &self.memory_deleted_loaded
+                    } else {
+                        &self.memory_loaded
+                    };
+                    if !list.contains(&scope) && !self.memory_notes.contains_key(&note.entity_id())
+                    {
+                        return false;
+                    }
+                    self.memory_notes
+                        .insert(note.entity_id(), CachedNote::full(note));
+                }
+                // Clients have no view yet.
                 _ => return false,
             },
             FeedChange::Delete(kind) => {
@@ -850,6 +1037,17 @@ impl Cache {
                     EntityKind::Connection => self.connections.remove(id).is_some(),
                     EntityKind::Skill => self.skills.remove(id).is_some(),
                     EntityKind::ChannelFile => self.channel_files.remove(id).is_some(),
+                    EntityKind::Routine => {
+                        self.routine_runs.remove(id);
+                        self.runs_loaded.remove(id);
+                        self.routines.remove(id).is_some()
+                    }
+                    EntityKind::RoutineRun => id.parse::<u64>().is_ok_and(|run| {
+                        self.routine_runs
+                            .values_mut()
+                            .any(|runs| runs.remove(&run).is_some())
+                    }),
+                    EntityKind::MemoryNote => self.memory_notes.remove(id).is_some(),
                     EntityKind::SessionItem => id.split_once(':').is_some_and(|(session, item)| {
                         let Some(items) = self.session_items.get_mut(session) else {
                             return false;
@@ -1097,6 +1295,173 @@ mod tests {
         assert_eq!(task.task_id, task_id.to_string());
         assert_eq!(state.channel_files.len(), 1);
         assert_eq!(state.files_loaded, [channel.to_string()]);
+    }
+
+    fn routine(channel: ChannelId) -> consort_proto::model::Routine {
+        consort_proto::model::Routine {
+            id: consort_proto::ids::RoutineId::new(),
+            channel_id: channel,
+            name: "Sunset check".into(),
+            schedule: consort_proto::model::RoutineSchedule::Interval { seconds: 3_600 },
+            prompt: "Check.".into(),
+            action: consort_proto::model::RoutineAction::CoordinatorTurn,
+            enabled: true,
+            next_run_at: None,
+            last_run_at: None,
+            last_run_status: None,
+        }
+    }
+
+    fn run(routine: &consort_proto::model::Routine, id: u64) -> RoutineRun {
+        RoutineRun {
+            id,
+            routine_id: routine.id,
+            channel_id: routine.channel_id,
+            started_at: Timestamp::from_millis(1),
+            ended_at: None,
+            status: consort_proto::model::RoutineRunStatus::Running,
+            manual: false,
+            message_id: None,
+            task_id: None,
+            error: None,
+        }
+    }
+
+    fn delete(seq: u64, kind: EntityKind, id: String, channel: Option<ChannelId>) -> FeedEntry {
+        FeedEntry {
+            seq,
+            at: Timestamp::from_millis(0),
+            entity_id: id,
+            channel_id: channel,
+            change: FeedChange::Delete(kind),
+        }
+    }
+
+    #[test]
+    fn the_cache_keeps_routines_and_the_runs_of_loaded_routines() {
+        let mut cache = Cache::default();
+        let lights = ChannelId::new();
+        let sunset = routine(lights);
+        let mut snapshot = snapshot_at(10);
+        snapshot.routines = vec![sunset.clone()];
+        cache.load_snapshot(snapshot);
+        assert_eq!(cache.routines.len(), 1);
+
+        // A change in the feed replaces the routine. The same entry again
+        // changes nothing.
+        let mut off = sunset.clone();
+        off.enabled = false;
+        assert!(cache.apply(upsert(11, EntityPayload::Routine(off.clone()))));
+        assert!(!cache.apply(upsert(0, EntityPayload::Routine(off))));
+        assert!(!cache.routines[&sunset.id.to_string()].enabled);
+
+        // A run of a routine whose runs are not loaded does not make a
+        // partial list.
+        assert!(!cache.apply(upsert(12, EntityPayload::RoutineRun(run(&sunset, 1)))));
+        cache.load_routine_runs(&sunset.id.to_string(), vec![run(&sunset, 1)], 12);
+        let mut ended = run(&sunset, 1);
+        ended.status = consort_proto::model::RoutineRunStatus::Ok;
+        assert!(cache.apply(upsert(13, EntityPayload::RoutineRun(ended))));
+        assert!(cache.apply(upsert(14, EntityPayload::RoutineRun(run(&sunset, 2)))));
+        let runs = &cache.routine_runs[&sunset.id.to_string()];
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[&1].status, consort_proto::model::RoutineRunStatus::Ok);
+        // An older answer does not undo the feed.
+        cache.load_routine_runs(&sunset.id.to_string(), vec![run(&sunset, 1)], 12);
+        let runs = &cache.routine_runs[&sunset.id.to_string()];
+        assert_eq!(runs[&1].status, consort_proto::model::RoutineRunStatus::Ok);
+
+        // A deleted routine takes its runs with it.
+        assert!(cache.apply(delete(
+            15,
+            EntityKind::Routine,
+            sunset.id.to_string(),
+            Some(lights)
+        )));
+        assert!(cache.routines.is_empty() && cache.routine_runs.is_empty());
+
+        // The routines of a deleted channel go with it.
+        let other = routine(lights);
+        assert!(cache.apply(upsert(16, EntityPayload::Routine(other))));
+        cache.apply(delete(
+            17,
+            EntityKind::Channel,
+            lights.to_string(),
+            Some(lights),
+        ));
+        assert!(cache.routines.is_empty());
+    }
+
+    fn summary(
+        scope: consort_proto::model::MemoryScope,
+        path: &str,
+        byte: u8,
+    ) -> MemoryNoteSummary {
+        MemoryNoteSummary {
+            scope,
+            path: path.into(),
+            sha256: consort_proto::model::Sha256Hash::from_bytes([byte; 32]),
+            version: 1,
+            updated_by: consort_proto::model::MemoryAuthor::User,
+            updated_at: Timestamp::from_millis(1),
+            suggested_by: None,
+            deleted_at: None,
+        }
+    }
+
+    fn full(summary: &MemoryNoteSummary, content: &str) -> MemoryNote {
+        MemoryNote {
+            scope: summary.scope,
+            path: summary.path.clone(),
+            content: content.into(),
+            sha256: summary.sha256.clone(),
+            version: summary.version,
+            updated_by: summary.updated_by,
+            updated_at: summary.updated_at,
+            suggested_by: None,
+            deleted_at: summary.deleted_at,
+        }
+    }
+
+    #[test]
+    fn the_cache_keeps_the_memory_of_loaded_scopes() {
+        use consort_proto::model::MemoryScope;
+        let mut cache = Cache::default();
+        let lights = ChannelId::new();
+        let scope = MemoryScope::Channel(lights);
+        let roof = summary(scope, "decisions/roofline.md", 1);
+        // A note of a scope that is not loaded is dropped.
+        assert!(!cache.apply(upsert(5, EntityPayload::MemoryNote(full(&roof, "Lumen.")))));
+        cache.load_memory(&lights.to_string(), vec![roof.clone()], false, 5);
+        let key = format!("{lights}:decisions/roofline.md");
+        assert!(!cache.memory_notes[&key].has_content);
+        // A read gives the text. A list with the same hash keeps it.
+        cache.merge_memory_note(full(&roof, "Lumen."), 6);
+        cache.load_memory(&lights.to_string(), vec![roof.clone()], false, 6);
+        assert!(cache.memory_notes[&key].has_content);
+        // The feed brings a new version, then the delete to Recently deleted.
+        let mut newer = full(&summary(scope, "decisions/roofline.md", 2), "Lumen Co.");
+        newer.version = 2;
+        assert!(cache.apply(upsert(7, EntityPayload::MemoryNote(newer.clone()))));
+        assert_eq!(cache.memory_notes[&key].note.version, 2);
+        newer.deleted_at = Some(Timestamp::from_millis(9));
+        assert!(cache.apply(upsert(8, EntityPayload::MemoryNote(newer))));
+        assert!(cache.memory_notes[&key].note.deleted_at.is_some());
+        // An older list does not bring the deleted note back as live.
+        cache.load_memory(&lights.to_string(), vec![roof.clone()], false, 6);
+        assert!(cache.memory_notes[&key].note.deleted_at.is_some());
+        // A purge removes it, and the channel takes its memory with it.
+        assert!(cache.apply(delete(9, EntityKind::MemoryNote, key.clone(), Some(lights))));
+        assert!(cache.memory_notes.is_empty());
+        cache.load_memory(&lights.to_string(), vec![roof], false, 9);
+        cache.apply(delete(
+            10,
+            EntityKind::Channel,
+            lights.to_string(),
+            Some(lights),
+        ));
+        assert!(cache.memory_notes.is_empty());
+        assert!(!cache.memory_loaded.contains(&lights.to_string()));
     }
 
     fn upsert(seq: u64, payload: EntityPayload) -> FeedEntry {

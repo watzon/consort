@@ -1,5 +1,6 @@
 //! Settings, in the window: Appearance and Workers, and a line for the
-//! sections that come later.
+//! sections that come later. Routines and Memory are in `ui/routines.rs`
+//! and `ui/memory.rs`.
 
 use consort_client::{ApprovalMode, ViewState, WorkerView};
 use consort_theme::{Appearance, Mode, TextSize, ThemeLibrary, Tokens, TypeExt as _};
@@ -234,6 +235,8 @@ impl ConsortApp {
             SettingsSection::Workers => self.render_workers(t, window, cx),
             SettingsSection::Connectors => self.render_connectors(t, window, cx),
             SettingsSection::Skills => self.render_skills(t, window, cx),
+            SettingsSection::Routines => self.render_routines_settings(t, window, cx),
+            SettingsSection::Memory => self.render_memory_settings(t, window, cx),
             other => self.render_later(other, t),
         };
         div()
@@ -279,14 +282,6 @@ impl ConsortApp {
             SettingsSection::Hub => (
                 "Hub",
                 "This page comes in a later build. It will show the hub address, its version and its storage.",
-            ),
-            SettingsSection::Memory => (
-                "Memory",
-                "This page comes in a later build. It will list the memory notes for each channel, so you can read and edit them.",
-            ),
-            SettingsSection::Routines => (
-                "Routines",
-                "This page comes in a later build. It will list the routines of each channel, with their schedules and last runs.",
             ),
             _ => ("", ""),
         };

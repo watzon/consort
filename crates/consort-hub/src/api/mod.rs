@@ -56,6 +56,8 @@ pub(crate) async fn dispatch(hub: &Hub, caller: Caller, request: ClientRequest) 
         R::MemoryWrite(r) => to_value(&hub.memory_write(caller, r).await?),
         R::MemoryDelete(r) => to_value(&hub.memory_delete(caller, r).await?),
         R::MemoryHistory(r) => to_value(&hub.memory_history(caller, r).await?),
+        R::MemoryRestore(r) => to_value(&hub.memory_restore(caller, r).await?),
+        R::MemoryMove(r) => to_value(&hub.memory_move(caller, r).await?),
         R::FilesList(r) => to_value(&hub.files_list(caller, r).await?),
         R::FilesPut(r) => to_value(&hub.files_put(caller, r).await?),
         R::FilesMove(r) => to_value(&hub.files_move(caller, r).await?),

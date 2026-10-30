@@ -19,6 +19,9 @@ mod files_tests;
 mod fonts;
 #[cfg(test)]
 mod keys_tests;
+mod knowledge;
+#[cfg(test)]
+mod knowledge_tests;
 mod notice;
 mod read_marker;
 mod ui;
@@ -41,7 +44,12 @@ actions!(consort, [Quit]);
 /// account-settings, hub-cards, tutti-manages, instructions, mark-idle,
 /// mark-working, mark-needs-you, mark-done. Phase 1: top-tint,
 /// attachments, drop, bubbles, lightbox, files, files-menu, files-drop,
-/// files-empty, thread-attach and add-skill-upload. The old names `everything` and
+/// files-empty, thread-attach and add-skill-upload. Phase 2: routines,
+/// routine-runs, routine-new, routine-edit, schedule-picker,
+/// settings-routines, memory, memory-conflict, settings-memory,
+/// memory-history, memory-deleted, routines-empty, memory-empty,
+/// schedule-interval, schedule-once, schedule-once-past and
+/// schedule-cron. The old names `everything` and
 /// `everything-manages` still work. `--light` and `--dark` set
 /// the mode, and `--theme <name>` the theme.
 #[derive(Clone, Debug, Default)]
@@ -115,6 +123,14 @@ fn main() {
             .and_then(consort_client::mock_files::screen_state)
     {
         // The phase 1 screens: files and attachments in house-lights.
+        Client::mock_with(state)
+    } else if mock
+        && let Some(state) = args
+            .screen
+            .as_deref()
+            .and_then(consort_client::mock_routines::screen_state)
+    {
+        // The phase 2 screens: routines and memory.
         Client::mock_with(state)
     } else if mock {
         Client::mock()

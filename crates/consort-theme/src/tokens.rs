@@ -358,9 +358,36 @@ pub struct Components {
     /// The width of the focus ring.
     pub focus_ring: Pixels,
     pub files: Files,
+    pub knowledge: Knowledge,
     pub sidebar: Sidebar,
     pub chat: Chat,
     pub theme_preview: ThemePreview,
+}
+
+/// The sizes of routines and memory. See `structure::Knowledge`.
+#[derive(Clone, Copy, Debug)]
+pub struct Knowledge {
+    pub switch_w: Pixels,
+    pub switch_h: Pixels,
+    pub switch_thumb: Pixels,
+    pub status_dot: Pixels,
+    pub row_pad_y: Pixels,
+    pub summary_label: Pixels,
+    pub run_duration: Pixels,
+    pub run_link: Pixels,
+    pub channel_field: Pixels,
+    pub time_field: Pixels,
+    pub every_field: Pixels,
+    pub unit_field: Pixels,
+    pub day_button: Pixels,
+    pub zone_popover: Pixels,
+    pub zone_list: Pixels,
+    pub calendar_cell: Pixels,
+    pub tree_indent: Pixels,
+    pub change_bar: Pixels,
+    pub editor_min_height: Pixels,
+    pub version_list: Pixels,
+    pub line_icon: Pixels,
 }
 
 /// The sizes of attachments and channel files. See `structure::Files`.
@@ -535,6 +562,29 @@ impl Components {
                 date_col: px(f.date_col),
                 more: px(f.more),
                 artifact_indent: px(f.artifact_indent),
+            },
+            knowledge: Knowledge {
+                switch_w: px(c.knowledge.switch_w),
+                switch_h: px(c.knowledge.switch_h),
+                switch_thumb: px(c.knowledge.switch_thumb),
+                status_dot: px(c.knowledge.status_dot),
+                row_pad_y: px(c.knowledge.row_pad_y),
+                summary_label: px(c.knowledge.summary_label),
+                run_duration: px(c.knowledge.run_duration),
+                run_link: px(c.knowledge.run_link),
+                channel_field: px(c.knowledge.channel_field),
+                time_field: px(c.knowledge.time_field),
+                every_field: px(c.knowledge.every_field),
+                unit_field: px(c.knowledge.unit_field),
+                day_button: px(c.knowledge.day_button),
+                zone_popover: px(c.knowledge.zone_popover),
+                zone_list: px(c.knowledge.zone_list),
+                calendar_cell: px(c.knowledge.calendar_cell),
+                tree_indent: px(c.knowledge.tree_indent),
+                change_bar: px(c.knowledge.change_bar),
+                editor_min_height: px(c.knowledge.editor_min_height),
+                version_list: px(c.knowledge.version_list),
+                line_icon: px(c.knowledge.line_icon),
             },
             sidebar: Sidebar {
                 inset: px(sb.inset),

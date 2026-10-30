@@ -20,13 +20,16 @@ pub mod files;
 pub mod format;
 pub mod hub;
 pub mod limits;
+pub mod memory;
 pub mod mock;
 mod mock_backend;
 mod mock_backend_ext;
 pub mod mock_extensions;
 pub mod mock_files;
+pub mod mock_routines;
 pub mod picker;
 pub mod reduce;
+pub mod routines;
 pub mod skills;
 pub mod store;
 #[cfg(test)]

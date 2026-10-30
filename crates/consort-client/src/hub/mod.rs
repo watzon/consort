@@ -11,6 +11,7 @@
 mod commands;
 mod extensions;
 mod files;
+mod knowledge;
 mod link;
 mod outbox;
 mod url;

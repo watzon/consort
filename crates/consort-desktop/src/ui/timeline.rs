@@ -716,6 +716,9 @@ impl ConsortApp {
         t: &Tokens,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        if let Some(memory) = &notice.memory {
+            return self.render_memory_saved_line(notice, memory, t, cx);
+        }
         let c = &t.colors;
         let copy = notice.text.clone();
         div()

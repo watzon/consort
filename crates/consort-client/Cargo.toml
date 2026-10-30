@@ -11,6 +11,9 @@ workspace = true
 [dependencies]
 consort-proto.workspace = true
 chrono.workspace = true
+chrono-tz.workspace = true
+croner.workspace = true
+iana-time-zone.workspace = true
 directories.workspace = true
 ed25519-dalek.workspace = true
 futures-util.workspace = true
