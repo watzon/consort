@@ -520,3 +520,29 @@ The user was away during the first build, from 2026-10-29. These are the choices
 | 514 | Desktop | A picture chip shows a thin progress bar at its bottom while it uploads. | 7D6 draws only file chips while they upload, but a picture uploads too | Yes |
 | 515 | Theme | The light box is black at 0.92 (`derive.lightbox_alpha`), in both modes. | 8EA is near black, and a picture reads best on black | Yes |
 | 516 | Hub | `HEAD /v1/blobs/{sha256}` has its own handler that checks the file and answers its size without reading it. | Before, axum answered HEAD with the GET handler, which read the whole blob into memory just to say it exists | Yes |
+| 517 | Hub | Backup settings and the last result live in `backup.json` in the data folder, not in `hub.db` | No schema migration in phase 3; the settings belong to the machine | Yes |
+| 518 | Hub | A backup is one tar archive: manifest, `hub.db` from SQLite's online backup, the keys, `backup.json` and every blob | One file to copy; a consistent database while the hub runs; the keys read the Composio key after a restore | Yes |
+| 519 | Hub | `hub.backup` answers at once; clients poll `hub.status` every second while it runs | A large backup takes longer than a request; no new feed entity | Yes |
+| 520 | Hub | Scheduled backups use the client's time zone, run once per slot, and skip a slot more than an hour late | The same rules as routines | Yes |
+| 521 | Hub | Archive names are `consort-YYYY-MM-DD-HHMM[-N].tar` in the schedule's time zone; prune keeps the newest N by name | The design's name; stable sort | Yes |
+| 522 | Hub | A running hub holds `<data>/hub.lock`; a second hub and a restore refuse that folder | Restore must know no hub runs; two hubs would break the database | Yes |
+| 523 | Hub | Free disk space from `statvfs` (rustix) on Unix only | No `unsafe` in Consort | Yes |
+| 524 | Hub | `last_seen_at` also changes when a client disconnects | "Seen 2 hours ago" means when the app left | Yes |
+| 525 | CLI | `consort hub restore` checks hashes and the database first, and with `--force` moves the old files to `before-restore-<time>/` | Nothing lost; a damaged archive fails before changes | Yes |
+| 526 | Proto | `Client.os`, `Client.paired_by` and `client.list` `online` | The Clients page needs them; JSON record, no migration | Yes |
+| 527 | Client | Notification rules are pure logic in `consort-client` (`notify`) on an `AttentionView`; the desktop delivers | Tested once, shared with mobile later | Yes |
+| 528 | Client | Nothing notifies for what was there at the first load, or while its place is on screen in the active window | No burst at start; no notification for what the user sees | Yes |
+| 529 | Client | Message text off hides every written text (messages, summaries, questions, reasons); task titles and channel names show | The design example; privacy | Yes |
+| 530 | Client | Routine messages count as routine results, not messages | The Routines switch is off by default | Yes |
+| 531 | Client | Notification switches live in `notifications.json` in the client folder | The approved design: settings are per client | Yes |
+| 532 | Desktop | GPUI posts notifications and routes clicks; `objc2-app-kit` sets the Dock badge; `mac-usernotifications` reads the permission; Windows and Linux show the count in the window title | No `unsafe` in Consort; GPUI keeps the click delegate | Yes |
+| 533 | Desktop | The QR code holds `PairingInvite` JSON (`hub_url`, `code`) | The proto type for this code | Yes |
+| 534 | Desktop | The pairing dialog says which app paired, with Done | The design leaves the end state open | Yes |
+| 535 | Desktop | Weekly backups have a day select; Change folder is an inline path field | A week needs a day; the folder is on the hub machine | Yes |
+| 536 | Install | Installs come from GitHub Releases with scripts in `scripts/install/`. The repo name is one constant per language. `get.consort.dev` is not used. Release file names have no version, and `SHA256SUMS` lists all files. | Approved: GitHub Releases until there is a domain | Yes |
+| 537 | CLI | `consort worker install`, `uninstall` and `status` pair the machine and manage a per-user service (launchd, systemd user unit, Task Scheduler). `--dry-run` prints the plan. `consort worker run --log-file` writes the log to a file. | Phase 5, item 2 | Yes |
+| 538 | CLI | The service text is made from templates in code and tested on every system. The install runs commands through a `Runner`, so tests never touch a service manager. | Review of an install without an install | Yes |
+| 539 | Hub | TLS is a documented Caddy reverse proxy. The hub unit is hardened. The Dockerfile and Compose file exist. The hub reads `CONSORT_HUB_DATA`, `CONSORT_HUB_LISTEN` and `CONSORT_PUBLIC_URL`. | Phase 5, item 3 | Yes |
+| 540 | Release | The workflow builds the CLI for five targets and the desktop app for macOS, Windows and Linux. Windows and Linux desktop builds are best effort. `scripts/bundle-macos.sh` makes the app. | Phase 5, item 1 | Yes |
+| 541 | Desktop | App updates: check at start and every 6 hours, a hash-checked download into a staging folder, "Update ready. Restart to install." The logic is in `consort-client`. The switch is `updates.json`. | Approved: on by default | Yes |
+| 542 | Desktop | The Add worker dialog has three steps and replaces decision 122 ("There is no installer yet"). | Phase 5, item 2 | Yes |
