@@ -244,6 +244,8 @@ impl Tx<'_> {
         for sql in [
             "DELETE FROM task_inbox WHERE task_id = ?1",
             "DELETE FROM task_attachments WHERE task_id = ?1",
+            "DELETE FROM task_requests WHERE task_id = ?1",
+            "DELETE FROM voice_tasks WHERE task_id = ?1",
             "DELETE FROM tasks WHERE id = ?1",
         ] {
             self.db().execute(sql, [&id])?;

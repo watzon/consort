@@ -51,7 +51,7 @@ pub use proactivity::{
     CancelFollowUpArgs, FollowUpLaterArgs, FollowUpResult, NoReplyNeededArgs, SetProactivityArgs,
     SetProactivityResult,
 };
-pub use voice::{VoiceGuideArgs, VoiceGuideResult, VoiceSampleArgs};
+pub use voice::{ProposeVoiceRuleArgs, VoiceGuideArgs, VoiceGuideResult, VoiceSampleArgs};
 
 /// The kind of session that a tool is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -819,6 +819,9 @@ hub_tools! {
     /// `voice_sample`.
     VoiceSample("voice_sample", VoiceSampleArgs, TUTTI_ONLY,
         "Return the sample draft for a voice_sample event. Nothing is sent and the hub does not save it. Post nothing else for this event."),
+    /// `propose_voice_rule`.
+    ProposeVoiceRule("propose_voice_rule", ProposeVoiceRuleArgs, TUTTI_ONLY,
+        "Propose one rule for the user's style guide after a voice_edits event. Cite at least 3 edited pairs of that context that agree. The hub checks the pairs and shows the user an offer card; voice.md changes only after the user says Do it. You cannot write voice.md yourself."),
     /// `list_channels`.
     ListChannels("list_channels", NoArgs, TUTTI_ONLY,
         "List the channels with their purpose and task counts."),
@@ -1475,6 +1478,7 @@ mod tests {
         ];
         let tutti_only = [
             "voice_sample",
+            "propose_voice_rule",
             "list_channels",
             "read_channel",
             "message_channel",

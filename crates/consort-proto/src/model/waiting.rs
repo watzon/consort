@@ -13,7 +13,9 @@ use serde_json::Value;
 
 use super::account::SignInMethod;
 use super::common::ValidationError;
-use super::connector::{DisplayField, ToolApprovals, ToolKind, UseIn};
+use super::connector::{
+    ApprovalRule, DisplayField, ToolApprovals, ToolKind, UseIn, canonical_json,
+};
 use super::skill::{SkillAudit, SkillSource};
 use super::voice::{CommitmentFlag, OutgoingKind, VoiceUse};
 use crate::ids::{
@@ -191,6 +193,12 @@ pub struct ConnectorCard {
     /// The user said "Not how I write".
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub not_my_voice: bool,
+    /// The rule that made the hub ask, set when the card is posted. Only
+    /// "Ask once per task" saves an allow for later calls, also when the
+    /// answer comes after the call stopped waiting. `None` on a card from
+    /// an older hub saves nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ask_rule: Option<ApprovalRule>,
 }
 
 impl ConnectorCard {
@@ -199,6 +207,26 @@ impl ConnectorCard {
         self.draft_arguments
             .as_ref()
             .is_some_and(|draft| draft != &self.arguments)
+    }
+
+    /// The hash of what the user checks on a card with flags: the
+    /// arguments and the flags. "I checked the marked lines" holds only for
+    /// this hash, so a new scan or an edit from another client clears it.
+    pub fn review_hash(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let flags = serde_json::to_value(&self.flags).unwrap_or(Value::Null);
+        let mut hasher = Sha256::new();
+        hasher.update(canonical_json(&self.arguments).as_bytes());
+        hasher.update(b"\n");
+        hasher.update(canonical_json(&flags).as_bytes());
+        hasher
+            .finalize()
+            .iter()
+            .fold(String::with_capacity(64), |mut out, b| {
+                use std::fmt::Write as _;
+                let _ = write!(out, "{b:02x}");
+                out
+            })
     }
 }
 
@@ -787,6 +815,7 @@ mod tests {
                 flags: Vec::new(),
                 draft_arguments: None,
                 not_my_voice: false,
+                ask_rule: None,
             })),
             ApprovalDetails::Management(Box::new(ManagementCard {
                 tool: "update_connection".into(),

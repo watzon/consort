@@ -98,8 +98,9 @@ pub struct VoiceUi {
     /// rule, `ex:<section>:<index>` for an example.
     pub hovered: Option<String>,
     /// The draft cards whose "I checked the marked lines" is ticked, with
-    /// the flags that the tick covers. A new scan clears it.
-    pub checked: BTreeMap<String, usize>,
+    /// the review hash of the card that the user saw. A new scan or an
+    /// edit from another client makes a new hash, so the tick clears.
+    pub checked: BTreeMap<String, String>,
     /// The draft card in Edit: the approval and the key of the card that
     /// shows the fields. The same card in another view stays as it is.
     pub editing: Option<(String, String)>,
@@ -391,39 +392,47 @@ impl ConsortApp {
 
     // The draft card ------------------------------------------------------
 
-    /// Whether "I checked the marked lines" is ticked for a card with this
-    /// many flags. New flags after Edit clear it.
-    pub fn draft_checked(&self, approval_id: &str, flags: usize) -> bool {
-        self.voice.checked.get(approval_id) == Some(&flags)
+    /// Whether "I checked the marked lines" is ticked for the card with
+    /// this review hash. A new scan, an Edit or an edit from another client
+    /// gives a new hash, so the tick clears.
+    pub fn draft_checked(&self, approval_id: &str, review_hash: &str) -> bool {
+        self.voice
+            .checked
+            .get(approval_id)
+            .is_some_and(|h| h == review_hash)
     }
 
     pub fn toggle_draft_checked(
         &mut self,
         approval_id: &str,
-        flags: usize,
+        review_hash: &str,
         cx: &mut Context<Self>,
     ) {
-        if self.draft_checked(approval_id, flags) {
+        if self.draft_checked(approval_id, review_hash) {
             self.voice.checked.remove(approval_id);
         } else {
-            self.voice.checked.insert(approval_id.to_owned(), flags);
+            self.voice
+                .checked
+                .insert(approval_id.to_owned(), review_hash.to_owned());
         }
         cx.notify();
     }
 
-    /// Allow or Don't on a draft card: Allow sends the tick.
+    /// Allow or Don't on a draft card: Allow sends the tick with the review
+    /// hash of the card that the user checked.
     pub fn answer_draft_card(
         &mut self,
         approval_id: String,
         choice: consort_client::ApprovalChoice,
-        checked: bool,
+        checked: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if choice == consort_client::ApprovalChoice::Deny || !checked {
+        let Some(checked) = checked.filter(|_| choice != consort_client::ApprovalChoice::Deny)
+        else {
             self.answer_approval(approval_id, choice, window, cx);
             return;
-        }
+        };
         if self.blocked_by_hub(cx) {
             return;
         }
@@ -436,7 +445,7 @@ impl ConsortApp {
                     .run(Command::AnswerApproval {
                         approval_id: id,
                         choice,
-                        checked: true,
+                        checked: Some(checked),
                     })
                     .await
             },
@@ -534,7 +543,10 @@ impl ConsortApp {
                 self.open_channel(TUTTI.into(), window, cx);
                 self.open_thread(REPLY_TASK.into(), window, cx);
                 if screen == "voice-approval-checked" {
-                    self.voice.checked.insert(DRAFT_APPROVAL.into(), 2);
+                    self.voice.checked.insert(
+                        DRAFT_APPROVAL.into(),
+                        consort_client::mock_voice::MOCK_REVIEW_HASH.into(),
+                    );
                 }
                 if screen == "voice-approval-edit" {
                     // The card in the task thread, as the design shows it.

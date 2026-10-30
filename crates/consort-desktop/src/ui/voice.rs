@@ -470,7 +470,7 @@ impl ConsortApp {
                     ))
                     .child(promise(
                         "Approval",
-                        "Every send still waits for your answer. The voice cannot loosen that rule.",
+                        "While the voice is on, every send asks you first, also when the connection may run without asking. A draft follows the connection's rule.",
                         false,
                     ))
                     .child(promise(
@@ -1281,8 +1281,8 @@ impl ConsortApp {
                         ),
                 );
             }
-            let flags = draft.flags.len();
-            let checked = self.draft_checked(&approval.id, flags);
+            let hash = draft.review_hash.clone();
+            let checked = self.draft_checked(&approval.id, &hash);
             let id = approval.id.clone();
             out = out.child(list).child(
                 div()
@@ -1293,7 +1293,7 @@ impl ConsortApp {
                         checkbox(format!("{key}-checked"), checked, t)
                             .debug_selector(|| "draft-checked".into())
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.toggle_draft_checked(&id, flags, cx)
+                                this.toggle_draft_checked(&id, &hash, cx)
                             })),
                     )
                     .child(text(
@@ -1314,8 +1314,9 @@ impl ConsortApp {
         }
         // The buttons: Allow stays off until the tick, Edit, Don't, and
         // "Not how I write" at the right.
-        let checked = self.draft_checked(&approval.id, draft.flags.len());
+        let checked = self.draft_checked(&approval.id, &draft.review_hash);
         let blocked = draft.allow_blocked(checked);
+        let checked_hash = checked.then(|| draft.review_hash.clone());
         let offline = self.answers_blocked();
         let allow_label = approval.choice_label(ApprovalChoice::AllowOnce);
         let allow: AnyElement = if blocked {
@@ -1347,7 +1348,7 @@ impl ConsortApp {
                     this.answer_draft_card(
                         id.clone(),
                         ApprovalChoice::AllowOnce,
-                        checked,
+                        checked_hash.clone(),
                         window,
                         cx,
                     )

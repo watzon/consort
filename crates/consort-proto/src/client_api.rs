@@ -1166,6 +1166,11 @@ pub struct ApprovalAnswer {
     /// checked the marked lines". The hub refuses an allow without it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub checked: bool,
+    /// With `checked`: the [`crate::model::ConnectorCard::review_hash`] of
+    /// the card that the user checked. The hub refuses an allow when the
+    /// card changed since then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked_hash: Option<String>,
 }
 
 /// The response to `approval.answer`.
@@ -2605,6 +2610,7 @@ mod tests {
                 approval_id: ApprovalId::new(),
                 option_id: "allow".into(),
                 checked: false,
+                checked_hash: None,
             }
             .into(),
             DecisionAnswerRequest {

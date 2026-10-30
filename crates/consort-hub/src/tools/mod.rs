@@ -27,6 +27,27 @@ const CONNECTOR_TOOLS: &[HubTool] = &[
 /// itself.
 const SKILL_TOOLS: &[HubTool] = &[HubTool::ListSkills, HubTool::ReadSkill];
 
+/// The hub tools of a voice task: reading, its proposal and its summary.
+/// It cannot post, publish or ask, so the raw text that it reads stays in
+/// its session.
+const VOICE_TASK_TOOLS: &[HubTool] = &[
+    HubTool::MemoryList,
+    HubTool::MemoryRead,
+    HubTool::FilesList,
+    HubTool::ListWorkers,
+    HubTool::Search,
+    HubTool::ListConnectorTools,
+    HubTool::GetConnectorTool,
+    HubTool::RunConnectorTool,
+    HubTool::ListSkills,
+    HubTool::ReadSkill,
+    HubTool::SuggestMemory,
+    HubTool::SubmitForReview,
+];
+
+/// The tools that the hub lists only while the voice is on.
+const VOICE_TOOLS: &[HubTool] = &[HubTool::VoiceGuide, HubTool::ProposeVoiceRule];
+
 impl Hub {
     /// Builds the tool context of a session. A session that has ended or is
     /// lost has no hub tools: the hub no longer runs turns for it, so what
@@ -64,18 +85,21 @@ impl Hub {
         let ctx = self.tool_ctx(session_id).await?;
         let has_connections = self.channel_has_connections(&ctx).await?;
         let native_skills = crate::skills::harness_loads_skills(&ctx.session.harness);
-        // `voice_guide` is listed only while the voice is on.
+        // `voice_guide` and `propose_voice_rule` are listed only while the
+        // voice is on. A voice task gets only its own tools.
         let voice_on = self
             .store
             .read(|conn| Ok(crate::store::voice::settings(conn)?.enabled))
             .await?;
+        let voice_task = self.is_voice_task(ctx.task.as_ref()).await?;
         Ok(tools_for(ctx.audience)
             .into_iter()
             .filter(|t| {
                 HubTool::from_name(&t.name).is_none_or(|tool| {
                     (has_connections || !CONNECTOR_TOOLS.contains(&tool))
                         && (!native_skills || !SKILL_TOOLS.contains(&tool))
-                        && (voice_on || tool != HubTool::VoiceGuide)
+                        && (voice_on || !VOICE_TOOLS.contains(&tool))
+                        && (!voice_task || VOICE_TASK_TOOLS.contains(&tool))
                 })
             })
             .collect())
@@ -102,6 +126,11 @@ impl Hub {
         // A turn that the assistant started on its own has limits that the
         // hub enforces here, not in the prompt.
         self.check_turn_tool(&ctx, tool).await?;
+        if !VOICE_TASK_TOOLS.contains(&tool) && self.is_voice_task(ctx.task.as_ref()).await? {
+            return Err(crate::proactivity::turn::denied(
+                "A voice task can only read its sources, suggest the guide with suggest_memory and end with submit_for_review.",
+            ));
+        }
         let result = self.dispatch_tool(&ctx, call).await;
         // Only a call that worked counts for the fallback post. A failed
         // `post_message` posted nothing, so the turn still needs a post.
@@ -159,6 +188,7 @@ impl Hub {
             C::ReadSkill(a) => self.tool_read_skill(ctx, a).await,
             C::VoiceGuide(a) => self.tool_voice_guide(ctx, a).await,
             C::VoiceSample(a) => self.tool_voice_sample(ctx, a).await,
+            C::ProposeVoiceRule(a) => self.tool_propose_voice_rule(ctx, a).await,
             C::SearchSkills(a) => self.tool_search_skills(a).await,
             C::AddSkill(a) => self.tool_add_skill(ctx, a).await,
             other => self.tool_management(ctx, other).await,

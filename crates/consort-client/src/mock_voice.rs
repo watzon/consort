@@ -31,6 +31,8 @@ pub const VOICE_DECISION: &str = "dec_voice_offer";
 pub const REPLY_TASK: &str = "tsk_reply_dana";
 pub const REPLY_TASK_CARD: &str = "msg_reply_dana_task";
 pub const DRAFT_APPROVAL: &str = "apr_voice_draft";
+/// The review hash of the mock draft card.
+pub const MOCK_REVIEW_HASH: &str = "mock-review-hash";
 
 /// The `--screen` names of the voice designs.
 pub const SCREENS: &[&str] = &[
@@ -289,6 +291,7 @@ pub fn draft_approval() -> ApprovalView {
                 ],
                 edited: false,
                 not_my_voice: false,
+                review_hash: MOCK_REVIEW_HASH.into(),
             }),
         }))),
         button_labels: vec![

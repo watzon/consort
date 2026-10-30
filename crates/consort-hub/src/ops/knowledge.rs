@@ -67,11 +67,7 @@ impl Hub {
                 let content = if scope == MemoryScope::Global
                     && path == consort_proto::model::VOICE_NOTE_PATH
                 {
-                    crate::voice::screen_note_write(
-                        tx.db(),
-                        source.by == MemoryAuthor::User,
-                        &content,
-                    )?
+                    crate::voice::screen_note_write(tx, source.by, &content)?
                 } else {
                     content
                 };
@@ -92,6 +88,11 @@ impl Hub {
             })
             .await
     }
+}
+
+/// Whether a note is the style guide `voice.md`.
+pub(crate) fn is_voice_note(scope: MemoryScope, path: &str) -> bool {
+    scope == MemoryScope::Global && path == consort_proto::model::VOICE_NOTE_PATH
 }
 
 /// Who writes a memory note, and where the hub shows the write.
@@ -264,7 +265,15 @@ impl Hub {
     ) -> Result<MemoryNoteResult> {
         let note = self
             .store
-            .write(move |tx| tx.restore_memory(request.scope, &request.path))
+            .write(move |tx| {
+                let note = tx.restore_memory(request.scope, &request.path)?;
+                // The user brought the style guide back: its (you) rules
+                // are the user's again.
+                if is_voice_note(request.scope, &request.path) {
+                    tx.adopt_user_rules()?;
+                }
+                Ok(note)
+            })
             .await?;
         Ok(MemoryNoteResult { note })
     }
@@ -279,12 +288,16 @@ impl Hub {
         let note = self
             .store
             .write(move |tx| {
-                tx.move_memory(
+                let note = tx.move_memory(
                     request.scope,
                     &request.from_path,
                     &to,
                     &request.expected_sha256,
-                )
+                )?;
+                if is_voice_note(request.scope, &to) {
+                    tx.adopt_user_rules()?;
+                }
+                Ok(note)
             })
             .await?;
         Ok(MemoryNoteResult { note })

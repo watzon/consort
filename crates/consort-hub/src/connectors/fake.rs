@@ -110,6 +110,11 @@ fn tools_of(toolkit: &str) -> Vec<Value> {
             tool("GMAIL_FETCH_EMAILS", "Fetch emails", &["readOnlyHint"]),
             tool("GMAIL_SEND_EMAIL", "Send an email", &["createHint"]),
             tool(
+                "GMAIL_CREATE_EMAIL_DRAFT",
+                "Save an email draft",
+                &["createHint"],
+            ),
+            tool(
                 "GMAIL_DELETE_MESSAGE",
                 "Delete a message",
                 &["destructiveHint"],

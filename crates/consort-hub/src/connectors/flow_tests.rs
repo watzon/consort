@@ -185,6 +185,7 @@ async fn answer(hub: &Hub, approval_id: consort_proto::ids::ApprovalId, option: 
             approval_id,
             option_id: option.to_owned(),
             checked: false,
+            checked_hash: None,
         },
     )
     .await

@@ -381,6 +381,8 @@ fn begin_run(
                     routine_id: Some(id),
                     attachments: Vec::new(),
                     proactive: None,
+                    user_request: String::new(),
+                    voice_task: false,
                 }),
                 run,
                 schedule_error,

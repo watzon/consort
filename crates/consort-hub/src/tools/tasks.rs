@@ -235,7 +235,7 @@ impl Hub {
         let paths = args.attachments.clone();
         let session_id = ctx.session.id;
         let requested = args.approval_mode;
-        let (channel, attachments, (proactive_mode, origin)) = self
+        let (channel, attachments, (proactive_mode, origin), user_request) = self
             .store
             .read(move |conn| {
                 let channel = conversation::channel_or_404(conn, channel_id)?;
@@ -244,7 +244,12 @@ impl Hub {
                 let mode = crate::proactivity::tools::task_approval_mode(
                     conn, session_id, &channel, requested,
                 )?;
-                Ok((channel, attachments, mode))
+                // The user's own words of this turn: the voice scan
+                // compares the task's drafts with them, never with the
+                // brief that the coordinator wrote.
+                let user_request =
+                    crate::voice::card::turn_user_text(conn, session_id, channel_id)?;
+                Ok((channel, attachments, mode, user_request))
             })
             .await?;
         let mut placement = PlacementRequest {
@@ -271,6 +276,8 @@ impl Hub {
                 routine_id: None,
                 attachments,
                 proactive: origin,
+                user_request,
+                voice_task: false,
             })
             .await?;
         if !limited.is_empty() {

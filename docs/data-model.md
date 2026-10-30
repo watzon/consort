@@ -626,11 +626,9 @@ The settings are one JSON record in `meta` under the key `proactivity`, and a fe
 
 `proactive_channels` keeps, per channel, when the last check-in looked at the hub (the next change summary starts there), the silent check-ins in a row, and the interval before back-off doubled it. `task_status_since` keeps when each task entered its status and whether it got its nudge. `follow_ups` keeps the `key` and the time when the assistant set each follow-up, and `set_in_proactive_turn` (schema 11): a follow-up that a proactive turn set counts against the daily turn budget. `proactive_tasks` (schema 11) keeps the tasks that a proactive turn started: `task_id`, `channel_id`, the `kind` of the turn and `draft`. An update of such a task is proactive, and a draft task asks the user before each connector call that writes or sends. A task that a normal turn starts after the user chose "Do it" on an offer is a draft task too, with the kind of the offer. The meta keys `proactivity.brief_made` and `proactivity.defaults_v1` make the brief and the default routines come once. The meta key `hub_epoch` is the random epoch of the database (see [protocol.md](protocol.md)): the hub makes it when it creates the database, and a restore makes a new one.
 
-Schema 10 is kept for the voice build and changes nothing in this branch.
-
 ## Voice
 
-Hub migration 10 adds "Write in my voice" ([VOICE-PLAN.md](VOICE-PLAN.md), [ADR 0014](adr/0014-the-assistant-writes-in-the-users-voice-with-consent.md)).
+Hub migration 10 adds "Write in my voice" ([VOICE-PLAN.md](VOICE-PLAN.md), [ADR 0014](adr/0014-the-assistant-writes-in-the-users-voice-with-consent.md)). Migration 12 makes every voice table and index with `IF NOT EXISTS`: a hub that ran a build whose version 10 was empty is at version 11 without `draft_pairs` and `voice_uses`, and gets them. Migration 12 also adds `voice_tasks` and `task_requests`, and marks the voice task of the settings as a voice task.
 
 The settings are one JSON record in `meta` under the key `voice`, and a feed entity (`voice_settings`, ID `voice`). The `all` snapshot has them as `voice`.
 
@@ -641,11 +639,12 @@ The settings are one JSON record in `meta` under the key `voice`, and a feed ent
 | `learn_from_edits` | bool | On by default |
 | `disclosure` | `none`, `footer` or `footer_new_contacts` | Default `none` |
 | `last_learned_at`, `learned_summary` | timestamp, text, optional | Set by Do it |
-| `task_id` | ID, optional | The newest voice task |
-| `proposal_decision_id` | ID, optional | The offer that waits |
+| `task_id` | ID, optional | The newest voice task. Only its proposal reaches an offer |
+| `proposal_decision_id` | ID, optional | The offer that waits: a learned guide or one learned rule |
+| `user_rules` | list of `{section, text}` | The rules that the user wrote or changed. `section` is `core`, `hard` or a context key. The hub renders them into `voice.md` and the prompts with `(you)`, and the scan checks the user's hard rules from here |
 | `sample_id`, `sample_state` | integer, `writing` \| `ready` \| `failed` | The newest "Try it" sample. Its text is only in the hub's memory |
 
-The style guide that waits for Do it is in `meta` under `voice_proposal`. The style guide itself is the global memory note `voice.md` (see [Memory note](#memory-note)), with versions:
+The style guide that waits for Do it is in `meta` under `voice_proposal`; for an offer of one learned rule, `voice_rule_proposal` holds `{context, rule, replaces?}`, and `voice_proposal` holds the guide with the rule, for "Open the full guide". The meta key `voice_user_rules_adopted` says that the hub took the `(you)` rules of `voice.md` into `user_rules` once, at the first start after migration 12. The style guide itself is the global memory note `voice.md` (see [Memory note](#memory-note)), with versions:
 
 ```markdown
 # Voice
@@ -670,13 +669,19 @@ Not enough text yet. Add documents to learn this context.
 - Never promise a date or a price. (you)
 ```
 
-Every write of `voice.md` goes through the parser: sections that the format does not know and loose text are dropped, addresses, phone numbers and links become `{email}`, `{phone}` and `{link}`, each section keeps at most 12 rules and 6 examples, and the note must fit in 6 KiB. A write by the user marks every new rule `(you)`. A write by a session must keep every `(you)` rule.
+Only the hub and the user write `voice.md`. Every write goes through the parser: sections that the format does not know and loose text are dropped, addresses (also `mailto:` and written out as `name [at] domain [dot] com`), phone numbers and links (any scheme, `www.`, and bare domains such as `evil.com/pay`) become `{email}`, `{phone}` and `{link}`, also in the `sources:`, `learned:` and `learned from:` lines, each section keeps at most 12 rules and 6 examples, and the note must fit in 6 KiB. A write by the user marks every new or changed rule `(you)`, and the marked rules become `user_rules`. A session cannot write or delete the note. The hub writes it on Do it, with the user's rules of then.
 
-`draft_pairs` keeps one row per allowed draft card for 90 days: `approval_id`, `connection_id`, `tool`, `context` (none for a neutral draft), `draft`, `final` (the subject line and the text fields), `recipients`, `unchanged` (sent with no edit: the assistant's text, never used for learning), `not_my_voice`, `at`, and `used` (taken by a `voice_edits` wake).
+`draft_pairs` keeps one row per allowed draft card, and per draft or send that ran with no card, for 90 days: `approval_id` (a new ID for a call with no card), `connection_id`, `tool`, `context` (none for a neutral draft), `draft`, `final` (the subject line and the text fields), `final_bodies` (each text field alone, without the subject; the filter of the assistant's text matches these), `recipients`, `unchanged` (sent with no edit, or with no card: the assistant's text, never used for learning), `not_my_voice`, `at`, and `used` (taken by a `voice_edits` wake).
 
 `voice_uses` keeps each `voice_guide` call: `session_id`, `context`, `at`, for 90 days.
 
-A connector card ([Hub cards](#hub-cards)) of a draft or send tool has `outgoing` (`draft` or `send`), `editable`, `voice` (`{context}`, none is "Neutral style"), `flags` (`{field, label, text, kind: date | time | weekday | price | agreement | hard_rule, start, end, rule?}`, byte offsets into the field), `draft_arguments` (the assistant's arguments after an edit) and `not_my_voice`.
+`voice_tasks` (schema 12) keeps every task that learned the voice: `task_id` and `at`. The mark stays after Learn again, so an old voice task keeps its limits. Learn again, Turn off and Reset end the session of every voice task that still runs, and the task fails.
+
+`task_requests` (schema 12) keeps the user's own words that started a task: `task_id` and `text`, the user messages and typed answers of the coordinator turn that called `start_task`. The voice scan compares a task's drafts with this text and the user's replies in its thread, never with the brief.
+
+A connector card ([Hub cards](#hub-cards)) of a draft or send tool has `outgoing` (`draft` or `send`), `editable`, `voice` (`{context}`, none is "Neutral style"), `flags` (`{field, label, text, kind: date | time | weekday | price | agreement | hard_rule, start, end, rule?}`, byte offsets into the field; `field` is a path such as `blocks.0.text.text` for a nested value), `draft_arguments` (the assistant's arguments after an edit) and `not_my_voice`. Every connector card has `ask_rule`: the rule that made the hub ask.
+
+Every copy of a draft goes after 90 days. The maintenance purge deletes old `draft_pairs` and `voice_uses`, clears `arguments`, `draft_arguments`, `fields` and `flags` of old cards of draft and send tools, clears the arguments and the output of old `run_connector_tool` calls to such tools in session items, and replaces the brief of an old voice task with a short note. The connector call log keeps only a hash of the arguments, so it holds no copy.
 
 ## Preferences
 

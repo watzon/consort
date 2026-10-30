@@ -291,6 +291,9 @@ pub enum WakeEvent {
 /// One edited draft in a `voice_edits` event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VoiceEditPair {
+    /// The draft card of the pair. `propose_voice_rule` cites it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_id: Option<ApprovalId>,
     /// The sentences that the user removed.
     #[serde(default)]
     pub removed: Vec<String>,
@@ -308,6 +311,10 @@ pub struct VoiceEditPattern {
     pub text: String,
     /// In how many of the pairs.
     pub count: u32,
+    /// The draft cards of the pairs that agree. `propose_voice_rule` cites
+    /// them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub approval_ids: Vec<ApprovalId>,
 }
 
 // serde's `skip_serializing_if` passes a reference.
@@ -458,10 +465,21 @@ impl WakeEvent {
         }
     }
 
-    /// Whether this event is about the voice. A turn whose events are all
-    /// voice samples posts nothing as a fallback.
+    /// Whether this event is a "Try it" sample. A turn whose events are
+    /// all voice samples posts nothing as a fallback.
     pub fn is_voice_sample(&self) -> bool {
         matches!(self, Self::VoiceSample { .. })
+    }
+
+    /// Whether this event is about the voice: `voice_edits`,
+    /// `voice_feedback` or `voice_sample`. The hub gives such events a turn
+    /// of their own with a short list of tools, because they carry draft
+    /// text that can quote other people.
+    pub fn is_voice(&self) -> bool {
+        matches!(
+            self,
+            Self::VoiceEdits { .. } | Self::VoiceFeedback { .. } | Self::VoiceSample { .. }
+        )
     }
 
     fn render_into(&self, out: &mut String) {
@@ -681,7 +699,14 @@ impl WakeEvent {
 fn voice_edits_text(pairs: &[VoiceEditPair], agreeing: &[VoiceEditPattern]) -> String {
     let mut text = String::new();
     for (i, pair) in pairs.iter().enumerate() {
-        let _ = writeln!(text, "Edit {}:", i + 1);
+        match pair.approval_id {
+            Some(id) => {
+                let _ = writeln!(text, "Edit {} (pair {id}):", i + 1);
+            }
+            None => {
+                let _ = writeln!(text, "Edit {}:", i + 1);
+            }
+        }
         for line in &pair.removed {
             let _ = writeln!(text, "- removed: {line}");
         }
@@ -694,9 +719,15 @@ fn voice_edits_text(pairs: &[VoiceEditPair], agreeing: &[VoiceEditPattern]) -> S
     } else {
         text.push_str("Changes in 3 or more edits:\n");
         for p in agreeing {
+            let ids: Vec<String> = p.approval_ids.iter().map(ToString::to_string).collect();
+            let cited = if ids.is_empty() {
+                String::new()
+            } else {
+                format!(" (pairs {})", ids.join(", "))
+            };
             let _ = writeln!(
                 text,
-                "- {} \"{}\" in {} of {} edits",
+                "- {} \"{}\" in {} of {} edits{cited}",
                 p.change,
                 p.text,
                 p.count,
@@ -1095,6 +1126,7 @@ What you saw and did not report in recent check-ins:
         let edits = WakeEvent::VoiceEdits {
             context: "email.formal".into(),
             pairs: vec![VoiceEditPair {
+                approval_id: Some(approval),
                 removed: vec!["Hope you are well.".into()],
                 added: vec![],
             }],
@@ -1102,6 +1134,7 @@ What you saw and did not report in recent check-ins:
                 change: "removed".into(),
                 text: "Hope you are well.".into(),
                 count: 4,
+                approval_ids: vec![approval],
             }],
         };
         let text = render_events(std::slice::from_ref(&edits));
@@ -1110,7 +1143,8 @@ What you saw and did not report in recent check-ins:
             "{text}"
         );
         assert!(text.contains("- removed: Hope you are well."));
-        assert!(text.contains("removed \"Hope you are well.\" in 4 of 1 edits"));
+        assert!(text.contains("removed \"Hope you are well.\" in 4 of 1 edits (pairs apr_00000000-0000-0000-0000-000000000007)"));
+        assert!(text.contains("Edit 1 (pair apr_00000000-0000-0000-0000-000000000007):"));
         let none = WakeEvent::VoiceEdits {
             context: "chat".into(),
             pairs: vec![],

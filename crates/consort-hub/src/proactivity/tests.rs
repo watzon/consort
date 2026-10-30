@@ -536,6 +536,8 @@ async fn the_change_summary_names_status_changes_failed_runs_and_waiting_decisio
                 routine_id: None,
                 attachments: Vec::new(),
                 proactive: None,
+                user_request: String::new(),
+                voice_task: false,
             })
             .await
             .unwrap();
@@ -1067,6 +1069,8 @@ async fn task_in(hub: &Hub, channel_id: ChannelId, status: TaskStatus) -> TaskId
             routine_id: None,
             attachments: Vec::new(),
             proactive: None,
+            user_request: String::new(),
+            voice_task: false,
         })
         .await
         .unwrap();

@@ -345,8 +345,10 @@ pub enum Command {
         approval_id: String,
         choice: ApprovalChoice,
         /// The user ticked "I checked the marked lines" on a draft card
-        /// with flags. The hub refuses an allow of such a card without it.
-        checked: bool,
+        /// with flags: the review hash of the card that the user saw
+        /// ([`crate::DraftCardView::review_hash`]). The hub refuses an
+        /// allow of such a card without it, or when the card changed since.
+        checked: Option<String>,
     },
     AnswerDecision {
         decision_id: String,

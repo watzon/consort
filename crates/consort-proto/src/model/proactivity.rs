@@ -165,8 +165,10 @@ pub enum ProactiveKind {
     ChannelCreated,
     /// The user rated a proactive message as too noisy.
     Feedback,
-    /// An offer about the style guide of "Write in my voice". It comes from
-    /// the user's own sources or edits, so no level stops it.
+    /// An offer about the style guide of "Write in my voice". Only the hub
+    /// posts it. The guide from "Learn" answers the user's own click, so no
+    /// level stops it; the hub offers a rule learned from edits
+    /// (`propose_voice_rule`) only when Tutti's level is not Off.
     Voice,
 }
 

@@ -92,6 +92,12 @@ impl Hub {
                 if let Some((kind, draft)) = new.proactive {
                     tx.save_proactive_task(&task, kind, draft)?;
                 }
+                if !new.user_request.trim().is_empty() {
+                    tx.save_task_request(task.id, &new.user_request)?;
+                }
+                if new.voice_task {
+                    tx.mark_voice_task(task.id)?;
+                }
                 Ok(task)
             })
             .await?;
@@ -398,6 +404,8 @@ impl Hub {
                 routine_id: None,
                 attachments: Vec::new(),
                 proactive: None,
+                user_request: String::new(),
+                voice_task: false,
             })
             .await?;
         Ok(TaskResult { task })
@@ -1046,6 +1054,7 @@ mod tests {
                 approval_id,
                 option_id: "allow".to_owned(),
                 checked: false,
+                checked_hash: None,
             },
         )
         .await

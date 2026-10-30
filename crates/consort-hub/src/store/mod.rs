@@ -161,6 +161,7 @@ pub fn open_and_migrate(data_dir: &Path) -> Result<Connection> {
     let mut conn = open_connection(&db_path)?;
     migrations::migrate(&mut conn)?;
     ensure_hub_epoch(&conn)?;
+    voice::adopt_user_rules_once(&conn)?;
     Ok(conn)
 }
 

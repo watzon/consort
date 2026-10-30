@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use crate::app::{ConsortApp, Dialog, SettingsSection};
 use crate::voice::VoiceDialog;
-use consort_client::mock_voice::{DRAFT_APPROVAL, GMAIL, SLACK};
+use consort_client::mock_voice::{DRAFT_APPROVAL, GMAIL, MOCK_REVIEW_HASH, SLACK};
 use consort_client::voice::{Disclosure, GuideEdit};
 use consort_client::{Client, ViewState};
 use gpui::{AnyWindowHandle, TestAppContext, VisualTestContext};
@@ -210,7 +210,13 @@ fn a_draft_card_keeps_allow_off_until_the_tick(cx: &mut TestAppContext) {
     assert!(has(cx, "draft-allow-off"));
     assert!(!has(cx, "draft-allow"));
     click(cx, "draft-checked");
-    assert!(app.read_with(cx, |app, _| app.draft_checked(DRAFT_APPROVAL, 2)));
+    assert!(app.read_with(cx, |app, _| {
+        app.draft_checked(DRAFT_APPROVAL, MOCK_REVIEW_HASH)
+    }));
+    // The tick holds only for the hash of the card that the user saw.
+    assert!(!app.read_with(cx, |app, _| {
+        app.draft_checked(DRAFT_APPROVAL, "another scan")
+    }));
     assert!(has(cx, "draft-allow"));
 
     // Edit, then Save changes: the hub checks again and the tick clears.
@@ -227,7 +233,7 @@ fn a_draft_card_keeps_allow_off_until_the_tick(cx: &mut TestAppContext) {
         })
     });
     until(cx, &app, "the flags are gone", |app| {
-        !app.draft_checked(DRAFT_APPROVAL, 2) && app.voice.editing.is_none()
+        !app.draft_checked(DRAFT_APPROVAL, MOCK_REVIEW_HASH) && app.voice.editing.is_none()
     });
     settle(cx, 100);
     assert!(has(cx, "draft-allow"), "no flags: allow is on");

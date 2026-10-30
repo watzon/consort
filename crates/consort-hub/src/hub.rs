@@ -261,6 +261,8 @@ pub(crate) async fn test_task_session(
             routine_id: None,
             attachments: Vec::new(),
             proactive: None,
+            user_request: String::new(),
+            voice_task: false,
         })
         .await
         .unwrap();

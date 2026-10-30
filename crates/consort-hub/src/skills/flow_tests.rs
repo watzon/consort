@@ -934,6 +934,7 @@ async fn add_skill_posts_an_install_card_and_allow_installs_it() {
             approval_id: id,
             option_id: "allow".to_owned(),
             checked: false,
+            checked_hash: None,
         },
     )
     .await
@@ -1038,6 +1039,7 @@ async fn skill_install_with_an_approval_id_closes_the_card_and_deny_installs_not
             approval_id: id,
             option_id: "deny".to_owned(),
             checked: false,
+            checked_hash: None,
         },
     )
     .await

@@ -569,6 +569,9 @@ impl Hub {
         args: MemoryDeleteArgs,
     ) -> Result<Value> {
         let scope = writable_scope(ctx)?;
+        if crate::ops::knowledge::is_voice_note(scope, &args.path) {
+            return Err(policy_denied(crate::voice::VOICE_NOTE_REFUSAL));
+        }
         self.store
             .write(move |tx| tx.delete_memory(scope, &args.path, &args.expected_sha256))
             .await?;

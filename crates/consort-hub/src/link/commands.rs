@@ -456,6 +456,8 @@ mod tests {
                 routine_id: None,
                 attachments: Vec::new(),
                 proactive: None,
+                user_request: String::new(),
+                voice_task: false,
             })
             .await
             .unwrap();

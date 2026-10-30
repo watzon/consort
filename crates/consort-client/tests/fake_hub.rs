@@ -3919,6 +3919,7 @@ async fn connectors_and_hub_cards_use_their_requests() {
             flags: Vec::new(),
             draft_arguments: None,
             not_my_voice: false,
+            ask_rule: None,
         }));
         approval.options = details.hub_card_options().unwrap();
         approval.details = details;
@@ -6138,6 +6139,7 @@ async fn the_voice_page_and_the_draft_card_use_their_requests() {
             }],
             draft_arguments: None,
             not_my_voice: false,
+            ask_rule: None,
         }));
         approval.options = details.hub_card_options().unwrap();
         approval.details = details;
@@ -6220,7 +6222,7 @@ async fn the_voice_page_and_the_draft_card_use_their_requests() {
         .run(Command::AnswerApproval {
             approval_id: approval_id.clone(),
             choice: ApprovalChoice::AllowOnce,
-            checked: true,
+            checked: Some("hash-the-user-saw".into()),
         })
         .await
         .unwrap();
@@ -6234,6 +6236,7 @@ async fn the_voice_page_and_the_draft_card_use_their_requests() {
     assert_eq!(edit[0]["fields"]["body"], "I will check my calendar.");
     let answer = recorded_of(&hub, "approval.answer");
     assert_eq!(answer[0]["checked"], true);
+    assert_eq!(answer[0]["checked_hash"], "hash-the-user-saw");
     let set = recorded_of(&hub, "voice.set");
     assert_eq!(set[0]["enabled"], true);
     assert_eq!(recorded_of(&hub, "voice.get").len(), 1);

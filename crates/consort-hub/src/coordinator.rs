@@ -193,9 +193,16 @@ fn turn_batch(events: &[(i64, WakeEvent)], room: usize) -> (Vec<i64>, Vec<WakeEv
     let mut taken = Vec::new();
     for (id, event) in events {
         // The research pass gets a turn of its own, so its read-only rules
-        // never mix with another event's.
+        // never mix with another event's. Voice events get turns of their
+        // own too, with their short list of tools.
         let research = matches!(event, WakeEvent::Research { .. });
         if research && !taken.is_empty() {
+            break;
+        }
+        if taken
+            .first()
+            .is_some_and(|first: &WakeEvent| first.is_voice() != event.is_voice())
+        {
             break;
         }
         let cost = json_len(&render_events(std::slice::from_ref(event))) - shell;
@@ -968,6 +975,57 @@ mod tests {
         assert_eq!(taken, [events[1].1.clone()]);
         let (ids, _, _) = turn_batch(&events[2..], usize::MAX);
         assert_eq!(ids, [3]);
+    }
+
+    #[test]
+    fn voice_events_get_turns_of_their_own_with_the_voice_tools() {
+        let feedback = |n: u64| WakeEvent::VoiceSample {
+            sample: n,
+            request: "Reply to Dana, say yes".to_owned(),
+        };
+        let edits = WakeEvent::VoiceEdits {
+            context: "chat".to_owned(),
+            pairs: Vec::new(),
+            agreeing: Vec::new(),
+        };
+        let events = vec![
+            (1, said("hi")),
+            (2, edits.clone()),
+            (3, feedback(1)),
+            (4, task_update(None)),
+        ];
+        let (ids, _, _) = turn_batch(&events, usize::MAX);
+        assert_eq!(ids, [1], "voice events wait for a turn of their own");
+        let (ids, taken, _) = turn_batch(&events[1..], usize::MAX);
+        assert_eq!(ids, [2, 3], "voice events batch together");
+        let kind = crate::proactivity::turn::classify(&taken);
+        assert_eq!(kind, crate::proactivity::turn::TurnKind::Voice);
+        use consort_proto::tools::HubTool;
+        for tool in [
+            HubTool::VoiceGuide,
+            HubTool::VoiceSample,
+            HubTool::ProposeVoiceRule,
+            HubTool::AskDecision,
+            HubTool::PostMessage,
+        ] {
+            assert!(
+                crate::proactivity::turn::check_tool(&kind, tool).is_ok(),
+                "{tool:?}"
+            );
+        }
+        for tool in [
+            HubTool::RunConnectorTool,
+            HubTool::StartTask,
+            HubTool::MemoryWrite,
+            HubTool::MessageChannel,
+        ] {
+            assert!(
+                crate::proactivity::turn::check_tool(&kind, tool).is_err(),
+                "{tool:?}"
+            );
+        }
+        let (ids, _, _) = turn_batch(&events[3..], usize::MAX);
+        assert_eq!(ids, [4]);
     }
 
     #[test]

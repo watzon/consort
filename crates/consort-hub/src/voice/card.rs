@@ -3,11 +3,12 @@
 //! pairs and "Not how I write".
 
 use consort_proto::client_api::{ApprovalEdit, ApprovalResult};
-use consort_proto::ids::{ApprovalId, ChannelId, SessionId, TaskId};
+use consort_proto::ids::{ApprovalId, ChannelId, ConnectionId, SessionId, TaskId};
 use consort_proto::model::{
     Approval, ApprovalDetails, ApprovalStatus, Author, CORE_CONTEXT, CommitmentFlag, ConnectorCard,
-    DISCLOSURE_LINE, Disclosure, DraftPair, EDITABLE_ARGUMENTS, OutgoingKind, ToolKind,
-    VOICE_EDITS_WAKE_PAIRS, VoiceGuide, VoiceUse, outgoing_kind,
+    DISCLOSURE_LINE, Disclosure, DraftPair, EDITABLE_ARGUMENTS, OutgoingKind, ProactivityLevel,
+    TaskCreator, ToolKind, VOICE_EDITS_WAKE_PAIRS, VoiceGuide, VoiceUse, outgoing_kind,
+    placeholders,
 };
 use consort_proto::turn_input::WakeEvent;
 use rusqlite::Connection as Db;
@@ -31,9 +32,18 @@ pub(crate) struct CardVoice {
     pub editable: Vec<String>,
     pub voice: Option<VoiceUse>,
     pub flags: Vec<CommitmentFlag>,
+    /// "Write in my voice" is on.
+    pub voice_on: bool,
 }
 
 impl CardVoice {
+    /// Whether the hub must show the card, whatever the connection's rule
+    /// and earlier allows say: a call with flags, and every send while the
+    /// voice is on. A draft keeps the connection's rule.
+    pub(crate) fn must_ask(&self) -> bool {
+        !self.flags.is_empty() || (self.voice_on && self.outgoing == Some(OutgoingKind::Send))
+    }
+
     /// Puts the voice parts on a card.
     pub(crate) fn apply(self, card: &mut ConnectorCard) {
         card.outgoing = self.outgoing;
@@ -45,7 +55,7 @@ impl CardVoice {
 
 /// The argument keys of a call that the user can edit: text values of the
 /// keys in [`EDITABLE_ARGUMENTS`], in that order.
-fn editable_keys(arguments: &Value) -> Vec<String> {
+pub(crate) fn editable_keys(arguments: &Value) -> Vec<String> {
     EDITABLE_ARGUMENTS
         .iter()
         .filter(|k| arguments.get(**k).is_some_and(Value::is_string))
@@ -59,6 +69,108 @@ fn label_of(key: &str) -> String {
         .into_iter()
         .next()
         .map_or_else(|| key.to_owned(), |f| f.label)
+}
+
+/// Whether an argument key holds a recipient, an ID, a URL or another value
+/// that is not text in the user's name. The scan skips such keys at every
+/// depth.
+fn is_address_or_id(key: &str) -> bool {
+    const KEYS: &[&str] = &[
+        "to",
+        "cc",
+        "bcc",
+        "from",
+        "sender",
+        "reply_to",
+        "recipient",
+        "recipients",
+        "channel",
+        "channels",
+        "user",
+        "users",
+        "username",
+        "thread_ts",
+        "ts",
+        "id",
+        "ids",
+        "url",
+        "urls",
+        "href",
+        "link",
+        "links",
+        "email",
+        "emails",
+        "type",
+        "mimetype",
+        "style",
+        "icon_emoji",
+        "team",
+        "workspace",
+        "visibility",
+    ];
+    let k = key.to_ascii_lowercase();
+    KEYS.contains(&k.as_str())
+        || [
+            "_id", "_ids", "_url", "_urls", "_email", "_emails", "_ts", "_type", "_at", "_uri",
+        ]
+        .iter()
+        .any(|s| k.ends_with(s))
+        || k.starts_with("recipient")
+        || k.starts_with("to_")
+}
+
+/// One string of a call's arguments that the scan reads.
+struct TextValue {
+    /// The key, or the path of a nested value such as `blocks.0.text.text`.
+    path: String,
+    /// The label of its top-level key.
+    label: String,
+    value: String,
+}
+
+/// Every string value of the arguments, at any depth, except recipients,
+/// IDs and URLs: Slack `blocks`, LinkedIn `commentary`, a nested
+/// `body.content`. The editable fields come first, in their order.
+fn text_values(arguments: &Value) -> Vec<TextValue> {
+    fn walk(value: &Value, path: &mut Vec<String>, out: &mut Vec<TextValue>) {
+        match value {
+            Value::Object(map) => {
+                for (key, inner) in map {
+                    if is_address_or_id(key) {
+                        continue;
+                    }
+                    path.push(key.clone());
+                    walk(inner, path, out);
+                    path.pop();
+                }
+            }
+            Value::Array(items) => {
+                for (i, inner) in items.iter().enumerate() {
+                    path.push(i.to_string());
+                    walk(inner, path, out);
+                    path.pop();
+                }
+            }
+            Value::String(text) if !path.is_empty() && !text.trim().is_empty() => {
+                out.push(TextValue {
+                    path: path.join("."),
+                    label: label_of(&path[0]),
+                    value: text.clone(),
+                });
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(arguments, &mut Vec::new(), &mut out);
+    let rank = |path: &str| {
+        EDITABLE_ARGUMENTS
+            .iter()
+            .position(|k| *k == path)
+            .unwrap_or(EDITABLE_ARGUMENTS.len())
+    };
+    out.sort_by_key(|t| rank(&t.path));
+    out
 }
 
 /// The recipients of a call: the values of its address fields.
@@ -110,68 +222,108 @@ fn draft_text(arguments: &Value, keys: &[String]) -> String {
         .join("\n\n")
 }
 
-/// What the user asked for: a task's brief and the user's messages in its
-/// thread, or the user messages of a coordinator's turn and its channel.
+/// The text fields of a draft without the subject, each alone.
+fn bodies(arguments: &Value, keys: &[String]) -> Vec<String> {
+    keys.iter()
+        .filter(|k| *k != "subject")
+        .filter_map(|k| arguments.get(k)?.as_str().map(str::to_owned))
+        .filter(|t| !t.trim().is_empty())
+        .collect()
+}
+
+/// A user text without the lines that quote other text (`> ...`), such
+/// as a pasted mail.
+fn own_words(text: &str) -> String {
+    text.lines()
+        .filter(|l| !l.trim_start().starts_with('>'))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The user's own words in the open turn of a coordinator session: the
+/// user messages, the typed answers to decisions and the "Try it" request.
+/// When the turn has a user message, the newest user messages of the
+/// channel count too. A turn that no user text started (a proactive turn,
+/// a task update) gives an empty text.
+pub(crate) fn turn_user_text(
+    conn: &Db,
+    session_id: SessionId,
+    channel_id: ChannelId,
+) -> Result<String> {
+    let row = coord_store::coordinator(conn, channel_id)?;
+    if row.session_id != Some(session_id) || !row.turn_open {
+        return Ok(String::new());
+    }
+    let mut parts = Vec::new();
+    let mut user_message = false;
+    for event in &row.turn_events {
+        match event {
+            WakeEvent::UserMessage { text, .. } => {
+                parts.push(own_words(text));
+                user_message = true;
+            }
+            WakeEvent::DecisionAnswered {
+                text: Some(text), ..
+            } => parts.push(own_words(text)),
+            WakeEvent::VoiceSample { request, .. } => parts.push(own_words(request)),
+            _ => {}
+        }
+    }
+    if user_message {
+        let (messages, _) =
+            conversation::messages_page(conn, channel_id, None, None, 50, usize::MAX)?;
+        parts.extend(
+            messages
+                .into_iter()
+                .filter(|m| m.author == Author::User)
+                .take(REQUEST_MESSAGES)
+                .map(|m| own_words(&m.body)),
+        );
+    }
+    Ok(parts.join("\n"))
+}
+
+/// What the user asked for, in the user's own words only. For a task: the
+/// user text of the coordinator turn that started it (or its brief, when
+/// the user wrote the task in a client) and the user's replies in its
+/// thread. For a coordinator: the user text of its open turn. Never a brief
+/// or a title that a model wrote, a `message_channel` text, quoted mail or
+/// tool output.
 fn request_text(
     conn: &Db,
     session_id: SessionId,
     channel_id: ChannelId,
     task_id: Option<TaskId>,
 ) -> Result<String> {
+    let Some(task_id) = task_id else {
+        return turn_user_text(conn, session_id, channel_id);
+    };
+    let task = work::task_or_404(conn, task_id)?;
     let mut parts = Vec::new();
-    if let Some(task_id) = task_id {
-        let task = work::task_or_404(conn, task_id)?;
-        parts.push(task.title.clone());
-        parts.push(task.brief.clone());
-        for message in conversation::thread_replies(conn, task.card_message_id)? {
-            if message.author == Author::User {
-                parts.push(message.body);
-            }
-        }
-        return Ok(parts.join("\n"));
+    if task.created_by == TaskCreator::User {
+        parts.push(own_words(&task.title));
+        parts.push(own_words(&task.brief));
     }
-    let row = coord_store::coordinator(conn, channel_id)?;
-    if row.session_id == Some(session_id) {
-        for event in &row.turn_events {
-            match event {
-                WakeEvent::UserMessage { text, .. }
-                | WakeEvent::TuttiMessage { text, .. }
-                | WakeEvent::VoiceSample { request: text, .. } => parts.push(text.clone()),
-                WakeEvent::DecisionAnswered {
-                    text: Some(text), ..
-                } => parts.push(text.clone()),
-                _ => {}
-            }
+    if let Some(text) = store::task_request(conn, task_id)? {
+        parts.push(text);
+    }
+    for message in conversation::thread_replies(conn, task.card_message_id)? {
+        if message.author == Author::User {
+            parts.push(own_words(&message.body));
         }
     }
-    let (messages, _) = conversation::messages_page(conn, channel_id, None, None, 50, usize::MAX)?;
-    parts.extend(
-        messages
-            .into_iter()
-            .filter(|m| m.author == Author::User)
-            .take(REQUEST_MESSAGES)
-            .map(|m| m.body),
-    );
     Ok(parts.join("\n"))
 }
 
-/// The flags of a call's text.
-fn flags_for(
-    arguments: &Value,
-    keys: &[String],
-    request: &str,
-    guide: &VoiceGuide,
-) -> Vec<CommitmentFlag> {
-    let labels: Vec<String> = keys.iter().map(|k| label_of(k)).collect();
-    let fields: Vec<ScanField<'_>> = keys
+/// The flags of a call's text: every string value, nested ones too.
+fn flags_for(arguments: &Value, request: &str, guide: &VoiceGuide) -> Vec<CommitmentFlag> {
+    let values = text_values(arguments);
+    let fields: Vec<ScanField<'_>> = values
         .iter()
-        .zip(&labels)
-        .filter_map(|(k, label)| {
-            Some(ScanField {
-                key: k,
-                label,
-                value: arguments.get(k)?.as_str()?,
-            })
+        .map(|t| ScanField {
+            key: &t.path,
+            label: &t.label,
+            value: &t.value,
         })
         .collect();
     scan(&fields, request, &guide.hard_rules)
@@ -193,7 +345,8 @@ fn add_disclosure(arguments: &mut Value, keys: &[String]) {
 impl Hub {
     /// The voice parts of a connector call, before the hub asks or runs
     /// it. With the voice on, it adds the disclosure line to the
-    /// arguments, names the voice that wrote the text, and scans the text.
+    /// arguments, names the voice that wrote the text, and scans every
+    /// string of the arguments.
     pub(crate) async fn voice_for_call(
         &self,
         ctx: &ToolCtx,
@@ -208,13 +361,13 @@ impl Hub {
         let (session_id, channel_id) = (ctx.session.id, ctx.channel.id);
         let task_id = ctx.task.as_ref().map(|t| t.id);
         let to = recipients(arguments);
-        let found = self
+        let (voice_on, found) = self
             .store
             .read(move |conn| {
-                let Some(guide) = active_guide(conn)? else {
-                    return Ok(None);
-                };
                 let settings = store::settings(conn)?;
+                let Some(guide) = active_guide(conn)? else {
+                    return Ok((settings.enabled, None));
+                };
                 let context = store::last_voice_use(conn, session_id)?
                     .unwrap_or_else(|| CORE_CONTEXT.to_owned());
                 let disclose = match settings.disclosure {
@@ -231,31 +384,34 @@ impl Hub {
                     }
                 };
                 let request = request_text(conn, session_id, channel_id, task_id)?;
-                Ok(Some((guide, context, disclose, request)))
+                Ok((true, Some((guide, context, disclose, request))))
             })
             .await?;
         let Some((guide, context, disclose, request)) = found else {
             return Ok(CardVoice {
                 outgoing: Some(outgoing),
                 editable,
+                voice_on,
                 ..CardVoice::default()
             });
         };
         if disclose {
             add_disclosure(arguments, &editable);
         }
-        let flags = flags_for(arguments, &editable, &request, &guide);
+        let flags = flags_for(arguments, &request, &guide);
         Ok(CardVoice {
             outgoing: Some(outgoing),
             editable,
             voice: Some(VoiceUse { context }),
             flags,
+            voice_on,
         })
     }
 
     /// `approval.edit`: new text for the fields of a draft card. The hub
     /// keeps the assistant's arguments, checks the new text again, and
-    /// clears the old flags.
+    /// clears the old flags. The new flags have a new review hash, so an
+    /// earlier "I checked the marked lines" no longer holds.
     pub(crate) async fn approval_edit(
         &self,
         _caller: &Caller,
@@ -312,7 +468,7 @@ impl Hub {
                 card.flags = match active_guide(tx.db())? {
                     Some(guide) => {
                         let request = request_text(tx.db(), session_id, channel_id, task_id)?;
-                        flags_for(&card.arguments, &card.editable, &request, &guide)
+                        flags_for(&card.arguments, &request, &guide)
                     }
                     None => Vec::new(),
                 };
@@ -324,49 +480,45 @@ impl Hub {
     }
 }
 
-/// An allow of a card with flags needs "I checked the marked lines".
-pub(crate) fn check_allow(approval: &Approval, allow: bool, checked: bool) -> Result<()> {
-    if let ApprovalDetails::Connector(card) = &approval.details
-        && allow
-        && !card.flags.is_empty()
-        && !checked
-    {
+/// An allow of a card with flags needs "I checked the marked lines" for
+/// the card as it is now: `checked_hash` must be the card's review hash.
+pub(crate) fn check_allow(
+    approval: &Approval,
+    allow: bool,
+    checked: bool,
+    checked_hash: Option<&str>,
+) -> Result<()> {
+    let ApprovalDetails::Connector(card) = &approval.details else {
+        return Ok(());
+    };
+    if !allow || card.flags.is_empty() {
+        return Ok(());
+    }
+    if !checked {
         return Err(HubError::invalid(
             "Check the marked lines and tick \"I checked the marked lines\" before you allow this call.",
+        ));
+    }
+    if checked_hash != Some(card.review_hash().as_str()) {
+        return Err(HubError::conflict(
+            "The text or the marked lines of this card changed after you ticked \"I checked the marked lines\". Check the new lines and tick the box again.",
         ));
     }
     Ok(())
 }
 
-/// Stores the draft pair of an allowed draft card. When 5 edited pairs of
-/// one context wait, it queues a `voice_edits` wake for Tutti and returns
-/// Tutti, which the caller kicks after the commit.
-pub(crate) fn record_pair_in_tx(tx: &mut Tx<'_>, approval: &Approval) -> Result<Option<ChannelId>> {
-    let ApprovalDetails::Connector(card) = &approval.details else {
-        return Ok(None);
-    };
-    if card.outgoing.is_none() || approval.status != ApprovalStatus::Allowed {
-        return Ok(None);
-    }
-    let draft_arguments = card.draft_arguments.as_ref().unwrap_or(&card.arguments);
-    let pair = DraftPair {
-        approval_id: approval.id,
-        connection_id: card.connection_id,
-        tool: card.tool.clone(),
-        context: card.voice.as_ref().map(|v| v.context.clone()),
-        draft: draft_text(draft_arguments, &card.editable),
-        final_text: draft_text(&card.arguments, &card.editable),
-        recipients: recipients(&card.arguments),
-        unchanged: !card.edited(),
-        not_my_voice: card.not_my_voice,
-        at: tx.now(),
-    };
-    tx.save_draft_pair(&pair)?;
-    let Some(context) = pair.context.filter(|_| !pair.unchanged) else {
-        return Ok(None);
-    };
+/// Whether the Tutti coordinator may make offers about the voice: its
+/// proactivity level is not Off. With Off, edited pairs wait.
+fn voice_offers_allowed(conn: &Db) -> Result<bool> {
+    Ok(conversation::tutti_channel(conn)?.proactivity_level() != ProactivityLevel::Off)
+}
+
+/// Queues a `voice_edits` wake when 5 edited pairs of one context wait and
+/// Tutti may make offers. Returns Tutti, which the caller kicks after the
+/// commit.
+fn wake_for_edits(tx: &mut Tx<'_>, context: String) -> Result<Option<ChannelId>> {
     let settings = store::settings(tx.db())?;
-    if !settings.enabled || !settings.learn_from_edits {
+    if !settings.enabled || !settings.learn_from_edits || !voice_offers_allowed(tx.db())? {
         return Ok(None);
     }
     let waiting = store::unused_edited_pairs(tx.db(), &context)?;
@@ -389,8 +541,71 @@ pub(crate) fn record_pair_in_tx(tx: &mut Tx<'_>, approval: &Approval) -> Result<
     Ok(Some(tutti.id))
 }
 
+/// Stores the draft pair of an allowed draft card. When 5 edited pairs of
+/// one context wait, it queues a `voice_edits` wake for Tutti and returns
+/// Tutti, which the caller kicks after the commit.
+pub(crate) fn record_pair_in_tx(tx: &mut Tx<'_>, approval: &Approval) -> Result<Option<ChannelId>> {
+    let ApprovalDetails::Connector(card) = &approval.details else {
+        return Ok(None);
+    };
+    if card.outgoing.is_none() || approval.status != ApprovalStatus::Allowed {
+        return Ok(None);
+    }
+    let draft_arguments = card.draft_arguments.as_ref().unwrap_or(&card.arguments);
+    let pair = DraftPair {
+        approval_id: approval.id,
+        connection_id: card.connection_id,
+        tool: card.tool.clone(),
+        context: card.voice.as_ref().map(|v| v.context.clone()),
+        draft: draft_text(draft_arguments, &card.editable),
+        final_text: draft_text(&card.arguments, &card.editable),
+        final_bodies: bodies(&card.arguments, &card.editable),
+        recipients: recipients(&card.arguments),
+        unchanged: !card.edited(),
+        not_my_voice: card.not_my_voice,
+        at: tx.now(),
+    };
+    tx.save_draft_pair(&pair)?;
+    match pair.context.filter(|_| !pair.unchanged) {
+        Some(context) => wake_for_edits(tx, context),
+        None => Ok(None),
+    }
+}
+
+/// Stores a draft or send that ran with no card (the connection's rule or
+/// an earlier allow let it run). The user saw no draft, so it counts as
+/// sent unchanged: the assistant's text, never used for learning.
+pub(crate) fn record_unasked_pair(
+    tx: &mut Tx<'_>,
+    connection_id: ConnectionId,
+    tool: &str,
+    arguments: &Value,
+    context: Option<String>,
+) -> Result<()> {
+    let keys = editable_keys(arguments);
+    let text = draft_text(arguments, &keys);
+    if text.trim().is_empty() {
+        return Ok(());
+    }
+    tx.save_draft_pair(&DraftPair {
+        approval_id: ApprovalId::new(),
+        connection_id,
+        tool: tool.to_owned(),
+        context,
+        draft: text.clone(),
+        final_text: text,
+        final_bodies: bodies(arguments, &keys),
+        recipients: recipients(arguments),
+        unchanged: true,
+        not_my_voice: false,
+        at: tx.now(),
+    })
+}
+
 /// "Not how I write": marks the card and its pair, and wakes Tutti once
 /// with a `voice_feedback` event. Returns Tutti when it queued the wake.
+/// The draft in the event has placeholders for addresses, phone numbers
+/// and links.
 pub(crate) fn not_my_voice(tx: &mut Tx<'_>, approval_id: ApprovalId) -> Result<Option<ChannelId>> {
     let mut approval = work::approval(tx.db(), approval_id)?
         .ok_or_else(|| HubError::not_found("The approval does not exist."))?;
@@ -409,10 +624,10 @@ pub(crate) fn not_my_voice(tx: &mut Tx<'_>, approval_id: ApprovalId) -> Result<O
     }
     card.not_my_voice = true;
     let context = card.voice.as_ref().map(|v| v.context.clone());
-    let draft = draft_text(
+    let draft = placeholders(&draft_text(
         card.draft_arguments.as_ref().unwrap_or(&card.arguments),
         &card.editable,
-    );
+    ));
     tx.save_approval(&approval)?;
     if let Some(mut pair) = store::draft_pair(tx.db(), approval_id)? {
         pair.not_my_voice = true;

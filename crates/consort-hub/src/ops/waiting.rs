@@ -43,6 +43,7 @@ impl Hub {
                     &approval,
                     !option.kind.is_deny(),
                     request.checked,
+                    request.checked_hash.as_deref(),
                 )?;
                 approval.status = if option.kind.is_deny() {
                     ApprovalStatus::Denied

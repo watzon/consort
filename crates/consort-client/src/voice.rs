@@ -538,6 +538,9 @@ pub struct DraftCardView {
     pub edited: bool,
     /// The user said "Not how I write".
     pub not_my_voice: bool,
+    /// The hash of the arguments and flags that the user checks. A tick
+    /// holds only for this hash, so a new scan clears it.
+    pub review_hash: String,
 }
 
 impl DraftCardView {
@@ -614,6 +617,7 @@ pub fn draft_card(card: &ConnectorCard) -> Option<DraftCardView> {
             .collect(),
         edited: card.edited(),
         not_my_voice: card.not_my_voice,
+        review_hash: card.review_hash(),
     })
 }
 

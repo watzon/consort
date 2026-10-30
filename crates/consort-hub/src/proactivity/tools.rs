@@ -112,13 +112,8 @@ pub(crate) fn decision_posting(
     if !offer {
         return Ok(turn::mark_for(&kind));
     }
-    // An offer about the style guide answers the user's own edits or
-    // feedback, so no level stops it.
-    if row_has_voice_event(tx.db(), session_id, channel.id)? {
-        let mut mark = ProactiveMark::new(consort_proto::model::ProactiveKind::Voice);
-        mark.offer = true;
-        return Ok(Some(mark));
-    }
+    // An offer about the style guide is the hub's (`propose_voice_rule`),
+    // so every offer here follows the normal gate.
     if !kind.is_proactive() {
         return Err(HubError::invalid(
             "An offer is for a turn that you started on your own. Ask a normal decision instead.",
@@ -145,25 +140,6 @@ pub(crate) fn decision_posting(
         mark.offer = true;
     }
     Ok(mark)
-}
-
-/// Whether the open turn of a coordinator has a `voice_edits` or
-/// `voice_feedback` event.
-fn row_has_voice_event(
-    conn: &rusqlite::Connection,
-    session_id: SessionId,
-    channel_id: consort_proto::ids::ChannelId,
-) -> Result<bool> {
-    let (_, row) = turn::turn_of_session(conn, session_id, channel_id)?;
-    Ok(row.session_id == Some(session_id)
-        && row.turn_open
-        && row.turn_events.iter().any(|e| {
-            matches!(
-                e,
-                consort_proto::turn_input::WakeEvent::VoiceEdits { .. }
-                    | consort_proto::turn_input::WakeEvent::VoiceFeedback { .. }
-            )
-        }))
 }
 
 /// The kind of the proactive turn that starts a task, and whether the task

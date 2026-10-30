@@ -4,17 +4,24 @@
 //!
 //! - The voice is off by default. Turning it on starts the voice task in
 //!   Tutti with a fixed brief that lists only the chosen sources
-//!   ([`learn`]). That task can run only read tools of those connections,
-//!   and its proposal comes back as an offer card. The hub writes
-//!   `voice.md` only after "Do it". Raw text never becomes memory: every
-//!   write of `voice.md` goes through the style guide format and the
-//!   screening of [`consort_proto::model::VoiceGuide`].
+//!   ([`learn`]). Every voice task keeps its mark, so an old one keeps its
+//!   limits; Learn again, Turn off and Reset stop the earlier ones. A
+//!   voice task can run only read tools of those connections, and its
+//!   proposal comes back as an offer card.
+//! - The hub owns `voice.md`. It writes the note only after "Do it" on an
+//!   offer, or for the user's own edit in Settings > Voice. Sessions cannot
+//!   write or delete it; a learned rule change goes through
+//!   `propose_voice_rule`. The user's rules are hub data in the settings,
+//!   and the hub renders them with the mark `(you)`. Raw text never
+//!   becomes memory: every write goes through the style guide format and
+//!   the screening of [`consort_proto::model::VoiceGuide`].
 //! - Only a session that can reach a connector tool that drafts or sends
 //!   gets the voice in its prompt ([`Hub::voice_prompt_section`]).
 //! - The card of a draft or send tool says which voice wrote it, has Edit,
 //!   and marks commitments that the request did not contain ([`card`],
-//!   [`scan`]). An allow needs "I checked the marked lines" while flags
-//!   exist. The voice never loosens the approval rule.
+//!   [`scan`]). An allow needs "I checked the marked lines" for the flags
+//!   that the user saw. While the voice is on, every send asks. The voice
+//!   never loosens the approval rule.
 //! - Edits teach the voice: the hub keeps draft pairs for 90 days and wakes
 //!   Tutti after 5 edited pairs of one context ([`edits`]).
 
@@ -26,9 +33,9 @@ use consort_proto::client_api::{
 };
 use consort_proto::frame::Empty;
 use consort_proto::model::{
-    Channel, Connection, DRAFT_PAIR_KEEP_DAYS, MemoryScope, VOICE_NOTE_MAX_BYTES, VOICE_NOTE_PATH,
-    VoiceGuide, VoiceSample, VoiceSampleState, VoiceSettings, VoiceSourceKind, mark_user_rules,
-    outgoing_kind,
+    Channel, Connection, DRAFT_PAIR_KEEP_DAYS, MemoryAuthor, MemoryScope, VOICE_NOTE_MAX_BYTES,
+    VOICE_NOTE_PATH, VoiceGuide, VoiceSample, VoiceSampleState, VoiceSettings, VoiceSourceKind,
+    mark_user_rules, outgoing_kind,
 };
 use consort_proto::turn_input::WakeEvent;
 use rusqlite::Connection as Db;
@@ -80,13 +87,22 @@ impl VoiceState {
     }
 }
 
-/// The style guide, when `voice.md` exists.
+/// The error of a session that writes or deletes `voice.md`.
+pub(crate) const VOICE_NOTE_REFUSAL: &str = "voice.md belongs to the hub. Sessions cannot write or delete it. To change a rule after a voice_edits event, call propose_voice_rule with the edits that agree; the user approves it as an offer. To add a rule that the user asked for, tell the user to add it in Settings > Voice.";
+
+/// The style guide, when `voice.md` exists, with the user's rules from the
+/// settings. A `(you)` mark in the note that the settings do not have is
+/// not the user's.
 pub(crate) fn guide(conn: &Db) -> Result<Option<VoiceGuide>> {
-    Ok(
-        knowledge::memory_note(conn, MemoryScope::Global, VOICE_NOTE_PATH)?
-            .filter(|n| n.deleted_at.is_none())
-            .map(|n| VoiceGuide::parse(&n.content)),
-    )
+    let Some(note) = knowledge::memory_note(conn, MemoryScope::Global, VOICE_NOTE_PATH)?
+        .filter(|n| n.deleted_at.is_none())
+    else {
+        return Ok(None);
+    };
+    let settings = store::settings(conn)?;
+    Ok(Some(
+        VoiceGuide::parse(&note.content).with_user_rules(&settings.user_rules),
+    ))
 }
 
 /// The style guide when the voice is on and the guide says something.
@@ -98,34 +114,27 @@ pub(crate) fn active_guide(conn: &Db) -> Result<Option<VoiceGuide>> {
     Ok(guide(conn)?.filter(|g| !g.is_empty()))
 }
 
-/// Checks and normalizes a write of `voice.md`. A write by the user marks
-/// every new rule as the user's. A write by a session must keep every rule
-/// that the user wrote. Both go through the format and the screening, and
-/// must fit in 6 KiB.
-pub(crate) fn screen_note_write(conn: &Db, by_user: bool, content: &str) -> Result<String> {
-    let before = guide(conn)?.unwrap_or_else(VoiceGuide::empty);
-    let after = VoiceGuide::parse(content).screened();
-    let after = if by_user {
-        mark_user_rules(&before, after)
-    } else {
-        let kept: Vec<String> = after
-            .user_rules()
-            .iter()
-            .map(|r| r.to_lowercase())
-            .collect();
-        let dropped: Vec<String> = before
-            .user_rules()
-            .into_iter()
-            .filter(|r| !kept.contains(&r.to_lowercase()))
-            .collect();
-        if !dropped.is_empty() {
-            return Err(HubError::invalid(format!(
-                "The new voice.md drops rules that the user wrote. Keep them word for word with the mark (you): {}",
-                dropped.join(" | ")
-            )));
-        }
-        after
-    };
+/// Checks and normalizes a write of `voice.md` from outside the hub. Only
+/// the user may write it: a session gets [`VOICE_NOTE_REFUSAL`]. The
+/// user's write marks every new or changed rule as the user's, and the
+/// rules with the mark become the user's rules in the settings. The text
+/// goes through the format and the screening, and must fit in 6 KiB.
+pub(crate) fn screen_note_write(
+    tx: &mut Tx<'_>,
+    by: MemoryAuthor,
+    content: &str,
+) -> Result<String> {
+    if by != MemoryAuthor::User {
+        return Err(crate::proactivity::turn::denied(VOICE_NOTE_REFUSAL));
+    }
+    let before = guide(tx.db())?.unwrap_or_else(VoiceGuide::empty);
+    let after = mark_user_rules(&before, VoiceGuide::parse(content).screened());
+    let mut settings = store::settings(tx.db())?;
+    let user_rules = after.user_rule_list();
+    if settings.user_rules != user_rules {
+        settings.user_rules = user_rules;
+        tx.save_voice_settings(&settings)?;
+    }
     let text = after.render();
     if text.len() > VOICE_NOTE_MAX_BYTES {
         return Err(HubError::invalid(format!(
@@ -192,7 +201,8 @@ impl Hub {
         Ok(reaches.then(|| prompt_text(&guide)))
     }
 
-    /// Whether a session belongs to the voice task.
+    /// Whether a session belongs to a voice task: any task that learned
+    /// the voice, also one that a newer voice task replaced.
     pub(crate) async fn is_voice_task(
         &self,
         task: Option<&consort_proto::model::Task>,
@@ -201,8 +211,9 @@ impl Hub {
             return Ok(false);
         };
         let id = task.id;
-        let settings = self.store.read(store::settings).await?;
-        Ok(settings.task_id == Some(id))
+        self.store
+            .read(move |conn| store::is_voice_task(conn, id))
+            .await
     }
 
     /// The settings with the sample that the hub holds.
@@ -246,6 +257,7 @@ impl Hub {
         if let Some(sources) = &request.sources {
             learn::validate_sources(sources)?;
         }
+        let turn_off = request.enabled == Some(false);
         let hub = self.clone();
         let (settings, start) = self
             .store
@@ -287,6 +299,9 @@ impl Hub {
                 Ok((settings, start))
             })
             .await?;
+        if turn_off {
+            self.stop_voice_tasks("The voice was turned off.").await?;
+        }
         if start {
             let settings = self.start_voice_task().await?;
             return Ok(self.voice_result(settings));
@@ -319,6 +334,7 @@ impl Hub {
         _caller: &Caller,
         _request: VoiceReset,
     ) -> Result<VoiceResult> {
+        self.stop_voice_tasks("The voice was reset.").await?;
         let settings = self
             .store
             .write(|tx| {
@@ -333,6 +349,7 @@ impl Hub {
                 settings.enabled = false;
                 settings.last_learned_at = None;
                 settings.learned_summary = None;
+                settings.user_rules.clear();
                 tx.save_voice_settings(&settings)?;
                 Ok(settings)
             })

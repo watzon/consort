@@ -147,6 +147,7 @@ async fn a_task_runs_with_an_approval_and_ends_resolved() {
             approval_id: approval.id,
             option_id: "allow".to_owned(),
             checked: false,
+            checked_hash: None,
         })
         .await
         .unwrap()
@@ -172,6 +173,7 @@ async fn a_task_runs_with_an_approval_and_ends_resolved() {
             approval_id: approval.id,
             option_id: "deny".to_owned(),
             checked: false,
+            checked_hash: None,
         })
         .await
         .unwrap_err();
@@ -311,6 +313,7 @@ async fn a_denied_approval_sends_the_deny_option_back() {
             approval_id: approval.id,
             option_id: "deny".to_owned(),
             checked: false,
+            checked_hash: None,
         })
         .await
         .unwrap()
@@ -328,6 +331,7 @@ async fn a_denied_approval_sends_the_deny_option_back() {
             approval_id: approval.id,
             option_id: "other".to_owned(),
             checked: false,
+            checked_hash: None,
         })
         .await
         .unwrap_err();

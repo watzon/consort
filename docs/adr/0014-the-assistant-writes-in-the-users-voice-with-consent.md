@@ -11,10 +11,11 @@ When the user turns on "Write in my voice", drafts that go out in the user's nam
 ## Decision
 
 - Off by default. The user chooses each source. A task learns from the sources on a worker; raw text never becomes memory.
-- The learned guide is the global memory note `voice.md`, with sections per context and short screened examples. The user approves the first guide and every learned change.
+- The learned guide is the global memory note `voice.md`, with sections per context and short screened examples. The hub owns the note: no session can write or delete it. It changes only when the user says Do it on an offer (the first guide, or one learned rule from `propose_voice_rule`), or when the user edits it. The rules that the user wrote are hub data in the settings, and the hub renders them with `(you)`.
 - The hub adds the voice only to sessions that can draft or send through a connector, and only for text that goes out in the user's name.
-- The hub scans drafts for dates, amounts and agreements that the request did not contain, and the approval card makes the user check them. The voice never loosens the approval rule of a send tool.
-- Edits on the approval card teach the voice. A rule changes only when at least 3 edits agree.
+- The hub scans every string of a draft or send call for dates, times, amounts and agreements whose value is not in the request, and the approval card makes the user check them. The request is only the user's own words, never a brief or a mail. The tick holds only for the flags that the user saw.
+- While the voice is on, every send asks the user, whatever the connection's rule and earlier allows. A draft keeps the connection's rule unless it has flags. The voice never loosens an approval rule.
+- Edits on the approval card teach the voice. A rule changes only when at least 3 distinct edited drafts of one context show it, and the hub checks that count. Voice offers follow the Tutti proactivity level.
 
 ## Considered options
 
@@ -26,3 +27,7 @@ When the user turns on "Write in my voice", drafts that go out in the user's nam
 
 - New hub settings, a voice task brief, a `voice_guide` tool, draft pairs, and new fields on approval cards.
 - Approval cards for send and draft tools get Edit, which is useful even with the voice off.
+- With the voice on, a connection set to "Run without asking" still asks before each send. This costs a click per send; it is the price of text that goes out in the user's name.
+- Every copy of a draft (pairs, card text, call arguments in sessions, voice task briefs) goes after 90 days.
+
+Changed on 2026-10-30 after the review of the first build: sends in the voice always ask, the hub owns `voice.md`, the user's rules are hub data, and the scan compares values with the user's own words only.

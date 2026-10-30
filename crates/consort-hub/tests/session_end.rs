@@ -248,6 +248,7 @@ async fn a_refused_answer_fails_the_task_so_it_can_be_retried() {
             approval_id: approval.id,
             option_id: "allow".to_owned(),
             checked: false,
+            checked_hash: None,
         })
         .await
         .unwrap();

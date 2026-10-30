@@ -1,7 +1,8 @@
 //! Learning from edits: the sentences that the user removed from or added
 //! to a draft, and the changes that several edits agree on.
 
-use consort_proto::model::{DraftPair, VOICE_EDITS_AGREE_MIN};
+use consort_proto::ids::ApprovalId;
+use consort_proto::model::{DraftPair, VOICE_EDITS_AGREE_MIN, placeholders};
 use consort_proto::turn_input::{VoiceEditPair, VoiceEditPattern};
 
 /// The sentences of a text: split at line breaks and after `.`, `!` and
@@ -48,6 +49,7 @@ pub(crate) fn diff(draft: &str, final_text: &str) -> VoiceEditPair {
     let before_keys: Vec<String> = before.iter().map(|s| key(s)).collect();
     let after_keys: Vec<String> = after.iter().map(|s| key(s)).collect();
     VoiceEditPair {
+        approval_id: None,
         removed: before
             .iter()
             .zip(&before_keys)
@@ -64,9 +66,10 @@ pub(crate) fn diff(draft: &str, final_text: &str) -> VoiceEditPair {
 }
 
 /// The changes that at least [`VOICE_EDITS_AGREE_MIN`] edits agree on,
-/// most first. Each edit counts once for a change.
+/// most first, with the cards of the edits. Each edit counts once for a
+/// change.
 pub(crate) fn agreeing(pairs: &[VoiceEditPair]) -> Vec<VoiceEditPattern> {
-    let mut counts: Vec<(String, String, String, u32)> = Vec::new();
+    let mut counts: Vec<(String, String, String, u32, Vec<ApprovalId>)> = Vec::new();
     for pair in pairs {
         let mut seen: Vec<(String, String)> = Vec::new();
         for (change, list) in [("removed", &pair.removed), ("added", &pair.added)] {
@@ -76,12 +79,16 @@ pub(crate) fn agreeing(pairs: &[VoiceEditPair]) -> Vec<VoiceEditPattern> {
                     continue;
                 }
                 seen.push((change.to_owned(), k.clone()));
+                let ids: Vec<ApprovalId> = pair.approval_id.into_iter().collect();
                 match counts
                     .iter_mut()
-                    .find(|(c, kk, _, _)| c == change && *kk == k)
+                    .find(|(c, kk, _, _, _)| c == change && *kk == k)
                 {
-                    Some(entry) => entry.3 += 1,
-                    None => counts.push((change.to_owned(), k, sentence.clone(), 1)),
+                    Some(entry) => {
+                        entry.3 += 1;
+                        entry.4.extend(ids);
+                    }
+                    None => counts.push((change.to_owned(), k, sentence.clone(), 1, ids)),
                 }
             }
         }
@@ -89,22 +96,29 @@ pub(crate) fn agreeing(pairs: &[VoiceEditPair]) -> Vec<VoiceEditPattern> {
     let min = u32::try_from(VOICE_EDITS_AGREE_MIN).unwrap_or(3);
     let mut out: Vec<VoiceEditPattern> = counts
         .into_iter()
-        .filter(|(_, _, _, n)| *n >= min)
-        .map(|(change, _, text, count)| VoiceEditPattern {
+        .filter(|(_, _, _, n, _)| *n >= min)
+        .map(|(change, _, text, count, approval_ids)| VoiceEditPattern {
             change,
             text,
             count,
+            approval_ids,
         })
         .collect();
     out.sort_by_key(|a| std::cmp::Reverse(a.count));
     out
 }
 
-/// The edits of draft pairs, for a `voice_edits` event.
+/// The edits of draft pairs, for a `voice_edits` event, with their cards.
+/// Addresses, phone numbers and links in the sentences become
+/// placeholders.
 pub(crate) fn edit_pairs(pairs: &[DraftPair]) -> Vec<VoiceEditPair> {
     pairs
         .iter()
-        .map(|p| diff(&p.draft, &p.final_text))
+        .map(|p| {
+            let mut pair = diff(&placeholders(&p.draft), &placeholders(&p.final_text));
+            pair.approval_id = Some(p.approval_id);
+            pair
+        })
         .collect()
 }
 
@@ -125,6 +139,7 @@ mod tests {
     #[test]
     fn three_agreeing_edits_make_a_pattern_and_two_do_not() {
         let edit = |removed: &str| VoiceEditPair {
+            approval_id: None,
             removed: vec![removed.to_owned()],
             added: vec![],
         };

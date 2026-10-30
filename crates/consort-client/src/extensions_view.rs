@@ -551,6 +551,7 @@ mod tests {
             flags: Vec::new(),
             draft_arguments: None,
             not_my_voice: false,
+            ask_rule: None,
         }));
         let options = details.hub_card_options().unwrap();
         let (card, labels) = hub_card(&details, &options, &Cache::default()).unwrap();

@@ -24,6 +24,13 @@ pub(crate) struct NewTask {
     /// The kind of the proactive turn that starts the task, and whether
     /// the task runs in draft mode. `None` for every other task.
     pub proactive: Option<(consort_proto::model::ProactiveKind, bool)>,
+    /// The user's own words that led to the task: the user messages and
+    /// answers of the coordinator turn that started it. Empty for a task
+    /// that no user text started. The voice scan compares drafts with it.
+    pub user_request: String,
+    /// The task learns the voice. The hub marks it in the same write, so
+    /// its limits hold from its first call.
+    pub voice_task: bool,
 }
 
 impl Hub {

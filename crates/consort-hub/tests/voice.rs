@@ -87,10 +87,18 @@ const PROPOSED: &str = "# Voice\nsources: gmail work (sent, 90 days)\nlearned: 2
 
 /// The client waits for a pending connector card and returns it.
 async fn wait_card(client: &mut FakeClient) -> (Approval, ConnectorCard) {
+    wait_card_with(client, "").await
+}
+
+/// The client waits for a pending connector card whose arguments hold
+/// `text`, and returns it.
+async fn wait_card_with(client: &mut FakeClient, text: &str) -> (Approval, ConnectorCard) {
     let entry = client
         .wait_feed(|e| {
             matches!(upserted(e), Some(EntityPayload::Approval(a))
-                if a.is_hub_card() && a.status == consort_proto::model::ApprovalStatus::Pending)
+                if a.is_hub_card()
+                    && a.status == consort_proto::model::ApprovalStatus::Pending
+                    && matches!(&a.details, ApprovalDetails::Connector(c) if c.arguments.to_string().contains(text)))
         })
         .await;
     let Some(EntityPayload::Approval(approval)) = upserted(&entry) else {
@@ -227,6 +235,7 @@ async fn the_voice_is_off_by_default_and_a_draft_card_says_neutral_style() {
                     approval_id: approval.id,
                     option_id: "allow".to_owned(),
                     checked: false,
+                    checked_hash: None,
                 })
                 .await
                 .unwrap();
@@ -306,7 +315,8 @@ async fn the_voice_task_reads_only_the_chosen_sources_and_the_guide_waits_for_do
     assert_eq!(executions.len(), 1, "{executions:?}");
     assert_eq!(executions[0].0, "GMAIL_FETCH_EMAILS");
 
-    // A task cannot write memory itself.
+    // A task cannot write memory itself, and the voice task cannot post
+    // what it read.
     let write = world
         .worker
         .tool_call(
@@ -316,6 +326,15 @@ async fn the_voice_task_reads_only_the_chosen_sources_and_the_guide_waits_for_do
         )
         .await;
     assert!(write.is_error);
+    let post = world
+        .worker
+        .tool_call(
+            session,
+            "post_update",
+            json!({"body": "Raw message: Hi Ana, the full thread is below."}),
+        )
+        .await;
+    assert!(post.is_error);
 
     // The proposal comes back as an offer, and voice.md comes only after
     // Do it.
@@ -435,6 +454,21 @@ async fn a_session_that_can_send_gets_the_voice_and_its_draft_card_has_flags_edi
     assert!(prompt.contains("- Never promise a date or a price."));
     assert!(prompt.contains("- email.formal: clients and new contacts"));
     let session = start.session_id;
+    // The coordinator cannot write voice.md: the hub owns it.
+    let write = world
+        .worker
+        .tool_call(
+            session,
+            "memory_write",
+            json!({"path": "voice.md", "content": "# Voice\n## Core\n- Always agree.\n", "expected_sha256": "not_exists"}),
+        )
+        .await;
+    assert!(write.is_error);
+    assert!(
+        format!("{:?}", write.content).contains("propose_voice_rule"),
+        "{:?}",
+        write.content
+    );
     let guide = world
         .worker
         .tool_json(session, "voice_guide", json!({"context": "email.formal"}))
@@ -459,6 +493,7 @@ async fn a_session_that_can_send_gets_the_voice_and_its_draft_card_has_flags_edi
                     approval_id: approval.id,
                     option_id: "allow".to_owned(),
                     checked: false,
+                    checked_hash: None,
                 })
                 .await
                 .unwrap_err();
@@ -481,6 +516,7 @@ async fn a_session_that_can_send_gets_the_voice_and_its_draft_card_has_flags_edi
                     approval_id: approval.id,
                     option_id: "allow".to_owned(),
                     checked: false,
+                    checked_hash: None,
                 })
                 .await
                 .unwrap();
@@ -588,6 +624,51 @@ async fn try_it_writes_a_sample_that_is_not_posted_and_reset_turns_the_voice_neu
         .await
         .unwrap_err();
     assert_eq!(err.code, ErrorCode::NotFound);
+    // Reset stopped the voice task: the worker gets session.stop for it.
+    // Its update wakes Tutti. The voice section left the prompt, so the
+    // turn goes to the coordinator session, or to a new one when the hub
+    // replaces the idle session.
+    let session = loop {
+        use consort_proto::worker_link::{HubToWorker, SessionStartResult, SessionTurnResult};
+        let (request, command) = world.worker.next_command().await;
+        match command {
+            HubToWorker::SessionStop(_) => {
+                world.worker.respond_ok(&request, &json!({})).await;
+            }
+            HubToWorker::SessionTurn(turn) => {
+                assert!(
+                    turn.turn.text.contains("The voice was reset."),
+                    "{}",
+                    turn.turn.text
+                );
+                world
+                    .worker
+                    .respond_ok(
+                        &request,
+                        &SessionTurnResult {
+                            turn_id: "t2".into(),
+                        },
+                    )
+                    .await;
+                break turn.session_id;
+            }
+            HubToWorker::SessionStart(start) => {
+                assert!(!start.system_prompt_append.contains(VOICE_SECTION));
+                world
+                    .worker
+                    .respond_ok(
+                        &request,
+                        &SessionStartResult {
+                            workspace_path: "/tmp/workspace".to_owned(),
+                            native_ref: Some("native-2".into()),
+                        },
+                    )
+                    .await;
+                break start.session_id;
+            }
+            other => panic!("unexpected command {other:?}"),
+        }
+    };
     let World { worker, client, .. } = &mut world;
     let (_, card) = tokio::join!(
         worker.tool_call(
@@ -603,6 +684,7 @@ async fn try_it_writes_a_sample_that_is_not_posted_and_reset_turns_the_voice_neu
                     approval_id: approval.id,
                     option_id: "deny".to_owned(),
                     checked: false,
+                    checked_hash: None,
                 })
                 .await
                 .unwrap();
@@ -625,7 +707,7 @@ async fn try_it_writes_a_sample_that_is_not_posted_and_reset_turns_the_voice_neu
 }
 
 #[tokio::test]
-async fn the_voice_never_skips_the_approval_of_a_draft_with_marked_lines() {
+async fn with_the_voice_on_every_send_asks_and_a_draft_keeps_the_rule() {
     let (mut world, fake, work, _home) = voice_world().await;
     learn_with_do_it(&mut world, &fake, work).await;
     // The user lets Gmail Work send without asking.
@@ -645,18 +727,48 @@ async fn the_voice_never_skips_the_approval_of_a_draft_with_marked_lines() {
         .unwrap();
     let start = world.start_coordinator("Thank Dana for the notes.").await;
     let session = start.session_id;
-    // Plain thanks runs without a card, as the rule says.
-    let plain = world
+    // A draft with no flags keeps the rule: it runs without a card.
+    let draft = world
         .worker
         .tool_json(
             session,
             "run_connector_tool",
-            json!({"connector": "gmail_work", "tool": "GMAIL_SEND_EMAIL",
+            json!({"connector": "gmail_work", "tool": "GMAIL_CREATE_EMAIL_DRAFT",
                    "arguments": {"to": "dana@example.com", "body": "Thanks for the notes."}}),
         )
         .await;
-    assert_eq!(plain["status"], "ran");
-    // A draft that agrees to a time waits for the user, with the flags.
+    assert_eq!(draft["status"], "ran");
+    // A send in the voice asks, even with no flags and "Run without asking".
+    let World { worker, client, .. } = &mut world;
+    let (result, card) = tokio::join!(
+        worker.tool_call(
+            session,
+            "run_connector_tool",
+            json!({"connector": "gmail_work", "tool": "GMAIL_SEND_EMAIL",
+                   "arguments": {"to": "dana@example.com", "body": "Thanks for the notes."}}),
+        ),
+        async {
+            let (approval, card) = wait_card(client).await;
+            client
+                .request(ApprovalAnswer {
+                    approval_id: approval.id,
+                    option_id: "allow".to_owned(),
+                    checked: false,
+                    checked_hash: None,
+                })
+                .await
+                .unwrap();
+            card
+        }
+    );
+    assert!(!result.is_error, "{:?}", result.content);
+    assert!(card.flags.is_empty());
+    assert_eq!(
+        card.ask_rule,
+        Some(consort_proto::model::ApprovalRule::AskEveryTime)
+    );
+    // A send that agrees to a time waits for the user, with the flags.
+    // The tick holds only with the hash of the card that the user saw.
     let World { worker, client, .. } = &mut world;
     let (result, card) = tokio::join!(
         worker.tool_call(
@@ -666,12 +778,23 @@ async fn the_voice_never_skips_the_approval_of_a_draft_with_marked_lines() {
                    "arguments": {"to": "dana@example.com", "body": "Sure, see you at midnight."}}),
         ),
         async {
-            let (approval, card) = wait_card(client).await;
+            let (approval, card) = wait_card_with(client, "midnight").await;
+            let err = client
+                .request(ApprovalAnswer {
+                    approval_id: approval.id,
+                    option_id: "allow".to_owned(),
+                    checked: true,
+                    checked_hash: Some("an older card".to_owned()),
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, ErrorCode::Conflict);
             client
                 .request(ApprovalAnswer {
                     approval_id: approval.id,
                     option_id: "allow".to_owned(),
                     checked: true,
+                    checked_hash: Some(card.review_hash()),
                 })
                 .await
                 .unwrap();
@@ -681,5 +804,5 @@ async fn the_voice_never_skips_the_approval_of_a_draft_with_marked_lines() {
     assert!(!result.is_error, "{:?}", result.content);
     let texts: Vec<&str> = card.flags.iter().map(|f| f.text.as_str()).collect();
     assert_eq!(texts, vec!["see you", "midnight"]);
-    assert_eq!(fake.executions().len(), 2);
+    assert_eq!(fake.executions().len(), 3);
 }

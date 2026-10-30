@@ -19,6 +19,7 @@ pub const MIGRATIONS: &[&str] = &[
     include_str!("schema_v9.sql"),
     include_str!("schema_v10.sql"),
     include_str!("schema_v11.sql"),
+    include_str!("schema_v12.sql"),
 ];
 
 pub fn current_version() -> i64 {
@@ -75,6 +76,63 @@ mod tests {
             )
             .unwrap();
         assert_eq!(hits, 1);
+    }
+
+    /// A hub that ran a build whose version 10 was empty (`SELECT 1;`) is at
+    /// version 11 without the voice tables. Version 12 makes them, and the
+    /// voice task of its settings becomes a marked voice task.
+    #[test]
+    fn a_hub_at_version_11_without_the_voice_tables_gets_them() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        for (i, sql) in MIGRATIONS[..11].iter().enumerate() {
+            let sql = if i == 9 { "SELECT 1;" } else { sql };
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.execute_batch("PRAGMA user_version = 11").unwrap();
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('voice', '{\"enabled\":true,\"task_id\":\"tsk_1\"}')",
+            [],
+        )
+        .unwrap();
+        let has = |conn: &Connection, table: &str| -> bool {
+            conn.query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                [table],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+                == 1
+        };
+        assert!(!has(&conn, "draft_pairs"));
+        migrate(&mut conn).unwrap();
+        for table in ["draft_pairs", "voice_uses", "voice_tasks", "task_requests"] {
+            assert!(has(&conn, table), "{table}");
+        }
+        conn.execute(
+            "INSERT INTO draft_pairs (approval_id, context, unchanged, at, data) VALUES ('a', 'chat', 0, 1, '{}')",
+            [],
+        )
+        .unwrap();
+        let task: String = conn
+            .query_row("SELECT task_id FROM voice_tasks", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(task, "tsk_1");
+        // A hub that has the tables keeps their rows.
+        let mut full = Connection::open_in_memory().unwrap();
+        for sql in &MIGRATIONS[..11] {
+            full.execute_batch(sql).unwrap();
+        }
+        full.execute_batch("PRAGMA user_version = 11").unwrap();
+        full.execute(
+            "INSERT INTO draft_pairs (approval_id, context, unchanged, at, data) VALUES ('kept', 'chat', 0, 1, '{}')",
+            [],
+        )
+        .unwrap();
+        migrate(&mut full).unwrap();
+        let kept: i64 = full
+            .query_row("SELECT count(*) FROM draft_pairs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(kept, 1);
     }
 
     /// Opens a database at schema version 5, the last one before Tutti, so a

@@ -241,11 +241,11 @@ The user's own way of writing to other people, which the assistant can use for d
 _Avoid_: persona, tone of the assistant, writing style (for the assistant's own replies)
 
 **Style guide**:
-The global memory note `voice.md` that describes the voice: Core rules, one section for each context (Formal email, Close email, Chat, Public posts), short examples with placeholders, and hard rules. A rule that ends with `(you)` is one that the user wrote, and a learned change never replaces it.
+The global memory note `voice.md` that describes the voice: Core rules, one section for each context (Formal email, Close email, Chat, Public posts), short examples with placeholders, and hard rules. A rule that ends with `(you)` is one that the user wrote, and a learned change never replaces it. The hub owns the note: it changes only when the user edits it or says Do it on an offer.
 _Avoid_: voice profile, persona file, style model
 
 **Commitment flag**:
-A phrase in a draft that the user must check before it goes out: a date, a time, a weekday, a price or an agreement that the request did not contain, or text that breaks a hard rule.
+A phrase in a draft that the user must check before it goes out: a date, a time, a weekday, a price or an agreement whose value the request (the user's own words) did not contain, or text that breaks a hard rule.
 _Avoid_: warning, risk marker, highlight
 
 **Draft pair**:

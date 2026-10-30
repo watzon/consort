@@ -636,7 +636,8 @@ async fn run(shared: Arc<Shared>, command: Command) -> Result<CommandOutput, Cli
                 .call(consort_proto::client_api::ApprovalAnswer {
                     approval_id: parse(&approval_id, "approval")?,
                     option_id,
-                    checked,
+                    checked: checked.is_some(),
+                    checked_hash: checked,
                 })
                 .await;
             if let Err(err) = answered {

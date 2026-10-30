@@ -179,6 +179,7 @@ fn card(voice: Option<&str>, flags: Vec<CommitmentFlag>) -> ConnectorCard {
         flags,
         draft_arguments: None,
         not_my_voice: false,
+        ask_rule: None,
     }
 }
 

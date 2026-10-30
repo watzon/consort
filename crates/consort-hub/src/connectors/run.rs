@@ -321,14 +321,16 @@ impl Hub {
         self.connectors.client()?;
         let tool = self.connector_tool(&connection, &args.tool).await?;
         let kind = tool_kind(&tool);
-        let voice_task = self.check_voice_task_call(ctx, &connection, kind).await?;
+        let voice_task = self
+            .check_voice_task_call(ctx, &connection, &tool.slug, kind, &arguments)
+            .await?;
         if kind != consort_proto::model::ToolKind::Read && self.in_research_turn(ctx).await? {
             return Err(crate::proactivity::turn::denied(
                 crate::proactivity::turn::RESEARCH_REFUSAL,
             ));
         }
         // A draft or send tool: the voice, the disclosure line and the
-        // commitment flags. A call with flags always asks the user.
+        // commitment flags.
         let voice = self
             .voice_for_call(ctx, &tool.slug, kind, &mut arguments)
             .await?;
@@ -336,14 +338,17 @@ impl Hub {
         let mut rule = connection.approvals.rule_for(kind);
         // A proactive turn and a draft task ask before each call that writes
         // or sends, whatever the connection allows and whatever the user
-        // allowed before.
-        if kind != consort_proto::model::ToolKind::Read
-            && self.connector_calls_ask_each_time(ctx).await?
+        // allowed before. So does a call with flags, and every send while
+        // the voice is on: the card is the only place where the user sees
+        // the text that goes out in their name. Such an answer saves no
+        // allow for later calls.
+        if (kind != consort_proto::model::ToolKind::Read
+            && self.connector_calls_ask_each_time(ctx).await?)
+            || voice.must_ask()
         {
             rule = ApprovalRule::AskEveryTime;
         }
         let decision = match rule {
-            _ if !voice.flags.is_empty() => None,
             ApprovalRule::RunWithoutAsking => Some(CallDecision::RanWithoutAsking),
             ApprovalRule::AskOncePerTask => {
                 let (key, id) = (scope.grant_key(), connection.id);
@@ -365,7 +370,27 @@ impl Hub {
         };
         if decision.is_some() {
             let mut result = self.execute_call(&record, &account).await?;
-            self.redact_for_voice_task(voice_task, &mut result).await?;
+            // A draft or send that the user did not see is the assistant's
+            // text: it never teaches the voice.
+            if voice.outgoing.is_some()
+                && matches!(
+                    result,
+                    RunConnectorToolResult::Ran {
+                        successful: true,
+                        ..
+                    }
+                )
+            {
+                let (id, slug, sent) = (connection.id, tool.slug.clone(), arguments.clone());
+                let context = voice.voice.as_ref().map(|v| v.context.clone());
+                self.store
+                    .write(move |tx| {
+                        crate::voice::card::record_unasked_pair(tx, id, &slug, &sent, context)
+                    })
+                    .await?;
+            }
+            self.redact_for_voice_task(voice_task, &connection, &mut result)
+                .await?;
             return Ok(serde_json::to_value(result)?);
         }
 
@@ -390,6 +415,7 @@ impl Hub {
             flags: Vec::new(),
             draft_arguments: None,
             not_my_voice: false,
+            ask_rule: Some(rule),
         };
         voice.apply(&mut card);
         if let Err(err) = self
@@ -438,7 +464,8 @@ impl Hub {
             ..record
         };
         let mut result = self.answered_call(&record, &account, rule, status).await?;
-        self.redact_for_voice_task(voice_task, &mut result).await?;
+        self.redact_for_voice_task(voice_task, &connection, &mut result)
+            .await?;
         Ok(serde_json::to_value(result)?)
     }
 
@@ -454,16 +481,28 @@ impl Hub {
         }))
     }
 
-    /// In the voice task, text that the assistant wrote leaves the result.
+    /// In the voice task, text that the assistant wrote leaves the result,
+    /// and so do direct messages and private channels that the user did not
+    /// choose.
     async fn redact_for_voice_task(
         &self,
         voice_task: bool,
+        connection: &Connection,
         result: &mut RunConnectorToolResult,
     ) -> Result<()> {
         if !voice_task {
             return Ok(());
         }
         if let RunConnectorToolResult::Ran { data, .. } = result {
+            if !self.voice_private_allowed(connection).await? {
+                let dropped = crate::voice::learn::drop_private_chats(data);
+                if dropped > 0 {
+                    tracing::info!(
+                        dropped,
+                        "left private chats out of what the voice task read"
+                    );
+                }
+            }
             let texts = self.assistant_texts().await?;
             let left_out = crate::voice::learn::redact_assistant_text(data, &texts);
             if left_out > 0 {
@@ -690,7 +729,10 @@ impl Hub {
                 card.tool, connection.name
             ));
         };
-        let rule = connection.approvals.rule_for(card.tool_kind);
+        // The rule that made the card ask, as the hub decided when it posted
+        // the card. A proactive turn, a draft task, flags and a send in the
+        // voice asked every time, so their late answer saves no allow.
+        let rule = card.ask_rule.unwrap_or(ApprovalRule::AskEveryTime);
         let result = self
             .answered_call(&record, &account, rule, approval.status)
             .await;

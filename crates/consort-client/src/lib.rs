@@ -369,7 +369,7 @@ impl Client {
         self.run(Command::AnswerApproval {
             approval_id,
             choice,
-            checked: false,
+            checked: None,
         })
         .await
     }

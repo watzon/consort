@@ -1,10 +1,11 @@
 //! Learning the voice: the voice task with its fixed brief, the limits on
 //! what that task may read, the proposal that comes back with
-//! `suggest_memory`, and the offer card "Save this style guide?".
+//! `suggest_memory`, the offer card "Save this style guide?", and the
+//! offer of one learned rule (`propose_voice_rule`).
 
 use std::fmt::Write as _;
 
-use consort_proto::ids::{ConnectionId, DecisionId};
+use consort_proto::ids::{ConnectionId, DecisionId, SessionId};
 use consort_proto::model::{
     ApprovalMode, Author, Connection, Decision, DecisionOption, DecisionStatus, DraftPair,
     ExpectedHash, MemoryAuthor, MemoryScope, MessageKind, OFFER_DO_IT, OFFER_NEVER, OFFER_NOT_NOW,
@@ -13,13 +14,16 @@ use consort_proto::model::{
     VOICE_NOTE_PATH, VOICE_TASK_TITLE, VoiceGuide, VoiceSettings, VoiceSource, VoiceSourceKind,
     context_label, placeholders,
 };
+use consort_proto::status::{Actor, TaskStatus};
 use consort_proto::tools::{OkResult, SuggestMemoryArgs};
 use consort_proto::turn_input::SuggestionSource;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::{edits, guide, store};
 use crate::error::{HubError, Result};
 use crate::hub::{Hub, ToolCtx};
+use crate::link::events::{Effects, end_session_by_hub};
 use crate::ops::hooks::NewTask;
 use crate::store::{Tx, connectors as con_store, conversation, knowledge, work};
 
@@ -165,13 +169,16 @@ pub(crate) fn voice_brief(
 5. Never copy a whole message except as one of these short examples. Never put a fact about a person, a thread or a deal in the guide.\n\
 6. The guide is style only. It never holds a date, a price, a promise or an agreement."
     );
+    out.push_str("7. Never write the mark (you). Only the hub marks the rules that the user wrote, and it adds them to the guide itself.");
     if !user_rules.is_empty() {
         out.push_str(
-            "7. Keep these rules that the user wrote, word for word, with the mark (you):\n",
+            " These rules are the user's. Do not repeat them or write a rule against them:\n",
         );
         for rule in user_rules {
-            let _ = writeln!(out, "   - {rule} (you)");
+            let _ = writeln!(out, "   - {rule}");
         }
+    } else {
+        out.push('\n');
     }
     if settings.learn_from_edits && !edited.is_empty() {
         out.push_str("\n## Edits that the user made to drafts\n\nThe user changed these drafts before they went out. Learn from the changes.\n");
@@ -179,17 +186,21 @@ pub(crate) fn voice_brief(
             let diff = edits::diff(&pair.draft, &pair.final_text);
             let _ = writeln!(out, "Edit {}:", i + 1);
             for line in &diff.removed {
-                let _ = writeln!(out, "- removed: {}", quote_line(line, 200));
+                let _ = writeln!(out, "- removed: {}", quote_line(&placeholders(line), 200));
             }
             for line in &diff.added {
-                let _ = writeln!(out, "+ added: {}", quote_line(line, 200));
+                let _ = writeln!(out, "+ added: {}", quote_line(&placeholders(line), 200));
             }
         }
     }
     if !unchanged.is_empty() {
         out.push_str("\n## Text that the assistant wrote\n\nThe user sent these drafts unchanged. They are the assistant's words, not the user's. The hub removes them from what you read when it finds them; leave out any that you still see:\n");
         for pair in unchanged.iter().take(BRIEF_UNCHANGED_MAX) {
-            let _ = writeln!(out, "- {}", quote_line(&pair.final_text, 160));
+            let _ = writeln!(
+                out,
+                "- {}",
+                quote_line(&placeholders(&pair.final_text), 160)
+            );
         }
     }
     out.push_str("\n## The guide\n\nWrite the guide in this format, at most 6 KiB. Keep the four context headings.\n\n");
@@ -198,34 +209,43 @@ pub(crate) fn voice_brief(
     out
 }
 
-/// Adds the user's rules of `old` that `new` does not have, in the same
-/// section.
-fn keep_user_rules(old: &VoiceGuide, mut new: VoiceGuide) -> VoiceGuide {
-    let has = |rules: &[consort_proto::model::VoiceRule], text: &str| {
-        rules
+/// A learned rule that waits for "Do it" on its offer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RuleProposal {
+    /// `core` or a context key: the section of the rule.
+    pub context: String,
+    /// The rule.
+    pub rule: String,
+    /// The learned rule that it replaces.
+    #[serde(default)]
+    pub replaces: Option<String>,
+}
+
+impl RuleProposal {
+    /// The guide with this rule, in its section. A rule that is there
+    /// already changes nothing. Only a learned rule can be replaced.
+    pub(crate) fn apply_to(&self, mut guide: VoiceGuide) -> VoiceGuide {
+        let rules = if self.context == consort_proto::model::CORE_CONTEXT {
+            &mut guide.core
+        } else if let Some(section) = guide.contexts.iter_mut().find(|c| c.key == self.context) {
+            &mut section.rules
+        } else {
+            &mut guide.core
+        };
+        if let Some(old) = &self.replaces {
+            rules.retain(|r| r.by_user || !r.text.trim().eq_ignore_ascii_case(old.trim()));
+        }
+        if !rules
             .iter()
-            .any(|r| r.text.trim().eq_ignore_ascii_case(text.trim()))
-    };
-    for rule in old.core.iter().filter(|r| r.by_user) {
-        if !has(&new.core, &rule.text) {
-            new.core.push(rule.clone());
+            .any(|r| r.text.trim().eq_ignore_ascii_case(self.rule.trim()))
+        {
+            rules.push(consort_proto::model::VoiceRule {
+                text: self.rule.trim().to_owned(),
+                by_user: false,
+            });
         }
+        guide
     }
-    for rule in old.hard_rules.iter().filter(|r| r.by_user) {
-        if !has(&new.hard_rules, &rule.text) {
-            new.hard_rules.push(rule.clone());
-        }
-    }
-    for old_section in &old.contexts {
-        if let Some(section) = new.contexts.iter_mut().find(|c| c.key == old_section.key) {
-            for rule in old_section.rules.iter().filter(|r| r.by_user) {
-                if !has(&section.rules, &rule.text) {
-                    section.rules.push(rule.clone());
-                }
-            }
-        }
-    }
-    new
 }
 
 /// Cancels the offer card that waits, and drops its guide.
@@ -237,7 +257,30 @@ pub(crate) fn close_proposal(tx: &mut Tx<'_>, settings: &mut VoiceSettings) -> R
         decision.status = DecisionStatus::Canceled;
         tx.save_decision(&decision)?;
     }
+    tx.save_voice_rule_proposal(None)?;
     tx.save_voice_proposal("")
+}
+
+/// The guide to write on "Do it": a learned rule goes into the guide as
+/// it is now; a whole learned guide replaces it. Both get the user's
+/// rules of now, so a rule that the user wrote while the offer waited
+/// stays.
+fn guide_to_write(tx: &Tx<'_>, settings: &VoiceSettings) -> Result<Option<String>> {
+    let guide = match store::rule_proposal(tx.db())? {
+        Some(rule) => {
+            let current = guide(tx.db())?.unwrap_or_else(VoiceGuide::empty);
+            rule.apply_to(current)
+        }
+        None => match store::proposal(tx.db())? {
+            Some(text) => VoiceGuide::parse(&text),
+            None => return Ok(None),
+        },
+    };
+    let guide = guide
+        .screened()
+        .with_user_rules(&settings.user_rules)
+        .fit_to_limit();
+    Ok(Some(guide.render()))
 }
 
 /// The user answered the offer "Save this style guide?". Do it writes
@@ -249,7 +292,8 @@ pub(crate) fn proposal_answered(tx: &mut Tx<'_>, decision: &Decision) -> Result<
         return Ok(false);
     }
     settings.proposal_decision_id = None;
-    let proposal = store::proposal(tx.db())?;
+    let learned_guide = store::rule_proposal(tx.db())?.is_none();
+    let proposal = guide_to_write(tx, &settings)?;
     match decision.answer_label() {
         Some(OFFER_DO_IT) => {
             if let Some(text) = proposal {
@@ -260,7 +304,10 @@ pub(crate) fn proposal_answered(tx: &mut Tx<'_>, decision: &Decision) -> Result<
                     Some(note) => ExpectedHash::Sha256(note.sha256.clone()),
                     None => ExpectedHash::NotExists,
                 };
-                let suggested_by = settings.task_id.map(SuggestionSource::Task);
+                let suggested_by = settings
+                    .task_id
+                    .filter(|_| learned_guide)
+                    .map(SuggestionSource::Task);
                 let note = tx.write_memory(
                     MemoryScope::Global,
                     VOICE_NOTE_PATH,
@@ -275,13 +322,19 @@ pub(crate) fn proposal_answered(tx: &mut Tx<'_>, decision: &Decision) -> Result<
                     &note,
                     current.is_none(),
                 )?;
-                settings.last_learned_at = Some(tx.now());
-                settings.learned_summary = VoiceGuide::parse(&text).learned;
+                if learned_guide {
+                    settings.last_learned_at = Some(tx.now());
+                    settings.learned_summary = VoiceGuide::parse(&text).learned;
+                }
             }
         }
-        Some(OFFER_NEVER) => settings.enabled = false,
+        // Never about this on the guide turns the voice off. On a learned
+        // rule, it stops the offers of rules from edits.
+        Some(OFFER_NEVER) if learned_guide => settings.enabled = false,
+        Some(OFFER_NEVER) => settings.learn_from_edits = false,
         _ => {}
     }
+    tx.save_voice_rule_proposal(None)?;
     tx.save_voice_proposal("")?;
     tx.save_voice_settings(&settings)?;
     Ok(true)
@@ -291,6 +344,8 @@ impl Hub {
     /// Starts the voice task in Tutti with the fixed brief, and returns the
     /// settings with the task.
     pub(crate) async fn start_voice_task(&self) -> Result<VoiceSettings> {
+        self.stop_voice_tasks("A new voice task replaced this one.")
+            .await?;
         let (settings, tutti, brief) = self
             .store
             .read(|conn| {
@@ -319,6 +374,8 @@ impl Hub {
                 attachments: Vec::new(),
                 // The user started it with Learn, so it is not proactive.
                 proactive: None,
+                user_request: String::new(),
+                voice_task: true,
             })
             .await?;
         let task_id = task.id;
@@ -338,7 +395,9 @@ impl Hub {
         &self,
         ctx: &ToolCtx,
         connection: &Connection,
+        slug: &str,
         kind: ToolKind,
+        arguments: &Value,
     ) -> Result<bool> {
         if !self.is_voice_task(ctx.task.as_ref()).await? {
             return Ok(false);
@@ -355,7 +414,94 @@ impl Hub {
                 "The voice task may only read. It cannot send, change or delete anything.",
             ));
         }
+        let private_allowed = settings
+            .sources
+            .iter()
+            .any(|s| s.connection_id == Some(connection.id) && s.include_private);
+        if VoiceSourceKind::for_service(&connection.service) == Some(VoiceSourceKind::Chat)
+            && !private_allowed
+            && names_private_chat(slug, arguments)
+        {
+            return Err(crate::proactivity::turn::denied(format!(
+                "The user chose only public channels of {}. Do not read direct messages or private channels.",
+                connection.name
+            )));
+        }
         Ok(true)
+    }
+
+    /// Whether the voice task may see private chats of a connection: the
+    /// user ticked them for that source.
+    pub(crate) async fn voice_private_allowed(&self, connection: &Connection) -> Result<bool> {
+        let id = connection.id;
+        let settings = self.store.read(store::settings).await?;
+        Ok(
+            VoiceSourceKind::for_service(&connection.service) != Some(VoiceSourceKind::Chat)
+                || settings
+                    .sources
+                    .iter()
+                    .any(|s| s.connection_id == Some(id) && s.include_private),
+        )
+    }
+
+    /// Ends the earlier voice tasks: a running session ends, and the task
+    /// fails with `reason`. The tasks keep their mark, so a retried one
+    /// keeps its limits, and its proposal no longer reaches an offer.
+    pub(crate) async fn stop_voice_tasks(&self, reason: &str) -> Result<()> {
+        let hub = self.clone();
+        let reason = reason.to_owned();
+        let (fx, failed) = self
+            .store
+            .write(move |tx| {
+                let mut fx = Effects::default();
+                let mut failed = Vec::new();
+                for id in store::voice_tasks(tx.db())? {
+                    let Some(mut task) = work::task(tx.db(), id)? else {
+                        continue;
+                    };
+                    // The task fails first, with the reason, so ending its
+                    // session changes nothing more.
+                    let running = matches!(
+                        task.status,
+                        TaskStatus::UpNext
+                            | TaskStatus::Working
+                            | TaskStatus::NeedsInput
+                            | TaskStatus::Review
+                    );
+                    if running
+                        && crate::ops::flow::transition(
+                            tx,
+                            &mut task,
+                            TaskStatus::Failed,
+                            Actor::System,
+                            Some(reason.clone()),
+                            None,
+                        )?
+                    {
+                        tx.save_task(&task)?;
+                        failed.push(task.channel_id);
+                    }
+                    if let Some(session) = task.current_session_id {
+                        fx.merge(end_session_by_hub(&hub, tx, session, &reason)?);
+                    }
+                }
+                // The offer that waits goes too: a new guide comes, or the
+                // voice is off.
+                let mut settings = store::settings(tx.db())?;
+                if settings.task_id.is_some() || settings.proposal_decision_id.is_some() {
+                    close_proposal(tx, &mut settings)?;
+                    settings.task_id = None;
+                    tx.save_voice_settings(&settings)?;
+                }
+                Ok((fx, failed))
+            })
+            .await?;
+        self.run_effects(fx);
+        // The update of a failed voice task wakes its coordinator.
+        for channel in failed {
+            self.kick_coordinator(channel);
+        }
+        Ok(())
     }
 
     /// The texts that the assistant wrote and the user sent unchanged, for
@@ -365,7 +511,7 @@ impl Hub {
             .store
             .read(|conn| store::recent_pairs(conn, true, 500))
             .await?;
-        Ok(pairs.into_iter().map(|p| p.final_text).collect())
+        Ok(pairs.into_iter().flat_map(assistant_bodies).collect())
     }
 
     /// `suggest_memory` from the voice task: the hub screens the guide,
@@ -377,18 +523,27 @@ impl Hub {
         args: SuggestMemoryArgs,
     ) -> Result<Value> {
         let session_id = ctx.session.id;
+        let task_id = ctx.task.as_ref().map(|t| t.id);
         self.store
             .write(move |tx| {
-                let old = guide(tx.db())?.unwrap_or_else(VoiceGuide::empty);
-                let proposed = VoiceGuide::parse(&args.note).screened();
-                let proposed = keep_user_rules(&old, proposed).fit_to_limit();
+                let mut settings = store::settings(tx.db())?;
+                if !settings.enabled || task_id.is_none() || settings.task_id != task_id {
+                    return Err(crate::proactivity::turn::denied(
+                        "This voice task was stopped or replaced, so its guide goes nowhere. Call submit_for_review and stop.",
+                    ));
+                }
+                // The proposal never holds a (you) mark of its own: the
+                // user's rules come from the settings.
+                let proposed = VoiceGuide::parse(&args.note)
+                    .screened()
+                    .with_user_rules(&settings.user_rules)
+                    .fit_to_limit();
                 if proposed.is_empty() {
                     return Err(HubError::invalid(
                         "The guide is empty. Write rules and examples in the voice.md format of the brief, then call suggest_memory again.",
                     ));
                 }
                 let text = proposed.render();
-                let mut settings = store::settings(tx.db())?;
                 close_proposal(tx, &mut settings)?;
                 tx.save_voice_proposal(&text)?;
                 let labels: Vec<String> = proposed
@@ -409,37 +564,13 @@ impl Hub {
                 let context = format!("{reason}\n\n{contexts} I save nothing until you say Do it.")
                     .trim()
                     .to_owned();
-                let tutti = conversation::tutti_channel(tx.db())?;
-                let mut new = conversation::NewMessage::new(
-                    tutti.id,
-                    Author::Assistant,
-                    MessageKind::Decision,
-                    PROPOSAL_QUESTION,
-                );
-                new.author_session_id = Some(session_id);
-                let mut card = tx.insert_message(new)?;
-                let mut mark = ProactiveMark::new(ProactiveKind::Voice);
-                mark.offer = true;
-                card.proactive = Some(mark);
-                tx.save_message(&card)?;
-                let decision = Decision {
-                    id: DecisionId::new(),
-                    channel_id: tutti.id,
-                    task_id: None,
+                let decision = post_offer(
+                    tx,
                     session_id,
-                    message_id: card.id,
-                    request_id: None,
-                    question: PROPOSAL_QUESTION.to_owned(),
-                    context: Some(context),
-                    options: proposal_options(),
-                    recommended_index: None,
-                    allow_free_text: false,
-                    status: DecisionStatus::Pending,
-                    answer: None,
-                    answered_at: None,
-                    created_at: tx.now(),
-                };
-                tx.save_decision(&decision)?;
+                    PROPOSAL_QUESTION,
+                    context,
+                    proposal_options(),
+                )?;
                 settings.proposal_decision_id = Some(decision.id);
                 tx.save_voice_settings(&settings)
             })
@@ -477,4 +608,292 @@ pub(crate) fn redact_assistant_text(value: &mut Value, texts: &[String]) -> usiz
         }
     }
     walk(value, &wanted)
+}
+
+/// Posts an offer about the voice in Tutti: a decision card with the mark
+/// of a voice offer. The hub carries out the answer.
+fn post_offer(
+    tx: &mut Tx<'_>,
+    session_id: SessionId,
+    question: &str,
+    context: String,
+    options: Vec<DecisionOption>,
+) -> Result<Decision> {
+    let tutti = conversation::tutti_channel(tx.db())?;
+    let mut new =
+        conversation::NewMessage::new(tutti.id, Author::Assistant, MessageKind::Decision, question);
+    new.author_session_id = Some(session_id);
+    let mut card = tx.insert_message(new)?;
+    let mut mark = ProactiveMark::new(ProactiveKind::Voice);
+    mark.offer = true;
+    card.proactive = Some(mark);
+    tx.save_message(&card)?;
+    let decision = Decision {
+        id: DecisionId::new(),
+        channel_id: tutti.id,
+        task_id: None,
+        session_id,
+        message_id: card.id,
+        request_id: None,
+        question: question.to_owned(),
+        context: Some(context),
+        options,
+        recommended_index: None,
+        allow_free_text: false,
+        status: DecisionStatus::Pending,
+        answer: None,
+        answered_at: None,
+        created_at: tx.now(),
+    };
+    tx.save_decision(&decision)?;
+    Ok(decision)
+}
+
+/// The texts of a sent-unchanged pair that the filter matches, each alone:
+/// the bodies without the subject.
+fn assistant_bodies(pair: DraftPair) -> Vec<String> {
+    if !pair.final_bodies.is_empty() {
+        return pair.final_bodies;
+    }
+    // A pair from before the bodies were kept alone: drop the subject line.
+    let text = match pair.final_text.strip_prefix("Subject: ") {
+        Some(rest) => rest
+            .split_once("\n\n")
+            .map_or(String::new(), |(_, body)| body.to_owned()),
+        None => pair.final_text,
+    };
+    vec![text]
+}
+
+/// Whether a read call names direct messages or private channels: its slug
+/// words (`IM`, `DM`, `MPIM`, `PRIVATE`, `GROUP`, `DIRECT`), a channel ID of a
+/// DM or a private group (`D…`, `G…`), or a `types` filter with them.
+pub(crate) fn names_private_chat(slug: &str, arguments: &Value) -> bool {
+    const PRIVATE: &[&str] = &[
+        "IM", "IMS", "DM", "DMS", "MPIM", "MPIMS", "DIRECT", "PRIVATE", "GROUP", "GROUPS",
+    ];
+    let upper = slug.to_ascii_uppercase();
+    if upper.split(['_', '-', '.']).any(|w| PRIVATE.contains(&w)) {
+        return true;
+    }
+    fn walk(value: &Value, key: &str) -> bool {
+        match value {
+            Value::Object(map) => map.iter().any(|(k, v)| walk(v, k)),
+            Value::Array(items) => items.iter().any(|v| walk(v, key)),
+            Value::String(text) => {
+                let key = key.to_ascii_lowercase();
+                let words: Vec<String> = text
+                    .split([',', ' '])
+                    .map(|w| w.trim().to_ascii_lowercase())
+                    .collect();
+                (key.contains("channel") || key.contains("conversation"))
+                    && is_private_chat_id(text)
+                    || (key == "types"
+                        && words
+                            .iter()
+                            .any(|w| matches!(w.as_str(), "im" | "mpim" | "private_channel")))
+                    || (key == "query"
+                        && words
+                            .iter()
+                            .any(|w| w.starts_with("is:dm") || w.starts_with("in:@")))
+            }
+            Value::Bool(true) => {
+                let key = key.to_ascii_lowercase();
+                key.contains("private")
+                    || key.contains("include_dm")
+                    || key.contains("im") && key.starts_with("is_")
+            }
+            _ => false,
+        }
+    }
+    walk(arguments, "")
+}
+
+/// A Slack ID of a direct message (`D…`) or a private group (`G…`).
+fn is_private_chat_id(text: &str) -> bool {
+    let text = text.trim();
+    text.len() >= 9
+        && (text.starts_with('D') || text.starts_with('G'))
+        && text
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+}
+
+/// Removes direct messages and private channels from what the voice task
+/// reads: every object that says it is one (`is_im`, `is_mpim`,
+/// `is_private`, `is_group`, a channel ID `D…` or `G…`). Returns how many
+/// it removed.
+pub(crate) fn drop_private_chats(value: &mut Value) -> usize {
+    fn private(item: &Value) -> bool {
+        let Value::Object(map) = item else {
+            return false;
+        };
+        let flag = |v: &Value| {
+            ["is_im", "is_mpim", "is_private", "is_group"]
+                .iter()
+                .any(|k| v.get(*k).and_then(Value::as_bool) == Some(true))
+        };
+        if flag(item) {
+            return true;
+        }
+        match map.get("channel") {
+            Some(Value::String(id)) => is_private_chat_id(id),
+            Some(channel @ Value::Object(_)) => {
+                flag(channel)
+                    || channel
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .is_some_and(is_private_chat_id)
+            }
+            _ => false,
+        }
+    }
+    match value {
+        Value::Array(items) => {
+            let before = items.len();
+            items.retain(|i| !private(i));
+            let removed = before - items.len();
+            removed + items.iter_mut().map(drop_private_chats).sum::<usize>()
+        }
+        Value::Object(map) => map.values_mut().map(drop_private_chats).sum(),
+        _ => 0,
+    }
+}
+
+impl Hub {
+    /// `propose_voice_rule`: one learned rule change, as an offer. The hub
+    /// checks that the cited pairs are at least 3 distinct edited pairs of
+    /// the context, that the voice and learning from edits are on, and that
+    /// Tutti may make offers (its level is not Off). `voice.md` changes
+    /// only on "Do it".
+    pub(crate) async fn tool_propose_voice_rule(
+        &self,
+        ctx: &ToolCtx,
+        args: consort_proto::tools::ProposeVoiceRuleArgs,
+    ) -> Result<Value> {
+        let rule = placeholders(args.rule.trim());
+        let rule: String = rule
+            .chars()
+            .take(consort_proto::model::VOICE_RULE_MAX_CHARS)
+            .collect();
+        if rule.trim().is_empty() {
+            return Err(HubError::invalid("Write the rule as one short sentence."));
+        }
+        let context = args.context.trim().to_ascii_lowercase();
+        if context != consort_proto::model::CORE_CONTEXT
+            && !consort_proto::model::VOICE_CONTEXTS.contains(&context.as_str())
+        {
+            return Err(HubError::invalid(format!(
+                "There is no context {context}. Use the context of the voice_edits event: core or one of {}.",
+                consort_proto::model::VOICE_CONTEXTS.join(", ")
+            )));
+        }
+        let mut ids = args.pair_ids.clone();
+        ids.sort_by_key(ToString::to_string);
+        ids.dedup();
+        let session_id = ctx.session.id;
+        let replaces = args.replaces.filter(|r| !r.trim().is_empty());
+        self.store
+            .write(move |tx| {
+                let mut settings = store::settings(tx.db())?;
+                if !settings.enabled || !settings.learn_from_edits {
+                    return Err(crate::proactivity::turn::denied(
+                        "The voice or learning from edits is off. Propose nothing.",
+                    ));
+                }
+                let tutti = conversation::tutti_channel(tx.db())?;
+                if tutti.proactivity_level() == consort_proto::model::ProactivityLevel::Off {
+                    return Err(crate::proactivity::turn::denied(
+                        "Proactivity is Off in Tutti, so the voice makes no offers. Propose nothing.",
+                    ));
+                }
+                let mut agreeing = 0;
+                for id in &ids {
+                    let pair = store::draft_pair(tx.db(), *id)?;
+                    if pair.is_some_and(|p| {
+                        !p.unchanged && p.context.as_deref() == Some(context.as_str())
+                    }) {
+                        agreeing += 1;
+                    }
+                }
+                if agreeing < consort_proto::model::VOICE_EDITS_AGREE_MIN {
+                    return Err(HubError::invalid(format!(
+                        "A rule needs at least {} distinct edited pairs of {context} that show it; {agreeing} of the cited pairs are. Cite the pair IDs from the voice_edits event, or propose nothing.",
+                        consort_proto::model::VOICE_EDITS_AGREE_MIN
+                    )));
+                }
+                let current = guide(tx.db())?.unwrap_or_else(VoiceGuide::empty);
+                if let Some(old) = &replaces {
+                    let section = if context == consort_proto::model::CORE_CONTEXT {
+                        &current.core
+                    } else {
+                        current
+                            .context(&context)
+                            .map_or(&current.core, |c| &c.rules)
+                    };
+                    match section
+                        .iter()
+                        .find(|r| r.text.trim().eq_ignore_ascii_case(old.trim()))
+                    {
+                        Some(r) if r.by_user => {
+                            return Err(crate::proactivity::turn::denied(
+                                "That rule is the user's own. A learned change never replaces it.",
+                            ));
+                        }
+                        Some(_) => {}
+                        None => {
+                            return Err(HubError::invalid(
+                                "The guide has no such rule in that section. Copy the rule word for word, or leave replaces out.",
+                            ));
+                        }
+                    }
+                }
+                let proposal = RuleProposal {
+                    context: context.clone(),
+                    rule: rule.clone(),
+                    replaces: replaces.clone(),
+                };
+                let preview = proposal.apply_to(current).with_user_rules(&settings.user_rules);
+                close_proposal(tx, &mut settings)?;
+                tx.save_voice_proposal(&preview.fit_to_limit().render())?;
+                tx.save_voice_rule_proposal(Some(&proposal))?;
+                let change = match &replaces {
+                    Some(old) => format!("Replace \"{old}\" with \"{rule}\""),
+                    None => format!("Add \"{rule}\""),
+                };
+                let text = format!(
+                    "{change} in {}. Your edits to {agreeing} drafts show it. I change nothing until you say Do it.",
+                    context_label(&context)
+                );
+                let decision = post_offer(tx, session_id, RULE_QUESTION, text, rule_options())?;
+                settings.proposal_decision_id = Some(decision.id);
+                tx.save_voice_settings(&settings)
+            })
+            .await?;
+        Ok(serde_json::to_value(OkResult::OK)?)
+    }
+}
+
+/// The question of the offer of one learned rule.
+pub(crate) const RULE_QUESTION: &str = "Change your style guide?";
+
+/// The three options of the offer of one learned rule.
+fn rule_options() -> Vec<DecisionOption> {
+    vec![
+        DecisionOption {
+            label: OFFER_DO_IT.to_owned(),
+            consequence: "Consort changes the rule in voice.md.".to_owned(),
+            id: None,
+        },
+        DecisionOption {
+            label: OFFER_NOT_NOW.to_owned(),
+            consequence: "Nothing changes.".to_owned(),
+            id: None,
+        },
+        DecisionOption {
+            label: OFFER_NEVER.to_owned(),
+            consequence: "Nothing changes, and Consort stops learning from your edits.".to_owned(),
+            id: None,
+        },
+    ]
 }
