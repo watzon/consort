@@ -1,6 +1,6 @@
 # Plan: finishing the app
 
-Status: written on 2026-10-29 from a gap analysis that compared three things: what the design docs promise (about 200 items), what the code does today, and every open item in the E2E notes, the build notes and the plans. The user sets the order.
+Status: the user approved phases 1 to 5 in this order on 2026-10-29. Phases 6 and 7 wait. Work starts with Paper designs for everything that is missing. Written on 2026-10-29 from a gap analysis that compared three things: what the design docs promise (about 200 items), what the code does today, and every open item in the E2E notes, the build notes and the plans. The user sets the order.
 
 ## Where things stand
 
@@ -25,6 +25,17 @@ Status: written on 2026-10-29 from a gap analysis that compared three things: wh
 - **Nothing to install yet.** There is no app bundle, no worker installer, no service install, and no mobile client.
 
 ## Phases
+
+### First: the top tint (with the phase 1 designs)
+
+The top of the timeline darkens progressively, like Claude Duet, in place of the solid fade:
+- Content that moves up under the mark stays faintly visible.
+- The tint grows as content moves up, and it is much darker from the mark's position to the window top.
+- The activity pill and the top-right buttons sit on the tint.
+- Remove the solid zone (`fade_top_solid`), and set the tint with a few stops as tokens.
+- GPUI gradients have two stops, so the tint is two or three stacked gradient layers.
+
+Reference: the user's Duet screenshot of 2026-10-29.
 
 Each phase starts with a Paper design where it has new screens, as in the earlier builds. Then contract notes (if the proto changes), then parallel builds with disjoint crates, then a check in the running app.
 
@@ -104,14 +115,14 @@ Design first: the thread panel, the search results, the New task dialog, the cha
 4. **A persistent client cache** (SQLite), so the app opens with its data while the hub is offline.
 5. **Windows checks** of everything above, on bigboi.
 
-### Phase 6: mobile and push
+### Phase 6: mobile and push (later)
 
 1. **The `client-ffi` crate** with UniFFI over `consort-client`.
 2. **A spike** of Expo and native, then a choice (ADR 0006 leaves this open).
 3. **Hub push** through APNs and FCM (or Expo), on the triggers in `protocol.md`.
 4. **The mobile app:** Tutti, channels, Tasks, the task thread, and answers to approvals and decisions.
 
-### Phase 7: harness breadth
+### Phase 7: harness breadth (later)
 
 - The native Pi adapter.
 - ACP agents that use `uvx`.
