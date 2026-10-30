@@ -81,6 +81,11 @@ impl Store {
         self.dir.join("outbox.json")
     }
 
+    /// The saved cache: see [`crate::persist`].
+    pub fn cache_path(&self) -> PathBuf {
+        self.dir.join(crate::persist::FILE_NAME)
+    }
+
     /// The saved identity, or `None` when this client is not paired. With
     /// only one of the two files present, the pairing is damaged, and the
     /// answer is an error, not `None`.
@@ -131,13 +136,16 @@ impl Store {
         Ok(())
     }
 
-    /// Removes the identity and the outbox, for "pair again".
+    /// Removes the identity, the outbox and the saved cache, for "pair
+    /// again" and for unpairing. The saved cache holds the data of the old
+    /// hub, so it goes with the identity.
     pub fn clear(&self) -> Result<(), ClientError> {
         for path in [self.config_path(), self.key_path(), self.outbox_path()] {
             if path.exists() {
                 std::fs::remove_file(&path).map_err(|e| storage_error(&path, e))?;
             }
         }
+        crate::persist::delete(&self.cache_path());
         Ok(())
     }
 }

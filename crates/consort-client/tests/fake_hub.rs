@@ -80,6 +80,8 @@ struct Hub {
     extra: Vec<Channel>,
     /// Stop reading from every socket, so the hub answers no ping.
     mute: Arc<tokio::sync::Notify>,
+    /// Refuse every WebSocket upgrade, as a hub that is down.
+    down: bool,
     /// Store `message.send` requests but never answer them.
     silent_sends: bool,
     /// Frames to push to the connected client.
@@ -734,7 +736,12 @@ async fn put_blob(
 }
 
 async fn ws(State(hub): State<Shared>, upgrade: WebSocketUpgrade) -> impl IntoResponse {
-    upgrade.on_upgrade(move |socket| session(hub, socket))
+    if hub.lock().unwrap().down {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    upgrade
+        .on_upgrade(move |socket| session(hub, socket))
+        .into_response()
 }
 
 async fn send(socket: &mut WebSocket, frame: Frame) {
@@ -5529,4 +5536,329 @@ async fn memory_loads_writes_with_the_stale_check_and_comes_back_from_recently_d
             .iter()
             .any(|n| n.path == "people/kevin.md")
     );
+}
+
+// ---------------------------------------------------------------------------
+// The saved cache (phase 5): the app opens with its data while the hub is
+// down, and a reconnect resumes from the saved feed position.
+
+/// What the client saved in `dir`, or `None` while there is no whole save.
+fn saved(dir: &std::path::Path) -> Option<consort_client::persist::Saved> {
+    let store = Store::new(dir);
+    let identity = store.load().ok()??;
+    let owner = consort_client::persist::Owner::of(&identity);
+    consort_client::persist::CacheFile::open(&store.cache_path(), &owner)
+        .ok()?
+        .1
+}
+
+/// Waits until the client saved its first whole load.
+async fn until_saved(dir: &std::path::Path, channel: &str) -> consort_client::persist::Saved {
+    until("the cache is saved", || {
+        saved(dir).is_some_and(|s| s.cache.channels_loaded.contains(channel))
+    })
+    .await;
+    saved(dir).unwrap()
+}
+
+fn add_message(hub: &Shared, body: &str) -> (Frame, ChannelId) {
+    let mut h = hub.lock().unwrap();
+    let channel_id = h.channel.as_ref().unwrap().id;
+    let m = text_message(channel_id, body, Timestamp::now().as_millis(), None);
+    h.messages.push(m.clone());
+    (feed(&mut h, EntityPayload::Message(m)), channel_id)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restart_opens_with_saved_data_and_catches_up_from_the_saved_position() {
+    let (url, hub) = start_hub().await;
+    let (_, channel_id) = add_message(&hub, "Said before the restart");
+    let dir = tempfile::tempdir().unwrap();
+    let first = paired_client(&url, dir.path(), options(quick())).await;
+    let tutti = tutti_id(&first);
+    let saved_seq = until_saved(dir.path(), &tutti).await.cache.seq;
+    drop(first);
+
+    let client = Client::start_with(Some(Store::new(dir.path())), options(quick())).unwrap();
+    // Before the first connect, the app has its data.
+    let start = client.state();
+    assert!(
+        bodies_of(&start, &tutti)
+            .iter()
+            .any(|(b, _)| b == "Said before the restart"),
+        "{:?}",
+        bodies_of(&start, &tutti)
+    );
+    assert!(start.tutti().is_some());
+    assert!(!start.tasks.is_empty(), "the tasks show too");
+
+    wait_for(&client, "online", |s| s.connection == Connection::Online).await;
+    // It caught up from its position. It did not load a snapshot.
+    {
+        let h = hub.lock().unwrap();
+        assert_eq!(
+            h.sessions[1],
+            vec!["auth.response", "hello", "sync.subscribe"]
+        );
+        assert_eq!(h.subscribe_after[1], saved_seq);
+    }
+    // What the hub changed while the app was away arrives from the feed.
+    let (frame, _) = add_message(&hub, "Said while the app was away");
+    push(&hub, vec![frame]);
+    wait_for(&client, "the missed message", |s| {
+        bodies_of(s, &tutti)
+            .iter()
+            .any(|(b, _)| b == "Said while the app was away")
+    })
+    .await;
+    let _ = channel_id;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_saved_position_that_the_hub_does_not_have_loads_a_new_snapshot() {
+    let (url, hub) = start_hub().await;
+    hub.lock().unwrap().resync_on_reconnect = true;
+    let dir = tempfile::tempdir().unwrap();
+    let first = paired_client(&url, dir.path(), options(quick())).await;
+    let tutti = tutti_id(&first);
+    until_saved(dir.path(), &tutti).await;
+    drop(first);
+    {
+        let mut h = hub.lock().unwrap();
+        if let Some(channel) = h.channel.as_mut() {
+            channel.purpose = "Renamed while the app was away".into();
+        }
+    }
+
+    let client = Client::start_with(Some(Store::new(dir.path())), options(quick())).unwrap();
+    // The old data shows first.
+    assert_ne!(
+        client.state().tutti().unwrap().purpose,
+        "Renamed while the app was away"
+    );
+    let state = wait_for(&client, "the new snapshot", |s| {
+        s.connection == Connection::Online
+            && s.tutti()
+                .is_some_and(|c| c.purpose == "Renamed while the app was away")
+    })
+    .await;
+    assert!(state.tutti().is_some());
+    assert_eq!(
+        hub.lock().unwrap().sessions[1],
+        vec![
+            "auth.response",
+            "hello",
+            "sync.subscribe",
+            "sync.snapshot",
+            "sync.snapshot",
+            "sync.subscribe"
+        ]
+    );
+    // The new data is saved, and it holds the new text.
+    until("the new snapshot is saved", || {
+        saved(dir.path()).is_some_and(|s| {
+            s.cache
+                .channels
+                .get(&tutti)
+                .is_some_and(|c| c.purpose == "Renamed while the app was away")
+        })
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_damaged_cache_file_is_moved_aside_and_the_client_loads_a_snapshot() {
+    let (url, hub) = start_hub().await;
+    let dir = tempfile::tempdir().unwrap();
+    let first = paired_client(&url, dir.path(), options(quick())).await;
+    let tutti = tutti_id(&first);
+    until_saved(dir.path(), &tutti).await;
+    drop(first);
+    let store = Store::new(dir.path());
+    std::fs::write(store.cache_path(), "garbage ".repeat(2_000)).unwrap();
+
+    let client = Client::start_with(Some(store.clone()), options(quick())).unwrap();
+    // No saved data, and the app still starts.
+    assert!(client.state().tutti().is_none());
+    wait_for(&client, "a new snapshot", |s| {
+        s.connection == Connection::Online && s.tutti().is_some()
+    })
+    .await;
+    let sessions = hub.lock().unwrap().sessions.clone();
+    assert!(
+        sessions[1].iter().any(|k| k == "sync.snapshot"),
+        "{:?}",
+        sessions[1]
+    );
+    assert!(dir.path().join("cache.sqlite3.broken").exists());
+    // The new file holds the new data.
+    until_saved(dir.path(), &tutti).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unpairing_removes_the_saved_data_with_the_identity() {
+    let (url, _hub) = start_hub().await;
+    let dir = tempfile::tempdir().unwrap();
+    let client = paired_client(&url, dir.path(), options(quick())).await;
+    let tutti = tutti_id(&client);
+    let store = Store::new(dir.path());
+    until_saved(dir.path(), &tutti).await;
+    assert!(store.cache_path().exists());
+
+    client.unpair().await.unwrap();
+    assert!(!store.cache_path().exists(), "the saved data is gone");
+    assert!(store.load().unwrap().is_none(), "the identity is gone");
+    wait_for(&client, "not paired", |s| {
+        s.connection == Connection::NotPaired && s.tutti().is_none()
+    })
+    .await;
+    // The link ended, and a late save does not bring the file back.
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    assert!(!store.cache_path().exists());
+    assert_eq!(client.state().connection, Connection::NotPaired);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pairing_with_a_hub_again_removes_the_saved_data_of_the_old_hub() {
+    let (url, _hub) = start_hub().await;
+    let (other_url, _other) = start_hub().await;
+    let dir = tempfile::tempdir().unwrap();
+    let client = paired_client(&url, dir.path(), options(quick())).await;
+    let tutti = tutti_id(&client);
+    let old = until_saved(dir.path(), &tutti).await;
+    assert!(old.cache.channels.contains_key(&tutti));
+
+    client.pair(other_url, CODE.into()).await.unwrap();
+    // Whatever the new hub sends, the file never holds the old hub's channel
+    // for the new identity.
+    wait_for(&client, "online at the new hub", |s| {
+        s.connection == Connection::Online && s.tutti().is_some()
+    })
+    .await;
+    let new_tutti = tutti_id(&client);
+    let new = until_saved(dir.path(), &new_tutti).await;
+    assert_eq!(new.cache.channels.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_app_opens_offline_with_saved_data_and_sends_the_queue_when_the_hub_is_back() {
+    let (url, hub) = start_hub().await;
+    add_message(&hub, "Said before the hub went down");
+    let dir = tempfile::tempdir().unwrap();
+    let first = paired_client(&url, dir.path(), options(quick())).await;
+    let tutti = tutti_id(&first);
+    let saved_at = until_saved(dir.path(), &tutti).await;
+    assert!(saved_at.fresh_at > 0);
+    drop(first);
+    hub.lock().unwrap().down = true;
+
+    let client = Client::start_with(Some(Store::new(dir.path())), options(quick())).unwrap();
+    let state = wait_for(&client, "the offline state", |s| {
+        matches!(s.connection, Connection::Offline { .. }) && s.saved_data.is_some()
+    })
+    .await;
+    // The data shows, with the time it is from.
+    assert!(
+        bodies_of(&state, &tutti)
+            .iter()
+            .any(|(b, _)| b == "Said before the hub went down")
+    );
+    let from = state.saved_data.clone().unwrap();
+    assert!(from.from_ms >= saved_at.fresh_at, "{from:?}");
+    assert!(
+        from.pill_text()
+            .starts_with("Cannot reach the hub. You see saved data from "),
+        "{}",
+        from.pill_text()
+    );
+    // No worker reads as online, and approvals wait for the hub.
+    assert!(state.workers.iter().all(|w| !w.online));
+    assert_eq!(state.sidebar.workers_online, 0);
+    assert!(state.answers_blocked().is_some());
+    assert!(
+        client
+            .answer_approval("apr_none".into(), ApprovalChoice::AllowOnce)
+            .await
+            .is_err(),
+        "an answer needs the hub"
+    );
+
+    // A message waits in the outbox, and the view says that it is pending.
+    client
+        .send_message(tutti.clone(), "Sent while the hub was down".into())
+        .await
+        .unwrap();
+    let state = wait_for(&client, "the queued message", |s| {
+        bodies_of(s, &tutti)
+            .iter()
+            .any(|(b, pending)| b == "Sent while the hub was down" && *pending)
+    })
+    .await;
+    assert!(state.saved_data.is_some());
+    assert!(dir.path().join("outbox.json").exists());
+    assert!(hub.lock().unwrap().sent_bodies.is_empty());
+
+    // The hub comes back. The queue goes out, and the screen is current.
+    hub.lock().unwrap().down = false;
+    client.reconnect().await.unwrap();
+    let state = wait_for(&client, "the sent message", |s| {
+        s.connection == Connection::Online
+            && bodies_of(s, &tutti)
+                .iter()
+                .any(|(b, pending)| b == "Sent while the hub was down" && !*pending)
+    })
+    .await;
+    assert!(state.saved_data.is_none());
+    assert!(state.answers_blocked().is_none());
+    assert_eq!(
+        hub.lock().unwrap().sent_bodies,
+        vec!["Sent while the hub was down"]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hub_that_goes_down_while_the_app_runs_shows_the_time_of_the_last_update() {
+    let (url, hub) = start_hub().await;
+    let dir = tempfile::tempdir().unwrap();
+    let client = paired_client(&url, dir.path(), options(quick())).await;
+    assert!(client.state().saved_data.is_none(), "online: no pill");
+    let before = Timestamp::now().as_millis();
+    {
+        let mut h = hub.lock().unwrap();
+        h.down = true;
+    }
+    let kick = hub.lock().unwrap().kick.clone();
+    kick.notify_one();
+    let state = wait_for(&client, "the offline state", |s| {
+        matches!(s.connection, Connection::Offline { .. }) && s.saved_data.is_some()
+    })
+    .await;
+    let after = Timestamp::now().as_millis();
+    let from = state.saved_data.clone().unwrap().from_ms;
+    // The data was current until the link ended: a moment ago, not at
+    // the start of the run.
+    assert!(
+        from >= before - 1_000 && from <= after,
+        "{before} {from} {after}"
+    );
+    assert!(state.answers_blocked().is_some());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hub_that_refuses_the_app_takes_the_saved_data_with_it() {
+    let (url, hub) = start_hub().await;
+    let dir = tempfile::tempdir().unwrap();
+    let first = paired_client(&url, dir.path(), options(quick())).await;
+    let tutti = tutti_id(&first);
+    until_saved(dir.path(), &tutti).await;
+    drop(first);
+    // The hub does not know this app any more.
+    hub.lock().unwrap().key = None;
+
+    let client = Client::start_with(Some(Store::new(dir.path())), options(quick())).unwrap();
+    wait_for(&client, "the refusal", |s| {
+        matches!(s.connection, Connection::Refused { .. })
+    })
+    .await;
+    assert!(!Store::new(dir.path()).cache_path().exists());
 }

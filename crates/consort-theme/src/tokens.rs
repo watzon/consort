@@ -303,6 +303,12 @@ pub struct Opacity {
     pub drop_fill: f32,
     pub nav_disabled: f32,
     pub you_tile: f32,
+    /// A button that needs the hub, while the hub is offline.
+    pub offline_dim: f32,
+    /// The Three voices mark while the hub is offline.
+    pub offline_mark: f32,
+    /// The bubble of a message that waits in the outbox.
+    pub queued: f32,
 }
 
 /// Sizes of single components, from `structure.json`.
@@ -867,6 +873,9 @@ impl Tokens {
                 drop_fill: s.opacity.drop_fill,
                 nav_disabled: s.opacity.nav_disabled,
                 you_tile: s.opacity.you_tile,
+                offline_dim: s.opacity.offline_dim,
+                offline_mark: s.opacity.offline_mark,
+                queued: s.opacity.queued,
             },
             component: Components::new(&s.component, scale),
             icon: Icons {

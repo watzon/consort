@@ -1660,6 +1660,7 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
 
     let mut state = ViewState {
         connection,
+        saved_data: None,
         user,
         sidebar: SidebarView::default(),
         channels: channel_views,

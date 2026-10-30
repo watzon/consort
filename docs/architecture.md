@@ -173,7 +173,8 @@ The worker uses the `git` command, not a git library. The task then gets the use
 Everything in a client except drawing lives in the `client-core` crate:
 
 - the connection, authentication and reconnection,
-- the local SQLite cache and the feed position,
+- the local SQLite cache and the feed position (`cache.sqlite3`: the app opens with its data while the hub is offline, and a reconnect resumes from the saved position),
+- the offline state: a status pill with the time of the saved data, workers with an unknown status, approvals and decisions that wait for the hub, and a message queue that sends when the hub is back,
 - sending with idempotency keys,
 - the reducers that turn feed entries into view state: the sidebar, the timeline, the Tasks panel groups (Ready for review, Needs input, per channel), and the unread counts.
 

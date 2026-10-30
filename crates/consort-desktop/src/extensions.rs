@@ -938,6 +938,9 @@ impl ConsortApp {
     /// Continue in browser on a connect card: the hub connects with the
     /// card's settings, and the app opens the page when it has it.
     pub fn continue_connect_card(&mut self, approval_id: String, cx: &mut Context<Self>) {
+        if self.blocked_by_hub(cx) {
+            return;
+        }
         if !self.ext.browser_cards.contains(&approval_id) {
             self.ext.browser_cards.push(approval_id.clone());
         }
@@ -957,6 +960,9 @@ impl ConsortApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.blocked_by_hub(cx) {
+            return;
+        }
         let Some(HubCardView::ConnectService(card)) = find_card(&self.state, &approval_id) else {
             return;
         };
@@ -980,6 +986,9 @@ impl ConsortApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.blocked_by_hub(cx) {
+            return;
+        }
         let Some(HubCardView::SignIn(card)) = find_card(&self.state, &approval_id) else {
             return;
         };

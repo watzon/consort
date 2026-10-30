@@ -1406,6 +1406,7 @@ dependencies = [
  "markdown",
  "rand 0.8.8",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2 0.10.9",

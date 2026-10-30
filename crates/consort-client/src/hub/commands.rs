@@ -150,8 +150,37 @@ async fn run(shared: Arc<Shared>, command: Command) -> Result<CommandOutput, Cli
                     ..Cache::default()
                 };
             }
+            // The saved data is the old hub's. A live link to the old hub
+            // ends, so the client connects to the new one.
+            shared.forget_saved();
+            shared.restart_link();
             shared.defer_waiters();
             shared.set_connection(Connection::Connecting);
+            shared.wake.notify_one();
+        }
+        Command::Unpair => {
+            if let Ok(mut i) = shared.identity.lock() {
+                *i = None;
+            }
+            shared.forget_saved();
+            if let Some(store) = &shared.store {
+                store.clear()?;
+            }
+            if let Ok(mut cache) = shared.cache.lock() {
+                cache.fail_pending(
+                    "This message did not go out, because you unpaired this app from the hub.",
+                );
+                let failures = std::mem::take(&mut cache.send_failures);
+                *cache = Cache {
+                    send_failures: failures,
+                    ..Cache::default()
+                };
+            }
+            shared.defer_waiters();
+            // A live link ends at its next tick. The link loop then sees
+            // that no identity is left and says that the app is not paired.
+            shared.restart_link();
+            shared.set_connection(Connection::NotPaired);
             shared.wake.notify_one();
         }
         Command::SendMessage {

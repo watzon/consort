@@ -28,8 +28,11 @@ mod mock_backend;
 mod mock_backend_ext;
 pub mod mock_extensions;
 pub mod mock_files;
+pub mod mock_offline;
 pub mod mock_routines;
 pub mod notify;
+pub mod offline;
+pub mod persist;
 pub mod picker;
 pub mod reduce;
 pub mod routines;
@@ -209,6 +212,7 @@ impl Client {
             tokio::spawn(hub::run_outbox(shared.clone()));
             tokio::spawn(hub::run_loader(shared.clone()));
             tokio::spawn(hub::run_logos(shared.clone()));
+            tokio::spawn(hub::run_save(shared.clone()));
             let backend = hub::HubBackend { shared };
             serve(backend, rx, publish, stop).await;
         })?;
@@ -317,6 +321,12 @@ impl Client {
     /// code, then connects.
     pub async fn pair(&self, hub_url: String, code: String) -> Result<(), ClientError> {
         self.run(Command::Pair { hub_url, code }).await
+    }
+
+    /// Forgets the hub. This removes the identity, the outbox and the saved
+    /// data from this computer. The app then asks for a pairing again.
+    pub async fn unpair(&self) -> Result<(), ClientError> {
+        self.run(Command::Unpair).await
     }
 
     /// Changes the text of one of the user's own messages.

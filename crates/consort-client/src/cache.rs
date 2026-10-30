@@ -52,7 +52,7 @@ pub struct SendFailure {
 
 /// The part of a session item that the view reads. The cache keeps nothing
 /// else, so a command with a large output costs a few bytes.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ItemSummary {
     /// The command line.
     Command(String),

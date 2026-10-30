@@ -13,6 +13,7 @@ pub mod channel_panel;
 pub mod connectors;
 pub mod dialogs;
 pub mod ext_parts;
+pub mod hub_blocked;
 pub mod hub_cards;
 pub mod icons;
 pub mod links;
