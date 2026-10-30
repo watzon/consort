@@ -1947,7 +1947,9 @@ fn the_skill_folder_goes_into_the_opencode_config() {
     let config: Value = serde_json::from_str(&with.env["OPENCODE_CONFIG_CONTENT"]).unwrap();
     assert_eq!(
         config["skills"],
-        json!([PathBuf::from("/runtime/ses_1/skills/skills").to_string_lossy()])
+        json!([PathBuf::from("/runtime/ses_1/skills")
+            .join("skills")
+            .to_string_lossy()])
     );
     // The permissions stay.
     assert_eq!(config["permission"]["bash"], "ask");
@@ -1980,7 +1982,15 @@ fn the_skill_folder_goes_into_the_opencode_config() {
         process_watcher: None,
     };
     let process = agent_process_spec(HarnessKind::OpenCode, &account, &spec, &found).unwrap();
-    assert!(process.env["OPENCODE_CONFIG_CONTENT"].contains("/runtime/ses_1/skills/skills"));
+    // The config is JSON, so the JSON text of the path shows in it. A
+    // Windows path has backslashes, and JSON escapes them.
+    let folder = json!(
+        PathBuf::from("/runtime/ses_1/skills")
+            .join("skills")
+            .to_string_lossy()
+    )
+    .to_string();
+    assert!(process.env["OPENCODE_CONFIG_CONTENT"].contains(&folder));
     spec.skills = None;
     let process = agent_process_spec(HarnessKind::OpenCode, &account, &spec, &found).unwrap();
     assert!(!process.env["OPENCODE_CONFIG_CONTENT"].contains("skills"));

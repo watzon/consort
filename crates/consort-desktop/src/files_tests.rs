@@ -348,7 +348,16 @@ fn the_light_box_opens_steps_and_closes(cx: &mut TestAppContext) {
     cx.simulate_click(front.center(), Modifiers::default());
     draw(cx);
     let lightbox = bounds(cx, "lightbox");
-    assert_eq!(lightbox.size, size(px(1440.), px(900.)));
+    // The light box covers the app but not the title bar of Windows and
+    // Linux, so the window can always move and close.
+    let bar = cx.update(|window, cx| {
+        if crate::ui::window_controls::has_controls(window) {
+            crate::ui::window_controls::bar_height(&ConsortApp::tokens(cx))
+        } else {
+            px(0.)
+        }
+    });
+    assert_eq!(lightbox.size, size(px(1440.), px(900.) - bar));
     assert!(has(cx, "lightbox-image") && has(cx, "lightbox-count"));
     app.read_with(cx, |app, _| {
         let lb = app.lightbox.as_ref().expect("open");

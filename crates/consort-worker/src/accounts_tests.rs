@@ -2,8 +2,11 @@
 //! a fake `claude` program.
 
 use std::collections::HashMap;
+#[cfg(unix)]
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(unix)]
+use std::sync::Mutex;
 use std::time::Duration;
 
 use consort_harness::{Harness, HarnessKind};
@@ -22,7 +25,9 @@ use tokio::sync::mpsc;
 use crate::config::WorkerToml;
 use crate::core::Core;
 use crate::core::tests::test_core;
-use crate::profile::{ENV_FILE, read_secrets};
+#[cfg(unix)]
+use crate::profile::ENV_FILE;
+use crate::profile::read_secrets;
 
 fn fakes(managed: bool) -> crate::Harnesses {
     let mut harnesses: crate::Harnesses = HashMap::new();
@@ -115,7 +120,7 @@ async fn an_opencode_account_runs_with_its_own_home() {
     assert!(profile.join("home").is_dir());
     assert_eq!(
         env["XDG_DATA_HOME"],
-        profile.join("xdg/data").to_string_lossy(),
+        profile.join("xdg").join("data").to_string_lossy(),
         "the sign-in stays where it was"
     );
     // The pins name tools of the user and nothing else.

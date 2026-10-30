@@ -449,6 +449,14 @@ async fn a_git_workspace_does_not_see_the_worker_folders() {
     };
     let workspace = rig.open("start-git", start).await;
     assert!(channel_file(&workspace, "doc.md").is_file());
-    let status = git(&["status", "--porcelain"], &workspace);
+    // The clone ran with the system settings of git. On Windows these have
+    // `core.autocrlf=true`, and the files have CRLF line ends. This `git`
+    // ignores the system settings, so say the same setting here.
+    let autocrlf: &[&str] = if cfg!(windows) {
+        &["-c", "core.autocrlf=true"]
+    } else {
+        &[]
+    };
+    let status = git(&[autocrlf, &["status", "--porcelain"]].concat(), &workspace);
     assert_eq!(status, "", "git sees the worker folders: {status}");
 }

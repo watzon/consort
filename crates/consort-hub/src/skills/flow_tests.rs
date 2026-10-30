@@ -707,7 +707,6 @@ async fn a_failed_audit_blocks_the_skill() {
     assert_eq!(err.code(), ErrorCode::SkillBlocked);
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn the_update_check_finds_a_new_version_and_only_accept_moves_the_pin() {
     let s = setup().await;
@@ -898,7 +897,6 @@ async fn wait_for_skill(hub: &Hub, name: &str) -> Skill {
     panic!("the skill {name} was not installed");
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn add_skill_posts_an_install_card_and_allow_installs_it() {
     let s = setup().await;

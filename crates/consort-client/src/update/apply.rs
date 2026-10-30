@@ -226,12 +226,16 @@ fn sh_quote(text: &str) -> String {
 /// The shell script for Linux. It waits for the process `pid`, unpacks the
 /// tarball, copies the files over the install folder, and starts the program.
 pub fn unix_script(pid: u32, archive: &Path, install: &Install, log: &Path) -> String {
-    let work = archive
-        .parent()
-        .map(|p| p.join("unpacked"))
-        .unwrap_or_default();
-    let exe = install.root.join(&install.exe_name);
-    let new_exe = install.root.join(format!("{}.new", install.exe_name));
+    // The paths are joined as text with slashes, so the script is the same
+    // when a test builds it on Windows.
+    let archive_text = archive.to_string_lossy();
+    let folder = archive_text
+        .rsplit_once('/')
+        .map_or("", |(folder, _)| folder);
+    let work = format!("{folder}/unpacked");
+    let root_path = install.root.to_string_lossy();
+    let exe = format!("{root_path}/{}", install.exe_name);
+    let new_exe = format!("{exe}.new");
     format!(
         "#!/bin/sh\n\
          log={log}\n\
@@ -249,16 +253,13 @@ pub fn unix_script(pid: u32, archive: &Path, install: &Install, log: &Path) -> S
          rm -rf {work}\n\
          nohup {exe} >/dev/null 2>&1 &\n",
         log = sh_quote(&log.to_string_lossy()),
-        work = sh_quote(&work.to_string_lossy()),
-        archive = sh_quote(&archive.to_string_lossy()),
+        work = sh_quote(&work),
+        archive = sh_quote(&archive_text),
         name = sh_quote(&install.exe_name),
-        new_exe = sh_quote(&new_exe.to_string_lossy()),
-        exe = sh_quote(&exe.to_string_lossy()),
-        root = sh_quote(&install.root.to_string_lossy()),
-        root_text = install
-            .root
-            .to_string_lossy()
-            .replace(['"', '`', '$', '\\'], ""),
+        new_exe = sh_quote(&new_exe),
+        exe = sh_quote(&exe),
+        root = sh_quote(&root_path),
+        root_text = root_path.replace(['"', '`', '$', '\\'], ""),
     )
 }
 

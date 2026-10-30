@@ -24,7 +24,11 @@ use gpui_kit::{App, SharedString, SystemNotification};
 pub const HAS_DOCK_BADGE: bool = cfg!(target_os = "macos");
 
 /// Whether the system lets Consort show notifications.
+///
+/// Only macOS reads the state of the permission. The other systems report
+/// `System`, so the other variants are built on macOS and in tests only.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub enum Permission {
     /// The app is asking.
     Checking,

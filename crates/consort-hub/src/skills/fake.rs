@@ -177,6 +177,9 @@ pub fn skill_md(name: &str, extra: &str) -> String {
 /// GitHub, so the hub's partial fetch runs as it does there.
 pub struct TestRepo {
     pub dir: tempfile::TempDir,
+    /// Files that `commit` marks as executable in the git index. A file
+    /// system without a mode bit (Windows) needs this too.
+    executables: std::sync::Mutex<Vec<String>>,
 }
 
 fn run_git(dir: &Path, args: &[&str]) -> String {
@@ -211,11 +214,21 @@ impl TestRepo {
         ] {
             run_git(path, &["config", key, value]);
         }
-        Self { dir }
+        Self {
+            dir,
+            executables: std::sync::Mutex::new(Vec::new()),
+        }
     }
 
     pub fn url(&self) -> String {
-        format!("file://{}", self.dir.path().display())
+        // A Windows path has backslashes and a drive letter: `C:\x` becomes
+        // `file:///C:/x`.
+        let path = self.dir.path().display().to_string().replace('\\', "/");
+        if path.starts_with('/') {
+            format!("file://{path}")
+        } else {
+            format!("file:///{path}")
+        }
     }
 
     pub fn write(&self, path: &str, bytes: impl AsRef<[u8]>) {
@@ -224,12 +237,9 @@ impl TestRepo {
         std::fs::write(full, bytes).unwrap();
     }
 
-    #[cfg(unix)]
     pub fn write_executable(&self, path: &str, bytes: impl AsRef<[u8]>) {
-        use std::os::unix::fs::PermissionsExt;
         self.write(path, bytes);
-        let full = self.dir.path().join(path);
-        std::fs::set_permissions(full, std::fs::Permissions::from_mode(0o755)).unwrap();
+        self.executables.lock().unwrap().push(path.to_owned());
     }
 
     #[cfg(unix)]
@@ -246,6 +256,9 @@ impl TestRepo {
     /// Commits every change and returns the commit SHA.
     pub fn commit(&self, message: &str) -> String {
         run_git(self.dir.path(), &["add", "-A"]);
+        for path in self.executables.lock().unwrap().iter() {
+            run_git(self.dir.path(), &["update-index", "--chmod=+x", "--", path]);
+        }
         run_git(
             self.dir.path(),
             &["commit", "-q", "--allow-empty", "-m", message],
