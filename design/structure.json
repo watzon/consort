@@ -43,12 +43,12 @@
     "switcher_name_max": 240,
     "error_text_max_height": 240,
     "bubble_max_width": 560,
-    "content_top": 92,
+    "content_top": 98,
     "top_tint": [
-      { "at": 0, "alpha": 0.94 },
-      { "at": 56, "alpha": 0.84 },
-      { "at": 108, "alpha": 0.5 },
-      { "at": 184, "alpha": 0 }
+      { "at": 0, "alpha": 0.97 },
+      { "at": 60, "alpha": 0.94 },
+      { "at": 86, "alpha": 0.8 },
+      { "at": 108, "alpha": 0 }
     ],
     "fade_bottom": 32
   },

@@ -540,7 +540,7 @@ fn the_top_tint_lies_under_the_mark_and_the_first_bubble_starts_below_the_pill(
             assert_eq!(layer.size.height, stops[ix + 1].at - stops[ix].at);
         }
         let tint_bottom = layers[layers.len() - 1].bottom();
-        assert_eq!(tint_bottom - top, px(184.));
+        assert_eq!(tint_bottom - top, px(108.));
         // The mark and the top actions sit on the tint.
         assert!(voices.bottom() < tint_bottom, "the mark");
         let tasks = cx.debug_bounds("tasks-button").expect("the Tasks button");

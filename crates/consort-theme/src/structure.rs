@@ -647,7 +647,7 @@ mod tests {
         let s = super::structure();
         assert_eq!(s.layout.bubble_max_width, 560.0);
         assert!(s.layout.bubble_max_width < s.layout.timeline_max_width);
-        assert_eq!((s.layout.content_top, s.layout.fade_bottom), (92.0, 32.0));
+        assert_eq!((s.layout.content_top, s.layout.fade_bottom), (98.0, 32.0));
         // 8 frames a second.
         assert_eq!(s.motion.frame_ms, 125);
         assert_eq!(s.motion.done_hold_ms, 1500);
@@ -666,19 +666,19 @@ mod tests {
         assert!(s.layout.content_top - needed < s.space.md);
     }
 
-    /// The top tint of the Paper artboard "Base: Tutti with top tint and
-    /// larger sidebar": the canvas at about 94 percent at the top, 84 at
-    /// 56 px, 50 at 108 px, and clear at 184 px. The tint gets lighter all
-    /// the way down, and it reaches below the place where the first item
-    /// starts, so content that moves up under the mark stays faintly
-    /// visible.
+    /// The top tint. The user asked for a tint that is much darker from the
+    /// mark up, like Claude Duet: the canvas at 97 percent at the top, 94 at
+    /// the bottom of the mark (60 px), 80 at the bottom of the pill (86 px),
+    /// and clear at 108 px, just below the place where the first item
+    /// starts at rest. The tint gets lighter all the way down, and content
+    /// that moves up under the mark stays faintly visible.
     #[test]
     fn the_top_tint_gets_lighter_from_the_top_to_clear() {
         let s = super::structure();
         let stops = s.layout.top_tint;
         assert_eq!(
             stops.map(|t| (t.at, t.alpha)),
-            [(0.0, 0.94), (56.0, 0.84), (108.0, 0.5), (184.0, 0.0)]
+            [(0.0, 0.97), (60.0, 0.94), (86.0, 0.8), (108.0, 0.0)]
         );
         for pair in stops.windows(2) {
             assert!(pair[0].at < pair[1].at);

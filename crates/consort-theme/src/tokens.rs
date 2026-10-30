@@ -1023,8 +1023,8 @@ mod tests {
         assert_eq!(t.layout.sidebar_width, px(288.0));
         assert_eq!(t.component.sidebar.row_text.size, px(15.0));
         assert_eq!(t.component.sidebar.title_bar, px(52.0));
-        assert_eq!(t.layout.content_top, px(92.0));
-        assert_eq!(t.layout.top_tint_height(), px(184.0));
+        assert_eq!(t.layout.content_top, px(98.0));
+        assert_eq!(t.layout.top_tint_height(), px(108.0));
     }
 
     /// The sidebar text follows the text size setting, like every other
