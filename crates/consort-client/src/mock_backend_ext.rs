@@ -346,6 +346,22 @@ pub(crate) fn apply(
             if state.tools_of(&service).is_none() {
                 state.service_tools.push(mx::service_tools(&service));
             }
+            // As the hub's detail: the service with its sign-in schemes.
+            if !state
+                .connector_catalog
+                .services
+                .iter()
+                .any(|s| s.slug == service && !s.auth_schemes.is_empty())
+                && let Some(found) = mx::catalog_services()
+                    .into_iter()
+                    .find(|s| s.slug == service)
+            {
+                state
+                    .connector_catalog
+                    .services
+                    .retain(|s| s.slug != service);
+                state.connector_catalog.services.push(found);
+            }
         }
         Command::Connect(new) => {
             let name = new.name.trim().to_owned();
@@ -818,13 +834,23 @@ pub(crate) fn apply(
             }));
             return Ok(CommandOutput::SkillFiles(files));
         }
-        Command::ReadSkillFile { skill_id, path, .. } => {
+        Command::ReadSkillFile {
+            skill_id,
+            path,
+            pending,
+        } => {
             let skill = state.skill(&skill_id).ok_or_else(|| not_found("skill"))?;
             let content = if path == "SKILL.md" {
-                format!(
+                let mut text = format!(
                     "---\nname: {}\ndescription: {}\n---\n\n# {}\n\nFollow these steps when the task fits this skill.\n",
                     skill.name, skill.description, skill.name
-                )
+                );
+                // The new version of a skill adds a step, so a review has a
+                // change to show.
+                if pending {
+                    text.push_str("Run the linter before you finish.\n");
+                }
+                text
             } else {
                 "#!/usr/bin/env python3\nprint(\"mock script\")\n".to_owned()
             };

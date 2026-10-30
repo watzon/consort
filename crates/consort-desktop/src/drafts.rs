@@ -110,20 +110,6 @@ pub fn switch_thread(
         .unwrap_or_default()
 }
 
-/// The draft after the New task button: the draft stays, and "Start a task
-/// to " follows it. A box that holds nothing gets just that text. A second
-/// press adds nothing, so the text does not pile up.
-pub fn start_task_text(draft: &str) -> String {
-    let start = crate::app::START_TASK_TEXT;
-    if draft.trim().is_empty() {
-        start.to_owned()
-    } else if draft.trim_end().ends_with(start.trim_end()) {
-        draft.to_owned()
-    } else {
-        append_text(draft, start)
-    }
-}
-
 /// Text as a Markdown quote: `> ` before each line.
 pub fn quote_block(text: &str) -> String {
     text.lines().map(|line| format!("> {line}\n")).collect()
@@ -221,20 +207,6 @@ mod tests {
     }
 
     /// Review cycle 3, finding 4: the New task buttons replaced the draft.
-    #[test]
-    fn new_task_adds_to_the_draft_and_never_replaces_it() {
-        assert_eq!(start_task_text(""), "Start a task to ");
-        assert_eq!(start_task_text("  \n"), "Start a task to ");
-        assert_eq!(
-            start_task_text("Why does the build fail on Windows?"),
-            "Why does the build fail on Windows?\n\nStart a task to "
-        );
-        // A second press adds nothing.
-        let once = start_task_text("A draft");
-        assert_eq!(start_task_text(&once), once);
-        assert_eq!(start_task_text("Start a task to "), "Start a task to ");
-    }
-
     /// Review cycle 3, finding 4: a draft written in channel A went to
     /// channel B after a click in the sidebar.
     #[test]

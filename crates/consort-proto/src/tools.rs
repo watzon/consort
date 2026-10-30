@@ -1079,6 +1079,9 @@ pub enum SearchHit {
         path: String,
         /// The matching text.
         snippet: String,
+        /// When the note last changed. Older hubs leave it out.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        updated_at: Option<Timestamp>,
     },
     /// A task.
     Task {
@@ -1090,7 +1093,45 @@ pub enum SearchHit {
         title: String,
         /// Its status.
         status: TaskStatus,
+        /// When the task last changed. Older hubs leave it out.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        updated_at: Option<Timestamp>,
     },
+}
+
+impl SearchHit {
+    /// The kind of the hit.
+    pub fn kind(&self) -> SearchKind {
+        match self {
+            SearchHit::Message { .. } => SearchKind::Message,
+            SearchHit::MemoryNote { .. } => SearchKind::MemoryNote,
+            SearchHit::Task { .. } => SearchKind::Task,
+        }
+    }
+}
+
+/// What a search can find. `message.search` takes a list of them to search
+/// only those kinds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchKind {
+    /// Messages in timelines and threads.
+    Message,
+    /// Memory notes.
+    MemoryNote,
+    /// Tasks, by title and brief.
+    Task,
+}
+
+impl SearchKind {
+    /// The kind as the search index names it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SearchKind::Message => "message",
+            SearchKind::MemoryNote => "memory_note",
+            SearchKind::Task => "task",
+        }
+    }
 }
 
 /// `search` result.

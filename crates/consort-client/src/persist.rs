@@ -131,6 +131,7 @@ const ROUTINE: &str = "routine";
 const ROUTINE_RUN: &str = "routine_run";
 const MEMORY_NOTE: &str = "memory_note";
 const TASK: &str = "task";
+const ARCHIVED_TASK: &str = "archived_task";
 const APPROVAL: &str = "approval";
 const DECISION: &str = "decision";
 const READ_MARKER: &str = "read_marker";
@@ -152,6 +153,7 @@ const MEMORY_DELETED_LOADED: &str = "memory_deleted_loaded";
 const TASK_PREVIEWS: &str = "task_previews";
 const TASKS_HAVE_MORE: &str = "tasks_have_more";
 const TASKS_ABSENT: &str = "tasks_absent";
+const ARCHIVED_HAS_MORE: &str = "archived_has_more";
 const HAS_OLDER: &str = "has_older";
 const CHANNELS_LOADED: &str = "channels_loaded";
 const LOADED_THREADS: &str = "loaded_threads";
@@ -182,6 +184,10 @@ fn row<T: Serialize>(kind: &'static str, id: &str, value: &T) -> Result<Row, Per
 /// The cache keeps more than this file holds. What stays out, and why:
 /// - `touched`, `sign_ins`, `sign_ins_dismissed`: they guard a load that is
 ///   in flight, and no load survives a restart.
+/// - `convo` (without the archived tasks): the search, the open item and the
+///   loaded message threads are screen state. A thread is in `loaded_threads`
+///   already, and the app loads the search and the item again when the user
+///   opens them.
 /// - `pending` and `send_failures`: the outbox has its own file.
 /// - `acp_registry*`, `extensions`, `local_blobs`, `admin` (without the
 ///   paired clients): the app asks the hub for them when a page needs them.
@@ -223,6 +229,9 @@ pub fn rows(cache: &Cache, fresh_at: i64, owner: &Owner) -> Result<Rows, Persist
     for (id, v) in &cache.tasks {
         entities.push(row(TASK, id, v)?);
     }
+    for v in &cache.convo.archived.tasks {
+        entities.push(row(ARCHIVED_TASK, &v.id.to_string(), v)?);
+    }
     for (id, v) in &cache.approvals {
         entities.push(row(APPROVAL, id, v)?);
     }
@@ -261,6 +270,7 @@ pub fn rows(cache: &Cache, fresh_at: i64, owner: &Owner) -> Result<Rows, Persist
     meta.insert(TASK_PREVIEWS, json(&cache.task_previews)?);
     meta.insert(TASKS_HAVE_MORE, json(&cache.tasks_have_more)?);
     meta.insert(TASKS_ABSENT, json(&cache.tasks_absent)?);
+    meta.insert(ARCHIVED_HAS_MORE, json(&cache.convo.archived.has_more)?);
     meta.insert(HAS_OLDER, json(&cache.has_older)?);
     meta.insert(CHANNELS_LOADED, json(&cache.channels_loaded)?);
     meta.insert(LOADED_THREADS, json(&cache.loaded_threads)?);
@@ -327,6 +337,9 @@ fn restore_row(cache: &mut Cache, kind: &str, id: String, text: &str) -> Result<
         TASK => {
             cache.tasks.insert(id, parse::<Task>(text)?);
         }
+        ARCHIVED_TASK => {
+            cache.convo.archived.tasks.push(parse::<Task>(text)?);
+        }
         APPROVAL => {
             cache.approvals.insert(id, parse::<Approval>(text)?);
         }
@@ -392,6 +405,15 @@ fn restore(
     };
     for (kind, id, text) in rows {
         restore_row(&mut cache, &kind, id, &text)?;
+    }
+    // The rows come in key order. The list shows the newest archive first.
+    let archived = &mut cache.convo.archived;
+    archived
+        .tasks
+        .sort_by(|a, b| b.archived_at.cmp(&a.archived_at).then(a.id.cmp(&b.id)));
+    if !archived.tasks.is_empty() {
+        archived.has_more = meta_value(meta, ARCHIVED_HAS_MORE)?;
+        archived.load = crate::connectors::LoadState::Loaded;
     }
     Ok(cache)
 }
@@ -758,6 +780,7 @@ mod tests {
             worker_id: None,
             review_summary: Some("Ready.".into()),
             resolved_at: None,
+            session_ended: false,
             archived_at: None,
             created_at: at(1),
             updated_at: at(2),
@@ -889,6 +912,10 @@ mod tests {
             .tasks
             .insert(task_id.to_string(), task(task_id, channel_id, card));
         cache.task_previews.insert(task_id.to_string());
+        let mut archived = task(TaskId::new(), channel_id, card);
+        archived.archived_at = Some(at(9));
+        cache.convo.archived.tasks.push(archived);
+        cache.convo.archived.has_more = true;
         cache.tasks_absent.insert(TaskId::new().to_string());
         let approval = Approval {
             id: ApprovalId::new(),
@@ -1057,6 +1084,7 @@ mod tests {
             skills,
             extensions: _,
             admin,
+            convo,
         } = a;
         macro_rules! same {
             ($($field:ident),+ $(,)?) => {
@@ -1099,6 +1127,13 @@ mod tests {
             connections,
             skills,
         );
+        // The archived tasks come back in order. The search, the open item
+        // and the loaded threads of `convo` are screen state, so they stay out.
+        assert_eq!(
+            format!("{:?}", (&convo.archived.tasks, convo.archived.has_more)),
+            format!("{:?}", (&b.convo.archived.tasks, b.convo.archived.has_more)),
+            "the archived tasks differ"
+        );
         assert_eq!(
             format!("{:?}", admin.clients),
             format!("{:?}", b.admin.clients),
@@ -1119,8 +1154,8 @@ mod tests {
         let (mut file, saved) = CacheFile::open(&path, &owner()).unwrap();
         assert!(saved.is_none(), "a new file holds no data");
         let written = save(&mut file, &cache, 1_800_000_000_000);
-        // One row for each entity: 18 kinds, and two session items.
-        assert_eq!(written, 19);
+        // One row for each entity: 19 kinds, and two session items.
+        assert_eq!(written, 20);
         drop(file);
 
         let (_, saved) = CacheFile::open(&path, &owner()).unwrap();

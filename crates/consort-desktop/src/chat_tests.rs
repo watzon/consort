@@ -206,18 +206,12 @@ fn the_tasks_button_opens_the_panel_and_has_a_gold_dot_when_something_needs_you(
     cx.simulate_click(tasks.center(), Modifiers::default());
     cx.run_until_parked();
     app.read_with(cx, |app, _| assert_eq!(app.panel, Panel::None));
-    // New task puts the start of a task in the composer.
+    // New task opens the New task dialog.
     let new_task = cx.debug_bounds("new-task").expect("New task");
     cx.simulate_click(new_task.center(), Modifiers::default());
     cx.run_until_parked();
-    app.read_with(cx, |app, cx| {
-        assert!(
-            app.inputs
-                .composer
-                .read(cx)
-                .value()
-                .starts_with(crate::app::START_TASK_TEXT)
-        )
+    app.read_with(cx, |app, _| {
+        assert_eq!(app.dialog, Some(crate::app::Dialog::NewTask))
     });
 }
 

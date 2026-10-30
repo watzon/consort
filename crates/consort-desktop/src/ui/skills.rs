@@ -581,26 +581,45 @@ impl ConsortApp {
             SkillUpdateView::CheckFailed { .. } => {
                 text("Check failed", t.text.ui, c.status_failed).into_any_element()
             }
-            SkillUpdateView::Available { commit, .. } => button(
-                "skill-update",
-                match commit {
-                    Some(commit) => format!("Update to {commit}"),
-                    None => "Update".to_owned(),
-                },
-                ButtonKind::Secondary,
-                t,
-            )
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.update_skill(
-                    update_id.clone(),
-                    SkillChanges {
-                        accept_new_version: true,
-                        ..SkillChanges::default()
-                    },
-                    cx,
-                )
-            }))
-            .into_any_element(),
+            SkillUpdateView::Available { commit, .. } => {
+                let review_id = update_id.clone();
+                div()
+                    .flex()
+                    .gap(t.space.sm)
+                    .child(
+                        button("skill-review", "Review changes", ButtonKind::Quiet, t).on_click(
+                            cx.listener(move |this, _, window, cx| {
+                                this.open_dialog(
+                                    crate::app::Dialog::SkillDiff(review_id.clone()),
+                                    window,
+                                    cx,
+                                )
+                            }),
+                        ),
+                    )
+                    .child(
+                        button(
+                            "skill-update",
+                            match commit {
+                                Some(commit) => format!("Update to {commit}"),
+                                None => "Update".to_owned(),
+                            },
+                            ButtonKind::Secondary,
+                            t,
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.update_skill(
+                                update_id.clone(),
+                                SkillChanges {
+                                    accept_new_version: true,
+                                    ..SkillChanges::default()
+                                },
+                                cx,
+                            )
+                        })),
+                    )
+                    .into_any_element()
+            }
         };
         let update_hint = match &skill.update {
             SkillUpdateView::Available {

@@ -54,6 +54,9 @@ use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
 
 const CODE: &str = "ABCD-EFGH";
 
+#[path = "fake_hub_parts/phase4.rs"]
+mod phase4;
+
 #[derive(Default)]
 struct Hub {
     origin: String,
@@ -151,6 +154,8 @@ struct Hub {
     /// The memory notes, also the deleted ones, and every version.
     notes: Vec<consort_proto::model::MemoryNote>,
     versions: Vec<consort_proto::model::MemoryNote>,
+    /// Phase 4: see `fake_hub_parts/phase4.rs`.
+    phase4: phase4::State,
 }
 
 fn note_hash(content: &str) -> consort_proto::model::Sha256Hash {
@@ -288,6 +293,7 @@ fn seed(hub: &mut Hub) {
         worker_id: None,
         review_summary: None,
         resolved_at: None,
+        session_ended: false,
         archived_at: None,
         created_at: ts(now - 5_000),
         updated_at: ts(now - 5_000),
@@ -1802,6 +1808,14 @@ async fn session(hub: Shared, mut socket: WebSocket) {
                     expires_at: Timestamp::now().plus_millis(600_000),
                 })
                 .unwrap(),
+            kind if phase4::handles(kind) => {
+                let (reply, events) = phase4::answer(&hub, &req);
+                send(&mut socket, reply).await;
+                for event in events {
+                    send(&mut socket, event).await;
+                }
+                continue;
+            }
             other => req.respond_error(ErrorBody::new(
                 ErrorCode::Invalid,
                 format!("The fake hub has no {other}."),

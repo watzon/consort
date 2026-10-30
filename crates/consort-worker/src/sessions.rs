@@ -261,6 +261,7 @@ async fn pump(
     hub_tools: ToolCache,
 ) {
     let mut coalescer = Coalescer::default();
+    let item_details = crate::item_details::ItemDetails::new(&core.consort_home);
     let interval = Duration::from_millis(OUTPUT_DELTA_INTERVAL_MS);
     let mut deadline: Option<tokio::time::Instant> = None;
     let mut exit_held = false;
@@ -273,7 +274,9 @@ async fn pump(
         };
         tokio::select! {
             event = events.recv() => {
-                let Some(event) = event else { break };
+                let Some(mut event) = event else { break };
+                // The full output and the diffs stay here for `item.detail`.
+                item_details.observe(session_id, &mut event);
                 if is_exit_event(&event) {
                     let hold = if exit_held { Duration::ZERO } else { EXIT_HOLD };
                     exit_held = true;

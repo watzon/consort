@@ -303,6 +303,7 @@ pub(crate) async fn test_task_session(
             task.status = TaskStatus::Working;
             task.start_at = None;
             task.current_session_id = Some(stored.id);
+            task.session_ended = false;
             task.worker_id = Some(stored.worker_id);
             tx.save_task(&task)?;
             Ok(task)

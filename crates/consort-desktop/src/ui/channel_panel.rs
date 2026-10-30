@@ -940,6 +940,10 @@ impl ConsortApp {
                         .task(task_id)
                         .map(|t| t.channel_id.clone())
                         .unwrap_or_default(),
+                    UploadTarget::Thread { root_id } => self
+                        .find_message(root_id)
+                        .map(|m| m.channel_id)
+                        .unwrap_or_else(|| self.channel_id.clone()),
                 };
                 self.load_channel_files_of(&channel_id, cx);
                 let mut files: Vec<ChannelFileView> = self

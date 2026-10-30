@@ -19,7 +19,7 @@ use crate::{
             ButtonKind, button, detail, focusable, icon, icon_button, line, selectable,
             status_color, status_glyph, text,
         },
-        timeline::{open_context_menu, task_menu, time_text},
+        timeline::{open_context_menu, task_menu},
     },
 };
 
@@ -203,7 +203,10 @@ impl ConsortApp {
             }
             body = body.child(section);
         }
-        if !any {
+        if self.tasks_tab == TasksTab::Resolved {
+            body = body.child(self.render_archived_tasks(t, cx));
+        }
+        if !any && self.tasks_tab != TasksTab::Resolved {
             let (title, line_text) = match self.tasks_tab {
                 TasksTab::Active => (
                     "No active tasks",
@@ -264,7 +267,7 @@ impl ConsortApp {
                             cx,
                         )
                         .on_click(
-                            cx.listener(|this, _, window, cx| this.start_task_draft(window, cx)),
+                            cx.listener(|this, _, window, cx| this.open_new_task(window, cx)),
                         ),
                     )
                     .child(
@@ -307,6 +310,7 @@ impl ConsortApp {
         let id = task.id.clone();
         let menu_id = task.id.clone();
         let status = task.status;
+        let ended = task.session_ended;
         // `text.tertiary` never sits on `surface.selected`.
         let quiet = if selected {
             c.text_secondary
@@ -363,7 +367,13 @@ impl ConsortApp {
         .on_mouse_down(
             MouseButton::Right,
             cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                open_context_menu(this, event, task_menu(&menu_id, status, true), window, cx)
+                open_context_menu(
+                    this,
+                    event,
+                    task_menu(&menu_id, status, ended, true),
+                    window,
+                    cx,
+                )
             }),
         )
         .into_any_element()
@@ -376,10 +386,20 @@ impl ConsortApp {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        if let Some(item) = self
+            .state
+            .convo
+            .item
+            .clone()
+            .filter(|i| i.task_id == task_id)
+        {
+            return self.render_item_view(item, t, _window, cx);
+        }
         let c = &t.colors;
         let state = self.state.clone();
         let task = state.task(task_id).cloned();
         let thread = state.thread(task_id).cloned();
+        let session_ended = task.as_ref().is_some_and(|t| t.session_ended);
         let title = task.as_ref().map(|t| t.title.clone()).unwrap_or_default();
         let status = task.as_ref().map(|t| t.status).unwrap_or_default();
         let status_detail = thread
@@ -460,7 +480,7 @@ impl ConsortApp {
                         .on_click(cx.listener(move |this, _, _, cx| {
                             if let Some(bounds) = this.triggers.get("thread-more") {
                                 // The thread is open, so the menu has no Open thread.
-                                let items = task_menu(&menu_task, status, false);
+                                let items = task_menu(&menu_task, status, session_ended, false);
                                 this.open_menu(OpenMenu::under(bounds, items, false), cx);
                             }
                         })),
@@ -516,35 +536,7 @@ impl ConsortApp {
                     })
             });
 
-        // The brief that started the task, in full. It sits under the header
-        // as a section that opens. The text is selectable Markdown, and it
-        // scrolls when it is long.
         let loading = thread.as_ref().is_some_and(|th| th.text_is_preview);
-        let brief = thread
-            .as_ref()
-            .filter(|th| !th.brief.trim().is_empty())
-            .map(|th| th.brief.clone())
-            .map(|brief| {
-                let open = self.brief_open.iter().any(|id| id == task_id);
-                self.render_text_section(
-                    TextSection {
-                        key: format!("thread-brief-{task_id}"),
-                        toggle_id: "thread-brief-toggle",
-                        label: "Brief",
-                        open,
-                        above: false,
-                        loading,
-                    },
-                    &brief,
-                    t,
-                    cx,
-                    {
-                        let task = task_id.to_owned();
-                        move |this: &mut ConsortApp| toggle_id(&mut this.brief_open, &task)
-                    },
-                )
-            });
-
         // What the task said when it went to Ready for review, in full. It
         // sits above the Resolve bar, open by default, so the user reads it
         // before they resolve the task.
@@ -573,103 +565,18 @@ impl ConsortApp {
                 )
             });
 
-        let placement = thread
-            .as_ref()
-            .and_then(|th| th.placement.clone())
-            .map(|p| {
-                let row = |label: &str, value: AnyElement| {
-                    div()
-                        .flex()
-                        .gap(t.space.md)
-                        .child(
-                            text(label.to_owned(), detail(t), c.text_tertiary)
-                                .w(t.space.page + t.space.xxl)
-                                .flex_none(),
-                        )
-                        .child(value)
-                };
-                // A known path in mono, else the repo, else a task with no
-                // repo, which runs in a new empty folder.
-                let workspace = div()
-                    .flex()
-                    .flex_wrap()
-                    .min_w_0()
-                    .type_style(detail(t))
-                    .text_color(c.text_secondary);
-                // "Worktree of x", "Clone of x", but "In x" for in place.
-                let lead = match p.isolation {
-                    consort_client::Isolation::InPlace => "In ".to_owned(),
-                    other => format!("{} of ", other.label()),
-                };
-                // The path, the branch and the repo are text that the user may
-                // copy, so they are selectable.
-                let mono = |what: &str, value: String| {
-                    selectable(
-                        SharedString::from(format!("workspace-{what}-{task_id}")),
-                        value,
-                        detail(t),
-                        c.text_secondary,
-                    )
-                    .font_family(t.font_mono.clone())
-                };
-                let workspace = if !p.path.is_empty() {
-                    workspace
-                        .child(lead)
-                        .child(mono("path", p.path.clone()))
-                        .when_some(p.branch.clone(), |d, b| {
-                            d.child(" at ").child(mono("branch", b))
-                        })
-                } else if let Some(repo) = p.repo.clone() {
-                    workspace.child(lead).child(mono("repo", repo))
-                } else {
-                    workspace.child("A new empty folder")
-                };
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(t.space.xs + t.space.xxs)
-                    .py(t.space.md)
-                    .px(t.space.lg)
-                    .border_b(t.border_width)
-                    .border_color(c.border_subtle)
-                    .child(row(
-                        "Worker",
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(t.space.xs + t.space.xxs)
-                            .child(
-                                div()
-                                    .size(t.space.xs + t.space.xxs)
-                                    .rounded(t.radius.full)
-                                    .when(p.worker_online, |d| d.bg(c.status_done))
-                                    .when(!p.worker_online, |d| {
-                                        d.border(t.border_width).border_color(c.text_tertiary)
-                                    }),
-                            )
-                            .child(text(
-                                format!("{}, {}", p.worker_name, p.worker_os),
-                                detail(t),
-                                c.text_secondary,
-                            ))
-                            .into_any_element(),
-                    ))
-                    .child(row(
-                        "Harness",
-                        text(p.harness.clone(), detail(t), c.text_secondary).into_any_element(),
-                    ))
-                    .child(row("Workspace", workspace.into_any_element()))
-            });
-
         let count = self.thread_keys.len();
         let posts = list(
             self.thread.clone(),
             cx.processor(move |this, ix: usize, window, cx| {
                 let t = ConsortApp::tokens(cx);
-                let post = this
-                    .thread_post(ix)
-                    .map(|post| this.render_post(&post, &t, window, cx))
-                    .unwrap_or_else(|| div().into_any_element());
+                let post = if this.thread_has_brief() && ix == 0 {
+                    this.render_brief_bubbles(&t, cx)
+                } else {
+                    this.thread_post(ix)
+                        .map(|post| this.render_post(&post, &t, window, cx))
+                        .unwrap_or_else(|| div().into_any_element())
+                };
                 div()
                     .px(t.space.lg)
                     .when(ix == 0, |d| d.pt(t.space.lg))
@@ -903,9 +810,7 @@ impl ConsortApp {
                 this.drop_files(crate::app::DropOver::Reply, paths, cx);
             }))
             .child(head)
-            .children(brief)
             .children(reason)
-            .children(placement)
             .child(
                 div()
                     .relative()
@@ -1008,7 +913,19 @@ impl ConsortApp {
         let Panel::Thread(task_id) = &self.panel else {
             return None;
         };
-        self.state.thread(task_id)?.posts.get(ix).cloned()
+        let offset = usize::from(self.thread_has_brief());
+        self.state
+            .thread(task_id)?
+            .posts
+            .get(ix.checked_sub(offset)?)
+            .cloned()
+    }
+
+    /// The first row of the thread is the brief.
+    fn thread_has_brief(&self) -> bool {
+        self.thread_keys
+            .first()
+            .is_some_and(|k| k.starts_with("brief-"))
     }
 
     fn render_post(
@@ -1019,38 +936,19 @@ impl ConsortApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let c = &t.colors;
+        let chat = t.component.chat;
         let you = post.speaker == Speaker::You;
-        // A system notice has no speaker: it is not a message from anyone.
-        let notice_only = post
-            .bodies
-            .iter()
-            .all(|b| matches!(b, PostBody::Notice { .. }));
-        let mut col = div().flex().flex_col().gap(t.space.sm).child(
-            div()
-                .flex()
-                .items_baseline()
-                .gap(t.space.sm)
-                .when(!notice_only, |d| {
-                    d.child(text(
-                        post.speaker.label(),
-                        t.text.label,
-                        if you { c.accent_text } else { c.text_secondary },
-                    ))
-                })
-                .child(text(
-                    if post.pending {
-                        crate::ui::timeline::pending_text(matches!(
-                            self.state.connection,
-                            consort_client::Connection::Offline { .. }
-                        ))
-                        .to_owned()
-                    } else {
-                        time_text(&post.time_label, false).to_owned()
-                    },
-                    t.text.caption,
-                    c.text_tertiary,
-                )),
-        );
+        let max = t.layout.panel_width - t.space.page;
+        // The thread is bubbles, as the timeline (`BDH-0`): the task's words
+        // at the left, yours at the right.
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .gap(t.space.xs + t.space.xxs)
+            .w_full()
+            .when(you, |d| d.items_end())
+            .when(!you, |d| d.items_start());
+        let count = post.bodies.len();
         for (i, body) in post.bodies.iter().enumerate() {
             let key = format!("{}.{i}", post.id);
             let element = match body {
@@ -1059,110 +957,74 @@ impl ConsortApp {
                         &key,
                         markdown,
                         crate::ui::timeline::post_menu(markdown),
-                        c.surface_card,
+                        c.surface_raised,
                         t,
                         cx,
                     );
-                    if you {
-                        div()
-                            .flex()
-                            .child(
-                                div()
-                                    .bg(c.accent_surface)
-                                    .rounded(t.radius.lg)
-                                    .py(t.space.xs + t.space.xxs)
-                                    .px(t.space.md)
-                                    .type_style(t.text.ui)
-                                    .child(md),
-                            )
-                            .into_any_element()
-                    } else {
-                        md.type_style(t.text.ui)
-                            .text_color(c.text_primary)
-                            .into_any_element()
-                    }
-                }
-                PostBody::Activity { summary, items } => {
-                    let open = self.activity_open.contains(&key);
-                    let toggle_key = key.clone();
+                    let last = i + 1 == count;
                     div()
-                        .flex()
-                        .flex_col()
-                        .border(t.border_width)
-                        .border_color(c.border_subtle)
-                        .rounded(t.radius.md)
-                        .child(
-                            focusable(div().id(SharedString::from(format!("{key}-activity"))), t)
-                                .flex()
-                                .items_center()
-                                .gap(t.space.sm)
-                                .py(t.space.xs + t.space.xxs)
-                                .px(t.space.sm + t.space.xxs)
-                                .cursor_pointer()
-                                .rounded(t.radius.md)
-                                .hover(|s| s.bg(c.hover_sidebar))
-                                .child(icon("terminal", t.icon.dense, c.text_tertiary))
-                                .child(text(summary.clone(), detail(t), c.text_secondary).flex_1())
-                                .child(icon(
-                                    if open {
-                                        "chevron-down"
-                                    } else {
-                                        "chevron-right"
-                                    },
-                                    t.icon.dense,
-                                    c.text_tertiary,
-                                ))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    if let Some(pos) =
-                                        this.activity_open.iter().position(|k| *k == toggle_key)
-                                    {
-                                        this.activity_open.remove(pos);
-                                    } else {
-                                        this.activity_open.push(toggle_key.clone());
-                                    }
-                                    cx.notify();
-                                })),
-                        )
-                        .when(open, |d| {
-                            let mut list = div()
-                                .flex()
-                                .flex_col()
-                                .gap(t.space.xxs)
-                                .px(t.space.sm + t.space.xxs)
-                                .pb(t.space.sm)
-                                .pl(t.icon.dense + t.space.sm + t.space.sm + t.space.xxs);
-                            for (n, item) in items.iter().enumerate() {
-                                // Command lines are selectable, so the user
-                                // can copy them.
-                                list = list.child(
-                                    selectable(
-                                        SharedString::from(format!("{key}-item-{n}")),
-                                        item.clone(),
-                                        detail(t),
-                                        c.text_tertiary,
-                                    )
-                                    .font_family(t.font_mono.clone()),
-                                );
-                            }
-                            d.child(list)
+                        .max_w(max)
+                        .min_w_0()
+                        .py(chat.bubble_pad_y)
+                        .px(chat.bubble_pad_x)
+                        .rounded(chat.bubble_radius)
+                        .when(last && you, |d| d.rounded_br(chat.bubble_tail))
+                        .when(last && !you, |d| d.rounded_bl(chat.bubble_tail))
+                        .bg(if you {
+                            c.accent_surface
+                        } else {
+                            c.surface_card
                         })
+                        .type_style(t.text.body)
+                        .text_color(c.text_primary)
+                        .child(md)
                         .into_any_element()
                 }
-                PostBody::Approval(approval) => {
-                    self.render_approval_card(approval, &key, false, t, cx)
+                PostBody::Activity { summary, items } => {
+                    self.render_activity_chip(&key, summary, items, t, cx)
                 }
-                PostBody::Decision(decision) => self.render_decision(decision, &key, true, t, cx),
+                PostBody::Approval(approval) => div()
+                    .flex()
+                    .flex_col()
+                    .w_full()
+                    .gap(t.space.xs + t.space.xxs)
+                    .child(self.request_line(&key, "Approval", approval.state, t, cx))
+                    .child(self.render_approval_card(approval, &key, false, t, cx))
+                    .into_any_element(),
+                PostBody::Decision(decision) => div()
+                    .flex()
+                    .flex_col()
+                    .w_full()
+                    .gap(t.space.xs + t.space.xxs)
+                    .child(self.request_line(&key, "Decision", decision.state, t, cx))
+                    .child(self.render_decision(decision, &key, true, t, cx))
+                    .into_any_element(),
                 // A system notice: quiet, selectable, no speaker of its own.
-                PostBody::Notice { text: notice, .. } => selectable(
-                    SharedString::from(format!("{key}-notice")),
-                    notice.clone(),
-                    t.text.ui,
-                    c.text_tertiary,
-                )
-                .into_any_element(),
+                PostBody::Notice { text: notice, .. } => div()
+                    .w_full()
+                    .flex()
+                    .justify_center()
+                    .child(selectable(
+                        SharedString::from(format!("{key}-notice")),
+                        notice.clone(),
+                        t.text.ui,
+                        c.text_tertiary,
+                    ))
+                    .into_any_element(),
                 PostBody::Attachments(list) => self.render_post_attachments(&key, list, t, cx),
             };
             col = col.child(element);
+        }
+        if post.pending {
+            col = col.child(text(
+                crate::ui::timeline::pending_text(matches!(
+                    self.state.connection,
+                    consort_client::Connection::Offline { .. }
+                ))
+                .to_owned(),
+                t.text.caption,
+                c.text_tertiary,
+            ));
         }
         col.into_any_element()
     }

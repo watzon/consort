@@ -28,6 +28,8 @@ pub enum UploadTarget {
     Composer { channel_id: String },
     /// The reply box of a task thread.
     Reply { task_id: String },
+    /// The reply box of the thread of a message.
+    Thread { root_id: String },
     /// A folder of a channel's files. `folder` is empty for the top folder.
     /// The upload becomes a channel file when it is ready.
     ChannelFiles { channel_id: String, folder: String },

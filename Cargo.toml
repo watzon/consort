@@ -56,6 +56,10 @@ futures-util = { version = "0.3", default-features = false, features = ["std", "
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
 url = "2"
 
+# The unified diff of an ACP file change, for the task item view (phase 4).
+# It is already in the tree; pinned to that version.
+similar = "=2.7.0"
+
 # Harness, worker, testkit and CLI (added by the worker agent)
 tokio = { version = "1.48", features = ["full"] }
 tokio-util = { version = "0.7", features = ["compat"] }

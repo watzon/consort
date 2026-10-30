@@ -11,6 +11,7 @@
 
 mod admin;
 mod commands;
+mod convo;
 mod extensions;
 mod files;
 mod knowledge;

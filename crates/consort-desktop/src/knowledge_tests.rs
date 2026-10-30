@@ -529,3 +529,62 @@ fn the_memory_saved_line_opens_its_note(cx: &mut TestAppContext) {
         );
     });
 }
+
+/// A memory note in the search results opens in phase 2's views: a channel
+/// note in the Memory tab of the Channel panel, a global note in Settings >
+/// Memory.
+#[gpui::test]
+fn a_memory_search_hit_opens_the_note_in_the_memory_views(cx: &mut TestAppContext) {
+    use crate::app::Page;
+    use consort_client::convo::{SearchHitView, SearchSection, SearchTarget};
+
+    let hit = |channel_id: Option<&str>, path: &str| SearchHitView {
+        section: SearchSection::Memory,
+        target: SearchTarget::Memory {
+            channel_id: channel_id.map(str::to_owned),
+            path: path.to_owned(),
+        },
+        title: path.to_owned(),
+        title_note: None,
+        icon: Some("notebook".into()),
+        tutti: false,
+        status: None,
+        snippet: String::new(),
+        detail: String::new(),
+    };
+    let (handle, app) = open(state(), cx);
+    let cx = &mut VisualTestContext::from_window(handle, cx);
+
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            app.open_hit(hit(Some(LIGHTS), "decisions/roofline.md"), window, cx)
+        })
+    });
+    draw(cx);
+    app.read_with(cx, |app, _| {
+        assert_eq!(app.page, Page::Main);
+        assert_eq!(app.channel_id, LIGHTS);
+        assert_eq!(app.panel, Panel::Channel);
+        assert_eq!(app.channel_tab, ChannelTab::Memory);
+        assert_eq!(
+            app.knowledge.panel_note,
+            Some((LIGHTS.to_owned(), "decisions/roofline.md".to_owned()))
+        );
+    });
+
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            app.open_hit(hit(None, "people/kevin.md"), window, cx)
+        })
+    });
+    draw(cx);
+    app.read_with(cx, |app, _| {
+        assert_eq!(app.page, Page::Settings);
+        assert_eq!(app.settings_section, SettingsSection::Memory);
+        assert_eq!(
+            app.knowledge.settings_note,
+            Some((GLOBAL.to_owned(), "people/kevin.md".to_owned()))
+        );
+    });
+    assert!(has(cx, "settings-memory"));
+}

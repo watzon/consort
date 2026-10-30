@@ -319,6 +319,39 @@ impl Core {
     /// Stores a command result and sends it to the hub. A copy of the
     /// command that arrived while it ran gets this answer too: the answer
     /// goes on the current link, and it has the command ID.
+    /// `item.detail`: uploads the kept output or diff of an item as a blob
+    /// and gives its hash. An item with nothing kept is `not_found`.
+    pub async fn item_detail(
+        &self,
+        detail: consort_proto::worker_link::ItemDetail,
+    ) -> Result<Value, ErrorBody> {
+        let details = crate::item_details::ItemDetails::new(&self.consort_home);
+        let Some((bytes, mime)) = details.read(detail.session_id, detail.item_id) else {
+            return Err(ErrorBody::new(
+                ErrorCode::NotFound,
+                "This worker has no full output for this item. Only the summary in the thread is left.",
+            ));
+        };
+        let digest: [u8; 32] = <sha2::Sha256 as sha2::Digest>::digest(&bytes).into();
+        let sha256 = consort_proto::model::Sha256Hash::from_bytes(digest);
+        let size = bytes.len() as u64;
+        crate::http::upload_blob(
+            &self.hub_url,
+            self.worker_id,
+            &self.identity,
+            &sha256,
+            bytes,
+        )
+        .await
+        .map_err(|e| ErrorBody::new(ErrorCode::Internal, e.to_string()))?;
+        serde_json::to_value(consort_proto::worker_link::ItemDetailResult {
+            sha256,
+            size,
+            mime: mime.to_owned(),
+        })
+        .map_err(|_| ErrorBody::internal())
+    }
+
     pub fn finish_command(&self, id: &FrameId, result: Result<Value, ErrorBody>) {
         if let Err(err) = self
             .store
@@ -488,14 +521,12 @@ impl Core {
                     core.finish_command(&id, result.map(|()| json!({})));
                 });
             }
-            HubToWorker::ItemDetail(_) => {
-                self.finish_command(
-                    &id,
-                    Err(ErrorBody::new(
-                        ErrorCode::NotFound,
-                        "this worker build does not keep the full output of items",
-                    )),
-                );
+            HubToWorker::ItemDetail(detail) => {
+                let core = self.clone();
+                tokio::spawn(async move {
+                    let result = core.item_detail(detail).await;
+                    core.finish_command(&id, result);
+                });
             }
             other => {
                 let Some(session_id) = other.session_id() else {

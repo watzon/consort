@@ -50,6 +50,29 @@ pub fn tasks_not_archived(conn: &Connection) -> Result<Vec<Task>> {
     )
 }
 
+/// A page of the archived tasks, the most recently archived first, and
+/// whether more follow. With a channel, only that channel's tasks.
+pub fn archived_tasks(
+    conn: &Connection,
+    channel_id: Option<ChannelId>,
+    offset: u32,
+    limit: u32,
+) -> Result<(Vec<Task>, bool)> {
+    let mut tasks: Vec<Task> = list_docs(
+        conn,
+        "SELECT data FROM tasks WHERE archived_at IS NOT NULL AND (?1 IS NULL OR channel_id = ?1)
+         ORDER BY archived_at DESC, rowid DESC LIMIT ?2 OFFSET ?3",
+        params![
+            channel_id.map(|c| c.to_string()),
+            i64::from(limit) + 1,
+            i64::from(offset)
+        ],
+    )?;
+    let has_more = tasks.len() > usize::try_from(limit).unwrap_or(usize::MAX);
+    tasks.truncate(usize::try_from(limit).unwrap_or(usize::MAX));
+    Ok((tasks, has_more))
+}
+
 /// Tasks in one status, across channels, oldest first. Archived tasks count.
 pub fn tasks_with_status(conn: &Connection, status: TaskStatus) -> Result<Vec<Task>> {
     list_docs(

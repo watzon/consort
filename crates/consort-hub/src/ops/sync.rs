@@ -173,6 +173,34 @@ impl Hub {
             .await?;
         Ok(consort_proto::client_api::TaskResult { task })
     }
+
+    /// `task.list_archived`: a page of the archived tasks, the most
+    /// recently archived first, with long texts cut as in a snapshot.
+    pub(crate) async fn task_list_archived(
+        &self,
+        _caller: &crate::hub::Caller,
+        request: consort_proto::client_api::TaskListArchived,
+    ) -> Result<consort_proto::client_api::TaskListArchivedResult> {
+        const DEFAULT: u32 = 50;
+        const MAX: u32 = 200;
+        let limit = request.limit.unwrap_or(DEFAULT).clamp(1, MAX);
+        let offset = request.offset.unwrap_or(0);
+        let (mut tasks, has_more) = self
+            .store
+            .read(move |conn| work::archived_tasks(conn, request.channel_id, offset, limit))
+            .await?;
+        let mut tasks_cut = Vec::new();
+        for task in &mut tasks {
+            if crate::limits::preview_task(task) {
+                tasks_cut.push(task.id);
+            }
+        }
+        Ok(consort_proto::client_api::TaskListArchivedResult {
+            tasks,
+            tasks_cut,
+            has_more,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -203,6 +231,7 @@ mod tests {
             worker_id: None,
             review_summary: Some("s".repeat(8 * 1024)),
             resolved_at: (status == TaskStatus::Resolved).then_some(time),
+            session_ended: false,
             archived_at: None,
             created_at: time,
             updated_at: time,

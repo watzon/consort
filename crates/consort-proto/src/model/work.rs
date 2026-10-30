@@ -168,6 +168,11 @@ pub struct Task {
     pub review_summary: Option<String>,
     /// When the user resolved the task.
     pub resolved_at: Option<Timestamp>,
+    /// The current session of the task has ended, so the task cannot take a
+    /// message. A task in Ready for review or Resolved can then only
+    /// retry. A new session sets it back to false. Older hubs leave it out.
+    #[serde(default)]
+    pub session_ended: bool,
     /// When the task was archived. Archive hides a task in any status.
     pub archived_at: Option<Timestamp>,
     /// When the task was created.

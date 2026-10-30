@@ -553,6 +553,12 @@ pub(crate) fn finish_session(
                 .task
                 .as_ref()
                 .is_some_and(|t| matches!(t.status, TaskStatus::Working | TaskStatus::NeedsInput));
+            if current && let Some(task) = ctx.task.as_mut() {
+                // Clients offer Retry for a task in Ready for review or
+                // Resolved only when its session has ended.
+                task.session_ended = true;
+                ctx.task_dirty = true;
+            }
             if current && running {
                 let reason = if lost {
                     "The session was lost. Retry the task."

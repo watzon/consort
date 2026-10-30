@@ -14,6 +14,9 @@ mod app;
 mod assets;
 #[cfg(test)]
 mod chat_tests;
+mod convo;
+#[cfg(test)]
+mod convo_tests;
 mod countdown;
 mod drafts;
 mod edit_keys;
@@ -182,10 +185,13 @@ fn main() {
             // on Windows).
             cx.set_app_identity("dev.consort.desktop", "Consort");
             cx.on_action(|_: &Quit, cx| cx.quit());
+            convo::bind_keys(cx);
             cx.bind_keys([gpui_kit::KeyBinding::new("cmd-q", Quit, None)]);
-            cx.set_menus(vec![
-                Menu::new("Consort").items([MenuItem::action("Quit Consort", Quit)]),
-            ]);
+            cx.set_menus(vec![Menu::new("Consort").items([
+                MenuItem::action("About Consort", convo::ShowAbout),
+                MenuItem::separator(),
+                MenuItem::action("Quit Consort", Quit),
+            ])]);
             cx.on_window_closed(|cx, _| {
                 if cx.windows().is_empty() {
                     cx.quit();

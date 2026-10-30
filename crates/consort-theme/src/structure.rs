@@ -322,6 +322,7 @@ pub struct Components {
     pub update_notice: UpdateNotice,
     pub chat: Chat,
     pub theme_preview: ThemePreview,
+    pub convo: Convo,
 }
 
 /// The sizes of Settings > Hub, Settings > Clients, the Pair a new app
@@ -500,6 +501,66 @@ pub struct Sidebar {
     pub account_pad_bottom: f32,
 }
 
+/// The sizes of phase 4: reactions, the message menu, the emoji picker,
+/// the wide panel of a task item, the search palette, and the New task,
+/// channel settings, New channel, group and About dialogs. From the phase 4
+/// Paper artboards.
+#[derive(Clone, Copy, Debug, Deserialize)]
+pub struct Convo {
+    /// The height of a reaction chip under a bubble, and its padding.
+    pub reaction_chip: f32,
+    pub reaction_pad_x: f32,
+    /// The gap between the chips, and above them.
+    pub reaction_gap: f32,
+    /// A quick emoji button at the top of the message menu.
+    pub quick_emoji: f32,
+    /// The message menu with the quick emoji.
+    pub menu_width: f32,
+    /// The emoji picker behind More, and one cell of its grid.
+    pub emoji_picker_width: f32,
+    pub emoji_cell: f32,
+    pub emoji_picker_height: f32,
+    /// The side panel while it shows a task item in full.
+    pub panel_wide: f32,
+    /// The line numbers of command output, and of each side of a diff.
+    pub line_number_col: f32,
+    /// The search palette.
+    pub search_width: f32,
+    /// A Go to row of the search palette.
+    pub search_row: f32,
+    /// The most height of the result list before it scrolls.
+    pub search_results_max: f32,
+    /// A skeleton row while the hub searches: the dot and the bars.
+    pub skeleton_dot: f32,
+    pub skeleton_bar: f32,
+    pub skeleton_title: f32,
+    pub skeleton_line: f32,
+    /// The channel settings dialog: two columns.
+    pub dialog_settings: f32,
+    pub settings_column_gap: f32,
+    /// The New channel dialog.
+    pub dialog_small: f32,
+    /// The New group and Delete group dialogs.
+    pub dialog_group: f32,
+    /// The About dialog, its mark and its wordmark.
+    pub dialog_about: f32,
+    pub about_mark: f32,
+    /// An icon choice of the New channel dialog and the channel settings.
+    pub icon_choice: f32,
+    /// The least height of the brief box of the New task dialog.
+    pub brief_box: f32,
+    /// The least height of the instructions box of the channel settings.
+    pub instructions_box: f32,
+    /// The accent ring around the root of an open thread.
+    pub root_ring: f32,
+    /// The line that shows where a dragged group goes.
+    pub drag_line: f32,
+    pub reaction_emoji: TypeStyle,
+    pub quick_emoji_text: TypeStyle,
+    pub emoji_cell_text: TypeStyle,
+    pub wordmark: TypeStyle,
+}
+
 /// The sizes of the update notice above the account row in the sidebar.
 /// From the approved Paper artboard "App update in the sidebar, dark".
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -664,6 +725,32 @@ mod tests {
             s.layout.content_top
         );
         assert!(s.layout.content_top - needed < s.space.md);
+    }
+
+    /// The phase 4 sizes come from the Paper artboards: the reaction chips
+    /// and the quick emoji of `9I9-0`, the 560 px item view of `CA5-0`, the
+    /// 640 px search palette of `A0N-0`, and the 880 px channel settings of
+    /// `CYJ-0`. The wide panel is wider than the usual one, and the two
+    /// columns of the settings fit in the dialog.
+    #[test]
+    fn convo_tokens_keep_the_values_of_the_phase_4_designs() {
+        let s = super::structure();
+        let v = s.component.convo;
+        assert_eq!((v.reaction_chip, v.reaction_pad_x), (24.0, 8.0));
+        assert_eq!((v.quick_emoji, v.menu_width), (30.0, 248.0));
+        assert_eq!(v.reaction_emoji.size, 13.0);
+        assert_eq!(v.panel_wide, 560.0);
+        assert!(v.panel_wide > s.layout.panel_width);
+        assert_eq!(v.search_width, 640.0);
+        assert_eq!(v.dialog_settings, 880.0);
+        assert!(v.dialog_settings > 2.0 * s.layout.dialog_width * 0.8);
+        assert_eq!(
+            (v.dialog_small, v.dialog_group, v.dialog_about),
+            (460.0, 400.0, 440.0)
+        );
+        assert_eq!(v.wordmark.weight, 700);
+        // Six quick emoji and More fit in the menu.
+        assert!(6.0 * v.quick_emoji < v.menu_width);
     }
 
     /// The top tint. The user asked for a tint that is much darker from the

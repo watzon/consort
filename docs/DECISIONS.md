@@ -576,3 +576,13 @@ The user was away during the first build, from 2026-10-29. These are the choices
 | 570 | Desktop | The offline pill replaces the "Retrying in N s" line above the composer while saved data shows. Try again calls `reconnect`. The composer says "Messages wait here until the hub is back" in place of "Runs on". | Paper `ERQ-0` has one place for the notice. Two lines would say the same thing. | Yes |
 | 571 | Desktop | Dimmed answers use a tooltip and a notice on click. The guards are in `answer_approval`, `answer_decision` and the connect and sign-in card actions, not only in the buttons. | A dimmed button is still a click target. Every path that sends an answer must stop. | Yes |
 | 572 | Theme | New opacity tokens: `offline_dim` 0.45, `offline_mark` 0.7, `queued` 0.75. | Values from `ERQ-0`. | Yes |
+| 573 | Proto | `Task.session_ended`; `message.search` `kinds` and hit `updated_at`; `task.list_archived`; `FileChange.diff` (worker only) | Retry rule in clients, the search scope, the archived view, the item view | Yes |
+| 574 | Hub | `session_ended` is set when the current session of a task ends and cleared by a new session; no migration | Clients show Retry only when it works | Yes |
+| 575 | Worker | `item.detail` uploads the kept output or diff (16 MiB cap per item, `cache/items/`) | Replaces decision 90's `not_found` | Yes |
+| 576 | Client | Phase 4 views and commands in `convo.rs`, `reduce_convo.rs`, `hub/convo.rs`, `mock_convo.rs` | Shared with mobile later | Yes |
+| 577 | Desktop | Threads on messages in the right panel with the accent ring; reactions with the quick emoji and a picker of our own | Approved designs `95W-0`, `9I9-0` | Yes |
+| 578 | Desktop | Search: local Go to at once, hub results after 220 ms, scope by Tab, results open in place | Approved designs `A0N-0`, `AFG-0` | Yes |
+| 579 | Desktop | New task dialog, item view at 560 px, channel settings with Save changes, simple New channel, group "+" and drag | Approved designs `ARL-0`, `CA5-0`, `CPJ-0`, `CYJ-0`, `EYQ-0`, `FOZ-0`, `FWA-0` | Yes |
+| 580 | Desktop | Task thread in bubbles; About from the settings rail and the app menu | Approved designs `BDH-0`, `DWF-0` | Yes |
+| 581 | Desktop | No voice button: the system dictation types through GPUI's text input; the tooltip names the shortcut | No safe AppKit call starts dictation | Yes |
+| 582 | Client cache | The saved cache keeps the archived tasks (row kind `archived_task`, newest archive first, and `archived_has_more`). The search, the open item and the loaded threads of `ConvoCache` stay out | Archived tasks come from the hub, so the list shows offline. The rest is screen state | Yes |

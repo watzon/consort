@@ -110,6 +110,19 @@ fn count_lines(text: Option<&str>) -> u32 {
         .unwrap_or(0)
 }
 
+/// A unified diff with 3 lines of context, from the old and the new text
+/// of an ACP `diff` block. A new file has no old text, and a removed file no
+/// new text.
+pub(crate) fn unified_diff(path: &str, old: Option<&str>, new: Option<&str>) -> String {
+    let old = old.unwrap_or("");
+    let new = new.unwrap_or("");
+    similar::TextDiff::from_lines(old, new)
+        .unified_diff()
+        .context_radius(3)
+        .header(&format!("a/{path}"), &format!("b/{path}"))
+        .to_string()
+}
+
 /// File changes from a tool call's `diff` content and `locations`.
 fn file_changes(value: &Value, kind: &str) -> Vec<FileChange> {
     let mut changes = Vec::new();
@@ -135,6 +148,7 @@ fn file_changes(value: &Value, kind: &str) -> Vec<FileChange> {
                 from_path: None,
                 lines_added: count_lines(new),
                 lines_removed: count_lines(old),
+                diff: Some(unified_diff(path, old, new)),
             });
         }
     }
@@ -150,6 +164,7 @@ fn file_changes(value: &Value, kind: &str) -> Vec<FileChange> {
                 from_path: None,
                 lines_added: 0,
                 lines_removed: 0,
+                diff: None,
             });
         }
     }

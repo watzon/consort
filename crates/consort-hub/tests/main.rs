@@ -24,6 +24,7 @@ mod heartbeat;
 mod memory_and_blobs;
 mod offline_and_events;
 mod pairing_and_auth;
+mod phase4_tasks;
 mod refused_turns;
 mod reopened_and_decisions;
 mod revoke_and_handshake;

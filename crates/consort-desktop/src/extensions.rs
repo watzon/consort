@@ -178,6 +178,8 @@ impl ExtInputs {
 pub struct ExtState {
     /// The connection open in Settings > Connectors.
     pub connection: Option<String>,
+    /// Reconnect waits for the sign-in schemes of a service.
+    pub reconnect_loading: bool,
     /// The skill open in Settings > Skills.
     pub skill: Option<String>,
     pub connect: ConnectForm,
@@ -665,6 +667,33 @@ impl ConsortApp {
         let Some(connection) = self.state.connection(&connection_id).cloned() else {
             return;
         };
+        // A service that no catalog page loaded has no sign-in schemes yet,
+        // so Reconnect cannot tell a form from a browser sign-in. Load the
+        // service first, then decide.
+        let known = self
+            .state
+            .connector_catalog
+            .services
+            .iter()
+            .any(|s| s.slug == connection.service && !s.auth_schemes.is_empty());
+        if !known && !self.ext.reconnect_loading {
+            self.ext.reconnect_loading = true;
+            let client = self.client.clone();
+            let service = connection.service.clone();
+            cx.spawn_in(window, async move |this, cx| {
+                let loaded = client.run(Command::LoadServiceTools { service }).await;
+                let _ = this.update_in(cx, |this, window, cx| {
+                    this.state = this.client.state();
+                    match loaded {
+                        Ok(()) => this.reconnect(connection_id, window, cx),
+                        Err(err) => this.show_error(err.to_string(), cx),
+                    }
+                    this.ext.reconnect_loading = false;
+                });
+            })
+            .detach();
+            return;
+        }
         let service = service_from(
             &connection.service,
             &connection.service_name,

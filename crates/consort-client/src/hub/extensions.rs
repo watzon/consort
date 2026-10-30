@@ -310,6 +310,18 @@ pub(super) async fn run(
                     },
                 };
                 cache.extensions.service_tools.insert(service, entry);
+                // The detail also holds the service with its sign-in
+                // schemes. Reconnect needs them for a service that no
+                // catalog page has loaded.
+                if let Ok(detail) = &result {
+                    let view = crate::extensions_view::service_view(&detail.service);
+                    let services = &mut cache.extensions.catalog.services;
+                    match services.iter_mut().find(|s| s.slug == view.slug) {
+                        Some(known) if known.auth_schemes.is_empty() => *known = view,
+                        Some(_) => {}
+                        None => services.push(view),
+                    }
+                }
             }
             shared.publish();
         }

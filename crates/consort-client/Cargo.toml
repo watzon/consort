@@ -14,6 +14,7 @@ chrono.workspace = true
 chrono-tz.workspace = true
 croner.workspace = true
 iana-time-zone.workspace = true
+similar.workspace = true
 directories.workspace = true
 ed25519-dalek.workspace = true
 futures-util.workspace = true

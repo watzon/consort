@@ -41,12 +41,13 @@ pub enum PickerTarget {
     /// The assistant (the coordinator) of a channel, by channel ID. A
     /// choice sends `channel.update` at once.
     Assistant(String),
-    /// "Model for the assistant" in the New channel dialog.
-    NewChannelAssistant,
-    /// "Model for tasks" in the New channel dialog.
-    NewChannelTasks,
     /// The model of a "Start a task" routine, in the routine dialog.
     RoutineTask,
+    /// "Model and effort" in the channel settings dialog. A choice changes
+    /// only the form; Save changes sends it.
+    SettingsAssistant,
+    /// "Model and effort" in the New task dialog.
+    NewTask,
 }
 
 /// The part of the picker that the arrow keys move in. The search field
@@ -147,13 +148,13 @@ impl ConsortApp {
                 .channel(id)
                 .and_then(|c| c.coordinator_selection.as_ref())
                 .map(|e| e.selection.clone()),
-            PickerTarget::NewChannelAssistant => self.new_channel.coordinator_selection.clone(),
-            PickerTarget::NewChannelTasks => self.new_channel.task_selection.clone(),
             PickerTarget::RoutineTask => self
                 .knowledge
                 .routine_dialog
                 .as_ref()
                 .and_then(|d| d.form.selection.clone()),
+            PickerTarget::SettingsAssistant => self.convo.settings.selection.clone(),
+            PickerTarget::NewTask => self.convo.new_task.selection.clone(),
         }
     }
 
@@ -167,13 +168,13 @@ impl ConsortApp {
                         .as_ref()
                         .is_some_and(|e| e.source == SelectionSource::Channel)
             }),
-            PickerTarget::NewChannelAssistant => self.new_channel.coordinator_selection.is_some(),
-            PickerTarget::NewChannelTasks => self.new_channel.task_selection.is_some(),
             PickerTarget::RoutineTask => self
                 .knowledge
                 .routine_dialog
                 .as_ref()
                 .is_some_and(|d| d.form.selection.is_some()),
+            PickerTarget::SettingsAssistant => self.convo.settings.selection.is_some(),
+            PickerTarget::NewTask => self.convo.new_task.selection.is_some(),
         }
     }
 
@@ -202,13 +203,13 @@ impl ConsortApp {
                         .await
                 });
             }
-            PickerTarget::NewChannelAssistant => self.new_channel.coordinator_selection = selection,
-            PickerTarget::NewChannelTasks => self.new_channel.task_selection = selection,
             PickerTarget::RoutineTask => {
                 if let Some(dialog) = self.knowledge.routine_dialog.as_mut() {
                     dialog.form.selection = selection;
                 }
             }
+            PickerTarget::SettingsAssistant => self.convo.settings.selection = selection,
+            PickerTarget::NewTask => self.convo.new_task.selection = selection,
         }
         cx.notify();
     }
@@ -601,9 +602,9 @@ impl ConsortApp {
             Some(s) => (s.model_name.clone(), s.account_label.clone()),
             None if style == TriggerStyle::Field => {
                 let tutti = match &target {
-                    PickerTarget::NewChannelTasks => self
+                    PickerTarget::NewTask => self
                         .state
-                        .tutti()
+                        .channel(&self.convo.new_task.channel_id)
                         .and_then(|c| c.task_selection.as_ref())
                         .map(|s| s.model_name.clone()),
                     _ => self
@@ -612,10 +613,11 @@ impl ConsortApp {
                         .and_then(|c| c.coordinator_selection.as_ref())
                         .map(|e| e.selection.model_name.clone()),
                 };
-                (
-                    format!("Same as {}", crate::ui::TUTTI),
-                    tutti.unwrap_or_default(),
-                )
+                let same = match &target {
+                    PickerTarget::NewTask => "Same as the channel".to_owned(),
+                    _ => format!("Same as {}", crate::ui::TUTTI),
+                };
+                (same, tutti.unwrap_or_default())
             }
             None => ("Choose a model".to_owned(), String::new()),
         };
@@ -687,12 +689,13 @@ impl ConsortApp {
     fn dialog_allows(&self, target: &PickerTarget) -> bool {
         match target {
             PickerTarget::Assistant(_) => true,
-            PickerTarget::NewChannelAssistant | PickerTarget::NewChannelTasks => {
-                self.dialog == Some(crate::app::Dialog::NewChannel)
+            PickerTarget::SettingsAssistant => {
+                matches!(self.dialog, Some(crate::app::Dialog::ChannelSettings(_)))
             }
             PickerTarget::RoutineTask => {
                 matches!(self.dialog, Some(crate::app::Dialog::Routine(_)))
             }
+            PickerTarget::NewTask => self.dialog == Some(crate::app::Dialog::NewTask),
         }
     }
 

@@ -48,10 +48,12 @@ These come from the user's experience with GPUI. Follow them in every view.
 1. **Text selection is explicit.** GPUI text is not selectable unless you make it so. Make these selectable: message text (assistant and yours), code blocks, command blocks in approvals, task thread posts, memory notes, error details, IDs and paths that a user may copy. Do not make chrome selectable: sidebar rows, buttons, tabs, labels, timestamps.
 2. **Context menus are planned, not accidental.** Every surface below has a right-click menu. Keep the item names in sentence case and the order fixed.
    - Selected text: Copy, Quote in reply, Ask Consort about this.
-   - A message: Copy text, Copy as Markdown, Reply in thread, Quote in reply. Your own message also has Edit and Delete.
+   - A message: the six quick emoji and More above the items, then Copy text, Copy as Markdown, Reply in thread, Quote in reply. Your own message also has Edit and Delete. A reply in a thread has no Reply in thread.
    - A code or command block: Copy code.
-   - A task card or task row: Open thread, Resolve (Ready for review only) or Not done (resolved only), Retry (failed only), Stop (working only), Archive (failed or resolved only), Copy task ID.
-   - A channel row: Rename, Instructions, Model, Worker tags, Connectors and skills, Change icon, Move to group, Archive, Delete.
+   - A task card or task row: Open thread, Resolve (Ready for review only) or Not done (resolved only), Retry (failed, or Ready for review or Resolved whose session ended), Stop (working only), Archive (failed or resolved only), Copy task ID, Delete.
+   - A channel row: Rename, Instructions, Model, Worker tags, Connectors and skills, Change icon, Move to group, Archive, Delete. Rename, Instructions, Model and Worker tags open the channel settings dialog.
+   - The "+" of the Tutti row (a left click): New channel, New group.
+   - A group row (its "..." button, a left click): New channel, Rename, Delete group.
    - A connection row (Settings > Connectors): Reconnect, Activity, Copy handle, Disconnect.
    - A skill row (Settings > Skills): Turn off (Turn on when it is off), View files, Remove.
    - A skill source row (Settings > Skills): Remove. Only a source that the user added has it.

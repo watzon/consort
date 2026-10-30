@@ -48,7 +48,7 @@ fn os(os: model::Os) -> Os {
     }
 }
 
-fn approval_mode(mode: model::ApprovalMode) -> ApprovalMode {
+pub(crate) fn approval_mode(mode: model::ApprovalMode) -> ApprovalMode {
     match mode {
         model::ApprovalMode::Ask => ApprovalMode::Ask,
         model::ApprovalMode::AutoEdits => ApprovalMode::AutoEdits,
@@ -723,7 +723,7 @@ pub fn memory_saved(body: &str) -> Option<crate::view::MemorySavedView> {
     })
 }
 
-fn speaker(m: &model::Message) -> Speaker {
+pub(crate) fn speaker(m: &model::Message) -> Speaker {
     match m.author {
         Author::User => Speaker::You,
         Author::Assistant if m.author_task_id.is_some() => Speaker::Task,
@@ -736,7 +736,7 @@ fn speaker(m: &model::Message) -> Speaker {
 /// The name of a channel as the user sees it. The main channel shows as
 /// Tutti whatever the hub calls it: the hub and the wire still say
 /// Tutti until the rename pass.
-fn shown_name(c: &model::Channel) -> String {
+pub(crate) fn shown_name(c: &model::Channel) -> String {
     if c.kind == PK::Tutti {
         crate::view::TUTTI.to_owned()
     } else {
@@ -792,7 +792,7 @@ fn channel_activities(cache: &Cache, state: &ViewState) -> Vec<crate::activity::
 }
 
 /// The artifact task of each blob in the channel files, by hash.
-fn artifact_tasks(cache: &Cache) -> BTreeMap<String, crate::files::ArtifactTask> {
+pub(crate) fn artifact_tasks(cache: &Cache) -> BTreeMap<String, crate::files::ArtifactTask> {
     cache
         .channel_files
         .values()
@@ -815,7 +815,7 @@ fn artifact_tasks(cache: &Cache) -> BTreeMap<String, crate::files::ArtifactTask>
 }
 
 /// The views of the blobs that a message names.
-fn attachment_views(
+pub(crate) fn attachment_views(
     blobs: &[model::BlobRef],
     artifacts: &BTreeMap<String, crate::files::ArtifactTask>,
     cache: &Cache,
@@ -1044,7 +1044,7 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                     own,
                     tutti_selection.clone(),
                 ),
-                repos: Vec::new(),
+                repos: crate::reduce_convo::channel_repos(cache, c),
                 preferred_workers: c.preferred_workers.iter().map(|w| w.to_string()).collect(),
                 task_selection: c.task_selection.as_ref().map(|s| selection_view(cache, s)),
                 default_isolation: isolation(c.default_isolation),
@@ -1055,6 +1055,9 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                     .map(|id| id.to_string())
                     .collect(),
                 disabled_skills: c.disabled_skills.iter().map(|id| id.to_string()).collect(),
+                default_approval_mode: approval_mode(c.default_approval_mode),
+                allowed_local_mcp_servers: c.allowed_local_mcp_servers.clone(),
+                memory_enabled: c.memory_enabled,
             }
         })
         .collect();
@@ -1114,6 +1117,7 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                 updated_at: t.updated_at.as_millis(),
                 card_message_id: t.card_message_id.to_string(),
                 approval_mode: approval_mode(t.approval_mode),
+                session_ended: t.session_ended,
             }
         })
         .collect();
@@ -1305,6 +1309,8 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                     reply_count: m.reply_count,
                     pending: false,
                     attachments: attachment_views(&m.attachments, &artifacts, cache),
+                    reactions: crate::convo::reaction_views(&m.reactions),
+                    last_reply_label: crate::reduce_convo::last_reply(m, now),
                 }));
             }
         }
@@ -1415,21 +1421,26 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
         if let Some(session) = task.current_session_id {
             let (mut commands, mut files) = (0, std::collections::BTreeSet::new());
             let mut lines = Vec::new();
-            for item in cache
+            for (item_id, item) in cache
                 .session_items
                 .get(&session.to_string())
                 .into_iter()
-                .flat_map(|items| items.values())
+                .flat_map(|items| items.iter())
             {
+                let line = |text: String| ActivityLine {
+                    text,
+                    session_id: session.to_string(),
+                    item_id: item_id.clone(),
+                };
                 match item {
                     ItemSummary::Command(command) => {
                         commands += 1;
-                        lines.push(command.clone());
+                        lines.push(line(command.clone()));
                     }
                     ItemSummary::Files(paths) => {
                         for path in paths {
                             files.insert(path.clone());
-                            lines.push(format!("Changed {path}"));
+                            lines.push(line(format!("Changed {path}")));
                         }
                     }
                 }
@@ -1562,6 +1573,11 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                 os: os(w.os),
                 online,
                 paused: w.paused,
+                local_mcp_servers: w
+                    .inventory
+                    .iter()
+                    .flat_map(|i| i.local_mcp_servers.iter().map(|s| s.name.clone()))
+                    .collect(),
                 sidebar_detail: if online {
                     os_label.to_owned()
                 } else {
@@ -1756,8 +1772,10 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
         memory_notes: memory_note_views(cache),
         memory_loaded: cache.memory_loaded.iter().cloned().collect(),
         memory_deleted_loaded: cache.memory_deleted_loaded.iter().cloned().collect(),
+        convo: crate::convo::ConvoView::default(),
     };
     state.activity = channel_activities(cache, &state);
+    state.convo = crate::reduce_convo::convo_view(cache, &state, now);
     // Collapsed groups and unread counts come from the hub, so seed the
     // sidebar before the shared rules rebuild it.
     state.sidebar.groups = groups
@@ -2145,6 +2163,7 @@ mod tests {
                 worker_id: None,
                 review_summary: None,
                 resolved_at: None,
+                session_ended: false,
                 archived_at: None,
                 created_at: Timestamp::from_millis(NOW - 40_000),
                 updated_at: Timestamp::from_millis(NOW - 120_000),
@@ -2931,7 +2950,11 @@ mod tests {
             panic!("no activity line");
         };
         assert_eq!(summary, "Ran 1 command");
-        assert_eq!(items, &vec!["cargo test".to_owned()]);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].text, "cargo test");
+        // The line opens the item in full.
+        assert_eq!(items[0].session_id, session.to_string());
+        assert!(!items[0].item_id.is_empty());
     }
 
     /// Finding 14: the detail block names the real action, whatever the

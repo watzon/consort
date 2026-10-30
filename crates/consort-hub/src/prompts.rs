@@ -289,6 +289,7 @@ mod tests {
             worker_id: None,
             review_summary: None,
             resolved_at: None,
+            session_ended: false,
             archived_at: None,
             created_at: Timestamp::EPOCH,
             updated_at: Timestamp::EPOCH,

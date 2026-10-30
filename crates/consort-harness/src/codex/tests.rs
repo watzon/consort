@@ -110,6 +110,12 @@ fn commands_output_and_file_changes() {
                 (f.changes[2].change, f.changes[2].lines_added),
                 (FileChangeKind::Add, 2)
             );
+            // The diff goes to the worker; an empty diff is none.
+            assert_eq!(
+                f.changes[0].diff.as_deref(),
+                Some("@@ -1 +1,2 @@\n-a\n+b\n+c\n")
+            );
+            assert_eq!(f.changes[1].diff, None);
         }
         other => panic!("{other:?}"),
     }
