@@ -21,6 +21,8 @@ pub mod dialogs;
 pub mod ext_parts;
 pub mod hub_blocked;
 pub mod hub_cards;
+pub mod icon_catalog;
+pub mod icon_picker;
 pub mod icons;
 pub mod links;
 pub mod mark;

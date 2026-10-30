@@ -328,6 +328,31 @@ pub fn faded_scroll(
     t: &Tokens,
     cx: &mut Context<ConsortApp>,
 ) -> Div {
+    faded_scroll_rows(
+        id,
+        handle,
+        height,
+        vec![content.into_any_element()],
+        ground,
+        clear,
+        t,
+        cx,
+    )
+}
+
+/// [`faded_scroll`] with each row as its own child of the scroll, so
+/// `ScrollHandle::scroll_to_item` can bring one row into view.
+#[allow(clippy::too_many_arguments)]
+pub fn faded_scroll_rows(
+    id: &'static str,
+    handle: &ScrollHandle,
+    height: Pixels,
+    rows: Vec<gpui_kit::AnyElement>,
+    ground: Hsla,
+    clear: Hsla,
+    t: &Tokens,
+    cx: &mut Context<ConsortApp>,
+) -> Div {
     let offset = handle.offset();
     let max = handle.max_offset();
     let above = offset.y < -Pixels::from(0.5);
@@ -346,7 +371,7 @@ pub fn faded_scroll(
                 .track_scroll(handle)
                 // The fades follow the scroll position.
                 .on_scroll(cx.listener(|_, _, _, cx| cx.notify()))
-                .child(content),
+                .children(rows),
         )
         // The list knows its height only after its first layout. When that
         // shows more rows below than this draw assumed, draw again, so the

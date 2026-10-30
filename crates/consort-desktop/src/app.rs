@@ -2258,6 +2258,7 @@ impl ConsortApp {
         self.dialog_error = None;
         self.picker = None;
         self.effort_menu = None;
+        self.convo.icon_picker = None;
         self.focus.focus(window, cx);
         cx.notify();
     }
@@ -2695,25 +2696,7 @@ impl ConsortApp {
                 self.open_dialog(Dialog::ChannelSettings(id), window, cx)
             }
             MenuAction::ChangeIcon(id) => {
-                if let Some(anchor) = self.last_menu_anchor() {
-                    let current = self
-                        .state
-                        .channel(&id)
-                        .map(|c| c.icon.clone())
-                        .unwrap_or_default();
-                    let items = CHANNEL_ICONS
-                        .iter()
-                        .map(|(icon, label)| {
-                            MenuItem::new(
-                                *label,
-                                MenuAction::SetIcon(id.clone(), (*icon).to_owned()),
-                            )
-                            .icon(icon)
-                            .checked(current == *icon)
-                        })
-                        .collect();
-                    self.open_menu(OpenMenu { items, ..anchor }, cx);
-                }
+                self.open_icon_picker(crate::convo::IconTarget::Channel(id), window, cx)
             }
             MenuAction::SetIcon(id, icon) => self.spawn_command(cx, async move {
                 client
@@ -2928,6 +2911,12 @@ impl ConsortApp {
             cx.stop_propagation();
             return;
         }
+        // The All icons dialog is on top of everything, so its keys come
+        // first: Escape closes only it.
+        if self.icon_picker_key(key, window, cx) {
+            cx.stop_propagation();
+            return;
+        }
         if let Some(menu) = self.menu.as_mut() {
             match key {
                 "escape" => self.menu = None,
@@ -3010,19 +2999,6 @@ pub enum Field {
 fn focus_input(input: &Entity<InputState>, window: &mut Window, cx: &mut Context<ConsortApp>) {
     input.update(cx, |input, cx| input.focus(window, cx));
 }
-
-/// The icons that a channel can have, with their names in the menu.
-pub const CHANNEL_ICONS: [(&str, &str); 9] = [
-    ("hash", "Hash"),
-    ("mic", "Microphone"),
-    ("shield", "Shield"),
-    ("hard-drive", "Drive"),
-    ("server", "Server"),
-    ("lightbulb", "Light bulb"),
-    ("book-open", "Book"),
-    ("cloud", "Cloud"),
-    ("terminal", "Terminal"),
-];
 
 /// The menu of "Move to group": every group, then No group and New group.
 /// A hub with no group still gets a menu with two items.
@@ -3164,6 +3140,8 @@ impl Render for ConsortApp {
                     .when_some(self.dialog.clone(), |layer, dialog| {
                         layer.child(self.render_dialog(&dialog, &t, window, cx))
                     })
+                    // All icons opens over the dialog that opened it.
+                    .children(self.render_icon_picker(&t, window, cx))
                     .when(self.lightbox.is_some(), |layer| {
                         layer.child(self.render_lightbox(&t, window, cx))
                     })

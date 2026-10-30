@@ -11,16 +11,17 @@ use consort_client::{
 };
 use consort_theme::{Tokens, TypeExt as _};
 use gpui_kit::{
-    AnyElement, Context, Div, Focusable as _, InteractiveElement, IntoElement, ParentElement,
-    Pixels, SharedString, StatefulInteractiveElement as _, Styled, Window, div,
+    AnyElement, AppContext as _, Context, Div, Focusable as _, InteractiveElement, IntoElement,
+    ParentElement, Pixels, SharedString, StatefulInteractiveElement as _, Styled, Window, div,
     prelude::FluentBuilder as _,
 };
 
 use crate::{
     app::{ConsortApp, Dialog, Field},
-    convo::{ConvoAction, NEW_CHANNEL_ICONS},
+    convo::ConvoAction,
     ui::{
         dialogs::{field_block, input_box},
+        icon_picker::icon_tile,
         menu::{MenuAction, MenuItem, OpenMenu},
         model_picker::{PickerTarget, TriggerStyle},
         parts::{ButtonKind, button, detail, focusable, icon, line, tag_chip, text},
@@ -102,90 +103,58 @@ fn section(title: &str, t: &Tokens) -> Div {
     text(title.to_owned(), t.text.title, t.colors.text_primary)
 }
 
-/// The icon choices of the New channel dialog and the channel settings: the
-/// seven of the design, and More with every icon.
-fn icon_choices(
-    current: &str,
-    triggers: &crate::ui::menu::TriggerBounds,
-    t: &Tokens,
-    cx: &mut Context<ConsortApp>,
-) -> Div {
+/// The icon choices of the New channel dialog: the seven quick icons (an
+/// icon picked in All icons takes the last place) and All icons, which
+/// opens every icon with a search (Paper `IAN-0`).
+fn icon_choices(current: &str, t: &Tokens, cx: &mut Context<ConsortApp>) -> Div {
     let c = &t.colors;
     let v = t.component.convo;
+    let current = crate::ui::icons::resolve(current).to_owned();
     let mut row = div().flex().items_center().gap(t.space.xs + t.space.xxs);
-    for name in NEW_CHANNEL_ICONS {
-        let active = current == name;
+    for name in crate::convo::quick_icons(&current) {
+        let label = crate::ui::icon_catalog::label(name);
         row = row.child(
-            focusable(
-                div().id(SharedString::from(format!("icon-choice-{name}"))),
+            icon_tile(
+                SharedString::from(format!("icon-choice-{name}")),
+                name,
+                v.icon_choice,
+                t.icon.size,
+                current == name,
+                false,
                 t,
+                cx,
             )
-            .flex()
-            .flex_none()
-            .items_center()
-            .justify_center()
-            .size(v.icon_choice)
-            .rounded(t.radius.md)
-            .border(t.border_width)
-            .border_color(if active {
-                c.text_secondary
-            } else {
-                c.border_subtle
+            .debug_selector(move || format!("icon-choice-{name}"))
+            .tooltip(move |_, cx| {
+                cx.new(|_| crate::ui::convo_sidebar::Tip(label.clone().into()))
+                    .into()
             })
-            .when(active, |d| d.bg(c.surface_selected))
-            .cursor_pointer()
-            .hover(|s| s.bg(c.hover_raised))
-            .child(icon(name, t.icon.size, c.text_secondary))
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.run_convo(ConvoAction::PickIcon(name.to_owned()), window, cx)
             })),
         );
     }
-    let custom = !NEW_CHANNEL_ICONS.contains(&current);
     row.child(
         focusable(div().id("icon-choice-more"), t)
-            .relative()
+            .debug_selector(|| "icon-choice-more".into())
             .flex()
             .flex_1()
             .items_center()
             .justify_center()
-            .gap(t.space.xs)
             .h(v.icon_choice)
             .rounded(t.radius.md)
             .border(t.border_width)
             .border_dashed()
-            .border_color(if custom {
-                c.text_secondary
-            } else {
-                c.border_strong
-            })
+            .border_color(c.border_strong)
             .cursor_pointer()
             .hover(|s| s.bg(c.hover_raised))
-            .child(triggers.track("icon-choice-more"))
-            .when(custom && !current.is_empty(), |d| {
-                d.child(icon(current, t.icon.size, c.text_secondary))
-            })
-            .child(text("More", t.text.ui_strong, c.text_secondary))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                if let Some(bounds) = this.triggers.get("icon-choice-more") {
-                    let current = if this.dialog == Some(Dialog::NewChannel) {
-                        this.convo.new_channel_icon.clone()
-                    } else {
-                        this.convo.settings.icon.clone()
-                    };
-                    let items = crate::app::CHANNEL_ICONS
-                        .iter()
-                        .map(|(name, label)| {
-                            MenuItem::new(
-                                *label,
-                                MenuAction::Convo(ConvoAction::PickIcon((*name).to_owned())),
-                            )
-                            .icon(name)
-                            .checked(current == *name)
-                        })
-                        .collect();
-                    this.open_menu(OpenMenu::under(bounds, items, false), cx);
-                }
+            .child(text("All icons", t.text.ui_strong, c.text_secondary))
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.run_convo(
+                    ConvoAction::OpenIconPicker(crate::convo::IconTarget::NewChannel),
+                    window,
+                    cx,
+                )
             })),
     )
 }
@@ -241,7 +210,7 @@ impl ConsortApp {
                     .flex_col()
                     .gap(t.space.xs + t.space.xxs)
                     .child(text("Icon", t.text.label, c.text_secondary))
-                    .child(icon_choices(&icon_now, &self.triggers.clone(), t, cx)),
+                    .child(icon_choices(&icon_now, t, cx)),
             )
             .child(field_block(
                 "Name",
@@ -942,6 +911,7 @@ impl ConsortApp {
 
         // General.
         let icon_button = focusable(div().id("settings-icon"), t)
+            .debug_selector(|| "settings-icon".into())
             .relative()
             .flex()
             .flex_none()
@@ -954,32 +924,13 @@ impl ConsortApp {
             .border_color(c.border_strong)
             .cursor_pointer()
             .hover(|s| s.bg(c.hover_card))
-            .child(self.triggers.track("settings-icon"))
             .child(icon(&form.icon, t.icon.size, c.text_secondary))
-            .on_click(cx.listener(|this, _, _, cx| {
-                if let Some(bounds) = this.triggers.get("settings-icon") {
-                    let current = this.convo.settings.icon.clone();
-                    let items = crate::app::CHANNEL_ICONS
-                        .iter()
-                        .map(|(n, label)| (*n, *label))
-                        .chain(NEW_CHANNEL_ICONS.iter().map(|n| (*n, *n)))
-                        .map(|(n, label)| {
-                            let label = label.replace('-', " ");
-                            let mut chars = label.chars();
-                            let label = chars
-                                .next()
-                                .map(|f| f.to_uppercase().collect::<String>() + chars.as_str())
-                                .unwrap_or_default();
-                            MenuItem::new(
-                                label,
-                                MenuAction::Convo(ConvoAction::PickIcon(n.to_owned())),
-                            )
-                            .icon(n)
-                            .checked(current == n)
-                        })
-                        .collect();
-                    this.open_menu(OpenMenu::under(bounds, items, false), cx);
-                }
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.run_convo(
+                    ConvoAction::OpenIconPicker(crate::convo::IconTarget::ChannelSettings),
+                    window,
+                    cx,
+                )
             }));
         let instructions = div()
             .min_h(v.instructions_box)

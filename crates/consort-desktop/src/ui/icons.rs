@@ -51,9 +51,19 @@ pub fn resolve(name: &str) -> &str {
     }
 }
 
-/// The asset path of an icon in one of its three versions (0, 1 or 2).
+/// The icons that have only one version. `bot` is not hand drawn, so it
+/// does not shimmer.
+const ONE_VERSION: [&str; 1] = ["bot"];
+
+/// The asset path of an icon in one of its three versions (0, 1 or 2). An
+/// icon with one version gives that version for every number.
 pub fn path(name: &str, version: usize) -> SharedString {
     let name = resolve(name);
+    let version = if ONE_VERSION.contains(&name) {
+        0
+    } else {
+        version
+    };
     match version % 3 {
         0 => format!("icons/{name}.svg"),
         v => format!("icons/v{v}/{name}.svg"),
@@ -130,6 +140,21 @@ mod tests {
                 assert!(assets.load(&p).ok().flatten().is_some(), "{name} -> {p}");
             }
         }
+    }
+
+    /// The All icons dialog shimmers every icon of the set on hover, so
+    /// every icon must load in all three versions. `bot` has one drawing,
+    /// which every version gives.
+    #[test]
+    fn every_icon_of_the_catalog_loads_in_every_version() {
+        let assets = crate::assets::Assets;
+        for name in crate::ui::icon_catalog::flatten(&crate::ui::icon_catalog::search("")) {
+            for v in 0..3 {
+                let p = path(name, v);
+                assert!(assets.load(&p).ok().flatten().is_some(), "{name} -> {p}");
+            }
+        }
+        assert_eq!(path("bot", 2), "icons/bot.svg");
     }
 
     #[test]

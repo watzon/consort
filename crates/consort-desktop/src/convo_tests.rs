@@ -16,7 +16,10 @@ use consort_client::{
 use gpui::{AnyWindowHandle, TestAppContext, VisualTestContext};
 use gpui_kit::{AppContext as _, Entity, WindowOptions, point, px, size};
 
-fn open(state: ViewState, cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<ConsortApp>) {
+pub(crate) fn open(
+    state: ViewState,
+    cx: &mut TestAppContext,
+) -> (AnyWindowHandle, Entity<ConsortApp>) {
     cx.executor().allow_parking();
     cx.update(|cx| {
         gpui_kit::init(cx);
@@ -45,13 +48,13 @@ fn open(state: ViewState, cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<C
     (handle, app)
 }
 
-fn draw(cx: &mut VisualTestContext) {
+pub(crate) fn draw(cx: &mut VisualTestContext) {
     cx.update(|window, _| window.refresh());
     cx.run_until_parked();
 }
 
 /// Waits until `ready` holds for the app, for at most 5 seconds.
-fn until(
+pub(crate) fn until(
     cx: &mut VisualTestContext,
     app: &Entity<ConsortApp>,
     what: &str,
@@ -72,7 +75,7 @@ fn until(
     }
 }
 
-fn mock() -> ViewState {
+pub(crate) fn mock() -> ViewState {
     consort_client::mock::view_state()
 }
 

@@ -51,7 +51,7 @@ These come from the user's experience with GPUI. Follow them in every view.
    - A message: the six quick emoji and More above the items, then Copy text, Copy as Markdown, Reply in thread, Quote in reply. Your own message also has Edit and Delete. A reply in a thread has no Reply in thread.
    - A code or command block: Copy code.
    - A task card or task row: Open thread, Resolve (Ready for review only) or Not done (resolved only), Retry (failed, or Ready for review or Resolved whose session ended), Stop (working only), Archive (failed or resolved only), Copy task ID, Delete.
-   - A channel row: Rename, Instructions, Model, Worker tags, Connectors and skills, Change icon, Move to group, Archive, Delete. Rename, Instructions, Model and Worker tags open the channel settings dialog.
+   - A channel row: Rename, Instructions, Model, Worker tags, Connectors and skills, Change icon, Move to group, Archive, Delete. Rename, Instructions, Model and Worker tags open the channel settings dialog. Change icon opens the All icons dialog.
    - The "+" of the Tutti row (a left click): New channel, New group.
    - A group row (its "..." button, a left click): New channel, Rename, Delete group.
    - A connection row (Settings > Connectors): Reconnect, Activity, Copy handle, Disconnect.

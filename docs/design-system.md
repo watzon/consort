@@ -139,6 +139,12 @@ Needs input and Ready for review both use the accent, because both are your turn
 
 Up next and Resolved keep Consort's own glyphs, because the icon set has nothing like them. A live status (Working or Needs input) shimmers through the three versions of its icon at 8 frames a second. It stands still under Reduce motion.
 
+### Channel icons
+
+A channel can have any icon of the set. The New channel dialog shows seven quick icons (`code`, `globe`, `server`, `home`, `memory`, `appearance`, `star`) and All icons. All icons opens a dialog over it with a search and every icon in six categories (`ui/icon_catalog.rs`). A word finds an icon when it starts a word of its name or of a keyword; the keywords include the old Lucide names, so "cloud" finds `globe`. An icon picked in All icons takes the place of the last quick icon. The channel settings and Change icon in a channel's menu open the same dialog.
+
+An icon tile has four states. At rest: no ground. Hover (the active state): `tint_accent` ground, the icon in `text.primary`, and the shimmer through its three versions. Picked: `surface.selected` ground with a `text.secondary` border; it does not shimmer, so the accent stays the color of hover and focus. Keyboard: the focus ring. Designs: `docs/notes/design-icon-picker.md`.
+
 A worker that is online shows a solid dot in `status.done`. A worker that is offline shows an open ring in `text.tertiary`.
 
 ### Where status and requests appear

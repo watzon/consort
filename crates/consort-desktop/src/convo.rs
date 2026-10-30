@@ -37,17 +37,54 @@ pub fn bind_keys(cx: &mut gpui_kit::App) {
     ]);
 }
 
-/// The icons of the New channel dialog, in the order of the design
-/// (`EYQ-0`): globe, notebook, server, laptop, palette, metronome, bell.
+/// The quick icons of the New channel dialog and the channel settings, in
+/// the order of the design (`docs/notes/design-icon-picker.md`): software,
+/// the web, a homelab, a house, notes and reading, design, and anything
+/// else. An icon picked in All icons takes the last place.
 pub const NEW_CHANNEL_ICONS: [&str; 7] = [
+    "code",
     "globe",
-    "memory",
     "server",
-    "worker",
+    "home",
+    "memory",
     "appearance",
-    "routine",
-    "bell",
+    "star",
 ];
+
+/// The quick row for the icon that is picked now: the seven quick icons,
+/// with a picked icon that is not one of them in the last place.
+pub fn quick_icons(current: &str) -> [&'static str; 7] {
+    let mut row = NEW_CHANNEL_ICONS;
+    let current = crate::ui::icons::resolve(current);
+    if !row.contains(&current)
+        && let Some(name) = crate::ui::icon_catalog::flatten(&crate::ui::icon_catalog::search(""))
+            .into_iter()
+            .find(|n| *n == current)
+    {
+        row[6] = name;
+    }
+    row
+}
+
+/// What an icon from the All icons dialog is for.
+#[derive(Clone, Debug, PartialEq)]
+pub enum IconTarget {
+    /// The open New channel dialog.
+    NewChannel,
+    /// The open channel settings dialog. Save changes keeps it.
+    ChannelSettings,
+    /// A channel, from Change icon in its menu. The pick saves at once.
+    Channel(String),
+}
+
+/// The open All icons dialog.
+#[derive(Clone, Debug, PartialEq)]
+pub struct IconPicker {
+    pub target: IconTarget,
+    /// The icon that the arrow keys moved to, as an index into the
+    /// results. `None` while the search field has the focus.
+    pub focus: Option<usize>,
+}
 
 /// How long the search waits after a key press before it asks the hub.
 const SEARCH_DELAY: std::time::Duration = std::time::Duration::from_millis(220);
@@ -70,8 +107,11 @@ pub enum ConvoAction {
     DeleteGroup(String),
     DeleteTask(String),
     RestoreTask(String),
-    /// An icon for the New channel dialog or the channel settings.
+    /// An icon for the New channel dialog or the channel settings, or for
+    /// the target of the open All icons dialog.
     PickIcon(String),
+    /// Open the All icons dialog.
+    OpenIconPicker(IconTarget),
     /// The channel of the New task dialog.
     TaskChannel(String),
     /// "One worker" in the New task dialog.
@@ -165,6 +205,10 @@ pub struct ConvoState {
     pub settings: SettingsForm,
     /// The open emoji picker: the message and where it opens.
     pub emoji_picker: Option<(String, MenuAnchor)>,
+    /// The All icons dialog, over the dialog that opened it.
+    pub icon_picker: Option<IconPicker>,
+    /// The scroll of the All icons list.
+    pub icon_scroll: gpui_kit::ScrollHandle,
     pub search_scope: SearchScope,
     /// Counts the key presses in the search, so only the last one asks.
     pub search_serial: u64,
@@ -194,6 +238,7 @@ pub struct ConvoInputs {
     pub settings_instructions: Entity<TextareaState>,
     pub repo_url: Entity<InputState>,
     pub thread_reply: Entity<TextareaState>,
+    pub icon_search: Entity<InputState>,
 }
 
 impl ConvoInputs {
@@ -230,6 +275,7 @@ impl ConvoInputs {
                     .submit_on_enter(true)
                     .placeholder("Reply in thread")
             }),
+            icon_search: field("Search icons", window, cx),
         };
         let mut subscriptions = Vec::new();
         subscriptions.push(cx.subscribe_in(
@@ -239,6 +285,28 @@ impl ConvoInputs {
                 if let InputEvent::PressEnter { shift: false, .. } = event {
                     this.send_thread_reply(window, cx);
                 }
+            },
+        ));
+        subscriptions.push(cx.subscribe_in(
+            &inputs.icon_search,
+            window,
+            |this, _, event: &InputEvent, window, cx| match event {
+                // A new word starts at the top of the results.
+                InputEvent::Change => {
+                    if let Some(picker) = this.convo.icon_picker.as_mut() {
+                        picker.focus = None;
+                    }
+                    cx.notify();
+                }
+                // Enter picks the first result.
+                InputEvent::PressEnter { .. } => {
+                    let query = this.convo_inputs.icon_search.read(cx).value().to_string();
+                    let results = crate::ui::icon_catalog::search(&query);
+                    if let Some(name) = crate::ui::icon_catalog::flatten(&results).first() {
+                        this.run_convo(ConvoAction::PickIcon((*name).to_owned()), window, cx);
+                    }
+                }
+                _ => {}
             },
         ));
         subscriptions.push(cx.subscribe_in(
@@ -282,6 +350,7 @@ impl ConvoInputs {
             &self.settings_name,
             &self.settings_purpose,
             &self.repo_url,
+            &self.icon_search,
         ] {
             let style = style.clone();
             field.update(cx, |s, cx| {
@@ -365,12 +434,23 @@ impl ConsortApp {
                     .await
             }),
             ConvoAction::PickIcon(icon) => {
-                if self.dialog == Some(Dialog::NewChannel) {
-                    self.convo.new_channel_icon = icon;
-                } else {
-                    self.convo.settings.icon = icon;
+                let target = match self.convo.icon_picker.take() {
+                    Some(picker) => {
+                        self.after_icon_picker(window, cx);
+                        picker.target
+                    }
+                    None if self.dialog == Some(Dialog::NewChannel) => IconTarget::NewChannel,
+                    None => IconTarget::ChannelSettings,
+                };
+                match target {
+                    IconTarget::NewChannel => self.convo.new_channel_icon = icon,
+                    IconTarget::ChannelSettings => self.convo.settings.icon = icon,
+                    IconTarget::Channel(id) => {
+                        self.run_menu(crate::ui::menu::MenuAction::SetIcon(id, icon), window, cx)
+                    }
                 }
             }
+            ConvoAction::OpenIconPicker(target) => self.open_icon_picker(target, window, cx),
             ConvoAction::TaskChannel(id) => self.set_task_channel(id),
             ConvoAction::TaskWorker(id) => self.convo.new_task.runs_on = RunsOn::Worker(id),
             ConvoAction::TaskRepo(repo) => self.convo.new_task.repo_id = repo,
@@ -1117,6 +1197,24 @@ impl ConsortApp {
                     "spanish"
                 };
                 self.set_field(Field::Name, name, window, cx);
+            }
+            // Paper IIJ-0 and IQF-0: All icons over New channel, and with
+            // the search "arrow".
+            "icon-picker" | "icon-picker-search" => {
+                self.run_convo(ConvoAction::NewChannel(None), window, cx);
+                self.convo.new_channel_icon = "memory".into();
+                self.set_field(Field::Name, "reading", window, cx);
+                self.open_icon_picker(IconTarget::NewChannel, window, cx);
+                if screen == "icon-picker-search" {
+                    let search = self.convo_inputs.icon_search.clone();
+                    search.update(cx, |input, cx| input.set_value("arrow", window, cx));
+                }
+            }
+            // Paper IAN-0: New channel after a pick in All icons.
+            "icon-picked" => {
+                self.run_convo(ConvoAction::NewChannel(None), window, cx);
+                self.convo.new_channel_icon = "connector".into();
+                self.set_field(Field::Name, "reading", window, cx);
             }
             "new-group" => {
                 self.open_dialog(Dialog::NewGroup(None), window, cx);

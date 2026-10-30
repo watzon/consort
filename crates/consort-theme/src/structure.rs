@@ -644,6 +644,14 @@ pub struct Convo {
     pub about_mark: f32,
     /// An icon choice of the New channel dialog and the channel settings.
     pub icon_choice: f32,
+    /// The All icons dialog (Paper `IIJ-0`): its width, a tile of its list
+    /// and the icon in it, the gap between tiles, and the height of the
+    /// list that scrolls.
+    pub icon_picker_width: f32,
+    pub icon_tile: f32,
+    pub icon_tile_icon: f32,
+    pub icon_tile_gap: f32,
+    pub icon_list_height: f32,
     /// The least height of the brief box of the New task dialog.
     pub brief_box: f32,
     /// The least height of the instructions box of the channel settings.

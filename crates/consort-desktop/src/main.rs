@@ -27,6 +27,8 @@ mod extensions;
 mod files_tests;
 mod fonts;
 #[cfg(test)]
+mod icon_picker_tests;
+#[cfg(test)]
 mod keys_tests;
 mod knowledge;
 #[cfg(test)]
@@ -65,7 +67,8 @@ actions!(consort, [Quit]);
 /// mark-working, mark-needs-you, mark-done. Phase 1: top-tint,
 /// attachments, drop, bubbles, lightbox, files, files-menu, files-drop,
 /// files-empty, thread-attach and add-skill-upload. Phase 3: hub, clients,
-/// clients-revoke, pair-client and notifications. Phase 5: add-worker,
+/// clients-revoke, pair-client and notifications. The icon picker: icon-picker,
+/// icon-picker-search and icon-picked. Phase 5: add-worker,
 /// add-worker-install, worker-added, update-ready and hub-offline. The old names `everything` and
 /// files-empty, thread-attach and add-skill-upload. Phase 2: routines,
 /// routine-runs, routine-new, routine-edit, schedule-picker,
