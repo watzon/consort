@@ -222,6 +222,11 @@ pub struct FileChange {
     /// Lines removed.
     #[serde(default)]
     pub lines_removed: u32,
+    /// The unified diff, when the harness gave one. Only the harness adapter
+    /// and the worker see it: the worker keeps it for `item.detail` and
+    /// takes it out before the item goes to the hub.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff: Option<String>,
 }
 
 /// The payload of a `file_change` item.
@@ -434,6 +439,7 @@ mod tests {
                     from_path: Some("src/b.rs".into()),
                     lines_added: 3,
                     lines_removed: 1,
+                    diff: None,
                 }],
             }),
             ItemPayload::ToolCall(ToolCallPayload {

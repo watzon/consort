@@ -12,7 +12,7 @@ use gpui_kit::{
 };
 
 use crate::{
-    app::{ConsortApp, Dialog, Page, SettingsSection},
+    app::{ConsortApp, Page, SettingsSection},
     ui::window_controls::DragArea as _,
     ui::{
         menu::{OpenMenu, archived_channel_menu, channel_menu, worker_menu},
@@ -89,51 +89,67 @@ impl ConsortApp {
         for (gi, group) in sidebar.groups.iter().enumerate() {
             let collapsed = group.collapsed;
             let group_id = group.id.clone();
+            let hover_key = group.id.clone();
+            let hovered = self.row_hovered(&group.id);
+            let buttons = hovered.then(|| self.group_buttons(&group.id, &group.name, t, cx));
             let mut block = div()
                 .flex()
                 .flex_col()
                 .gap(t.space.xxs)
                 .pt(sb.group_top)
                 .child(
-                    focusable(
-                        group_label(t)
-                            .id(SharedString::from(format!("group-{}", group.id)))
-                            .when(gi == 0, |d| {
-                                d.debug_selector(|| "sidebar-group-label".into())
-                            }),
+                    self.group_drag(
+                        focusable(
+                            group_label(t)
+                                .id(SharedString::from(format!("group-{}", group.id)))
+                                .when(gi == 0, |d| {
+                                    d.debug_selector(|| "sidebar-group-label".into())
+                                }),
+                            t,
+                        )
+                        .cursor_pointer()
+                        .rounded(t.radius.lg)
+                        .when(hovered, |d| d.bg(c.hover_sidebar))
+                        .on_hover(cx.listener(move |this, on: &bool, _, cx| {
+                            this.set_row_hover(&hover_key, *on, cx)
+                        }))
+                        .child(text(group.name.clone(), sb.label_text, c.text_tertiary))
+                        .child(div().flex_1().child(icon(
+                            if collapsed {
+                                "chevron-right"
+                            } else {
+                                "chevron-down"
+                            },
+                            t.icon.dense,
+                            c.text_tertiary,
+                        )))
+                        .children(buttons)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let client = this.client.clone();
+                            let group_id = group_id.clone();
+                            this.spawn_command(cx, async move {
+                                client
+                                    .run(consort_client::Command::SetGroupCollapsed {
+                                        group_id,
+                                        collapsed: !collapsed,
+                                    })
+                                    .await
+                            });
+                        })),
+                        &group.id,
+                        &group.name,
                         t,
-                    )
-                    .cursor_pointer()
-                    .child(text(group.name.clone(), sb.label_text, c.text_tertiary))
-                    .child(icon(
-                        if collapsed {
-                            "chevron-right"
-                        } else {
-                            "chevron-down"
-                        },
-                        t.icon.dense,
-                        c.text_tertiary,
-                    ))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        let client = this.client.clone();
-                        let group_id = group_id.clone();
-                        this.spawn_command(cx, async move {
-                            client
-                                .run(consort_client::Command::SetGroupCollapsed {
-                                    group_id,
-                                    collapsed: !collapsed,
-                                })
-                                .await
-                        });
-                    })),
+                        cx,
+                    ),
                 );
             if !collapsed {
                 for channel in &group.channels {
                     block = block.child(self.channel_row(channel, false, &selected, t, cx));
                 }
-            }
-            if gi + 1 == sidebar.groups.len() && waiting.is_none() {
-                block = block.child(self.new_channel_row(t, cx));
+                // An empty group says how to fill it.
+                if group.channels.is_empty() && waiting.is_none() {
+                    block = block.child(self.add_channel_row(&group.id, t, cx));
+                }
             }
             groups = groups.child(block);
         }
@@ -152,9 +168,6 @@ impl ConsortApp {
             let mut block = div().flex().flex_col().gap(t.space.xxs).pt(sb.group_top);
             for channel in &sidebar.ungrouped {
                 block = block.child(self.channel_row(channel, false, &selected, t, cx));
-            }
-            if sidebar.groups.is_empty() {
-                block = block.child(self.new_channel_row(t, cx));
             }
             groups = groups.child(block);
         }
@@ -358,20 +371,6 @@ impl ConsortApp {
         block.into_any_element()
     }
 
-    fn new_channel_row(&mut self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
-        let c = &t.colors;
-        let sb = t.component.sidebar;
-        focusable(row(t).id("new-channel"), t)
-            .cursor_pointer()
-            .hover(|s| s.bg(c.hover_sidebar))
-            .child(icon("plus", sb.row_icon, c.text_tertiary))
-            .child(text("New channel", sb.row_text, c.text_tertiary))
-            .on_click(
-                cx.listener(|this, _, window, cx| this.open_dialog(Dialog::NewChannel, window, cx)),
-            )
-            .into_any_element()
-    }
-
     fn channel_row(
         &mut self,
         channel: &SidebarChannel,
@@ -430,6 +429,12 @@ impl ConsortApp {
                     .bg(c.accent_text)
                     .mr(t.space.xs + t.space.xxs),
             )
+        })
+        .when(tutti, |d| {
+            d.on_hover(cx.listener(|this, on: &bool, _, cx| this.set_row_hover("tutti", *on, cx)))
+                .when(self.row_hovered("tutti"), |d| {
+                    d.child(self.tutti_plus(t, cx))
+                })
         })
         .when(!tutti || channel.status.is_some(), |d| d.child(status))
         .on_click(cx.listener(move |this, _, window, cx| this.open_channel(id.clone(), window, cx)))

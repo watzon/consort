@@ -958,7 +958,14 @@ impl Hub {
         let hits = self
             .store
             .read(move |conn| {
-                knowledge::search(conn, &request.query, request.channel_id, limit, &|_| true)
+                knowledge::search(
+                    conn,
+                    &request.query,
+                    request.channel_id,
+                    &request.kinds,
+                    limit,
+                    &|_| true,
+                )
             })
             .await?;
         Ok(SearchResult { hits })
@@ -1833,6 +1840,7 @@ mod tests {
                     worker_id: None,
                     review_summary: None,
                     resolved_at: None,
+                    session_ended: false,
                     archived_at: None,
                     created_at: now,
                     updated_at: now,
@@ -2090,6 +2098,7 @@ mod tests {
             query: "pelican".to_owned(),
             channel_id,
             limit: None,
+            kinds: Vec::new(),
         };
 
         let all = hub.message_search(&user, search(None)).await.unwrap();

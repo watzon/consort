@@ -488,6 +488,7 @@ mod tests {
                 let mut task = work::task_or_404(tx.db(), task_id)?;
                 task.status = TaskStatus::Working;
                 task.current_session_id = Some(session_id);
+                task.session_ended = false;
                 task.worker_id = Some(worker_id);
                 tx.save_task(&task)?;
                 // The user allowed it, but the worker was away.

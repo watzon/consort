@@ -574,20 +574,25 @@ impl Hub {
             ));
         }
         let actor = ctx.memory_actor();
-        let hits =
-            self.store
-                .read(move |conn| {
-                    knowledge::search(conn, &args.query, args.channel_id, SEARCH_LIMIT, &|hit| {
-                        match hit {
-                            SearchHit::Message { channel_id, .. }
-                            | SearchHit::Task { channel_id, .. } => {
-                                sees_every_channel || *channel_id == own_channel
-                            }
-                            SearchHit::MemoryNote { scope, .. } => actor.can_read(*scope),
+        let hits = self
+            .store
+            .read(move |conn| {
+                knowledge::search(
+                    conn,
+                    &args.query,
+                    args.channel_id,
+                    &[],
+                    SEARCH_LIMIT,
+                    &|hit| match hit {
+                        SearchHit::Message { channel_id, .. }
+                        | SearchHit::Task { channel_id, .. } => {
+                            sees_every_channel || *channel_id == own_channel
                         }
-                    })
-                })
-                .await?;
+                        SearchHit::MemoryNote { scope, .. } => actor.can_read(*scope),
+                    },
+                )
+            })
+            .await?;
         to_value(&SearchResult { hits })
     }
 
@@ -859,6 +864,7 @@ mod tests {
                     worker_id: None,
                     review_summary: None,
                     resolved_at: None,
+                    session_ended: false,
                     archived_at: None,
                     created_at: now,
                     updated_at: now,

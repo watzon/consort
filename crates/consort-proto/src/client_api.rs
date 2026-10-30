@@ -889,6 +889,9 @@ pub struct MessageSearch {
     /// The most results.
     #[serde(default)]
     pub limit: Option<u32>,
+    /// Find only these kinds. Empty finds every kind.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kinds: Vec<crate::tools::SearchKind>,
 }
 
 /// `read.mark`: move a read marker forward.
@@ -1019,6 +1022,36 @@ pub struct TaskDelete {
 pub struct TaskGet {
     /// The task.
     pub task_id: TaskId,
+}
+
+/// `task.list_archived`: a page of the archived tasks, the most recently
+/// archived first. A snapshot leaves archived tasks out, so this is the way
+/// to find one and restore it with `task.archive` and `archived: false`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskListArchived {
+    /// Only the tasks of this channel. Empty means every channel.
+    #[serde(default)]
+    pub channel_id: Option<ChannelId>,
+    /// Skip this many tasks, for the next page.
+    #[serde(default)]
+    pub offset: Option<u32>,
+    /// The most tasks. The default is 50 and the limit is 200.
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+/// The response to `task.list_archived`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskListArchivedResult {
+    /// The tasks, the most recently archived first. A long brief or review
+    /// summary is cut to a preview, as in a snapshot, and the task ID is in
+    /// `tasks_cut`. `task.get` gives the full task.
+    pub tasks: Vec<Task>,
+    /// The tasks whose brief or review summary is a preview.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tasks_cut: Vec<TaskId>,
+    /// Whether more archived tasks exist after this page.
+    pub has_more: bool,
 }
 
 /// `task.items`: a page of a task's session items, oldest first.
@@ -1641,6 +1674,8 @@ message_family! {
         TaskDelete("task.delete", TaskDelete => Empty),
         /// Get one full task.
         TaskGet("task.get", TaskGet => TaskResult),
+        /// List the archived tasks.
+        TaskListArchived("task.list_archived", TaskListArchived => TaskListArchivedResult),
         /// Load a task's session items.
         TaskItems("task.items", TaskItems => TaskItemsResult),
         /// Get an item's full data.
@@ -1845,6 +1880,57 @@ mod tests {
         }
     }
 
+    /// A task from an older hub has no `session_ended`. It reads as false,
+    /// and a new hub writes it.
+    #[test]
+    fn a_task_without_session_ended_reads_as_running() {
+        let mut value = serde_json::to_value(task()).unwrap();
+        assert_eq!(value["session_ended"], serde_json::json!(false));
+        value.as_object_mut().unwrap().remove("session_ended");
+        let old: Task = serde_json::from_value(value).unwrap();
+        assert!(!old.session_ended);
+    }
+
+    /// `message.search` leaves `kinds` out when it is empty, and a search
+    /// hit from an older hub has no `updated_at`.
+    #[test]
+    fn search_kinds_and_hit_dates_are_optional() {
+        let all = MessageSearch {
+            query: "engine".into(),
+            channel_id: None,
+            limit: None,
+            kinds: Vec::new(),
+        };
+        let value = serde_json::to_value(&all).unwrap();
+        assert!(value.get("kinds").is_none());
+        let some: MessageSearch = serde_json::from_value(serde_json::json!({
+            "query": "engine",
+            "kinds": ["memory_note", "task"],
+        }))
+        .unwrap();
+        assert_eq!(
+            some.kinds,
+            [
+                crate::tools::SearchKind::MemoryNote,
+                crate::tools::SearchKind::Task
+            ]
+        );
+        let hit: crate::tools::SearchHit = serde_json::from_value(serde_json::json!({
+            "kind": "memory_note",
+            "scope": "global",
+            "path": "a.md",
+            "snippet": "x",
+        }))
+        .unwrap();
+        assert!(matches!(
+            hit,
+            crate::tools::SearchHit::MemoryNote {
+                updated_at: None,
+                ..
+            }
+        ));
+    }
+
     fn task() -> Task {
         Task {
             id: "tsk_00000000-0000-0000-0000-000000000003".parse().unwrap(),
@@ -1863,6 +1949,7 @@ mod tests {
             worker_id: None,
             review_summary: Some("PR #62 is up.".into()),
             resolved_at: None,
+            session_ended: false,
             archived_at: None,
             created_at: Timestamp::from_millis(1),
             updated_at: Timestamp::from_millis(2),
@@ -2178,6 +2265,7 @@ mod tests {
                 query: "sayso".into(),
                 channel_id: None,
                 limit: None,
+                kinds: Vec::new(),
             }
             .into(),
             ReadMark {
@@ -2217,6 +2305,12 @@ mod tests {
             .into(),
             TaskDelete { task_id: tsk }.into(),
             TaskGet { task_id: tsk }.into(),
+            TaskListArchived {
+                channel_id: Some(chn()),
+                offset: Some(50),
+                limit: None,
+            }
+            .into(),
             TaskItems {
                 task_id: tsk,
                 session_id: None,

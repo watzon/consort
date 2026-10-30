@@ -145,6 +145,9 @@ impl ConsortApp {
                 crate::app::Panel::Thread(task_id) => Some(UploadTarget::Reply {
                     task_id: task_id.clone(),
                 }),
+                crate::app::Panel::MessageThread(root_id) => Some(UploadTarget::Thread {
+                    root_id: root_id.clone(),
+                }),
                 _ => None,
             },
         }

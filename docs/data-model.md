@@ -170,6 +170,7 @@ The hub has one user, so a message that is read on one client is read on all of 
 | `worker_id` | ID, optional | The worker of the current session, so the task card can show when it is offline |
 | `review_summary` | markdown, optional | The text the task gave when it went to Ready for review |
 | `resolved_at`, `archived_at` | timestamp, optional | Archive hides a task in any status |
+| `session_ended` | bool | True when the current session has ended. Retry is then the way on for a task in Ready for review or Resolved. A new session sets it to false. Stored in the task's JSON, so no column |
 | `created_at`, `updated_at` | timestamp | |
 
 A placement request has these fields:

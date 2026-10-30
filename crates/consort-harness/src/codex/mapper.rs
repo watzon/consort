@@ -78,6 +78,7 @@ fn file_change(change: &FileUpdateChange) -> FileChange {
         from_path,
         lines_added: added,
         lines_removed: removed,
+        diff: (!change.diff.trim().is_empty()).then(|| change.diff.clone()),
     }
 }
 

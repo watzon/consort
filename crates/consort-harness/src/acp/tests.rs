@@ -117,6 +117,13 @@ fn edits_plans_mcp_tools_and_thoughts() {
                 (f.changes[0].lines_added, f.changes[0].lines_removed),
                 (3, 2)
             );
+            // The worker keeps the diff for the task item view.
+            let diff = f.changes[0].diff.as_deref().unwrap();
+            assert!(diff.contains("--- a//w/src/lib.rs"), "{diff}");
+            assert!(diff.contains("-b\n"), "{diff}");
+            assert!(diff.contains("+c\n"), "{diff}");
+            assert!(diff.contains("+d"), "{diff}");
+            assert!(diff.contains(" a\n"), "{diff}");
         }
         other => panic!("{other:?}"),
     }

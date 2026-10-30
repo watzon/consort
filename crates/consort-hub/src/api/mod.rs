@@ -47,6 +47,7 @@ pub(crate) async fn dispatch(hub: &Hub, caller: Caller, request: ClientRequest) 
         R::TaskArchive(r) => to_value(&hub.task_archive(caller, r).await?),
         R::TaskDelete(r) => to_value(&hub.task_delete(caller, r).await?),
         R::TaskGet(r) => to_value(&hub.task_get(caller, r).await?),
+        R::TaskListArchived(r) => to_value(&hub.task_list_archived(caller, r).await?),
         R::TaskItems(r) => to_value(&hub.task_items(caller, r).await?),
         R::TaskItemDetail(r) => to_value(&hub.task_item_detail(caller, r).await?),
         R::ApprovalAnswer(r) => to_value(&hub.approval_answer(caller, r).await?),

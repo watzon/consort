@@ -1,8 +1,8 @@
-//! Dialogs: New channel, Add worker, Rename, Instructions, tags and the
-//! confirmations. 520 to 560 px wide, `xl` corners, `shadow.float`, over the
+//! Dialogs: Add worker, New group, the renames and the confirmations. The
+//! phase 4 dialogs (New channel, New task, channel settings, About) are in
+//! `convo_dialogs.rs`. 520 to 560 px wide, `xl` corners, `shadow.float`, over the
 //! scrim.
 
-use consort_client::{ChannelChanges, Isolation, NewChannel};
 use consort_theme::{Tokens, TypeExt as _};
 use gpui_kit::{
     AnyElement, Context, Div, Entity, Focusable as _, InteractiveElement, IntoElement,
@@ -15,11 +15,7 @@ use crate::{
     notice::{Notice, NoticeKind},
     ui::{
         menu::{MenuAction, MenuItem, OpenMenu},
-        model_picker::{PickerTarget, TriggerStyle},
-        parts::{
-            ButtonKind, button, detail, error_box, focusable, icon, icon_button, selectable, text,
-        },
-        settings::segmented,
+        parts::{ButtonKind, button, detail, error_box, icon, icon_button, selectable, text},
     },
 };
 
@@ -61,93 +57,6 @@ pub fn input_box(input: &Entity<InputState>, focused: bool, t: &Tokens) -> Div {
         .child(crate::ui::parts::input(input, t.text.ui))
 }
 
-/// A box that looks like an input and opens a select menu.
-fn select_box(
-    id: &'static str,
-    value: String,
-    app: &ConsortApp,
-    t: &Tokens,
-) -> gpui_kit::Stateful<Div> {
-    select_box_with_logo(id, value, None, app, t)
-}
-
-/// A select box with the logo of a provider before the value.
-fn select_box_with_logo(
-    id: &'static str,
-    value: String,
-    logo: Option<&consort_client::ProviderLogo>,
-    app: &ConsortApp,
-    t: &Tokens,
-) -> gpui_kit::Stateful<Div> {
-    let c = &t.colors;
-    focusable(div().id(id), t)
-        .relative()
-        .flex()
-        .items_center()
-        .justify_between()
-        .py(t.component.input_pad_y)
-        .pl(t.space.md)
-        .pr(t.space.sm + t.space.xxs)
-        .bg(c.surface_card)
-        .border(t.border_width)
-        .border_color(c.border_strong)
-        .rounded(t.radius.md)
-        .cursor_pointer()
-        .hover(|s| s.border_color(c.text_tertiary))
-        .child(app.triggers.track(id))
-        .child(
-            div()
-                .flex()
-                .items_center()
-                .gap(t.space.sm)
-                .min_w_0()
-                .children(
-                    logo.map(|logo| {
-                        crate::ui::parts::provider_logo(logo, t.icon.size, c.text_primary)
-                    }),
-                )
-                .child(text(value, t.text.ui, c.text_primary)),
-        )
-        .child(icon("chevrons-up-down", t.icon.dense, c.text_secondary))
-}
-
-/// The items of the Group select in the New channel dialog: every group, then
-/// No group and New group. A hub with no group still gets two items.
-pub fn group_pick_items(
-    groups: &[consort_client::GroupView],
-    current: Option<&str>,
-    new_group: bool,
-) -> Vec<MenuItem> {
-    let mut items: Vec<MenuItem> = groups
-        .iter()
-        .map(|g| {
-            MenuItem::new(
-                g.name.clone(),
-                MenuAction::Select("new-channel-group", g.id.clone()),
-            )
-            .checked(!new_group && current == Some(g.id.as_str()))
-        })
-        .collect();
-    let in_known_group = current.is_some_and(|c| groups.iter().any(|g| g.id == c));
-    let mut none = MenuItem::new(
-        "No group",
-        MenuAction::Select("new-channel-group", NO_GROUP.to_owned()),
-    )
-    .checked(!new_group && !in_known_group);
-    if !items.is_empty() {
-        none = none.separated();
-    }
-    items.push(none);
-    items.push(
-        MenuItem::new(
-            "New group",
-            MenuAction::Select("new-channel-group", NEW_GROUP.to_owned()),
-        )
-        .checked(new_group),
-    );
-    items
-}
-
 /// The note under a Worker tags field: what the tags do and how many
 /// workers match, or that none does and what to do.
 pub fn tags_note(matching: usize) -> String {
@@ -186,25 +95,12 @@ pub fn tag_suggestions(state: &consort_client::ViewState, chosen: &[String]) -> 
     out
 }
 
-/// The select option that puts the new channel in no group. It is not a
-/// group ID, so it cannot be a group.
-pub const NO_GROUP: &str = "no-group";
-/// The select option that makes a group for the new channel.
-pub const NEW_GROUP: &str = "new-group";
-
 impl ConsortApp {
     /// The Worker tags field of a channel: the chosen tags as removable
     /// chips, Add tag (a menu of every worker tag), the tags of the matching
     /// workers to add with one click, and how many workers match.
-    /// `settings` says which list it edits: the open Worker tags dialog, or
-    /// the New channel form.
-    pub fn tags_field(
-        &self,
-        chosen: &[String],
-        settings: bool,
-        t: &Tokens,
-        cx: &mut Context<Self>,
-    ) -> Div {
+    /// It edits the tags of the channel settings form.
+    pub fn tags_field(&self, chosen: &[String], t: &Tokens, cx: &mut Context<Self>) -> Div {
         let c = &t.colors;
         let mut row = div()
             .flex()
@@ -230,12 +126,7 @@ impl ConsortApp {
                     .child(text(tag.clone(), t.text.ui_strong, c.accent_text))
                     .child(icon("x", t.space.md, c.accent_text))
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        let tags = if settings {
-                            &mut this.channel_tags
-                        } else {
-                            &mut this.new_channel.tags
-                        };
-                        tags.retain(|t| *t != remove);
+                        this.convo.settings.tags.retain(|t| *t != remove);
                         cx.notify();
                     })),
             );
@@ -327,11 +218,7 @@ impl ConsortApp {
                             tag
                         })
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            let tags = if settings {
-                                &mut this.channel_tags
-                            } else {
-                                &mut this.new_channel.tags
-                            };
+                            let tags = &mut this.convo.settings.tags;
                             if !tags.contains(&add) {
                                 tags.push(add.clone());
                             }
@@ -342,26 +229,44 @@ impl ConsortApp {
             row = row.child(also);
         }
         let matching = self.state.workers_with_tags(chosen).len();
+        // The count sits at the right of the label. A note shows only when
+        // there is no tag, or when no worker matches.
         let note = if chosen.is_empty() {
-            "Add a tag to keep the work of this channel on some workers, such as work or gpu-nvidia.".to_owned()
+            Some("Add a tag to keep the work of this channel on some workers, such as work or gpu-nvidia.".to_owned())
+        } else if matching == 0 {
+            Some(tags_note(matching))
         } else {
-            tags_note(matching)
+            None
         };
         div()
             .flex()
             .flex_col()
             .gap(t.space.xs + t.space.xxs)
-            .child(text("Worker tags", t.text.label, c.text_secondary))
+            .child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .child(text("Worker tags", t.text.label, c.text_secondary))
+                    .when(!chosen.is_empty(), |d| {
+                        d.child(text(
+                            consort_client::convo::workers_match_label(matching),
+                            detail(t),
+                            c.text_tertiary,
+                        ))
+                    }),
+            )
             .child(row)
-            .child(text(
-                note,
-                detail(t),
-                if !chosen.is_empty() && matching == 0 {
-                    c.status_failed
-                } else {
-                    c.text_tertiary
-                },
-            ))
+            .when_some(note, |d, note| {
+                d.child(text(
+                    note,
+                    detail(t),
+                    if !chosen.is_empty() && matching == 0 {
+                        c.status_failed
+                    } else {
+                        c.text_tertiary
+                    },
+                ))
+            })
     }
 
     /// The toast at the bottom. Its text is selectable. An error has a mark
@@ -550,6 +455,26 @@ impl ConsortApp {
                     div(),
                 ),
             },
+            Dialog::NewChannel
+            | Dialog::NewTask
+            | Dialog::ChannelSettings(_)
+            | Dialog::RenameGroup(_)
+            | Dialog::ConfirmDeleteGroup(_)
+            | Dialog::ConfirmDeleteTask(_)
+            | Dialog::SkillDiff(_)
+            | Dialog::About => match self.convo_dialog(dialog, t, window, cx) {
+                Some((title, description, width, body, actions, logo)) => {
+                    lead = logo;
+                    (title, description, width, body, actions)
+                }
+                None => (
+                    String::new(),
+                    String::new(),
+                    t.layout.dialog_width,
+                    div(),
+                    div(),
+                ),
+            },
             Dialog::ConfirmDeleteFile(..)
             | Dialog::RenameFile(..)
             | Dialog::MoveFile(..)
@@ -631,139 +556,7 @@ impl ConsortApp {
                     ),
                 )
             }
-            Dialog::ChannelTags(id) => {
-                let id = id.clone();
-                let name = self
-                    .state
-                    .channel(&id)
-                    .map(|ch| ch.name.clone())
-                    .unwrap_or_default();
-                let tags = self.channel_tags.clone();
-                (
-                    format!("Worker tags for {name}"),
-                    "Choose the worker tags that this channel requires.".to_owned(),
-                    t.layout.dialog_wide,
-                    self.tags_field(&tags, true, t, cx),
-                    self.dialog_actions("Save tags", t, cx, move |this, window, cx| {
-                        let client = this.client.clone();
-                        let id = id.clone();
-                        let tags = this.channel_tags.clone();
-                        this.submit_dialog(
-                            async move {
-                                client
-                                    .update_channel(
-                                        id,
-                                        ChannelChanges {
-                                            tags: Some(tags),
-                                            ..ChannelChanges::default()
-                                        },
-                                    )
-                                    .await
-                            },
-                            window,
-                            cx,
-                        );
-                    }),
-                )
-            }
-            Dialog::NewChannel => self.new_channel_dialog(t, window, cx),
             Dialog::AddWorker => self.add_worker_dialog(t, cx),
-            Dialog::RenameChannel(id) => {
-                let id = id.clone();
-                let focused = self
-                    .inputs
-                    .name
-                    .read(cx)
-                    .focus_handle(cx)
-                    .is_focused(window);
-                (
-                    "Rename channel".to_owned(),
-                    "The name shows in the sidebar and in Tutti.".to_owned(),
-                    t.layout.dialog_width,
-                    field_block("Name", input_box(&self.inputs.name, focused, t), None, t),
-                    self.dialog_actions("Rename", t, cx, move |this, window, cx| {
-                        let name = this.field(Field::Name, cx);
-                        if name.is_empty() {
-                            this.dialog_error = Some("Enter a name for the channel.".into());
-                            cx.notify();
-                            return;
-                        }
-                        let client = this.client.clone();
-                        let id = id.clone();
-                        this.submit_dialog(
-                            async move {
-                                client
-                                    .update_channel(
-                                        id,
-                                        ChannelChanges {
-                                            name: Some(name),
-                                            ..ChannelChanges::default()
-                                        },
-                                    )
-                                    .await
-                            },
-                            window,
-                            cx,
-                        );
-                    }),
-                )
-            }
-            Dialog::Instructions(id) => {
-                let id = id.clone();
-                let name = self
-                    .state
-                    .channel(&id)
-                    .map(|ch| ch.name.clone())
-                    .unwrap_or_default();
-                let purpose_focused = self
-                    .inputs
-                    .purpose
-                    .read(cx)
-                    .focus_handle(cx)
-                    .is_focused(window);
-                (
-                    format!("Instructions for {name}"),
-                    "Standing guidance that Consort reads before every turn in this channel. Write it in Markdown.".to_owned(),
-                    t.layout.dialog_wide,
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap(t.space.lg)
-                        .child(field_block(
-                            "Purpose",
-                            input_box(&self.inputs.purpose, purpose_focused, t),
-                            Some("One line about what this channel is for"),
-                            t,
-                        ))
-                        .child(field_block("Instructions", div()
-                        .min_h(t.component.notes_min_height)
-                        .py(t.space.sm)
-                        .px(t.space.md)
-                        .bg(c.surface_card)
-                        .border(t.border_width)
-                        .border_color(c.border_strong)
-                        .rounded(t.radius.md)
-                        .type_style(t.text.ui)
-                        .child(
-                            crate::ui::parts::textarea(&self.inputs.notes, t.text.ui),
-                        ), None, t)),
-                    self.dialog_actions("Save instructions", t, cx, move |this, window, cx| {
-                        let notes = this.inputs.notes.read(cx).value().to_string();
-                        let purpose = this.field(Field::Purpose, cx);
-                        let client = this.client.clone();
-                        let id = id.clone();
-                        this.submit_dialog(
-                            async move {
-                                client
-                                    .update_channel(id, ChannelChanges { purpose: Some(purpose), instructions: Some(notes), ..ChannelChanges::default() })
-                                    .await
-                            },
-                            window,
-                            cx,
-                        );
-                    }),
-                )
-            }
             Dialog::RenameWorker(id) => {
                 let id = id.clone();
                 let focused = self
@@ -841,8 +634,8 @@ impl ConsortApp {
                     .is_focused(window);
                 (
                     "New group".to_owned(),
-                    "A group is a named folder of channels in the sidebar.".to_owned(),
-                    t.layout.dialog_width,
+                    "A group is a folder of channels in the sidebar.".to_owned(),
+                    t.component.convo.dialog_group,
                     field_block("Name", input_box(&self.inputs.name, focused, t), None, t),
                     self.dialog_actions("Create group", t, cx, move |this, window, cx| {
                         let name = this.field(Field::Name, cx);
@@ -956,23 +749,10 @@ impl ConsortApp {
             .on_mouse_down(gpui_kit::MouseButton::Left, |_, _, cx| {
                 cx.stop_propagation()
             })
-            .child(
-                div()
-                    .flex()
-                    .items_start()
-                    .gap(t.space.md)
-                    .children(lead)
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .flex_1()
-                            .min_w_0()
-                            .gap(t.space.xs)
-                            .child(text(title, t.text.heading, c.text_primary))
-                            .child(text(description, t.text.ui, c.text_secondary)),
-                    )
-                    .child(
+            .relative()
+            .when(title.is_empty(), |card| {
+                card.child(
+                    div().absolute().top(t.space.lg).right(t.space.lg).child(
                         icon_button(
                             "dialog-close",
                             "x",
@@ -985,7 +765,42 @@ impl ConsortApp {
                         )
                         .on_click(cx.listener(|this, _, window, cx| this.close_dialog(window, cx))),
                     ),
-            )
+                )
+            })
+            .when(!title.is_empty(), |card| {
+                card.child(
+                    div()
+                        .flex()
+                        .items_start()
+                        .gap(t.space.md)
+                        .children(lead)
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .flex_1()
+                                .min_w_0()
+                                .gap(t.space.xs)
+                                .child(text(title, t.text.heading, c.text_primary))
+                                .child(text(description, t.text.ui, c.text_secondary)),
+                        )
+                        .child(
+                            icon_button(
+                                "dialog-close",
+                                "x",
+                                t.space.xl + t.space.xs,
+                                t.icon.size,
+                                c.text_secondary,
+                                c.hover_raised,
+                                t,
+                                cx,
+                            )
+                            .on_click(
+                                cx.listener(|this, _, window, cx| this.close_dialog(window, cx)),
+                            ),
+                        ),
+                )
+            })
             .child(body)
             .children(
                 self.dialog_error.clone().map(|err| {
@@ -1064,320 +879,6 @@ impl ConsortApp {
                     .on_click(cx.listener(|this, _, window, cx| this.close_dialog(window, cx))),
             )
             .child(confirm)
-    }
-
-    fn new_channel_dialog(
-        &mut self,
-        t: &Tokens,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> (String, String, gpui_kit::Pixels, Div, Div) {
-        let c = &t.colors;
-        let state = self.state.clone();
-        let form = self.new_channel.clone();
-        let name_focused = self
-            .inputs
-            .name
-            .read(cx)
-            .focus_handle(cx)
-            .is_focused(window);
-        let purpose_focused = self
-            .inputs
-            .purpose
-            .read(cx)
-            .focus_handle(cx)
-            .is_focused(window);
-        let group_name = if form.new_group {
-            "New group".to_owned()
-        } else {
-            form.group_id
-                .as_ref()
-                .and_then(|g| state.groups.iter().find(|x| &x.id == g))
-                .map(|g| g.name.clone())
-                .unwrap_or_else(|| "No group".to_owned())
-        };
-        let groups = state.groups.clone();
-        let current_group = form.group_id.clone();
-        let new_group = form.new_group;
-        let group_select = select_box("new-channel-group", group_name, self, t).on_click(
-            cx.listener(move |this, _, _, cx| {
-                if let Some(bounds) = this.triggers.get("new-channel-group") {
-                    let items = group_pick_items(&groups, current_group.as_deref(), new_group);
-                    this.open_menu(OpenMenu::under(bounds, items, true), cx);
-                }
-            }),
-        );
-        let group_name_focused = self
-            .inputs
-            .group_name
-            .read(cx)
-            .focus_handle(cx)
-            .is_focused(window);
-        let mut chips = div().flex().flex_wrap().gap(t.space.xs + t.space.xxs);
-        for (i, worker_id) in form.workers.iter().enumerate() {
-            let name = state
-                .worker(worker_id)
-                .map(|w| w.name.clone())
-                .unwrap_or_default();
-            let remove = worker_id.clone();
-            chips = chips.child(
-                div()
-                    .id(SharedString::from(format!("chip-{worker_id}")))
-                    .flex()
-                    .items_center()
-                    .gap(t.space.xs + t.space.xxs)
-                    .py(t.space.xs)
-                    .px(t.space.sm + t.space.xxs)
-                    .rounded(t.radius.full)
-                    .bg(c.surface_selected)
-                    .border(t.border_width)
-                    .border_color(c.border_strong)
-                    .cursor_pointer()
-                    .child(text((i + 1).to_string(), detail(t), c.text_secondary))
-                    .child(text(name, t.text.ui, c.text_primary))
-                    .child(icon("x", t.space.md, c.text_secondary))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.new_channel.workers.retain(|w| *w != remove);
-                        cx.notify();
-                    })),
-            );
-        }
-        let free: Vec<(String, String)> = state
-            .workers
-            .iter()
-            .filter(|w| !form.workers.contains(&w.id))
-            .map(|w| (w.id.clone(), w.name.clone()))
-            .collect();
-        if !free.is_empty() {
-            chips = chips.child(
-                div()
-                    .id("new-channel-worker")
-                    .relative()
-                    .flex()
-                    .items_center()
-                    .py(t.space.xs)
-                    .px(t.space.sm + t.space.xxs)
-                    .rounded(t.radius.full)
-                    .border(t.border_width)
-                    .border_color(c.border_strong)
-                    .border_dashed()
-                    .cursor_pointer()
-                    .hover(|s| s.bg(c.hover_raised))
-                    .child(self.triggers.track("new-channel-worker"))
-                    .child(text("Add worker", t.text.ui, c.text_secondary))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if let Some(bounds) = this.triggers.get("new-channel-worker") {
-                            let items = free
-                                .iter()
-                                .map(|(id, name)| {
-                                    MenuItem::new(
-                                        name.clone(),
-                                        MenuAction::Select("new-channel-worker", id.clone()),
-                                    )
-                                })
-                                .collect();
-                            this.open_menu(OpenMenu::under(bounds, items, false), cx);
-                        }
-                    })),
-            );
-        }
-        let assistant_model = self.render_model_trigger(
-            "new-channel-assistant",
-            PickerTarget::NewChannelAssistant,
-            TriggerStyle::Field,
-            t,
-            cx,
-        );
-        let assistant_effort = self.render_effort_trigger(
-            "new-channel-assistant-effort",
-            PickerTarget::NewChannelAssistant,
-            TriggerStyle::Field,
-            t,
-            cx,
-        );
-        let task_model = self.render_model_trigger(
-            "new-channel-tasks",
-            PickerTarget::NewChannelTasks,
-            TriggerStyle::Field,
-            t,
-            cx,
-        );
-        let task_effort = self.render_effort_trigger(
-            "new-channel-tasks-effort",
-            PickerTarget::NewChannelTasks,
-            TriggerStyle::Field,
-            t,
-            cx,
-        );
-        // A model field, with the effort select next to it when the model
-        // has effort levels.
-        let model_row = |label: &str, model: AnyElement, effort: Option<AnyElement>| {
-            field_block(
-                label,
-                div()
-                    .flex()
-                    .gap(t.space.sm)
-                    .child(div().flex_1().min_w_0().child(model))
-                    .when_some(effort, |d, effort| {
-                        d.child(div().flex_none().w(t.component.effort_select).child(effort))
-                    }),
-                None,
-                t,
-            )
-        };
-        let isolation = segmented(
-            "isolation",
-            &[
-                (Isolation::InPlace, "In place"),
-                (Isolation::Worktree, "Worktree"),
-                (Isolation::Clone, "Clone"),
-            ],
-            form.isolation,
-            t,
-            cx,
-            |_| detail(t),
-            |this, value, _, cx| {
-                this.new_channel.isolation = value;
-                cx.notify();
-            },
-        )
-        .border(t.border_width)
-        .border_color(c.border_strong);
-        let isolation_hint = match form.isolation {
-            Isolation::InPlace => {
-                "Tasks work in your checkout. They see and change your working tree."
-            }
-            Isolation::Worktree => {
-                "A worktree gets your local commits and uncommitted changes, and it leaves your own working tree alone."
-            }
-            Isolation::Clone => "Each task gets a fresh clone. It sees only what is pushed.",
-        };
-        let repos = div()
-            .flex()
-            .flex_col()
-            .bg(c.surface_card)
-            .border(t.border_width)
-            .border_color(c.border_strong)
-            .rounded(t.radius.md)
-            .child(
-                div()
-                    .id("add-repo")
-                    .flex()
-                    .items_center()
-                    .gap(t.space.sm + t.space.xxs)
-                    .py(t.space.sm)
-                    .px(t.space.md)
-                    .cursor_pointer()
-                    .hover(|s| s.bg(c.hover_card))
-                    .child(icon("plus", t.icon.size, c.text_tertiary))
-                    .child(text("Add a repo", t.text.ui, c.text_secondary))
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.show_notice(
-                            "Repos come in a later build. Ask Consort to attach one.".into(),
-                            cx,
-                        )
-                    })),
-            );
-        let body = div()
-            .flex()
-            .flex_col()
-            .gap(t.space.lg + t.space.xxs)
-            .child(
-                div()
-                    .flex()
-                    .gap(t.space.md)
-                    .child(
-                        field_block("Name", input_box(&self.inputs.name, name_focused, t), None, t).flex_1(),
-                    )
-                    .child(field_block("Group", group_select, None, t).w(t.component.group_select).flex_none()),
-            )
-            .child(field_block(
-                "Purpose",
-                input_box(&self.inputs.purpose, purpose_focused, t),
-                Some("One line. Consort reads it before every turn in this channel."),
-                t,
-            ))
-            .when(form.new_group, |d| {
-                d.child(field_block(
-                    "Group name",
-                    input_box(&self.inputs.group_name, group_name_focused, t),
-                    Some("The channel goes in this new group."),
-                    t,
-                ))
-            })
-            .child(field_block("Repos", repos, None, t))
-            .child(self.tags_field(&form.tags, false, t, cx))
-            .child(model_row("Model for the assistant", assistant_model, assistant_effort))
-            .child(model_row("Model for tasks", task_model, task_effort))
-            .child(
-                div()
-                    .flex()
-                    .gap(t.space.md)
-                    .child(field_block("Run tasks on", chips, None, t).flex_1().min_w_0())
-                    .child(field_block("Workspace", isolation, None, t).w(t.component.workspace_control).flex_none()),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(t.space.xs)
-                    .child(text(
-                        "Consort tries the workers in order, then any online worker with the repo and the account.",
-                        detail(t),
-                        c.text_tertiary,
-                    ))
-                    .child(text(isolation_hint, detail(t), c.text_tertiary)),
-            )
-;
-        let actions = self.dialog_actions("Create channel", t, cx, |this, window, cx| {
-            let name = this.field(Field::Name, cx);
-            if name.is_empty() {
-                this.dialog_error = Some("Enter a name for the channel.".into());
-                cx.notify();
-                return;
-            }
-            let form = this.new_channel.clone();
-            let new_group = if form.new_group {
-                let group = this.field(Field::GroupName, cx);
-                if group.is_empty() {
-                    this.dialog_error = Some("Enter a name for the group.".into());
-                    cx.notify();
-                    return;
-                }
-                Some(group)
-            } else {
-                None
-            };
-            let channel = NewChannel {
-                name,
-                purpose: this.field(Field::Purpose, cx),
-                group_id: if form.new_group { None } else { form.group_id },
-                new_group,
-                repos: Vec::new(),
-                preferred_workers: form.workers,
-                coordinator_selection: form.coordinator_selection,
-                task_selection: form.task_selection,
-                isolation: form.isolation,
-                tags: form.tags,
-            };
-            // The new channel opens as soon as the hub sends it.
-            let before = this.state.channels.iter().map(|c| c.id.clone()).collect();
-            this.open_created = Some((channel.name.clone(), before));
-            let client = this.client.clone();
-            this.submit_dialog(
-                async move { client.create_channel(channel).await },
-                window,
-                cx,
-            );
-        });
-        (
-            "New channel".to_owned(),
-            "A channel keeps one subject together: its memory, tasks, routines, files and repos."
-                .to_owned(),
-            t.layout.dialog_wide,
-            body,
-            actions,
-        )
     }
 }
 

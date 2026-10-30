@@ -228,7 +228,8 @@ impl ConsortApp {
                         cx.notify();
                     })),
             )
-            .child(nav);
+            .child(nav.flex_1())
+            .child(self.about_row(t, cx));
         let content = match self.settings_section {
             SettingsSection::Appearance => self.render_appearance(t, window, cx),
             SettingsSection::Workers => self.render_workers(t, window, cx),
@@ -918,39 +919,19 @@ impl ConsortApp {
         &mut self,
         select: &'static str,
         option: &str,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self.pick_admin_select(select, option, cx) {
             return;
         }
-        match resolve_pick(&self.state, &self.new_channel.workers, select, option) {
+        match resolve_pick(&self.state, select, option) {
             Some(Pick::ApprovalMode(mode)) => self.show_notice(
                 format!("The approval mode is set on the worker. Set max_approval_mode to {} in worker.toml.", mode_key(mode)),
                 cx,
             ),
-            Some(Pick::Group(id)) => {
-                self.new_channel.group_id = Some(id);
-                self.new_channel.new_group = false;
-            }
-            Some(Pick::NoGroup) => {
-                self.new_channel.group_id = None;
-                self.new_channel.new_group = false;
-            }
-            Some(Pick::NewGroup) => {
-                self.new_channel.group_id = None;
-                self.new_channel.new_group = true;
-                self.inputs
-                    .group_name
-                    .update(cx, |input, cx| input.focus(window, cx));
-            }
-            Some(Pick::Worker(id)) => self.new_channel.workers.push(id),
             Some(Pick::Tag(tag)) => {
-                let tags = if matches!(self.dialog, Some(Dialog::ChannelTags(_))) {
-                    &mut self.channel_tags
-                } else {
-                    &mut self.new_channel.tags
-                };
+                let tags = &mut self.convo.settings.tags;
                 if !tags.contains(&tag) {
                     tags.push(tag);
                 }
@@ -968,46 +949,23 @@ impl ConsortApp {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Pick {
     ApprovalMode(ApprovalMode),
-    Group(String),
-    /// The new channel goes in no group.
-    NoGroup,
-    /// The new channel goes in a group that the dialog makes.
-    NewGroup,
-    Worker(String),
     /// A worker tag for a channel.
     Tag(String),
 }
 
 /// Matches the stable ID of a picked option to the state now. Returns `None`
-/// when the option is gone, or when a worker is already chosen.
-pub fn resolve_pick(
-    state: &ViewState,
-    chosen_workers: &[String],
-    select: &str,
-    option: &str,
-) -> Option<Pick> {
+/// when the option is gone.
+pub fn resolve_pick(state: &ViewState, select: &str, option: &str) -> Option<Pick> {
     match select {
         "approval-mode" => ApprovalMode::ALL
             .iter()
             .find(|mode| mode_key(**mode) == option)
             .map(|mode| Pick::ApprovalMode(*mode)),
-        "new-channel-group" if option == crate::ui::dialogs::NO_GROUP => Some(Pick::NoGroup),
-        "new-channel-group" if option == crate::ui::dialogs::NEW_GROUP => Some(Pick::NewGroup),
-        "new-channel-group" => state
-            .groups
-            .iter()
-            .find(|group| group.id == option)
-            .map(|group| Pick::Group(group.id.clone())),
         "channel-tag" => state
             .tags
             .iter()
             .find(|tag| *tag == option)
             .map(|tag| Pick::Tag(tag.clone())),
-        "new-channel-worker" => state
-            .workers
-            .iter()
-            .find(|worker| worker.id == option && !chosen_workers.contains(&worker.id))
-            .map(|worker| Pick::Worker(worker.id.clone())),
         _ => None,
     }
 }
@@ -1335,52 +1293,20 @@ mod tests {
     #[test]
     fn a_pick_follows_the_id_when_the_list_changed() {
         let mut state = state_with_choices();
-        assert!(state.groups.len() >= 2, "the mock has groups");
-        let wanted = state.groups[1].id.clone();
-        // The menu was built before this change moved the groups.
-        state.groups.reverse();
+        // The menu was built before this change moved the tags.
+        state.tags.reverse();
         assert_eq!(
-            resolve_pick(&state, &[], "new-channel-group", &wanted),
-            Some(Pick::Group(wanted))
-        );
-        assert_eq!(
-            resolve_pick(&state, &[], "channel-tag", "gpu-nvidia"),
+            resolve_pick(&state, "channel-tag", "gpu-nvidia"),
             Some(Pick::Tag("gpu-nvidia".into()))
         );
-        assert_eq!(
-            resolve_pick(&state, &[], "channel-tag", "no-such-tag"),
-            None
-        );
+        assert_eq!(resolve_pick(&state, "channel-tag", "no-such-tag"), None);
     }
 
     #[test]
     fn a_pick_that_is_gone_resolves_to_nothing() {
         let state = state_with_choices();
-        assert_eq!(resolve_pick(&state, &[], "new-channel-group", "gone"), None);
-        assert_eq!(
-            resolve_pick(&state, &[], "new-channel-worker", "gone"),
-            None
-        );
-        assert_eq!(resolve_pick(&state, &[], "no-such-select", "x"), None);
-    }
-
-    #[test]
-    fn a_worker_that_is_already_chosen_is_not_added_twice() {
-        let state = state_with_choices();
-        let worker = state.workers[0].id.clone();
-        assert_eq!(
-            resolve_pick(&state, &[], "new-channel-worker", &worker),
-            Some(Pick::Worker(worker.clone()))
-        );
-        assert_eq!(
-            resolve_pick(
-                &state,
-                std::slice::from_ref(&worker),
-                "new-channel-worker",
-                &worker
-            ),
-            None
-        );
+        assert_eq!(resolve_pick(&state, "channel-tag", "gone"), None);
+        assert_eq!(resolve_pick(&state, "no-such-select", "x"), None);
     }
 
     #[test]
@@ -1388,11 +1314,11 @@ mod tests {
         let state = ViewState::default();
         for mode in ApprovalMode::ALL {
             assert_eq!(
-                resolve_pick(&state, &[], "approval-mode", mode_key(mode)),
+                resolve_pick(&state, "approval-mode", mode_key(mode)),
                 Some(Pick::ApprovalMode(mode))
             );
         }
-        assert_eq!(resolve_pick(&state, &[], "approval-mode", "root"), None);
+        assert_eq!(resolve_pick(&state, "approval-mode", "root"), None);
     }
 
     #[test]

@@ -87,6 +87,27 @@ pub(crate) fn selection(view: &Option<SelectionView>) -> Option<ModelSelection> 
     })
 }
 
+/// The isolation as the proto names it.
+pub(crate) fn proto_isolation(i: crate::view::Isolation) -> consort_proto::model::Isolation {
+    match i {
+        crate::view::Isolation::InPlace => consort_proto::model::Isolation::InPlace,
+        crate::view::Isolation::Worktree => consort_proto::model::Isolation::Worktree,
+        crate::view::Isolation::Clone => consort_proto::model::Isolation::Clone,
+    }
+}
+
+/// The approval mode as the proto names it.
+pub(crate) fn proto_approval_mode(
+    mode: crate::view::ApprovalMode,
+) -> consort_proto::model::ApprovalMode {
+    match mode {
+        crate::view::ApprovalMode::Ask => consort_proto::model::ApprovalMode::Ask,
+        crate::view::ApprovalMode::AutoEdits => consort_proto::model::ApprovalMode::AutoEdits,
+        crate::view::ApprovalMode::Auto => consort_proto::model::ApprovalMode::Auto,
+        crate::view::ApprovalMode::FullAccess => consort_proto::model::ApprovalMode::FullAccess,
+    }
+}
+
 /// The `channel.update` for some changes, or `None` when they change no
 /// field of it. A group change is a `channel.move`, so it is not here. A
 /// selection of `Some(None)` sends `null`, which takes the selection away.
@@ -118,6 +139,31 @@ pub(crate) fn channel_update(
     }
     if let Some(chosen) = changes.task_selection {
         patch["task_selection"] = json(selection(&chosen))?;
+    }
+    if let Some(isolation) = changes.default_isolation {
+        patch["default_isolation"] = serde_json::to_value(proto_isolation(isolation))
+            .map_err(|e| ClientError::Other(e.to_string()))?;
+    }
+    if let Some(mode) = changes.default_approval_mode {
+        patch["default_approval_mode"] = serde_json::to_value(proto_approval_mode(mode))
+            .map_err(|e| ClientError::Other(e.to_string()))?;
+    }
+    if let Some(servers) = changes.allowed_local_mcp_servers {
+        patch["allowed_local_mcp_servers"] = servers.into();
+    }
+    if let Some(memory) = changes.memory_enabled {
+        patch["memory_enabled"] = memory.into();
+    }
+    // The caller turns new repo URLs into IDs first (`repo.create`).
+    if let Some(repos) = changes.repos {
+        let ids: Vec<String> = repos
+            .into_iter()
+            .filter_map(|r| match r {
+                crate::convo::RepoChoice::Existing(id) => Some(id),
+                crate::convo::RepoChoice::New(_) => None,
+            })
+            .collect();
+        patch["repo_ids"] = ids.into();
     }
     if patch.as_object().is_none_or(|o| o.len() <= 1) {
         return Ok(None);
@@ -277,7 +323,7 @@ async fn run(shared: Arc<Shared>, command: Command) -> Result<CommandOutput, Cli
                     name: new.name.trim().to_owned(),
                     purpose: new.purpose,
                     instructions: String::new(),
-                    icon: None,
+                    icon: new.icon.clone(),
                     color: None,
                     group_id,
                     coordinator_selection: selection(&new.coordinator_selection),
@@ -315,6 +361,10 @@ async fn run(shared: Arc<Shared>, command: Command) -> Result<CommandOutput, Cli
         } => {
             let id: consort_proto::ids::ChannelId = parse(&channel_id, "channel")?;
             let group = changes.group_id.clone();
+            let mut changes = changes;
+            if let Some(repos) = changes.repos.take() {
+                changes.repos = Some(super::convo::resolve_repos(&shared, repos).await?);
+            }
             if let Some(update) = channel_update(id, changes)? {
                 shared.call(update).await?;
             }
@@ -797,6 +847,22 @@ async fn run(shared: Arc<Shared>, command: Command) -> Result<CommandOutput, Cli
         | Command::RevokeClient { .. }
         | Command::ClientPairingCode
         | Command::CancelClientPairing) => return super::admin::run(&shared, command).await,
+        // Phase 4: the conversation and the tasks.
+        command @ (Command::React { .. }
+        | Command::LoadMessageThread { .. }
+        | Command::FindMessage { .. }
+        | Command::ReplyInThread { .. }
+        | Command::Search { .. }
+        | Command::ClearSearch
+        | Command::CreateTask(_)
+        | Command::DeleteTask { .. }
+        | Command::RestoreTask { .. }
+        | Command::LoadArchivedTasks { .. }
+        | Command::OpenTaskItem { .. }
+        | Command::CloseTaskItem
+        | Command::DeleteGroup { .. }
+        | Command::RenameGroup { .. }
+        | Command::ReorderGroups { .. }) => return super::convo::run(&shared, command).await,
         // Connectors, skills and the provider extras.
         other => return super::extensions::run(&shared, other).await,
     }

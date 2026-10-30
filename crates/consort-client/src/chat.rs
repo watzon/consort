@@ -116,6 +116,11 @@ pub enum ChatRow {
         item: usize,
         spacing: Spacing,
     },
+    /// The reaction chips and the reply line under a message, in its lane.
+    Footer {
+        item: usize,
+        lane: Lane,
+    },
 }
 
 impl ChatRow {
@@ -135,6 +140,7 @@ impl ChatRow {
             ChatRow::Attachment(a) => format!("{}#a{}", item_key(a.item), a.part),
             ChatRow::Card(c) => item_key(c.item).to_owned(),
             ChatRow::Notice { item, .. } => item_key(*item).to_owned(),
+            ChatRow::Footer { item, .. } => format!("{}#f", item_key(*item)),
         }
     }
 }
@@ -425,6 +431,9 @@ pub fn rows(items: &[TimelineItem]) -> Vec<ChatRow> {
                     last_bubble = Some(out.len() - 1);
                 }
                 push_attachments(&mut out, &mut open_lane, &mut after_separator);
+                if !m.reactions.is_empty() || m.reply_count > 0 {
+                    out.push(ChatRow::Footer { item: ix, lane });
+                }
             }
             TimelineItem::TaskCard(_) | TimelineItem::Approval(_) | TimelineItem::Decision(_) => {
                 close(&mut out, &mut last_bubble, &mut open_lane);
@@ -784,6 +793,7 @@ mod tests {
                 ChatRow::Attachment(a) => format!("{:?} {}", a.kind, a.item),
                 ChatRow::Card(_) => "card".to_owned(),
                 ChatRow::Notice { .. } => "notice".to_owned(),
+                ChatRow::Footer { .. } => "footer".to_owned(),
             })
             .collect();
         assert_eq!(
@@ -811,5 +821,42 @@ mod tests {
         assert_ne!(rows[1].key(&items), rows[2].key(&items));
         // Your text bubble is the last of your group, so it has the tail.
         assert!(bubbles(&rows)[0].last_in_group);
+    }
+
+    #[test]
+    fn reactions_and_replies_get_a_footer_in_the_lane_of_the_message() {
+        let mut answer = msg("m2", Speaker::Consort, 1, "9:01 AM", "One.\n\nTwo.");
+        if let TimelineItem::Message(m) = &mut answer {
+            m.reply_count = 4;
+        }
+        let mut question = msg("m1", Speaker::You, 0, "9:00 AM", "What is left?");
+        if let TimelineItem::Message(m) = &mut question {
+            m.reactions = vec![crate::convo::ReactionView {
+                emoji: "👀".into(),
+                mine: false,
+                assistant: true,
+            }];
+        }
+        let items = vec![
+            question,
+            answer,
+            msg("m3", Speaker::Consort, 2, "9:02 AM", "Three."),
+        ];
+        let rows = rows(&items);
+        let footers: Vec<(usize, Lane)> = rows
+            .iter()
+            .filter_map(|r| match r {
+                ChatRow::Footer { item, lane } => Some((*item, *lane)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(footers, vec![(0, Lane::You), (1, Lane::Assistant)]);
+        // The footer follows the last bubble of its message.
+        let at = rows
+            .iter()
+            .position(|r| matches!(r, ChatRow::Footer { item: 1, .. }))
+            .unwrap();
+        assert!(matches!(&rows[at - 1], ChatRow::Bubble(b) if b.item == 1 && b.part == 1));
+        assert_eq!(rows[at].key(&items), "m2#f");
     }
 }

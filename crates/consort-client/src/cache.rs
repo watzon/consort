@@ -153,6 +153,8 @@ pub struct Cache {
     pub extensions: Extensions,
     /// The hub status and the paired clients. See [`crate::admin`].
     pub admin: crate::admin::AdminCache,
+    /// Phase 4: search, message threads, the open item, archived tasks.
+    pub convo: crate::convo::ConvoCache,
 }
 
 /// The parts of the connector and skill views that the client loads on
@@ -911,6 +913,7 @@ mod tests {
             worker_id: None,
             review_summary: None,
             resolved_at: None,
+            session_ended: false,
             archived_at: None,
             created_at: Timestamp::from_millis(1),
             updated_at: Timestamp::from_millis(1),

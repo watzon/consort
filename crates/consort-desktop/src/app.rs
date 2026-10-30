@@ -9,8 +9,8 @@ use std::{
 };
 
 use consort_client::{
-    ApprovalChoice, ChannelChanges, Client, ClientError, Connection, Drafts, Isolation, Os,
-    SelectionView, ViewState, update::Updates,
+    ApprovalChoice, ChannelChanges, Client, ClientError, Connection, Drafts, Os, ViewState,
+    update::Updates,
 };
 use consort_theme::{ActiveTokens as _, Tokens, TypeExt as _};
 use gpui_kit::{
@@ -51,9 +51,6 @@ const COUNTDOWN_TICK: Duration = Duration::from_secs(1);
 /// typing makes one write.
 const DRAFT_SAVE_DELAY: Duration = Duration::from_millis(1_500);
 
-/// The text that the New task buttons put in a message box.
-pub const START_TASK_TEXT: &str = "Start a task to ";
-
 /// Which page fills the window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Page {
@@ -70,6 +67,8 @@ pub enum Panel {
     Thread(String),
     /// The Channel panel of the open channel: Files, Routines and Memory.
     Channel,
+    /// The thread of a message, by the root's message ID.
+    MessageThread(String),
 }
 
 /// The tabs of the Channel panel. Only Files is built. Routines and Memory
@@ -126,10 +125,10 @@ pub enum SettingsSection {
 /// The open dialog.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Dialog {
+    /// The New channel dialog: a name and an icon. The group, if any, is in
+    /// `ConsortApp::convo.new_channel_group`.
     NewChannel,
     AddWorker,
-    RenameChannel(String),
-    Instructions(String),
     RenameWorker(String),
     EditTags(String),
     /// A small dialog that names a new group. With a channel ID, the channel
@@ -145,8 +144,6 @@ pub enum Dialog {
     RenameAccount(String, String),
     /// Remove an account: the worker ID and the account ID.
     ConfirmRemoveAccount(String, String),
-    /// The worker tags of a channel.
-    ChannelTags(String),
     /// Change or remove the Composio key.
     ComposioKey,
     /// The connector catalog.
@@ -179,6 +176,16 @@ pub enum Dialog {
     ChooseChannelFiles(consort_client::UploadTarget),
     /// Pair a new app: a setup code, a QR code and the hub address.
     PairClient,
+    /// Phase 4: New task, the channel settings, a group's name and its
+    /// delete, a task's delete, and About. See `crate::convo`.
+    NewTask,
+    ChannelSettings(String),
+    RenameGroup(String),
+    ConfirmDeleteGroup(String),
+    ConfirmDeleteTask(String),
+    About,
+    /// The changes of a new skill version, by skill ID.
+    SkillDiff(String),
 }
 
 /// The step of the Add account dialog.
@@ -219,23 +226,6 @@ pub struct AddAccountForm {
     pub auto_started: bool,
 }
 
-/// The fields of the New channel dialog that are not text inputs.
-#[derive(Clone, Debug, Default)]
-pub struct NewChannelForm {
-    pub group_id: Option<String>,
-    /// The channel goes in a new group. The group's name is in the
-    /// `group_name` input.
-    pub new_group: bool,
-    pub workers: Vec<String>,
-    /// "Model for the assistant". `None` is "Same as Tutti".
-    pub coordinator_selection: Option<SelectionView>,
-    /// "Model for tasks". `None` is "Same as Tutti".
-    pub task_selection: Option<SelectionView>,
-    pub isolation: Isolation,
-    /// The worker tags that the channel requires.
-    pub tags: Vec<String>,
-}
-
 /// The onboarding form state.
 #[derive(Clone, Debug, Default)]
 pub struct Onboarding {
@@ -250,13 +240,9 @@ pub struct Inputs {
     pub decision_answer: Entity<TextareaState>,
     pub edit: Entity<TextareaState>,
     pub name: Entity<InputState>,
-    pub purpose: Entity<InputState>,
-    pub notes: Entity<TextareaState>,
     pub hub_url: Entity<InputState>,
     pub search: Entity<InputState>,
     pub setup_code: Entity<InputState>,
-    /// The name of a new group in the New channel dialog.
-    pub group_name: Entity<InputState>,
     /// The search of the ACP registry in the Add account dialog.
     pub agent_search: Entity<InputState>,
     /// The program and the arguments of a custom command.
@@ -304,9 +290,10 @@ pub struct ConsortApp {
     pub notices: Notices,
     /// The IDs of the refused messages that a notice already showed.
     announced_failures: std::collections::HashSet<String>,
-    pub new_channel: NewChannelForm,
-    /// The tags in the open Worker tags dialog of a channel.
-    pub channel_tags: Vec<String>,
+    /// Phase 4: threads, reactions, search, New task, channel settings,
+    /// groups and About. See `crate::convo`.
+    pub convo: crate::convo::ConvoState,
+    pub convo_inputs: crate::convo::ConvoInputs,
     pub add_account: AddAccountForm,
     /// The worker whose Add tag field is open.
     pub tag_entry: Option<String>,
@@ -450,16 +437,9 @@ impl ConsortApp {
             decision_answer: textarea("Write your answer", (2, 6), window, cx),
             edit: textarea("Message", (1, 10), window, cx),
             name: field("Name", window, cx),
-            purpose: field("What is this channel for?", window, cx),
-            notes: cx.new(|cx| {
-                TextareaState::new(window, cx)
-                    .auto_grow(8, 16)
-                    .placeholder("Write standing guidance for Consort in this channel")
-            }),
             hub_url: field("https://hub.example.com", window, cx),
             search: field("Go to a channel or a task", window, cx),
             setup_code: field("ABCD-EFGH", window, cx),
-            group_name: field("Name of the new group", window, cx),
             agent_search: field("Search agents", window, cx),
             program: field("Program, such as my-agent", window, cx),
             program_args: field("Arguments, such as --acp", window, cx),
@@ -474,8 +454,10 @@ impl ConsortApp {
             model_search: field("Search every account", window, cx),
         };
         let ext_inputs = crate::extensions::ExtInputs::new(window, cx);
+        let (convo_inputs, convo_subscriptions) = crate::convo::ConvoInputs::new(window, cx);
         let (admin, admin_subscriptions) = crate::admin::AdminState::new(&client, demo, window, cx);
         let mut subscriptions = admin_subscriptions;
+        subscriptions.extend(convo_subscriptions);
         subscriptions.push(cx.subscribe_in(
             &inputs.composer,
             window,
@@ -510,8 +492,6 @@ impl ConsortApp {
         // submits it.
         for field in [
             &inputs.name,
-            &inputs.purpose,
-            &inputs.group_name,
             &inputs.hub_url,
             &inputs.setup_code,
             &inputs.program,
@@ -581,6 +561,7 @@ impl ConsortApp {
                 if let InputEvent::Change = event {
                     if this.switcher.is_some() {
                         this.switcher = Some(0);
+                        this.search_changed(cx);
                     }
                     cx.notify();
                 }
@@ -654,8 +635,8 @@ impl ConsortApp {
             thread_keys: Vec::new(),
             notices: Notices::default(),
             announced_failures: std::collections::HashSet::new(),
-            new_channel: NewChannelForm::default(),
-            channel_tags: Vec::new(),
+            convo: crate::convo::ConvoState::default(),
+            convo_inputs,
             add_account: AddAccountForm::default(),
             tag_entry: None,
             tag_error: None,
@@ -767,7 +748,6 @@ impl ConsortApp {
             &self.inputs.composer,
             &self.inputs.reply,
             &self.inputs.decision_answer,
-            &self.inputs.notes,
             &self.inputs.edit,
         ] {
             let style = style.clone();
@@ -778,11 +758,9 @@ impl ConsortApp {
         }
         for field in [
             &self.inputs.name,
-            &self.inputs.purpose,
             &self.inputs.hub_url,
             &self.inputs.setup_code,
             &self.inputs.search,
-            &self.inputs.group_name,
             &self.inputs.agent_search,
             &self.inputs.program,
             &self.inputs.program_args,
@@ -801,6 +779,7 @@ impl ConsortApp {
                 cx.notify();
             });
         }
+        self.convo_inputs.set_style(&style, cx);
     }
 
     pub fn tokens(cx: &gpui_kit::App) -> Tokens {
@@ -835,6 +814,7 @@ impl ConsortApp {
         {
             self.panel = Panel::None;
         }
+        self.follow_convo(cx);
         if let Some((name, before)) = self.open_created.clone()
             && let Some(created) = self
                 .state
@@ -1114,10 +1094,18 @@ impl ConsortApp {
         }
         self.timeline_channel = self.channel_id.clone();
         let thread_keys: Vec<String> = match &self.panel {
+            // The brief is the first row of the thread, as bubbles.
             Panel::Thread(task_id) => self
                 .state
                 .thread(task_id)
-                .map(|t| t.posts.iter().map(|p| p.id.clone()).collect())
+                .map(|t| {
+                    let brief = (!t.brief.trim().is_empty())
+                        .then(|| format!("brief-{task_id}-{}", t.text_is_preview));
+                    brief
+                        .into_iter()
+                        .chain(t.posts.iter().map(|p| p.id.clone()))
+                        .collect()
+                })
                 .unwrap_or_default(),
             _ => Vec::new(),
         };
@@ -1371,19 +1359,6 @@ impl ConsortApp {
                     }
                 }
             }
-            // The Instructions dialog of sayso, with its purpose.
-            "instructions" => {
-                if let Some(id) = sayso.clone() {
-                    self.open_channel(id.clone(), window, cx);
-                    self.open_dialog(Dialog::Instructions(id), window, cx);
-                }
-            }
-            "channel-tags" => {
-                if let Some(id) = sayso.clone() {
-                    self.open_channel(id.clone(), window, cx);
-                    self.open_dialog(Dialog::ChannelTags(id), window, cx);
-                }
-            }
             "update-ready" => {
                 // The notice above the account row: the update is
                 // downloaded and checked.
@@ -1414,25 +1389,6 @@ impl ConsortApp {
                     });
                     self.apply_state(self.state.clone(), cx);
                 }
-            }
-            "new-channel" => {
-                self.open_dialog(Dialog::NewChannel, window, cx);
-                self.set_field(Field::Name, "consort", window, cx);
-                self.set_field(
-                    Field::Purpose,
-                    "Build Consort: the hub, the workers and the desktop app",
-                    window,
-                    cx,
-                );
-                self.new_channel.workers = self
-                    .state
-                    .workers
-                    .iter()
-                    .filter(|w| w.name == "MacBook Pro" || w.name == "homelab")
-                    .rev()
-                    .map(|w| w.id.clone())
-                    .collect();
-                self.new_channel.tags = vec!["personal".to_owned()];
             }
             // Phase 1: files and attachments, in house-lights.
             "attachments" | "drop" | "bubbles" | "lightbox" | "files" | "files-menu"
@@ -1631,7 +1587,9 @@ impl ConsortApp {
                 }
             }
             other => {
-                self.open_admin_screen(other, window, cx);
+                if !self.open_convo_screen(other, window, cx) {
+                    self.open_admin_screen(other, window, cx);
+                }
             }
         }
         cx.notify();
@@ -1796,15 +1754,12 @@ impl ConsortApp {
 
     /// Puts "Start a task to " in the composer after the draft. A draft is
     /// never replaced.
-    pub fn start_task_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// The New task buttons open the New task dialog.
+    pub fn open_new_task(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.waiting().is_some() {
             return;
         }
-        self.inputs.composer.update(cx, |input, cx| {
-            let draft = input.value().to_string();
-            input.set_value(drafts::start_task_text(&draft), window, cx);
-            input.focus(window, cx);
-        });
+        self.open_dialog(Dialog::NewTask, window, cx);
     }
 
     /// Connects to the hub now, without waiting for the retry timer.
@@ -2037,33 +1992,21 @@ impl ConsortApp {
         self.dialog_serial += 1;
         match &dialog {
             Dialog::NewChannel => {
-                self.new_channel = NewChannelForm {
-                    group_id: self.state.groups.first().map(|g| g.id.clone()),
-                    new_group: false,
-                    workers: Vec::new(),
-                    coordinator_selection: None,
-                    task_selection: None,
-                    isolation: Isolation::Worktree,
-                    tags: Vec::new(),
-                };
+                self.convo.new_channel_icon = crate::convo::NEW_CHANNEL_ICONS[0].to_owned();
                 self.set_field(Field::Name, "", window, cx);
-                self.set_field(Field::Purpose, "", window, cx);
-                self.set_field(Field::GroupName, "", window, cx);
                 focus_input(&self.inputs.name, window, cx);
             }
             Dialog::NewGroup(_) => {
                 self.set_field(Field::Name, "", window, cx);
                 focus_input(&self.inputs.name, window, cx);
             }
-            Dialog::RenameChannel(id) => {
-                let name = self
-                    .state
-                    .channel(id)
-                    .map(|c| c.name.clone())
-                    .unwrap_or_default();
-                self.set_field(Field::Name, &name, window, cx);
-                focus_input(&self.inputs.name, window, cx);
-            }
+            Dialog::NewTask
+            | Dialog::ChannelSettings(_)
+            | Dialog::RenameGroup(_)
+            | Dialog::ConfirmDeleteGroup(_)
+            | Dialog::ConfirmDeleteTask(_)
+            | Dialog::SkillDiff(_)
+            | Dialog::About => self.prepare_convo_dialog(&dialog, window, cx),
             Dialog::RenameWorker(id) => {
                 let name = self
                     .state
@@ -2081,26 +2024,6 @@ impl ConsortApp {
                     .unwrap_or_default();
                 self.set_field(Field::Name, &tags, window, cx);
                 focus_input(&self.inputs.name, window, cx);
-            }
-            Dialog::Instructions(id) => {
-                // The purpose lives here since the channel header went away.
-                let purpose = self
-                    .state
-                    .channel(id)
-                    .map(|c| c.purpose.clone())
-                    .unwrap_or_default();
-                self.set_field(Field::Purpose, &purpose, window, cx);
-                let notes = self
-                    .state
-                    .channel(id)
-                    .map(|c| c.instructions.clone())
-                    .unwrap_or_default();
-                self.inputs
-                    .notes
-                    .update(cx, |input, cx| input.set_value(notes, window, cx));
-                self.inputs
-                    .notes
-                    .update(cx, |input, cx| input.focus(window, cx));
             }
             Dialog::AddWorker => {
                 self.add_worker_os = crate::ui::add_worker::default_os();
@@ -2153,13 +2076,6 @@ impl ConsortApp {
                     .unwrap_or_default();
                 self.set_field(Field::Name, &name, window, cx);
                 focus_input(&self.inputs.name, window, cx);
-            }
-            Dialog::ChannelTags(id) => {
-                self.channel_tags = self
-                    .state
-                    .channel(id)
-                    .map(|c| c.tags.clone())
-                    .unwrap_or_default();
             }
             Dialog::RenameFile(_, path) => {
                 let name = consort_client::files::split_path(path).1.to_owned();
@@ -2336,8 +2252,6 @@ impl ConsortApp {
     ) {
         let input = match field {
             Field::Name => &self.inputs.name,
-            Field::Purpose => &self.inputs.purpose,
-            Field::GroupName => &self.inputs.group_name,
             Field::HubUrl => &self.inputs.hub_url,
             Field::SetupCode => &self.inputs.setup_code,
         };
@@ -2348,8 +2262,6 @@ impl ConsortApp {
     pub fn field(&self, field: Field, cx: &gpui_kit::App) -> String {
         let input = match field {
             Field::Name => &self.inputs.name,
-            Field::Purpose => &self.inputs.purpose,
-            Field::GroupName => &self.inputs.group_name,
             Field::HubUrl => &self.inputs.hub_url,
             Field::SetupCode => &self.inputs.setup_code,
         };
@@ -2405,7 +2317,7 @@ impl ConsortApp {
     /// key does nothing until the first ends. A failure shows the error with
     /// `kept`, a sentence that says what the user still has. On success,
     /// `on_ok` runs.
-    fn run_guarded<F>(
+    pub(crate) fn run_guarded<F>(
         &mut self,
         key: String,
         command: F,
@@ -2435,7 +2347,7 @@ impl ConsortApp {
 
     /// Empties a message box after its text went out, if the box still holds
     /// what was sent. Text that the user typed meanwhile stays.
-    fn clear_draft_if_sent(
+    pub(crate) fn clear_draft_if_sent(
         input: &Entity<TextareaState>,
         sent: &str,
         window: &mut Window,
@@ -2673,13 +2585,10 @@ impl ConsortApp {
             MenuAction::QuoteInReply(text) => self.quote_in_reply(&text, window, cx),
             MenuAction::AskConsort(text) => self.ask_consort(&text, window, cx),
             MenuAction::OpenThread(task_id) => self.open_thread(task_id, window, cx),
-            MenuAction::ReplyInThread(text) => {
-                self.quote_in_reply(&text, window, cx);
-                self.show_notice(
-                    "Threads on messages come in a later build. The message is quoted in the composer.".into(),
-                    cx,
-                );
+            MenuAction::ReplyInThread(message_id) => {
+                self.open_message_thread(message_id, window, cx)
             }
+            MenuAction::Convo(action) => self.run_convo(action, window, cx),
             MenuAction::EditMessage(message_id, text) => {
                 self.editing = Some(message_id);
                 let end = text.len();
@@ -2711,11 +2620,10 @@ impl ConsortApp {
             MenuAction::ArchiveTask(id) => {
                 self.spawn_command(cx, async move { client.archive_task(id).await })
             }
-            MenuAction::RenameChannel(id) => {
-                self.open_dialog(Dialog::RenameChannel(id), window, cx)
-            }
-            MenuAction::ChannelInstructions(id) => {
-                self.open_dialog(Dialog::Instructions(id), window, cx)
+            // Rename, Instructions, Model and Worker tags all open the
+            // channel settings, which replaced their dialogs.
+            MenuAction::RenameChannel(id) | MenuAction::ChannelInstructions(id) => {
+                self.open_dialog(Dialog::ChannelSettings(id), window, cx)
             }
             MenuAction::ChangeIcon(id) => {
                 if let Some(anchor) = self.last_menu_anchor() {
@@ -2787,12 +2695,8 @@ impl ConsortApp {
             MenuAction::RemoveWorker(id) => {
                 self.open_dialog(Dialog::ConfirmRemoveWorker(id), window, cx)
             }
-            MenuAction::ChannelTags(id) => self.open_dialog(Dialog::ChannelTags(id), window, cx),
-            MenuAction::ChannelModel(id) => {
-                // The picker opens where the channel menu was.
-                if let Some(anchor) = self.last_menu_anchor() {
-                    self.open_picker(PickerTarget::Assistant(id), anchor.anchor, window, cx);
-                }
+            MenuAction::ChannelTags(id) | MenuAction::ChannelModel(id) => {
+                self.open_dialog(Dialog::ChannelSettings(id), window, cx)
             }
             MenuAction::RenameAccount(worker_id, account_id) => {
                 self.open_dialog(Dialog::RenameAccount(worker_id, account_id), window, cx)
@@ -3029,8 +2933,6 @@ impl ConsortApp {
 #[derive(Clone, Copy)]
 pub enum Field {
     Name,
-    Purpose,
-    GroupName,
     HubUrl,
     SetupCode,
 }
@@ -3164,6 +3066,11 @@ impl Render for ConsortApp {
             .key_context("Consort")
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::on_key_down))
+            .on_action(
+                cx.listener(|this, _: &crate::convo::ShowAbout, window, cx| {
+                    this.open_dialog(Dialog::About, window, cx)
+                }),
+            )
             .relative()
             .size_full()
             .flex()
@@ -3200,6 +3107,7 @@ impl Render for ConsortApp {
             .children(picker)
             .children(picker_tip)
             .children(effort)
+            .children(self.render_emoji_picker(&t, window, cx))
             .when_some(menu, |root, menu| {
                 root.child(render_menu(
                     &menu,

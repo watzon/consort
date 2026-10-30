@@ -1,18 +1,14 @@
-//! The switcher (Command K): go to a channel or a task. It searches the view
-//! state on this client, so it works offline and answers at once.
+//! The search palette (Command K): go to a channel or a task at once, from
+//! the view state on this client, and find messages, memory notes and tasks
+//! on the hub (`message.search`). The view is in `ui/convo_search.rs`.
 
 use consort_client::{ChannelKind, TaskStatus, ViewState};
-use consort_theme::{Tokens, TypeExt as _};
-use gpui_kit::{
-    AnyElement, Context, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, ParentElement,
-    SharedString, StatefulInteractiveElement as _, Styled, Window, div,
-    prelude::FluentBuilder as _,
-};
+use consort_theme::Tokens;
+use gpui_kit::{AnyElement, Context, KeyDownEvent, Window};
 
-use crate::{
-    app::ConsortApp,
-    ui::parts::{detail, icon, line, status_glyph, text},
-};
+use consort_client::convo::{SearchHitView, SearchSection, SearchTarget};
+
+use crate::app::ConsortApp;
 
 /// The most rows the switcher shows.
 const MAX_ROWS: usize = 10;
@@ -54,10 +50,22 @@ fn score(text: &str, query: &str) -> u8 {
     }
 }
 
+/// How well `text` matches any word of `query`: the best score of the
+/// words. One word that matches is enough, so "windows engine" finds the
+/// channel whose purpose says "Windows".
+fn score_words(text: &str, query: &str) -> u8 {
+    let mut best = score(text, query);
+    for word in query.split_whitespace().filter(|w| w.chars().count() > 1) {
+        best = best.max(score(text, word));
+    }
+    best
+}
+
 /// The results for `query`: channels first, then tasks, best match first.
 /// With no query: every channel, then the tasks that need the user.
 pub fn search(state: &ViewState, query: &str) -> Vec<Hit> {
     let query = query.trim().to_lowercase();
+    let score = score_words;
     let mut channels: Vec<(u8, usize, Hit)> = state
         .channels
         .iter()
@@ -131,9 +139,14 @@ impl ConsortApp {
     pub fn open_switcher(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.menu = None;
         self.switcher = Some(0);
+        self.convo.search_scope = consort_client::convo::SearchScope::All;
         self.inputs.search.update(cx, |input, cx| {
             input.set_value("", window, cx);
             input.focus(window, cx);
+        });
+        let client = self.client.clone();
+        self.spawn_command(cx, async move {
+            client.run(consort_client::Command::ClearSearch).await
         });
         cx.notify();
     }
@@ -144,12 +157,37 @@ impl ConsortApp {
         cx.notify();
     }
 
-    fn switcher_hits(&self, cx: &gpui_kit::App) -> Vec<Hit> {
+    pub(crate) fn switcher_hits(&self, cx: &gpui_kit::App) -> Vec<Hit> {
+        if !self.convo.search_scope.shows_go_to() {
+            return Vec::new();
+        }
         let query = self.inputs.search.read(cx).value().to_string();
-        search(&self.state, &query)
+        let mut hits = search(&self.state, &query);
+        if self.convo.search_scope == consort_client::convo::SearchScope::Tasks {
+            hits.retain(|h| matches!(h, Hit::Task { .. }));
+        }
+        hits
     }
 
-    fn go_to(&mut self, hit: Hit, window: &mut Window, cx: &mut Context<Self>) {
+    /// The hub results that the palette shows now, in the order of their
+    /// sections: messages, memory, tasks.
+    pub(crate) fn hub_hits(&self, cx: &gpui_kit::App) -> Vec<SearchHitView> {
+        let query = self.inputs.search.read(cx).value().trim().to_owned();
+        let search = &self.state.convo.search;
+        if search.query.trim() != query || search.scope != self.convo.search_scope {
+            return Vec::new();
+        }
+        let mut hits = search.hits.clone();
+        let rank = |s: SearchSection| match s {
+            SearchSection::Messages => 0,
+            SearchSection::Memory => 1,
+            SearchSection::Tasks => 2,
+        };
+        hits.sort_by_key(|h| rank(h.section));
+        hits
+    }
+
+    pub(crate) fn go_to(&mut self, hit: Hit, window: &mut Window, cx: &mut Context<Self>) {
         self.close_switcher(window, cx);
         match hit {
             Hit::Channel { id, .. } => self.open_channel(id, window, cx),
@@ -160,20 +198,126 @@ impl ConsortApp {
         }
     }
 
-    fn switcher_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+    /// Opens a hub result in place: a message in its channel, a reply in
+    /// its thread, a task in its thread, a memory note in its channel.
+    pub fn open_hit(&mut self, hit: SearchHitView, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_switcher(window, cx);
+        let client = self.client.clone();
+        match hit.target {
+            SearchTarget::Message {
+                channel_id,
+                message_id,
+                thread_root_id,
+                task_id,
+            } => {
+                if self.state.channel(&channel_id).is_some() {
+                    self.open_channel(channel_id.clone(), window, cx);
+                }
+                match (thread_root_id, task_id) {
+                    (Some(_), Some(task)) => self.open_thread(task, window, cx),
+                    (Some(root), None) => {
+                        self.convo.scroll_to = Some(root.clone());
+                        let (c2, r2) = (channel_id.clone(), root.clone());
+                        let find = client.clone();
+                        self.spawn_command(cx, async move {
+                            find.run(consort_client::Command::FindMessage {
+                                channel_id: c2,
+                                message_id: r2,
+                            })
+                            .await
+                        });
+                        self.open_message_thread(root, window, cx);
+                    }
+                    (None, _) => {
+                        self.convo.scroll_to = Some(message_id.clone());
+                        self.spawn_command(cx, async move {
+                            client
+                                .run(consort_client::Command::FindMessage {
+                                    channel_id,
+                                    message_id,
+                                })
+                                .await
+                        });
+                    }
+                }
+            }
+            SearchTarget::Task {
+                task_id,
+                channel_id,
+            } => {
+                if self.state.channel(&channel_id).is_some() {
+                    self.open_channel(channel_id, window, cx);
+                }
+                if self.state.task(&task_id).is_some() {
+                    self.open_thread(task_id, window, cx);
+                } else {
+                    // An archived task: the Resolved tab lists it with
+                    // Restore.
+                    self.panel = crate::app::Panel::Tasks;
+                    self.tasks_tab = crate::app::TasksTab::Resolved;
+                    self.convo.archived_open = true;
+                    self.spawn_command(cx, async move {
+                        client
+                            .run(consort_client::Command::LoadArchivedTasks { more: false })
+                            .await
+                    });
+                }
+            }
+            // The memory views come with phase 2. Until then a note opens
+            // its channel (Tutti for global memory).
+            SearchTarget::Memory { channel_id, .. } => {
+                let id = channel_id
+                    .filter(|id| self.state.channel(id).is_some())
+                    .or_else(|| self.state.tutti().map(|c| c.id.clone()));
+                if let Some(id) = id {
+                    self.open_channel(id, window, cx);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// "Ask Tutti to search": Tutti gets the question, and the assistant
+    /// looks with its own tools.
+    pub(crate) fn ask_tutti_to_search(
+        &mut self,
+        query: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_switcher(window, cx);
+        let Some(tutti) = self.state.tutti().map(|c| c.id.clone()) else {
+            return;
+        };
+        self.open_channel(tutti.clone(), window, cx);
+        let client = self.client.clone();
+        let body = format!(
+            "Look for \u{201C}{query}\u{201D} in my channels, tasks and memory, and tell me what you find."
+        );
+        self.spawn_command(cx, async move { client.send_message(tutti, body).await });
+    }
+
+    pub(crate) fn switcher_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(selected) = self.switcher else {
             return;
         };
-        let hits = self.switcher_hits(cx);
+        let local = self.switcher_hits(cx);
+        let hub = self.hub_hits(cx);
+        let total = local.len() + hub.len();
         match event.keystroke.key.as_str() {
             "escape" => self.close_switcher(window, cx),
-            "down" if !hits.is_empty() => self.switcher = Some((selected + 1) % hits.len()),
-            "up" if !hits.is_empty() => {
-                self.switcher = Some((selected + hits.len() - 1) % hits.len())
-            }
+            "down" if total > 0 => self.switcher = Some((selected + 1) % total),
+            "up" if total > 0 => self.switcher = Some((selected + total - 1) % total),
             "enter" => {
-                if let Some(hit) = hits.get(selected).cloned() {
+                if let Some(hit) = local.get(selected).cloned() {
                     self.go_to(hit, window, cx);
+                } else if let Some(hit) = hub.get(selected.saturating_sub(local.len())).cloned() {
+                    self.open_hit(hit, window, cx);
                 }
             }
             _ => return,
@@ -183,173 +327,7 @@ impl ConsortApp {
     }
 
     pub fn render_switcher(&mut self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
-        let c = &t.colors;
-        let hits = self.switcher_hits(cx);
-        let selected = self.switcher.unwrap_or(0).min(hits.len().saturating_sub(1));
-        let query = self.inputs.search.read(cx).value().trim().to_owned();
-        let mut list = div().flex().flex_col().p(t.space.xs);
-        let mut last_kind: Option<bool> = None;
-        for (i, hit) in hits.iter().enumerate() {
-            let is_task = matches!(hit, Hit::Task { .. });
-            if last_kind != Some(is_task) {
-                list = list.child(
-                    div()
-                        .px(t.space.sm)
-                        .pt(if i == 0 { t.space.xs } else { t.space.sm })
-                        .pb(t.space.xs)
-                        .child(text(
-                            if is_task { "Tasks" } else { "Channels" },
-                            t.text.label,
-                            c.text_tertiary,
-                        )),
-                );
-                last_kind = Some(is_task);
-            }
-            let is_selected = i == selected;
-            // `text.tertiary` never sits on `surface.selected`.
-            let quiet = if is_selected {
-                c.text_secondary
-            } else {
-                c.text_tertiary
-            };
-            let (leading, name, detail_text) = match hit {
-                Hit::Channel {
-                    name,
-                    icon: icon_name,
-                    tutti,
-                    detail: d,
-                    ..
-                } => (
-                    if *tutti {
-                        crate::ui::mark::still_mark(t.icon.size, t)
-                    } else {
-                        icon(icon_name, t.icon.size, c.text_secondary).into_any_element()
-                    },
-                    name.clone(),
-                    d.clone(),
-                ),
-                Hit::Task {
-                    id,
-                    title,
-                    status,
-                    detail: d,
-                    ..
-                } => (
-                    status_glyph(
-                        SharedString::from(format!("switcher-{id}")),
-                        *status,
-                        t.icon.size,
-                        t,
-                        cx,
-                    ),
-                    title.clone(),
-                    d.clone(),
-                ),
-            };
-            let pick = hit.clone();
-            list =
-                list.child(
-                    div()
-                        .id(("switcher-row", i))
-                        .flex()
-                        .items_center()
-                        .gap(t.space.md)
-                        .h(t.space.xxl + t.space.xs)
-                        .px(t.space.sm)
-                        .rounded(t.radius.md)
-                        .cursor_pointer()
-                        .when(is_selected, |d| d.bg(c.surface_selected))
-                        .when(!is_selected, |d| d.hover(|s| s.bg(c.hover_raised)))
-                        .child(leading)
-                        .child(
-                            line(name, t.text.ui, c.text_primary)
-                                .flex_none()
-                                .max_w(t.layout.switcher_name_max),
-                        )
-                        .child(line(detail_text, t.text.ui, quiet).flex_1())
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.go_to(pick.clone(), window, cx)
-                        })),
-                );
-        }
-        if hits.is_empty() {
-            list = list.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(t.space.xxs)
-                    .p(t.space.md)
-                    .child(text(
-                        format!("Nothing matches \u{201C}{query}\u{201D}"),
-                        t.text.ui_strong,
-                        c.text_primary,
-                    ))
-                    .child(text(
-                        "Try a shorter word, or the name of a channel.",
-                        t.text.ui,
-                        c.text_secondary,
-                    )),
-            );
-        }
-        let panel = div()
-            .id("switcher")
-            .occlude()
-            .flex()
-            .flex_col()
-            .w(t.layout.switcher_width)
-            .bg(c.surface_raised)
-            .border(t.border_width)
-            .border_color(c.border_strong)
-            .rounded(t.radius.xl)
-            .shadow(t.shadow_float())
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .capture_key_down(cx.listener(Self::switcher_key))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(t.space.md)
-                    .px(t.space.lg)
-                    .py(t.space.md)
-                    .border_b(t.border_width)
-                    .border_color(c.border_subtle)
-                    .child(icon("search", t.icon.size, c.text_secondary))
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_color(c.text_primary)
-                            .child(crate::ui::parts::input(&self.inputs.search, t.text.body)),
-                    )
-                    .child(
-                        div()
-                            .px(t.space.xs + t.space.xxs)
-                            .rounded(t.radius.sm)
-                            .border(t.border_width)
-                            .border_color(c.border_strong)
-                            .type_style(detail(t))
-                            .text_color(c.text_secondary)
-                            .child("Esc"),
-                    ),
-            )
-            .child(list);
-        div()
-            .id("switcher-scrim")
-            .absolute()
-            .top_0()
-            .left_0()
-            .size_full()
-            .occlude()
-            .flex()
-            .items_start()
-            .justify_center()
-            .pt(t.layout.switcher_top)
-            .bg(c.scrim)
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, window, cx| this.close_switcher(window, cx)),
-            )
-            .child(panel)
-            .into_any_element()
+        crate::ui::convo_search::render_search(self, t, cx)
     }
 }
 
@@ -383,6 +361,17 @@ mod tests {
                     _ => None,
                 })
                 .all(TaskStatus::is_your_turn)
+        );
+    }
+
+    #[test]
+    fn one_word_of_the_query_is_enough() {
+        let state = consort_client::mock::view_state();
+        let hits = search(&state, "windows engine");
+        assert!(
+            hits.iter()
+                .any(|h| matches!(h, Hit::Channel { name, .. } if name == "sayso")),
+            "{hits:?}"
         );
     }
 

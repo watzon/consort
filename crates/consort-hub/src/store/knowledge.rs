@@ -8,7 +8,7 @@ use consort_proto::model::{
     MemoryScope, Sha256Hash, memory_note_entity_id,
 };
 use consort_proto::time::Timestamp;
-use consort_proto::tools::SearchHit;
+use consort_proto::tools::{SearchHit, SearchKind};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use super::{Tx, get_doc, list_docs, to_doc};
@@ -447,28 +447,40 @@ fn fts_query(text: &str) -> Option<String> {
 
 /// Searches messages, memory notes and task titles. `allow` filters hits, for
 /// example by what the caller may read. The result has at most `limit` hits.
+///
+/// `kinds` keeps only hits of those kinds. Empty keeps every kind. The kind
+/// filter runs in the query, so a search for memory notes is not crowded
+/// out by many messages.
 pub fn search(
     conn: &Connection,
     query: &str,
     channel_id: Option<ChannelId>,
+    kinds: &[SearchKind],
     limit: usize,
     allow: &dyn Fn(&SearchHit) -> bool,
 ) -> Result<Vec<SearchHit>> {
     let Some(fts) = fts_query(query) else {
         return Ok(Vec::new());
     };
+    // `,message,task,` and so on: `instr` finds `,<kind>,` in it.
+    let kind_list = (!kinds.is_empty()).then(|| {
+        let names: Vec<&str> = kinds.iter().map(|k| k.as_str()).collect();
+        format!(",{},", names.join(","))
+    });
     let mut stmt = conn.prepare_cached(
         "SELECT kind, ref, channel_id, scope, title,
                 snippet(search_idx, 5, '', '', '\u{2026}', 18)
          FROM search_idx
          WHERE search_idx MATCH ?1 AND (?2 IS NULL OR channel_id = ?2)
+           AND (?4 IS NULL OR instr(?4, ',' || kind || ',') > 0)
          ORDER BY rank LIMIT ?3",
     )?;
     let rows = stmt.query_map(
         params![
             fts,
             channel_id.map(|c| c.to_string()),
-            i64::try_from(limit.saturating_mul(4).max(limit)).unwrap_or(i64::MAX)
+            i64::try_from(limit.saturating_mul(4).max(limit)).unwrap_or(i64::MAX),
+            kind_list
         ],
         |row| {
             Ok((
@@ -503,10 +515,12 @@ pub fn search(
             }
             "memory_note" => {
                 let Ok(scope) = scope.parse() else { continue };
+                let updated_at = memory_note(conn, scope, &title)?.map(|n| n.updated_at);
                 SearchHit::MemoryNote {
                     scope,
                     path: title,
                     snippet,
+                    updated_at,
                 }
             }
             "task" => {
@@ -519,6 +533,7 @@ pub fn search(
                     channel_id: task.channel_id,
                     title: task.title,
                     status: task.status,
+                    updated_at: Some(task.updated_at),
                 }
             }
             _ => continue,
@@ -602,7 +617,7 @@ mod tests {
         assert_eq!(second.version, 2);
 
         let hits = store
-            .read(|conn| search(conn, "coffee", None, 10, &|_| true))
+            .read(|conn| search(conn, "coffee", None, &[], 10, &|_| true))
             .await
             .unwrap();
         assert_eq!(hits.len(), 1);

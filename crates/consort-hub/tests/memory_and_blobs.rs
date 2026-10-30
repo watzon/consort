@@ -15,6 +15,7 @@ use consort_proto::client_api::{
 use consort_proto::error::ErrorCode;
 use consort_proto::model::{ExpectedHash, MemoryScope, Sha256Hash};
 use consort_proto::time::Timestamp;
+use consort_proto::tools::{SearchHit, SearchKind};
 use ed25519_dalek::Signer;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -298,6 +299,7 @@ async fn message_search_finds_messages_and_memory_with_a_tool() {
             query: "quarterly".to_owned(),
             channel_id: None,
             limit: None,
+            kinds: Vec::new(),
         })
         .await
         .unwrap();
@@ -320,6 +322,48 @@ async fn message_search_finds_messages_and_memory_with_a_tool() {
         .collect();
     assert!(kinds.contains(&"message".to_owned()), "{kinds:?}");
     assert!(kinds.contains(&"memory_note".to_owned()), "{kinds:?}");
+
+    // A client can ask for one kind. The memory hit says when the note
+    // changed, so the search results can show it.
+    let notes = world
+        .client
+        .request(MessageSearch {
+            query: "quarterly".to_owned(),
+            channel_id: None,
+            limit: Some(1),
+            kinds: vec![SearchKind::MemoryNote],
+        })
+        .await
+        .unwrap();
+    assert_eq!(notes.hits.len(), 1, "{:?}", notes.hits);
+    match &notes.hits[0] {
+        SearchHit::MemoryNote {
+            path, updated_at, ..
+        } => {
+            assert_eq!(path, "work.md");
+            assert!(updated_at.is_some());
+        }
+        other => panic!("not a memory note: {other:?}"),
+    }
+    let messages = world
+        .client
+        .request(MessageSearch {
+            query: "quarterly".to_owned(),
+            channel_id: None,
+            limit: None,
+            kinds: vec![SearchKind::Message, SearchKind::Task],
+        })
+        .await
+        .unwrap();
+    assert!(
+        messages
+            .hits
+            .iter()
+            .all(|h| h.kind() == SearchKind::Message),
+        "{:?}",
+        messages.hits
+    );
+    assert_eq!(messages.hits.len(), 1);
     world.hub.handle.shutdown().await.unwrap();
 }
 

@@ -82,6 +82,7 @@ impl Hub {
                     worker_id: None,
                     review_summary: None,
                     resolved_at: None,
+                    session_ended: false,
                     archived_at: None,
                     created_at: now,
                     updated_at: now,
@@ -314,6 +315,7 @@ impl Hub {
                     None,
                 )?;
                 task.current_session_id = Some(session.id);
+                task.session_ended = false;
                 task.worker_id = Some(worker_id);
                 tx.save_task(&task)?;
                 Ok(true)
@@ -586,6 +588,7 @@ impl Hub {
                 let mut task = work::task_or_404(tx.db(), id)?;
                 if transition(tx, &mut task, TaskStatus::UpNext, actor, None, None)? {
                     task.current_session_id = None;
+                    task.session_ended = false;
                     task.worker_id = None;
                     task.review_summary = None;
                     tx.save_task(&task)?;
@@ -655,11 +658,15 @@ impl Hub {
                 if task.archived_at.is_some() != archived_at.is_some() {
                     task.archived_at = archived_at;
                     task.updated_at = tx.now();
-                    tx.save_task(&task)?;
                     // A resolved task is done, so its session stops and its
                     // workspace goes (DECISION 61). Resolve alone keeps
                     // both, because Not done needs them.
-                    if task.archived_at.is_some() && task.status == TaskStatus::Resolved {
+                    let release = task.archived_at.is_some() && task.status == TaskStatus::Resolved;
+                    if release && task.current_session_id.is_some() {
+                        task.session_ended = true;
+                    }
+                    tx.save_task(&task)?;
+                    if release {
                         fx = release_task(&hub, tx, &task, "The task was archived.")?;
                     }
                 }

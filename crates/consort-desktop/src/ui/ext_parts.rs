@@ -348,6 +348,23 @@ pub fn faded_scroll(
                 .on_scroll(cx.listener(|_, _, _, cx| cx.notify()))
                 .child(content),
         )
+        // The list knows its height only after its first layout. When that
+        // shows more rows below than this draw assumed, draw again, so the
+        // bottom fade is there before the first scroll.
+        .child({
+            let handle = handle.clone();
+            gpui_kit::canvas(
+                move |_, window, _| {
+                    let now_below = -handle.offset().y + Pixels::from(0.5) < handle.max_offset().y;
+                    if now_below != below {
+                        window.refresh();
+                    }
+                },
+                |_, _, _, _| {},
+            )
+            .absolute()
+            .size_0()
+        })
         .when(above, |d| {
             d.child(
                 div()

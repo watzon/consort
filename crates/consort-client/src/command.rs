@@ -152,6 +152,8 @@ pub struct NewChannel {
     /// client makes the group first and puts the channel in it, and
     /// `group_id` is not used.
     pub new_group: Option<String>,
+    /// The icon, a Lucide icon name. `None` gives the default.
+    pub icon: Option<String>,
 }
 
 /// Changes to a channel. A `None` field stays as it is.
@@ -170,6 +172,17 @@ pub struct ChannelChanges {
     pub coordinator_selection: Option<Option<SelectionView>>,
     /// The model that tasks start with. `Some(None)` takes it away.
     pub task_selection: Option<Option<SelectionView>>,
+    /// The isolation of a new task.
+    pub default_isolation: Option<Isolation>,
+    /// The approval mode of a new task.
+    pub default_approval_mode: Option<crate::view::ApprovalMode>,
+    /// The local MCP servers that a task from the assistant may use.
+    pub allowed_local_mcp_servers: Option<Vec<String>>,
+    /// Channel memory on or off.
+    pub memory_enabled: Option<bool>,
+    /// The attached repos, in order. A new URL is made with `repo.create`
+    /// first.
+    pub repos: Option<Vec<crate::convo::RepoChoice>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -526,6 +539,77 @@ pub enum Command {
     /// `ViewState::admin.pairing`.
     ClientPairingCode,
     CancelClientPairing,
+    // Phase 4: the conversation and the tasks. See [`crate::convo`].
+    /// Adds or removes your reaction on a message (`message.react`).
+    React {
+        message_id: String,
+        emoji: String,
+        remove: bool,
+    },
+    /// Loads the replies of a message's thread, once.
+    LoadMessageThread {
+        message_id: String,
+    },
+    /// Loads older pages of a channel until the client holds the message,
+    /// so a search result can scroll to it.
+    FindMessage {
+        channel_id: String,
+        message_id: String,
+    },
+    /// Replies in the thread of a message. Uploads work as for
+    /// `SendMessage`, with [`crate::UploadTarget::Thread`].
+    ReplyInThread {
+        channel_id: String,
+        root_id: String,
+        body: String,
+        client_message_id: String,
+        attachments: Vec<String>,
+    },
+    /// Searches the hub (`message.search`). The answer goes to
+    /// `ViewState.convo.search`. An answer to an older query is dropped.
+    Search {
+        query: String,
+        scope: crate::convo::SearchScope,
+    },
+    /// Forgets the search.
+    ClearSearch,
+    /// Makes a task (`task.create`).
+    CreateTask(crate::convo::NewTask),
+    /// Deletes a task with its thread (`task.delete`).
+    DeleteTask {
+        task_id: String,
+    },
+    /// Brings an archived task back (`task.archive` with `archived: false`).
+    RestoreTask {
+        task_id: String,
+    },
+    /// Loads the archived tasks (`task.list_archived`). With `more`, the
+    /// next page.
+    LoadArchivedTasks {
+        more: bool,
+    },
+    /// Opens one item of a task in full: its place among the task's items
+    /// (`task.items`) and its output or diff (`task.item_detail`).
+    OpenTaskItem {
+        task_id: String,
+        session_id: String,
+        item_id: String,
+    },
+    /// Closes the open item.
+    CloseTaskItem,
+    /// Deletes a group. Its channels move out of it (`group.delete`).
+    DeleteGroup {
+        group_id: String,
+    },
+    /// Renames a group (`group.update`).
+    RenameGroup {
+        group_id: String,
+        name: String,
+    },
+    /// Sets the order of the groups (`group.reorder`).
+    ReorderGroups {
+        group_ids: Vec<String>,
+    },
 }
 
 /// Refuses a channel ID that cannot name a channel. The ID is empty until the

@@ -183,7 +183,7 @@ impl MockBackend {
                     kind: ChannelKind::Standard,
                     name,
                     purpose: new.purpose,
-                    icon: "hash".into(),
+                    icon: new.icon.unwrap_or_else(|| "hash".into()),
                     group_id,
                     coordinator_worker: Some("hub".into()),
                     coordinator_selection: crate::picker::effective_selection(
@@ -194,6 +194,7 @@ impl MockBackend {
                     task_selection: new.task_selection,
                     default_isolation: new.isolation,
                     tags: checked_tags(&new.tags)?,
+                    memory_enabled: true,
                     ..ChannelView::default()
                 });
                 state.timelines.push(TimelineView {
@@ -207,6 +208,10 @@ impl MockBackend {
                 channel_id,
                 changes,
             } => {
+                let new_repos = changes
+                    .repos
+                    .clone()
+                    .map(|r| crate::mock_convo::channel_repos(&state.convo.repos, r));
                 let channel = state
                     .channels
                     .iter_mut()
@@ -233,6 +238,36 @@ impl MockBackend {
                 if let Some(chosen) = changes.task_selection {
                     channel.task_selection = chosen;
                 }
+                if let Some(isolation) = changes.default_isolation {
+                    channel.default_isolation = isolation;
+                }
+                if let Some(mode) = changes.default_approval_mode {
+                    channel.default_approval_mode = mode;
+                }
+                if let Some(servers) = changes.allowed_local_mcp_servers {
+                    channel.allowed_local_mcp_servers = servers;
+                }
+                if let Some(memory) = changes.memory_enabled {
+                    channel.memory_enabled = memory;
+                }
+                if let Some(repos) = new_repos {
+                    for repo in &repos {
+                        if !state.convo.repos.iter().any(|r| r.id == repo.id) {
+                            state.convo.repos.push(repo.clone());
+                        }
+                    }
+                    let channel = state
+                        .channels
+                        .iter_mut()
+                        .find(|c| c.id == channel_id)
+                        .ok_or_else(not_found)?;
+                    channel.repos = repos;
+                }
+                let channel = state
+                    .channels
+                    .iter_mut()
+                    .find(|c| c.id == channel_id)
+                    .ok_or_else(not_found)?;
                 let name = channel.name.clone();
                 for task in state
                     .tasks
@@ -745,6 +780,29 @@ impl MockBackend {
             | Command::ClientPairingCode
             | Command::CancelClientPairing) => {
                 applied.output = crate::mock_admin::apply(&mut state, command, &mut applied.later)?;
+            }
+            // Phase 4: the conversation and the tasks.
+            command @ (Command::React { .. }
+            | Command::LoadMessageThread { .. }
+            | Command::FindMessage { .. }
+            | Command::ReplyInThread { .. }
+            | Command::Search { .. }
+            | Command::ClearSearch
+            | Command::CreateTask(_)
+            | Command::DeleteTask { .. }
+            | Command::RestoreTask { .. }
+            | Command::LoadArchivedTasks { .. }
+            | Command::OpenTaskItem { .. }
+            | Command::CloseTaskItem
+            | Command::DeleteGroup { .. }
+            | Command::RenameGroup { .. }
+            | Command::ReorderGroups { .. }) => {
+                applied.output = crate::mock_convo::apply(
+                    &mut state,
+                    command,
+                    &mut self.next_id,
+                    &mut applied.later,
+                )?;
             }
             // Connectors, skills and the provider extras.
             other => {

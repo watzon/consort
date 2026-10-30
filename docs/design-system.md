@@ -335,6 +335,28 @@ Settings pages that are not lists (Hub, Clients, Notifications) use one column o
 | `dock_tile`, `dock_mark`, `dock_badge` | 40, 24, 18 | The Dock icon preview with its count on `status.failed` |
 | `banner_width`, `banner_tile`, `banner_mark` | 360, 32, 20 | The example banner of Settings > Notifications |
 
+### Conversation and tasks
+
+The values of phase 4 come from the Paper artboards `95W-0` to `FWA-0` through `component.convo` in `structure.json`:
+
+| Token | Size (px) | Use |
+|---|---|---|
+| `reaction_chip`, `reaction_pad_x`, `reaction_gap`, `reaction_emoji` | 24, 8, 4, 13/16 | A reaction chip under a bubble. Yours is on `tint.accent` with an `accent.text` border, the assistant's on `surface.card` with `border.subtle`. A count shows only when both chose the emoji |
+| `quick_emoji`, `quick_emoji_text`, `menu_width` | 30, 16/20, 248 | The six quick emoji and More at the top of the message menu. A chosen one has the accent ring, and a second click removes it |
+| `emoji_picker_width`, `emoji_cell`, `emoji_picker_height`, `emoji_cell_text` | 320, 36, 300, 20/24 | The emoji picker behind More, grouped, on `surface.raised` |
+| `root_ring` | 1 | The `accent.text` ring around every bubble of a message whose thread is open, as an open task card has |
+| `panel_wide`, `line_number_col` | 560, 44 | The task panel while it shows one item in full, and the line numbers of output and of each side of a diff. Added lines are on `tint.done`, removed lines on `tint.failed`, hunk headers on `tint.scheduled` |
+| `search_width`, `search_row`, `search_results_max` | 640, 36, 460 | The search palette (Command K) and its Go to rows. Matches are bold in `text.primary`, never in the accent |
+| `skeleton_dot`, `skeleton_bar`, `skeleton_title`, `skeleton_line` | 18, 8, 120, 440 | The skeleton rows while the hub searches, on `surface.card` |
+| `dialog_settings`, `settings_column_gap` | 880, 28 | The channel settings in two columns with a line between them, and the review of a new skill version |
+| `dialog_small`, `dialog_group`, `dialog_about` | 460, 400, 440 | New channel, the group dialogs, and About |
+| `icon_choice` | 38 | An icon choice of New channel and the channel settings |
+| `about_mark`, `wordmark` | 80, 28/34 700 | The Three voices mark and the wordmark in About |
+| `brief_box`, `instructions_box` | 96, 100 | The least height of the brief of New task and the instructions of the channel settings |
+| `drag_line` | 2 | The `accent.text` line above a group where a dragged group goes |
+
+The task thread is bubbles, as the timeline: the brief is the first bubbles with the placement as a caption under them, the activity is a chip that opens to the commands and file changes (each opens in full), and approvals and decisions have a task line ("Approval", "Needs you") above the card.
+
 ## Provider logos
 
 Every provider shows with its logo, never as text alone. The logos are in `crates/consort-desktop/assets/providers/` (see the NOTICE there).

@@ -54,6 +54,9 @@ use ed25519_dalek::{Signature, Verifier as _, VerifyingKey};
 
 const CODE: &str = "ABCD-EFGH";
 
+#[path = "fake_hub_parts/phase4.rs"]
+mod phase4;
+
 #[derive(Default)]
 struct Hub {
     origin: String,
@@ -143,6 +146,8 @@ struct Hub {
     sent_attachments: Vec<Vec<consort_proto::model::BlobRef>>,
     /// The channel files.
     files: Vec<consort_proto::model::ChannelFile>,
+    /// Phase 4: see `fake_hub_parts/phase4.rs`.
+    phase4: phase4::State,
 }
 
 /// What the real hub writes at the end of a cut text.
@@ -268,6 +273,7 @@ fn seed(hub: &mut Hub) {
         worker_id: None,
         review_summary: None,
         resolved_at: None,
+        session_ended: false,
         archived_at: None,
         created_at: ts(now - 5_000),
         updated_at: ts(now - 5_000),
@@ -1556,6 +1562,14 @@ async fn session(hub: Shared, mut socket: WebSocket) {
                     expires_at: Timestamp::now().plus_millis(600_000),
                 })
                 .unwrap(),
+            kind if phase4::handles(kind) => {
+                let (reply, events) = phase4::answer(&hub, &req);
+                send(&mut socket, reply).await;
+                for event in events {
+                    send(&mut socket, event).await;
+                }
+                continue;
+            }
             other => req.respond_error(ErrorBody::new(
                 ErrorCode::Invalid,
                 format!("The fake hub has no {other}."),

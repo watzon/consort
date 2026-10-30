@@ -20,7 +20,11 @@ pub enum MenuAction {
     QuoteInReply(String),
     AskConsort(String),
     CopyMarkdown(String),
+    /// Open the thread of a message, by its ID.
     ReplyInThread(String),
+    /// Phase 4: reactions, groups, tasks and channel settings. See
+    /// `crate::convo`.
+    Convo(crate::convo::ConvoAction),
     /// Edit a message in place: its ID and its text.
     EditMessage(String, String),
     DeleteMessage(String),
@@ -348,6 +352,8 @@ pub struct OpenMenu {
     pub items: Vec<MenuItem>,
     pub width: Option<Pixels>,
     pub highlighted: Option<usize>,
+    /// The quick emoji row at the top of a message menu.
+    pub reactions: Option<crate::convo::ReactionBar>,
 }
 
 impl OpenMenu {
@@ -357,6 +363,7 @@ impl OpenMenu {
             items,
             width: None,
             highlighted: None,
+            reactions: None,
         }
     }
 
@@ -366,6 +373,7 @@ impl OpenMenu {
             items,
             width: match_width.then_some(bounds.size.width),
             highlighted: None,
+            reactions: None,
         }
     }
 
@@ -436,6 +444,23 @@ pub fn render_menu<V: 'static>(
         .shadow(t.shadow_float())
         .font_family(t.font_sans.clone())
         .type_style(t.text.ui);
+    if let Some(bar) = &menu.reactions {
+        list = list
+            .w(t.component.convo.menu_width)
+            .child(crate::convo::render_reaction_bar(
+                bar,
+                t,
+                cx,
+                on_pick.clone(),
+            ))
+            .child(
+                div()
+                    .my(t.space.xs)
+                    .mx(t.space.sm)
+                    .h(t.border_width)
+                    .bg(c.border_subtle),
+            );
+    }
     for (ix, item) in menu.items.iter().enumerate() {
         if item.separator_before && ix > 0 {
             list = list.child(

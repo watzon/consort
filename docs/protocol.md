@@ -367,7 +367,7 @@ The hub gives each session the tools for its role. Each tool's `input_schema` is
 | `files_list` | optional `prefix` | Channel file paths, sizes and hashes |
 | `list_workers` | None | Each worker's ID, name, OS, state, tags, account labels with their models, local MCP server names and repo checkouts |
 | `ask_decision` | `question`, `options` (2 to 4, each with `label` and `consequence`), optional `recommended_index`, `context` and `allow_free_text` | `decision_id`. The answer arrives as input to a later turn |
-| `search` | `query`, optional `channel_id` | Matching messages, memory notes and tasks |
+| `search` | `query`, optional `channel_id` | Matching messages, memory notes and tasks. A memory note and a task hit have `updated_at` |
 
 ### Tools for coordinators
 
@@ -542,8 +542,8 @@ A client that does not know these fields shows the preview, which ends with a no
 | Area | Types |
 |---|---|
 | Channels and groups | `channel.create`, `channel.update`, `channel.archive` (with `archived`, default true), `channel.delete`, `channel.move`, `group.create`, `group.update`, `group.delete`, `group.reorder`, `repo.create` |
-| Messages | `message.send` (with `client_message_id`), `message.list` (a page of a timeline or a thread, newest first; the page stops early when its messages would take more than 768 KiB, and `has_more` is then true), `message.edit`, `message.delete`, `message.react`, `message.search`, `read.mark` |
-| Tasks | `task.create`, `task.update`, `task.get` (with `task_id`: the full task), `task.resolve`, `task.reopen`, `task.retry`, `task.interrupt`, `task.archive` (with `archived`, default true; archiving a resolved task stops its session and deletes its workspace), `task.delete`, `task.items`, `task.item_detail` (with `session_id` and `item_id`) |
+| Messages | `message.send` (with `client_message_id`), `message.list` (a page of a timeline or a thread, newest first; the page stops early when its messages would take more than 768 KiB, and `has_more` is then true), `message.edit`, `message.delete`, `message.react`, `message.search` (with `query`, optional `channel_id`, `limit` and `kinds`: `message`, `memory_note` or `task`; empty finds every kind), `read.mark` |
+| Tasks | `task.create`, `task.update`, `task.get` (with `task_id`: the full task), `task.resolve`, `task.reopen`, `task.retry`, `task.interrupt`, `task.archive` (with `archived`, default true; archiving a resolved task stops its session and deletes its workspace), `task.list_archived` (with optional `channel_id`, `offset`, `limit`: a page of the archived tasks, the most recently archived first, with `tasks_cut` and `has_more`; long texts are cut as in a snapshot), `task.delete`, `task.items`, `task.item_detail` (with `session_id` and `item_id`) |
 | Waiting on the user | `approval.answer`, `decision.answer` |
 | Memory | `memory.list`, `memory.read`, `memory.write`, `memory.delete`, `memory.history` |
 | Channel files | `files.list`, `files.put` (after a blob upload), `files.move`, `files.delete` |
@@ -585,7 +585,7 @@ The hub makes the `account_id` of `account.create` and sends it to the worker. I
 
 The hub ends a sign-in with `expired` when no update comes for 15 minutes (it checks every 5 seconds). When a worker disconnects, each of its sign-ins that has not ended becomes `failed` with "The worker went offline. Start the sign-in again." The hub deletes a sign-in one day after its last update.
 
-`task.retry` works for a Failed task, and for a task in Ready for review or Resolved whose session has ended. `task.reopen` (Not done) fails with `conflict` when archive deleted the workspace of the task. Retry is the way on then.
+`task.retry` works for a Failed task, and for a task in Ready for review or Resolved whose session has ended. A task has `session_ended`: true when its current session has ended (the worker ended or lost it, or archive stopped it), and false again when a new session starts. A client offers Retry for a task in Ready for review or Resolved only when it is true. `task.reopen` (Not done) fails with `conflict` when archive deleted the workspace of the task. Retry is the way on then.
 
 #### Connectors and skills
 

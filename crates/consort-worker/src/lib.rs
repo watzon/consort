@@ -21,6 +21,7 @@ mod core;
 mod error;
 pub mod http;
 pub mod identity;
+pub mod item_details;
 pub mod link;
 pub mod mcp;
 pub mod profile;

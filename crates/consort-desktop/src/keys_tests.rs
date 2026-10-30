@@ -418,15 +418,17 @@ fn a_rail_button_shows_a_tooltip(cx: &mut TestAppContext) {
     });
 }
 
-/// Escape in the picker of the New channel dialog closes only the picker.
+/// Escape in the picker of the New task dialog closes only the picker, and
+/// a choice there changes only the form.
 #[gpui::test]
 fn escape_in_the_picker_closes_only_the_picker(cx: &mut TestAppContext) {
     let (handle, app) = app_with_a_dialog(cx);
     let cx = &mut VisualTestContext::from_window(handle, cx);
     cx.update(|window, cx| {
         app.update(cx, |app, cx| {
+            app.open_dialog(Dialog::NewTask, window, cx);
             app.open_picker(
-                PickerTarget::NewChannelTasks,
+                PickerTarget::NewTask,
                 MenuAnchor::Point(gpui_kit::point(gpui_kit::px(400.), gpui_kit::px(300.))),
                 window,
                 cx,
@@ -434,17 +436,18 @@ fn escape_in_the_picker_closes_only_the_picker(cx: &mut TestAppContext) {
         })
     });
     cx.run_until_parked();
+    // The form starts with the channel's task model.
+    let before = app.read_with(cx, |app, _| app.convo.new_task.selection.clone());
     cx.simulate_keystrokes("escape");
     app.read_with(cx, |app, _| {
         assert!(app.picker.is_none(), "the picker is closed");
-        assert_eq!(app.dialog, Some(Dialog::NewChannel), "the dialog stays");
-        assert_eq!(app.new_channel.task_selection, None, "nothing was chosen");
+        assert_eq!(app.dialog, Some(Dialog::NewTask), "the dialog stays");
+        assert_eq!(app.convo.new_task.selection, before, "nothing was chosen");
     });
-    // A choice in the dialog changes only the form.
     cx.update(|window, cx| {
         app.update(cx, |app, cx| {
             app.open_picker(
-                PickerTarget::NewChannelTasks,
+                PickerTarget::NewTask,
                 MenuAnchor::Point(gpui_kit::point(gpui_kit::px(400.), gpui_kit::px(300.))),
                 window,
                 cx,
@@ -455,13 +458,13 @@ fn escape_in_the_picker_closes_only_the_picker(cx: &mut TestAppContext) {
     cx.simulate_keystrokes("enter");
     app.read_with(cx, |app, _| {
         let chosen = app
-            .new_channel
-            .task_selection
+            .convo
+            .new_task
+            .selection
             .clone()
-            .expect("a model for tasks");
+            .expect("a model for the task");
         assert_eq!(chosen.account_label, "Codex Personal");
-        assert_eq!(app.new_channel.coordinator_selection, None, "Same as Tutti");
-        assert_eq!(app.dialog, Some(Dialog::NewChannel));
+        assert_eq!(app.dialog, Some(Dialog::NewTask));
     });
 }
 

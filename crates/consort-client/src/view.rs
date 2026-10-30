@@ -78,6 +78,9 @@ pub struct ViewState {
     /// Settings > Hub, Settings > Clients, the pairing dialog, and what
     /// needs the user for notifications. See [`crate::admin`].
     pub admin: crate::admin::AdminView,
+    /// Phase 4: message threads, search, the open task item, the archived
+    /// tasks and the repos. See [`crate::convo`].
+    pub convo: crate::convo::ConvoView,
 }
 
 /// A message that the hub refused after it left the composer.
@@ -562,13 +565,22 @@ pub struct ChannelView {
     pub disabled_connections: Vec<String>,
     /// The skills that the channel turned off.
     pub disabled_skills: Vec<String>,
+    /// The approval mode of a new task.
+    pub default_approval_mode: ApprovalMode,
+    /// The local MCP servers that a task from the assistant may use.
+    pub allowed_local_mcp_servers: Vec<String>,
+    /// The channel has its own memory.
+    pub memory_enabled: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RepoView {
     pub id: String,
     pub name: String,
+    /// "Checked out on bigboi and MacBook Pro", or "Not checked out yet.
+    /// The first task clones it."
     pub checkouts: String,
+    pub url: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -696,6 +708,10 @@ pub struct MessageView {
     pub pending: bool,
     /// The files attached to the message.
     pub attachments: Vec<crate::files::AttachmentView>,
+    /// The reaction chips under the message.
+    pub reactions: Vec<crate::convo::ReactionView>,
+    /// "Last reply 9:31 AM", for a message with replies.
+    pub last_reply_label: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -864,6 +880,17 @@ pub struct TaskView {
     pub card_message_id: String,
     /// The approval mode that the task asked for. The worker may cap it.
     pub approval_mode: ApprovalMode,
+    /// The current session of the task has ended. A task in Ready for
+    /// review or Resolved can then only retry.
+    pub session_ended: bool,
+}
+
+impl TaskView {
+    /// Retry shows for a failed task, and for a task in Ready for review
+    /// or Resolved whose session has ended.
+    pub fn can_retry(&self) -> bool {
+        crate::convo::can_retry(self.status, self.session_ended)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -928,7 +955,7 @@ pub enum PostBody {
     /// changed 6 files".
     Activity {
         summary: String,
-        items: Vec<String>,
+        items: Vec<ActivityLine>,
     },
     Approval(ApprovalView),
     Decision(DecisionView),
@@ -939,6 +966,25 @@ pub enum PostBody {
     },
     /// The files attached to the post.
     Attachments(Vec<crate::files::AttachmentView>),
+}
+
+/// One command or file change in the activity chip of a task thread. A
+/// click opens it in full.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ActivityLine {
+    pub text: String,
+    pub session_id: String,
+    pub item_id: String,
+}
+
+impl ActivityLine {
+    /// A line with no item to open, for the mock.
+    pub fn text(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            ..Self::default()
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1442,6 +1488,8 @@ pub struct WorkerView {
     pub tags: Vec<String>,
     /// The tags that the worker found itself, such as `macos` or `ram-32gb`.
     pub detected_tags: Vec<String>,
+    /// The local MCP servers that the worker can reach, by name.
+    pub local_mcp_servers: Vec<String>,
     pub accounts: Vec<HarnessAccountView>,
     /// The managed tools, providers first.
     pub tools: Vec<ToolView>,

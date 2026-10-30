@@ -69,6 +69,9 @@ fn channel(id: &str, name: &str, purpose: &str, icon: &str, group: Option<&str>)
         tags: Vec::new(),
         disabled_connections: Vec::new(),
         disabled_skills: Vec::new(),
+        default_approval_mode: ApprovalMode::AutoEdits,
+        allowed_local_mcp_servers: Vec::new(),
+        memory_enabled: true,
     }
 }
 
@@ -102,6 +105,7 @@ fn task(
             T_ROOF => ApprovalMode::Auto,
             _ => ApprovalMode::AutoEdits,
         },
+        session_ended: false,
     }
 }
 
@@ -512,6 +516,11 @@ fn worker(
         status_line: status.into(),
         tags: tags.iter().map(|t| (*t).to_owned()).collect(),
         detected_tags: detected.iter().map(|t| (*t).to_owned()).collect(),
+        local_mcp_servers: match name {
+            "bigboi" => vec![text("windows-signing")],
+            "homelab" => vec![text("home-assistant")],
+            _ => Vec::new(),
+        },
         accounts,
         tools: tools(name, name == "bigboi"),
         tools_folder: if os == Os::Windows {
@@ -1121,10 +1130,10 @@ fn threads() -> Vec<TaskThreadView> {
                         PostBody::Activity {
                             summary: text("Ran 14 commands and changed 6 files"),
                             items: vec![
-                                text("cargo test --workspace"),
-                                text("Edited engine/src/cpu.rs"),
-                                text("Edited engine/build.rs"),
-                                text("Edited .github/workflows/release.yml"),
+                                ActivityLine::text("cargo test --workspace"),
+                                ActivityLine::text("Edited engine/src/cpu.rs"),
+                                ActivityLine::text("Edited engine/build.rs"),
+                                ActivityLine::text("Edited .github/workflows/release.yml"),
                             ],
                         },
                         PostBody::Approval(sayso_approval()),
@@ -1160,7 +1169,7 @@ fn threads() -> Vec<TaskThreadView> {
                 vec![
                     PostBody::Activity {
                         summary: text("Ran 9 commands and changed 3 files"),
-                        items: vec![text("pytest tests/test_rules.py")],
+                        items: vec![ActivityLine::text("pytest tests/test_rules.py")],
                     },
                     PostBody::Text(text(
                         "The new rules are ready.\n\n- A new member's first message with a link waits for review.\n- Members who joined more than a day ago keep the current rules.\n- A dry run on last week's messages flags 41 of 43 spam posts and no real ones.\n\n```toml\n[new_members]\nhold_first_link = true\nwindow_minutes = 1440\n```",
@@ -1186,7 +1195,9 @@ fn threads() -> Vec<TaskThreadView> {
                 vec![
                     PostBody::Activity {
                         summary: text("Ran 6 commands"),
-                        items: vec![text("rsync -a truenas:/mnt/tank/backups/ /srv/backups/")],
+                        items: vec![ActivityLine::text(
+                            "rsync -a truenas:/mnt/tank/backups/ /srv/backups/",
+                        )],
                     },
                     PostBody::Text(text("Copied 412 of 690 GB. About 20 minutes left.")),
                 ],
@@ -1314,6 +1325,7 @@ pub fn view_state() -> ViewState {
             id: text("rep_sayso"),
             name: text("watzon/sayso"),
             checkouts: text("Checked out on bigboi and MacBook Pro"),
+            url: text("https://github.com/watzon/sayso"),
         }];
         sayso.preferred_workers = vec![text("wrk_bigboi"), text("wrk_macbook")];
         sayso.task_selection = Some(selection("Codex Personal", "gpt-5.5", "GPT-5.5"));
@@ -1387,8 +1399,10 @@ pub fn view_state() -> ViewState {
         channel_files: crate::mock_files::channel_files(),
         files_loaded: vec![text(LIGHTS), text(EXT4)],
         admin: crate::mock_admin::admin(),
+        convo: crate::convo::ConvoView::default(),
     };
     stamp_times(&mut state.timelines);
+    crate::mock_convo::decorate(&mut state);
     if let Some(account) = state
         .workers
         .iter_mut()

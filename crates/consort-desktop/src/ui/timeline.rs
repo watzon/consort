@@ -79,7 +79,7 @@ pub fn message_menu(message: &MessageView) -> Vec<MenuItem> {
     if !message.pending {
         items.push(MenuItem::new(
             "Reply in thread",
-            MenuAction::ReplyInThread(message.body.clone()),
+            MenuAction::ReplyInThread(message.id.clone()),
         ));
     }
     items.push(MenuItem::new(
@@ -122,10 +122,16 @@ pub fn selection_menu(selected: String) -> Vec<MenuItem> {
 
 /// What a right click on a task card or a task row offers. Resolve is for a
 /// task that is Ready for review, and Not done is for a resolved task. Retry
-/// is for a failed task, Stop for a working one, and Archive for a failed or
-/// a resolved one. The thread panel leaves out Open thread, because the
-/// thread is open.
-pub fn task_menu(task_id: &str, status: TaskStatus, with_open_thread: bool) -> Vec<MenuItem> {
+/// is for a failed task, and for a task in Ready for review or Resolved
+/// whose session ended. Stop is for a working task, and Archive for a failed
+/// or a resolved one. Delete is last. The thread panel leaves out Open
+/// thread, because the thread is open.
+pub fn task_menu(
+    task_id: &str,
+    status: TaskStatus,
+    session_ended: bool,
+    with_open_thread: bool,
+) -> Vec<MenuItem> {
     let id = task_id.to_owned();
     let mut items = Vec::new();
     if with_open_thread {
@@ -145,7 +151,7 @@ pub fn task_menu(task_id: &str, status: TaskStatus, with_open_thread: bool) -> V
         )),
         _ => {}
     }
-    if status == TaskStatus::Failed {
+    if consort_client::convo::can_retry(status, session_ended) {
         items.push(MenuItem::new("Retry", MenuAction::RetryTask(id.clone())));
     }
     if status == TaskStatus::Working {
@@ -159,7 +165,14 @@ pub fn task_menu(task_id: &str, status: TaskStatus, with_open_thread: bool) -> V
             MenuAction::ArchiveTask(id.clone()),
         ));
     }
-    items.push(MenuItem::new("Copy task ID", MenuAction::Copy(id)).separated());
+    items.push(MenuItem::new("Copy task ID", MenuAction::Copy(id.clone())).separated());
+    items.push(
+        MenuItem::new(
+            "Delete",
+            MenuAction::Convo(crate::convo::ConvoAction::DeleteTask(id)),
+        )
+        .danger(),
+    );
     items
 }
 
@@ -194,11 +207,7 @@ impl ConsortApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let panel_width = if self.panel == Panel::None {
-            gpui_kit::Pixels::ZERO
-        } else {
-            t.layout.panel_width
-        };
+        let panel_width = self.right_panel_width(t);
         let column = (window.viewport_size().width
             - t.layout.sidebar_width
             - panel_width
@@ -240,6 +249,9 @@ impl ConsortApp {
             Panel::Tasks => Some(self.render_tasks_panel(t, window, cx)),
             Panel::Thread(task_id) => Some(self.render_thread_panel(&task_id, t, window, cx)),
             Panel::Channel => Some(self.render_channel_panel(t, window, cx)),
+            Panel::MessageThread(root) => {
+                Some(self.render_message_thread_panel(&root, t, window, cx))
+            }
         };
         div()
             .flex()
@@ -363,7 +375,7 @@ impl ConsortApp {
             .on_click(cx.listener(|this, _, _, cx| this.toggle_channel_panel(cx)));
         let new_task = action("new-task", "compose", self, cx)
             .debug_selector(|| "new-task".into())
-            .on_click(cx.listener(|this, _, window, cx| this.start_task_draft(window, cx)));
+            .on_click(cx.listener(|this, _, window, cx| this.open_new_task(window, cx)));
         // The connectors and skills of the channel, for a channel that has
         // some, with the count of those that its sessions get.
         let enabled = consort_client::channel_extensions(&state, &self.channel_id)
@@ -687,6 +699,10 @@ impl ConsortApp {
             ChatRow::Attachment(row) => {
                 (spacing(row.spacing), self.render_attachment_row(row, t, cx))
             }
+            ChatRow::Footer { item, lane } => (
+                t.component.convo.reaction_gap,
+                self.render_message_footer(*item, *lane == Lane::You, t, cx),
+            ),
             ChatRow::Notice { item, spacing: s } => {
                 let notice = self
                     .state
@@ -825,6 +841,10 @@ impl ConsortApp {
         }
         let tail = chat.bubble_tail;
         let selector = format!("bubble-{key}");
+        // While the thread of this message is open, its bubbles have the
+        // accent ring, as an open task card does.
+        let ring = crate::ui::convo_chat::thread_open_for(&self.panel, &message.id);
+        let menu_message = message.clone();
         let bubble = div()
             .id(SharedString::from(format!("bubble-{key}")))
             .debug_selector(move || selector)
@@ -842,10 +862,30 @@ impl ConsortApp {
             .rounded(chat.bubble_radius)
             .when(row.last_in_group && you, |d| d.rounded_br(tail))
             .when(row.last_in_group && !you, |d| d.rounded_bl(tail))
+            .when(ring, |d| {
+                d.border(t.component.convo.root_ring)
+                    .border_color(c.accent_text)
+            })
             .py(chat.bubble_pad_y)
             .px(chat.bubble_pad_x)
             .type_style(t.text.body)
             .text_color(c.text_primary)
+            // The message menu with the quick emoji, before the text's own.
+            .capture_any_mouse_down(
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    if event.button == MouseButton::Right {
+                        crate::ui::convo_chat::open_message_menu(
+                            this,
+                            event,
+                            &menu_message,
+                            true,
+                            window,
+                            cx,
+                        );
+                        cx.stop_propagation();
+                    }
+                }),
+            )
             .child(content);
         // A message on its way, or one that you edited, says so under its
         // last bubble. The times are in the separators.
@@ -1262,7 +1302,14 @@ impl ConsortApp {
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                    open_context_menu(this, event, task_menu(&menu_task, status, true), window, cx)
+                    let ended = this.state.task(&menu_task).is_some_and(|t| t.session_ended);
+                    open_context_menu(
+                        this,
+                        event,
+                        task_menu(&menu_task, status, ended, true),
+                        window,
+                        cx,
+                    )
                 }),
             );
         if collapsed {
@@ -1297,7 +1344,14 @@ impl ConsortApp {
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                    open_context_menu(this, event, task_menu(&menu_task, status, true), window, cx)
+                    let ended = this.state.task(&menu_task).is_some_and(|t| t.session_ended);
+                    open_context_menu(
+                        this,
+                        event,
+                        task_menu(&menu_task, status, ended, true),
+                        window,
+                        cx,
+                    )
                 }),
             );
         let pending = card
@@ -1480,12 +1534,18 @@ impl ConsortApp {
                         ))),
                 ),
                 DetailPart::Folder(folder) => detail_box.child(
+                    // GPUI's baseline does not line up a 16 px label with a
+                    // 20 px mono line, so both get the mono line height.
                     div()
                         .flex()
-                        .items_baseline()
+                        .items_start()
                         .gap(t.space.sm)
                         .min_w_0()
-                        .child(text("Folder", detail(t), c.text_tertiary).flex_none())
+                        .child(
+                            text("Folder", detail(t), c.text_tertiary)
+                                .flex_none()
+                                .line_height(t.text.mono.line),
+                        )
                         .child(
                             div()
                                 .min_w_0()
@@ -1761,11 +1821,23 @@ impl ConsortApp {
                             .pl(t.space.sm)
                             .child(
                                 div()
+                                    .id("composer-text")
                                     .flex_1()
                                     .min_w_0()
                                     .py(t.space.xs)
                                     .type_style(t.text.body)
                                     .text_color(c.text_primary)
+                                    // Voice input is the system's dictation:
+                                    // it types into the focused box. The
+                                    // tooltip says how to start it.
+                                    .when_some(crate::convo::dictation_hint(), |d, hint| {
+                                        d.tooltip(move |_, cx| {
+                                            gpui_kit::AppContext::new(cx, |_| {
+                                                crate::ui::convo_sidebar::Tip(hint.into())
+                                            })
+                                            .into()
+                                        })
+                                    })
                                     .child(input),
                             )
                             .child(send),
@@ -1798,11 +1870,6 @@ impl ConsortApp {
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.open_add_menu("composer-attach", add_target.clone(), cx)
                             })),
-                    )
-                    .child(
-                        tool("voice", "voice", cx).on_click(cx.listener(|this, _, _, cx| {
-                            this.show_notice("Voice input comes in a later build.".into(), cx)
-                        })),
                     )
                     .child(
                         div()
@@ -2028,31 +2095,48 @@ mod tests {
             TaskStatus::NeedsInput,
             TaskStatus::Failed,
         ] {
-            let items = task_menu("t1", status, true);
+            let items = task_menu("t1", status, false, true);
             assert!(
                 !labels(&items).contains(&"Resolve"),
                 "{status:?} offers Resolve"
             );
             assert!(!labels(&items).contains(&"Not done"));
         }
-        let review = task_menu("t1", TaskStatus::Review, true);
-        assert_eq!(labels(&review), ["Open thread", "Resolve", "Copy task ID"]);
-        let resolved = task_menu("t1", TaskStatus::Resolved, true);
+        let review = task_menu("t1", TaskStatus::Review, false, true);
+        assert_eq!(
+            labels(&review),
+            ["Open thread", "Resolve", "Copy task ID", "Delete"]
+        );
+        let resolved = task_menu("t1", TaskStatus::Resolved, false, true);
         assert_eq!(
             labels(&resolved),
-            ["Open thread", "Not done", "Archive", "Copy task ID"]
+            [
+                "Open thread",
+                "Not done",
+                "Archive",
+                "Copy task ID",
+                "Delete"
+            ]
         );
     }
 
     #[test]
     fn retry_and_stop_match_the_status() {
-        let failed = task_menu("t1", TaskStatus::Failed, true);
+        let failed = task_menu("t1", TaskStatus::Failed, false, true);
         assert_eq!(
             labels(&failed),
-            ["Open thread", "Retry", "Archive", "Copy task ID"]
+            ["Open thread", "Retry", "Archive", "Copy task ID", "Delete"]
         );
-        let working = task_menu("t1", TaskStatus::Working, true);
-        assert_eq!(labels(&working), ["Open thread", "Stop", "Copy task ID"]);
+        let working = task_menu("t1", TaskStatus::Working, false, true);
+        assert_eq!(
+            labels(&working),
+            ["Open thread", "Stop", "Copy task ID", "Delete"]
+        );
+        // A task in review or resolved whose session ended can only retry.
+        for status in [TaskStatus::Review, TaskStatus::Resolved] {
+            assert!(labels(&task_menu("t1", status, true, true)).contains(&"Retry"));
+            assert!(!labels(&task_menu("t1", status, false, true)).contains(&"Retry"));
+        }
     }
 
     /// Review cycle 3, finding 7: a failed task stayed in Active for ever.
@@ -2065,14 +2149,14 @@ mod tests {
             TaskStatus::NeedsInput,
             TaskStatus::Review,
         ] {
-            let items = task_menu("t1", status, true);
+            let items = task_menu("t1", status, false, true);
             assert!(
                 !labels(&items).contains(&"Archive"),
                 "{status:?} offers Archive"
             );
         }
         for status in [TaskStatus::Failed, TaskStatus::Resolved] {
-            let items = task_menu("t1", status, false);
+            let items = task_menu("t1", status, false, false);
             let archive = items
                 .iter()
                 .find(|i| i.label == "Archive")
@@ -2083,8 +2167,8 @@ mod tests {
 
     #[test]
     fn the_thread_menu_leaves_out_open_thread_by_a_flag_not_by_its_label() {
-        let items = task_menu("t1", TaskStatus::Working, false);
-        assert_eq!(labels(&items), ["Stop", "Copy task ID"]);
+        let items = task_menu("t1", TaskStatus::Working, false, false);
+        assert_eq!(labels(&items), ["Stop", "Copy task ID", "Delete"]);
         assert!(
             items
                 .iter()

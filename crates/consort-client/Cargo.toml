@@ -11,6 +11,7 @@ workspace = true
 [dependencies]
 consort-proto.workspace = true
 chrono.workspace = true
+similar.workspace = true
 directories.workspace = true
 ed25519-dalek.workspace = true
 futures-util.workspace = true
