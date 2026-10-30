@@ -35,7 +35,20 @@ The top of the timeline darkens progressively, like Claude Duet, in place of the
 - Remove the solid zone (`fade_top_solid`), and set the tint with a few stops as tokens.
 - GPUI gradients have two stops, so the tint is two or three stacked gradient layers.
 
-Reference: the user's Duet screenshot of 2026-10-29.
+Reference: the user's Duet screenshot of 2026-10-29. Paper: "Base: Tutti with top tint and larger sidebar, dark".
+
+### First: a larger sidebar (with the phase 1 designs)
+
+The sidebar was small next to Claude Duet's. The new scale, in the same Paper artboard:
+- 288 px wide, not 248.
+- 36 px rows, with 15 px text and 18 px icons.
+- `lg` corners on the selected row.
+- 13 px group labels.
+- A 52 px title bar.
+- 14 px worker rows.
+- A 28 px avatar in the account row.
+
+The sidebar tokens change, and all other screens follow.
 
 Each phase starts with a Paper design where it has new screens, as in the earlier builds. Then contract notes (if the proto changes), then parallel builds with disjoint crates, then a check in the running app.
 
