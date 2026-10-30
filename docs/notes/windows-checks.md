@@ -89,3 +89,32 @@ The script makes and deletes one Task Scheduler task, `ConsortShot`, because a p
 - **The task starts `powershell.exe` with `-WindowStyle Hidden`.** A console window can flash at sign-in. A launcher without a console window (a `windows_subsystem = "windows"` build, or `wscript`) would fix it. This is a polish item.
 - **A hub on Windows** does not show free disk space (decision P3-8). Unchanged.
 - **`cargo-nextest`** is not installed on bigboi, so the run used `cargo test`. `scripts/check.sh` falls back to it by design.
+
+## Second run (2026-10-30)
+
+The code was `main` at commit `2057d66` (phases 2, 4, 4b and 5 and the smaller hub and worker items) plus the changes in this branch. The history went to bigboi as a git bundle (`git bundle create ca536cb..windows-fixes-2`, `scp`, `git fetch` of the bundle in `C:\Users\cawat\Projects\consort`). The branch change files went over as one `git diff HEAD` patch and `git apply`. The ssh user is `cawat@bigboi.local` (the `bigboi` host entry in `~/.ssh/config` names another user). The default shell over ssh is `cmd.exe`.
+
+### Passed
+
+- `cargo build --workspace`: no warning.
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `cargo test --workspace --no-fail-fast` (no nextest on bigboi): 1845 passed, 0 failed, 25 ignored, after the fixes below.
+- The persistent client cache (`consort-client` `persist.rs`) passes all its tests on Windows. This includes moving a broken file aside, the newer schema file and `delete`. `CacheFile::open` drops the SQLite connection before it returns an error, so the file can be renamed. No change was needed.
+- Hub backup and restore tests pass.
+- Desktop app with `--mock --screen proactivity`, `hub-offline` and `channel-settings`: all three draw. The screenshots are `docs/screenshots/windows-proactivity.png`, `windows-hub-offline.png` and `windows-channel-settings.png`. The title bar has the Windows controls. The hub-offline screen shows the "Cannot reach the hub" banner with "Try again", and "Messages wait here until the hub is back" under the composer. Each app was stopped by PID.
+- `scripts/check.sh` on the Mac: "All checks passed in 111s".
+
+### Failed and fixed
+
+| Test | Cause | Fix |
+|---|---|---|
+| `consort-hub` `prompts::tests::the_coordinator_prompt_has_a_working_on_your_own_section_with_the_rules` | Git on Windows has `core.autocrlf=true`, so `prompts/coordinator.md` had CRLF line ends. The code embeds it with `include_str!` and looks for `"# Working on your own\n"`. This is a product risk too: the model prompt would have `\r\n` in a Windows build. | `.gitattributes` sets `eol=lf` for `crates/consort-hub/prompts/**` and for the embedded `crates/consort-hub/src/store/*.sql`. |
+| `consort-hub` `skills::remote_tests::git_gives_up_on_a_server_that_never_answers` | After the time limit, `run_git` dropped the child, which ended `git.exe` but not its helper `git-remote-http.exe`. The helper kept the temp folder as its current folder, so Windows could not remove `skill-fetch-*`. Two folders stayed. This is a real leak in a Windows hub. | `run_git` in `crates/consort-hub/src/skills/git.rs` now reads the pipes in two tasks and waits on the child itself. At the time limit (and the size limit) `stop` runs `taskkill /T /F /PID` on Windows, kills the child and waits until it has ended. |
+| `consort-hub` integration `skills::a_client_searches_previews_installs_and_updates_a_skill` | "no response to skill_directory.search" after 10 s in the full run. Alone it takes 1.8 s, and 3 of 3 runs of the whole binary passed. Git starts slowly on Windows and the search fetches a repo. | `WAIT` in `crates/consort-hub/tests/common/mod.rs` is 40 s on Windows and 10 s elsewhere. |
+
+### Left
+
+- `heartbeat::a_silent_worker_goes_offline_after_sixty_seconds` did not fail in this run, but the cause from the first run (paused clock with real sockets) is still there.
+- The ssh command shell is `cmd.exe`. A task that needs `powershell` must call it.
+- The checks that need a person at the machine are unchanged: real toasts, the window title count with a paired hub, `consort worker install` for real, and `worker.ps1` against a real release.
+- `consort-desktop` `--mock` shows saved data, but the screens do not show the SQLite file on disk. Nothing in the run opened a real cache file in the app. The tests cover it.

@@ -588,6 +588,39 @@ pub(crate) fn set_test_home(home: Option<PathBuf>) {
     TEST_HOME.with(|h| *h.borrow_mut() = home);
 }
 
+/// Reads a pipe of git to its end.
+async fn read_all<R: tokio::io::AsyncRead + Unpin>(pipe: Option<R>) -> Vec<u8> {
+    use tokio::io::AsyncReadExt as _;
+    let mut bytes = Vec::new();
+    if let Some(mut pipe) = pipe {
+        let _ = pipe.read_to_end(&mut bytes).await;
+    }
+    bytes
+}
+
+/// Stops git and waits until it has ended. On Windows, `git.exe` starts
+/// helper programs (`git-remote-http.exe`) that stay alive when only `git.exe`
+/// ends, so the whole tree is stopped.
+async fn stop(
+    child: &mut tokio::process::Child,
+    out_task: &tokio::task::JoinHandle<Vec<u8>>,
+    err_task: &tokio::task::JoinHandle<Vec<u8>>,
+) {
+    #[cfg(windows)]
+    if let Some(pid) = child.id() {
+        let _ = Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &pid.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
+    }
+    let _ = child.kill().await;
+    out_task.abort();
+    err_task.abort();
+}
+
 /// One git command, in a clean environment. `home` is the temp folder of
 /// the fetch. With `watch`, the command stops when that folder grows past
 /// [`FETCH_MAX_BYTES`]. With `options.with_credentials`, git also gets the
@@ -680,24 +713,37 @@ async fn run_git(
             let _ = pipe.shutdown().await;
         });
     }
-    let output = child.wait_with_output();
-    tokio::pin!(output);
+    // Read the pipes in tasks and wait for the process itself. A stop then
+    // waits until git has ended. On Windows a folder cannot be removed while
+    // a process runs in it, so the temp folder needs a git that is gone.
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let out_task = tokio::spawn(read_all(stdout));
+    let err_task = tokio::spawn(read_all(stderr));
     let deadline = tokio::time::sleep(options.timeout);
     tokio::pin!(deadline);
     let mut tick = tokio::time::interval(Duration::from_millis(250));
-    let output = loop {
+    let status = loop {
         tokio::select! {
-            out = &mut output => break out.map_err(|e| format!("git failed ({e})"))?,
-            () = &mut deadline => return Err(format!("git took longer than {}", crate::util::duration_text(options.timeout))),
+            out = child.wait() => break out.map_err(|e| format!("git failed ({e})"))?,
+            () = &mut deadline => {
+                stop(&mut child, &out_task, &err_task).await;
+                return Err(format!("git took longer than {}", crate::util::duration_text(options.timeout)));
+            }
             _ = tick.tick(), if watch => {
                 let dir = home.to_path_buf();
                 let size = tokio::task::spawn_blocking(move || folder_size(&dir)).await.unwrap_or(0);
                 if size > FETCH_MAX_BYTES {
-                    // Dropping the output future kills git (kill_on_drop).
+                    stop(&mut child, &out_task, &err_task).await;
                     return Err(format!("the repo is larger than {} MiB", FETCH_MAX_BYTES / (1024 * 1024)));
                 }
             }
         }
+    };
+    let output = std::process::Output {
+        status,
+        stdout: out_task.await.unwrap_or_default(),
+        stderr: err_task.await.unwrap_or_default(),
     };
     if output.status.success() {
         Ok(output.stdout)

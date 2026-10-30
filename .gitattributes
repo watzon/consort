@@ -3,3 +3,8 @@
 # the signature checks fail.
 crates/consort-tools/tests/fixtures/** -text
 crates/consort-tools/keys/** -text
+
+# Text that the hub program embeds with include_str!. A test and the prompt
+# code search for "\n", so Git on Windows must not make it CRLF.
+crates/consort-hub/prompts/** text eol=lf
+crates/consort-hub/src/store/*.sql text eol=lf

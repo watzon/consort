@@ -43,7 +43,9 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use consort_hub::{HubConfig, HubHandle, serve};
 
-pub const WAIT: Duration = Duration::from_secs(10);
+/// How long a test waits for the hub. Git starts slowly on Windows, and a
+/// loaded machine needs more time.
+pub const WAIT: Duration = Duration::from_secs(if cfg!(windows) { 40 } else { 10 });
 
 pub struct TestHub {
     pub handle: HubHandle,
