@@ -112,8 +112,13 @@ Design first: the three pages.
    - memory on or off
 
    Groups: delete and reorder.
-7. **Task thread in bubbles**, the same as the timeline. And an **About** screen with the mark.
-8. **Voice input.** A decision for the user: system dictation, a local Whisper model on the worker, or later.
+7. **A simple New channel, and a guided start.**
+   - **The New channel dialog asks only for the name and the icon.** Everything else is in the channel settings dialog.
+   - **A new channel does not start empty.** The hub sends the coordinator a `channel_created` wake event. The assistant greets the user, names the channel, and offers a guided setup: purpose, connectors, repos and model, one question at a time.
+   - **Quick-reply chips.** Assistant messages get `suggestions` (at most 4 short options). `post_message` and `reply` can set them, and the app shows them as chips under the newest assistant message. A click sends the text as the user's message, and the chips go away at any reply.
+   - **A "writing" bubble** with three dots, drawn as the three voices of the mark, while the assistant composes.
+8. **Task thread in bubbles**, the same as the timeline. And an **About** screen with the mark.
+9. **Voice input.** A decision for the user: system dictation, a local Whisper model on the worker, or later.
 
 Design first: the thread panel, the search results, the New task dialog, the channel settings dialog, and the task item view.
 
