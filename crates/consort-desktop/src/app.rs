@@ -10,7 +10,7 @@ use std::{
 
 use consort_client::{
     ApprovalChoice, ChannelChanges, Client, ClientError, Connection, Drafts, Isolation, Os,
-    SelectionView, ViewState,
+    SelectionView, ViewState, update::Updates,
 };
 use consort_theme::{ActiveTokens as _, Tokens, TypeExt as _};
 use gpui_kit::{
@@ -311,6 +311,10 @@ pub struct ConsortApp {
     /// Why the hub refused the last tag: the worker ID and the message.
     pub tag_error: Option<(String, String)>,
     pub add_worker_os: Os,
+    /// The step of the Add worker dialog that the user chose.
+    pub add_worker_step: crate::ui::add_worker::AddWorkerStep,
+    /// Updates of the app: the check, the download and the restart.
+    pub updates: consort_client::update::Updates,
     pub decision_writing: Option<String>,
     pub activity_open: Vec<String>,
     pub last_thread: Option<String>,
@@ -651,6 +655,8 @@ impl ConsortApp {
             tag_entry: None,
             tag_error: None,
             add_worker_os: Os::Linux,
+            add_worker_step: crate::ui::add_worker::AddWorkerStep::default(),
+            updates: crate::ui::update_notice::start_updates(demo),
             decision_writing: None,
             activity_open: Vec::new(),
             last_thread: None,
@@ -708,6 +714,7 @@ impl ConsortApp {
         this.update_placeholder(window, cx);
         this.sync_draft_inputs(window, cx);
         this.follow_connection(cx);
+        this.follow_updates(cx);
         this.mark_read(cx);
         // Reaching the top of the timeline loads older messages. Reaching the
         // bottom marks the channel read.
@@ -792,7 +799,7 @@ impl ConsortApp {
         self.apply_state(state, cx);
     }
 
-    fn apply_state(&mut self, state: Arc<ViewState>, cx: &mut Context<Self>) {
+    pub(crate) fn apply_state(&mut self, state: Arc<ViewState>, cx: &mut Context<Self>) {
         let was_paired = self.state.connection != Connection::NotPaired;
         self.state = state;
         if self.state.channel(&self.channel_id).is_none()
@@ -1358,8 +1365,18 @@ impl ConsortApp {
                     self.open_dialog(Dialog::ChannelTags(id), window, cx);
                 }
             }
-            "add-worker" | "worker-added" => {
+            "update-ready" => {
+                // The notice above the account row: the update is
+                // downloaded and checked.
+                self.updates = Updates::fixed(crate::ui::update_notice::ready_view());
+            }
+            "add-worker" | "add-worker-install" | "worker-added" => {
                 self.open_settings(SettingsSection::Workers, cx);
+                // The designs show Windows, chosen in step 1.
+                self.add_worker_os = Os::Windows;
+                if screen != "add-worker" {
+                    self.add_worker_step = crate::ui::add_worker::AddWorkerStep::Install;
+                }
                 // The window draws its first frame from this state, so the
                 // code must be there before it opens.
                 let _ = self
@@ -2064,6 +2081,8 @@ impl ConsortApp {
                     .update(cx, |input, cx| input.focus(window, cx));
             }
             Dialog::AddWorker => {
+                self.add_worker_os = crate::ui::add_worker::default_os();
+                self.add_worker_step = crate::ui::add_worker::AddWorkerStep::default();
                 self.add_worker_before = self.state.workers.iter().map(|w| w.id.clone()).collect();
                 self.added_worker = None;
                 let client = self.client.clone();

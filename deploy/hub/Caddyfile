@@ -1,0 +1,21 @@
+# Caddy in front of the Consort hub. Caddy gets and renews the certificate
+# for the name below by itself. Point the DNS record of the name at this
+# machine, and open ports 80 and 443.
+#
+# Caddy passes WebSocket traffic with no extra setting. The hub also needs
+# no special header from the proxy.
+hub.example.com {
+	encode zstd gzip
+
+	# The hub serves the client link (/v1/client), the worker link
+	# (/v1/worker), pairing, blobs and /healthz.
+	reverse_proxy 127.0.0.1:7600 {
+		# Uploads and downloads of attachments can be 256 MiB. A WebSocket
+		# stays open for as long as the app runs.
+		flush_interval -1
+		transport http {
+			read_timeout 0
+			write_timeout 0
+		}
+	}
+}

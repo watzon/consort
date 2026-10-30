@@ -1,0 +1,11 @@
+# The Caddyfile of docker-compose.yml. It reads the name from HUB_DOMAIN.
+{$HUB_DOMAIN} {
+	encode zstd gzip
+	reverse_proxy hub:7600 {
+		flush_interval -1
+		transport http {
+			read_timeout 0
+			write_timeout 0
+		}
+	}
+}

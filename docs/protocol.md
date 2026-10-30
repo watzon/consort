@@ -92,7 +92,7 @@ Workers and clients pair the same way, and both prove their identity with an Ed2
 ### Pair a worker
 
 1. In a client, the user chooses **Add worker**. The hub makes a pairing code: 8 characters, single use, valid for 10 minutes. The characters come from the Crockford base32 alphabet (`0-9` and `A-Z` without `I`, `L`, `O` and `U`). The hub shows the code as `ABCD-EFGH`. It ignores case, hyphens and spaces in a typed code, and it reads `O` as `0` and `I` or `L` as `1`.
-2. On the new machine, the user runs `app worker pair https://hub.example.com --code ABCD-EFGH`.
+2. On the new machine, the user runs `consort worker install --hub https://hub.example.com --code ABCD-EFGH` (the Add worker dialog gives a command that does this). `consort worker pair <url> --code <code>` pairs without installing a service.
 3. The worker makes an Ed25519 key pair. The private key stays in the OS keychain, or in a file with mode 0600 when no keychain is available.
 4. The worker sends `POST /v1/pair/worker` with `code`, `public_key`, `hostname`, `os`, `arch` and an optional `name`. Public keys, signatures and nonces are lowercase hex on the wire.
 5. The hub checks the code, stores the worker, and returns the `worker_id`. An HTTP error has the body `{"error": {"code", "message"}}`. The hub allows 10 pairing requests per minute from one IPv4 address or one IPv6 /64 network, and 60 per minute from all addresses together. After that, it answers HTTP 429 with the code `policy_denied`.

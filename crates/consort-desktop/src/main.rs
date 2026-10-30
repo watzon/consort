@@ -4,6 +4,9 @@
 //! hub is paired. `consort-desktop --mock` shows the designs' content with no
 //! hub.
 
+// A release build on Windows is a window app, with no console window.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod app;
 mod assets;
 #[cfg(test)]
@@ -20,6 +23,8 @@ mod fonts;
 #[cfg(test)]
 mod keys_tests;
 mod notice;
+#[cfg(test)]
+mod phase5_tests;
 mod read_marker;
 mod ui;
 mod waiting;
@@ -41,7 +46,8 @@ actions!(consort, [Quit]);
 /// account-settings, hub-cards, tutti-manages, instructions, mark-idle,
 /// mark-working, mark-needs-you, mark-done. Phase 1: top-tint,
 /// attachments, drop, bubbles, lightbox, files, files-menu, files-drop,
-/// files-empty, thread-attach and add-skill-upload. The old names `everything` and
+/// files-empty, thread-attach and add-skill-upload. Phase 5: add-worker,
+/// add-worker-install, worker-added and update-ready. The old names `everything` and
 /// `everything-manages` still work. `--light` and `--dark` set
 /// the mode, and `--theme <name>` the theme.
 #[derive(Clone, Debug, Default)]

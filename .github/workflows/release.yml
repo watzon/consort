@@ -1,0 +1,254 @@
+# Builds and publishes a Consort release when you push a tag such as v0.2.0.
+#
+#   git tag v0.2.0 && git push origin v0.2.0
+#
+# The tag must match the version in [workspace.package] of Cargo.toml.
+#
+# It builds:
+#   consort (the CLI: hub, worker and the rest) for macOS arm64 and x86_64,
+#     Linux x86_64 and arm64, and Windows x86_64
+#   the desktop app: Consort.app (zip and dmg) for macOS, a zip for Windows,
+#     a tarball for Linux x86_64
+# It writes SHA256SUMS for every file and attaches all of them to the release.
+# The install scripts (scripts/install/) and the app updater read these names
+# and the checksum file, so change names in one place only after you change
+# them there.
+#
+# The workflow uses github.repository, so it needs no repository name of its
+# own. The scripts and the app have one constant each (see docs/install.md).
+#
+# Signing and notarization of the macOS app run only when these repository
+# secrets exist:
+#   APPLE_CERTIFICATE            a Developer ID Application certificate (.p12),
+#                                encoded with base64
+#   APPLE_CERTIFICATE_PASSWORD   the password of the .p12 file
+#   APPLE_SIGNING_IDENTITY       "Developer ID Application: Name (TEAMID)"
+#   APPLE_ID                     the Apple ID for notarization
+#   APPLE_TEAM_ID                the team ID
+#   APPLE_APP_PASSWORD           an app-specific password for that Apple ID
+# Without them the macOS app is signed ad hoc.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check-version:
+    name: Check the tag
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: version
+        run: |
+          version="$(awk '/^\[workspace.package\]/ { in_pkg = 1; next } /^\[/ { in_pkg = 0 } in_pkg && /^version/ { gsub(/"/, "", $3); print $3; exit }' Cargo.toml)"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ] && [ "${GITHUB_REF_NAME}" != "v${version}" ]; then
+            echo "The tag ${GITHUB_REF_NAME} does not match the version ${version} in Cargo.toml." >&2
+            exit 1
+          fi
+
+  cli:
+    name: consort for ${{ matrix.key }}
+    needs: check-version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { key: macos-arm64, os: macos-14, target: aarch64-apple-darwin, archive: tar.gz }
+          - { key: macos-x86_64, os: macos-14, target: x86_64-apple-darwin, archive: tar.gz }
+          - { key: linux-x86_64, os: ubuntu-24.04, target: x86_64-unknown-linux-gnu, archive: tar.gz }
+          - { key: linux-arm64, os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, archive: tar.gz }
+          - { key: windows-x86_64, os: windows-2025, target: x86_64-pc-windows-msvc, archive: zip }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup toolchain install --profile minimal
+          rustup target add "${{ matrix.target }}"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: cli-${{ matrix.key }}
+      - name: Build
+        shell: bash
+        run: cargo build --release --locked -p consort-cli --target "${{ matrix.target }}"
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p out
+          bin="target/${{ matrix.target }}/release/consort"
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            cp "${bin}.exe" consort.exe
+            7z a "out/consort-${{ matrix.key }}.zip" consort.exe
+          else
+            tar -czf "out/consort-${{ matrix.key }}.tar.gz" -C "$(dirname "$bin")" consort
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cli-${{ matrix.key }}
+          path: out/*
+          if-no-files-found: error
+
+  desktop-macos:
+    name: Consort.app for ${{ matrix.key }}
+    needs: check-version
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { key: macos-arm64, target: aarch64-apple-darwin }
+          - { key: macos-x86_64, target: x86_64-apple-darwin }
+    env:
+      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: |
+          rustup toolchain install --profile minimal
+          rustup target add "${{ matrix.target }}"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: desktop-${{ matrix.key }}
+      - name: Import the signing certificate
+        if: env.APPLE_CERTIFICATE != ''
+        run: |
+          keychain="$RUNNER_TEMP/consort.keychain-db"
+          password="$(uuidgen)"
+          echo "$APPLE_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          security import "$RUNNER_TEMP/certificate.p12" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          security set-key-partition-list -S apple-tool:,apple: -k "$password" "$keychain"
+          security list-keychains -d user -s "$keychain" login.keychain-db
+      - name: Build, sign and notarize
+        run: scripts/bundle-macos.sh --target "${{ matrix.target }}" --dmg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ matrix.key }}
+          path: |
+            dist/Consort-${{ matrix.key }}.zip
+            dist/Consort-${{ matrix.key }}.dmg
+          if-no-files-found: error
+
+  # The Windows and Linux desktop builds are best effort. A failure here does
+  # not stop the release: the CLI and the macOS app still go out, and the
+  # missing files show in the release assets.
+  desktop-windows:
+    name: Desktop app for windows-x86_64
+    needs: check-version
+    runs-on: windows-2025
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        shell: bash
+        run: rustup toolchain install --profile minimal
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: desktop-windows
+      - name: Build
+        shell: bash
+        run: cargo build --release --locked -p consort-desktop
+      - name: Package
+        shell: bash
+        run: |
+          mkdir -p out stage/Consort
+          cp target/release/consort-desktop.exe stage/Consort/
+          cp design/logo/icons/app-icon-256.png stage/Consort/consort.png
+          (cd stage && 7z a "../out/Consort-windows-x86_64.zip" Consort)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-windows-x86_64
+          path: out/*
+          if-no-files-found: error
+
+  desktop-linux:
+    name: Desktop app for linux-x86_64
+    needs: check-version
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang cmake pkg-config libasound2-dev libfontconfig-dev libwayland-dev \
+            libx11-xcb-dev libxkbcommon-x11-dev libxkbcommon-dev libxcb1-dev libssl-dev \
+            libzstd-dev libvulkan-dev libdrm-dev libgbm-dev
+      - name: Install Rust
+        run: rustup toolchain install --profile minimal
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: desktop-linux
+      - name: Build
+        run: cargo build --release --locked -p consort-desktop
+      - name: Package
+        run: |
+          mkdir -p out stage/Consort
+          cp target/release/consort-desktop stage/Consort/
+          cp packaging/linux/consort.desktop stage/Consort/
+          cp design/logo/icons/app-icon-256.png stage/Consort/consort.png
+          tar -czf out/Consort-linux-x86_64.tar.gz -C stage Consort
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-linux-x86_64
+          path: out/*
+          if-no-files-found: error
+
+  release:
+    name: Publish the release
+    needs: [check-version, cli, desktop-macos, desktop-windows, desktop-linux]
+    # The CLI and the macOS app must work. The other desktop builds may not.
+    if: ${{ !cancelled() && needs.cli.result == 'success' && needs.desktop-macos.result == 'success' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Write the checksums
+        working-directory: artifacts
+        run: |
+          ls -l
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
+      - name: Attach the files to the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          prerelease=""
+          case "$TAG" in *-*) prerelease="--prerelease" ;; esac
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" artifacts/* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" artifacts/* --repo "$GITHUB_REPOSITORY" --title "Consort ${TAG#v}" --generate-notes $prerelease
+          fi
+      - name: Keep the files of a manual run
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-files
+          path: artifacts/*

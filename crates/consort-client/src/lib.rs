@@ -31,6 +31,7 @@ pub mod skills;
 pub mod store;
 #[cfg(test)]
 mod test_entities;
+pub mod update;
 pub mod uploads;
 pub mod view;
 
