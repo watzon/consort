@@ -1,5 +1,7 @@
 # Plan: finishing the app
 
+Status on 2026-10-30: phases 1 to 5, 4b (proactivity) and 4c (voice) are built and merged, with the smaller items. Phases 6 and 7 wait. What is left needs the user: see [notes/overnight-2026-10-30.md](notes/overnight-2026-10-30.md).
+
 Status: the user approved phases 1 to 5 in this order on 2026-10-29. Phases 6 and 7 wait. Work starts with Paper designs for everything that is missing. Written on 2026-10-29 from a gap analysis that compared three things: what the design docs promise (about 200 items), what the code does today, and every open item in the E2E notes, the build notes and the plans. The user sets the order.
 
 ## Where things stand

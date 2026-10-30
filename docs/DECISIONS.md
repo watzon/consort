@@ -671,3 +671,21 @@ The user was away during the first build, from 2026-10-29. These are the choices
 | 665 | Desktop | Sources while off stay in the app until Turn on and learn | Unticking everything must not bring the defaults back | Yes |
 | 666 | Desktop | A flagged body is a selectable copy over an underlined copy | GPUI's selectable text has no highlights | Yes |
 | 667 | Desktop | Edit fields show only in the card where Edit started | One text input entity cannot draw in two views | Yes |
+| 668 | Hub | While the voice is on, every send asks, whatever the connection's rule and earlier allows; a draft keeps the rule unless it has flags | The card is the only place where the user sees text that goes out in their name | Yes |
+| 669 | Hub | A card that the hub forced to ask saves no allow, also on a late answer (`ConnectorCard.ask_rule`) | A forced card must not open the way for later calls | Yes |
+| 670 | Hub | The scan normalizes text and compares values (time, date, amount, phrase), not substrings | `$50` inside `$500` and `deal` inside `ideal` passed as "in the request" | Yes |
+| 671 | Hub | The request is only the user's own words (`task_requests`, user turn events, thread replies) | A brief or a forwarded text can quote the sender, who could whitelist their own commitments | Yes |
+| 672 | Hub | The scan reads every string of the arguments except recipients, IDs, URLs and timestamps | Text in `blocks` or nested bodies went out unscanned | Yes |
+| 673 | Hub | "Is a voice task" is a mark on the task (`voice_tasks`); Learn again, Turn off and Reset stop earlier voice tasks | A replaced voice task lost its limits | Yes |
+| 674 | Hub | The hub owns `voice.md`; sessions cannot write or delete it; rule changes go through `propose_voice_rule` with 3 checked pairs | "3 agreeing edits" and "the user approves every change" held only in the prompt | Yes |
+| 675 | Hub | The user's rules are `VoiceSettings.user_rules`; the hub renders the `(you)` marks | A session could forge or move a mark | Yes |
+| 676 | Hub | Do it merges the user's rules of that moment | A rule that the user wrote while the offer waited was lost | Yes |
+| 677 | Hub schema | Version 12 makes the voice tables with `IF NOT EXISTS` and adds `voice_tasks` and `task_requests` | Hubs at 11 from the empty version 10 had no voice tables | Yes |
+| 678 | Protocol | `approval.answer.checked_hash` must match `ConnectorCard::review_hash` | The tick was not bound to the text and flags that the user saw | Yes |
+| 679 | Hub | Voice offers follow the Tutti level; with Off the edits wait; `ask_decision` offers always follow the normal gate | A voice event let any offer skip the gate | Yes |
+| 680 | Hub | Voice events get turns of their own with only the voice tools, reading, asking and posting (`TurnKind::Voice`) | Draft text in the events can quote other people | Yes |
+| 681 | Hub | A voice task has only read tools, `suggest_memory` and `submit_for_review`, and never reads unchosen DMs or private channels | Consent per source, and raw text stays in the task | Yes |
+| 682 | Hub | Screening replaces `mailto:`, written-out addresses and bare domains, also in `sources:` and `learned:` | Links such as `evil.com/pay` passed into approved rules | Yes |
+| 683 | Hub | Draft pairs keep each body alone; a call with no card is a sent-unchanged pair | The filter missed mail with a subject and calls with no card | Yes |
+| 684 | Hub | Every copy of a draft goes after 90 days: pairs, card text, call arguments in sessions, voice task briefs | "Kept 90 days" held only for the pairs | Yes |
+| 685 | Desktop | The tick is kept per review hash; the Approval line of Settings > Voice says that every send asks | One rule in the hub and on the page | Yes |
