@@ -121,9 +121,10 @@ During quiet hours and snooze, nothing notifies.
 
 ### M11. Quiet hours, snooze and the off switch (the gap in all three products)
 
-- Quiet hours: one global range, default 21:00 to 08:00, in the user's time zone. The desktop app sets the time zone from the system when the hub has none.
-- Snooze: for 2 hours, until tomorrow 08:00, or for a week. While snoozed, no proactive wake runs except follow-ups (which cannot notify). The coordinator can snooze with `set_proactivity` ("not today").
-- Off per channel, or "Pause all" in Settings > Proactivity.
+- Quiet hours: one global range, default 21:00 to 07:00, in the user's time zone. The desktop app sets the time zone from the system when the hub has none.
+- In quiet hours, check-ins and stale-task nudges wait, and nothing notifies. The routines that the user expects at a fixed time (the morning brief, the research pass, follow-ups) run at their time, but they cannot notify inside quiet hours. The research pass never posts, so it runs at night with no effect on the user.
+- Snooze: for 2 hours, until tomorrow at the end of quiet hours, or for a week. While snoozed, check-ins, stale-task nudges and the research pass do not run. Follow-ups and the morning brief still run, but they cannot notify. The coordinator can snooze with `set_proactivity` ("not today").
+- Off per channel, or "Pause all" in Settings > Proactivity. "Pause all" stops everything that starts on its own, including the brief and follow-ups (a follow-up that comes due while paused is skipped and logged).
 
 ### M12. The proactivity log and feedback (from OpenClaw's audit transcript and Grok's run history)
 
@@ -167,7 +168,7 @@ During quiet hours and snooze, nothing notifies.
 - Hub settings: `ProactivitySettings { quiet_hours: { start, end }, time_zone, snoozed_until, paused, notify_cap_per_day }` with `proactivity.get`, `proactivity.set`, `proactivity.snooze`, and `proactivity.log { channel?, kind?, before?, limit }`. Feed entries so clients stay current.
 - Tools: `follow_up_later`, `cancel_follow_up`, `set_proactivity` (quieter only, plus snooze), `post_message.notify`, `post_message.suggestions`, `reply.suggestions`, `no_reply_needed.finding`, `ask_decision.offer`.
 
-## Screens (Paper first, from worldY 9600 on the Desktop page)
+## Screens (Paper: see [notes/design-proactivity.md](notes/design-proactivity.md))
 
 1. Settings > Proactivity: Pause all, quiet hours and time zone, snooze, the level of each channel, "Proactive turns today", and the log with filters.
 2. A proactive message in the timeline with its mark ("Check-in", "Follow-up", "Morning brief") and the hover actions Useful and Too noisy.
