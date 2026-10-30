@@ -63,6 +63,9 @@ pub struct BubbleRow {
     pub with_items: bool,
     /// The last bubble of its group: it has the small corner.
     pub last_in_group: bool,
+    /// The bubble takes the full bubble width instead of fitting its text.
+    /// See [`needs_full_width`].
+    pub wide: bool,
     pub spacing: Spacing,
 }
 
@@ -223,6 +226,27 @@ pub fn split_paragraphs(markdown: &str) -> Vec<String> {
         .collect()
 }
 
+/// Whether a bubble's Markdown needs the full bubble width.
+///
+/// A bubble fits its text, but the layout cannot measure the natural width
+/// of a list, a table, a quote or a code block: it only knows the width of
+/// their widest part that cannot wrap, often one short heading. A bubble
+/// with only paragraphs and link definitions fits its text; any other block
+/// makes it wide, so that its lines do not wrap word by word.
+pub fn needs_full_width(markdown: &str) -> bool {
+    let mut options = ParseOptions::gfm();
+    options.constructs.math_text = false;
+    options.constructs.math_flow = false;
+    let Ok(root) = markdown::to_mdast(markdown, &options) else {
+        return false;
+    };
+    root.children().is_some_and(|children| {
+        children
+            .iter()
+            .any(|child| !matches!(child, Node::Paragraph(_) | Node::Definition(_)))
+    })
+}
+
 /// The lane of a speaker.
 fn lane_of(speaker: Speaker) -> Lane {
     match speaker {
@@ -311,14 +335,17 @@ pub fn rows(items: &[TimelineItem]) -> Vec<ChatRow> {
                 for (part, (markdown, title)) in parts.into_iter().enumerate() {
                     let in_group = open_lane == Some(lane);
                     let spacing = spacing_for(in_group, after_separator, out.is_empty());
+                    let with_items = !m.items.is_empty() && Some(part) == last_text;
+                    let wide = with_items || (!title && needs_full_width(&markdown));
                     out.push(ChatRow::Bubble(BubbleRow {
                         item: ix,
                         part,
                         markdown,
                         lane,
                         title,
-                        with_items: !m.items.is_empty() && Some(part) == last_text,
+                        with_items,
                         last_in_group: false,
+                        wide,
                         spacing,
                     }));
                     after_separator = false;
@@ -349,6 +376,21 @@ pub fn rows(items: &[TimelineItem]) -> Vec<ChatRow> {
 mod tests {
     use super::*;
     use crate::view::{DayView, MessageView, NoticeView, TaskCardView};
+
+    #[test]
+    fn only_paragraphs_fit_their_text() {
+        assert!(!needs_full_width("One short line."));
+        assert!(!needs_full_width(
+            "Two\n\nparagraphs, with a [link][a].\n\n[a]: https://example.com"
+        ));
+        assert!(needs_full_width(
+            "**Your accounts**\n\n- Gmail: search, read and draft.\n- Calendar"
+        ));
+        assert!(needs_full_width("## Run work\n\nStart tasks."));
+        assert!(needs_full_width("Run this:\n\n```sh\ncargo test\n```"));
+        assert!(needs_full_width("> A quote"));
+        assert!(needs_full_width("| a | b |\n|---|---|\n| 1 | 2 |"));
+    }
 
     const MIN: i64 = 60_000;
 

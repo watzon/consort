@@ -18,6 +18,8 @@ pub struct FrameClock {
     tick: Cell<u64>,
     /// A draw since the last `begin_frame` showed something that moves.
     used: Cell<bool>,
+    /// What moved needs the full 8 fps. Only the idle mark moved: 4 fps.
+    fast: Cell<bool>,
     /// The icon button under the pointer. Only it shimmers.
     hovered: RefCell<Option<ElementId>>,
 }
@@ -28,6 +30,7 @@ impl FrameClock {
     /// Starts a draw: nothing that moves has been drawn yet.
     pub fn begin_frame(&self) {
         self.used.set(false);
+        self.fast.set(false);
     }
 
     /// The last draw showed something that moves.
@@ -35,9 +38,21 @@ impl FrameClock {
         self.used.get()
     }
 
-    /// A draw shows something that moves, so the timer must run.
+    /// A draw shows something that moves at 8 fps, so the timer must run.
     pub fn mark_used(&self) {
         self.used.set(true);
+        self.fast.set(true);
+    }
+
+    /// A draw shows something that moves at half speed (the idle mark), so
+    /// the timer must run, at 4 fps unless something else needs more.
+    pub fn mark_used_slow(&self) {
+        self.used.set(true);
+    }
+
+    /// The last draw showed something that needs the full 8 fps.
+    pub fn fast(&self) -> bool {
+        self.fast.get()
     }
 
     /// Moves the clock on by one frame.
@@ -139,6 +154,17 @@ mod tests {
         assert_eq!(parse_defaults_bool("true"), Some(true));
         assert_eq!(parse_defaults_bool(""), None);
         assert_eq!(parse_defaults_bool("2"), None);
+    }
+
+    #[test]
+    fn only_the_idle_mark_lets_the_clock_slow_down() {
+        let clock = FrameClock::default();
+        clock.mark_used_slow();
+        assert!(clock.used() && !clock.fast());
+        clock.mark_used();
+        assert!(clock.fast());
+        clock.begin_frame();
+        assert!(!clock.used() && !clock.fast());
     }
 
     #[test]

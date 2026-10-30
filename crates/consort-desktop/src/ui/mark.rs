@@ -17,7 +17,7 @@ use gpui_kit::{AnyElement, IntoElement, Pixels, SharedString, Styled, img};
 /// What the mark shows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum MarkPhase {
-    /// Still. Nothing runs.
+    /// At rest: one pose whose edges shimmer at half speed.
     Idle,
     /// The voices circle each other.
     Working,
@@ -31,7 +31,8 @@ impl MarkPhase {
     /// The frames in one loop.
     pub fn frames(self) -> u64 {
         match self {
-            MarkPhase::Idle | MarkPhase::Done => 1,
+            MarkPhase::Done => 1,
+            MarkPhase::Idle => 3,
             MarkPhase::Working => 12,
             MarkPhase::NeedsYou => 24,
         }
@@ -49,6 +50,15 @@ impl MarkPhase {
     /// True for a phase that loops.
     pub fn animates(self) -> bool {
         self.frames() > 1
+    }
+
+    /// Clock ticks per frame: idle shimmers at half speed (4 fps), so an
+    /// app at rest redraws half as often.
+    pub fn ticks_per_frame(self) -> u64 {
+        match self {
+            MarkPhase::Idle => 2,
+            _ => 1,
+        }
     }
 
     /// The `--screen` name of the phase.
@@ -173,7 +183,7 @@ impl MarkPlayer {
         if reduce_motion || !phase.animates() {
             0
         } else {
-            tick.wrapping_sub(self.start_tick) % phase.frames()
+            (tick.wrapping_sub(self.start_tick) / phase.ticks_per_frame()) % phase.frames()
         }
     }
 }
@@ -194,7 +204,7 @@ mod tests {
         );
         assert_eq!(
             frame_path(MarkPhase::Idle, 7, true, true),
-            "mark/dark-sharp/idle-00.svg"
+            "mark/dark-sharp/idle-01.svg"
         );
         assert_eq!(
             frame_path(MarkPhase::Done, 0, false, false),
@@ -337,5 +347,11 @@ mod tests {
         assert_eq!(p.frame(MarkPhase::NeedsYou, 107, false), 0);
         assert_eq!(p.frame(MarkPhase::NeedsYou, 130, false), 23);
         assert_eq!(p.frame(MarkPhase::Idle, 131, false), 0);
+        // Idle shimmers at half speed over its three edge versions.
+        assert_eq!(p.frame(MarkPhase::Idle, 132, false), 0);
+        assert_eq!(p.frame(MarkPhase::Idle, 133, false), 1);
+        assert_eq!(p.frame(MarkPhase::Idle, 135, false), 2);
+        assert_eq!(p.frame(MarkPhase::Idle, 137, false), 0);
+        assert_eq!(p.frame(MarkPhase::Idle, 138, true), 0, "Reduce motion");
     }
 }

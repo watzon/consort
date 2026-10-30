@@ -352,7 +352,7 @@ Stop motion runs at 8 frames a second (`motion.frame_ms`, 125 ms) on one shared 
 - A live status icon (Working or Needs input): it shows its three hand-drawn versions in turn.
 - An icon button under the pointer: it shows its three versions in turn, only while the pointer is on it.
 
-The clock runs only while a draw showed one of these and the window is active. An idle screen draws nothing on a timer.
+The clock runs only while a draw showed one of these and the window is active. When the only thing that moves is the idle mark at the top center, the clock ticks at half speed (4 fps). With Reduce motion on, nothing draws on a timer.
 
 **Reduce motion** is a switch in Settings > Appearance. It starts from the user's choice (saved in `appearance.json`). Until the user sets it, it starts from the system setting where the app can read it (on macOS, `defaults read com.apple.universalaccess reduceMotion`), else off. With it on, the mark changes pose only when its state changes, nothing shimmers, and elements fade in 120 ms.
 
@@ -368,10 +368,10 @@ The clock runs only while a draw showed one of these and the window is active. A
 
 The logo is the Three voices mark: three dabs of pigment, one for each voice of a broken consort. Gold is the accent, then verdigris and lapis. Where they overlap, the paint mixes lighter (screen) on a dark ground and darker (multiply) on a light ground, like a chord.
 
-- **Frames.** GPUI cannot run an SVG noise filter at every frame, so `design/mark/generate.mjs` renders every frame ahead of time into `assets/mark/`: idle (1 frame), working (12 poses, each with its hand-drawn edge), needs you (24 frames), and done (1 frame). Each set is in dark pigments (`dark/`) and light pigments (`light/`). GPUI's image renderer (resvg) draws the paint filter and the blends.
+- **Frames.** GPUI cannot run an SVG noise filter at every frame, so `design/mark/generate.mjs` renders every frame ahead of time into `assets/mark/`: idle (3 frames: one pose, three edges), working (12 poses, each with its hand-drawn edge), needs you (24 frames), and done (1 frame). Each set is in dark pigments (`dark/`) and light pigments (`light/`). GPUI's image renderer (resvg) draws the paint filter and the blends.
 - **Small sizes.** At 16 to 20 px, use the sharp frames (`dark-sharp/`, `light-sharp/`), which have no paint edges.
-- **States.** Idle holds still. Working: the voices circle each other. Needs you: gold comes forward and beats twice a second. Done: the voices close into a chord for `motion.done_hold_ms` (1.5 s) after work ends, then the mark goes back to idle or to needs you.
-- **Where.** The mark is the logo on onboarding and on the start-up error, the Tutti row in the sidebar and in the switcher (idle, sharp, 16 px), and the title bar on Windows and Linux. The app icons in `design/logo/` are the idle mark on `surface.card`.
+- **States.** Idle keeps one pose and its edges shimmer at 4 fps, so the mark looks alive at rest. Working: the voices circle each other. Needs you: gold comes forward and beats twice a second. Done: the voices close into a chord for `motion.done_hold_ms` (1.5 s) after work ends, then the mark goes back to idle or to needs you.
+- **Where.** The mark is the logo on onboarding and on the start-up error, the Tutti row in the sidebar and in the switcher (idle, sharp, 16 px, always still), and the title bar on Windows and Linux. The app icons in `design/logo/` are the idle mark on `surface.card`.
 - **Wordmark.** "consort" in lowercase, Atkinson Hyperlegible Next 600, to the right of the mark. The mark is about 1.2 times the font size high.
 
 ## Text in the UI

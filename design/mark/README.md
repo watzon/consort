@@ -25,20 +25,20 @@ Frames go to `crates/consort-desktop/assets/mark/`.
 
 Sharp idle and done frames use viewBox `20 21 60 60`. Sharp working and needs frames use `10 11 80 80`.
 
-Each folder holds 38 frames:
+Each folder holds 40 frames:
 
 | State | Files | Notes |
 | --- | --- | --- |
-| idle | `idle-00` | Still. |
+| idle | `idle-00` to `idle-02` | One pose; the three edge versions. |
 | working | `working-00` to `working-11` | Loops after 12 frames. |
 | needs | `needs-00` to `needs-23` | Loops after 24 frames. Gold beats every 4 frames. |
 | done | `done-00` | Still. |
 
-In total there are 152 frames.
+In total there are 160 frames.
 
 ## Playback
 
-Play moving states at 8 fps. Play idle and done as one still frame.
+Play working and needs at 8 fps. Play idle at 4 fps (its edges shimmer and its pose stays), and done as one still frame. The 16 px sidebar mark shows `idle-00` only.
 
 ## Logo files
 

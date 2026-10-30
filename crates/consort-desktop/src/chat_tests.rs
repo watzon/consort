@@ -305,10 +305,102 @@ fn the_mark_plays_at_eight_frames_a_second_and_stops_under_reduce_motion(cx: &mu
 }
 
 #[gpui::test]
-fn an_icon_button_shimmers_only_while_hovered(cx: &mut TestAppContext) {
+fn a_bubble_with_a_list_takes_the_full_width(cx: &mut TestAppContext) {
+    // A list cannot report its natural width, so its bubble must not shrink
+    // to the width of a short heading and wrap the list word by word.
+    let mut state = mock();
+    let tutti = consort_client::mock::tutti_id();
+    for timeline in &mut state.timelines {
+        if timeline.channel_id != tutti {
+            continue;
+        }
+        let Some(consort_client::TimelineItem::Message(reply)) = timeline
+            .items
+            .iter()
+            .find(|i| i.key() == "msg_tutti_reply")
+            .cloned()
+        else {
+            panic!("the mock has the reply");
+        };
+        let mut list = reply.clone();
+        list.id = "msg_tutti_list".to_owned();
+        list.body = "**Your accounts**\n\n- Gmail (your personal, bitstormtech and watzon.tech accounts): search, read, draft, reply, label.\n- Google Calendar".to_owned();
+        let mut short = reply;
+        short.id = "msg_tutti_short".to_owned();
+        short.body = "Done.".to_owned();
+        timeline.items.retain(|i| i.key() != "msg_tutti_reply");
+        timeline
+            .items
+            .push(consort_client::TimelineItem::Message(list));
+        timeline
+            .items
+            .push(consort_client::TimelineItem::Message(short));
+    }
+    let (handle, app) = open(state, cx);
+    let cx = &mut VisualTestContext::from_window(handle, cx);
+    draw(cx);
+    let max = app.read_with(cx, |_, cx| ConsortApp::tokens(cx).layout.bubble_max_width);
+    let list = cx
+        .debug_bounds("bubble-msg_tutti_list.p0")
+        .expect("the list bubble draws");
+    assert!(
+        (list.size.width - max).abs() < px(1.),
+        "the list bubble is {:?}, the bubble width is {max:?}",
+        list.size.width
+    );
+    // A short plain message still fits its text.
+    let short = cx
+        .debug_bounds("bubble-msg_tutti_short.p0")
+        .expect("the short bubble draws");
+    assert!(short.size.width < max / 2., "{:?}", short.size.width);
+}
+
+#[gpui::test]
+fn the_idle_mark_shimmers_at_half_speed(cx: &mut TestAppContext) {
     let (handle, app) = open(quiet(), cx);
     let cx = &mut VisualTestContext::from_window(handle, cx);
     cx.update(|_, cx| app.update(cx, |app, _| app.window_active = true));
+    draw(cx);
+    app.read_with(cx, |app, cx| {
+        assert_eq!(app.mark_phase(cx), MarkPhase::Idle)
+    });
+    let mut frames = Vec::new();
+    for _ in 0..6 {
+        // Two frame periods per idle frame: 4 a second.
+        cx.executor().advance_clock(FRAME * 2);
+        cx.run_until_parked();
+        frames.push(cx.update(|_, cx| {
+            let tick = cx.global::<FrameClock>().tick();
+            app.update(cx, |app, _| app.mark.frame(MarkPhase::Idle, tick, false))
+        }));
+        let fast = cx.update(|_, cx| cx.global::<FrameClock>().fast());
+        assert!(!fast, "only the idle mark moves, so the clock runs slow");
+    }
+    let mut seen = frames.clone();
+    seen.sort_unstable();
+    seen.dedup();
+    assert_eq!(seen, [0, 1, 2], "the three edges show in turn: {frames:?}");
+    // Under Reduce motion the idle mark holds still.
+    cx.update(|_, cx| cx.set_reduce_motion(true));
+    let tick = cx.update(|_, cx| cx.global::<FrameClock>().tick());
+    app.update(cx, |app, _| {
+        assert_eq!(app.mark.frame(MarkPhase::Idle, tick + 3, true), 0)
+    });
+    cx.update(|_, cx| cx.set_reduce_motion(false));
+}
+
+#[gpui::test]
+fn an_icon_button_shimmers_only_while_hovered(cx: &mut TestAppContext) {
+    let (handle, app) = open(quiet(), cx);
+    let cx = &mut VisualTestContext::from_window(handle, cx);
+    // The idle mark shimmers too; hold it on its still Done frame, so only
+    // the button can move here.
+    cx.update(|_, cx| {
+        app.update(cx, |app, _| {
+            app.window_active = true;
+            app.mark_forced = Some(MarkPhase::Done);
+        })
+    });
     draw(cx);
     let tick = |cx: &mut VisualTestContext| cx.update(|_, cx| cx.global::<FrameClock>().tick());
     // Nothing moves: the clock stands still.

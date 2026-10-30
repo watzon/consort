@@ -226,7 +226,11 @@ impl ConsortApp {
         let reduce = cx.reduce_motion();
         let frame = self.mark.frame(phase, tick, reduce);
         if phase.animates() && !reduce {
-            cx.global::<FrameClock>().mark_used();
+            if phase.ticks_per_frame() > 1 {
+                cx.global::<FrameClock>().mark_used_slow();
+            } else {
+                cx.global::<FrameClock>().mark_used();
+            }
             // Load the frames of the loop before they show, so a frame
             // never draws empty while its image loads.
             for n in 0..phase.frames() {
@@ -799,6 +803,10 @@ impl ConsortApp {
             .debug_selector(move || selector)
             .max_w(t.layout.bubble_max_width)
             .min_w_0()
+            // Lists, tables, quotes and code cannot report a natural width,
+            // so their bubble takes the full lane, up to the bubble width
+            // (`needs_full_width`).
+            .when(row.wide, |d| d.w_full())
             .bg(if you {
                 c.accent_surface
             } else {

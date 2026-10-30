@@ -59,8 +59,9 @@ export function pose(state, f) {
     return { x: 50 + Math.cos(a) * d, y: 51 + Math.sin(a) * d, r: rr, op };
   });
 }
-// Idle holds still; only working and needs-you boil the edges.
-export function boilFor(state, f) { return state === 'idle' || state === 'done' ? 0 : f % 3; }
+// Done holds still. Idle keeps its pose and boils its edges (the app plays
+// it at half speed); working and needs-you boil as they move.
+export function boilFor(state, f) { return state === 'done' ? 0 : f % 3; }
 
 const UID = 'f';
 
@@ -77,8 +78,9 @@ export function markBody(state, f, pal, opts = {}) {
 
 const svg = (attrs, inner) => `<svg xmlns="http://www.w3.org/2000/svg" ${attrs}>${inner}</svg>\n`;
 
-// Frames per state: idle and done hold still. Working loops over 12, needs over 24.
-const STATES = [['idle', 1], ['working', 12], ['needs', 24], ['done', 1]];
+// Frames per state: idle loops over its 3 edge versions, done holds still.
+// Working loops over 12, needs over 24.
+const STATES = [['idle', 3], ['working', 12], ['needs', 24], ['done', 1]];
 
 const sets = [
   ['dark', DARK, false],

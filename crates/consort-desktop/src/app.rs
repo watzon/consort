@@ -1687,27 +1687,36 @@ impl ConsortApp {
             return;
         }
         self.clock_ticker = true;
-        let period = Self::tokens(cx).motion.frame;
+        let frame = Self::tokens(cx).motion.frame;
         cx.spawn(async move |this, cx| {
+            let mut period = frame;
             loop {
                 cx.background_executor().timer(period).await;
-                let keep = this.update(cx, |this, cx| {
-                    // The last draw says if something moved.
+                let next = this.update(cx, |this, cx| {
+                    // The last draw says if something moved, and how fast.
+                    let clock = cx.global::<FrameClock>();
                     let runs = crate::ui::motion::clock_runs(
-                        cx.global::<FrameClock>().used(),
+                        clock.used(),
                         this.window_active,
                         cx.reduce_motion(),
                     );
                     if !runs {
                         this.clock_ticker = false;
-                        return false;
+                        return None;
                     }
-                    cx.global::<FrameClock>().advance();
+                    // Only the idle mark moved: half speed.
+                    let next = if clock.fast() { frame } else { frame * 2 };
+                    clock.advance();
+                    if !clock.fast() {
+                        // The idle mark changes frame every two ticks.
+                        clock.advance();
+                    }
                     cx.notify();
-                    true
+                    Some(next)
                 });
-                if !matches!(keep, Ok(true)) {
-                    break;
+                match next {
+                    Ok(Some(next)) => period = next,
+                    _ => break,
                 }
             }
         })
