@@ -10,7 +10,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 #[path = "../src/connectors/fake.rs"]
-mod fake;
+pub(crate) mod fake;
 
 use crate::common::*;
 use consort_proto::client_api::{

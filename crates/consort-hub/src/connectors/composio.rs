@@ -11,6 +11,8 @@
 //! never hold a request header.
 
 use std::fmt;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use consort_proto::error::ErrorCode;
@@ -289,12 +291,32 @@ impl ConnectedAccount {
     }
 }
 
+/// Whether Composio accepted the key at the last call. Every [`Client`] of
+/// the hub shares one, so a call that Composio refuses shows in
+/// `composio.status` at once, with the next step.
+#[derive(Debug, Default)]
+pub(crate) struct KeyHealth {
+    refused: AtomicBool,
+}
+
+impl KeyHealth {
+    pub(crate) fn is_refused(&self) -> bool {
+        self.refused.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn set_refused(&self, refused: bool) {
+        self.refused.store(refused, Ordering::Relaxed);
+    }
+}
+
 /// A Composio client for one key and one base URL.
 #[derive(Clone)]
 pub(crate) struct Client {
     http: reqwest::Client,
     base: String,
     key: ApiKey,
+    health: Arc<KeyHealth>,
+    timeout: Duration,
 }
 
 impl fmt::Debug for Client {
@@ -312,9 +334,26 @@ pub(crate) fn composio_error(message: impl Into<String>) -> HubError {
 }
 
 impl Client {
+    #[cfg(test)]
     pub(crate) fn new(base: &str, key: ApiKey) -> Result<Self> {
+        Self::with_health(base, key, Arc::default())
+    }
+
+    /// A client that reports to `health` whether Composio accepts the key.
+    pub(crate) fn with_health(base: &str, key: ApiKey, health: Arc<KeyHealth>) -> Result<Self> {
+        Self::with_timeout(base, key, health, REQUEST_TIMEOUT)
+    }
+
+    /// The same, with another time limit for one request. Tests use a short
+    /// one with a server that never answers.
+    pub(crate) fn with_timeout(
+        base: &str,
+        key: ApiKey,
+        health: Arc<KeyHealth>,
+        timeout: Duration,
+    ) -> Result<Self> {
         let http = reqwest::Client::builder()
-            .timeout(REQUEST_TIMEOUT)
+            .timeout(timeout)
             .user_agent(concat!("consort-hub/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|_| HubError::internal("the HTTP client did not start"))?;
@@ -322,6 +361,8 @@ impl Client {
             http,
             base: base.trim_end_matches('/').to_owned(),
             key,
+            health,
+            timeout,
         })
     }
 
@@ -347,12 +388,22 @@ impl Client {
             request = request.json(body);
         }
         let response = request.send().await.map_err(|err| {
+            if err.is_timeout() {
+                return composio_error(format!(
+                    "Composio did not answer within {}. Try again in a moment.",
+                    crate::util::duration_text(self.timeout)
+                ));
+            }
             composio_error(format!(
                 "The hub could not reach Composio: {}. Check that the hub can reach the internet, then try again.",
                 err.without_url()
             ))
         })?;
         let status = response.status();
+        // A refused key is a fact about the key. Any other answer, also an
+        // error about the request, shows that Composio accepts the key.
+        self.health
+            .set_refused(matches!(status.as_u16(), 401 | 403));
         if response
             .content_length()
             .is_some_and(|len| len > MAX_RESPONSE_BYTES as u64)
@@ -360,6 +411,12 @@ impl Client {
             return Err(composio_error("Composio sent an answer that is too large."));
         }
         let bytes = response.bytes().await.map_err(|err| {
+            if err.is_timeout() {
+                return composio_error(format!(
+                    "Composio did not finish its answer within {}. Try again in a moment.",
+                    crate::util::duration_text(self.timeout)
+                ));
+            }
             composio_error(format!(
                 "The answer from Composio stopped: {}. Try again.",
                 err.without_url()

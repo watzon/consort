@@ -183,6 +183,8 @@ impl Core {
             }
             core.send_sign_in(id, state);
             if succeeded {
+                // A new login ends the expiry that a turn found.
+                core.clear_login_expired(account.id);
                 core.reprobe(account.id).await;
             } else {
                 core.send_inventory(false);

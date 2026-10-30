@@ -38,6 +38,10 @@ use crate::util::truncate_chars;
 /// session is signed out. The worker sends it (`consort-harness` has the
 /// same constant).
 pub(crate) const SIGNED_OUT_CODE: &str = "signed_out";
+/// The `code` of the error event that says that a turn found the login of
+/// the account expired, though the probe said it was signed in. The account
+/// shows "Sign in again", and placement skips it, like a signed-out account.
+pub(crate) const LOGIN_EXPIRED_CODE: &str = "login_expired";
 /// The `code` of the error event that a worker sends when it could not get
 /// an attachment or a channel file for a session. The hub also posts it as
 /// a notice, so the user sees which file the session did not get.
@@ -395,6 +399,9 @@ fn apply_event(tx: &mut Tx<'_>, ctx: &mut Ctx<'_>, event: &SessionEvent) -> Resu
             if code == SIGNED_OUT_CODE {
                 on_signed_out(tx, ctx, message)?;
             }
+            if code == LOGIN_EXPIRED_CODE {
+                on_login_expired(tx, ctx, message)?;
+            }
             if code == ATTACHMENT_FAILED_CODE {
                 // The user sees it where the files went: in the task thread,
                 // or in the channel of a coordinator.
@@ -640,7 +647,19 @@ fn release_coordinator(tx: &mut Tx<'_>, ctx: &mut Ctx<'_>, started: bool) -> Res
 /// choose it again until the worker reports it signed in. A coordinator
 /// session on that account cannot answer, so the hub replaces it.
 fn on_signed_out(tx: &mut Tx<'_>, ctx: &mut Ctx<'_>, detail: &str) -> Result<()> {
-    mark_account_signed_out(tx, &ctx.session, detail)?;
+    mark_account(tx, &ctx.session, AuthState::SignedOut, detail)?;
+    if ctx.session.role == SessionRole::Coordinator && ctx.is_current(tx)? {
+        replace_signed_out_coordinator(tx, ctx)?;
+    }
+    Ok(())
+}
+
+/// The login of the session's account expired. The hub sets the account to
+/// `error` with the detail ("The login expired. Sign in again."), so the app
+/// shows Expired, and placement does not choose it. A coordinator session on
+/// the account moves, as for a signed-out account.
+fn on_login_expired(tx: &mut Tx<'_>, ctx: &mut Ctx<'_>, detail: &str) -> Result<()> {
+    mark_account(tx, &ctx.session, AuthState::Error, detail)?;
     if ctx.session.role == SessionRole::Coordinator && ctx.is_current(tx)? {
         replace_signed_out_coordinator(tx, ctx)?;
     }
@@ -660,7 +679,7 @@ fn account_and_worker(tx: &Tx<'_>, session: &Session) -> Result<(String, String)
     Ok((label, name))
 }
 
-fn mark_account_signed_out(tx: &mut Tx<'_>, session: &Session, detail: &str) -> Result<()> {
+fn mark_account(tx: &mut Tx<'_>, session: &Session, state: AuthState, detail: &str) -> Result<()> {
     let Some(mut worker) = crate::store::machine::worker(tx.db(), session.worker_id)? else {
         return Ok(());
     };
@@ -673,9 +692,10 @@ fn mark_account_signed_out(tx: &mut Tx<'_>, session: &Session, detail: &str) -> 
         .accounts
         .iter_mut()
         .find(|a| a.account_id == session.account_id)
+        && (account.auth_state != state || account.auth_detail.as_deref() != Some(detail))
         && account.auth_state != AuthState::SignedOut
     {
-        account.auth_state = AuthState::SignedOut;
+        account.auth_state = state;
         account.auth_detail = Some(cut_text(detail, NOTICE_TEXT_MAX_BYTES));
         changed = true;
     }
@@ -697,8 +717,16 @@ fn mark_account_signed_out(tx: &mut Tx<'_>, session: &Session, detail: &str) -> 
 fn account_signed_out(tx: &Tx<'_>, session: &Session) -> Result<bool> {
     Ok(crate::store::machine::worker(tx.db(), session.worker_id)?
         .and_then(|w| w.inventory)
-        .and_then(|inv| inv.account(session.account_id).map(|a| a.auth_state))
-        == Some(AuthState::SignedOut))
+        .and_then(|inv| {
+            inv.account(session.account_id)
+                .map(|a| (a.auth_state, a.auth_detail.clone()))
+        })
+        .is_some_and(|(state, detail)| {
+            state == AuthState::SignedOut
+                // An expired login is the same for a coordinator.
+                || (state == AuthState::Error
+                    && detail.is_some_and(|d| d.to_ascii_lowercase().contains("expired")))
+        }))
 }
 
 /// Ends a coordinator session whose account is signed out. The events of

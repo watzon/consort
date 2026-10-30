@@ -17,7 +17,6 @@ use consort_proto::model::{
 };
 use consort_proto::time::Timestamp;
 
-use super::git::{Repo, parse_git_url, remote_commit};
 use super::package::{is_script, prepare};
 use crate::error::Result;
 use crate::hub::Hub;
@@ -130,21 +129,23 @@ impl Hub {
     /// Checks one skill. Returns the new update state, or `None` when it
     /// stays as it is.
     async fn check_one(&self, skill: &Skill) -> Result<Option<SkillUpdateState>> {
-        let (url, path, git_ref) = match &skill.source {
-            SkillSource::Git { url, path, git_ref } => (url, path, git_ref.as_deref()),
-            SkillSource::Directory { url, path, .. } => (url, path, None),
+        // A git skill follows its ref. A directory skill follows the ref in
+        // its location, or the default branch. Archive and npm skills have
+        // their own pins (see `remote.rs`). The user installed a `Git`
+        // skill from the URL, so git may use credentials for it.
+        let (location, path, git_ref, typed) = match &skill.source {
+            SkillSource::Git { url, path, git_ref } => (url, path, git_ref.as_deref(), true),
+            SkillSource::Directory { url, path, .. } => (url, path, None, false),
             SkillSource::Upload { .. } => return Ok(None),
         };
         let sources = &self.skill_sources;
-        let options = sources.git_options();
         let up_to_date = || {
             Ok(match skill.update {
                 SkillUpdateState::CheckFailed { .. } => Some(SkillUpdateState::UpToDate),
                 _ => None,
             })
         };
-        let target = parse_git_url(url, options)?;
-        let commit = remote_commit(sources.tmp_root(), &target.url, git_ref, options).await?;
+        let commit = self.remote_pin(location, git_ref, typed).await?;
         if skill.commit.as_deref() == Some(commit.as_str()) {
             return up_to_date();
         }
@@ -164,9 +165,10 @@ impl Hub {
         if same.as_deref() == Some(commit.as_str()) {
             return up_to_date();
         }
-        let repo = Repo::fetch(sources.tmp_root(), &target.url, git_ref, options).await?;
-        let files = repo.skill_files(path.as_deref()).await?;
-        let prepared = prepare(files, None)?;
+        let got = self
+            .fetch_remote(location, path.as_deref(), git_ref, typed)
+            .await?;
+        let prepared = prepare(got.files, None)?;
         if prepared.name != skill.name {
             return Ok(Some(SkillUpdateState::CheckFailed {
                 message: format!(
@@ -177,7 +179,7 @@ impl Hub {
         }
         if prepared.content_hash == skill.content_hash {
             if let Ok(mut same) = sources.same_files.lock() {
-                same.insert(skill.id, repo.commit.clone());
+                same.insert(skill.id, got.commit.clone());
             }
             return up_to_date();
         }
@@ -210,7 +212,7 @@ impl Hub {
             })
             .await?;
         Ok(Some(SkillUpdateState::Available {
-            commit: Some(repo.commit.clone()),
+            commit: Some(got.commit.clone()),
             content_hash: prepared.content_hash,
             changes,
             scripts_changed,

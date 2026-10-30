@@ -10,6 +10,7 @@ use crate::hub::{HUB_VERSION, Hub};
 pub(crate) mod blobs;
 pub(crate) mod client_ws;
 pub mod clients;
+pub(crate) mod logos;
 pub mod pairing;
 pub(crate) mod worker_ws;
 pub(crate) mod ws;
@@ -33,5 +34,6 @@ pub(crate) fn router(hub: Hub) -> Router {
                 .get(blobs::get_blob)
                 .head(blobs::head_blob),
         )
+        .route("/v1/logos/{key}", get(logos::get_logo))
         .with_state(hub)
 }

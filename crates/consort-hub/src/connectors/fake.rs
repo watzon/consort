@@ -32,6 +32,14 @@ pub struct FakeState {
     pub executions: Vec<(String, Value)>,
     /// Link accounts become active the first time the hub reads them.
     pub auto_activate: bool,
+    /// The project key is revoked: every call is refused.
+    pub revoked: bool,
+    /// Where the toolkit logos live. `None` keeps the https example URLs.
+    pub logo_base: Option<String>,
+    /// How many times each logo file was asked for.
+    pub logo_hits: BTreeMap<String, usize>,
+    /// Logo files that answer 404 from now on.
+    pub broken_logos: Vec<String>,
     next: u32,
 }
 
@@ -60,8 +68,9 @@ fn not_found(what: &str) -> Response {
 }
 
 fn check(state: &Shared, headers: &HeaderMap, call: String) -> bool {
-    state.lock().unwrap().calls.push(call);
-    headers.get("x-api-key").and_then(|v| v.to_str().ok()) == Some(GOOD_KEY)
+    let mut guard = state.lock().unwrap();
+    guard.calls.push(call);
+    !guard.revoked && headers.get("x-api-key").and_then(|v| v.to_str().ok()) == Some(GOOD_KEY)
 }
 
 fn toolkits() -> Vec<Value> {
@@ -113,6 +122,19 @@ fn tools_of(toolkit: &str) -> Vec<Value> {
     }
 }
 
+/// Points the logos of toolkits at the fake's own `/logos/` route.
+fn with_logos(base: Option<&str>, mut items: Vec<Value>) -> Vec<Value> {
+    if let Some(base) = base {
+        for item in &mut items {
+            if let Some(url) = item["meta"]["logo"].as_str() {
+                let name = url.rsplit('/').next().unwrap_or("x.svg").to_owned();
+                item["meta"]["logo"] = json!(format!("{base}/logos/{name}"));
+            }
+        }
+    }
+    items
+}
+
 fn page(items: Vec<Value>) -> Value {
     json!({"items": items, "next_cursor": null, "total_pages": 1, "current_page": 1, "total_items": 0})
 }
@@ -121,7 +143,8 @@ async fn list_toolkits(State(s): State<Shared>, headers: HeaderMap) -> Response 
     if !check(&s, &headers, "GET /toolkits".into()) {
         return unauthorized();
     }
-    axum::Json(page(toolkits())).into_response()
+    let base = s.lock().unwrap().logo_base.clone();
+    axum::Json(page(with_logos(base.as_deref(), toolkits()))).into_response()
 }
 
 async fn categories(State(s): State<Shared>, headers: HeaderMap) -> Response {
@@ -143,7 +166,11 @@ async fn toolkit(
     if !check(&s, &headers, format!("GET /toolkits/{slug}")) {
         return unauthorized();
     }
-    let Some(listed) = toolkits().into_iter().find(|t| t["slug"] == slug) else {
+    let base = s.lock().unwrap().logo_base.clone();
+    let Some(listed) = with_logos(base.as_deref(), toolkits())
+        .into_iter()
+        .find(|t| t["slug"] == slug)
+    else {
         return not_found("Toolkit");
     };
     let mode = listed["auth_schemes"][0]
@@ -441,6 +468,39 @@ async fn execute(
         .into_response()
 }
 
+/// A logo file. `slow.svg` accepts the request and never answers.
+async fn logo(State(s): State<Shared>, Path(name): Path<String>) -> Response {
+    {
+        let mut state = s.lock().unwrap();
+        *state.logo_hits.entry(name.clone()).or_default() += 1;
+        if state.broken_logos.contains(&name) {
+            return not_found("Logo");
+        }
+    }
+    match name.as_str() {
+        "slow.svg" => {
+            std::future::pending::<()>().await;
+            unreachable!()
+        }
+        "bad.svg" => (
+            [(axum::http::header::CONTENT_TYPE, "image/svg+xml")],
+            "<html>not an image</html>",
+        )
+            .into_response(),
+        "big.png" => {
+            let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+            bytes.resize(300 * 1024, 0);
+            ([(axum::http::header::CONTENT_TYPE, "image/png")], bytes).into_response()
+        }
+        "missing.svg" => not_found("Logo"),
+        other => (
+            [(axum::http::header::CONTENT_TYPE, "image/svg+xml")],
+            format!("<svg xmlns=\"http://www.w3.org/2000/svg\"><title>{other}</title></svg>"),
+        )
+            .into_response(),
+    }
+}
+
 impl FakeComposio {
     /// Starts the fake on a free local port. The base URL ends with
     /// `/api/v3.1`, like the real one.
@@ -467,7 +527,10 @@ impl FakeComposio {
                 get(get_account).delete(delete_account),
             )
             .with_state(state.clone());
-        let app = Router::new().nest("/api/v3.1", api);
+        let app = Router::new()
+            .nest("/api/v3.1", api)
+            .route("/logos/{name}", get(logo))
+            .with_state(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -479,6 +542,37 @@ impl FakeComposio {
         }
     }
 
+    /// The address of the fake without a path, for example for logos.
+    pub fn origin(&self) -> String {
+        self.url.trim_end_matches("/api/v3.1").to_owned()
+    }
+
+    /// Makes the toolkit logos point at the fake's own `/logos/` route.
+    pub fn serve_logos(&self) {
+        let origin = self.origin();
+        self.state.lock().unwrap().logo_base = Some(origin);
+    }
+
+    /// Makes a logo file answer 404 from now on.
+    pub fn revoke_logos_of(&self, name: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .broken_logos
+            .push(name.to_owned());
+    }
+
+    /// How many times a logo file was asked for.
+    pub fn logo_hits(&self, name: &str) -> usize {
+        self.state
+            .lock()
+            .unwrap()
+            .logo_hits
+            .get(name)
+            .copied()
+            .unwrap_or(0)
+    }
+
     /// How many times the hub made a call, for example `GET /toolkits`.
     pub fn count(&self, call: &str) -> usize {
         self.state
@@ -488,6 +582,23 @@ impl FakeComposio {
             .iter()
             .filter(|c| c.as_str() == call)
             .count()
+    }
+
+    /// Refuses the project key from now on, as Composio does after the key
+    /// is revoked or replaced.
+    pub fn revoke_key(&self) {
+        self.state.lock().unwrap().revoked = true;
+    }
+
+    /// Accepts the project key again.
+    pub fn restore_key(&self) {
+        self.state.lock().unwrap().revoked = false;
+    }
+
+    /// Forgets every connected account, as when the key belongs to another
+    /// Composio project that has none of them.
+    pub fn forget_accounts(&self) {
+        self.state.lock().unwrap().accounts.clear();
     }
 
     pub fn set_auto_activate(&self, on: bool) {

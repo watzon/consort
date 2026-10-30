@@ -292,6 +292,20 @@ async fn pump(
                 {
                     core.mark_signed_out(account_id, message);
                 }
+                // A turn found the login expired, which the probe cannot
+                // see. The account shows "Sign in again" until the user does.
+                if let SessionEvent::Error { code, .. } = &event
+                    && code == consort_harness::LOGIN_EXPIRED_ERROR_CODE
+                {
+                    core.mark_login_expired(account_id);
+                }
+                // A turn that works shows that the login is fine.
+                if matches!(
+                    &event,
+                    SessionEvent::TurnEnded { reason: consort_proto::worker_link::TurnEndReason::Completed, .. }
+                ) {
+                    core.clear_login_expired(account_id);
+                }
                 if let SessionEvent::RequestOpened(opened) = &event {
                     let allow = {
                         let tools = hub_tools.lock().await;

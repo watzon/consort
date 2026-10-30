@@ -62,6 +62,11 @@ pub(crate) struct Core {
     pub harnesses: Harnesses,
     pub sessions: Mutex<HashMap<SessionId, SessionHandle>>,
     pub statuses: Mutex<HashMap<AccountId, AccountStatus>>,
+    /// Accounts whose login a turn found expired. The probe cannot see an
+    /// expiry (`claude auth status` reports none), so a later probe that
+    /// says "signed in" does not undo the mark. A sign-in or a turn that
+    /// works clears it.
+    pub login_expired: Mutex<std::collections::HashSet<AccountId>>,
     pub spool_notify: Notify,
     pub inventory_notify: Notify,
     pub last_inventory_hash: Mutex<Option<String>>,
@@ -217,6 +222,7 @@ pub(crate) fn restore_sessions(core: &Arc<Core>) -> Result<usize, WorkerError> {
     // Skill folders of sessions that ended while the worker was down. A
     // session that resumes writes its folder again from the cache.
     crate::skills::sweep(&core.config_dir, &core.consort_home);
+    core.prune_skill_cache();
     let mut count = 0;
     for record in core.store.open_sessions()? {
         if record.state == SessionState::Starting && record.native_ref.is_none() {
@@ -234,6 +240,34 @@ pub(crate) fn restore_sessions(core: &Arc<Core>) -> Result<usize, WorkerError> {
 }
 
 impl Core {
+    /// Removes the skill bundles from the cache that no open session names
+    /// and that nobody used for 30 days. A session that needs one again gets
+    /// it from the hub.
+    pub(crate) fn prune_skill_cache(&self) {
+        let in_use: std::collections::HashSet<String> = match self.store.open_sessions() {
+            Ok(records) => records
+                .iter()
+                .flat_map(|r| r.start.extensions.skills.iter())
+                .map(|skill| skill.content_hash.to_string())
+                .collect(),
+            Err(err) => {
+                // Without the list of open sessions, nothing is safe to remove.
+                tracing::warn!(error = %err, "could not read the open sessions, so the worker does not prune the skill cache");
+                return;
+            }
+        };
+        let report = crate::skills::SkillCache::new(&self.consort_home)
+            .prune(crate::skills::PRUNE_AGE, &in_use);
+        if report.removed > 0 {
+            tracing::info!(
+                removed = report.removed,
+                kept = report.kept,
+                freed_bytes = report.freed_bytes,
+                "removed old skills from the cache"
+            );
+        }
+    }
+
     /// Whether the worker has started to stop.
     pub fn is_stopping(&self) -> bool {
         *self.stopping.borrow()
@@ -714,6 +748,47 @@ impl Core {
         }
         let status = adapter.probe(&prepared).await;
         drop(lease);
+        self.apply_login_expired(account.id, status)
+    }
+
+    /// Marks the account's login as expired in its inventory entry, until a
+    /// sign-in clears it. See [`consort_harness::LOGIN_EXPIRED_ERROR_CODE`].
+    pub fn mark_login_expired(&self, account_id: AccountId) {
+        lock(&self.login_expired).insert(account_id);
+        lock(&self.statuses)
+            .entry(account_id)
+            .and_modify(|status| {
+                status.auth_state = AuthState::Error;
+                status.auth_detail = Some(consort_harness::LOGIN_EXPIRED_MESSAGE.to_owned());
+            })
+            .or_insert_with(|| AccountStatus {
+                auth_state: AuthState::Error,
+                auth_detail: Some(consort_harness::LOGIN_EXPIRED_MESSAGE.to_owned()),
+                ..AccountStatus::default()
+            });
+        self.send_inventory(false);
+    }
+
+    /// Forgets that the account's login expired: the user signed in again,
+    /// or a turn on the account worked.
+    pub fn clear_login_expired(&self, account_id: AccountId) {
+        lock(&self.login_expired).remove(&account_id);
+    }
+
+    /// A probe that says "signed in" for an account whose login a turn found
+    /// expired stays "expired". A probe that finds the account signed out or
+    /// in error says more, and stays as it is.
+    fn apply_login_expired(
+        &self,
+        account_id: AccountId,
+        mut status: AccountStatus,
+    ) -> AccountStatus {
+        if status.auth_state == AuthState::SignedIn
+            && lock(&self.login_expired).contains(&account_id)
+        {
+            status.auth_state = AuthState::Error;
+            status.auth_detail = Some(consort_harness::LOGIN_EXPIRED_MESSAGE.to_owned());
+        }
         status
     }
 
@@ -954,10 +1029,16 @@ pub(crate) async fn inventory_loop(core: Arc<Core>, mut shutdown: watch::Receive
     core.probe_accounts().await;
     core.send_inventory(true);
     let mut last_probe = tokio::time::Instant::now();
+    // The cache was pruned when the worker started.
+    let mut last_prune = tokio::time::Instant::now();
     loop {
         tokio::select! {
             () = core.inventory_notify.notified() => core.send_inventory(false),
             () = tokio::time::sleep(Duration::from_secs(60)) => {
+                if last_prune.elapsed() > crate::skills::PRUNE_EVERY {
+                    core.prune_skill_cache();
+                    last_prune = tokio::time::Instant::now();
+                }
                 if last_probe.elapsed() > Duration::from_secs(15 * 60) {
                     core.probe_accounts().await;
                     last_probe = tokio::time::Instant::now();
@@ -997,6 +1078,7 @@ pub(crate) mod tests {
             harnesses,
             sessions: Mutex::new(HashMap::new()),
             statuses: Mutex::new(HashMap::new()),
+            login_expired: Mutex::default(),
             spool_notify: Notify::new(),
             inventory_notify: Notify::new(),
             last_inventory_hash: Mutex::new(None),
@@ -1488,6 +1570,73 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn a_login_that_a_turn_found_expired_shows_expired_until_a_sign_in() {
+        let script = FakeScript {
+            turns: vec![vec![
+                FakeStep::Event(SessionEvent::Error {
+                    code: consort_harness::LOGIN_EXPIRED_ERROR_CODE.into(),
+                    message: consort_harness::LOGIN_EXPIRED_MESSAGE.into(),
+                }),
+                FakeStep::Fail(consort_harness::LOGIN_EXPIRED_MESSAGE.into()),
+            ]],
+        };
+        let fake = FakeHarness::new(HarnessKind::ClaudeCode, script);
+        let (_dir, core, account_id) = fake_worker(&fake);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        core.link.attach(tx);
+        // The probe says signed in: it cannot see the expiry.
+        lock(&core.statuses).insert(
+            account_id,
+            AccountStatus {
+                auth_state: AuthState::SignedIn,
+                ..AccountStatus::default()
+            },
+        );
+        let session_id =
+            start_with_turn(&core, account_id, consort_proto::model::ApprovalMode::Ask).await;
+        wait_until("the account is marked", || {
+            lock(&core.statuses)[&account_id].auth_state == AuthState::Error
+        })
+        .await;
+        assert_eq!(
+            lock(&core.statuses)[&account_id].auth_detail.as_deref(),
+            Some("The login expired. Sign in again.")
+        );
+        let _ = session_id;
+
+        // The next probe still says signed in. The mark stays.
+        let probed = AccountStatus {
+            auth_state: AuthState::SignedIn,
+            ..AccountStatus::default()
+        };
+        let kept = core.apply_login_expired(account_id, probed.clone());
+        assert_eq!(kept.auth_state, AuthState::Error);
+        assert!(kept.auth_detail.unwrap().contains("expired"));
+        // A probe that finds the account signed out says more, and stays.
+        let signed_out = AccountStatus {
+            auth_state: AuthState::SignedOut,
+            auth_detail: Some("Not signed in.".into()),
+            ..AccountStatus::default()
+        };
+        assert_eq!(
+            core.apply_login_expired(account_id, signed_out).auth_state,
+            AuthState::SignedOut
+        );
+        // Another account is not touched.
+        assert_eq!(
+            core.apply_login_expired(AccountId::new(), probed.clone())
+                .auth_state,
+            AuthState::SignedIn
+        );
+        // A new sign-in clears the mark.
+        core.clear_login_expired(account_id);
+        assert_eq!(
+            core.apply_login_expired(account_id, probed).auth_state,
+            AuthState::SignedIn
+        );
+    }
+
+    #[tokio::test]
     async fn a_signed_out_open_marks_the_account_signed_out() {
         let fake = FakeHarness::new(HarnessKind::ClaudeCode, FakeScript::reply("Hi."));
         fake.set_open_failure(Some(FakeOpenFailure::SignedOut(
@@ -1853,6 +2002,43 @@ pub(crate) mod tests {
                 .iter()
                 .any(|spec| spec.session_id == unfinished && spec.resume.is_none())
         );
+    }
+
+    #[test]
+    fn the_start_of_the_worker_prunes_old_skills_but_not_those_of_open_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let core = test_core(dir.path(), Harnesses::default(), WorkerToml::default());
+        let cache = core.consort_home.join(crate::skills::CACHE_DIR);
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(40 * 24 * 60 * 60);
+        let make = |hash: &str| {
+            let folder = cache.join(hash);
+            std::fs::create_dir_all(&folder).unwrap();
+            let list = folder.join("bundle.json");
+            std::fs::write(&list, "{}").unwrap();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(list)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+            folder
+        };
+        let (open_hash, unused_hash) = ("a".repeat(64), "b".repeat(64));
+        let (open, unused) = (make(&open_hash), make(&unused_hash));
+        // An open session names the first one.
+        let id = SessionId::new();
+        let mut record = record(id);
+        record.start.extensions.skills = vec![consort_proto::model::SkillBundleRef {
+            skill_id: consort_proto::ids::SkillId::new(),
+            name: "pdf-forms".into(),
+            content_hash: open_hash.parse().unwrap(),
+        }];
+        core.store.put_session(&record).unwrap();
+        // `restore_sessions` would also start the session, so call the prune
+        // that it calls.
+        core.prune_skill_cache();
+        assert!(open.exists(), "an open session names it");
+        assert!(!unused.exists(), "40 days old, and no session names it");
     }
 
     /// The members of a process group that still run.

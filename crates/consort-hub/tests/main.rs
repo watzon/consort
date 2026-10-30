@@ -33,6 +33,7 @@ mod routines_and_memory;
 mod session_end;
 mod size_budgets;
 mod skills;
+mod smaller_items;
 mod snapshot_and_feed;
 mod start_failures;
 mod task_lifecycle;

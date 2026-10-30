@@ -75,6 +75,32 @@ pub fn connections(conn: &Db) -> Result<Vec<Connection>> {
     Ok(all)
 }
 
+/// Every connection with its Composio IDs.
+pub fn connection_rows(conn: &Db) -> Result<Vec<ConnectionRow>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT data, composio_account_id, auth_config_id, auth_scheme FROM connections",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<String>>(3)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (data, composio_account_id, auth_config_id, auth_scheme) = row?;
+        out.push(ConnectionRow {
+            connection: parse_doc(&data)?,
+            composio_account_id,
+            auth_config_id,
+            auth_scheme,
+        });
+    }
+    Ok(out)
+}
+
 /// Every handle in use.
 pub fn handles(conn: &Db) -> Result<Vec<String>> {
     let mut stmt = conn.prepare_cached("SELECT handle FROM connections")?;
@@ -145,6 +171,19 @@ pub fn connector_calls(
     let has_more = calls.len() > limit as usize;
     calls.truncate(limit as usize);
     Ok((calls, has_more))
+}
+
+/// How many calls reached Composio between two times (`from` included,
+/// `to` excluded, in Unix milliseconds). A call that was denied or
+/// expired before it ran did not reach Composio.
+pub fn calls_between(conn: &Db, from: i64, to: i64) -> Result<u64> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM connector_calls
+         WHERE at >= ?1 AND at < ?2 AND json_extract(data, '$.outcome') != 'not_run'",
+        params![from, to],
+        |row| row.get(0),
+    )?;
+    Ok(u64::try_from(count).unwrap_or(0))
 }
 
 /// Whether the user allowed this kind of call for this connection earlier

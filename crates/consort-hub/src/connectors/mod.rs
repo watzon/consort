@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use consort_proto::client_api::{
@@ -20,8 +20,10 @@ use consort_proto::ids::{ApprovalId, ConnectionId};
 use consort_proto::model::ApprovalStatus;
 use consort_proto::model::{
     AuthScheme, AuthSchemeKind, CATALOG_REFRESH_MS, CONNECT_ATTEMPT_TIMEOUT_MS, ComposioStatus,
-    ConnectorCategory, ConnectorService, ConnectorToolSummary, CredentialField, ToolKind,
+    ComposioUsage, ConnectorCategory, ConnectorService, ConnectorToolSummary, CredentialField,
+    ToolKind,
 };
+use consort_proto::time::Timestamp;
 use tokio::sync::oneshot;
 
 use crate::error::{HubError, Result};
@@ -33,9 +35,10 @@ pub(crate) mod composio;
 pub(crate) mod connections;
 pub(crate) mod extensions;
 pub(crate) mod key;
+pub(crate) mod logos;
 pub(crate) mod run;
 
-use composio::{ApiKey, Client, Tool, Toolkit};
+use composio::{ApiKey, Client, KeyHealth, Tool, Toolkit};
 
 const STATUS_META_KEY: &str = "composio_status";
 const USER_ID_META_KEY: &str = "composio_user_id";
@@ -54,6 +57,31 @@ const APPROVAL_WAIT_MARGIN: Duration = Duration::from_secs(15);
 const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(30);
 /// The default page of `connector_catalog.search`.
 const CATALOG_PAGE_DEFAULT: u32 = 50;
+/// How old the last key check may be before `composio.status` checks again.
+const STATUS_MAX_AGE_MS: i64 = 10 * 60 * 1_000;
+/// What `composio.status` says when Composio refuses the key. It names the
+/// next step.
+pub(crate) const KEY_REFUSED_MESSAGE: &str = "Composio refuses the key now. It may be revoked or replaced. Copy the project key from the Composio dashboard, then add it again in Settings > Connectors. Connections stay as they are until then.";
+
+/// The start of the month of `now` and the start of the next month, in
+/// Unix milliseconds (UTC).
+fn month_bounds(now: chrono::DateTime<chrono::Utc>) -> (i64, i64) {
+    use chrono::{Datelike, TimeZone, Utc};
+    let start = Utc
+        .with_ymd_and_hms(now.year(), now.month(), 1, 0, 0, 0)
+        .single()
+        .unwrap_or(now);
+    let (year, month) = if now.month() == 12 {
+        (now.year() + 1, 1)
+    } else {
+        (now.year(), now.month() + 1)
+    };
+    let end = Utc
+        .with_ymd_and_hms(year, month, 1, 0, 0, 0)
+        .single()
+        .unwrap_or(now);
+    (start.timestamp_millis(), end.timestamp_millis())
+}
 
 /// The waits that tests make shorter.
 #[derive(Debug, Clone, Copy)]
@@ -64,6 +92,9 @@ pub(crate) struct Timings {
     pub poll_interval: Duration,
     /// How long a connect attempt waits for the browser sign-in.
     pub connect_timeout_ms: i64,
+    /// How long one request to Composio may take. `None` is the default of
+    /// the client.
+    pub request_timeout: Option<Duration>,
 }
 
 impl Default for Timings {
@@ -73,6 +104,7 @@ impl Default for Timings {
                 .saturating_sub(APPROVAL_WAIT_MARGIN),
             poll_interval: CONNECT_POLL_INTERVAL,
             connect_timeout_ms: CONNECT_ATTEMPT_TIMEOUT_MS,
+            request_timeout: None,
         }
     }
 }
@@ -88,6 +120,10 @@ pub struct Connectors {
     keys: key::KeyStore,
     base_url: Mutex<String>,
     key: Mutex<Option<ApiKey>>,
+    /// Whether Composio accepted the key at the last call.
+    health: Arc<KeyHealth>,
+    /// The logos of the services, fetched once.
+    pub(crate) logos: logos::LogoCache,
     catalog: tokio::sync::Mutex<Catalog>,
     tools: tokio::sync::Mutex<HashMap<String, (Instant, Vec<Tool>)>>,
     /// Calls of `run_connector_tool` that wait for the answer to a card.
@@ -117,6 +153,12 @@ impl Connectors {
             keys,
             base_url: Mutex::new(base_url),
             key: Mutex::new(key),
+            health: Arc::default(),
+            logos: {
+                let cache = logos::LogoCache::open(data_dir);
+                cache.clean();
+                cache
+            },
             catalog: tokio::sync::Mutex::default(),
             tools: tokio::sync::Mutex::default(),
             waiters: Mutex::default(),
@@ -164,7 +206,11 @@ impl Connectors {
     /// A client for the stored key, or `composio_not_configured`.
     pub(crate) fn client(&self) -> Result<Client> {
         let key = self.key().ok_or_else(not_configured)?;
-        Client::new(&self.base_url(), key)
+        let health = self.health.clone();
+        match self.timings().request_timeout {
+            Some(limit) => Client::with_timeout(&self.base_url(), key, health, limit),
+            None => Client::with_health(&self.base_url(), key, health),
+        }
     }
 
     /// Registers a call that waits for a card. The receiver gets the
@@ -266,7 +312,8 @@ fn service_of(toolkit: &Toolkit, connected_count: u32) -> ConnectorService {
         slug: toolkit.slug.clone(),
         name: toolkit.name.clone(),
         description: toolkit.meta.description.clone(),
-        // Logos are not cached yet: this is the URL Composio gives.
+        // The URL that Composio gives. The hub swaps it for its own URL
+        // (`Hub::hub_logo_url`) before a client sees it.
         logo_url: toolkit.meta.logo.clone(),
         categories: toolkit.meta.categories.iter().map(|c| c.key()).collect(),
         tool_count: toolkit
@@ -296,6 +343,65 @@ fn in_category(toolkit: &Toolkit, category: &str) -> bool {
 }
 
 impl Hub {
+    /// The hub's own URL for a logo that lives at `origin`, and the logo is
+    /// fetched into the cache when a client asks for it. `None` when there is
+    /// no logo, or the origin is not one that the hub fetches. A URL that is
+    /// the hub's own already stays as it is. With `persist`, the key works
+    /// after a restart too (for a record that the hub stores).
+    pub(crate) fn hub_logo_url(&self, origin: Option<&str>, persist: bool) -> Option<String> {
+        let origin = origin?.trim();
+        if origin.is_empty() {
+            return None;
+        }
+        // The hub's own URL, maybe under an older address of the hub.
+        if let Some((_, tail)) = origin.rsplit_once(logos::ROUTE_PREFIX)
+            && self.connectors.logos.knows(tail)
+        {
+            return Some(format!("{}{}{tail}", self.logo_base(), logos::ROUTE_PREFIX));
+        }
+        let key = self.connectors.logos.register(origin, persist)?;
+        Some(format!("{}{}{key}", self.logo_base(), logos::ROUTE_PREFIX))
+    }
+
+    fn logo_base(&self) -> String {
+        self.settings.public_url.trim_end_matches('/').to_owned()
+    }
+
+    /// Gives the connections that were stored with a logo URL of Composio,
+    /// or of an older address of the hub, the hub's current logo URL. It
+    /// starts the fetch of each logo, so it is in the cache when the app
+    /// opens.
+    pub(crate) async fn refresh_connection_logos(&self) -> Result<()> {
+        let connections = self.store.read(con_store::connections).await?;
+        for connection in connections {
+            let Some(current) = connection.logo_url.clone() else {
+                continue;
+            };
+            let Some(logo_url) = self.hub_logo_url(Some(&current), true) else {
+                continue;
+            };
+            if let Some((_, key)) = logo_url.rsplit_once(logos::ROUTE_PREFIX) {
+                let (hub, key) = (self.clone(), key.to_owned());
+                tokio::spawn(async move {
+                    hub.connectors.logos.get(&key).await;
+                });
+            }
+            if logo_url != current {
+                let id = connection.id;
+                self.store
+                    .write(move |tx| {
+                        if let Some(mut c) = con_store::connection(tx.db(), id)? {
+                            c.logo_url = Some(logo_url);
+                            tx.save_connection(&c)?;
+                        }
+                        Ok(())
+                    })
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
     async fn composio_status_stored(&self) -> Result<ComposioStatus> {
         let stored = self
             .store
@@ -309,9 +415,57 @@ impl Hub {
         status.key_present = key.is_some();
         status.key_hint = key.map(|k| k.hint());
         if !status.key_present {
-            status = ComposioStatus::default();
+            return Ok(ComposioStatus::default());
         }
+        // A call that Composio refused since the last check shows at once.
+        if self.connectors.health.is_refused() {
+            status.error = Some(KEY_REFUSED_MESSAGE.to_owned());
+        }
+        status.usage = Some(self.composio_usage().await?);
         Ok(status)
+    }
+
+    /// The tool calls that this hub sent to Composio in the current month
+    /// (UTC). Composio gives no usage to a project key (its billing calls
+    /// need a dashboard login), so the hub counts its own audit log. The
+    /// plan limit is not known, so `limit` is empty.
+    async fn composio_usage(&self) -> Result<ComposioUsage> {
+        let now =
+            chrono::DateTime::from_timestamp_millis(self.now().as_millis()).unwrap_or_default();
+        let (start, end) = month_bounds(now);
+        let used = self
+            .store
+            .read(move |conn| con_store::calls_between(conn, start, end))
+            .await?;
+        Ok(ComposioUsage {
+            used,
+            limit: None,
+            resets_at: Some(Timestamp::from_millis(end)),
+        })
+    }
+
+    /// Asks Composio whether it still accepts the key, and stores the
+    /// answer. A network failure changes nothing, because it says nothing
+    /// about the key. Does nothing when the hub has no key.
+    pub(crate) async fn refresh_composio_status(&self) -> Result<()> {
+        let Ok(client) = self.connectors.client() else {
+            return Ok(());
+        };
+        let mut status = self.composio_status_stored().await?;
+        match client.check_key().await {
+            Ok(()) => status.error = None,
+            Err(err) if composio::is_unauthorized(&err) => {
+                status.error = Some(KEY_REFUSED_MESSAGE.to_owned());
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "could not check the Composio key");
+                return Ok(());
+            }
+        }
+        status.checked_at = Some(self.now());
+        // The usage is not stored. It is counted each time.
+        status.usage = None;
+        self.save_composio_status(&status).await
     }
 
     async fn save_composio_status(&self, status: &ComposioStatus) -> Result<()> {
@@ -354,7 +508,11 @@ impl Hub {
             ));
         }
         let key = ApiKey::new(key);
-        let client = Client::new(&self.connectors.base_url(), key.clone())?;
+        let client = Client::with_health(
+            &self.connectors.base_url(),
+            key.clone(),
+            self.connectors.health.clone(),
+        )?;
         if let Err(err) = client.check_key().await {
             if composio::is_unauthorized(&err) {
                 return Err(HubError::invalid(
@@ -379,7 +537,11 @@ impl Hub {
         };
         self.save_composio_status(&status).await?;
         tracing::info!("the Composio key changed");
-        Ok(ComposioStatusResult { status })
+        // The new key may belong to another Composio project.
+        self.reconcile_connections_with_key().await?;
+        Ok(ComposioStatusResult {
+            status: self.composio_status_stored().await?,
+        })
     }
 
     pub(crate) async fn composio_remove_key(
@@ -403,6 +565,17 @@ impl Hub {
         _caller: &Caller,
         _request: ComposioGetStatus,
     ) -> Result<ComposioStatusResult> {
+        // Settings asks for the status when the page opens. A check that is
+        // older than a few minutes runs again, so a key that Composio
+        // refuses later shows here.
+        let stored = self.composio_status_stored().await?;
+        let stale = stored.key_present
+            && stored
+                .checked_at
+                .is_none_or(|at| self.now().as_millis() - at.as_millis() > STATUS_MAX_AGE_MS);
+        if stale {
+            self.refresh_composio_status().await?;
+        }
         Ok(ComposioStatusResult {
             status: self.composio_status_stored().await?,
         })
@@ -497,7 +670,11 @@ impl Hub {
             .iter()
             .filter(|t| search.is_none_or(|s| matches_search(t, s)))
             .filter(|t| category.is_none_or(|c| c.trim().is_empty() || in_category(t, c)))
-            .map(|t| service_of(t, counts.get(&t.slug).copied().unwrap_or(0)))
+            .map(|t| {
+                let mut service = service_of(t, counts.get(&t.slug).copied().unwrap_or(0));
+                service.logo_url = self.hub_logo_url(service.logo_url.as_deref(), false);
+                service
+            })
             .collect())
     }
 
@@ -599,6 +776,7 @@ impl Hub {
             meta: detail.meta.clone(),
         });
         let mut service = service_of(&toolkit, counts.get(&detail.slug).copied().unwrap_or(0));
+        service.logo_url = self.hub_logo_url(service.logo_url.as_deref(), false);
         for scheme in &mut service.auth_schemes {
             if let Some(details) = detail
                 .auth_config_details
@@ -653,6 +831,9 @@ pub(crate) mod fake;
 
 #[cfg(test)]
 mod flow_tests;
+
+#[cfg(test)]
+mod status_tests;
 
 #[cfg(test)]
 impl fake::FakeComposio {
@@ -711,6 +892,8 @@ mod tests {
             .await
             .unwrap()
             .status;
+        // The status holds the usage of this month.
+        assert_eq!(again.usage.as_ref().map(|u| u.used), Some(0));
         assert_eq!(again, status);
         let removed = hub
             .composio_remove_key(&Caller::Hub, ComposioRemoveKey {})
@@ -774,10 +957,10 @@ mod tests {
         assert_eq!(mail.services.len(), 1);
         let gmail = &mail.services[0];
         assert_eq!(gmail.slug, "gmail");
-        assert_eq!(
-            gmail.logo_url.as_deref(),
-            Some("https://logos.example/gmail.svg")
-        );
+        // The hub gives its own URL, not the one of Composio.
+        let logo = gmail.logo_url.as_deref().unwrap();
+        assert!(logo.contains("/v1/logos/"), "{logo}");
+        assert!(!logo.contains("logos.example"), "{logo}");
         assert!(
             gmail
                 .auth_schemes

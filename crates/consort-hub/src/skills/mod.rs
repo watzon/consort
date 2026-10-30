@@ -16,6 +16,8 @@ pub(crate) mod directory;
 pub(crate) mod git;
 pub(crate) mod install;
 pub(crate) mod package;
+pub(crate) mod remote;
+mod tarball;
 pub(crate) mod updates;
 mod upload;
 
@@ -23,6 +25,9 @@ mod upload;
 pub(crate) mod fake;
 #[cfg(test)]
 mod flow_tests;
+
+#[cfg(test)]
+mod remote_tests;
 
 pub use directory::SkillSources;
 pub use updates::UpdateReport;

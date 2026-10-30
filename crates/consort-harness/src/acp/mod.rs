@@ -1445,6 +1445,27 @@ impl Actor {
                             .await;
                             mapper.end_turn(TurnEndReason::Failed, Some(hint))
                         }
+                        // Claude Code's `claude auth status` reports no expiry,
+                        // so an expired login passes the probe and fails here
+                        // with an API error. Tell the worker, so the account
+                        // shows "Sign in again" and placement stops choosing it.
+                        Err(err)
+                            if self.kind == HarnessKind::ClaudeCode
+                                && crate::login_expired_text(&format!(
+                                    "{err} {}",
+                                    err.data.as_ref().map(ToString::to_string).unwrap_or_default()
+                                )) =>
+                        {
+                            self.emit(SessionEvent::Error {
+                                code: crate::LOGIN_EXPIRED_ERROR_CODE.to_owned(),
+                                message: crate::LOGIN_EXPIRED_MESSAGE.to_owned(),
+                            })
+                            .await;
+                            mapper.end_turn(
+                                TurnEndReason::Failed,
+                                Some(crate::LOGIN_EXPIRED_MESSAGE.to_owned()),
+                            )
+                        }
                         Err(err) => mapper.end_turn(TurnEndReason::Failed, Some(err.to_string())),
                     };
                     self.emit_all(events).await;

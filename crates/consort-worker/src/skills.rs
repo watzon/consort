@@ -12,6 +12,7 @@
 //! The worker checks the files again each time it uses a cache folder, so a
 //! file that changed on disk is fetched again and never reaches a session.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
@@ -33,6 +34,14 @@ pub const CACHE_DIR: &str = "cache/skills";
 const BUNDLE_FILE: &str = "bundle.json";
 /// The folder with the files of a cached bundle.
 const FILES_DIR: &str = "files";
+/// The empty file in a cached bundle that each use touches. Its time is the
+/// last use, and the prune reads it.
+const USED_FILE: &str = "used";
+/// How long a cached bundle stays after its last use, when no open session
+/// names it.
+pub const PRUNE_AGE: std::time::Duration = std::time::Duration::from_secs(30 * 24 * 60 * 60);
+/// How often the worker prunes the cache.
+pub const PRUNE_EVERY: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
 /// Why a skill could not be made ready.
 #[derive(Debug, thiserror::Error)]
@@ -112,6 +121,7 @@ impl SkillCache {
         validate_skill_name(&wanted.name).map_err(|e| invalid(e.to_string()))?;
         let dir = self.bundle_dir(&wanted.content_hash);
         if verify_dir(&dir, &wanted.content_hash) {
+            touch(&dir);
             return Ok(SkillSource {
                 name,
                 dir: dir.join(FILES_DIR),
@@ -164,10 +174,54 @@ impl SkillCache {
                 return Err(SkillError::Io { name, source: err });
             }
         }
+        touch(&dir);
         Ok(SkillSource {
             name,
             dir: dir.join(FILES_DIR),
         })
+    }
+
+    /// Removes the cached bundles that nothing uses any more: a bundle that
+    /// no open session names (`in_use`, by content hash) and that nobody
+    /// used for longer than `max_age`. A bundle that a session needs again
+    /// comes back from the hub. Temporary folders of a download in progress
+    /// stay. Returns what it removed.
+    pub fn prune(&self, max_age: std::time::Duration, in_use: &HashSet<String>) -> PruneReport {
+        let mut report = PruneReport::default();
+        let Ok(entries) = std::fs::read_dir(&self.root) else {
+            return report;
+        };
+        let now = std::time::SystemTime::now();
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let path = entry.path();
+            if name.starts_with(".tmp-") || !path.is_dir() {
+                continue;
+            }
+            if in_use.contains(&name) {
+                report.kept += 1;
+                continue;
+            }
+            let idle = last_use(&path)
+                .and_then(|used| now.duration_since(used).ok())
+                .unwrap_or_default();
+            if idle <= max_age {
+                report.kept += 1;
+                continue;
+            }
+            let size = folder_bytes(&path);
+            match std::fs::remove_dir_all(&path) {
+                Ok(()) => {
+                    report.removed += 1;
+                    report.freed_bytes += size;
+                }
+                Err(err) => {
+                    tracing::warn!(folder = %path.display(), error = %err, "could not remove an old skill from the cache");
+                    report.kept += 1;
+                }
+            }
+        }
+        report
     }
 
     /// Downloads every file of `bundle` into `temp`, and checks each one.
@@ -203,6 +257,57 @@ impl SkillCache {
         std::fs::write(temp.join(BUNDLE_FILE), list).map_err(io)?;
         Ok(())
     }
+}
+
+/// What a prune of the skill cache did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PruneReport {
+    /// Bundles removed.
+    pub removed: usize,
+    /// Bundles kept: in use, recent, or not removable.
+    pub kept: usize,
+    /// The size of the removed files, in bytes.
+    pub freed_bytes: u64,
+}
+
+/// Marks a cached bundle as used now. A failure is not an error: the bundle
+/// then looks older than it is, and the worker fetches it again later.
+fn touch(dir: &Path) {
+    let marker = dir.join(USED_FILE);
+    if let Err(err) = std::fs::write(&marker, b"") {
+        tracing::debug!(file = %marker.display(), error = %err, "could not mark a skill as used");
+    }
+}
+
+/// When a cached bundle was used last: the `used` marker, else the file list
+/// of the bundle, else the folder.
+fn last_use(dir: &Path) -> Option<std::time::SystemTime> {
+    [USED_FILE, BUNDLE_FILE]
+        .iter()
+        .find_map(|file| std::fs::metadata(dir.join(file)).ok()?.modified().ok())
+        .or_else(|| std::fs::metadata(dir).ok()?.modified().ok())
+}
+
+/// The size of the files in a folder, without following links.
+fn folder_bytes(dir: &Path) -> u64 {
+    let mut total = 0;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(folder) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&folder) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(meta) = entry.path().symlink_metadata() else {
+                continue;
+            };
+            if meta.is_dir() {
+                stack.push(entry.path());
+            } else {
+                total += meta.len();
+            }
+        }
+    }
+    total
 }
 
 /// Downloads one file of a bundle.
@@ -553,6 +658,117 @@ pub(crate) mod tests {
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(left, [wanted.content_hash.to_string()]);
+    }
+
+    /// Sets the time of the last use of a cached bundle.
+    fn use_it_at(home: &Path, wanted: &SkillBundleRef, age: std::time::Duration) {
+        let marker = home
+            .join(CACHE_DIR)
+            .join(wanted.content_hash.as_str())
+            .join(USED_FILE);
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(marker)
+            .unwrap();
+        file.set_modified(std::time::SystemTime::now() - age)
+            .unwrap();
+    }
+
+    fn cached(home: &Path, wanted: &SkillBundleRef) -> bool {
+        home.join(CACHE_DIR)
+            .join(wanted.content_hash.as_str())
+            .exists()
+    }
+
+    #[tokio::test]
+    async fn the_prune_removes_old_versions_that_no_session_uses() {
+        let home = tempfile::tempdir().unwrap();
+        let source = MemorySource::default();
+        let day = std::time::Duration::from_secs(24 * 60 * 60);
+        let old = source.add("pdf-forms", &files());
+        let old_but_open = source.add(
+            "pdf-notes",
+            &[(
+                "SKILL.md",
+                "---\nname: pdf-notes\ndescription: Notes.\n---\nOld.\n",
+                false,
+            )],
+        );
+        let recent = source.add(
+            "pdf-recent",
+            &[(
+                "SKILL.md",
+                "---\nname: pdf-recent\ndescription: New.\n---\nNew.\n",
+                false,
+            )],
+        );
+        let cache = SkillCache::new(home.path());
+        for wanted in [&old, &old_but_open, &recent] {
+            cache.ensure(&source, wanted).await.unwrap();
+        }
+        use_it_at(home.path(), &old, 40 * day);
+        use_it_at(home.path(), &old_but_open, 90 * day);
+        use_it_at(home.path(), &recent, 2 * day);
+        // A download that is in progress, and a folder of no bundle.
+        let temp = home.path().join(CACHE_DIR).join(".tmp-abc");
+        std::fs::create_dir_all(&temp).unwrap();
+        let in_use = HashSet::from([old_but_open.content_hash.to_string()]);
+
+        let report = cache.prune(30 * day, &in_use);
+        assert_eq!(report.removed, 1);
+        assert_eq!(report.kept, 2);
+        assert!(report.freed_bytes > 0);
+        assert!(!cached(home.path(), &old), "old and unused");
+        assert!(
+            cached(home.path(), &old_but_open),
+            "an open session names it"
+        );
+        assert!(cached(home.path(), &recent), "used 2 days ago");
+        assert!(temp.exists(), "a download in progress stays");
+
+        // A pruned bundle comes back from the hub when a session needs it.
+        let calls = source.bundle_calls.load(Ordering::SeqCst);
+        cache.ensure(&source, &old).await.unwrap();
+        assert!(cached(home.path(), &old));
+        assert_eq!(source.bundle_calls.load(Ordering::SeqCst), calls + 1);
+        // Using a bundle marks it as used now, so it survives the prune.
+        let again = cache.prune(30 * day, &HashSet::new());
+        assert_eq!(again.removed, 1, "only the bundle that nobody opened");
+        assert!(!cached(home.path(), &old_but_open));
+        assert!(cached(home.path(), &old));
+    }
+
+    #[tokio::test]
+    async fn the_prune_of_a_missing_cache_does_nothing() {
+        let home = tempfile::tempdir().unwrap();
+        let report = SkillCache::new(home.path()).prune(std::time::Duration::ZERO, &HashSet::new());
+        assert_eq!(report, PruneReport::default());
+    }
+
+    #[tokio::test]
+    async fn a_bundle_from_before_the_marker_is_aged_by_its_file_list() {
+        let home = tempfile::tempdir().unwrap();
+        let source = MemorySource::default();
+        let wanted = source.add("pdf-forms", &files());
+        let cache = SkillCache::new(home.path());
+        cache.ensure(&source, &wanted).await.unwrap();
+        let dir = home
+            .path()
+            .join(CACHE_DIR)
+            .join(wanted.content_hash.as_str());
+        std::fs::remove_file(dir.join(USED_FILE)).unwrap();
+        // Just made: kept.
+        let day = std::time::Duration::from_secs(24 * 60 * 60);
+        assert_eq!(cache.prune(PRUNE_AGE, &HashSet::new()).removed, 0);
+        // The file list is 40 days old: removed.
+        let list = std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join(BUNDLE_FILE))
+            .unwrap();
+        list.set_modified(std::time::SystemTime::now() - 40 * day)
+            .unwrap();
+        assert_eq!(cache.prune(PRUNE_AGE, &HashSet::new()).removed, 1);
+        assert!(!dir.exists());
     }
 
     #[tokio::test]
