@@ -56,7 +56,10 @@ impl Hub {
         let timestamp: i64 = header_text(headers, HEADER_TIMESTAMP)
             .and_then(|v| v.parse().ok())
             .ok_or_else(denied)?;
-        if (now.as_millis() - timestamp).abs() > HTTP_SIGNATURE_MAX_SKEW_MS {
+        // Checked math: the header can hold any number.
+        if now.as_millis().saturating_sub(timestamp).unsigned_abs()
+            > HTTP_SIGNATURE_MAX_SKEW_MS.unsigned_abs()
+        {
             return Err(HubError::unauthorized(
                 "The request time is too far from the hub time. Check the clock on this machine.",
             ));

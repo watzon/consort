@@ -780,6 +780,10 @@ enum Command {
         answer: Answer,
         reply: oneshot::Sender<Result<(), HarnessError>>,
     },
+    SetMode {
+        mode: ApprovalMode,
+        reply: oneshot::Sender<Result<(), HarnessError>>,
+    },
     Close,
 }
 
@@ -1234,7 +1238,7 @@ impl Actor {
         // When the agent reports a higher mode, the actor sets the mode back
         // at once. `resetting` holds the mode that went too high while the
         // reset runs.
-        let limit = self.spec.approval_mode;
+        let mut limit = self.spec.approval_mode;
         let watch_mode = self.kind == HarnessKind::ClaudeCode;
         let mut resetting: Option<String> = None;
         let mut lost_reason = String::new();
@@ -1324,6 +1328,37 @@ impl Actor {
                                 cancel_deadline = Some(tokio::time::Instant::now() + INTERRUPT_GRACE);
                             }
                             let _ = reply.send(result);
+                        }
+                        Command::SetMode { mode, reply } => {
+                            if running.is_some() || resetting.is_some() {
+                                let _ = reply.send(Err(HarnessError::Protocol("a turn is running".to_owned())));
+                                continue;
+                            }
+                            if mode == limit {
+                                let _ = reply.send(Ok(()));
+                                continue;
+                            }
+                            // Only Claude Code changes its permission mode in a
+                            // running session. Other agents take their mode
+                            // when they start.
+                            let target = claude_mode(mode);
+                            let message = if watch_mode { mode_reset_message(&native, &mode_setter, target) } else { None };
+                            let Some(message) = message else {
+                                let _ = reply.send(Err(HarnessError::Unsupported("change the approval mode")));
+                                continue;
+                            };
+                            // The new limit holds at once, so the mode updates
+                            // that the agent sends now are checked against it.
+                            limit = mode;
+                            let future = cx.send_request(message).block_task();
+                            tokio::spawn(async move {
+                                let result = match tokio::time::timeout(MODE_RESET_TIMEOUT, future).await {
+                                    Err(_) => Err(HarnessError::Timeout("the agent did not change its permission mode".to_owned())),
+                                    Ok(Err(err)) => Err(protocol_error(&err)),
+                                    Ok(Ok(answer)) => mode_answer(&answer, target),
+                                };
+                                let _ = reply.send(result);
+                            });
                         }
                         Command::Respond { request: request_id, answer, reply } => {
                             let Some(permission) = pending.remove(&request_id) else {
@@ -1605,6 +1640,26 @@ fn mode_reset_message(
         ModeSetter::None => return None,
     };
     UntypedMessage::new(method, params).ok()
+}
+
+/// Checks the answer to a mode change. `session/set_config_option` answers
+/// with the options, so the mode is read back. `session/set_mode` has no
+/// answer to read.
+fn mode_answer(answer: &Value, target: &str) -> Result<(), HarnessError> {
+    let Some(options) = answer.get("configOptions").and_then(Value::as_array) else {
+        return Ok(());
+    };
+    let now = find_option(options, "mode", &["mode"])
+        .and_then(|o| o.get("currentValue"))
+        .and_then(Value::as_str);
+    if now == Some(target) {
+        Ok(())
+    } else {
+        Err(HarnessError::ModeUnavailable(format!(
+            "the agent reports `{}`, not `{target}`",
+            now.unwrap_or("no mode")
+        )))
+    }
 }
 
 /// The text of the `mode_reset_failed` error.
@@ -2058,6 +2113,13 @@ impl HarnessSession for AcpSession {
 
     async fn interrupt(&mut self) -> Result<(), HarnessError> {
         self.call(|reply| Command::Interrupt { reply }).await
+    }
+
+    /// Claude Code changes its permission mode with the same call that sets
+    /// it at the start, and the adapter reads it back. Other ACP agents take
+    /// their mode when they start, so they return `Unsupported`.
+    async fn set_approval_mode(&mut self, mode: ApprovalMode) -> Result<(), HarnessError> {
+        self.call(|reply| Command::SetMode { mode, reply }).await
     }
 
     async fn respond(&mut self, request: RequestId, answer: Answer) -> Result<(), HarnessError> {

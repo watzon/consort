@@ -156,6 +156,10 @@ struct Hub {
     versions: Vec<consort_proto::model::MemoryNote>,
     /// Phase 4: see `fake_hub_parts/phase4.rs`.
     phase4: phase4::State,
+    /// The hub epoch that `hello` sends.
+    hub_epoch: Option<String>,
+    /// While set, each channel snapshot waits until this fires.
+    hold_channel_snapshots: Option<Arc<tokio::sync::Notify>>,
 }
 
 fn note_hash(content: &str) -> consort_proto::model::Sha256Hash {
@@ -824,15 +828,25 @@ async fn session(hub: Shared, mut socket: WebSocket) {
                     }
                 }
             }
-            "hello" => req
-                .respond_ok(&ClientHelloResult {
+            "hello" => {
+                let (feed_seq, hub_epoch) = {
+                    let h = hub.lock().unwrap();
+                    (h.seq, h.hub_epoch.clone())
+                };
+                req.respond_ok(&ClientHelloResult {
                     protocol_version: 1,
                     hub_version: "test".into(),
-                    feed_seq: hub.lock().unwrap().seq,
+                    feed_seq,
+                    hub_epoch,
                 })
-                .unwrap(),
+                .unwrap()
+            }
             "sync.snapshot" => {
                 let body: SyncSnapshot = req.decode_as().unwrap();
+                let gate = hub.lock().unwrap().hold_channel_snapshots.clone();
+                if let (SnapshotScope::Channel(_), Some(gate)) = (&body.scope, gate) {
+                    gate.notified().await;
+                }
                 let mut h = hub.lock().unwrap();
                 // As the real hub: scope `all` has no messages. A channel
                 // snapshot has the newest top-level messages of one channel.
@@ -5894,4 +5908,183 @@ async fn a_hub_that_refuses_the_app_takes_the_saved_data_with_it() {
     })
     .await;
     assert!(!Store::new(dir.path()).cache_path().exists());
+}
+
+// ---------------------------------------------------------------------------
+// Review fixes: a new owner, a skipped change, a restored hub.
+
+/// The IDs of the channels in the saved file.
+fn saved_channels(dir: &std::path::Path) -> Vec<String> {
+    saved(dir)
+        .map(|s| s.cache.channels.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// Review finding 8: a link to the old hub that was still in its first
+/// sync when the user paired with a new hub saved the old hub's data under
+/// the new owner.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn data_of_the_old_hub_never_lands_under_a_new_pairing() {
+    let (url_a, hub_a) = start_hub().await;
+    add_message(&hub_a, "From hub A");
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let old_channel = {
+        let mut h = hub_a.lock().unwrap();
+        h.hold_channel_snapshots = Some(gate.clone());
+        h.channel.as_ref().unwrap().id.to_string()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let client =
+        Client::start_with(Some(Store::new(dir.path())), ClientOptions::desktop()).unwrap();
+    client.pair(url_a, CODE.into()).await.unwrap();
+    // The link to A waits for its channel snapshot.
+    until("the first sync of hub A", || {
+        hub_a
+            .lock()
+            .unwrap()
+            .sessions
+            .first()
+            .is_some_and(|s| s.iter().filter(|k| *k == "sync.snapshot").count() >= 2)
+    })
+    .await;
+
+    let (url_b, hub_b) = start_hub().await;
+    let new_channel = hub_b
+        .lock()
+        .unwrap()
+        .channel
+        .as_ref()
+        .unwrap()
+        .id
+        .to_string();
+    client.pair(url_b, CODE.into()).await.unwrap();
+    // Now hub A answers the old link.
+    gate.notify_waiters();
+    wait_for(&client, "online with hub B", |s| {
+        s.connection == Connection::Online && s.tutti().is_some_and(|t| t.id == new_channel)
+    })
+    .await;
+    until("the save of hub B", || {
+        saved_channels(dir.path()).contains(&new_channel)
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    let state = client.state();
+    assert!(
+        bodies_of(&state, &old_channel).is_empty(),
+        "no message of hub A shows"
+    );
+    assert!(
+        !saved_channels(dir.path()).contains(&old_channel),
+        "the file holds no channel of hub A"
+    );
+    let saved = saved(dir.path()).unwrap();
+    assert!(
+        saved
+            .cache
+            .messages
+            .values()
+            .all(|m| m.body != "From hub A"),
+        "the file holds no message of hub A"
+    );
+}
+
+/// Review finding 9: a skipped change moved the saved feed position before
+/// its data arrived, so a quit lost the change for good.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_saved_position_waits_for_the_data_of_a_skipped_change() {
+    let (url, hub) = start_hub().await;
+    let dir = tempfile::tempdir().unwrap();
+    let client = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
+    let tutti = tutti_id(&client);
+    let before = until_saved(dir.path(), &tutti).await.cache.seq;
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let (skipped_seq, frames) = {
+        let mut h = hub.lock().unwrap();
+        h.hold_channel_snapshots = Some(gate.clone());
+        let channel_id = h.channel.as_ref().unwrap().id;
+        let m = text_message(
+            channel_id,
+            "the skipped change",
+            Timestamp::now().as_millis(),
+            None,
+        );
+        h.messages.push(m);
+        h.seq += 1;
+        let skipped = Frame::event(&consort_proto::client_api::FeedSkipped {
+            seq: h.seq,
+            channel_id: Some(channel_id),
+            entity: consort_proto::client_api::EntityKind::Message,
+            entity_id: "msg".into(),
+        })
+        .unwrap();
+        let skipped_seq = h.seq;
+        // A later change that asks for a save.
+        let later = text_message(
+            channel_id,
+            "a later change",
+            Timestamp::now().as_millis(),
+            None,
+        );
+        h.messages.push(later.clone());
+        let next = feed(&mut h, EntityPayload::Message(later));
+        (skipped_seq, vec![skipped, next])
+    };
+    push(&hub, frames);
+    wait_for(&client, "the later change", |s| {
+        bodies_of(s, &tutti)
+            .iter()
+            .any(|(b, _)| b == "a later change")
+    })
+    .await;
+    // Several save delays pass while the data of the skipped change waits.
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    let held = saved(dir.path()).unwrap().cache.seq;
+    assert!(
+        held < skipped_seq,
+        "the file keeps a position before the gap: {held} (before {before}, gap {skipped_seq})"
+    );
+    gate.notify_waiters();
+    until("the save after the data came", || {
+        saved(dir.path()).is_some_and(|s| {
+            s.cache.seq > skipped_seq
+                && s.cache
+                    .messages
+                    .values()
+                    .any(|m| m.body == "the skipped change")
+        })
+    })
+    .await;
+}
+
+/// Review finding 15: a hub that was restored from a backup keeps its URL,
+/// and its feed numbers name other changes. A new epoch makes the client
+/// drop its saved position and load a snapshot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hub_with_a_new_epoch_gets_a_snapshot_not_a_resume() {
+    let (url, hub) = start_hub().await;
+    hub.lock().unwrap().hub_epoch = Some("before-restore".into());
+    let dir = tempfile::tempdir().unwrap();
+    let first = paired_client(&url, dir.path(), options(quick())).await;
+    let tutti = tutti_id(&first);
+    let saved_first = until_saved(dir.path(), &tutti).await;
+    assert_eq!(
+        saved_first.cache.hub_epoch.as_deref(),
+        Some("before-restore")
+    );
+    drop(first);
+
+    hub.lock().unwrap().hub_epoch = Some("after-restore".into());
+    let client = Client::start_with(Some(Store::new(dir.path())), options(quick())).unwrap();
+    wait_for(&client, "online", |s| s.connection == Connection::Online).await;
+    let session = hub.lock().unwrap().sessions[1].clone();
+    assert_eq!(
+        &session[..3],
+        ["auth.response", "hello", "sync.snapshot"],
+        "no resume from the old position: {session:?}"
+    );
+    until("the new epoch is saved", || {
+        saved(dir.path()).is_some_and(|s| s.cache.hub_epoch.as_deref() == Some("after-restore"))
+    })
+    .await;
 }

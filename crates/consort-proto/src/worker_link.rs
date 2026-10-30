@@ -481,6 +481,11 @@ pub struct SessionStart {
     pub resume: Option<ResumeSpec>,
     /// The first turn.
     pub turn: Option<TurnInput>,
+    /// The approval mode of the first turn only, when it must be stricter
+    /// than `approval_mode` (see [`SessionTurn::approval_mode`]). `None`
+    /// means `approval_mode`, and it is what an older hub sends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_approval_mode: Option<ApprovalMode>,
 }
 
 /// The result of [`SessionStart`].
@@ -505,6 +510,16 @@ pub struct SessionTurn {
     /// change, and it is what an older hub sends.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub channel_files: Option<Vec<FileRef>>,
+    /// The approval mode of this turn only. The worker runs the turn at the
+    /// lower of this mode and the session's own mode, and the next turn
+    /// without one goes back to the session's mode. The hub sends `Ask` for
+    /// a proactive turn and the research pass of a coordinator, so every
+    /// harness shell command and file edit waits for the user. A worker
+    /// whose harness cannot change its mode for one turn refuses the turn
+    /// with `policy_denied`. `None` means the session's mode, and it is what
+    /// an older hub sends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_mode: Option<ApprovalMode>,
 }
 
 /// The result of [`SessionTurn`].
@@ -1077,6 +1092,7 @@ They are installed as skills. Use one when the task fits it."
             extensions: SessionExtensions::default(),
             resume: None,
             turn: None,
+            turn_approval_mode: None,
         };
         let value = serde_json::to_value(&start).unwrap();
         assert!(value.get("extensions").is_none());
@@ -1266,12 +1282,14 @@ They are installed as skills. Use one when the task fits it."
                     text: "Fix the bug.".into(),
                     attachments: vec![],
                 }),
+                turn_approval_mode: None,
             }
             .into(),
             SessionTurn {
                 session_id: ses(),
                 turn: TurnInput::default(),
                 channel_files: None,
+                approval_mode: None,
             }
             .into(),
             SessionSteer {

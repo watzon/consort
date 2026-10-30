@@ -159,7 +159,40 @@ pub fn open_and_migrate(data_dir: &Path) -> Result<Connection> {
     make_database_private(&db_path)?;
     let mut conn = open_connection(&db_path)?;
     migrations::migrate(&mut conn)?;
+    ensure_hub_epoch(&conn)?;
     Ok(conn)
+}
+
+/// The meta key of the hub epoch: a random ID of this database. Clients
+/// compare it with the epoch of their saved feed position.
+pub const HUB_EPOCH_KEY: &str = "hub_epoch";
+
+/// Gives the database a hub epoch when it has none: a new database, or
+/// one from a hub before epochs.
+fn ensure_hub_epoch(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO NOTHING",
+        [HUB_EPOCH_KEY, &crate::util::random_token()],
+    )?;
+    Ok(())
+}
+
+/// Gives the database a new hub epoch. A restore calls it, so clients
+/// that saved a feed position of the hub before the restore load a
+/// snapshot.
+pub(crate) fn renew_hub_epoch(conn: &Connection) -> Result<String> {
+    let epoch = crate::util::random_token();
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        [HUB_EPOCH_KEY, &epoch],
+    )?;
+    Ok(epoch)
+}
+
+/// The hub epoch.
+pub fn hub_epoch(conn: &Connection) -> Result<Option<String>> {
+    meta_get(conn, HUB_EPOCH_KEY)
 }
 
 impl Store {
@@ -173,7 +206,16 @@ impl Store {
             .spawn(move || {
                 let mut conn = conn;
                 while let Ok(job) = receiver.recv() {
-                    job(&mut conn);
+                    // A job that panics fails only its own write: its
+                    // transaction rolls back when it unwinds, its caller
+                    // gets an error, and the writer takes the next job.
+                    let ran =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(&mut conn)));
+                    if ran.is_err() {
+                        tracing::error!(
+                            "a database write panicked; the hub rolled it back and goes on"
+                        );
+                    }
                 }
             })?;
         let (feed_tx, _) = broadcast::channel(FEED_BROADCAST_CAPACITY);
@@ -446,6 +488,48 @@ mod tests {
     use super::*;
     use consort_proto::ids::GroupId;
     use consort_proto::model::Group;
+
+    #[tokio::test]
+    async fn a_write_that_panics_does_not_stop_the_writer() {
+        let (store, _dir) = temp_store();
+        let failed = store
+            .write(|tx| -> Result<()> {
+                tx.meta_set("review.panic", "written")?;
+                panic!("a bug in a write");
+            })
+            .await;
+        assert!(failed.is_err());
+        // The write rolled back, and the writer takes the next job.
+        store
+            .write(|tx| tx.meta_set("review.after", "ok"))
+            .await
+            .unwrap();
+        let (panicked, after) = store
+            .read(|conn| {
+                Ok((
+                    meta_get(conn, "review.panic")?,
+                    meta_get(conn, "review.after")?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!(panicked, None);
+        assert_eq!(after.as_deref(), Some("ok"));
+    }
+
+    #[tokio::test]
+    async fn a_new_database_has_a_hub_epoch_that_stays_until_a_restore_renews_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = {
+            let conn = open_and_migrate(dir.path()).unwrap();
+            hub_epoch(&conn).unwrap().expect("an epoch")
+        };
+        let conn = open_and_migrate(dir.path()).unwrap();
+        assert_eq!(hub_epoch(&conn).unwrap().as_deref(), Some(first.as_str()));
+        let renewed = renew_hub_epoch(&conn).unwrap();
+        assert_ne!(renewed, first);
+        assert_eq!(hub_epoch(&conn).unwrap(), Some(renewed));
+    }
 
     #[tokio::test]
     async fn a_write_adds_a_feed_entry_and_broadcasts_after_commit() {

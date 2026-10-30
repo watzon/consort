@@ -119,6 +119,7 @@ impl Rig {
             extensions: Default::default(),
             resume: None,
             turn: Some(turn),
+            turn_approval_mode: None,
         }
     }
 
@@ -302,6 +303,7 @@ async fn a_turn_refreshes_the_channel_files_and_uses_the_cache() {
                 attachments,
             },
             channel_files: files,
+            approval_mode: None,
         };
         let hub = rig.hub.clone();
         let id = id.to_owned();

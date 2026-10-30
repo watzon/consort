@@ -43,6 +43,12 @@ pub const FOLLOW_UP_MIN_MINUTES: u64 = 15;
 pub const FOLLOW_UP_MAX_DAYS: u64 = 30;
 /// The most follow-ups that wait in one channel.
 pub const FOLLOW_UPS_MAX_PER_CHANNEL: usize = 20;
+/// The most follow-ups that run in one channel in a day. The hub skips the
+/// next ones that day (`skipped_budget`).
+pub const FOLLOW_UPS_MAX_RUNS_PER_DAY: u32 = 10;
+/// The shortest time between two runs of the morning brief or the research
+/// pass, in seconds: 12 hours.
+pub const BRIEF_RESEARCH_MIN_GAP_SECONDS: u64 = 12 * 60 * 60;
 /// The most characters in the reason of a follow-up.
 pub const FOLLOW_UP_REASON_MAX_CHARS: usize = 300;
 

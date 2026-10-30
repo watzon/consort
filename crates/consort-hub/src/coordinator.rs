@@ -192,11 +192,20 @@ fn turn_batch(events: &[(i64, WakeEvent)], room: usize) -> (Vec<i64>, Vec<WakeEv
     let mut ids = Vec::new();
     let mut taken = Vec::new();
     for (id, event) in events {
+        // The research pass gets a turn of its own, so its read-only rules
+        // never mix with another event's.
+        let research = matches!(event, WakeEvent::Research { .. });
+        if research && !taken.is_empty() {
+            break;
+        }
         let cost = json_len(&render_events(std::slice::from_ref(event))) - shell;
         if used + cost <= room {
             used += cost;
             ids.push(*id);
             taken.push(event.clone());
+            if research {
+                break;
+            }
             continue;
         }
         if taken.is_empty() {
@@ -207,6 +216,16 @@ fn turn_batch(events: &[(i64, WakeEvent)], room: usize) -> (Vec<i64>, Vec<WakeEv
     }
     let rendered = render_events(&taken);
     (ids, taken, rendered)
+}
+
+/// The approval mode of a coordinator turn with these events. A proactive
+/// turn and the research pass run in Ask: every shell command and file edit
+/// of the coordinator's harness waits for the user, whatever the channel's
+/// default mode. Other turns use the session's mode.
+fn turn_approval_mode(events: &[WakeEvent]) -> Option<consort_proto::model::ApprovalMode> {
+    crate::proactivity::turn::classify(events)
+        .is_proactive()
+        .then_some(consort_proto::model::ApprovalMode::Ask)
 }
 
 /// The main text of an event: a message, a summary, a prompt or a note.
@@ -392,6 +411,7 @@ impl Hub {
         if let Some(session) = inputs.session.clone() {
             let worker_id = session.worker_id;
             let (event_ids, events, rendered) = turn_batch(&inputs.events, TURN_TEXT_MAX_BYTES);
+            let approval_mode = turn_approval_mode(&events);
             let started = self
                 .store
                 .write(move |tx| {
@@ -427,6 +447,7 @@ impl Hub {
                                 attachments,
                             },
                             channel_files,
+                            approval_mode,
                         }),
                     )?;
                     Ok(true)
@@ -481,6 +502,7 @@ impl Hub {
         let room = turn_room(json_len(&system_prompt) + json_len(&inputs.context))
             .max(TURN_TEXT_MIN_BYTES);
         let (event_ids, events, rendered) = turn_batch(&inputs.events, room);
+        let turn_approval_mode = turn_approval_mode(&events);
         let first_turn = format!("{}\n\n{rendered}", inputs.context);
         let worker_id = placement.worker_id;
         let channel = inputs.channel.clone();
@@ -555,6 +577,7 @@ impl Hub {
                             text: first_turn,
                             attachments,
                         }),
+                        turn_approval_mode,
                     }),
                 )?;
                 Ok(true)
@@ -898,6 +921,51 @@ mod tests {
         assert!(json_len(&text) <= room);
         let (ids, _, _) = turn_batch(&events, usize::MAX);
         assert_eq!(ids, [1, 2, 3]);
+    }
+
+    fn research() -> WakeEvent {
+        WakeEvent::Research {
+            routine: consort_proto::ids::RoutineId::new(),
+            log: 1,
+        }
+    }
+
+    fn task_update(proactive: Option<consort_proto::model::ProactiveKind>) -> WakeEvent {
+        WakeEvent::TaskUpdate {
+            task: consort_proto::ids::TaskId::new(),
+            title: "Draft".to_owned(),
+            status: consort_proto::status::TaskStatus::Review,
+            text: "Done.".to_owned(),
+            proactive,
+        }
+    }
+
+    #[test]
+    fn the_research_pass_gets_a_turn_of_its_own() {
+        let events = vec![(1, said("hi")), (2, research()), (3, task_update(None))];
+        let (ids, _, _) = turn_batch(&events, usize::MAX);
+        assert_eq!(ids, [1], "research waits for a turn of its own");
+        let (ids, taken, _) = turn_batch(&events[1..], usize::MAX);
+        assert_eq!(ids, [2]);
+        assert_eq!(taken, [events[1].1.clone()]);
+        let (ids, _, _) = turn_batch(&events[2..], usize::MAX);
+        assert_eq!(ids, [3]);
+    }
+
+    #[test]
+    fn proactive_turns_run_in_ask_and_normal_turns_in_the_session_mode() {
+        use consort_proto::model::{ApprovalMode, ProactiveKind};
+        assert_eq!(turn_approval_mode(&[research()]), Some(ApprovalMode::Ask));
+        assert_eq!(
+            turn_approval_mode(&[task_update(Some(ProactiveKind::CheckIn))]),
+            Some(ApprovalMode::Ask)
+        );
+        assert_eq!(turn_approval_mode(&[task_update(None)]), None);
+        assert_eq!(
+            turn_approval_mode(&[said("go"), task_update(Some(ProactiveKind::CheckIn))]),
+            None,
+            "the user acted"
+        );
     }
 
     #[test]

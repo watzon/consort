@@ -353,6 +353,18 @@ pub trait HarnessSession: Send {
     /// Stops the running turn.
     async fn interrupt(&mut self) -> Result<(), HarnessError>;
 
+    /// Changes the approval mode for the next turns, while no turn runs.
+    /// The worker calls it with a mode at or below the session's own mode,
+    /// before a turn that must be stricter (a proactive coordinator turn
+    /// runs in Ask), and again with the session's mode before the next
+    /// normal turn. An adapter whose harness cannot change its mode in a
+    /// running session returns [`HarnessError::Unsupported`], and the
+    /// worker then refuses the stricter turn.
+    async fn set_approval_mode(&mut self, mode: ApprovalMode) -> Result<(), HarnessError> {
+        let _ = mode;
+        Err(HarnessError::Unsupported("change the approval mode"))
+    }
+
     /// Answers an open request.
     async fn respond(&mut self, request: RequestId, answer: Answer) -> Result<(), HarnessError>;
 

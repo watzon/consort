@@ -100,6 +100,10 @@ pub struct FakeRecord {
     pub probed: Vec<AccountConfig>,
     /// The account of every `open`, with its runtime settings.
     pub opened_accounts: Vec<AccountConfig>,
+    /// Every approval mode change, in order.
+    pub mode_changes: Vec<ApprovalMode>,
+    /// The approval mode that each turn ran in, in order.
+    pub turn_modes: Vec<ApprovalMode>,
 }
 
 /// How [`FakeHarness::open`] fails, after [`FakeHarness::set_open_failure`].
@@ -135,6 +139,9 @@ pub struct FakeHarness {
     /// When set, the fake asks for the managed tool of its accounts, like a
     /// real adapter. Off by default, so a worker test installs nothing.
     pub uses_managed_tools: bool,
+    /// When set, the session cannot change its approval mode, like a
+    /// harness that takes its mode only at start.
+    pub fixed_mode: bool,
 }
 
 impl FakeHarness {
@@ -158,6 +165,7 @@ impl FakeHarness {
             steer_delay: Duration::ZERO,
             session_capabilities: None,
             uses_managed_tools: false,
+            fixed_mode: false,
         }
     }
 
@@ -274,6 +282,7 @@ impl Harness for FakeHarness {
             })
             .await;
         let (cancel, _) = watch::channel(0_u64);
+        let mode = spec.approval_mode;
         Ok((
             Box::new(FakeSession {
                 spec,
@@ -290,6 +299,8 @@ impl Harness for FakeHarness {
                 cancel,
                 fail_turn: self.fail_turn,
                 steer_delay: self.steer_delay,
+                mode,
+                fixed_mode: self.fixed_mode,
             }),
             rx,
         ))
@@ -310,6 +321,9 @@ struct FakeSession {
     cancel: watch::Sender<u64>,
     fail_turn: bool,
     steer_delay: Duration,
+    /// The approval mode that the next turn runs in.
+    mode: ApprovalMode,
+    fixed_mode: bool,
 }
 
 async fn play(
@@ -469,6 +483,7 @@ impl HarnessSession for FakeSession {
     async fn turn(&mut self, input: TurnInput) -> Result<TurnId, HarnessError> {
         if let Ok(mut record) = self.record.lock() {
             record.turns.push(input);
+            record.turn_modes.push(self.mode);
         }
         if self.fail_turn {
             return Err(HarnessError::Protocol(
@@ -504,6 +519,17 @@ impl HarnessSession for FakeSession {
             tokio::time::sleep(delay).await;
             Ok(())
         })
+    }
+
+    async fn set_approval_mode(&mut self, mode: ApprovalMode) -> Result<(), HarnessError> {
+        if self.fixed_mode {
+            return Err(HarnessError::Unsupported("change the approval mode"));
+        }
+        if let Ok(mut record) = self.record.lock() {
+            record.mode_changes.push(mode);
+        }
+        self.mode = mode;
+        Ok(())
     }
 
     async fn interrupt(&mut self) -> Result<(), HarnessError> {

@@ -236,6 +236,19 @@ pub fn thread_params(
     }
 }
 
+/// The approval policy and the sandbox policy of `turn/start` for a mode.
+/// `turn/start` takes the sandbox as an object, while `thread/start` takes
+/// its name.
+pub fn turn_policies(mode: ApprovalMode) -> (&'static str, Value) {
+    let (policy, sandbox) = codex_policy(mode);
+    let kind = match sandbox {
+        "read-only" => "readOnly",
+        "workspace-write" => "workspaceWrite",
+        _ => "dangerFullAccess",
+    };
+    (policy, serde_json::json!({ "type": kind }))
+}
+
 /// The models from `model/list`, with an `effort` option.
 pub fn models_from_list(models: &[protocol::Model]) -> Vec<ModelInfo> {
     models
@@ -646,6 +659,8 @@ pub(crate) async fn start_thread(
         pending: HashMap::new(),
         effort,
         counter: 0,
+        mode: spec.approval_mode,
+        applied_mode: spec.approval_mode,
     };
     let task = tokio::spawn(actor.run(process, inbound, command_rx));
     Ok((
@@ -663,6 +678,10 @@ enum Command {
     Turn {
         input: TurnInput,
         reply: oneshot::Sender<Result<TurnId, HarnessError>>,
+    },
+    SetMode {
+        mode: ApprovalMode,
+        reply: oneshot::Sender<Result<(), HarnessError>>,
     },
     Steer {
         input: TurnInput,
@@ -719,6 +738,11 @@ struct Actor {
     pending: HashMap<RequestId, Pending>,
     effort: Option<String>,
     counter: u64,
+    /// The approval mode of the next turn, and the mode that Codex has
+    /// now. A `turn/start` sends the policies when they differ: Codex keeps
+    /// them for the next turns too.
+    mode: ApprovalMode,
+    applied_mode: ApprovalMode,
 }
 
 impl Actor {
@@ -766,6 +790,15 @@ impl Actor {
                         Command::Close => { exit = Exit::User; break }
                         Command::Turn { input, reply } => {
                             let _ = reply.send(self.start_turn(&input).await);
+                        }
+                        Command::SetMode { mode, reply } => {
+                            let result = if self.mapper.current_turn().is_some() {
+                                Err(HarnessError::Protocol("a turn is running".to_owned()))
+                            } else {
+                                self.mode = mode;
+                                Ok(())
+                            };
+                            let _ = reply.send(result);
                         }
                         // Steer and interrupt answer in their own tasks, so
                         // approvals go on while Codex takes them.
@@ -905,6 +938,12 @@ impl Actor {
                 "a turn is already running".to_owned(),
             ));
         }
+        let (approval_policy, sandbox_policy) = if self.mode == self.applied_mode {
+            (None, None)
+        } else {
+            let (policy, sandbox) = turn_policies(self.mode);
+            (Some(policy.to_owned()), Some(sandbox))
+        };
         let response: TurnStartResponse = self
             .client
             .request(
@@ -913,9 +952,12 @@ impl Actor {
                     thread_id: self.thread_id.clone(),
                     input: turn_input(input, &self.workspace),
                     effort: self.effort.clone(),
+                    approval_policy,
+                    sandbox_policy,
                 },
             )
             .await?;
+        self.applied_mode = self.mode;
         self.mapper.turn_accepted(&response.turn.id);
         Ok(TurnId::new(response.turn.id))
     }
@@ -1230,6 +1272,12 @@ impl HarnessSession for CodexSession {
 
     async fn interrupt(&mut self) -> Result<(), HarnessError> {
         self.call(|reply| Command::Interrupt { reply }).await
+    }
+
+    /// Codex takes an approval policy and a sandbox policy with each
+    /// `turn/start`, so the next turn sends the new ones.
+    async fn set_approval_mode(&mut self, mode: ApprovalMode) -> Result<(), HarnessError> {
+        self.call(|reply| Command::SetMode { mode, reply }).await
     }
 
     async fn respond(&mut self, request: RequestId, answer: Answer) -> Result<(), HarnessError> {

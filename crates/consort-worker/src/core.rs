@@ -1294,6 +1294,7 @@ pub(crate) mod tests {
                 attachments: vec![],
             },
             channel_files: None,
+            approval_mode: None,
         }
         .into();
         let turn_id = FrameId::new("cmd-turn");
@@ -1456,6 +1457,7 @@ pub(crate) mod tests {
             session_id,
             turn: TurnInput::default(),
             channel_files: None,
+            approval_mode: None,
         }
         .into();
         lock(&core.inflight).insert("c9".to_owned());
@@ -2136,5 +2138,124 @@ pub(crate) mod tests {
             .unwrap();
         wait_until("the child to die", || live_members(pgid) == 0).await;
         assert!(core.store.processes().unwrap().is_empty());
+    }
+
+    /// Sends one turn with an approval mode of its own and waits for the
+    /// result. Returns whether the worker took it.
+    async fn turn_in_mode(
+        core: &Arc<Core>,
+        session_id: SessionId,
+        n: u32,
+        mode: Option<consort_proto::model::ApprovalMode>,
+    ) -> Result<(), consort_proto::error::ErrorBody> {
+        let turn: HubToWorker = SessionTurn {
+            session_id,
+            turn: TurnInput {
+                text: format!("Turn {n}"),
+                attachments: vec![],
+            },
+            channel_files: None,
+            approval_mode: mode,
+        }
+        .into();
+        let id = format!("turn-{session_id}-{n}");
+        core.dispatch(request(&FrameId::new(&id), &turn));
+        wait_until("the turn result", || {
+            core.store.command_result(&id).unwrap().is_some()
+        })
+        .await;
+        // The fake turn ends on its own; give it a moment.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        match core.store.command_result(&id).unwrap() {
+            Some(crate::store::StoredResult::Ok { .. }) => Ok(()),
+            Some(crate::store::StoredResult::Err { error }) => Err(error),
+            None => unreachable!("waited for the result"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_turn_with_a_stricter_mode_runs_in_it_and_the_next_turn_goes_back() {
+        use consort_proto::model::ApprovalMode;
+        let fake = FakeHarness::new(HarnessKind::ClaudeCode, FakeScript::reply("Hi."));
+        let record = fake.record();
+        let (_dir, core, account_id) = fake_worker(&fake);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        core.link.attach(tx);
+        // A coordinator session in Auto whose first turn is proactive.
+        let session_id = SessionId::new();
+        let mut command = start(session_id);
+        command.account_id = account_id;
+        command.approval_mode = ApprovalMode::Auto;
+        command.turn = Some(TurnInput {
+            text: "Check in".into(),
+            attachments: vec![],
+        });
+        command.turn_approval_mode = Some(ApprovalMode::Ask);
+        let id = format!("start-{session_id}");
+        core.dispatch(request(&FrameId::new(&id), &command.into()));
+        wait_until("the start result", || {
+            core.store.command_result(&id).unwrap().is_some()
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // A normal turn goes back to Auto, a proactive one runs in Ask, and
+        // a turn cannot raise the mode above the session's.
+        turn_in_mode(&core, session_id, 1, None).await.unwrap();
+        turn_in_mode(&core, session_id, 2, Some(ApprovalMode::Ask))
+            .await
+            .unwrap();
+        turn_in_mode(&core, session_id, 3, Some(ApprovalMode::FullAccess))
+            .await
+            .unwrap();
+        let record = record.lock().unwrap();
+        assert_eq!(record.opened[0].approval_mode, ApprovalMode::Auto);
+        assert_eq!(
+            record.turn_modes,
+            [
+                ApprovalMode::Ask,
+                ApprovalMode::Auto,
+                ApprovalMode::Ask,
+                ApprovalMode::Auto
+            ]
+        );
+        assert_eq!(
+            record.mode_changes,
+            [
+                ApprovalMode::Ask,
+                ApprovalMode::Auto,
+                ApprovalMode::Ask,
+                ApprovalMode::Auto
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_harness_that_cannot_change_its_mode_refuses_a_stricter_turn() {
+        use consort_proto::model::ApprovalMode;
+        let mut fake = FakeHarness::new(HarnessKind::ClaudeCode, FakeScript::reply("Hi."));
+        fake.fixed_mode = true;
+        let record = fake.record();
+        let (_dir, core, account_id) = fake_worker(&fake);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        core.link.attach(tx);
+        let session_id = start_with_turn(&core, account_id, ApprovalMode::Auto).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let err = turn_in_mode(&core, session_id, 1, Some(ApprovalMode::Ask))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, consort_proto::error::ErrorCode::PolicyDenied);
+        assert!(
+            err.message.contains("cannot change its approval mode"),
+            "{}",
+            err.message
+        );
+        assert_eq!(
+            record.lock().unwrap().turns.len(),
+            1,
+            "the turn did not run"
+        );
+        // A turn that needs no change still runs.
+        turn_in_mode(&core, session_id, 2, None).await.unwrap();
+        assert_eq!(record.lock().unwrap().turns.len(), 2);
     }
 }

@@ -4,7 +4,7 @@
 
 use std::{
     collections::HashMap,
-    sync::Arc,
+    sync::{Arc, atomic::Ordering},
     time::{Duration, SystemTime},
 };
 
@@ -32,7 +32,11 @@ use super::{
     Failure, Outgoing, Reply, Shared, is_transport,
     url::{addr_is_private, plain_http_name, resolve_private, ws_url},
 };
-use crate::{ClientError, store::Identity, view::Connection};
+use crate::{ClientError, cache::Cache, store::Identity, view::Connection};
+
+/// Why a link ends when the user paired with another hub or unpaired while
+/// it ran.
+const OWNER_CHANGED: &str = "The app paired with another hub, so this link ended.";
 
 /// Why a session on the link ended.
 pub(super) enum SessionEnd {
@@ -302,6 +306,9 @@ async fn session(
     online_since: &mut Option<Instant>,
 ) -> Result<(), SessionEnd> {
     let limits = shared.options.timeouts;
+    // The owner that this link works for. After a Pair or an Unpair, the
+    // link stops and writes nothing more into the cache.
+    let generation = shared.generation();
     let url = ws_url(&identity.config.hub_url).map_err(|e| lost(e.to_string()))?;
     let mut ws = tokio::time::timeout(limits.connect, open(&identity.config.hub_url, url))
         .await
@@ -311,6 +318,9 @@ async fn session(
                 seconds(limits.connect)
             ))
         })??;
+    if shared.generation() != generation {
+        return Err(lost(OWNER_CHANGED));
+    }
     // A restart request from an earlier link is over.
     shared
         .restart
@@ -342,14 +352,24 @@ async fn session(
         version: env!("CARGO_PKG_VERSION").to_owned(),
         protocol_versions: SUPPORTED_PROTOCOL_VERSIONS.to_vec(),
     };
-    handshake_call(&mut ws, &hello, limits.handshake)
+    let hello = handshake_call(&mut ws, &hello, limits.handshake)
         .await?
         .map_err(refused_or_lost)?;
 
-    initial_sync(shared, &mut ws, limits.handshake).await?;
+    initial_sync(
+        shared,
+        &mut ws,
+        limits.handshake,
+        generation,
+        hello.hub_epoch,
+    )
+    .await?;
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Outgoing>();
     if let Ok(mut link) = shared.link.lock() {
+        if shared.generation() != generation {
+            return Err(lost(OWNER_CHANGED));
+        }
         *link = Some(tx);
     }
     *online_since = Some(Instant::now());
@@ -381,7 +401,7 @@ async fn session(
                     Some(Err(e)) => break Err(lost(e.to_string())),
                     Some(Ok(WsMessage::Text(text))) => match Frame::parse(text.as_str()) {
                         Ok(Frame::Event(event)) => {
-                            if let Some(end) = on_event(shared, &event) {
+                            if let Some(end) = on_event(shared, &event, generation) {
                                 break Err(end);
                             }
                         }
@@ -432,6 +452,9 @@ async fn session(
                     // silent for the whole sleep. Start again at once.
                     break Err(lost("The computer was asleep, so Consort connects to the hub again."));
                 }
+                if shared.generation() != generation {
+                    break Err(lost(OWNER_CHANGED));
+                }
                 if shared.restart.swap(false, std::sync::atomic::Ordering::AcqRel) {
                     break Err(lost("Consort could not load all the changes from the hub. It connects again to load the data"));
                 }
@@ -462,7 +485,9 @@ async fn session(
             }
         }
     };
-    if let Ok(mut link) = shared.link.lock() {
+    if let Ok(mut link) = shared.link.lock()
+        && shared.generation() == generation
+    {
         *link = None;
     }
     for (_, w) in waiting.drain() {
@@ -478,14 +503,23 @@ async fn initial_sync(
     shared: &Arc<Shared>,
     ws: &mut Ws,
     limit: Duration,
+    generation: u64,
+    hub_epoch: Option<String>,
 ) -> Result<(), SessionEnd> {
-    let (loaded, seq) = shared
-        .cache
-        .lock()
-        .map(|c| (c.loaded, c.seq))
-        .unwrap_or((false, 0));
+    // Every write of the cache below checks that the owner is still the one
+    // that this link started with.
+    let changed = || lost(OWNER_CHANGED);
+    let (loaded, seq, same_epoch) = shared
+        .with_cache_of(generation, |c| (c.loaded, c.seq, c.hub_epoch == hub_epoch))
+        .ok_or_else(changed)?;
+    if loaded && !same_epoch {
+        // The hub was restored from a backup (or is another database at
+        // the same address). Its feed numbers name other changes, so the
+        // saved position means nothing there.
+        tracing::info!("the hub has a new epoch, so the client loads a snapshot");
+    }
     let mut subscribed = false;
-    if loaded {
+    if loaded && same_epoch {
         match handshake_call(
             ws,
             &SyncSubscribe {
@@ -512,13 +546,14 @@ async fn initial_sync(
         .await?
         .map_err(refused_or_lost)?;
         let after = snapshot.seq;
-        let channels = match shared.cache.lock() {
-            Ok(mut cache) => {
+        let epoch = hub_epoch.clone();
+        let channels = shared
+            .with_cache_of(generation, move |cache| {
                 cache.load_snapshot(snapshot);
+                cache.hub_epoch = epoch;
                 cache.channels_to_load()
-            }
-            Err(_) => Vec::new(),
-        };
+            })
+            .ok_or_else(changed)?;
         // The `all` snapshot has no messages. Each channel snapshot brings
         // the newest timeline messages of one channel. A channel that the
         // hub cannot answer for is left for the loader to try again.
@@ -533,9 +568,9 @@ async fn initial_sync(
             .await
             {
                 Ok(channel) => {
-                    if let Ok(mut cache) = shared.cache.lock() {
-                        cache.load_channel(channel_id, channel);
-                    }
+                    shared
+                        .with_cache_of(generation, |cache| cache.load_channel(channel_id, channel))
+                        .ok_or_else(changed)?;
                 }
                 Err(Fetch::Session(end)) => return Err(end),
                 Err(Fetch::Remote(err)) if err.code == ErrorCode::Unauthorized => {
@@ -570,9 +605,9 @@ async fn initial_sync(
                 match handshake_fetch(ws, &request, limit).await {
                     Ok(page) => {
                         let messages = pager.accept(page);
-                        if let Ok(mut cache) = shared.cache.lock() {
-                            cache.merge_messages(messages);
-                        }
+                        shared
+                            .with_cache_of(generation, |cache| cache.merge_messages(messages))
+                            .ok_or_else(changed)?;
                     }
                     Err(Fetch::Session(end)) => return Err(end),
                     Err(Fetch::Remote(err)) => {
@@ -584,7 +619,7 @@ async fn initial_sync(
         }
         // Before the subscription: a handshake call drops the feed events
         // that come while it waits.
-        load_proactivity(shared, ws, limit).await?;
+        load_proactivity(shared, ws, limit, generation).await?;
         handshake_call(
             ws,
             &SyncSubscribe {
@@ -596,9 +631,9 @@ async fn initial_sync(
         .await?
         .map_err(refused_or_lost)?;
     }
-    if let Ok(mut cache) = shared.cache.lock() {
-        cache.finish_load();
-    }
+    shared
+        .with_cache_of(generation, Cache::finish_load)
+        .ok_or_else(changed)?;
     Ok(())
 }
 
@@ -609,6 +644,7 @@ async fn load_proactivity(
     shared: &Arc<Shared>,
     ws: &mut Ws,
     limit: Duration,
+    generation: u64,
 ) -> Result<(), SessionEnd> {
     let zone_unset = shared
         .cache
@@ -626,31 +662,31 @@ async fn load_proactivity(
             time_zone_if_unset: true,
             ..Default::default()
         };
-        if let Ok(result) = handshake_call(ws, &request, limit).await?
-            && let Ok(mut cache) = shared.cache.lock()
-        {
-            cache.proactivity.apply_settings(result.settings);
+        if let Ok(result) = handshake_call(ws, &request, limit).await? {
+            shared.with_cache_of(generation, |cache| {
+                cache.proactivity.apply_settings(result.settings);
+            });
         }
     }
     let page = consort_proto::client_api::ProactivityLog {
         limit: Some(crate::proactivity::LOG_PAGE),
         ..Default::default()
     };
-    if let Ok(page) = handshake_call(ws, &page, limit).await?
-        && let Ok(mut cache) = shared.cache.lock()
-    {
-        cache.proactivity.load_page(page.wakes, page.has_more);
+    if let Ok(page) = handshake_call(ws, &page, limit).await? {
+        shared.with_cache_of(generation, |cache| {
+            cache.proactivity.load_page(page.wakes, page.has_more);
+        });
     }
     Ok(())
 }
 
 /// Handles one event from the hub.
-fn on_event(shared: &Arc<Shared>, event: &EventFrame) -> Option<SessionEnd> {
+fn on_event(shared: &Arc<Shared>, event: &EventFrame, generation: u64) -> Option<SessionEnd> {
     match event.kind.as_str() {
-        "feed" => on_feed(shared, event),
+        "feed" => on_feed(shared, event, generation),
         "feed.skipped" => {
             match event.decode_as::<FeedSkipped>() {
-                Ok(skipped) => recover(shared, skipped.seq, skipped.channel_id),
+                Ok(skipped) => recover(shared, skipped.seq, skipped.channel_id, generation),
                 Err(err) => {
                     tracing::warn!(error = %err, "a feed.skipped event could not be read");
                 }
@@ -661,22 +697,20 @@ fn on_event(shared: &Arc<Shared>, event: &EventFrame) -> Option<SessionEnd> {
     }
 }
 
-fn on_feed(shared: &Arc<Shared>, event: &EventFrame) -> Option<SessionEnd> {
+fn on_feed(shared: &Arc<Shared>, event: &EventFrame, generation: u64) -> Option<SessionEnd> {
     match event.decode_as::<FeedEntry>() {
         Ok(entry) => {
             let channel_changed = matches!(
                 &entry.change,
                 FeedChange::Upsert(consort_proto::client_api::EntityPayload::Channel(_))
             );
-            let (changed, outbox_shrank) = shared
-                .cache
-                .lock()
-                .map(|mut c| {
-                    let before = c.pending.len();
-                    let changed = c.apply(entry);
-                    (changed, c.pending.len() < before)
-                })
-                .unwrap_or((false, false));
+            let Some((changed, outbox_shrank)) = shared.with_cache_of(generation, |c| {
+                let before = c.pending.len();
+                let changed = c.apply(entry);
+                (changed, c.pending.len() < before)
+            }) else {
+                return Some(lost(OWNER_CHANGED));
+            };
             if changed {
                 shared.publish();
             }
@@ -705,13 +739,11 @@ fn on_feed(shared: &Arc<Shared>, event: &EventFrame) -> Option<SessionEnd> {
             tracing::warn!(?seq, error = %err, "a feed entry could not be read, so the client skips it");
             match seq {
                 Some(seq) => {
-                    recover(shared, seq, channel);
+                    recover(shared, seq, channel, generation);
                     None
                 }
                 None => {
-                    if let Ok(mut cache) = shared.cache.lock() {
-                        cache.loaded = false;
-                    }
+                    shared.with_cache_of(generation, |cache| cache.loaded = false);
                     Some(lost(
                         "The hub sent a change that this app cannot read. Consort loads the data again",
                     ))
@@ -724,10 +756,17 @@ fn on_feed(shared: &Arc<Shared>, event: &EventFrame) -> Option<SessionEnd> {
 /// Moves the feed position past an entry that is missing, and asks the hub for
 /// the data again: the channel when the entry names one, else everything
 /// that is not in a channel.
-fn recover(shared: &Arc<Shared>, seq: u64, channel_id: Option<ChannelId>) {
-    if let Ok(mut cache) = shared.cache.lock() {
-        cache.skip_to(seq);
+///
+/// The live position moves at once, so the next entries apply. The saved
+/// position does not: no save runs until the data is in (see
+/// `Shared::recovering`). A quit before that keeps the position before the
+/// gap in the file, and the next start replays the change.
+fn recover(shared: &Arc<Shared>, seq: u64, channel_id: Option<ChannelId>, generation: u64) {
+    let skipped = shared.with_cache_of(generation, |cache| cache.skip_to(seq));
+    if skipped.is_none() {
+        return;
     }
+    shared.recovering.fetch_add(1, Ordering::AcqRel);
     let shared = shared.clone();
     tokio::spawn(async move {
         let scope = match channel_id {
@@ -736,15 +775,14 @@ fn recover(shared: &Arc<Shared>, seq: u64, channel_id: Option<ChannelId>) {
         };
         match shared.call(SyncSnapshot { scope }).await {
             Ok(snapshot) => {
-                if let Ok(mut cache) = shared.cache.lock() {
-                    match channel_id {
-                        Some(id) if cache.channels.contains_key(&id.to_string()) => {
-                            cache.load_channel(id, snapshot);
-                        }
-                        Some(_) => {}
-                        None => cache.merge_entities(snapshot),
+                shared.with_cache_of(generation, |cache| match channel_id {
+                    Some(id) if cache.channels.contains_key(&id.to_string()) => {
+                        cache.load_channel(id, snapshot);
                     }
-                }
+                    Some(_) => {}
+                    None => cache.merge_entities(snapshot),
+                });
+                shared.recovering.fetch_sub(1, Ordering::AcqRel);
                 shared.publish();
                 shared.loader_wake.notify_one();
             }
@@ -753,9 +791,8 @@ fn recover(shared: &Arc<Shared>, seq: u64, channel_id: Option<ChannelId>) {
                 // The cache misses a change. Nothing else retries this while
                 // the link stays up, so end the link: the next connection
                 // sees that the cache is not loaded and loads everything.
-                if let Ok(mut cache) = shared.cache.lock() {
-                    cache.loaded = false;
-                }
+                shared.with_cache_of(generation, |cache| cache.loaded = false);
+                shared.recovering.fetch_sub(1, Ordering::AcqRel);
                 shared.restart_link();
             }
         }

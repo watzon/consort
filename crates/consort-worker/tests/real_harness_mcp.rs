@@ -70,6 +70,7 @@ async fn hub_tools_reach_with(kind: HarnessKind, allow_shell: bool) {
         extensions: Default::default(),
         resume: None,
         turn: None,
+        turn_approval_mode: None,
     };
     let response = hub.command("start", start.into()).await;
     println!("session.start: {:?}", response.result);

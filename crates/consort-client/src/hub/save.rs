@@ -68,6 +68,13 @@ impl Shared {
         let Slot::Open(file) = &mut *slot else {
             return;
         };
+        // While a recover waits for the data of a skipped change, the feed
+        // position is past data that the cache does not hold yet. The file
+        // keeps the last position before the gap; the recover asks for a
+        // save when the data is in.
+        if self.recovering.load(Ordering::Acquire) > 0 {
+            return;
+        }
         let rows = match self.cache.lock() {
             // A half load is not worth keeping. The file keeps the last
             // whole one.

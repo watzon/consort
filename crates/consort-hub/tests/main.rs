@@ -28,6 +28,7 @@ mod phase4_tasks;
 mod proactivity;
 mod refused_turns;
 mod reopened_and_decisions;
+mod review_fixes;
 mod revoke_and_handshake;
 mod routines_and_memory;
 mod session_end;

@@ -535,6 +535,7 @@ async fn the_change_summary_names_status_changes_failed_runs_and_waiting_decisio
                 created_by: TaskCreator::User,
                 routine_id: None,
                 attachments: Vec::new(),
+                proactive: None,
             })
             .await
             .unwrap();
@@ -1065,6 +1066,7 @@ async fn task_in(hub: &Hub, channel_id: ChannelId, status: TaskStatus) -> TaskId
             created_by: TaskCreator::User,
             routine_id: None,
             attachments: Vec::new(),
+            proactive: None,
         })
         .await
         .unwrap();
@@ -1779,3 +1781,5 @@ async fn the_log_pages_newest_first_with_filters() {
         .unwrap();
     assert_eq!(purged, 3);
 }
+
+mod review;

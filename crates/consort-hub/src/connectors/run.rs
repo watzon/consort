@@ -327,7 +327,15 @@ impl Hub {
             ));
         }
         let scope = CallScope::of(ctx);
-        let rule = connection.approvals.rule_for(kind);
+        let mut rule = connection.approvals.rule_for(kind);
+        // A proactive turn and a draft task ask before each call that writes
+        // or sends, whatever the connection allows and whatever the user
+        // allowed before.
+        if kind != consort_proto::model::ToolKind::Read
+            && self.connector_calls_ask_each_time(ctx).await?
+        {
+            rule = ApprovalRule::AskEveryTime;
+        }
         let decision = match rule {
             ApprovalRule::RunWithoutAsking => Some(CallDecision::RanWithoutAsking),
             ApprovalRule::AskOncePerTask => {

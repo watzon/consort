@@ -83,6 +83,7 @@ async fn the_hub_gets_the_whole_output_of_a_command_as_a_blob() {
             text: "Build it".into(),
             attachments: vec![],
         }),
+        turn_approval_mode: None,
     };
     let started = hub.command("start-1", start.into()).await;
     assert!(started.result.is_ok(), "{:?}", started.result);

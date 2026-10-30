@@ -188,6 +188,15 @@ pub(crate) struct Shared {
     /// When the data was last known to be current, in Unix milliseconds, or
     /// 0. The saved data from an earlier run sets it at the start.
     fresh_at: std::sync::atomic::AtomicI64,
+    /// The number of the identity that the cache belongs to. Pair and
+    /// Unpair raise it. A link, a call and a recover that started with an
+    /// older number never write the cache, so data of the old hub never
+    /// lands under the new owner.
+    generation: std::sync::atomic::AtomicU64,
+    /// Recovers that wait for the data of a skipped change. The cache is
+    /// not saved while one runs, so the saved feed position never moves past
+    /// a change whose data has not arrived.
+    recovering: std::sync::atomic::AtomicUsize,
 }
 
 impl Shared {
@@ -279,6 +288,8 @@ impl Shared {
             cache_file: Mutex::new(cache_file),
             save_wake: Notify::new(),
             fresh_at: std::sync::atomic::AtomicI64::new(fresh_at),
+            generation: std::sync::atomic::AtomicU64::new(0),
+            recovering: std::sync::atomic::AtomicUsize::new(0),
         });
         shared.publish_now();
         Ok(shared)
@@ -373,6 +384,39 @@ impl Shared {
         }
     }
 
+    /// The number of the current identity (see `generation`).
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Changes the cache, but only while the identity is still the one of
+    /// `generation`. Returns `None` when it changed: the caller drops what
+    /// it got from the old hub.
+    pub(crate) fn with_cache_of<T>(
+        &self,
+        generation: u64,
+        change: impl FnOnce(&mut Cache) -> T,
+    ) -> Option<T> {
+        let mut cache = self.cache.lock().ok()?;
+        // Pair and Unpair raise the number under the cache lock, so this
+        // check and the change see the same owner.
+        (self.generation() == generation).then(|| change(&mut cache))
+    }
+
+    /// Starts a new owner of the cache: raises the generation and resets the
+    /// cache with `reset`, under the cache lock. The live link to the old
+    /// hub stops taking requests.
+    pub(crate) fn new_owner(&self, reset: impl FnOnce(&mut Cache)) {
+        if let Ok(mut cache) = self.cache.lock() {
+            self.generation
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            reset(&mut cache);
+        }
+        if let Ok(mut link) = self.link.lock() {
+            *link = None;
+        }
+    }
+
     /// Ends the live link, so the client connects again and loads the data
     /// again. Use it when the cache is known to miss a change.
     pub(crate) fn restart_link(&self) {
@@ -390,6 +434,8 @@ impl Shared {
 
     /// Sends one request on the live link and waits for its response.
     async fn call<R: Request>(&self, body: R) -> Result<R::Response, ClientError> {
+        // An answer from the old hub after a Pair is not used.
+        let generation = self.generation();
         let id = FrameId::generate();
         let frame =
             Frame::request(id.clone(), &body).map_err(|e| ClientError::Other(e.to_string()))?;
@@ -417,6 +463,9 @@ impl Shared {
             Ok(Ok(Err(Failure::Remote(err)))) => return Err(hub_error(err)),
             Ok(Ok(Ok(value))) => value,
         };
+        if self.generation() != generation {
+            return Err(ClientError::NotConnected);
+        }
         serde_json::from_value(value).map_err(|e| {
             ClientError::Other(format!(
                 "The hub sent a response that this app cannot read: {e}. Update Consort, then try again"

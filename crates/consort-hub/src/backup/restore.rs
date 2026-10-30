@@ -98,7 +98,7 @@ fn not_a_backup(path: &Path, reason: impl Into<String>) -> RestoreError {
 }
 
 /// Reads the manifest, the first entry of the archive.
-fn read_manifest(archive: &Path) -> Result<Manifest, RestoreError> {
+pub(crate) fn read_manifest(archive: &Path) -> Result<Manifest, RestoreError> {
     let file = std::fs::File::open(archive)
         .map_err(|err| not_a_backup(archive, format!("it cannot be opened ({err})")))?;
     let mut tar = tar::Archive::new(file);
@@ -212,7 +212,7 @@ fn unpack(archive: &Path, staging: &Path) -> Result<u64, RestoreError> {
 }
 
 /// Checks the restored database: SQLite's integrity check, and a schema
-/// that this hub knows.
+/// that this hub knows. Then gives it a new hub epoch.
 fn check_database(archive: &Path, db: &Path, hub_version: &str) -> Result<(), RestoreError> {
     let conn = rusqlite::Connection::open(db)
         .map_err(|_| not_a_backup(archive, "its database cannot be opened"))?;
@@ -231,6 +231,10 @@ fn check_database(archive: &Path, db: &Path, hub_version: &str) -> Result<(), Re
             hub_version: hub_version.to_owned(),
         });
     }
+    // A restored hub has an older feed. A new epoch makes every client
+    // drop its saved feed position and load a snapshot.
+    crate::store::renew_hub_epoch(&conn)
+        .map_err(|_| not_a_backup(archive, "its database cannot be written"))?;
     Ok(())
 }
 

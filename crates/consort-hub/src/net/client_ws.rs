@@ -73,8 +73,12 @@ async fn run_client(hub: Hub, mut socket: WebSocket, peer_ip: IpAddr) {
         fail_protocol(&mut socket, &auth.hello).await;
         return;
     };
-    let feed_seq = match hub.store.read(feed::head_seq).await {
-        Ok(seq) => seq,
+    let head = hub
+        .store
+        .read(|conn| Ok((feed::head_seq(conn)?, crate::store::hub_epoch(conn)?)))
+        .await;
+    let (feed_seq, hub_epoch) = match head {
+        Ok(head) => head,
         Err(err) => {
             fail(
                 &mut socket,
@@ -119,6 +123,7 @@ async fn run_client(hub: Hub, mut socket: WebSocket, peer_ip: IpAddr) {
         protocol_version: version,
         hub_version: HUB_VERSION.to_owned(),
         feed_seq,
+        hub_epoch,
     };
     let sent = match auth.hello.respond_ok(&result) {
         Ok(reply) => send_frame(&mut socket, &reply).await,

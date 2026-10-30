@@ -59,6 +59,7 @@ fn session_start(session_id: SessionId, account_id: AccountId) -> SessionStart {
             text: "Run the tests".into(),
             attachments: vec![],
         }),
+        turn_approval_mode: None,
     }
 }
 
@@ -293,6 +294,7 @@ async fn pair_connect_run_a_session_and_resend_after_reconnect() {
                     attachments: vec![],
                 },
                 channel_files: None,
+                approval_mode: None,
             }
             .into(),
         )
@@ -336,6 +338,7 @@ async fn pair_connect_run_a_session_and_resend_after_reconnect() {
                 session_id: SessionId::new(),
                 turn: TurnInput::default(),
                 channel_files: None,
+                approval_mode: None,
             }
             .into(),
         )
@@ -441,6 +444,7 @@ async fn sessions_resume_after_a_worker_restart() {
                     attachments: vec![],
                 },
                 channel_files: None,
+                approval_mode: None,
             }
             .into(),
         )
@@ -529,6 +533,7 @@ async fn the_worker_allows_hub_tools_without_asking_the_hub() {
                     attachments: vec![],
                 },
                 channel_files: None,
+                approval_mode: None,
             }
             .into(),
         )

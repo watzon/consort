@@ -833,6 +833,9 @@ pub(crate) mod fake;
 mod flow_tests;
 
 #[cfg(test)]
+mod proactive_tests;
+
+#[cfg(test)]
 mod status_tests;
 
 #[cfg(test)]

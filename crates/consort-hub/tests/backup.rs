@@ -261,6 +261,8 @@ struct BackedUp {
     hash: Sha256Hash,
     client_id: consort_proto::ids::ClientId,
     key: ed25519_dalek::SigningKey,
+    /// The hub epoch that the client saw before the backup.
+    epoch: Option<String>,
 }
 
 async fn hub_with_backup() -> BackedUp {
@@ -282,7 +284,12 @@ async fn hub_with_backup() -> BackedUp {
     client.request(HubBackup {}).await.unwrap();
     let status = wait_for_backup(&hub, &mut client).await;
     let archive = PathBuf::from(status.backup.last.unwrap().path);
-    let FakeClient { client_id, key, .. } = client;
+    let FakeClient {
+        client_id,
+        key,
+        hello,
+        ..
+    } = client;
     let TestHub { handle, dir, .. } = hub;
     handle.shutdown().await.unwrap();
     BackedUp {
@@ -291,6 +298,7 @@ async fn hub_with_backup() -> BackedUp {
         hash,
         client_id,
         key,
+        epoch: hello.hub_epoch,
     }
 }
 
@@ -313,6 +321,11 @@ async fn a_restore_round_trip_brings_back_messages_and_blobs() {
         "the restored hub has a client"
     );
     let mut client = FakeClient::connect(&hub, backed.client_id, backed.key).await;
+    // The restored hub has a new epoch, so a client drops its saved feed
+    // position and loads a snapshot.
+    assert!(backed.epoch.is_some());
+    assert!(client.hello.hub_epoch.is_some());
+    assert_ne!(client.hello.hub_epoch, backed.epoch);
     let tutti = client.tutti().await;
     let page = client
         .request(MessageList {

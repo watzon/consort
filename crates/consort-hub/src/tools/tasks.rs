@@ -235,7 +235,7 @@ impl Hub {
         let paths = args.attachments.clone();
         let session_id = ctx.session.id;
         let requested = args.approval_mode;
-        let (channel, attachments, (proactive_mode, draft)) = self
+        let (channel, attachments, (proactive_mode, origin)) = self
             .store
             .read(move |conn| {
                 let channel = conversation::channel_or_404(conn, channel_id)?;
@@ -270,6 +270,7 @@ impl Hub {
                 created_by: TaskCreator::Assistant,
                 routine_id: None,
                 attachments,
+                proactive: origin,
             })
             .await?;
         if !limited.is_empty() {
@@ -294,8 +295,10 @@ impl Hub {
                 .await?;
         }
         let mut notes = limited.for_assistant;
-        if draft {
+        if origin.is_some() {
             self.note_turn_task(ctx, task.id).await?;
+        }
+        if origin.is_some_and(|(_, draft)| draft) {
             notes.push(
                 "You started this task on your own, so it runs in draft mode: every outward action waits for the user.".to_owned(),
             );
@@ -314,6 +317,7 @@ impl Hub {
         args: MessageTaskArgs,
     ) -> Result<Value> {
         let (task_id, channel_id) = (args.task_id, ctx.channel.id);
+        self.check_steer_task(ctx, task_id).await?;
         let paths = args.attachments.clone();
         let (task, attachments) = self
             .store
@@ -467,6 +471,7 @@ impl Hub {
         self.store
             .read(move |conn| own_task(conn, &ctx_copy, args.task_id).map(|_| ()))
             .await?;
+        self.check_steer_task(ctx, args.task_id).await?;
         let task = self.retry_task(args.task_id, Actor::Coordinator).await?;
         to_value(&TaskStatusResult {
             task_id: task.id,

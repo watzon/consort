@@ -1137,6 +1137,7 @@ fn task_turn_ended(
                 session_id: ctx.session.id,
                 turn,
                 channel_files,
+                approval_mode: None,
             }),
         )?;
         ctx.runtime.turn_open = true;
@@ -1456,6 +1457,7 @@ mod tests {
             extensions: Default::default(),
             resume: None,
             turn: None,
+            turn_approval_mode: None,
         })
     }
 
@@ -1467,6 +1469,7 @@ mod tests {
                 attachments: Vec::new(),
             },
             channel_files: None,
+            approval_mode: None,
         })
     }
 

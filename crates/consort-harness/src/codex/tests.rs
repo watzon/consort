@@ -816,6 +816,103 @@ mod fake_server {
         session.close().await.unwrap();
     }
 
+    /// An app-server that ends each turn at once, and logs what it got.
+    async fn run_quick_server(stream: tokio::io::DuplexStream, log: Arc<Mutex<Vec<Value>>>) {
+        let (read, mut write) = tokio::io::split(stream);
+        let mut lines = BufReader::new(read).lines();
+        let mut turns = 0;
+        while let Ok(Some(line)) = lines.next_line().await {
+            let msg: Value = serde_json::from_str(&line).unwrap();
+            log.lock().unwrap().push(msg.clone());
+            let id = msg.get("id").cloned();
+            let replies = match msg.get("method").and_then(Value::as_str) {
+                Some("thread/start") => {
+                    vec![json!({"id": id, "result": {"thread": {"id": "th1"}, "model": "m"}})]
+                }
+                Some("turn/start") => {
+                    turns += 1;
+                    let turn = format!("t{turns}");
+                    vec![
+                        json!({"id": id, "result": {"turn": {"id": turn, "status": "inProgress", "items": []}}}),
+                        json!({"method": "turn/completed", "params": {"threadId": "th1", "turn": {"id": turn, "status": "completed", "items": []}}}),
+                    ]
+                }
+                _ => continue,
+            };
+            for reply in replies {
+                write
+                    .write_all(format!("{reply}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+            write.flush().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_turn_in_another_approval_mode_sends_its_policies_once() {
+        let (client_side, server_side) = tokio::io::duplex(1 << 16);
+        let log = Arc::new(Mutex::new(Vec::new()));
+        tokio::spawn(run_quick_server(server_side, log.clone()));
+        let (read, write) = tokio::io::split(client_side);
+        let (client, inbound) = RpcClient::start(write, read);
+        let spec = SessionSpec {
+            session_id: SessionId::new(),
+            workspace: "/w".into(),
+            runtime_dir: "/r".into(),
+            model: String::new(),
+            options: Default::default(),
+            approval_mode: ApprovalMode::Auto,
+            allow_shell: true,
+            system_prompt_append: String::new(),
+            mcp_servers: vec![],
+            env: BTreeMap::new(),
+            extras_enabled: true,
+            skills: None,
+            resume: None,
+            process_watcher: None,
+        };
+        let (session, mut events) =
+            start_thread(spec, serde_json::Map::new(), client, inbound, None)
+                .await
+                .unwrap();
+        let mut session: Box<dyn HarnessSession> = Box::new(session);
+        let mut turn = async |session: &mut Box<dyn HarnessSession>, text: &str| {
+            session
+                .turn(TurnInput {
+                    text: text.into(),
+                    attachments: vec![],
+                })
+                .await
+                .unwrap();
+            next_matching(&mut events, |e| matches!(e, SessionEvent::TurnEnded { .. })).await;
+        };
+        turn(&mut session, "Normal").await;
+        session.set_approval_mode(ApprovalMode::Ask).await.unwrap();
+        turn(&mut session, "Proactive").await;
+        turn(&mut session, "Proactive again").await;
+        session.set_approval_mode(ApprovalMode::Auto).await.unwrap();
+        turn(&mut session, "Normal again").await;
+        let log = log.lock().unwrap();
+        let starts: Vec<&Value> = log.iter().filter(|m| m["method"] == "turn/start").collect();
+        assert_eq!(starts.len(), 4);
+        assert!(starts[0]["params"].get("approvalPolicy").is_none());
+        assert_eq!(starts[1]["params"]["approvalPolicy"], "untrusted");
+        assert_eq!(
+            starts[1]["params"]["sandboxPolicy"],
+            json!({"type": "readOnly"})
+        );
+        assert!(
+            starts[2]["params"].get("approvalPolicy").is_none(),
+            "Codex keeps the policies for the next turns"
+        );
+        assert_eq!(starts[3]["params"]["approvalPolicy"], "never");
+        assert_eq!(
+            starts[3]["params"]["sandboxPolicy"],
+            json!({"type": "workspaceWrite"})
+        );
+    }
+
     /// An app-server that accepts `turn/interrupt` but never ends the turn.
     async fn run_stuck_server(stream: tokio::io::DuplexStream) {
         let (read, mut write) = tokio::io::split(stream);

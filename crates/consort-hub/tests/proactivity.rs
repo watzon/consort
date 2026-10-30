@@ -163,6 +163,11 @@ async fn a_proactive_turn_drops_its_text_and_marks_its_posts() {
     let start = world.worker.accept_session_start().await;
     let text = start.turn.as_ref().unwrap().text.clone();
     assert!(text.contains("<check_in routine="), "{text}");
+    // A proactive turn runs in Ask, whatever the channel's default mode.
+    assert_eq!(
+        start.turn_approval_mode,
+        Some(consort_proto::model::ApprovalMode::Ask)
+    );
     assert!(text.contains("Watch the Brightline mail."), "{text}");
     assert!(
         !text.contains("log"),
@@ -217,6 +222,10 @@ async fn a_proactive_turn_drops_its_text_and_marks_its_posts() {
         panic!("a turn in the same session");
     };
     assert!(turn.turn.text.contains("<check_in"));
+    assert_eq!(
+        turn.approval_mode,
+        Some(consort_proto::model::ApprovalMode::Ask)
+    );
     world
         .worker
         .send_events(start.session_id, vec![turn_started("t2")])
@@ -336,6 +345,10 @@ async fn a_new_channel_gets_the_guided_start_with_quick_replies() {
         panic!("a turn");
     };
     assert!(turn.turn.text.contains("<user_message"));
+    assert_eq!(
+        turn.approval_mode, None,
+        "a normal turn uses the session's mode"
+    );
     world
         .worker
         .send_events(start.session_id, vec![turn_started("t2")])
