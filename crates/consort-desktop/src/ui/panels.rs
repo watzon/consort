@@ -1038,7 +1038,15 @@ impl ConsortApp {
                     ))
                 })
                 .child(text(
-                    time_text(&post.time_label, post.pending).to_owned(),
+                    if post.pending {
+                        crate::ui::timeline::pending_text(matches!(
+                            self.state.connection,
+                            consort_client::Connection::Offline { .. }
+                        ))
+                        .to_owned()
+                    } else {
+                        time_text(&post.time_label, false).to_owned()
+                    },
                     t.text.caption,
                     c.text_tertiary,
                 )),
@@ -1246,6 +1254,7 @@ impl ConsortApp {
     ) -> AnyElement {
         let c = &t.colors;
         let answered = decision.state == RequestState::Answered;
+        let blocked = self.answers_blocked();
         let mut options = div().flex().flex_col().gap(t.space.xs + t.space.xxs);
         for (i, option) in decision.options.iter().enumerate() {
             let i = i as u32;
@@ -1334,7 +1343,7 @@ impl ConsortApp {
                             )),
                     )
                     .when(!answered, |d| {
-                        d.child(
+                        d.child(crate::ui::hub_blocked::needs_hub(
                             button(
                                 SharedString::from(format!("{key}-choose-{i}")),
                                 "Choose",
@@ -1351,7 +1360,9 @@ impl ConsortApp {
                                     this.answer_decision(id.clone(), Some(i), None, window, cx)
                                 },
                             )),
-                        )
+                            blocked,
+                            t,
+                        ))
                     }),
             );
         }
@@ -1396,7 +1407,7 @@ impl ConsortApp {
                     div()
                         .flex()
                         .gap(t.space.sm)
-                        .child(
+                        .child(crate::ui::hub_blocked::needs_hub(
                             button(
                                 SharedString::from(format!("{key}-send")),
                                 "Send answer",
@@ -1415,12 +1426,14 @@ impl ConsortApp {
                                     if text.is_empty() {
                                         return;
                                     }
-                                    // The answer box keeps the text until the
-                                    // hub takes the answer.
+                                    // The answer box keeps the text until
+                                    // the hub takes the answer.
                                     this.answer_decision(id.clone(), None, Some(text), window, cx);
                                 },
                             )),
-                        )
+                            blocked,
+                            t,
+                        ))
                         .child(
                             button(
                                 SharedString::from(format!("{key}-cancel")),

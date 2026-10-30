@@ -5,6 +5,7 @@
 //! - this file: the shared state, the request/response plumbing and pairing,
 //! - `link`: the WebSocket session, the reconnect loop and the channel loader,
 //! - `outbox`: the messages that wait for the hub, sent in order,
+//! - `save`: the cache on disk, so the app opens with data while the hub is down,
 //! - `commands`: what each [`Command`] asks of the hub,
 //! - `url`: the hub URL rules.
 
@@ -15,6 +16,7 @@ mod files;
 mod knowledge;
 mod link;
 mod outbox;
+mod save;
 mod url;
 
 use std::{
@@ -41,13 +43,14 @@ pub(crate) use extensions::run_logos;
 pub use link::backoff;
 pub(crate) use link::{run_link, run_loader};
 pub(crate) use outbox::run_outbox;
+pub(crate) use save::run_save;
 pub use url::normalize_hub_url;
 use url::{plain_http_name, resolve_private};
 
 use crate::{
     ClientError,
     cache::{Cache, PendingSend},
-    format,
+    format, persist,
     reduce::view_state,
     store::{ClientConfig, Identity, Store},
     view::{Connection, PairingCodeView, UserView, ViewState},
@@ -176,6 +179,13 @@ pub(crate) struct Shared {
     /// The last token from `auth.http_token` and when it ends, in Unix
     /// milliseconds.
     http_token: Mutex<Option<(String, i64)>>,
+    /// The cache on disk. See [`save`].
+    cache_file: Mutex<save::Slot>,
+    /// The cache may need a save.
+    save_wake: Notify,
+    /// When the data was last known to be current, in Unix milliseconds, or
+    /// 0. The saved data from an earlier run sets it at the start.
+    fresh_at: std::sync::atomic::AtomicI64,
 }
 
 impl Shared {
@@ -219,9 +229,31 @@ impl Shared {
             (Some(store), Some(identity)) => store.load_outbox(&identity.config.client_id),
             _ => Vec::new(),
         };
+        // The saved data of the last run, for the hub that this client is
+        // paired with. The app opens with it before the first connect.
+        let saved = match (&store, &identity) {
+            (Some(store), Some(identity)) => {
+                let (file, saved) = crate::persist::open_or_recover(
+                    &store.cache_path(),
+                    &persist::Owner::of(identity),
+                );
+                (
+                    file.map_or(save::Slot::Unusable, |f| save::Slot::Open(Box::new(f))),
+                    saved,
+                )
+            }
+            // Not paired: no saved data belongs to anyone.
+            (Some(store), None) => {
+                crate::persist::delete(&store.cache_path());
+                (save::Slot::Closed, None)
+            }
+            (None, _) => (save::Slot::Unusable, None),
+        };
+        let (cache_file, saved) = saved;
+        let fresh_at = saved.as_ref().map_or(0, |s| s.fresh_at);
         let cache = Cache {
             pending: outbox.clone(),
-            ..Cache::default()
+            ..saved.map(|s| s.cache).unwrap_or_default()
         };
         let shared = Arc::new(Shared {
             store,
@@ -242,6 +274,9 @@ impl Shared {
             saved_outbox: Mutex::new(outbox),
             uploads: Mutex::new(crate::uploads::Uploads::default()),
             http_token: Mutex::new(None),
+            cache_file: Mutex::new(cache_file),
+            save_wake: Notify::new(),
+            fresh_at: std::sync::atomic::AtomicI64::new(fresh_at),
         });
         shared.publish_now();
         Ok(shared)
@@ -258,6 +293,7 @@ impl Shared {
     /// most every [`PUBLISH_INTERVAL`]. The outbox goes to disk at once.
     pub(crate) fn publish(&self) {
         self.sync_outbox();
+        self.request_save();
         self.publish_wake.notify_one();
     }
 
@@ -265,6 +301,7 @@ impl Shared {
     /// it differs from the one they have.
     fn publish_now(&self) {
         self.sync_outbox();
+        self.request_save();
         let connection = self
             .connection
             .lock()
@@ -274,13 +311,18 @@ impl Shared {
         let Ok(cache) = self.cache.lock() else {
             return;
         };
-        let mut state = view_state(
-            &cache,
-            connection,
-            self.options.user.clone(),
-            format::now_ms(),
-        );
+        let now = format::now_ms();
+        // While the link is up, the data is current.
+        if connection == Connection::Online {
+            self.mark_fresh();
+        }
+        let has_data = cache.loaded && !cache.channels.is_empty();
+        let mut state = view_state(&cache, connection.clone(), self.options.user.clone(), now);
         drop(cache);
+        crate::offline::mark_saved(
+            &mut state,
+            crate::offline::saved_data(&connection, has_data, self.fresh_at(), now),
+        );
         state.worker_pairing = pairing;
         if let Ok(uploads) = self.uploads.lock() {
             state.uploads = uploads.views();

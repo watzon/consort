@@ -24,9 +24,23 @@ This page lists the entities that the hub, the workers and the clients store, wi
 | Worker | `<workspace>/.consort/attachments/` and `<workspace>/.channel/files/` | The attachments of a session's turns, and the read-only copy of the channel files (see [protocol.md](protocol.md#attachments-and-channel-files-on-the-worker)) |
 | Worker | A log file, outside the worker folder | The log of the installed service: `~/Library/Logs/Consort/worker.log`, `~/.local/state/consort/worker.log` or `%LOCALAPPDATA%\Consort\logs\worker.log`. See [install.md](install.md) |
 | Worker | Each harness's own files | Raw session transcripts and harness logins. The worker never copies these to the hub |
-| Client | `cache.db` (SQLite) | A partial copy of hub entities and the last feed sequence number |
+| Client | `cache.sqlite3` (SQLite) | A copy of the hub entities that the client holds, the last feed sequence number, the time of the last current data and the hub it came from. The app opens with it while the hub is offline. See [Saved client cache](#saved-client-cache). The client removes the file when the user unpairs or pairs with another hub, and moves a file that it cannot use to `cache.sqlite3.broken` |
+| Client | `outbox.json` | The messages that wait for the hub, in the order the user sent them |
 | Client | `updates.json` | The switch "Get updates on their own" (`{"auto": true}`, on by default) |
 | Client | `<cache dir>/consort/updates/<version>/` | The staging folder of app updates: the downloaded release file, checked by its SHA-256 |
+
+### Saved client cache
+
+The client keeps its cache in `cache.sqlite3` in its folder (`<config dir>/consort/`, or `CONSORT_CONFIG_DIR`). Mode 0600 on Unix. The file has two tables and `PRAGMA user_version` 1:
+
+| Table | Columns | Holds |
+|---|---|---|
+| `entity` | `kind`, `id`, `json` | One row for each entity of the cache, keyed by kind and the key that the cache uses. The `json` is the entity as the hub sends it. Kinds: `group`, `channel`, `repo`, `worker`, `message`, `channel_file`, `routine`, `routine_run`, `memory_note`, `task`, `approval`, `decision`, `read_marker`, `session_item`, `session_activity`, `connection`, `skill` and `client` |
+| `meta` | `key`, `value` | `seq` (the feed position), `fresh_at` (Unix ms: when the data was last current), `client_id` and `hub_url` (who the data belongs to), `preferences`, and the sets that say what the cache has loaded (`channels_loaded`, `files_loaded`, `runs_loaded`, `memory_loaded`, `memory_deleted_loaded`, `loaded_threads`, `task_previews`, `tasks_absent`, `has_older`, `tasks_have_more`) |
+
+The client writes the file about half a second after a change, in one transaction, and only the rows that changed. It writes only a cache whose first load is whole. At start, the client reads the file before it connects, and the app shows the data at once. A file for another client ID or another hub URL is emptied. A file with another schema version, a file that SQLite cannot open, a file that fails its integrity check, and a row that cannot be read are moved to `cache.sqlite3.broken`, and the client starts with no saved data. A schema change raises the version, and the client does not migrate: an old file is moved aside and the next connect loads a snapshot.
+
+The cache does not hold the outbox, the sign-ins, the ACP registry, the connector catalog, the logos and the hub status. The outbox has its own file. The rest loads again when a page needs it.
 
 The Consort home is `~/.consort` (`%USERPROFILE%\.consort` on Windows). `CONSORT_HOME` overrides it. `consort dev` sets it to `<data>/home` unless `CONSORT_HOME` is set.
 

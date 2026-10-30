@@ -523,6 +523,8 @@ The client API uses the same frames, errors and authentication as the worker lin
 | `feed` (from the hub) | `seq`, `at`, `channel_id`, `entity`, `entity_id`, `op` and `payload` | None. `payload` is `null` for `delete` |
 | `feed.skipped` (from the hub) | `seq`, `channel_id`, `entity` and `entity_id` | None. The hub could not send the entry `seq`, because it does not fit in one frame. The feed goes on after it. Get the entity again, for example with `message.list` or a new snapshot. A client that does not know this event ignores it |
 
+A client that has a saved cache (see [data-model.md](data-model.md#saved-client-cache)) sends `sync.subscribe` with its saved `after_seq` at the first connect, with no snapshot. The hub answers `resync_required` when that position is older than the oldest kept entry or newer than the hub's head, and the client then loads a snapshot as before. The client takes a saved position only for the same hub URL and client ID.
+
 A `routine_run` feed entry has the run number as its `entity_id`. The hub sends one when a run starts and one when it ends. A `memory_note` entry with `deleted_at` is a note that went to Recently deleted. The hub sends a `delete` for a memory note when it renames the note (with an upsert for the new path) and when the purge removes a note 30 days after its deletion.
 
 When a channel is deleted, the feed has a `delete` for each entity of the channel that a client can hold (messages, read markers, tasks, session items, approvals, decisions, routines, channel files and memory notes), and then one for the channel.

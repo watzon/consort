@@ -2594,6 +2594,9 @@ impl ConsortApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.blocked_by_hub(cx) {
+            return;
+        }
         let client = self.client.clone();
         let approval_id = id.clone();
         self.run_guarded(
@@ -2616,6 +2619,9 @@ impl ConsortApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.blocked_by_hub(cx) {
+            return;
+        }
         let client = self.client.clone();
         let decision_id = id.clone();
         let sent = text.clone();

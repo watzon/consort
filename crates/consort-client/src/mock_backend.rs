@@ -449,6 +449,7 @@ impl MockBackend {
             }
             Command::CancelWorkerPairing => state.worker_pairing = None,
             Command::Pair { .. } => state.connection = Connection::Demo,
+            Command::Unpair => state.connection = Connection::NotPaired,
             Command::RenameWorker { worker_id, name } => {
                 let name = name.trim().to_owned();
                 if name.is_empty() {

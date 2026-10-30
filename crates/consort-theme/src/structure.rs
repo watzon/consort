@@ -202,6 +202,12 @@ pub struct Opacity {
     /// The file tile in a file bubble in your lane: the scrim at this
     /// share, so the tile reads on `accent.surface`.
     pub you_tile: f32,
+    /// A button that needs the hub, while the hub is offline.
+    pub offline_dim: f32,
+    /// The Three voices mark while the hub is offline.
+    pub offline_mark: f32,
+    /// The bubble of a message that waits in the outbox.
+    pub queued: f32,
 }
 
 /// Sizes of single components that no other token covers. Each one comes
@@ -697,6 +703,7 @@ mod tests {
             ),
             (0.45, 0.22, 0.06, 0.4)
         );
+        assert_eq!((o.offline_dim, o.offline_mark, o.queued), (0.45, 0.7, 0.75));
         for share in [
             o.answered_dim,
             o.busy,
@@ -706,6 +713,9 @@ mod tests {
             o.drop_fill,
             o.nav_disabled,
             o.you_tile,
+            o.offline_dim,
+            o.offline_mark,
+            o.queued,
         ] {
             assert!(share > 0.0 && share < 1.0);
         }

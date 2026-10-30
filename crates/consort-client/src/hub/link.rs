@@ -858,8 +858,22 @@ pub(crate) async fn run_link(shared: Arc<Shared>) {
         let mut online_since = None;
         let result = session(&shared, &identity, &mut online_since).await;
         reconnect.after_session(online_since.map(|since: Instant| since.elapsed()));
+        if online_since.is_some() {
+            // The data was current until the link ended. The saved data and
+            // the offline pill say so.
+            shared.mark_fresh();
+        }
+        // The user unpaired while the session ran.
+        if shared.identity().is_none() && !matches!(result, Err(SessionEnd::Refused(_))) {
+            shared.set_connection(Connection::NotPaired);
+            reconnect.reset();
+            continue;
+        }
         let reason = match result {
             Err(SessionEnd::Refused(reason)) => {
+                // The hub does not trust this client any more, so the saved
+                // data of that hub goes too.
+                shared.forget_saved();
                 shared.set_connection(Connection::Refused {
                     reason: if reason.is_empty() {
                         "The hub does not accept this app any more. Pair it again.".into()

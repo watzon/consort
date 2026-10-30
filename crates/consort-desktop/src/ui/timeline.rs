@@ -8,7 +8,7 @@ use consort_client::{
     TaskStatus, TimelineItem,
     chat::{BubbleRow, ChatRow, Lane, Spacing},
 };
-use consort_theme::{Tokens, TypeExt as _};
+use consort_theme::{Tokens, Type, TypeExt as _};
 use gpui_kit::{
     AnyElement, App, Context, Div, Hsla, InteractiveElement, IntoElement, MouseButton,
     MouseDownEvent, ParentElement, SharedString, StatefulInteractiveElement as _, Styled, Window,
@@ -263,7 +263,14 @@ impl ConsortApp {
         let chat = t.component.chat;
         let state = self.state.clone();
         let activity = state.activity(&self.channel_id);
-        let phase = self.mark_phase(cx);
+        // While the hub is offline, the screen shows saved data. The mark
+        // rests and fades, and its pill says so (Paper `ERQ-0`).
+        let saved = state.saved_data.clone();
+        let phase = if saved.is_some() {
+            MarkPhase::Idle
+        } else {
+            self.mark_phase(cx)
+        };
         let tick = cx.global::<FrameClock>().tick();
         let reduce = cx.reduce_motion();
         let frame = self.mark.frame(phase, tick, reduce);
@@ -304,8 +311,53 @@ impl ConsortApp {
                 div()
                     .id("three-voices")
                     .debug_selector(|| "three-voices".into())
-                    .child(img(mark_frame(phase, frame, t.is_dark(), false)).size(chat.mark)),
+                    .child(
+                        img(mark_frame(phase, frame, t.is_dark(), false))
+                            .size(chat.mark)
+                            .when(saved.is_some(), |i| i.opacity(t.opacity.offline_mark)),
+                    ),
             )
+            .when_some(saved, |d, saved| {
+                d.child(
+                    div()
+                        .id("offline-pill")
+                        .debug_selector(|| "offline-pill".into())
+                        .flex()
+                        .items_center()
+                        .gap(chat.pill_pad_x)
+                        .py(chat.pill_pad_y)
+                        .pl(chat.pill_pad_x)
+                        .pr(t.space.xs)
+                        .rounded(t.radius.full)
+                        .bg(c.surface_card)
+                        .border(t.border_width)
+                        .border_color(c.border_subtle)
+                        .child(
+                            text(saved.pill_text(), detail(t), c.text_secondary)
+                                .whitespace_nowrap(),
+                        )
+                        .child(
+                            div()
+                                .id("offline-try-again")
+                                .debug_selector(|| "offline-try-again".into())
+                                .px(t.space.sm)
+                                .py(t.border_width)
+                                .rounded(t.radius.full)
+                                .bg(c.surface_selected)
+                                .cursor_pointer()
+                                .hover(|s| s.bg(c.hover_raised))
+                                .child(text(
+                                    "Try again",
+                                    Type {
+                                        weight: t.text.ui_strong.weight,
+                                        ..detail(t)
+                                    },
+                                    c.text_primary,
+                                ))
+                                .on_click(cx.listener(|this, _, _, cx| this.try_again(cx))),
+                        ),
+                )
+            })
             .when_some(line, |d, line| {
                 d.child(
                     div()
@@ -827,6 +879,11 @@ impl ConsortApp {
             content = content.child(self.render_brief_items(&message, t, cx));
         }
         let tail = chat.bubble_tail;
+        let hub_down = matches!(
+            self.state.connection,
+            consort_client::Connection::Offline { .. }
+        );
+        let queued = message.pending && hub_down;
         let selector = format!("bubble-{key}");
         let bubble = div()
             .id(SharedString::from(format!("bubble-{key}")))
@@ -849,6 +906,8 @@ impl ConsortApp {
             .px(chat.bubble_pad_x)
             .type_style(t.text.body)
             .text_color(c.text_primary)
+            // A message that waits for the hub is a little faded.
+            .when(queued, |d| d.opacity(t.opacity.queued))
             .child(content);
         // A message on its way, or one that you edited, says so under its
         // last bubble. The times are in the separators.
@@ -860,7 +919,7 @@ impl ConsortApp {
         let note = if !last_part {
             None
         } else if message.pending {
-            Some(time_text("", true).to_owned())
+            Some(pending_text(hub_down).to_owned())
         } else if message.edited {
             Some("Edited".to_owned())
         } else {
@@ -869,9 +928,22 @@ impl ConsortApp {
         lane.child(bubble)
             .when_some(note, |d, note| {
                 d.child(
-                    text(note, t.text.caption, c.text_tertiary)
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(t.space.xs + t.space.xxs)
                         .pt(t.space.xxs)
-                        .px(chat.bubble_pad_x),
+                        .px(chat.bubble_pad_x)
+                        // The glyph of a waiting message, in place of the
+                        // plain note.
+                        .when(queued, |row| {
+                            row.child(crate::ui::parts::icon(
+                                "working",
+                                t.icon.dense,
+                                c.text_tertiary,
+                            ))
+                        })
+                        .child(text(note, t.text.caption, c.text_tertiary)),
                 )
             })
             .into_any_element()
@@ -1545,6 +1617,7 @@ impl ConsortApp {
         t: &Tokens,
         cx: &mut Context<Self>,
     ) -> Div {
+        let blocked = self.answers_blocked();
         let mut row = div().flex().flex_wrap().items_center().gap(t.space.sm);
         for (i, choice) in approval.choices.iter().enumerate() {
             let kind = match choice {
@@ -1557,7 +1630,7 @@ impl ConsortApp {
             // The wide choice shows the harness's own words, which can be
             // long. They wrap, so the user reads the whole scope.
             let wide = choice == ApprovalChoice::AllowForTask;
-            row = row.child(
+            row = row.child(crate::ui::hub_blocked::needs_hub(
                 button(
                     SharedString::from(format!("{}-{i}", approval.id)),
                     approval.choice_label(choice),
@@ -1568,7 +1641,9 @@ impl ConsortApp {
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.answer_approval(id.clone(), choice, window, cx)
                 })),
-            );
+                blocked,
+                t,
+            ));
         }
         row
     }
@@ -1589,6 +1664,7 @@ impl ConsortApp {
                     .as_ref()
                     .is_some_and(|e| e.source == consort_client::SelectionSource::Tutti)
         });
+        let hub_offline = state.saved_data.is_some();
         let runs_on = channel
             .and_then(|ch| ch.coordinator_worker.clone())
             .filter(|w| !w.trim().is_empty());
@@ -1646,7 +1722,10 @@ impl ConsortApp {
         };
         // The line above the composer: the state of the link, and for an
         // offline link the reason and a countdown that ticks once a second.
+        // With saved data on screen, the pill under the mark says that the
+        // hub is down, so this line stays out.
         let link: Option<(String, Option<String>, bool)> = match &state.connection {
+            consort_client::Connection::Offline { .. } if state.saved_data.is_some() => None,
             consort_client::Connection::Offline {
                 retry_in_ms,
                 reason,
@@ -1829,12 +1908,25 @@ impl ConsortApp {
                     .children(model_chip)
                     .children(effort_chip)
                     .child(div().flex_1())
-                    .when_some(runs_on, |d, worker| {
+                    .when_some(runs_on.filter(|_| !hub_offline), |d, worker| {
                         d.child(
                             text(format!("Runs on {worker}"), detail(t), c.text_tertiary)
                                 .whitespace_nowrap()
                                 .id("runs-on")
                                 .debug_selector(|| "runs-on".into()),
+                        )
+                    })
+                    // Nothing runs while the hub is down. A message waits.
+                    .when(hub_offline, |d| {
+                        d.child(
+                            text(
+                                "Messages wait here until the hub is back",
+                                detail(t),
+                                c.text_tertiary,
+                            )
+                            .whitespace_nowrap()
+                            .id("queue-hint")
+                            .debug_selector(|| "queue-hint".into()),
                         )
                     }),
             )
@@ -1874,6 +1966,16 @@ pub fn detail_parts(approval: &ApprovalView, with_summary: bool) -> Vec<DetailPa
 /// the hub says "Sending" where its time goes.
 pub fn time_text(label: &str, pending: bool) -> &str {
     if pending { "Sending" } else { label }
+}
+
+/// What a message that is not on the hub yet says: "Sends when the hub is
+/// back" while the link is down, else "Sending".
+pub fn pending_text(hub_down: bool) -> &'static str {
+    if hub_down {
+        "Sends when the hub is back"
+    } else {
+        "Sending"
+    }
 }
 
 /// True for the clicks that open a link: the main or middle mouse button, a

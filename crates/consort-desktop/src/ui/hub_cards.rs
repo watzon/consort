@@ -17,6 +17,7 @@ use crate::{
     app::ConsortApp,
     ui::{
         ext_parts::service_logo,
+        hub_blocked::needs_hub,
         parts::{
             ButtonKind, button, detail, error_box, icon, provider_logo, selectable, status_glyph,
             text,
@@ -459,31 +460,36 @@ impl ConsortApp {
         let deny_label = approval.choice_label(ApprovalChoice::Deny);
         let mut row = div().flex().flex_wrap().items_center().gap(t.space.sm);
         let blocked = matches!(card, HubCardView::SkillInstall(i) if i.blocked_reason.is_some());
+        let offline = self.answers_blocked();
         let allow = {
             let id = id.clone();
             let card = card.clone();
-            button(
-                SharedString::from(format!("{key}-allow")),
-                allow_label,
-                ButtonKind::Primary,
+            needs_hub(
+                button(
+                    SharedString::from(format!("{key}-allow")),
+                    allow_label,
+                    ButtonKind::Primary,
+                    t,
+                )
+                .when(busy, |b| b.opacity(t.opacity.busy))
+                .when(matches!(card, HubCardView::ConnectService(_)), |b| {
+                    b.child(icon("external-link", t.icon.dense, c.accent_on_fill))
+                })
+                .on_click(cx.listener(move |this, _, window, cx| match &card {
+                    HubCardView::ConnectService(_) => this.continue_connect_card(id.clone(), cx),
+                    HubCardView::SignIn(_) => this.sign_in_from_card(id.clone(), window, cx),
+                    _ => this.answer_approval(id.clone(), ApprovalChoice::AllowOnce, window, cx),
+                })),
+                offline,
                 t,
             )
-            .when(busy, |b| b.opacity(t.opacity.busy))
-            .when(matches!(card, HubCardView::ConnectService(_)), |b| {
-                b.child(icon("external-link", t.icon.dense, c.accent_on_fill))
-            })
-            .on_click(cx.listener(move |this, _, window, cx| match &card {
-                HubCardView::ConnectService(_) => this.continue_connect_card(id.clone(), cx),
-                HubCardView::SignIn(_) => this.sign_in_from_card(id.clone(), window, cx),
-                _ => this.answer_approval(id.clone(), ApprovalChoice::AllowOnce, window, cx),
-            }))
         };
         if !blocked {
             row = row.child(allow);
         }
         if matches!(card, HubCardView::ConnectService(_)) {
             let id = id.clone();
-            row = row.child(
+            row = row.child(needs_hub(
                 button(
                     SharedString::from(format!("{key}-change")),
                     "Change settings",
@@ -493,9 +499,11 @@ impl ConsortApp {
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.change_connect_card(id.clone(), window, cx)
                 })),
-            );
+                offline,
+                t,
+            ));
         }
-        row.child(
+        row.child(needs_hub(
             button(
                 SharedString::from(format!("{key}-deny")),
                 deny_label,
@@ -505,7 +513,9 @@ impl ConsortApp {
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.answer_approval(id.clone(), ApprovalChoice::Deny, window, cx)
             })),
-        )
+            offline,
+            t,
+        ))
     }
 
     /// The line of an answered card.

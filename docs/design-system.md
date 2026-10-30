@@ -348,6 +348,15 @@ Settings pages that are not lists (Hub, Clients, Notifications) use one column o
 | `dock_tile`, `dock_mark`, `dock_badge` | 40, 24, 18 | The Dock icon preview with its count on `status.failed` |
 | `banner_width`, `banner_tile`, `banner_mark` | 360, 32, 20 | The example banner of Settings > Notifications |
 
+### The hub is offline
+
+Paper `ERQ-0`. The app opens with its saved data, and the same state shows when the hub goes away while the app runs.
+
+- The status pill under the mark says "Cannot reach the hub. You see saved data from 9:41 AM." (a day name when the data is older than today) and has Try again. It uses the activity pill's size and `surface.card`. The mark rests at `opacity.offline_mark` (0.7).
+- Workers: the group label says "Status unknown", and every dot is hollow.
+- Approval and decision buttons use `opacity.offline_dim` (0.45), and a tooltip says "Waiting for the hub. You can answer when it is back." A click shows the same text in a notice.
+- A message that waits has `opacity.queued` (0.75) and the line "Sends when the hub is back" with the working glyph. The composer line says "Messages wait here until the hub is back", in place of "Runs on <worker>".
+
 ## Provider logos
 
 Every provider shows with its logo, never as text alone. The logos are in `crates/consort-desktop/assets/providers/` (see the NOTICE there).

@@ -13,6 +13,9 @@ pub const TUTTI: &str = "Tutti";
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ViewState {
     pub connection: Connection,
+    /// Set while the hub cannot be reached and the screen shows saved data.
+    /// See [`crate::offline`].
+    pub saved_data: Option<crate::offline::SavedData>,
     pub user: UserView,
     pub sidebar: SidebarView,
     /// Every channel, Tutti first.

@@ -173,10 +173,16 @@ impl ConsortApp {
                 group_label(t)
                     .child(text("Workers", sb.label_text, c.text_tertiary).flex_1())
                     .child(text(
-                        format!(
-                            "{} of {} online",
-                            sidebar.workers_online, sidebar.workers_total
-                        ),
+                        // The hub is down, so nobody knows which worker is
+                        // online.
+                        if state.saved_data.is_some() {
+                            consort_client::offline::STATUS_UNKNOWN.to_owned()
+                        } else {
+                            format!(
+                                "{} of {} online",
+                                sidebar.workers_online, sidebar.workers_total
+                            )
+                        },
                         t.text.caption,
                         c.text_tertiary,
                     )),

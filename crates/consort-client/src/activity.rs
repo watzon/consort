@@ -49,7 +49,7 @@ pub struct ChannelActivity {
 }
 
 /// What kind of work a session item is, for the line.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum WorkKind {
     Command,
     FileChange,
@@ -63,7 +63,7 @@ pub enum WorkKind {
 }
 
 /// The newest item of one session, as the cache keeps it.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SessionActivity {
     pub session_id: String,
     /// The channel of the feed entry that brought the item.

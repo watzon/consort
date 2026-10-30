@@ -31,6 +31,8 @@ mod knowledge_tests;
 mod notice;
 mod notify_platform;
 #[cfg(test)]
+mod offline_tests;
+#[cfg(test)]
 mod phase5_tests;
 mod read_marker;
 mod ui;
@@ -55,7 +57,7 @@ actions!(consort, [Quit]);
 /// attachments, drop, bubbles, lightbox, files, files-menu, files-drop,
 /// files-empty, thread-attach and add-skill-upload. Phase 3: hub, clients,
 /// clients-revoke, pair-client and notifications. Phase 5: add-worker,
-/// add-worker-install, worker-added and update-ready. The old names `everything` and
+/// add-worker-install, worker-added, update-ready and hub-offline. The old names `everything` and
 /// files-empty, thread-attach and add-skill-upload. Phase 2: routines,
 /// routine-runs, routine-new, routine-edit, schedule-picker,
 /// settings-routines, memory, memory-conflict, settings-memory,
@@ -143,6 +145,14 @@ fn main() {
             .and_then(consort_client::mock_routines::screen_state)
     {
         // The phase 2 screens: routines and memory.
+        Client::mock_with(state)
+    } else if mock
+        && let Some(state) = args
+            .screen
+            .as_deref()
+            .and_then(consort_client::mock_offline::screen_state)
+    {
+        // The hub is offline at start: saved data, a queued message.
         Client::mock_with(state)
     } else if mock {
         Client::mock()

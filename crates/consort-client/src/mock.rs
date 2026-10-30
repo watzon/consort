@@ -1337,6 +1337,7 @@ pub fn view_state() -> ViewState {
     }
     let mut state = ViewState {
         connection: Connection::Demo,
+        saved_data: None,
         user: UserView {
             name: text("Chris"),
             initials: text("CW"),

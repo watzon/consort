@@ -185,6 +185,10 @@ pub enum Command {
         hub_url: String,
         code: String,
     },
+    /// Forgets the hub: removes the identity, the outbox and the saved
+    /// data from this computer, and stops the link. The app asks for a
+    /// pairing again. Text that waited in the outbox stays as failed sends.
+    Unpair,
     /// Sends a message. It waits until the uploads in `attachments` are on
     /// the hub, then sends their blobs with the text and takes the uploads
     /// away. A failed upload stops the send with an error.

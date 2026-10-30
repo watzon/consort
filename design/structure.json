@@ -52,7 +52,7 @@
     ],
     "fade_bottom": 32
   },
-  "opacity": { "answered_dim": 0.6, "busy": 0.7, "danger_hover": 0.9, "failed_border": 0.45, "progress_track": 0.22, "drop_fill": 0.06, "nav_disabled": 0.4, "you_tile": 0.36 },
+  "opacity": { "answered_dim": 0.6, "busy": 0.7, "danger_hover": 0.9, "failed_border": 0.45, "progress_track": 0.22, "drop_fill": 0.06, "nav_disabled": 0.4, "you_tile": 0.36, "offline_dim": 0.45, "offline_mark": 0.7, "queued": 0.75 },
   "component": {
     "settings_label": 160,
     "settings_segmented": 336,
