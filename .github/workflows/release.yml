@@ -65,8 +65,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { key: macos-arm64, os: macos-14, target: aarch64-apple-darwin, archive: tar.gz }
-          - { key: macos-x86_64, os: macos-14, target: x86_64-apple-darwin, archive: tar.gz }
+          - { key: macos-arm64, os: macos-26, target: aarch64-apple-darwin, archive: tar.gz }
+          - { key: macos-x86_64, os: macos-26, target: x86_64-apple-darwin, archive: tar.gz }
           - { key: linux-x86_64, os: ubuntu-24.04, target: x86_64-unknown-linux-gnu, archive: tar.gz }
           - { key: linux-arm64, os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu, archive: tar.gz }
           - { key: windows-x86_64, os: windows-2025, target: x86_64-pc-windows-msvc, archive: zip }
@@ -103,7 +103,7 @@ jobs:
   desktop-macos:
     name: Consort.app for ${{ matrix.key }}
     needs: check-version
-    runs-on: macos-14
+    runs-on: macos-26
     strategy:
       fail-fast: false
       matrix:
@@ -188,12 +188,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install system libraries
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            clang cmake pkg-config libasound2-dev libfontconfig-dev libwayland-dev \
-            libx11-xcb-dev libxkbcommon-x11-dev libxkbcommon-dev libxcb1-dev libssl-dev \
-            libzstd-dev libvulkan-dev libdrm-dev libgbm-dev
+        run: scripts/linux-deps.sh
       - name: Install Rust
         run: rustup toolchain install --profile minimal
       - uses: Swatinem/rust-cache@v2

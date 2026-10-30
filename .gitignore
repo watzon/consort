@@ -5,3 +5,8 @@ target/
 .DS_Store
 /.consort-dev
 /dist/
+.env
+.env.*
+!.env.example
+*.key
+*.pem

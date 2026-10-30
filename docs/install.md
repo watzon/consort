@@ -88,7 +88,7 @@ Download the file for your system from the latest release:
 | Windows | `Consort-windows-x86_64.zip` | Unpack it and keep the `Consort` folder where you like. Run `consort-desktop.exe` |
 | Linux | `Consort-linux-x86_64.tar.gz` | Unpack it. Run `consort-desktop`. `consort.desktop` and `consort.png` are for your menu |
 
-Until the app is signed with a Developer ID and notarized, macOS asks you to confirm the first start: right-click the app, then choose Open. A release that has the signing secrets (below) is signed and notarized, and starts with no question. The Windows and Linux files are not signed.
+Until the app is signed with a Developer ID and notarized, macOS blocks the first start: go to System Settings > Privacy & Security and select Open Anyway. A release that has the signing secrets (below) is signed and notarized, and starts with no question. The Windows and Linux files are not signed.
 
 The Windows and Linux desktop builds are best effort. The release workflow builds them, but a failed build does not stop the release.
 
@@ -110,8 +110,9 @@ The staging folder is `consort/updates` in the cache folder of the system. The a
 ## Make a release
 
 1. Set `version` in `[workspace.package]` of `Cargo.toml`, and commit.
-2. Tag it and push the tag: `git tag v0.2.0 && git push origin v0.2.0`. The tag must match the version, or the workflow stops.
-3. The workflow `.github/workflows/release.yml` builds everything and publishes the release:
+1. Run the full CI on that commit and wait for it to pass: `gh workflow run ci.yml`. A push runs only the fast checks.
+1. Tag it and push the tag: `git tag v0.2.0 && git push origin v0.2.0`. The tag must match the version, or the workflow stops.
+1. The workflow `.github/workflows/release.yml` builds everything and publishes the release:
 
 | File | What |
 |---|---|
