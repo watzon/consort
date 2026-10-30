@@ -418,6 +418,8 @@ pub(super) async fn run(
                         succeeded: c.outcome == CallOutcome::Succeeded,
                         error: c.error.clone(),
                         time_label: format::time_label(c.at.as_millis()),
+                        day_label: format::day_label(c.at.as_millis(), format::now_ms()),
+                        size_label: format::size_label(c.result_bytes),
                     })
                     .collect(),
                 has_more: page.has_more,
@@ -545,7 +547,9 @@ pub(super) async fn run(
         Command::AddSkillDirectorySource { url } => {
             let url = url.trim().to_owned();
             if url.is_empty() {
-                return Err(invalid("Paste the URL of a marketplace.json file."));
+                return Err(invalid(
+                    "Paste the URL of a git repo or a marketplace.json file.",
+                ));
             }
             let result = shared
                 .call(SkillDirectoryAddSource { url })

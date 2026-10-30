@@ -66,7 +66,7 @@ async fn a_signed_out_coordinator_waits_for_a_sign_in_and_says_where() {
         )
         .await;
 
-    world.say(world.everything, "are you there?").await;
+    world.say(world.tutti, "are you there?").await;
     if let Some((_, command)) = world.worker.try_next_command(Duration::from_secs(1)).await {
         panic!(
             "the hub sent {} although no account is signed in",
@@ -165,7 +165,7 @@ async fn a_signed_out_coordinator_moves_to_another_signed_in_account() {
 #[tokio::test]
 async fn a_coordinator_start_that_fails_is_not_tried_again_at_once() {
     let mut world = World::start().await;
-    world.say(world.everything, "hello").await;
+    world.say(world.tutti, "hello").await;
     let (request, command) = world.worker.next_command().await;
     let HubToWorker::SessionStart(start) = command else {
         panic!("expected session.start, got {}", command.type_name());
@@ -198,7 +198,7 @@ async fn a_coordinator_start_that_fails_is_not_tried_again_at_once() {
         panic!("the hub sent {} after a failed start", command.type_name());
     }
     // A new message in the backoff waits too: the first wait is 10 s.
-    world.say(world.everything, "again").await;
+    world.say(world.tutti, "again").await;
     if let Some((_, command)) = world.worker.try_next_command(Duration::from_secs(2)).await {
         panic!("the hub sent {} in the backoff", command.type_name());
     }

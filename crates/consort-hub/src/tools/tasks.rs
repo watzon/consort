@@ -439,13 +439,13 @@ impl Hub {
         let (source, target) = match &ctx.task {
             Some(task) => (SuggestionSource::Task(task.id), ctx.channel.id),
             None => {
-                if ctx.channel.is_everything() {
+                if ctx.channel.is_tutti() {
                     return Err(HubError::invalid(
-                        "The Everything coordinator writes global memory itself. Use memory_write.",
+                        "The Tutti coordinator writes global memory itself. Use memory_write.",
                     ));
                 }
-                let everything = self.store.read(conversation::everything_channel).await?;
-                (SuggestionSource::Channel(ctx.channel.id), everything.id)
+                let tutti = self.store.read(conversation::tutti_channel).await?;
+                (SuggestionSource::Channel(ctx.channel.id), tutti.id)
             }
         };
         self.store

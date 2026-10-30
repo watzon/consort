@@ -50,8 +50,9 @@ pub use management::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolAudience {
-    /// The coordinator of the Everything channel.
-    EverythingCoordinator,
+    /// The coordinator of the Tutti channel.
+    #[serde(alias = "everything_coordinator")]
+    TuttiCoordinator,
     /// The coordinator of any other channel.
     ChannelCoordinator,
     /// A task session, in any channel.
@@ -61,7 +62,7 @@ pub enum ToolAudience {
 impl ToolAudience {
     /// Every audience.
     pub const ALL: [ToolAudience; 3] = [
-        Self::EverythingCoordinator,
+        Self::TuttiCoordinator,
         Self::ChannelCoordinator,
         Self::TaskSession,
     ];
@@ -70,7 +71,7 @@ impl ToolAudience {
     pub fn for_session(role: SessionRole, channel_kind: ChannelKind) -> Self {
         match (role, channel_kind) {
             (SessionRole::Task, _) => Self::TaskSession,
-            (SessionRole::Coordinator, ChannelKind::Everything) => Self::EverythingCoordinator,
+            (SessionRole::Coordinator, ChannelKind::Tutti) => Self::TuttiCoordinator,
             (SessionRole::Coordinator, ChannelKind::Standard) => Self::ChannelCoordinator,
         }
     }
@@ -78,10 +79,10 @@ impl ToolAudience {
 
 const EVERY_SESSION: &[ToolAudience] = &ToolAudience::ALL;
 const COORDINATORS: &[ToolAudience] = &[
-    ToolAudience::EverythingCoordinator,
+    ToolAudience::TuttiCoordinator,
     ToolAudience::ChannelCoordinator,
 ];
-const EVERYTHING_ONLY: &[ToolAudience] = &[ToolAudience::EverythingCoordinator];
+const TUTTI_ONLY: &[ToolAudience] = &[ToolAudience::TuttiCoordinator];
 const CHANNEL_COORDINATOR_AND_TASK: &[ToolAudience] =
     &[ToolAudience::ChannelCoordinator, ToolAudience::TaskSession];
 const TASK_ONLY: &[ToolAudience] = &[ToolAudience::TaskSession];
@@ -758,61 +759,61 @@ hub_tools! {
         "Post an install card for a skill from a git URL, owner/repo, or a search_skills entry. The card shows its license, scripts and audits, and the user adds it or not."),
     /// `suggest_memory`.
     SuggestMemory("suggest_memory", SuggestMemoryArgs, CHANNEL_COORDINATOR_AND_TASK,
-        "Suggest a note for memory. A task sends it to the channel coordinator. A channel coordinator sends it to the Everything coordinator as a global memory suggestion. The coordinator that gets it decides whether to keep it."),
-    // The Everything coordinator.
+        "Suggest a note for memory. A task sends it to the channel coordinator. A channel coordinator sends it to the Tutti coordinator as a global memory suggestion. The coordinator that gets it decides whether to keep it."),
+    // The Tutti coordinator.
     /// `list_channels`.
-    ListChannels("list_channels", NoArgs, EVERYTHING_ONLY,
+    ListChannels("list_channels", NoArgs, TUTTI_ONLY,
         "List the channels with their purpose and task counts."),
     /// `read_channel`.
-    ReadChannel("read_channel", ReadChannelArgs, EVERYTHING_ONLY,
+    ReadChannel("read_channel", ReadChannelArgs, TUTTI_ONLY,
         "Read a channel: its timeline, its tasks and its memory index."),
     /// `message_channel`.
-    MessageChannel("message_channel", MessageChannelArgs, EVERYTHING_ONLY,
-        "Post in a channel as a message from Everything. This wakes the coordinator of that channel."),
+    MessageChannel("message_channel", MessageChannelArgs, TUTTI_ONLY,
+        "Post in a channel as a message from Tutti. This wakes the coordinator of that channel."),
     /// `create_channel`.
-    CreateChannel("create_channel", CreateChannelArgs, EVERYTHING_ONLY,
+    CreateChannel("create_channel", CreateChannelArgs, TUTTI_ONLY,
         "Create a channel with a name and a purpose, and optionally a group, tags and models."),
     /// `update_channel`.
-    UpdateChannel("update_channel", UpdateChannelArgs, EVERYTHING_ONLY,
+    UpdateChannel("update_channel", UpdateChannelArgs, TUTTI_ONLY,
         "Change a channel. Fields that you leave out do not change. A change to its tags asks the user first."),
     /// `archive_channel`.
-    ArchiveChannel("archive_channel", ArchiveChannelArgs, EVERYTHING_ONLY,
+    ArchiveChannel("archive_channel", ArchiveChannelArgs, TUTTI_ONLY,
         "Archive a channel. This asks the user first."),
     /// `set_default_model`.
-    SetDefaultModel("set_default_model", SetDefaultModelArgs, EVERYTHING_ONLY,
-        "Set the model of Everything, which is also the model of every channel that has no model of its own."),
+    SetDefaultModel("set_default_model", SetDefaultModelArgs, TUTTI_ONLY,
+        "Set the model of Tutti, which is also the model of every channel that has no model of its own."),
     /// `set_worker_tags`.
-    SetWorkerTags("set_worker_tags", SetWorkerTagsArgs, EVERYTHING_ONLY,
+    SetWorkerTags("set_worker_tags", SetWorkerTagsArgs, TUTTI_ONLY,
         "Replace the user tags of a worker. This asks the user first."),
     /// `install_tool`.
-    InstallTool("install_tool", InstallToolArgs, EVERYTHING_ONLY,
+    InstallTool("install_tool", InstallToolArgs, TUTTI_ONLY,
         "Install or update a managed tool, such as claude-code or codex, on a worker."),
     /// `add_account`.
-    AddAccount("add_account", AddAccountArgs, EVERYTHING_ONLY,
+    AddAccount("add_account", AddAccountArgs, TUTTI_ONLY,
         "Add a provider account on a worker and post a sign-in card. The user signs in on the card."),
     /// `start_sign_in`.
-    StartSignIn("start_sign_in", StartSignInArgs, EVERYTHING_ONLY,
+    StartSignIn("start_sign_in", StartSignInArgs, TUTTI_ONLY,
         "Post a sign-in card for an account that is signed out. The user signs in on the card."),
     /// `set_account_extras`.
-    SetAccountExtras("set_account_extras", SetAccountExtrasArgs, EVERYTHING_ONLY,
+    SetAccountExtras("set_account_extras", SetAccountExtrasArgs, TUTTI_ONLY,
         "Turn an account's provider extras, such as claude.ai connectors and synced plugins and skills, on or off. Turning them on asks the user first."),
     /// `search_connector_catalog`.
-    SearchConnectorCatalog("search_connector_catalog", SearchConnectorCatalogArgs, EVERYTHING_ONLY,
+    SearchConnectorCatalog("search_connector_catalog", SearchConnectorCatalogArgs, TUTTI_ONLY,
         "Search the connector catalog for services to connect, such as Gmail or GitHub."),
     /// `update_connection`.
-    UpdateConnection("update_connection", UpdateConnectionArgs, EVERYTHING_ONLY,
+    UpdateConnection("update_connection", UpdateConnectionArgs, TUTTI_ONLY,
         "Change a connection's name, scope or approval rules. A wider scope or a looser rule asks the user first."),
     /// `disconnect`.
-    Disconnect("disconnect", DisconnectArgs, EVERYTHING_ONLY,
+    Disconnect("disconnect", DisconnectArgs, TUTTI_ONLY,
         "Disconnect a connection. This asks the user first."),
     /// `search_skills`.
-    SearchSkills("search_skills", SearchSkillsArgs, EVERYTHING_ONLY,
+    SearchSkills("search_skills", SearchSkillsArgs, TUTTI_ONLY,
         "Search the skill directories for skills to add."),
     /// `update_skill`.
-    UpdateSkill("update_skill", UpdateSkillArgs, EVERYTHING_ONLY,
+    UpdateSkill("update_skill", UpdateSkillArgs, TUTTI_ONLY,
         "Turn a skill on or off, change its scope, or take its new version. Turning on a skill with scripts or a wider scope asks the user first."),
     /// `remove_skill`.
-    RemoveSkill("remove_skill", RemoveSkillArgs, EVERYTHING_ONLY,
+    RemoveSkill("remove_skill", RemoveSkillArgs, TUTTI_ONLY,
         "Remove a skill. This asks the user first."),
     // A channel's coordinator, for its own channel only.
     /// `update_this_channel`.
@@ -1260,7 +1261,7 @@ pub struct ChannelSummary {
     pub id: ChannelId,
     /// The name.
     pub name: String,
-    /// `everything` or `standard`.
+    /// `tutti` or `standard`.
     pub kind: ChannelKind,
     /// The purpose.
     pub purpose: String,
@@ -1302,6 +1303,23 @@ mod tests {
     use super::*;
     use crate::model::UseIn;
     use serde_json::json;
+
+    #[test]
+    fn the_tutti_audience_reads_the_old_name_and_writes_the_new_one() {
+        let old: ToolAudience = serde_json::from_value(json!("everything_coordinator")).unwrap();
+        let new: ToolAudience = serde_json::from_value(json!("tutti_coordinator")).unwrap();
+        assert_eq!(
+            (old, new),
+            (
+                ToolAudience::TuttiCoordinator,
+                ToolAudience::TuttiCoordinator
+            )
+        );
+        assert_eq!(
+            serde_json::to_value(ToolAudience::TuttiCoordinator).unwrap(),
+            json!("tutti_coordinator")
+        );
+    }
 
     fn names(audience: ToolAudience) -> Vec<String> {
         tools_for(audience).into_iter().map(|t| t.name).collect()
@@ -1352,7 +1370,7 @@ mod tests {
             "connect_service",
             "add_skill",
         ];
-        let everything_only = [
+        let tutti_only = [
             "list_channels",
             "read_channel",
             "message_channel",
@@ -1381,46 +1399,43 @@ mod tests {
         ];
         let task_only = ["post_update", "submit_for_review", "publish_artifact"];
 
-        let everything = names(ToolAudience::EverythingCoordinator);
+        let tutti = names(ToolAudience::TuttiCoordinator);
         let channel = names(ToolAudience::ChannelCoordinator);
         let task = names(ToolAudience::TaskSession);
 
         for name in every.into_iter().chain(every_extensions) {
-            assert!(everything.contains(&name.to_owned()));
+            assert!(tutti.contains(&name.to_owned()));
             assert!(channel.contains(&name.to_owned()));
             assert!(task.contains(&name.to_owned()));
         }
         for name in coordinator.into_iter().chain(coordinator_extensions) {
-            assert!(everything.contains(&name.to_owned()), "{name}");
+            assert!(tutti.contains(&name.to_owned()), "{name}");
             assert!(channel.contains(&name.to_owned()), "{name}");
             assert!(!task.contains(&name.to_owned()), "{name}");
         }
-        for name in everything_only {
-            assert!(everything.contains(&name.to_owned()));
+        for name in tutti_only {
+            assert!(tutti.contains(&name.to_owned()));
             assert!(!channel.contains(&name.to_owned()));
             assert!(!task.contains(&name.to_owned()));
         }
         for name in task_only {
             assert!(task.contains(&name.to_owned()));
-            assert!(!everything.contains(&name.to_owned()));
+            assert!(!tutti.contains(&name.to_owned()));
             assert!(!channel.contains(&name.to_owned()));
         }
         for name in channel_only {
             assert!(channel.contains(&name.to_owned()), "{name}");
-            assert!(!everything.contains(&name.to_owned()), "{name}");
+            assert!(!tutti.contains(&name.to_owned()), "{name}");
             assert!(!task.contains(&name.to_owned()), "{name}");
         }
-        // suggest_memory: channel coordinators and tasks, not Everything.
+        // suggest_memory: channel coordinators and tasks, not Tutti.
         assert!(channel.contains(&"suggest_memory".to_owned()));
         assert!(task.contains(&"suggest_memory".to_owned()));
-        assert!(!everything.contains(&"suggest_memory".to_owned()));
+        assert!(!tutti.contains(&"suggest_memory".to_owned()));
 
         let every_len = every.len() + every_extensions.len();
         let coordinator_len = coordinator.len() + coordinator_extensions.len();
-        assert_eq!(
-            everything.len(),
-            every_len + coordinator_len + everything_only.len()
-        );
+        assert_eq!(tutti.len(), every_len + coordinator_len + tutti_only.len());
         assert_eq!(
             channel.len(),
             every_len + coordinator_len + channel_only.len() + 1
@@ -1431,15 +1446,15 @@ mod tests {
     #[test]
     fn audience_for_session() {
         assert_eq!(
-            ToolAudience::for_session(SessionRole::Coordinator, ChannelKind::Everything),
-            ToolAudience::EverythingCoordinator
+            ToolAudience::for_session(SessionRole::Coordinator, ChannelKind::Tutti),
+            ToolAudience::TuttiCoordinator
         );
         assert_eq!(
             ToolAudience::for_session(SessionRole::Coordinator, ChannelKind::Standard),
             ToolAudience::ChannelCoordinator
         );
         assert_eq!(
-            ToolAudience::for_session(SessionRole::Task, ChannelKind::Everything),
+            ToolAudience::for_session(SessionRole::Task, ChannelKind::Tutti),
             ToolAudience::TaskSession
         );
     }
@@ -1686,7 +1701,7 @@ mod tests {
     #[test]
     fn management_tools_parse_and_respect_audiences() {
         let update = HubToolCall::parse_for(
-            ToolAudience::EverythingCoordinator,
+            ToolAudience::TuttiCoordinator,
             "update_connection",
             json!({"connection": "github_work", "use_in": {"kind": "tags", "tags": ["work"]},
                    "approvals": {"read": "run_without_asking", "change": "ask_once_per_task", "delete": "ask_every_time"}}),
@@ -1705,7 +1720,7 @@ mod tests {
             args.approvals.unwrap().change,
             crate::model::ApprovalRule::AskOncePerTask
         );
-        // The channel assistant cannot use Everything's tools, and the other
+        // The channel assistant cannot use Tutti's tools, and the other
         // way round.
         for (audience, tool, args) in [
             (
@@ -1719,7 +1734,7 @@ mod tests {
                 json!({"name": "a", "purpose": "b"}),
             ),
             (
-                ToolAudience::EverythingCoordinator,
+                ToolAudience::TuttiCoordinator,
                 "set_channel_tags",
                 json!({"tags": []}),
             ),

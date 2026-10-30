@@ -28,9 +28,11 @@ pub struct Group {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChannelKind {
-    /// The one Everything channel. It has no group and cannot be archived or
-    /// deleted.
-    Everything,
+    /// The one Tutti channel. It has no group and cannot be archived or
+    /// deleted. The channel was called Everything before: old data and older
+    /// peers say `everything`, and this type still reads it.
+    #[serde(alias = "everything")]
+    Tutti,
     /// Any other channel.
     Standard,
 }
@@ -40,7 +42,7 @@ pub enum ChannelKind {
 pub struct Channel {
     /// The ID.
     pub id: ChannelId,
-    /// `everything` or `standard`.
+    /// `tutti` or `standard`.
     pub kind: ChannelKind,
     /// The name.
     pub name: String,
@@ -48,7 +50,7 @@ pub struct Channel {
     pub icon: Option<String>,
     /// The color role name.
     pub color: Option<String>,
-    /// The group. Always empty for Everything.
+    /// The group. Always empty for Tutti.
     pub group_id: Option<GroupId>,
     /// Order inside the group.
     pub position: i64,
@@ -56,7 +58,7 @@ pub struct Channel {
     pub purpose: String,
     /// The instructions, in markdown.
     pub instructions: String,
-    /// The coordinator's model selection. Empty means the Everything
+    /// The coordinator's model selection. Empty means the Tutti
     /// channel's value.
     pub coordinator_selection: Option<ModelSelection>,
     /// The default model selection for new tasks.
@@ -100,29 +102,29 @@ pub struct Channel {
 }
 
 impl Channel {
-    /// Whether this is the Everything channel.
-    pub fn is_everything(&self) -> bool {
-        self.kind == ChannelKind::Everything
+    /// Whether this is the Tutti channel.
+    pub fn is_tutti(&self) -> bool {
+        self.kind == ChannelKind::Tutti
     }
 
-    /// The memory scope that this channel owns. The Everything channel's
+    /// The memory scope that this channel owns. The Tutti channel's
     /// memory is the global memory.
     pub fn memory_scope(&self) -> MemoryScope {
         match self.kind {
-            ChannelKind::Everything => MemoryScope::Global,
+            ChannelKind::Tutti => MemoryScope::Global,
             ChannelKind::Standard => MemoryScope::Channel(self.id),
         }
     }
 
     /// The coordinator's model selection, with the fallback to the
-    /// Everything channel's value.
+    /// Tutti channel's value.
     pub fn effective_coordinator_selection<'a>(
         &'a self,
-        everything: &'a Channel,
+        tutti: &'a Channel,
     ) -> Option<&'a ModelSelection> {
         self.coordinator_selection
             .as_ref()
-            .or(everything.coordinator_selection.as_ref())
+            .or(tutti.coordinator_selection.as_ref())
     }
 }
 
@@ -253,4 +255,24 @@ pub struct ReadMarker {
     pub thread_root_id: Option<MessageId>,
     /// The newest message that the user has read.
     pub last_read_message_id: MessageId,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The main channel was called Everything. New data says `tutti`, and
+    /// stored data and older peers still say `everything`.
+    #[test]
+    fn the_tutti_kind_reads_the_old_name_and_writes_the_new_one() {
+        let new: ChannelKind = serde_json::from_str("\"tutti\"").unwrap();
+        let old: ChannelKind = serde_json::from_str("\"everything\"").unwrap();
+        assert_eq!((new, old), (ChannelKind::Tutti, ChannelKind::Tutti));
+        assert_eq!(
+            serde_json::to_string(&ChannelKind::Tutti).unwrap(),
+            "\"tutti\""
+        );
+        let standard: ChannelKind = serde_json::from_str("\"standard\"").unwrap();
+        assert_eq!(standard, ChannelKind::Standard);
+    }
 }

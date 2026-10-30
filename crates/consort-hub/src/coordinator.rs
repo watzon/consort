@@ -192,7 +192,7 @@ fn main_text(event: &mut WakeEvent) -> Option<&mut String> {
     match event {
         WakeEvent::UserMessage { text, .. }
         | WakeEvent::TaskUpdate { text, .. }
-        | WakeEvent::EverythingMessage { text, .. }
+        | WakeEvent::TuttiMessage { text, .. }
         | WakeEvent::CardAnswered { text, .. } => Some(text),
         WakeEvent::Routine { prompt, .. } => Some(prompt),
         WakeEvent::MemorySuggestion { note, .. } => Some(note),
@@ -204,7 +204,7 @@ fn main_text(event: &mut WakeEvent) -> Option<&mut String> {
 /// most `room` bytes as a JSON string.
 fn cut_event(event: &WakeEvent, room: usize) -> WakeEvent {
     let mark = match event {
-        WakeEvent::UserMessage { id, .. } | WakeEvent::EverythingMessage { id, .. } => format!(
+        WakeEvent::UserMessage { id, .. } | WakeEvent::TuttiMessage { id, .. } => format!(
             "\n\n[The hub cut this message here, because it is too long for one turn. Call fetch_thread with message_id \"{id}\" to read all of it.]"
         ),
         _ => "\n\n[The hub cut this text here, because it is too long for one turn.]".to_owned(),
@@ -243,8 +243,8 @@ fn cut_event(event: &WakeEvent, room: usize) -> WakeEvent {
 /// A hash of what the system prompt of a coordinator says about its channel.
 /// When it changes, the hub replaces the session, so the new purpose,
 /// instructions or model reach the coordinator.
-fn prompt_fingerprint(channel: &Channel, everything: &Channel, extensions_key: &str) -> String {
-    let selection = channel.effective_coordinator_selection(everything);
+fn prompt_fingerprint(channel: &Channel, tutti: &Channel, extensions_key: &str) -> String {
+    let selection = channel.effective_coordinator_selection(tutti);
     let text = format!(
         "{}\n{}\n{}\n{}\n{extensions_key}",
         channel.name,
@@ -256,18 +256,18 @@ fn prompt_fingerprint(channel: &Channel, everything: &Channel, extensions_key: &
 }
 
 /// The channels whose effective coordinator selection differs after one
-/// channel changed from `before` to `after`. A change to Everything moves
+/// channel changed from `before` to `after`. A change to Tutti moves
 /// every channel that has no selection of its own.
 pub(crate) fn moved_selections(
     before: &Channel,
     after: &Channel,
-    everything: &Channel,
+    tutti: &Channel,
     channels: &[Channel],
 ) -> Vec<ChannelId> {
-    let (everything_before, everything_after) = if after.is_everything() {
+    let (tutti_before, tutti_after) = if after.is_tutti() {
         (before, after)
     } else {
-        (everything, everything)
+        (tutti, tutti)
     };
     channels
         .iter()
@@ -278,8 +278,8 @@ pub(crate) fn moved_selections(
             } else {
                 (c, c)
             };
-            let moved = old.effective_coordinator_selection(everything_before)
-                != new.effective_coordinator_selection(everything_after);
+            let moved = old.effective_coordinator_selection(tutti_before)
+                != new.effective_coordinator_selection(tutti_after);
             moved.then_some(c.id)
         })
         .collect()
@@ -287,7 +287,7 @@ pub(crate) fn moved_selections(
 
 struct Inputs {
     channel: Channel,
-    everything: Channel,
+    tutti: Channel,
     events: Vec<(i64, WakeEvent)>,
     session: Option<Session>,
     workers: Vec<consort_proto::model::Worker>,
@@ -304,12 +304,12 @@ impl Hub {
     /// The memory index text of the global scope and of one channel.
     pub(crate) async fn memory_indexes(&self, channel: &Channel) -> Result<(String, String)> {
         let scope = channel.memory_scope();
-        let is_everything = channel.is_everything();
+        let is_tutti = channel.is_tutti();
         self.store
             .read(move |conn| {
                 let global =
                     knowledge::memory_notes(conn, consort_proto::model::MemoryScope::Global)?;
-                let own = if is_everything {
+                let own = if is_tutti {
                     Vec::new()
                 } else {
                     knowledge::memory_notes(conn, scope)?
@@ -333,7 +333,7 @@ impl Hub {
         };
 
         let fingerprint =
-            prompt_fingerprint(&inputs.channel, &inputs.everything, &inputs.extensions_key);
+            prompt_fingerprint(&inputs.channel, &inputs.tutti, &inputs.extensions_key);
         let mut inputs = inputs;
         if let Some(session) = inputs.session.clone() {
             let current = self
@@ -417,7 +417,7 @@ impl Hub {
         }
         let selection = inputs
             .channel
-            .effective_coordinator_selection(&inputs.everything)
+            .effective_coordinator_selection(&inputs.tutti)
             .cloned();
         let request = PlacementRequest::default();
         let placement = place(&PlacementInput {
@@ -665,7 +665,7 @@ impl Hub {
                     Some(id) => work::session(conn, id)?.filter(|s| !s.state.is_final()),
                     None => None,
                 };
-                let everything = conversation::everything_channel(conn)?;
+                let tutti = conversation::tutti_channel(conn)?;
                 let (workers, open) = if session.is_none() {
                     (machine::workers(conn)?, work::open_session_counts(conn)?)
                 } else {
@@ -697,7 +697,7 @@ impl Hub {
                     crate::connectors::extensions::effective_set_key(conn, channel_id)?;
                 Ok(Some(Inputs {
                     channel,
-                    everything,
+                    tutti,
                     events,
                     session,
                     workers,
@@ -806,19 +806,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_change_to_everything_moves_only_the_channels_that_inherit_it() {
+    async fn a_change_to_tutti_moves_only_the_channels_that_inherit_it() {
         let (hub, _dir) = crate::hub::test_hub().await;
-        let everything = hub
-            .store
-            .read(conversation::everything_channel)
-            .await
-            .unwrap();
+        let tutti = hub.store.read(conversation::tutti_channel).await.unwrap();
         let sel = |model: &str| consort_proto::model::ModelSelection {
             account_label: "Claude".to_owned(),
             model: model.to_owned(),
             options: ModelOptions::new(),
         };
-        let mut inherits = everything.clone();
+        let mut inherits = tutti.clone();
         inherits.id = ChannelId::new();
         inherits.kind = consort_proto::model::ChannelKind::Standard;
         inherits.coordinator_selection = None;
@@ -828,11 +824,11 @@ mod tests {
         let mut archived = inherits.clone();
         archived.id = ChannelId::new();
         archived.archived_at = Some(Timestamp::now());
-        let mut after = everything.clone();
+        let mut after = tutti.clone();
         after.coordinator_selection = Some(sel("new"));
         let all = vec![after.clone(), inherits.clone(), own.clone(), archived];
-        let moved = moved_selections(&everything, &after, &everything, &all);
-        assert_eq!(moved, [everything.id, inherits.id]);
+        let moved = moved_selections(&tutti, &after, &tutti, &all);
+        assert_eq!(moved, [tutti.id, inherits.id]);
 
         // A channel's own change moves only that channel, and only when the
         // effective selection changes.
@@ -923,15 +919,11 @@ mod tests {
 
     /// A coordinator session with a turn that opened 10 s ago.
     async fn session_with_old_turn(hub: &Hub) -> Session {
-        let everything = hub
-            .store
-            .read(conversation::everything_channel)
-            .await
-            .unwrap();
+        let tutti = hub.store.read(conversation::tutti_channel).await.unwrap();
         let session = Session {
             id: SessionId::new(),
             role: SessionRole::Coordinator,
-            channel_id: everything.id,
+            channel_id: tutti.id,
             task_id: None,
             worker_id: WorkerId::new(),
             account_id: AccountId::new(),
@@ -1018,15 +1010,11 @@ mod tests {
     #[tokio::test]
     async fn one_stuck_turn_that_fails_does_not_stop_the_others() {
         let (hub, _dir) = crate::hub::test_hub().await;
-        let everything = hub
-            .store
-            .read(conversation::everything_channel)
-            .await
-            .unwrap();
+        let tutti = hub.store.read(conversation::tutti_channel).await.unwrap();
         let session = Session {
             id: SessionId::new(),
             role: SessionRole::Coordinator,
-            channel_id: everything.id,
+            channel_id: tutti.id,
             task_id: None,
             worker_id: WorkerId::new(),
             account_id: AccountId::new(),
@@ -1057,7 +1045,7 @@ mod tests {
                 })?;
                 tx.save_session(&session)?;
                 tx.save_coordinator(&CoordinatorRow {
-                    channel_id: everything.id,
+                    channel_id: tutti.id,
                     session_id: Some(good),
                     turn_open: true,
                     turn_started_at: Some(old),

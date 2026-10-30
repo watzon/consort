@@ -137,7 +137,7 @@ pub fn effort_note(provider: &str) -> String {
 
 impl ConsortApp {
     /// The selection that a target has now: for a channel, the selection
-    /// that its assistant uses, its own or Everything's.
+    /// that its assistant uses, its own or Tutti's.
     pub fn picker_selection(&self, target: &PickerTarget) -> Option<SelectionView> {
         match target {
             PickerTarget::Assistant(id) => self
@@ -151,11 +151,11 @@ impl ConsortApp {
     }
 
     /// Whether the target has a model of its own that it can give up for
-    /// the Everything model.
+    /// the Tutti model.
     fn picker_can_inherit(&self, target: &PickerTarget) -> bool {
         match target {
             PickerTarget::Assistant(id) => self.state.channel(id).is_some_and(|c| {
-                c.kind != ChannelKind::Everything
+                c.kind != ChannelKind::Tutti
                     && c.coordinator_selection
                         .as_ref()
                         .is_some_and(|e| e.source == SelectionSource::Channel)
@@ -167,7 +167,7 @@ impl ConsortApp {
 
     /// Sets the selection of a target. For a channel's assistant, this
     /// sends `channel.update` at once. `None` gives the channel the
-    /// Everything model again.
+    /// Tutti model again.
     pub fn apply_selection(
         &mut self,
         target: &PickerTarget,
@@ -350,7 +350,7 @@ impl ConsortApp {
         );
         self.close_picker(window, cx);
         // A pick of the model that the channel uses already, from
-        // Everything, makes it the channel's own.
+        // Tutti, makes it the channel's own.
         self.apply_selection(&open.target, Some(chosen), cx);
     }
 
@@ -578,26 +578,26 @@ impl ConsortApp {
         let logo = selection
             .as_ref()
             .and_then(|s| self.state.account_logo(&s.account_label).cloned());
-        // In the dialog, a field with no model of its own uses Everything's.
+        // In the dialog, a field with no model of its own uses Tutti's.
         let (name, account) = match &selection {
             Some(s) if s.model_id.is_empty() => (s.account_label.clone(), String::new()),
             Some(s) => (s.model_name.clone(), s.account_label.clone()),
             None if style == TriggerStyle::Field => {
-                let everything = match &target {
+                let tutti = match &target {
                     PickerTarget::NewChannelTasks => self
                         .state
-                        .everything()
+                        .tutti()
                         .and_then(|c| c.task_selection.as_ref())
                         .map(|s| s.model_name.clone()),
                     _ => self
                         .state
-                        .everything()
+                        .tutti()
                         .and_then(|c| c.coordinator_selection.as_ref())
                         .map(|e| e.selection.model_name.clone()),
                 };
                 (
                     format!("Same as {}", crate::ui::TUTTI),
-                    everything.unwrap_or_default(),
+                    tutti.unwrap_or_default(),
                 )
             }
             None => ("Choose a model".to_owned(), String::new()),
@@ -890,7 +890,7 @@ impl ConsortApp {
 
     /// The header line of the main pane: a title in semibold, a detail in
     /// `text.tertiary`, and, for a target with a model of its own, the text
-    /// button "Use the Everything model" at its right end.
+    /// button "Use the Tutti model" at its right end.
     fn render_picker_header(
         &self,
         title: String,
@@ -917,7 +917,7 @@ impl ConsortApp {
             .child(line(detail_text, t.text.caption, c.text_tertiary).flex_1())
             .when(self.picker_can_inherit(&target), |d| {
                 d.child(
-                    focusable(div().id("use-everything-model"), t)
+                    focusable(div().id("use-tutti-model"), t)
                         .flex_none()
                         .px(t.space.xs)
                         .rounded(t.radius.sm)

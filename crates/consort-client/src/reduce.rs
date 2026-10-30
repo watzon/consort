@@ -708,9 +708,9 @@ fn speaker(m: &model::Message) -> Speaker {
 /// Builds the whole view state from the cache. `now` is Unix milliseconds.
 /// The name of a channel as the user sees it. The main channel shows as
 /// Tutti whatever the hub calls it: the hub and the wire still say
-/// Everything until the rename pass.
+/// Tutti until the rename pass.
 fn shown_name(c: &model::Channel) -> String {
-    if c.kind == PK::Everything {
+    if c.kind == PK::Tutti {
         crate::view::TUTTI.to_owned()
     } else {
         c.name.clone()
@@ -754,7 +754,7 @@ fn channel_activities(cache: &Cache, state: &ViewState) -> Vec<crate::activity::
             channel_id: c.id.clone(),
             activity: crate::activity::channel_activity(&crate::activity::Inputs {
                 channel_id: &c.id,
-                everything: c.kind == ChannelKind::Everything,
+                tutti: c.kind == ChannelKind::Tutti,
                 tasks: &tasks,
                 sessions: &sessions,
                 timeline: state.timeline(&c.id),
@@ -773,19 +773,19 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
             .map(|w| w.name.clone())
             .unwrap_or_else(|| "a worker".to_owned())
     };
-    let everything = cache.channels.values().find(|c| c.kind == PK::Everything);
-    let fallback_selection = everything.and_then(|c| c.coordinator_selection.clone());
-    let everything_selection = fallback_selection
+    let tutti = cache.channels.values().find(|c| c.kind == PK::Tutti);
+    let fallback_selection = tutti.and_then(|c| c.coordinator_selection.clone());
+    let tutti_selection = fallback_selection
         .as_ref()
         .map(|s| selection_view(cache, s));
 
-    // Channels, Everything first, then by group and position.
+    // Channels, Tutti first, then by group and position.
     let mut channels: Vec<&model::Channel> = cache
         .channels
         .values()
         .filter(|c| c.archived_at.is_none())
         .collect();
-    channels.sort_by_key(|c| (c.kind != PK::Everything, c.position, c.name.clone()));
+    channels.sort_by_key(|c| (c.kind != PK::Tutti, c.position, c.name.clone()));
     let channel_views: Vec<ChannelView> = channels
         .iter()
         .map(|c| {
@@ -816,8 +816,8 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                 .map(|s| selection_view(cache, s));
             ChannelView {
                 id: c.id.to_string(),
-                kind: if c.kind == PK::Everything {
-                    ChannelKind::Everything
+                kind: if c.kind == PK::Tutti {
+                    ChannelKind::Tutti
                 } else {
                     ChannelKind::Standard
                 },
@@ -825,18 +825,13 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                 purpose: c.purpose.clone(),
                 instructions: c.instructions.clone(),
                 icon: c.icon.clone().unwrap_or_else(|| {
-                    if c.kind == PK::Everything {
-                        "brace"
-                    } else {
-                        "hash"
-                    }
-                    .to_owned()
+                    if c.kind == PK::Tutti { "brace" } else { "hash" }.to_owned()
                 }),
                 group_id: c.group_id.map(|g| g.to_string()),
                 coordinator_worker: worker,
                 coordinator_selection: crate::picker::effective_selection(
                     own,
-                    everything_selection.clone(),
+                    tutti_selection.clone(),
                 ),
                 repos: Vec::new(),
                 preferred_workers: c.preferred_workers.iter().map(|w| w.to_string()).collect(),
@@ -855,7 +850,7 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
     let mut archived: Vec<&model::Channel> = cache
         .channels
         .values()
-        .filter(|c| c.archived_at.is_some() && c.kind != PK::Everything)
+        .filter(|c| c.archived_at.is_some() && c.kind != PK::Tutti)
         .collect();
     archived.sort_by_key(|c| (c.name.to_lowercase(), c.id.to_string()));
     let archived_channels: Vec<ArchivedChannelView> = archived
@@ -1539,8 +1534,8 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
             ..SidebarChannel::default()
         })
         .collect();
-    if let Some(e) = state.everything() {
-        state.sidebar.everything = SidebarChannel {
+    if let Some(e) = state.tutti() {
+        state.sidebar.tutti = SidebarChannel {
             id: e.id.clone(),
             unread: unread.get(&e.id).copied().unwrap_or(0),
             ..SidebarChannel::default()
@@ -1618,16 +1613,16 @@ pub(crate) fn sentence(text: &str) -> String {
 }
 
 /// The model of a task in words, from the task's own selection, its
-/// channel's default or the Everything default. The task keeps the model it
+/// channel's default or the Tutti default. The task keeps the model it
 /// started with, so the thread shows it and does not offer to change it.
 fn task_model_label(cache: &Cache, task: &model::Task) -> Option<String> {
     let channel = cache.channels.get(&task.channel_id.to_string());
-    let everything = cache.channels.values().find(|c| c.kind == PK::Everything);
+    let tutti = cache.channels.values().find(|c| c.kind == PK::Tutti);
     let chosen = task
         .model_selection
         .as_ref()
         .or(channel.and_then(|c| c.task_selection.as_ref()))
-        .or(everything.and_then(|c| c.task_selection.as_ref()))?;
+        .or(tutti.and_then(|c| c.task_selection.as_ref()))?;
     let view = selection_view(cache, chosen);
     let effort = model_effort(cache, &chosen.account_label, &chosen.model);
     Some(crate::picker::selection_words(&view, effort.as_ref()))
@@ -1661,16 +1656,16 @@ fn provider_logo_of(cache: &Cache, harness: &str) -> (String, ProviderLogo) {
 }
 
 /// The account and model of a task, best known first: the task's own
-/// selection, its channel's default, the Everything default, and, once the
+/// selection, its channel's default, the Tutti default, and, once the
 /// task runs on a worker with one signed-in account, that account.
 fn task_harness(cache: &Cache, task: &model::Task, worker: &model::Worker) -> String {
     let channel = cache.channels.get(&task.channel_id.to_string());
-    let everything = cache.channels.values().find(|c| c.kind == PK::Everything);
+    let tutti = cache.channels.values().find(|c| c.kind == PK::Tutti);
     let chosen = task
         .model_selection
         .as_ref()
         .or(channel.and_then(|c| c.task_selection.as_ref()))
-        .or(everything.and_then(|c| c.task_selection.as_ref()));
+        .or(tutti.and_then(|c| c.task_selection.as_ref()));
     if let Some(selection) = chosen {
         return selection_view(cache, selection).label();
     }
@@ -1810,7 +1805,7 @@ mod tests {
 
     struct World {
         cache: Cache,
-        everything: ChannelId,
+        tutti: ChannelId,
         sayso: ChannelId,
         task: TaskId,
         card: MessageId,
@@ -1819,7 +1814,7 @@ mod tests {
     fn world() -> World {
         let mut cache = Cache::default();
         let group = GroupId::new();
-        let everything = ChannelId::new();
+        let tutti = ChannelId::new();
         let sayso = ChannelId::new();
         cache.groups.insert(
             group.to_string(),
@@ -1832,7 +1827,7 @@ mod tests {
         );
         for c in [
             channel(sayso, ChannelKind::Standard, "sayso", Some(group)),
-            channel(everything, ChannelKind::Everything, "Everything", None),
+            channel(tutti, ChannelKind::Tutti, "Tutti", None),
         ] {
             cache.channels.insert(c.id.to_string(), c);
         }
@@ -1981,7 +1976,7 @@ mod tests {
         );
         World {
             cache,
-            everything,
+            tutti,
             sayso,
             task,
             card,
@@ -1993,10 +1988,10 @@ mod tests {
     }
 
     #[test]
-    fn everything_comes_first_and_groups_hold_their_channels() {
+    fn tutti_comes_first_and_groups_hold_their_channels() {
         let w = world();
         let state = view(&w.cache);
-        assert_eq!(state.channels[0].id, w.everything.to_string());
+        assert_eq!(state.channels[0].id, w.tutti.to_string());
         assert_eq!(state.channels[0].icon, "brace");
         assert_eq!(state.sidebar.groups[0].channels[0].name, "sayso");
         assert_eq!(
@@ -2064,14 +2059,14 @@ mod tests {
         let mut w = world();
         w.cache.pending.push(PendingSend {
             client_message_id: "c-1".into(),
-            channel_id: w.everything.to_string(),
+            channel_id: w.tutti.to_string(),
             thread_root_id: None,
             body: "Hi".into(),
             created_at: NOW,
         });
         let state = view(&w.cache);
         let items = &state
-            .timeline(&w.everything.to_string())
+            .timeline(&w.tutti.to_string())
             .expect("timeline")
             .items;
         assert!(
@@ -2080,7 +2075,7 @@ mod tests {
 
         let mut stored = message(
             MessageId::new(),
-            w.everything,
+            w.tutti,
             Author::User,
             MessageKind::Text,
             None,
@@ -2095,7 +2090,7 @@ mod tests {
         )));
         let state = view(&w.cache);
         let items = &state
-            .timeline(&w.everything.to_string())
+            .timeline(&w.tutti.to_string())
             .expect("timeline")
             .items;
         let mine: Vec<_> = items
@@ -2113,7 +2108,7 @@ mod tests {
     fn coordinator_approval(w: &mut World) -> ApprovalId {
         let mut message = message(
             MessageId::new(),
-            w.everything,
+            w.tutti,
             Author::Assistant,
             MessageKind::Approval,
             None,
@@ -2131,7 +2126,7 @@ mod tests {
             id.to_string(),
             Approval {
                 id,
-                channel_id: w.everything,
+                channel_id: w.tutti,
                 session_id: SessionId::new(),
                 task_id: None,
                 message_id: message.id,
@@ -2168,7 +2163,7 @@ mod tests {
         let id = coordinator_approval(&mut w);
         let state = view(&w.cache);
         let items = &state
-            .timeline(&w.everything.to_string())
+            .timeline(&w.tutti.to_string())
             .expect("timeline")
             .items;
         let card = items
@@ -2216,12 +2211,9 @@ mod tests {
             "Allow once"
         );
         assert_eq!(card.speaker, Speaker::Consort);
-        // Everything waits for the user.
-        assert_eq!(
-            state.sidebar.everything.status,
-            Some(TaskStatus::NeedsInput)
-        );
-        assert!(state.sidebar.everything.attention);
+        // Tutti waits for the user.
+        assert_eq!(state.sidebar.tutti.status, Some(TaskStatus::NeedsInput));
+        assert!(state.sidebar.tutti.attention);
         // The answer goes out by approval ID, with no task.
         let stored = w.cache.approvals.get(&id.to_string()).expect("stored");
         assert_eq!(
@@ -2247,7 +2239,7 @@ mod tests {
         }
         let state = view(&w.cache);
         let summary = state
-            .timeline(&w.everything.to_string())
+            .timeline(&w.tutti.to_string())
             .and_then(|t| {
                 t.items.iter().find_map(|i| match i {
                     TimelineItem::Approval(card) => Some(card.approval.summary.clone()),
@@ -2362,7 +2354,7 @@ mod tests {
         w.cache.approvals.remove(&id.to_string());
         let mut decision = message(
             MessageId::new(),
-            w.everything,
+            w.tutti,
             Author::Assistant,
             MessageKind::Decision,
             None,
@@ -2372,7 +2364,7 @@ mod tests {
         w.cache.messages.insert(decision.id.to_string(), decision);
         let state = view(&w.cache);
         let items = &state
-            .timeline(&w.everything.to_string())
+            .timeline(&w.tutti.to_string())
             .expect("timeline")
             .items;
         let approval = items
@@ -2398,7 +2390,7 @@ mod tests {
         assert_eq!(decision.state, RequestState::Closed);
         assert_eq!(decision.question, "Ship now?");
         // Closed requests do not wait for the user.
-        assert_eq!(state.sidebar.everything.status, None);
+        assert_eq!(state.sidebar.tutti.status, None);
     }
 
     #[test]
@@ -2528,13 +2520,13 @@ mod tests {
     #[test]
     fn unread_counts_from_the_oldest_loaded_message_when_the_marker_is_older() {
         let mut cache = Cache::default();
-        let everything = ChannelId::new();
-        let c = channel(everything, ChannelKind::Everything, "Everything", None);
+        let tutti = ChannelId::new();
+        let c = channel(tutti, ChannelKind::Tutti, "Tutti", None);
         cache.channels.insert(c.id.to_string(), c);
         for i in 0..5 {
             let m = message(
                 MessageId::new(),
-                everything,
+                tutti,
                 Author::Assistant,
                 MessageKind::Text,
                 None,
@@ -2544,7 +2536,7 @@ mod tests {
         }
         let mine = message(
             MessageId::new(),
-            everything,
+            tutti,
             Author::User,
             MessageKind::Text,
             None,
@@ -2553,15 +2545,15 @@ mod tests {
         cache.messages.insert(mine.id.to_string(), mine);
         // The marker names a message that this client has not loaded.
         cache.read_markers.insert(
-            everything.to_string(),
+            tutti.to_string(),
             ReadMarker {
-                channel_id: everything,
+                channel_id: tutti,
                 thread_root_id: None,
                 last_read_message_id: MessageId::new(),
             },
         );
         let state = view(&cache);
-        assert_eq!(state.sidebar.everything.unread, 5);
+        assert_eq!(state.sidebar.tutti.unread, 5);
     }
 
     #[test]
@@ -2571,7 +2563,7 @@ mod tests {
             .map(|i| {
                 let m = message(
                     MessageId::new(),
-                    w.everything,
+                    w.tutti,
                     Author::Assistant,
                     MessageKind::Text,
                     None,
@@ -2587,15 +2579,15 @@ mod tests {
             m.deleted_at = Some(Timestamp::from_millis(NOW));
         }
         w.cache.read_markers.insert(
-            w.everything.to_string(),
+            w.tutti.to_string(),
             ReadMarker {
-                channel_id: w.everything,
+                channel_id: w.tutti,
                 thread_root_id: None,
                 last_read_message_id: ids[1],
             },
         );
         let state = view(&w.cache);
-        assert_eq!(state.sidebar.everything.unread, 2);
+        assert_eq!(state.sidebar.tutti.unread, 2);
     }
 
     /// Finding 3: deleting a channel left its tasks, messages, approvals and
@@ -2644,7 +2636,7 @@ mod tests {
             Some(w.sayso),
         )));
         let c = &w.cache;
-        assert_eq!(c.channels.len(), 1, "only Everything is left");
+        assert_eq!(c.channels.len(), 1, "only Tutti is left");
         assert!(c.messages.is_empty(), "{:?}", c.messages.len());
         assert!(c.tasks.is_empty());
         assert!(c.approvals.is_empty());
@@ -2704,7 +2696,7 @@ mod tests {
         let id = coordinator_approval(&mut w);
         let detail = |w: &World| {
             view(&w.cache)
-                .timeline(&w.everything.to_string())
+                .timeline(&w.tutti.to_string())
                 .and_then(|t| {
                     t.items.iter().find_map(|i| match i {
                         TimelineItem::Approval(card) => Some(card.approval.clone()),
@@ -2903,7 +2895,7 @@ mod tests {
         assert!(view(&w.cache).timeline(&id).expect("timeline").loaded);
         assert!(
             !view(&w.cache)
-                .timeline(&w.everything.to_string())
+                .timeline(&w.tutti.to_string())
                 .expect("timeline")
                 .loaded
         );
@@ -3192,7 +3184,7 @@ mod tests {
         });
         w.cache.pending.push(PendingSend {
             client_message_id: "cm-2".into(),
-            channel_id: w.everything.to_string(),
+            channel_id: w.tutti.to_string(),
             thread_root_id: None,
             body: "Stays".into(),
             created_at: NOW,
@@ -3526,9 +3518,9 @@ mod tests {
                 bigboi.suggested_tags(&state.tags),
                 ["work", "arm64", "macos"]
             );
-            let everything = state.tags.clone();
+            let tutti = state.tags.clone();
             let mut all_taken = bigboi.clone();
-            all_taken.tags = everything;
+            all_taken.tags = tutti;
             assert!(all_taken.suggested_tags(&state.tags).is_empty());
         }
 
@@ -3601,7 +3593,7 @@ mod tests {
         }
 
         #[test]
-        fn a_channel_without_its_own_model_uses_everything_and_says_so() {
+        fn a_channel_without_its_own_model_uses_tutti_and_says_so() {
             let mut w = world();
             let sel = |model: &str| ModelSelection {
                 account_label: "Claude Personal".into(),
@@ -3610,18 +3602,18 @@ mod tests {
             };
             for channel in w.cache.channels.values_mut() {
                 channel.coordinator_selection = match channel.kind {
-                    PK::Everything => Some(sel("opus")),
+                    PK::Tutti => Some(sel("opus")),
                     PK::Standard => None,
                 };
             }
             let state = view(&w.cache);
-            let everything = state.everything().unwrap();
-            let own = everything.coordinator_selection.clone().unwrap();
+            let tutti = state.tutti().unwrap();
+            let own = tutti.coordinator_selection.clone().unwrap();
             assert_eq!(own.source, SelectionSource::Channel);
             assert_eq!(own.selection.model_id, "opus");
             let sayso = state.channel(&w.sayso.to_string()).unwrap();
             let inherited = sayso.coordinator_selection.clone().unwrap();
-            assert_eq!(inherited.source, SelectionSource::Everything);
+            assert_eq!(inherited.source, SelectionSource::Tutti);
             assert_eq!(inherited.selection.model_id, "opus");
 
             if let Some(channel) = w.cache.channels.get_mut(&w.sayso.to_string()) {

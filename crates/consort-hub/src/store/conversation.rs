@@ -54,13 +54,9 @@ pub fn channels(conn: &Connection) -> Result<Vec<Channel>> {
     )
 }
 
-pub fn everything_channel(conn: &Connection) -> Result<Channel> {
-    get_doc(
-        conn,
-        "SELECT data FROM channels WHERE kind = 'everything'",
-        [],
-    )?
-    .ok_or_else(|| HubError::internal("the Everything channel is missing"))
+pub fn tutti_channel(conn: &Connection) -> Result<Channel> {
+    get_doc(conn, "SELECT data FROM channels WHERE kind = 'tutti'", [])?
+        .ok_or_else(|| HubError::internal("the Tutti channel is missing"))
 }
 
 // Repos ------------------------------------------------------------------
@@ -257,7 +253,7 @@ impl Tx<'_> {
 
     pub fn save_channel(&mut self, channel: &Channel) -> Result<()> {
         let kind = match channel.kind {
-            ChannelKind::Everything => "everything",
+            ChannelKind::Tutti => "tutti",
             ChannelKind::Standard => "standard",
         };
         self.db().execute(

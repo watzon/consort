@@ -14,16 +14,12 @@ use consort_proto::error::ErrorCode;
 use consort_proto::model::{Author, FavoriteModel};
 
 #[tokio::test]
-async fn a_snapshot_has_the_everything_channel_and_the_feed_position() {
+async fn a_snapshot_has_the_tutti_channel_and_the_feed_position() {
     let hub = TestHub::start().await;
     let mut client = FakeClient::pair_and_connect(&hub).await;
     let snapshot = client.snapshot(SnapshotScope::All).await;
-    let everything: Vec<_> = snapshot
-        .channels
-        .iter()
-        .filter(|c| c.is_everything())
-        .collect();
-    assert_eq!(everything.len(), 1);
+    let tutti: Vec<_> = snapshot.channels.iter().filter(|c| c.is_tutti()).collect();
+    assert_eq!(tutti.len(), 1);
     assert!(snapshot.seq >= client.hello.feed_seq);
     assert!(
         snapshot.messages.is_empty(),
@@ -36,13 +32,13 @@ async fn a_snapshot_has_the_everything_channel_and_the_feed_position() {
 async fn a_message_reaches_a_subscribed_client_through_the_feed() {
     let hub = TestHub::start().await;
     let mut client = FakeClient::pair_and_connect(&hub).await;
-    let everything = client.everything().await;
+    let tutti = client.tutti().await;
     let snapshot = client.snapshot(SnapshotScope::All).await;
     client.subscribe(snapshot.seq).await.unwrap();
 
     let sent = client
         .request(MessageSend {
-            channel_id: everything,
+            channel_id: tutti,
             client_message_id: "cm-1".to_owned(),
             body: "Hello hub".to_owned(),
             attachments: Vec::new(),
@@ -58,10 +54,10 @@ async fn a_message_reaches_a_subscribed_client_through_the_feed() {
         .wait_feed(|e| matches!(upserted(e), Some(EntityPayload::Message(m)) if m.id == sent.id))
         .await;
     assert!(entry.seq > snapshot.seq);
-    assert_eq!(entry.channel_id, Some(everything));
+    assert_eq!(entry.channel_id, Some(tutti));
 
     // The channel snapshot has the message.
-    let channel_snapshot = client.snapshot(SnapshotScope::Channel(everything)).await;
+    let channel_snapshot = client.snapshot(SnapshotScope::Channel(tutti)).await;
     assert!(channel_snapshot.messages.iter().any(|m| m.id == sent.id));
     assert_eq!(channel_snapshot.channel_files.len(), 0);
     hub.handle.shutdown().await.unwrap();
@@ -71,9 +67,9 @@ async fn a_message_reaches_a_subscribed_client_through_the_feed() {
 async fn sending_the_same_client_message_id_twice_stores_one_message() {
     let hub = TestHub::start().await;
     let mut client = FakeClient::pair_and_connect(&hub).await;
-    let everything = client.everything().await;
+    let tutti = client.tutti().await;
     let request = || MessageSend {
-        channel_id: everything,
+        channel_id: tutti,
         client_message_id: "cm-same".to_owned(),
         body: "Once".to_owned(),
         attachments: Vec::new(),
@@ -86,7 +82,7 @@ async fn sending_the_same_client_message_id_twice_stores_one_message() {
 
     let page = client
         .request(MessageList {
-            channel_id: everything,
+            channel_id: tutti,
             thread_root_id: None,
             before: None,
             limit: None,
@@ -107,14 +103,14 @@ async fn sending_the_same_client_message_id_twice_stores_one_message() {
 async fn subscribing_from_an_older_position_replays_the_missed_entries() {
     let hub = TestHub::start().await;
     let mut client = FakeClient::pair_and_connect(&hub).await;
-    let everything = client.everything().await;
+    let tutti = client.tutti().await;
     let before = client.snapshot(SnapshotScope::All).await.seq;
 
     // Two messages arrive while the client is not subscribed.
     for i in 0..2 {
         client
             .request(MessageSend {
-                channel_id: everything,
+                channel_id: tutti,
                 client_message_id: format!("cm-{i}"),
                 body: format!("missed {i}"),
                 attachments: Vec::new(),
@@ -159,7 +155,7 @@ async fn a_position_the_hub_does_not_have_needs_a_new_snapshot() {
 async fn a_channel_filter_hides_the_entries_of_other_channels() {
     let hub = TestHub::start().await;
     let mut client = FakeClient::pair_and_connect(&hub).await;
-    let everything = client.everything().await;
+    let tutti = client.tutti().await;
     let other = client
         .request(consort_proto::client_api::ChannelCreate {
             name: "Other".to_owned(),
@@ -188,8 +184,8 @@ async fn a_channel_filter_hides_the_entries_of_other_channels() {
         .await
         .unwrap();
 
-    // A message in Everything first, then one in the other channel.
-    for (channel, text) in [(everything, "in everything"), (other.id, "in other")] {
+    // A message in Tutti first, then one in the other channel.
+    for (channel, text) in [(tutti, "in tutti"), (other.id, "in other")] {
         client
             .request(MessageSend {
                 channel_id: channel,
@@ -207,9 +203,11 @@ async fn a_channel_filter_hides_the_entries_of_other_channels() {
             |e| matches!(upserted(e), Some(EntityPayload::Message(m)) if m.body == "in other"),
         )
         .await;
-    assert!(!client.feed.iter().any(
-        |e| matches!(upserted(e), Some(EntityPayload::Message(m)) if m.body == "in everything")
-    ));
+    assert!(
+        !client.feed.iter().any(
+            |e| matches!(upserted(e), Some(EntityPayload::Message(m)) if m.body == "in tutti")
+        )
+    );
     hub.handle.shutdown().await.unwrap();
 }
 

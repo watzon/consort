@@ -189,10 +189,10 @@ async fn each_kind_of_session_gets_its_own_tool_list() {
         worker.peer.call_raw("tool.list", call).await.unwrap()
     }
     use consort_proto::ids::SessionId;
-    let everything_tools = names(list(&mut world.worker, coordinator.session_id).await);
-    assert!(everything_tools.contains(&"post_message".to_owned()));
-    assert!(everything_tools.contains(&"list_channels".to_owned()));
-    assert!(!everything_tools.contains(&"post_update".to_owned()));
+    let tutti_tools = names(list(&mut world.worker, coordinator.session_id).await);
+    assert!(tutti_tools.contains(&"post_message".to_owned()));
+    assert!(tutti_tools.contains(&"list_channels".to_owned()));
+    assert!(!tutti_tools.contains(&"post_update".to_owned()));
     let task_tools = names(list(&mut world.worker, task.session_id).await);
     assert!(task_tools.contains(&"post_update".to_owned()));
     assert!(task_tools.contains(&"submit_for_review".to_owned()));
@@ -292,7 +292,7 @@ async fn suggestions_travel_one_level_up() {
 async fn message_search_finds_messages_and_memory_with_a_tool() {
     let mut world = World::start().await;
     world
-        .say(world.everything, "The quarterly report is due on Friday.")
+        .say(world.tutti, "The quarterly report is due on Friday.")
         .await;
     let hits = world
         .client
@@ -374,10 +374,10 @@ async fn blobs_need_a_token_or_a_worker_signature_and_check_the_hash() {
     assert_eq!(response.status(), 404);
 
     // The blob becomes a channel file.
-    let everything = client.everything().await;
+    let tutti = client.tutti().await;
     let file = client
         .request(FilesPut {
-            channel_id: everything,
+            channel_id: tutti,
             path: "notes/hello.txt".to_owned(),
             blob_sha256: hash.clone(),
             size: u64::try_from(bytes.len()).unwrap(),
@@ -389,7 +389,7 @@ async fn blobs_need_a_token_or_a_worker_signature_and_check_the_hash() {
     assert_eq!(file.path, "notes/hello.txt");
     let listed = client
         .request(FilesList {
-            channel_id: everything,
+            channel_id: tutti,
             prefix: Some("notes/".to_owned()),
         })
         .await
@@ -398,7 +398,7 @@ async fn blobs_need_a_token_or_a_worker_signature_and_check_the_hash() {
     // A file whose blob was never uploaded is refused.
     let error = client
         .request(FilesPut {
-            channel_id: everything,
+            channel_id: tutti,
             path: "ghost.txt".to_owned(),
             blob_sha256: hash_of(b"ghost"),
             size: 5,
@@ -473,11 +473,11 @@ async fn a_worker_signs_its_blob_requests() {
 #[tokio::test]
 async fn a_message_attachment_and_thread_reply_counts_work_through_the_api() {
     let mut world = World::start().await;
-    let root = world.say(world.everything, "Root").await;
+    let root = world.say(world.tutti, "Root").await;
     let reply = world
         .client
         .request(MessageSend {
-            channel_id: world.everything,
+            channel_id: world.tutti,
             client_message_id: "reply-1".to_owned(),
             body: "A reply".to_owned(),
             attachments: Vec::new(),
@@ -491,7 +491,7 @@ async fn a_message_attachment_and_thread_reply_counts_work_through_the_api() {
     let snapshot = world
         .client
         .snapshot(consort_proto::client_api::SnapshotScope::Channel(
-            world.everything,
+            world.tutti,
         ))
         .await;
     let root_now = snapshot.messages.iter().find(|m| m.id == root.id).unwrap();

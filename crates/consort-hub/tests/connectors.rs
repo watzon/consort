@@ -223,8 +223,8 @@ async fn a_new_skill_replaces_the_idle_coordinator_session_at_its_next_turn() {
         )
         .await
         .unwrap();
-    let everything = world.everything;
-    world.say(everything, "Second").await;
+    let tutti = world.tutti;
+    world.say(tutti, "Second").await;
     // The set changed, so the hub ends the old session and starts one with
     // the skill.
     let (request, command) = world.worker.next_command().await;

@@ -87,10 +87,10 @@ async fn changing_the_instructions_replaces_the_coordinator_session() {
         )
         .await;
 
-    let mut update = ChannelUpdate::new(world.everything);
+    let mut update = ChannelUpdate::new(world.tutti);
     update.instructions = Some("Always answer in French.".to_owned());
     world.client.request(update).await.unwrap();
-    world.say(world.everything, "Bonjour").await;
+    world.say(world.tutti, "Bonjour").await;
 
     // The old session stops, and a new one starts with the new instructions.
     let mut stopped = None;
@@ -142,7 +142,7 @@ async fn a_routine_runs_now_and_wakes_the_coordinator() {
     let routine = world
         .client
         .request(RoutineCreate {
-            channel_id: world.everything,
+            channel_id: world.tutti,
             name: "Morning brief".to_owned(),
             schedule: RoutineSchedule::Interval { seconds: 3600 },
             prompt: "Summarize my open tasks.".to_owned(),
@@ -196,7 +196,7 @@ async fn a_routine_runs_now_and_wakes_the_coordinator() {
     let error = world
         .client
         .request(RoutineCreate {
-            channel_id: world.everything,
+            channel_id: world.tutti,
             name: "Too fast".to_owned(),
             schedule: RoutineSchedule::Interval { seconds: 5 },
             prompt: "x".to_owned(),
@@ -222,7 +222,7 @@ async fn a_start_task_routine_creates_a_task() {
     let routine = world
         .client
         .request(RoutineCreate {
-            channel_id: world.everything,
+            channel_id: world.tutti,
             name: "Nightly check".to_owned(),
             schedule: RoutineSchedule::Interval { seconds: 3600 },
             prompt: "Run the nightly checks and report.".to_owned(),

@@ -63,7 +63,7 @@ impl ToolCtx {
     /// The memory rights of the session.
     pub fn memory_actor(&self) -> MemoryActor {
         match self.audience {
-            ToolAudience::EverythingCoordinator => MemoryActor::EverythingCoordinator,
+            ToolAudience::TuttiCoordinator => MemoryActor::TuttiCoordinator,
             ToolAudience::ChannelCoordinator => MemoryActor::ChannelCoordinator(self.channel.id),
             ToolAudience::TaskSession => MemoryActor::TaskSession(self.channel.memory_scope()),
         }
@@ -137,7 +137,7 @@ impl Deref for Hub {
 }
 
 impl Hub {
-    /// Opens the store and creates the Everything channel when it is missing.
+    /// Opens the store and creates the Tutti channel when it is missing.
     /// It does not listen on a socket.
     pub async fn open(data_dir: &Path, public_url: String) -> Result<Self> {
         let store = Store::open(data_dir)?;
@@ -165,12 +165,12 @@ impl Hub {
     async fn bootstrap(&self) -> Result<()> {
         self.store
             .write(|tx| {
-                if conversation::everything_channel(tx.db()).is_err() {
+                if conversation::tutti_channel(tx.db()).is_err() {
                     let now = tx.now();
                     tx.save_channel(&Channel {
                         id: ChannelId::new(),
-                        kind: ChannelKind::Everything,
-                        name: "Everything".to_owned(),
+                        kind: ChannelKind::Tutti,
+                        name: "Tutti".to_owned(),
                         icon: None,
                         color: None,
                         group_id: None,
@@ -231,11 +231,7 @@ pub(crate) async fn test_task_session(
     };
     use consort_proto::status::TaskStatus;
 
-    let channel = hub
-        .store
-        .read(conversation::everything_channel)
-        .await
-        .unwrap();
+    let channel = hub.store.read(conversation::tutti_channel).await.unwrap();
     let task = hub
         .create_task(crate::ops::hooks::NewTask {
             channel_id: channel.id,

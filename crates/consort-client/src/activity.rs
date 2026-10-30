@@ -126,7 +126,7 @@ pub struct TaskWork<'a> {
 pub struct Inputs<'a> {
     pub channel_id: &'a str,
     /// Tutti reads every channel, so every task counts.
-    pub everything: bool,
+    pub tutti: bool,
     pub tasks: &'a [TaskWork<'a>],
     /// The newest item of each session.
     pub sessions: &'a [SessionActivity],
@@ -167,7 +167,7 @@ pub fn channel_activity(inputs: &Inputs<'_>) -> ActivityView {
     let relevant: Vec<&TaskWork<'_>> = inputs
         .tasks
         .iter()
-        .filter(|t| inputs.everything || t.channel_id == inputs.channel_id)
+        .filter(|t| inputs.tutti || t.channel_id == inputs.channel_id)
         .collect();
     let task_sessions: Vec<&str> = inputs.tasks.iter().filter_map(|t| t.session_id).collect();
     // The sessions whose items speak for this channel's work: the sessions
@@ -285,14 +285,14 @@ mod tests {
 
     fn run(
         channel: &str,
-        everything: bool,
+        tutti: bool,
         tasks: &[TaskWork<'_>],
         sessions: &[SessionActivity],
         timeline: Option<&TimelineView>,
     ) -> ActivityView {
         channel_activity(&Inputs {
             channel_id: channel,
-            everything,
+            tutti,
             tasks,
             sessions,
             timeline,

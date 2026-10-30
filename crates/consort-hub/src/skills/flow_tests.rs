@@ -838,11 +838,7 @@ async fn the_update_check_finds_a_new_version_and_only_accept_moves_the_pin() {
 }
 
 async fn coordinator(hub: &Hub) -> (SessionId, consort_proto::ids::ChannelId) {
-    let channel = hub
-        .store
-        .read(conversation::everything_channel)
-        .await
-        .unwrap();
+    let channel = hub.store.read(conversation::tutti_channel).await.unwrap();
     let session = Session {
         id: SessionId::new(),
         role: SessionRole::Coordinator,

@@ -694,12 +694,10 @@ fn replace_signed_out_coordinator(tx: &mut Tx<'_>, ctx: &mut Ctx<'_>) -> Result<
 /// True when placement finds a worker and an account for a new coordinator
 /// session of the channel now.
 fn coordinator_can_start(tx: &Tx<'_>, channel: &Channel) -> Result<bool> {
-    let everything = conversation::everything_channel(tx.db())?;
+    let tutti = conversation::tutti_channel(tx.db())?;
     let workers = crate::store::machine::workers(tx.db())?;
     let open = work::open_session_counts(tx.db())?;
-    let selection = channel
-        .effective_coordinator_selection(&everything)
-        .cloned();
+    let selection = channel.effective_coordinator_selection(&tutti).cloned();
     let request = consort_proto::model::PlacementRequest::default();
     Ok(crate::placement::place(&crate::placement::PlacementInput {
         subject: crate::placement::Subject::Coordinator,

@@ -53,7 +53,7 @@ _Avoid_: dependency, global install, binary
 ## Conversation
 
 **Tutti**:
-The main channel, where the assistant can read every other channel and manage all of Consort. In music, "tutti" means that all voices play together. The UI says Tutti. The code and the wire still call it Everything (`ChannelKind::Everything`, `ToolAudience::EverythingCoordinator`) until a later rename pass.
+The main channel, where the assistant can read every other channel and manage all of Consort. In music, "tutti" means that all voices play together. The UI, the code and the wire say Tutti.
 _Avoid_: Everything (the old name), main chat, home, inbox, overview
 
 **Channel**:

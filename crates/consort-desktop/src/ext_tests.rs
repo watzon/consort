@@ -357,3 +357,228 @@ fn the_sign_in_card_opens_the_sign_in_that_the_hub_started(cx: &mut TestAppConte
         assert_eq!(app.add_account.step, crate::app::AccountStep::SignIn);
     });
 }
+
+/// Whether an element with this debug selector is on screen. The selector
+/// leaks, which is fine in a test.
+fn has_bounds(cx: &mut VisualTestContext, selector: String) -> bool {
+    let selector: &'static str = Box::leak(selector.into_boxed_str());
+    cx.debug_bounds(selector).is_some()
+}
+
+fn labels(items: &[crate::ui::menu::MenuItem]) -> Vec<&str> {
+    items.iter().map(|i| i.label.as_ref()).collect()
+}
+
+/// Settings > Skills lists the sources of the skill directory. Only a source
+/// that the user added has a row menu, and its one item is Remove. skills.sh
+/// is a link and not a source.
+#[gpui::test]
+fn settings_skills_lists_the_sources_and_only_added_ones_can_be_removed(cx: &mut TestAppContext) {
+    let (handle, app) = open_app(cx, consort_client::mock::view_state());
+    let cx = &mut VisualTestContext::from_window(handle, cx);
+    cx.update(|_, cx| app.update(cx, |app, cx| app.open_settings(SettingsSection::Skills, cx)));
+    settle(cx);
+    let sources = app.read_with(cx, |app, _| app.state.skill_directory.sources.clone());
+    assert_eq!(
+        sources.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+        ["smithery", "anthropic", "src_acme"]
+    );
+    for id in ["smithery", "anthropic", "src_acme"] {
+        assert!(
+            has_bounds(cx, format!("skill-source-{id}")),
+            "the row of {id}"
+        );
+    }
+    assert!(cx.debug_bounds("add-skill-source").is_some());
+    assert!(cx.debug_bounds("skills-sh-link").is_some(), "skills.sh");
+    for source in &sources {
+        let menu = crate::ui::menu::skill_source_menu(source);
+        if source.removable {
+            let items = menu.expect("an added source has a menu");
+            assert_eq!(labels(&items), ["Remove"]);
+            assert_eq!(
+                items[0].action,
+                crate::ui::menu::MenuAction::RemoveSkillSource(source.id.clone())
+            );
+        } else {
+            assert!(menu.is_none(), "{} cannot be removed", source.name);
+        }
+    }
+}
+
+/// Add source asks for one URL, says what to do when it is empty, calls
+/// `skill_directory.add_source`, and closes. Remove calls
+/// `skill_directory.remove_source`.
+#[gpui::test]
+fn add_source_and_remove_call_the_directory_requests(cx: &mut TestAppContext) {
+    let (handle, app) = open_app(cx, consort_client::mock::view_state());
+    let cx = &mut VisualTestContext::from_window(handle, cx);
+    cx.update(|_, cx| app.update(cx, |app, cx| app.open_settings(SettingsSection::Skills, cx)));
+    settle(cx);
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            app.open_dialog(Dialog::AddSkillSource, window, cx)
+        })
+    });
+    settle(cx);
+    app.read_with(cx, |app, _| {
+        assert_eq!(app.dialog, Some(Dialog::AddSkillSource));
+    });
+    // An empty field says what to paste.
+    cx.update(|window, cx| app.update(cx, |app, cx| app.add_skill_source(window, cx)));
+    settle(cx);
+    app.read_with(cx, |app, _| {
+        assert_eq!(
+            app.dialog_error.as_deref(),
+            Some("Paste the URL of a git repo or a marketplace.json file.")
+        );
+        assert_eq!(app.dialog, Some(Dialog::AddSkillSource), "the dialog stays");
+        assert_eq!(app.state.skill_directory.sources.len(), 3);
+    });
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            app.ext_inputs.source_url.update(cx, |input, cx| {
+                input.set_value("https://github.com/owner/repo", window, cx)
+            });
+            app.add_skill_source(window, cx);
+        })
+    });
+    settle(cx);
+    app.read_with(cx, |app, _| {
+        assert!(app.dialog.is_none(), "the dialog closes");
+        let added = app
+            .state
+            .skill_directory
+            .sources
+            .iter()
+            .find(|s| s.url == "https://github.com/owner/repo")
+            .expect("the new source");
+        assert!(added.removable);
+        assert_eq!(added.name, "owner/repo");
+        assert_eq!(app.state.skill_directory.sources.len(), 4);
+    });
+    // Remove takes an added source away. The built-in ones stay.
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            app.run_menu(
+                crate::ui::menu::MenuAction::RemoveSkillSource("src_acme".into()),
+                window,
+                cx,
+            )
+        })
+    });
+    settle(cx);
+    app.read_with(cx, |app, _| {
+        let ids: Vec<&str> = app
+            .state
+            .skill_directory
+            .sources
+            .iter()
+            .map(|s| s.id.as_str())
+            .collect();
+        assert!(!ids.contains(&"src_acme"));
+        assert!(ids.contains(&"smithery") && ids.contains(&"anthropic"));
+        assert_eq!(ids.len(), 3);
+    });
+}
+
+/// The Activity item of a connection opens a dialog with the calls: the
+/// tool, the decision, the outcome, the time and the size. Show more loads
+/// the older page.
+#[gpui::test]
+fn the_activity_dialog_lists_the_calls_and_pages(cx: &mut TestAppContext) {
+    let (handle, app) = open_app(cx, consort_client::mock::view_state());
+    let cx = &mut VisualTestContext::from_window(handle, cx);
+    cx.update(|_, cx| {
+        app.update(cx, |app, cx| {
+            app.open_settings(SettingsSection::Connectors, cx)
+        })
+    });
+    settle(cx);
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            app.run_menu(
+                crate::ui::menu::MenuAction::ConnectionActivity(mx::CON_GITHUB.into()),
+                window,
+                cx,
+            )
+        })
+    });
+    settle(cx);
+    app.read_with(cx, |app, _| {
+        assert_eq!(
+            app.dialog,
+            Some(Dialog::ConnectionActivity(mx::CON_GITHUB.into()))
+        );
+        let calls = &app.ext.activity.calls;
+        assert_eq!(calls.len(), 3, "the newest page");
+        assert!(app.ext.activity.has_more);
+        let sent = &calls[1];
+        assert_eq!(sent.tool, "GMAIL_SEND_EMAIL");
+        assert_eq!(sent.decision, "Allowed by you");
+        assert!(sent.succeeded);
+        assert_eq!(sent.size_label, "412 B");
+        let denied = &calls[2];
+        assert!(!denied.succeeded);
+        assert_eq!(denied.error.as_deref(), Some("You said no."));
+    });
+    for id in ["ccl_mock_3", "ccl_mock_2", "ccl_mock_1"] {
+        assert!(has_bounds(cx, format!("call-{id}")), "{id}");
+    }
+    assert!(cx.debug_bounds("call-ccl_mock_0").is_none());
+    assert!(cx.debug_bounds("activity-more").is_some(), "Show more");
+    cx.update(|_, cx| {
+        app.update(cx, |app, cx| {
+            app.load_activity(mx::CON_GITHUB.into(), true, cx)
+        })
+    });
+    settle(cx);
+    app.read_with(cx, |app, _| {
+        assert_eq!(app.ext.activity.calls.len(), 4);
+        assert!(!app.ext.activity.has_more);
+        assert_eq!(app.ext.activity.calls[3].id, "ccl_mock_0");
+    });
+    assert!(cx.debug_bounds("call-ccl_mock_0").is_some());
+    assert!(cx.debug_bounds("activity-more").is_none(), "no more pages");
+}
+
+/// A page that fails says what happened and what to do next, and Try again
+/// loads the first page again.
+#[gpui::test]
+fn the_activity_dialog_says_when_the_calls_do_not_load(cx: &mut TestAppContext) {
+    let (handle, app) = open_app(cx, consort_client::mock::view_state());
+    let cx = &mut VisualTestContext::from_window(handle, cx);
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            app.open_dialog(
+                Dialog::ConnectionActivity(mx::CON_GITHUB.into()),
+                window,
+                cx,
+            )
+        })
+    });
+    settle(cx);
+    cx.update(|window, cx| {
+        app.update(cx, |app, _| {
+            app.ext.activity.calls.clear();
+            app.ext.activity.has_more = false;
+            app.ext.activity.error = Some(
+                "Consort could not load the activity: the hub does not answer. Try again.".into(),
+            );
+        });
+        window.refresh();
+    });
+    settle(cx);
+    assert!(cx.debug_bounds("activity-retry").is_some(), "Try again");
+    cx.update(|_, cx| {
+        app.update(cx, |app, cx| {
+            app.load_activity(mx::CON_GITHUB.into(), false, cx)
+        })
+    });
+    settle(cx);
+    app.read_with(cx, |app, _| {
+        assert!(app.ext.activity.error.is_none());
+        assert_eq!(app.ext.activity.calls.len(), 3);
+    });
+    assert!(cx.debug_bounds("activity-retry").is_none());
+}

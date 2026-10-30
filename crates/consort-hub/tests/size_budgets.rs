@@ -22,13 +22,13 @@ use serde_json::json;
 async fn many_long_briefs_fit_in_a_snapshot_as_previews_and_task_get_has_them_in_full() {
     let hub = TestHub::start().await;
     let mut client = FakeClient::pair_and_connect(&hub).await;
-    let everything = client.everything().await;
+    let tutti = client.tutti().await;
     let brief = "b".repeat(31 * 1024);
     let mut ids = Vec::new();
     for i in 0..34 {
         let created = client
             .request(TaskCreate {
-                channel_id: everything,
+                channel_id: tutti,
                 title: format!("Task {i}"),
                 brief: brief.clone(),
                 model_selection: None,
@@ -40,7 +40,7 @@ async fn many_long_briefs_fit_in_a_snapshot_as_previews_and_task_get_has_them_in
             .unwrap();
         ids.push(created.task.id);
     }
-    for scope in [SnapshotScope::All, SnapshotScope::Channel(everything)] {
+    for scope in [SnapshotScope::All, SnapshotScope::Channel(tutti)] {
         let snapshot = client.request(SyncSnapshot { scope }).await.unwrap();
         assert_eq!(snapshot.tasks.len(), 34);
         assert!(!snapshot.tasks_has_more);
@@ -109,13 +109,13 @@ async fn fetch_thread(world: &mut World, args: serde_json::Value) -> FetchThread
 async fn a_long_thread_comes_in_pages_and_the_named_reply_is_whole() {
     let mut world = World::start().await;
     world.start_coordinator("hi").await;
-    let root = world.say(world.everything, "root").await;
+    let root = world.say(world.tutti, "root").await;
     let mut replies: Vec<MessageId> = Vec::new();
     for i in 0..5 {
         let sent = world
             .client
             .request(MessageSend {
-                channel_id: world.everything,
+                channel_id: world.tutti,
                 client_message_id: format!("cm-big-{i}"),
                 body: format!("{i}{}", "x".repeat(200 * 1024)),
                 attachments: Vec::new(),

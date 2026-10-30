@@ -109,7 +109,7 @@ async fn a_worker_with_open_turns_in_two_channels_can_say_hello_after_a_restart(
         .unwrap()
         .channel
         .id;
-    world.say(world.everything, "one").await;
+    world.say(world.tutti, "one").await;
     world.worker.accept_session_start().await;
     world.say(b, "two").await;
     world.worker.accept_session_start().await;
@@ -206,7 +206,7 @@ async fn a_session_that_the_hub_marks_lost_gets_a_stop_command() {
             vec![turn_ended("t1", TurnEndReason::Completed)],
         )
         .await;
-    world.say(world.everything, "again").await;
+    world.say(world.tutti, "again").await;
     // The worker says that it does not know the session, so the hub marks it
     // lost. The worker may still run the harness, so it gets session.stop.
     let (request, command) = world.worker.next_command().await;
@@ -324,7 +324,7 @@ async fn a_thread_message_for_an_offline_worker_waits_for_the_open_turn() {
     world
         .client
         .request(MessageSend {
-            channel_id: world.everything,
+            channel_id: world.tutti,
             client_message_id: "while-away".to_owned(),
             body: "Also update the docs.".to_owned(),
             attachments: Vec::new(),

@@ -1,4 +1,4 @@
-//! Hub tools for messages, memory, files, search and the Everything-only tools.
+//! Hub tools for messages, memory, files, search and the Tutti-only tools.
 //!
 //! Each method returns the JSON of the matching `*Result` type from
 //! `consort_proto::tools`.
@@ -131,13 +131,13 @@ fn policy_denied(message: impl Into<String>) -> HubError {
     HubError::new(ErrorCode::PolicyDenied, message)
 }
 
-/// Stops a session that is not the Everything coordinator.
-fn require_everything(ctx: &ToolCtx) -> Result<()> {
-    if ctx.audience == ToolAudience::EverythingCoordinator {
+/// Stops a session that is not the Tutti coordinator.
+fn require_tutti(ctx: &ToolCtx) -> Result<()> {
+    if ctx.audience == ToolAudience::TuttiCoordinator {
         Ok(())
     } else {
         Err(policy_denied(
-            "Only the Everything coordinator can use this tool.",
+            "Only the Tutti coordinator can use this tool.",
         ))
     }
 }
@@ -562,7 +562,7 @@ impl Hub {
     // Search ---------------------------------------------------------------
 
     pub(crate) async fn tool_search(&self, ctx: &ToolCtx, args: SearchArgs) -> Result<Value> {
-        let sees_every_channel = ctx.audience == ToolAudience::EverythingCoordinator;
+        let sees_every_channel = ctx.audience == ToolAudience::TuttiCoordinator;
         let own_channel = ctx.channel.id;
         if !sees_every_channel && args.channel_id.is_some_and(|id| id != own_channel) {
             return Err(policy_denied(
@@ -587,10 +587,10 @@ impl Hub {
         to_value(&SearchResult { hits })
     }
 
-    // The Everything coordinator -------------------------------------------
+    // The Tutti coordinator -------------------------------------------
 
     pub(crate) async fn tool_list_channels(&self, ctx: &ToolCtx, _args: NoArgs) -> Result<Value> {
-        require_everything(ctx)?;
+        require_tutti(ctx)?;
         let channels = self
             .store
             .read(|conn| {
@@ -619,7 +619,7 @@ impl Hub {
         ctx: &ToolCtx,
         args: ReadChannelArgs,
     ) -> Result<Value> {
-        require_everything(ctx)?;
+        require_tutti(ctx)?;
         let result = self
             .store
             .read(move |conn| {
@@ -658,7 +658,7 @@ impl Hub {
         ctx: &ToolCtx,
         args: MessageChannelArgs,
     ) -> Result<Value> {
-        require_everything(ctx)?;
+        require_tutti(ctx)?;
         require_text(&args.body, "message")?;
         let session_id = ctx.session.id;
         let target = args.channel_id;
@@ -666,9 +666,9 @@ impl Hub {
             .store
             .write(move |tx| {
                 let channel = conversation::channel_or_404(tx.db(), target)?;
-                if channel.is_everything() {
+                if channel.is_tutti() {
                     return Err(HubError::conflict(
-                        "You cannot use message_channel for the Everything channel. Use post_message.",
+                        "You cannot use message_channel for the Tutti channel. Use post_message.",
                     ));
                 }
                 let message = tx.insert_message(NewMessage {
@@ -677,7 +677,7 @@ impl Hub {
                 })?;
                 tx.queue_wake(
                     target,
-                    &WakeEvent::EverythingMessage {
+                    &WakeEvent::TuttiMessage {
                         id: message.id,
                         at: message.created_at,
                         text: message.body.clone(),
@@ -742,11 +742,8 @@ mod tests {
         .channel
     }
 
-    async fn everything(hub: &Hub) -> Channel {
-        hub.store
-            .read(conversation::everything_channel)
-            .await
-            .unwrap()
+    async fn tutti(hub: &Hub) -> Channel {
+        hub.store.read(conversation::tutti_channel).await.unwrap()
     }
 
     async fn reload(hub: &Hub, channel: &Channel) -> Channel {
@@ -1211,17 +1208,17 @@ mod tests {
     #[tokio::test]
     async fn memory_rights_follow_the_memory_actor_rules() {
         let (hub, _dir) = test_hub().await;
-        let everything = everything(&hub).await;
+        let tutti = tutti(&hub).await;
         let a = new_channel(&hub, "A").await;
         let b = new_channel(&hub, "B").await;
-        let everything_ctx = ctx_for(&hub, &everything, SessionRole::Coordinator).await;
+        let tutti_ctx = ctx_for(&hub, &tutti, SessionRole::Coordinator).await;
         let a_ctx = ctx_for(&hub, &a, SessionRole::Coordinator).await;
         let b_ctx = ctx_for(&hub, &b, SessionRole::Coordinator).await;
         let task_ctx = ctx_for(&hub, &a, SessionRole::Task).await;
         assert_eq!(task_ctx.audience, ToolAudience::TaskSession);
 
         // Each coordinator writes its own scope.
-        write_note(&hub, &everything_ctx, "me.md", "The user is Chris.").await;
+        write_note(&hub, &tutti_ctx, "me.md", "The user is Chris.").await;
         write_note(&hub, &a_ctx, "a.md", "Channel A notes.").await;
         write_note(&hub, &b_ctx, "b.md", "Channel B notes.").await;
 
@@ -1247,12 +1244,12 @@ mod tests {
         let scope_a = Some(MemoryScope::Channel(a.id));
         let scope_b = Some(MemoryScope::Channel(b.id));
 
-        // The Everything coordinator reads every scope. It defaults to global.
-        let default = list(&everything_ctx, None).await.unwrap();
+        // The Tutti coordinator reads every scope. It defaults to global.
+        let default = list(&tutti_ctx, None).await.unwrap();
         assert_eq!(default.notes.len(), 1);
         assert_eq!(default.notes[0].path, "me.md");
-        assert!(read(&everything_ctx, scope_b, "b.md").await.is_ok());
-        assert_eq!(list(&everything_ctx, scope_a).await.unwrap().notes.len(), 1);
+        assert!(read(&tutti_ctx, scope_b, "b.md").await.is_ok());
+        assert_eq!(list(&tutti_ctx, scope_a).await.unwrap().notes.len(), 1);
 
         // A channel coordinator defaults to its channel, reads global, and
         // cannot read another channel.
@@ -1436,9 +1433,9 @@ mod tests {
             .await;
         assert_eq!(code_of(delete), ErrorCode::PolicyDenied);
 
-        // The Everything channel writes global memory, which has no switch.
-        let everything_ctx = ctx_for(&hub, &everything(&hub).await, SessionRole::Coordinator).await;
-        write_note(&hub, &everything_ctx, "me.md", "x").await;
+        // The Tutti channel writes global memory, which has no switch.
+        let tutti_ctx = ctx_for(&hub, &tutti(&hub).await, SessionRole::Coordinator).await;
+        write_note(&hub, &tutti_ctx, "me.md", "x").await;
     }
 
     // Files -----------------------------------------------------------------
@@ -1574,10 +1571,10 @@ mod tests {
     #[tokio::test]
     async fn search_hits_depend_on_the_audience() {
         let (hub, _dir) = test_hub().await;
-        let everything = everything(&hub).await;
+        let tutti = tutti(&hub).await;
         let a = new_channel(&hub, "A").await;
         let b = new_channel(&hub, "B").await;
-        let everything_ctx = ctx_for(&hub, &everything, SessionRole::Coordinator).await;
+        let tutti_ctx = ctx_for(&hub, &tutti, SessionRole::Coordinator).await;
         let a_ctx = ctx_for(&hub, &a, SessionRole::Coordinator).await;
         let b_ctx = ctx_for(&hub, &b, SessionRole::Coordinator).await;
         let task_ctx = ctx_for(&hub, &a, SessionRole::Task).await;
@@ -1586,13 +1583,7 @@ mod tests {
         user_message(&hub, b.id, "pelican in B").await;
         make_task(&hub, a.id, "Feed the pelican", TaskStatus::Working).await;
         make_task(&hub, b.id, "Count pelicans", TaskStatus::Working).await;
-        write_note(
-            &hub,
-            &everything_ctx,
-            "birds.md",
-            "The user likes pelicans.",
-        )
-        .await;
+        write_note(&hub, &tutti_ctx, "birds.md", "The user likes pelicans.").await;
         write_note(&hub, &a_ctx, "a.md", "Pelican rules for A.").await;
         write_note(&hub, &b_ctx, "b.md", "Pelican rules for B.").await;
 
@@ -1634,12 +1625,12 @@ mod tests {
             ids
         };
 
-        // Everything sees every channel and every memory scope.
-        let all = counts(search(&everything_ctx, None).await.unwrap());
+        // Tutti sees every channel and every memory scope.
+        let all = counts(search(&tutti_ctx, None).await.unwrap());
         assert_eq!(all.messages, sorted(vec![a.id, b.id]));
         assert_eq!(all.tasks, sorted(vec![a.id, b.id]));
         assert_eq!(all.notes.len(), 3);
-        let only_b = counts(search(&everything_ctx, Some(b.id)).await.unwrap());
+        let only_b = counts(search(&tutti_ctx, Some(b.id)).await.unwrap());
         assert_eq!(only_b.messages, [b.id]);
         assert_eq!(only_b.tasks, [b.id]);
         assert_eq!(only_b.notes, [MemoryScope::Channel(b.id)]);
@@ -1661,12 +1652,12 @@ mod tests {
         }
     }
 
-    // The Everything coordinator ---------------------------------------------
+    // The Tutti coordinator ---------------------------------------------
 
     #[tokio::test]
     async fn list_channels_counts_active_tasks_and_flags_archived_channels() {
         let (hub, _dir) = test_hub().await;
-        let everything = everything(&hub).await;
+        let tutti = tutti(&hub).await;
         let a = new_channel(&hub, "A").await;
         let old = new_channel(&hub, "Old").await;
         hub.channel_archive(
@@ -1681,15 +1672,15 @@ mod tests {
         make_task(&hub, a.id, "One", TaskStatus::Working).await;
         make_task(&hub, a.id, "Two", TaskStatus::Review).await;
         make_task(&hub, a.id, "Three", TaskStatus::Resolved).await;
-        let ctx = ctx_for(&hub, &everything, SessionRole::Coordinator).await;
+        let ctx = ctx_for(&hub, &tutti, SessionRole::Coordinator).await;
 
         let listed: ListChannelsResult =
             parse(hub.tool_list_channels(&ctx, NoArgs {}).await.unwrap());
         assert_eq!(listed.channels.len(), 3);
         let find = |id: ChannelId| listed.channels.iter().find(|c| c.id == id).unwrap();
         assert_eq!(
-            find(everything.id).kind,
-            consort_proto::model::ChannelKind::Everything
+            find(tutti.id).kind,
+            consort_proto::model::ChannelKind::Tutti
         );
         assert!(!find(a.id).archived);
         assert_eq!(find(a.id).purpose, "About A");
@@ -1703,10 +1694,10 @@ mod tests {
     #[tokio::test]
     async fn read_channel_returns_timeline_tasks_and_memory() {
         let (hub, _dir) = test_hub().await;
-        let everything = everything(&hub).await;
+        let tutti = tutti(&hub).await;
         let a = new_channel(&hub, "A").await;
         let a_ctx = ctx_for(&hub, &a, SessionRole::Coordinator).await;
-        let ctx = ctx_for(&hub, &everything, SessionRole::Coordinator).await;
+        let ctx = ctx_for(&hub, &tutti, SessionRole::Coordinator).await;
         let first = user_message(&hub, a.id, "first").await;
         tokio::time::sleep(std::time::Duration::from_millis(3)).await;
         let second = user_message(&hub, a.id, "second").await;
@@ -1772,12 +1763,12 @@ mod tests {
                 .all(|m| m.id != first.id && m.id != second.id)
         );
 
-        // The Everything channel reads its own memory scope, which is global.
+        // The Tutti channel reads its own memory scope, which is global.
         let own = hub
             .tool_read_channel(
                 &ctx,
                 ReadChannelArgs {
-                    channel_id: everything.id,
+                    channel_id: tutti.id,
                     since: None,
                 },
             )
@@ -1800,9 +1791,9 @@ mod tests {
     #[tokio::test]
     async fn message_channel_posts_and_queues_the_wake_event() {
         let (hub, _dir) = test_hub().await;
-        let everything = everything(&hub).await;
+        let tutti = tutti(&hub).await;
         let a = new_channel(&hub, "A").await;
-        let ctx = ctx_for(&hub, &everything, SessionRole::Coordinator).await;
+        let ctx = ctx_for(&hub, &tutti, SessionRole::Coordinator).await;
 
         let result = hub
             .tool_message_channel(
@@ -1829,24 +1820,24 @@ mod tests {
         assert_eq!(wakes.len(), 1);
         assert_eq!(
             wakes[0].1,
-            WakeEvent::EverythingMessage {
+            WakeEvent::TuttiMessage {
                 id: message.id,
                 at: message.created_at,
                 text: "Check the release notes.".to_owned(),
             }
         );
 
-        // Everything is not a target. An unknown channel and an empty body are refused.
-        let to_everything = hub
+        // Tutti is not a target. An unknown channel and an empty body are refused.
+        let to_tutti = hub
             .tool_message_channel(
                 &ctx,
                 MessageChannelArgs {
-                    channel_id: everything.id,
+                    channel_id: tutti.id,
                     body: "x".to_owned(),
                 },
             )
             .await;
-        assert_eq!(code_of(to_everything), ErrorCode::Conflict);
+        assert_eq!(code_of(to_tutti), ErrorCode::Conflict);
         let unknown = hub
             .tool_message_channel(
                 &ctx,
@@ -1870,7 +1861,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_everything_only_tools_refuse_other_sessions() {
+    async fn the_tutti_only_tools_refuse_other_sessions() {
         let (hub, _dir) = test_hub().await;
         let a = new_channel(&hub, "A").await;
         let ctx = ctx_for(&hub, &a, SessionRole::Coordinator).await;

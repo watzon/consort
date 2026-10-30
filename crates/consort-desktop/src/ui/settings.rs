@@ -48,7 +48,7 @@ const SECTIONS: [(&str, &[SectionEntry]); 3] = [
             (SettingsSection::Connectors, "Connectors", "link"),
             (SettingsSection::Skills, "Skills", "box"),
             (SettingsSection::Memory, "Memory", "book-open"),
-            (SettingsSection::Routines, "Routines", "clock"),
+            (SettingsSection::Routines, "Routines", "routine"),
         ],
     ),
 ];

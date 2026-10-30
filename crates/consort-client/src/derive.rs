@@ -96,8 +96,8 @@ pub fn channel_status(state: &ViewState, channel_id: &str) -> Option<TaskStatus>
 
 fn sidebar_channel(state: &ViewState, channel_id: &str, unread: u32) -> Option<SidebarChannel> {
     let channel = state.channel(channel_id)?;
-    // Everything shows no task glyph, but its own requests still mark it.
-    let status = if channel.kind == ChannelKind::Everything {
+    // Tutti shows no task glyph, but its own requests still mark it.
+    let status = if channel.kind == ChannelKind::Tutti {
         channel_waits(state, channel_id).then_some(TaskStatus::NeedsInput)
     } else {
         channel_status(state, channel_id)
@@ -113,18 +113,18 @@ fn sidebar_channel(state: &ViewState, channel_id: &str, unread: u32) -> Option<S
 }
 
 fn unread_of(previous: &SidebarView, channel_id: &str) -> u32 {
-    std::iter::once(&previous.everything)
+    std::iter::once(&previous.tutti)
         .chain(previous.groups.iter().flat_map(|g| g.channels.iter()))
         .chain(previous.ungrouped.iter())
         .find(|c| c.id == channel_id)
         .map_or(0, |c| c.unread)
 }
 
-/// The sidebar: Everything, the groups in order, then channels with no group.
+/// The sidebar: Tutti, the groups in order, then channels with no group.
 pub fn sidebar(state: &ViewState) -> SidebarView {
     let previous = &state.sidebar;
-    let everything = state
-        .everything()
+    let tutti = state
+        .tutti()
         .and_then(|c| sidebar_channel(state, &c.id, unread_of(previous, &c.id)))
         .unwrap_or_default();
     let groups = state
@@ -158,7 +158,7 @@ pub fn sidebar(state: &ViewState) -> SidebarView {
         .filter_map(|c| sidebar_channel(state, &c.id, unread_of(previous, &c.id)))
         .collect();
     SidebarView {
-        everything,
+        tutti,
         groups,
         ungrouped,
         workers_online: state.workers.iter().filter(|w| w.online).count() as u32,

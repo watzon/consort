@@ -27,6 +27,20 @@ pub fn time_label(ms: i64) -> String {
         .unwrap_or_default()
 }
 
+/// The size of something in bytes, in a few characters: "0 B", "512 B",
+/// "1.2 KB", "3.4 MB".
+pub fn size_label(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let kb = bytes as f64 / KB;
+    if kb < KB {
+        return format!("{kb:.1} KB");
+    }
+    format!("{:.1} MB", kb / KB)
+}
+
 /// "Today", "Yesterday", "Tuesday" within a week, then "October 12".
 pub fn day_label(ms: i64, now_ms: i64) -> String {
     let (Some(day), Some(now)) = (local(ms), local(now_ms)) else {
@@ -283,6 +297,14 @@ pub fn now_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_size_reads_in_a_few_characters() {
+        assert_eq!(super::size_label(0), "0 B");
+        assert_eq!(super::size_label(512), "512 B");
+        assert_eq!(super::size_label(1536), "1.5 KB");
+        assert_eq!(super::size_label(3 * 1024 * 1024 + 400_000), "3.4 MB");
+    }
+
     use super::*;
 
     #[test]

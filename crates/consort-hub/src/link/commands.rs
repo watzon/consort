@@ -442,11 +442,7 @@ mod tests {
     #[tokio::test]
     async fn an_expired_answer_ends_the_session_fails_the_task_and_shows_expired() {
         let (hub, _dir) = crate::hub::test_hub().await;
-        let channel = hub
-            .store
-            .read(conversation::everything_channel)
-            .await
-            .unwrap();
+        let channel = hub.store.read(conversation::tutti_channel).await.unwrap();
         let task = hub
             .create_task(NewTask {
                 channel_id: channel.id,

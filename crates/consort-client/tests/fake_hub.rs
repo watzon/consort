@@ -33,17 +33,19 @@ use consort_proto::{
         PairClientResponse, auth_signing_payload, normalize_origin,
     },
     client_api::{
-        ApprovalAnswer, ApprovalResult, EntityPayload, FeedEntry, MessageList, MessageListResult,
-        MessageResult, MessageSend, SNAPSHOT_MESSAGE_LIMIT, Snapshot, SnapshotScope, SyncSnapshot,
-        SyncSubscribe, TaskGet, TaskResult,
+        self as api, ApprovalAnswer, ApprovalResult, EntityPayload, FeedEntry, MessageList,
+        MessageListResult, MessageResult, MessageSend, SNAPSHOT_MESSAGE_LIMIT, Snapshot,
+        SnapshotScope, SyncSnapshot, SyncSubscribe, TaskGet, TaskResult,
     },
     error::{ErrorBody, ErrorCode},
     frame::{Empty, EventFrame, Frame, RequestFrame},
     ids::{ApprovalId, ChannelId, ClientId, MessageId, RequestId, SessionId, TaskId},
     model::{
-        Approval, ApprovalDetails, ApprovalMode, ApprovalStatus, Author, Channel, ChannelKind,
-        Isolation, Message, MessageKind, PlacementRequest, RequestOption, RequestOptionKind, Task,
-        TaskCreator,
+        Approval, ApprovalDetails, ApprovalMode, ApprovalStatus, AuditStatus, Author, CallDecision,
+        CallOutcome, Channel, ChannelKind, ConnectorCall, Isolation, Message, MessageKind,
+        PlacementRequest, RequestOption, RequestOptionKind, Skill, SkillAudit, SkillDirectoryEntry,
+        SkillDirectoryKind, SkillDirectorySource, SkillFileInfo, SkillSource, Task, TaskCreator,
+        ToolKind,
     },
     status::TaskStatus as PS,
     time::Timestamp,
@@ -116,6 +118,15 @@ struct Hub {
     /// `approval.answer` records the answer and stays connected, as the hub
     /// does for a hub card.
     record_answers: bool,
+    /// Answer every skill request with `unsupported`, as a hub without the
+    /// skill pipeline does. Off by default: the hub supports skills.
+    skills_unsupported: bool,
+    /// The skill directories that the hub searches.
+    skill_sources: Vec<SkillDirectorySource>,
+    /// The skills that `skill.install` made, oldest first.
+    skills: Vec<Skill>,
+    /// The audit log of connector calls, newest first.
+    calls: Vec<ConnectorCall>,
 }
 
 /// What the real hub writes at the end of a cut text.
@@ -152,14 +163,37 @@ fn ts(ms: i64) -> Timestamp {
 }
 
 fn seed(hub: &mut Hub) {
+    hub.skill_sources = vec![
+        SkillDirectorySource {
+            id: "smithery".into(),
+            kind: SkillDirectoryKind::Smithery,
+            name: "Smithery".into(),
+            url: "https://smithery.ai".into(),
+            removable: false,
+        },
+        SkillDirectorySource {
+            id: "anthropic".into(),
+            kind: SkillDirectoryKind::Anthropic,
+            name: "Anthropic".into(),
+            url: "https://github.com/anthropics/skills".into(),
+            removable: false,
+        },
+        SkillDirectorySource {
+            id: MARKETPLACE_URL.into(),
+            kind: SkillDirectoryKind::Marketplace,
+            name: "Team plugins".into(),
+            url: MARKETPLACE_URL.into(),
+            removable: true,
+        },
+    ];
     let channel_id = ChannelId::new();
     let card = MessageId::new();
     let task_id = TaskId::new();
     let now = Timestamp::now().as_millis();
     hub.channel = Some(Channel {
         id: channel_id,
-        kind: ChannelKind::Everything,
-        name: "Everything".into(),
+        kind: ChannelKind::Tutti,
+        name: "Tutti".into(),
         icon: None,
         color: None,
         group_id: None,
@@ -254,6 +288,332 @@ fn seed(hub: &mut Hub) {
         answered_by_client_id: None,
         created_at: ts(now - 4_000),
     });
+}
+
+/// The marketplace that the fake hub has from the start.
+const MARKETPLACE_URL: &str = "https://plugins.example.com/marketplace.json";
+/// The most entries or calls in one page of the fake hub, whatever `limit`
+/// says. It is small, so a test can reach a second page.
+const FAKE_PAGE: usize = 2;
+/// The commit that every fake preview pins.
+const FAKE_COMMIT: &str = "3f2a91c0d4e5b6a7980123456789abcdef012345";
+
+fn hash_of(digit: char) -> consort_proto::model::Sha256Hash {
+    digit.to_string().repeat(64).parse().unwrap()
+}
+
+/// The skill directory of the fake hub: three entries in three directories.
+fn skill_catalog(h: &Hub) -> Vec<SkillDirectoryEntry> {
+    let entry = |entry_id: &str,
+                 directory,
+                 source_id: Option<&str>,
+                 name: &str,
+                 description: &str,
+                 repo: &str,
+                 path: &str,
+                 status| SkillDirectoryEntry {
+        entry_id: entry_id.into(),
+        directory,
+        source_id: source_id.map(Into::into),
+        name: name.into(),
+        description: description.into(),
+        author: Some("acme".into()),
+        url: Some(format!("{repo}/tree/main/{path}")),
+        repo_url: Some(repo.into()),
+        path: Some(path.into()),
+        license: Some("MIT".into()),
+        installs: Some(1_200),
+        audits: vec![SkillAudit {
+            source: "Socket".into(),
+            status,
+            summary: Some("No known problems.".into()),
+            url: None,
+        }],
+        installed_skill_id: h.skills.iter().find(|s| s.name == name).map(|s| s.id),
+    };
+    vec![
+        entry(
+            "anthropic:pdf-forms",
+            SkillDirectoryKind::Anthropic,
+            None,
+            "pdf-forms",
+            "Fill in PDF forms.",
+            "https://github.com/anthropics/skills",
+            "pdf",
+            AuditStatus::Passed,
+        ),
+        entry(
+            "smithery:rust-review",
+            SkillDirectoryKind::Smithery,
+            None,
+            "rust-review",
+            "Review Rust code for bugs.",
+            "https://github.com/acme/rust-skills",
+            "review",
+            AuditStatus::Warning,
+        ),
+        entry(
+            "market:rust-test-writer",
+            SkillDirectoryKind::Marketplace,
+            Some(MARKETPLACE_URL),
+            "rust-test-writer",
+            "Write Rust tests and run them.",
+            "https://github.com/acme/team-plugins",
+            "rust-test-writer",
+            AuditStatus::Passed,
+        ),
+    ]
+}
+
+/// The source ID that a `source` filter of a search compares with.
+fn entry_source(entry: &SkillDirectoryEntry) -> String {
+    match entry.directory {
+        SkillDirectoryKind::Smithery => "smithery".into(),
+        SkillDirectoryKind::Anthropic => "anthropic".into(),
+        _ => entry.source_id.clone().unwrap_or_default(),
+    }
+}
+
+/// `skill_directory.search`: filters by words and by source, and pages by an
+/// offset in `cursor`. The first page names one directory that did not
+/// answer.
+fn search_skills(
+    h: &Hub,
+    body: &api::SkillDirectorySearch,
+) -> Result<api::SkillDirectorySearchResult, ErrorBody> {
+    let offset = match body.cursor.as_deref() {
+        None => 0,
+        Some(cursor) => cursor.parse::<usize>().map_err(|_| {
+            ErrorBody::new(
+                ErrorCode::Invalid,
+                "The cursor is not from this hub. Search again.",
+            )
+        })?,
+    };
+    let words = body.search.as_deref().unwrap_or("").to_lowercase();
+    let matching: Vec<SkillDirectoryEntry> = skill_catalog(h)
+        .into_iter()
+        .filter(|e| {
+            e.name.to_lowercase().contains(&words) || e.description.to_lowercase().contains(&words)
+        })
+        .filter(|e| {
+            body.source
+                .as_deref()
+                .is_none_or(|source| entry_source(e) == source)
+        })
+        .collect();
+    let end = (offset + FAKE_PAGE).min(matching.len());
+    let entries = matching
+        .get(offset..end)
+        .map(<[SkillDirectoryEntry]>::to_vec)
+        .unwrap_or_default();
+    Ok(api::SkillDirectorySearchResult {
+        entries,
+        next_cursor: (end < matching.len()).then(|| end.to_string()),
+        unavailable: if offset == 0 {
+            vec!["skills.sh".into()]
+        } else {
+            Vec::new()
+        },
+    })
+}
+
+/// What the fake hub fetched for a source: the preview and the source as
+/// the hub stores it.
+struct Fetched {
+    preview: api::SkillPreviewResult,
+    source: SkillSource,
+}
+
+/// `skill.preview` and the first step of `skill.install`. A git URL that
+/// holds `broken` is not a skill (`invalid`), `flaky` makes the hub fail
+/// (`internal`), and `blocked` gives a skill that the hub blocks.
+fn fetch_skill(h: &Hub, source: &api::SkillInstallSource) -> Result<Fetched, ErrorBody> {
+    let file = |path: &str, size: u64, executable| SkillFileInfo {
+        path: path.into(),
+        sha256: hash_of('d'),
+        size,
+        executable,
+    };
+    let (name, description, source, scripts, has_hooks, blocked_reason, license, audits) =
+        match source {
+            api::SkillInstallSource::Directory { entry_id, .. } => {
+                let entry = skill_catalog(h)
+                    .into_iter()
+                    .find(|e| &e.entry_id == entry_id)
+                    .ok_or_else(|| {
+                        ErrorBody::new(ErrorCode::NotFound, "That directory entry does not exist.")
+                    })?;
+                let scripted = entry.name == "rust-test-writer";
+                (
+                    entry.name.clone(),
+                    entry.description.clone(),
+                    SkillSource::Directory {
+                        directory: entry.directory,
+                        entry_id: entry.entry_id.clone(),
+                        url: entry.repo_url.clone().unwrap_or_default(),
+                        path: entry.path.clone(),
+                    },
+                    if scripted {
+                        vec!["scripts/run-tests.sh".to_owned()]
+                    } else {
+                        Vec::new()
+                    },
+                    scripted,
+                    None,
+                    entry.license.clone(),
+                    entry.audits.clone(),
+                )
+            }
+            api::SkillInstallSource::Git { url, path, git_ref } => {
+                if url.contains("broken") {
+                    return Err(ErrorBody::new(
+                        ErrorCode::Invalid,
+                        "The hub found no skill at that address. Check the URL, then try again.",
+                    ));
+                }
+                if url.contains("flaky") {
+                    return Err(ErrorBody::new(
+                        ErrorCode::Internal,
+                        "The fake hub fails this preview.",
+                    ));
+                }
+                let name = path
+                    .as_deref()
+                    .filter(|p| !p.is_empty())
+                    .unwrap_or(url)
+                    .trim_end_matches('/')
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or("skill")
+                    .to_owned();
+                let blocked = url.contains("blocked").then(|| {
+                    "The audit failed: the skill reads files outside its folder.".to_owned()
+                });
+                (
+                    name,
+                    format!("A skill from {url}."),
+                    SkillSource::Git {
+                        url: url.clone(),
+                        path: path.clone(),
+                        git_ref: git_ref.clone(),
+                    },
+                    Vec::new(),
+                    false,
+                    blocked,
+                    Some("Apache-2.0".to_owned()),
+                    vec![SkillAudit {
+                        source: "Socket".into(),
+                        status: AuditStatus::Unknown,
+                        summary: None,
+                        url: None,
+                    }],
+                )
+            }
+            api::SkillInstallSource::Upload { .. } => {
+                return Err(ErrorBody::new(
+                    ErrorCode::Invalid,
+                    "The fake hub takes no uploads.",
+                ));
+            }
+        };
+    let mut files = vec![file("SKILL.md", 1_204, false)];
+    files.extend(scripts.iter().map(|path| file(path, 380, true)));
+    Ok(Fetched {
+        preview: api::SkillPreviewResult {
+            installed_skill_id: h.skills.iter().find(|s| s.name == name).map(|s| s.id),
+            name,
+            description,
+            commit: Some(FAKE_COMMIT.into()),
+            content_hash: hash_of('e'),
+            license,
+            scripts,
+            audits,
+            files,
+            has_hooks,
+            blocked_reason,
+        },
+        source,
+    })
+}
+
+/// `skill.install`: the skill that the hub would make. A skill with scripts
+/// is off, whatever `enabled` says.
+fn install_skill(h: &Hub, body: &api::SkillInstall) -> Result<Skill, ErrorBody> {
+    let Fetched { preview, source } = fetch_skill(h, &body.source)?;
+    if let Some(reason) = preview.blocked_reason {
+        return Err(ErrorBody::new(
+            ErrorCode::SkillBlocked,
+            format!("The hub blocks this skill. {reason}"),
+        ));
+    }
+    if preview.installed_skill_id.is_some() {
+        return Err(ErrorBody::new(
+            ErrorCode::Conflict,
+            format!("A skill named {} is installed already.", preview.name),
+        ));
+    }
+    let has_scripts = !preview.scripts.is_empty();
+    Ok(Skill {
+        id: consort_proto::ids::SkillId::new(),
+        name: preview.name,
+        description: preview.description,
+        source,
+        commit: preview.commit,
+        content_hash: preview.content_hash,
+        license: preview.license,
+        scripts: preview.scripts,
+        audits: preview.audits,
+        enabled: !has_scripts && body.enabled.unwrap_or(true),
+        use_in: body.use_in.clone(),
+        update: Default::default(),
+        blocked_reason: None,
+        hooks_removed: preview.has_hooks,
+        file_count: u32::try_from(preview.files.len()).unwrap(),
+        size_bytes: preview.files.iter().map(|f| f.size).sum(),
+        installed_at: Timestamp::now(),
+        updated_at: Timestamp::now(),
+    })
+}
+
+/// `n` calls of a connection, newest first, each one minute older than the
+/// one before. The first three results are 2,048, 412 and 12,700 bytes.
+fn connector_calls(
+    connection_id: consort_proto::ids::ConnectionId,
+    n: usize,
+) -> Vec<ConnectorCall> {
+    let now = Timestamp::now().as_millis();
+    (0..n)
+        .map(|i| ConnectorCall {
+            id: consort_proto::ids::ConnectorCallId::new(),
+            connection_id,
+            channel_id: None,
+            session_id: None,
+            task_id: None,
+            tool: format!("GMAIL_TOOL_{i}"),
+            tool_kind: if i == 0 {
+                ToolKind::Change
+            } else {
+                ToolKind::Read
+            },
+            arguments_sha256: hash_of('b'),
+            decision: if i == 0 {
+                CallDecision::DeniedByUser
+            } else {
+                CallDecision::AllowedByUser
+            },
+            outcome: if i == 0 {
+                CallOutcome::NotRun
+            } else {
+                CallOutcome::Succeeded
+            },
+            error: None,
+            composio_log_id: None,
+            result_bytes: [2_048, 412, 12_700].get(i).copied().unwrap_or(1),
+            duration_ms: 120,
+            at: ts(now - 60_000 * i as i64),
+        })
+        .collect()
 }
 
 async fn pair_client(
@@ -711,11 +1071,171 @@ async fn session(hub: Shared, mut socket: WebSocket) {
                 h.push.notify_one();
                 req.respond_ok(&attempt).unwrap()
             }
-            "skill_directory.search" | "skill.preview" | "skill.install" => {
+            "skill_directory.search"
+            | "skill_directory.sources"
+            | "skill_directory.add_source"
+            | "skill_directory.remove_source"
+            | "skill.preview"
+            | "skill.install"
+                if hub.lock().unwrap().skills_unsupported =>
+            {
+                hub.lock()
+                    .unwrap()
+                    .recorded
+                    .push((req.kind.clone(), req.body.clone()));
                 req.respond_error(ErrorBody::new(
                     ErrorCode::Unsupported,
                     format!("Not built yet: {}.", req.kind),
                 ))
+            }
+            "skill_directory.search" => {
+                let body: api::SkillDirectorySearch = req.decode_as().unwrap();
+                let mut h = hub.lock().unwrap();
+                h.recorded.push((req.kind.clone(), req.body.clone()));
+                match search_skills(&h, &body) {
+                    Ok(result) => req.respond_ok(&result).unwrap(),
+                    Err(err) => req.respond_error(err),
+                }
+            }
+            "skill_directory.sources" => {
+                let mut h = hub.lock().unwrap();
+                h.recorded.push((req.kind.clone(), req.body.clone()));
+                req.respond_ok(&api::SkillDirectorySourcesResult {
+                    sources: h.skill_sources.clone(),
+                })
+                .unwrap()
+            }
+            "skill_directory.add_source" => {
+                let body: api::SkillDirectoryAddSource = req.decode_as().unwrap();
+                let mut h = hub.lock().unwrap();
+                h.recorded.push((req.kind.clone(), req.body.clone()));
+                let url = body.url.trim().to_owned();
+                if !url.starts_with("https://") || url.contains(' ') {
+                    req.respond_error(ErrorBody::new(
+                        ErrorCode::Invalid,
+                        format!(
+                            "{url:?} is not a link to a marketplace.json file. Paste an https:// link, then try again."
+                        ),
+                    ))
+                } else if h.skill_sources.iter().any(|s| s.id == url) {
+                    req.respond_error(ErrorBody::new(
+                        ErrorCode::Conflict,
+                        "This marketplace is in the list already.",
+                    ))
+                } else {
+                    h.skill_sources.push(SkillDirectorySource {
+                        id: url.clone(),
+                        kind: SkillDirectoryKind::Marketplace,
+                        name: url.trim_start_matches("https://").to_owned(),
+                        url,
+                        removable: true,
+                    });
+                    req.respond_ok(&api::SkillDirectorySourcesResult {
+                        sources: h.skill_sources.clone(),
+                    })
+                    .unwrap()
+                }
+            }
+            "skill_directory.remove_source" => {
+                let body: api::SkillDirectoryRemoveSource = req.decode_as().unwrap();
+                let mut h = hub.lock().unwrap();
+                h.recorded.push((req.kind.clone(), req.body.clone()));
+                match h.skill_sources.iter().find(|s| s.id == body.id).cloned() {
+                    None => req.respond_error(ErrorBody::new(
+                        ErrorCode::NotFound,
+                        "That directory is not in the list.",
+                    )),
+                    Some(source) if !source.removable => req.respond_error(ErrorBody::new(
+                        ErrorCode::Invalid,
+                        format!("{} is built in and stays in the list.", source.name),
+                    )),
+                    Some(_) => {
+                        h.skill_sources.retain(|s| s.id != body.id);
+                        req.respond_ok(&api::SkillDirectorySourcesResult {
+                            sources: h.skill_sources.clone(),
+                        })
+                        .unwrap()
+                    }
+                }
+            }
+            "skill.preview" => {
+                let body: api::SkillPreview = req.decode_as().unwrap();
+                let (dropped, result) = {
+                    let mut h = hub.lock().unwrap();
+                    h.recorded.push((req.kind.clone(), req.body.clone()));
+                    let dropped = matches!(
+                        &body.source,
+                        api::SkillInstallSource::Git { url, .. } if url.contains("dropped")
+                    );
+                    (dropped, fetch_skill(&h, &body.source))
+                };
+                if dropped {
+                    // The link breaks before the answer.
+                    let _ = socket.send(WsMessage::Close(None)).await;
+                    return;
+                }
+                match result {
+                    Ok(fetched) => req.respond_ok(&fetched.preview).unwrap(),
+                    Err(err) => req.respond_error(err),
+                }
+            }
+            "skill.install" => {
+                let body: api::SkillInstall = req.decode_as().unwrap();
+                let mut h = hub.lock().unwrap();
+                h.recorded.push((req.kind.clone(), req.body.clone()));
+                // An install from a card answers the card, so the card must
+                // exist before the hub installs anything.
+                let card = body
+                    .approval_id
+                    .map(|id| h.approval.clone().filter(|a| a.id == id));
+                match (install_skill(&h, &body), card) {
+                    (Err(err), _) => req.respond_error(err),
+                    (Ok(_), Some(None)) => req.respond_error(ErrorBody::new(
+                        ErrorCode::NotFound,
+                        "That install card does not exist.",
+                    )),
+                    (Ok(skill), card) => {
+                        h.skills.push(skill.clone());
+                        if let Some(Some(mut approval)) = card {
+                            // The card is allowed, and it names the skill.
+                            approval.status = ApprovalStatus::Allowed;
+                            approval.answer_option_id = Some("allow".into());
+                            approval.answered_at = Some(Timestamp::now());
+                            if let ApprovalDetails::SkillInstall(card) = &mut approval.details {
+                                card.skill_id = Some(skill.id);
+                            }
+                            h.approval = Some(approval.clone());
+                            let event = feed(&mut h, EntityPayload::Approval(approval));
+                            h.outbound.push(event);
+                            h.push.notify_one();
+                        }
+                        req.respond_ok(&api::SkillResult { skill }).unwrap()
+                    }
+                }
+            }
+            "connection.calls" => {
+                let body: api::ConnectionCalls = req.decode_as().unwrap();
+                let mut h = hub.lock().unwrap();
+                h.recorded.push((req.kind.clone(), req.body.clone()));
+                let mine: Vec<ConnectorCall> = h
+                    .calls
+                    .iter()
+                    .filter(|c| c.connection_id == body.connection_id)
+                    .cloned()
+                    .collect();
+                let start = match body.before {
+                    None => 0,
+                    Some(before) => mine
+                        .iter()
+                        .position(|c| c.id == before)
+                        .map_or(mine.len(), |at| at + 1),
+                };
+                let end = (start + FAKE_PAGE).min(mine.len());
+                req.respond_ok(&api::ConnectionCallsResult {
+                    calls: mine[start..end].to_vec(),
+                    has_more: end < mine.len(),
+                })
+                .unwrap()
             }
             "approval.answer" if hub.lock().unwrap().answer_conflict => req.respond_error(
                 ErrorBody::new(ErrorCode::Conflict, "This approval was already answered."),
@@ -817,12 +1337,12 @@ async fn pairs_syncs_sends_answers_and_reconnects() {
     client.pair(url.clone(), CODE.into()).await.unwrap();
     assert!(store.load().unwrap().is_some(), "the identity is saved");
     let state = wait_for(&client, "the snapshot", |s| {
-        s.connection == Connection::Online && s.everything().is_some()
+        s.connection == Connection::Online && s.tutti().is_some()
     })
     .await;
-    let everything = state.everything().unwrap().id.clone();
+    let tutti = state.tutti().unwrap().id.clone();
     let card = state
-        .timeline(&everything)
+        .timeline(&tutti)
         .and_then(|t| {
             t.items.iter().find_map(|i| match i {
                 TimelineItem::TaskCard(c) => Some(c.clone()),
@@ -838,11 +1358,11 @@ async fn pairs_syncs_sends_answers_and_reconnects() {
     assert_eq!(state.tasks_panel.need_you, 1);
 
     client
-        .send_message(everything.clone(), "Hello hub".into())
+        .send_message(tutti.clone(), "Hello hub".into())
         .await
         .unwrap();
     wait_for(&client, "the sent message", |s| {
-        s.timeline(&everything).is_some_and(|t| {
+        s.timeline(&tutti).is_some_and(|t| {
             t.items.iter().any(
                 |i| matches!(i, TimelineItem::Message(m) if m.body == "Hello hub" && !m.pending),
             )
@@ -905,8 +1425,7 @@ async fn resync_required_reloads_the_snapshot() {
     client.pair(url, CODE.into()).await.unwrap();
     wait_for(&client, "the first snapshot", |s| {
         s.connection == Connection::Online
-            && s.everything()
-                .is_some_and(|c| c.name == consort_client::TUTTI)
+            && s.tutti().is_some_and(|c| c.name == consort_client::TUTTI)
     })
     .await;
 
@@ -923,11 +1442,11 @@ async fn resync_required_reloads_the_snapshot() {
     kick.notify_one();
     let state = wait_for(&client, "the new snapshot", |s| {
         s.connection == Connection::Online
-            && s.everything()
+            && s.tutti()
                 .is_some_and(|c| c.purpose == "Renamed while the client was away")
     })
     .await;
-    assert!(state.everything().is_some());
+    assert!(state.tutti().is_some());
     let sessions = hub.lock().unwrap().sessions.clone();
     assert_eq!(
         sessions[1],
@@ -1012,32 +1531,28 @@ async fn a_restart_loads_history_threads_and_older_pages() {
     // A new client with the same identity: the app after a restart.
     let client =
         Client::start_with(Some(Store::new(dir.path())), ClientOptions::desktop()).unwrap();
-    let everything = channel_id.to_string();
+    let tutti = channel_id.to_string();
     let state = wait_for(&client, "the old messages", |s| {
-        timeline_bodies(s, &everything)
-            .iter()
-            .any(|b| b == "history 59")
+        timeline_bodies(s, &tutti).iter().any(|b| b == "history 59")
     })
     .await;
-    let bodies = timeline_bodies(&state, &everything);
+    let bodies = timeline_bodies(&state, &tutti);
     assert!(
         !bodies.iter().any(|b| b == "history 0"),
         "one snapshot holds the newest 50"
     );
-    assert!(state.timeline(&everything).unwrap().has_older);
+    assert!(state.timeline(&tutti).unwrap().has_older);
     assert!(
         !bodies.iter().any(|b| b.ends_with("reply")),
         "thread replies stay out of the timeline"
     );
 
-    client.load_older(everything.clone()).await.unwrap();
+    client.load_older(tutti.clone()).await.unwrap();
     let state = wait_for(&client, "the older page", |s| {
-        timeline_bodies(s, &everything)
-            .iter()
-            .any(|b| b == "history 0")
+        timeline_bodies(s, &tutti).iter().any(|b| b == "history 0")
     })
     .await;
-    assert!(!state.timeline(&everything).unwrap().has_older);
+    assert!(!state.timeline(&tutti).unwrap().has_older);
 
     client.load_thread(task_id.to_string()).await.unwrap();
     let state = wait_for(&client, "the thread replies", |s| {
@@ -1083,7 +1598,7 @@ async fn paired_client(url: &str, dir: &std::path::Path, options: ClientOptions)
     let client = Client::start_with(Some(Store::new(dir)), options).unwrap();
     client.pair(url.to_owned(), CODE.into()).await.unwrap();
     wait_for(&client, "online", |s| {
-        s.connection == Connection::Online && s.everything().is_some()
+        s.connection == Connection::Online && s.tutti().is_some()
     })
     .await;
     client
@@ -1121,8 +1636,8 @@ fn bodies_of(state: &ViewState, channel: &str) -> Vec<(String, bool)> {
         .unwrap_or_default()
 }
 
-fn everything_id(client: &Client) -> String {
-    client.state().everything().unwrap().id.clone()
+fn tutti_id(client: &Client) -> String {
+    client.state().tutti().unwrap().id.clone()
 }
 
 // ---------------------------------------------------------------------------
@@ -1135,7 +1650,7 @@ async fn an_unreadable_feed_entry_is_skipped_and_never_replayed() {
     let (url, hub) = start_hub().await;
     let dir = tempfile::tempdir().unwrap();
     let client = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
-    let everything = everything_id(&client);
+    let tutti = tutti_id(&client);
     let (good_seq, frames) = {
         let mut h = hub.lock().unwrap();
         let channel_id = h.channel.as_ref().unwrap().id;
@@ -1159,7 +1674,7 @@ async fn an_unreadable_feed_entry_is_skipped_and_never_replayed() {
     };
     push(&hub, frames);
     wait_for(&client, "the entry after the bad one", |s| {
-        bodies_of(s, &everything)
+        bodies_of(s, &tutti)
             .iter()
             .any(|(b, _)| b == "after the bad entry")
     })
@@ -1189,7 +1704,7 @@ async fn feed_skipped_moves_past_the_entry_and_loads_the_channel_again() {
     let (url, hub) = start_hub().await;
     let dir = tempfile::tempdir().unwrap();
     let client = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
-    let everything = everything_id(&client);
+    let tutti = tutti_id(&client);
     let (seq, frame) = {
         let mut h = hub.lock().unwrap();
         let channel_id = h.channel.as_ref().unwrap().id;
@@ -1213,7 +1728,7 @@ async fn feed_skipped_moves_past_the_entry_and_loads_the_channel_again() {
     };
     push(&hub, vec![frame]);
     wait_for(&client, "the message from the snapshot", |s| {
-        bodies_of(s, &everything)
+        bodies_of(s, &tutti)
             .iter()
             .any(|(b, _)| b == "too large for the feed")
     })
@@ -1247,17 +1762,15 @@ async fn a_channel_snapshot_that_fails_is_tried_again() {
     }
     let dir = tempfile::tempdir().unwrap();
     let client = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
-    let everything = everything_id(&client);
+    let tutti = tutti_id(&client);
     assert!(
-        !bodies_of(&client.state(), &everything)
+        !bodies_of(&client.state(), &tutti)
             .iter()
             .any(|(b, _)| b == "history"),
         "the first snapshot failed"
     );
     wait_for(&client, "the second try", |s| {
-        bodies_of(s, &everything)
-            .iter()
-            .any(|(b, _)| b == "history")
+        bodies_of(s, &tutti).iter().any(|(b, _)| b == "history")
     })
     .await;
     assert_eq!(hub.lock().unwrap().sessions.len(), 1, "no reconnect");
@@ -1315,23 +1828,23 @@ async fn a_send_that_gets_no_answer_stays_pending_and_is_not_doubled() {
     let (url, hub) = start_hub().await;
     let dir = tempfile::tempdir().unwrap();
     let client = paired_client(&url, dir.path(), options(quick())).await;
-    let everything = everything_id(&client);
+    let tutti = tutti_id(&client);
     hub.lock().unwrap().silent_sends = true;
     // The hub stores the message and never answers. The call times out, the
     // link ends, and the message stays pending: the caller sees no error.
     client
-        .send_message(everything.clone(), "Hello hub".into())
+        .send_message(tutti.clone(), "Hello hub".into())
         .await
         .unwrap();
     assert!(
-        bodies_of(&client.state(), &everything)
+        bodies_of(&client.state(), &tutti)
             .iter()
             .any(|(b, pending)| b == "Hello hub" && *pending),
         "the message shows as pending"
     );
     hub.lock().unwrap().silent_sends = false;
     wait_for(&client, "the message after the reconnect", |s| {
-        bodies_of(s, &everything)
+        bodies_of(s, &tutti)
             .iter()
             .any(|(b, pending)| b == "Hello hub" && !*pending)
     })
@@ -1353,12 +1866,12 @@ async fn a_stuck_command_does_not_block_the_next_one() {
     timeouts.call = Duration::from_secs(5);
     timeouts.idle = Duration::from_secs(30);
     let client = paired_client(&url, dir.path(), options(timeouts)).await;
-    let everything = everything_id(&client);
+    let tutti = tutti_id(&client);
     hub.lock().unwrap().silent_sends = true;
     let stuck = {
         let client = client.clone();
-        let everything = everything.clone();
-        tokio::spawn(async move { client.send_message(everything, "Stuck".into()).await })
+        let tutti = tutti.clone();
+        tokio::spawn(async move { client.send_message(tutti, "Stuck".into()).await })
     };
     until("the hub got the send", || {
         !hub.lock().unwrap().sent_ids.is_empty()
@@ -1403,11 +1916,11 @@ async fn dropping_the_client_does_not_wait_for_a_stuck_call() {
     timeouts.call = Duration::from_secs(20);
     timeouts.idle = Duration::from_secs(60);
     let client = paired_client(&url, dir.path(), options(timeouts)).await;
-    let everything = everything_id(&client);
+    let tutti = tutti_id(&client);
     hub.lock().unwrap().silent_sends = true;
     let _ = tokio::time::timeout(
         Duration::from_millis(200),
-        client.send_message(everything, "Stuck".into()),
+        client.send_message(tutti, "Stuck".into()),
     )
     .await;
     let started = std::time::Instant::now();
@@ -1427,7 +1940,7 @@ async fn the_outbox_survives_a_restart_and_goes_out_in_order() {
     let (url, hub) = start_hub().await;
     let dir = tempfile::tempdir().unwrap();
     let first = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
-    let everything = everything_id(&first);
+    let tutti = tutti_id(&first);
     drop(first);
     let store = Store::new(dir.path());
     let client_id = store.load().unwrap().unwrap().config.client_id;
@@ -1443,10 +1956,10 @@ async fn the_outbox_survives_a_restart_and_goes_out_in_order() {
         .save_outbox(
             &client_id,
             &[
-                pending("c-1", &everything, "one"),
+                pending("c-1", &tutti, "one"),
                 pending("c-2", &missing, "lost"),
-                pending("c-3", &everything, "two"),
-                pending("c-4", &everything, "three"),
+                pending("c-3", &tutti, "two"),
+                pending("c-4", &tutti, "three"),
             ],
         )
         .unwrap();
@@ -1464,7 +1977,7 @@ async fn the_outbox_survives_a_restart_and_goes_out_in_order() {
         state.send_failures[0].message
     );
     wait_for(&client, "the sent messages", |s| {
-        let b = bodies_of(s, &everything);
+        let b = bodies_of(s, &tutti);
         ["one", "two", "three"]
             .iter()
             .all(|body| b.iter().any(|(x, pending)| x == body && !pending))
@@ -1495,12 +2008,9 @@ async fn a_queued_message_is_saved_in_the_outbox_file() {
     let (url, hub) = start_hub().await;
     let dir = tempfile::tempdir().unwrap();
     let client = paired_client(&url, dir.path(), options(quick())).await;
-    let everything = everything_id(&client);
+    let tutti = tutti_id(&client);
     hub.lock().unwrap().silent_sends = true;
-    client
-        .send_message(everything, "Keep me".into())
-        .await
-        .unwrap();
+    client.send_message(tutti, "Keep me".into()).await.unwrap();
     let file = std::fs::read_to_string(dir.path().join("outbox.json")).unwrap();
     assert!(file.contains("Keep me"), "{file}");
 }
@@ -1524,15 +2034,13 @@ async fn has_older_follows_messages_has_more() {
     }
     let dir = tempfile::tempdir().unwrap();
     let client = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
-    let everything = everything_id(&client);
+    let tutti = tutti_id(&client);
     wait_for(&client, "the message", |s| {
-        bodies_of(s, &everything)
-            .iter()
-            .any(|(b, _)| b == "only one")
+        bodies_of(s, &tutti).iter().any(|(b, _)| b == "only one")
     })
     .await;
     assert!(
-        client.state().timeline(&everything).unwrap().has_older,
+        client.state().timeline(&tutti).unwrap().has_older,
         "a short page with has_more means older messages"
     );
 
@@ -1550,12 +2058,12 @@ async fn has_older_follows_messages_has_more() {
     }
     let dir = tempfile::tempdir().unwrap();
     let client = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
-    let everything = everything_id(&client);
+    let tutti = tutti_id(&client);
     wait_for(&client, "the messages", |s| {
-        bodies_of(s, &everything).iter().any(|(b, _)| b == "m 49")
+        bodies_of(s, &tutti).iter().any(|(b, _)| b == "m 49")
     })
     .await;
-    assert!(!client.state().timeline(&everything).unwrap().has_older);
+    assert!(!client.state().timeline(&tutti).unwrap().has_older);
 }
 
 /// Finding 23: a thread with more than 200 replies loads in pages.
@@ -1601,26 +2109,23 @@ async fn mark_read_is_sent_once_for_each_newest_message() {
     }
     let dir = tempfile::tempdir().unwrap();
     let client = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
-    let everything = everything_id(&client);
+    let tutti = tutti_id(&client);
     let state = wait_for(&client, "the unread message", |s| {
-        s.sidebar.everything.unread >= 1
+        s.sidebar.tutti.unread >= 1
     })
     .await;
-    assert!(state.sidebar.everything.unread >= 1);
+    assert!(state.sidebar.tutti.unread >= 1);
     client
         .run(Command::MarkRead {
-            channel_id: everything.clone(),
+            channel_id: tutti.clone(),
         })
         .await
         .unwrap();
-    wait_for(&client, "nothing unread", |s| {
-        s.sidebar.everything.unread == 0
-    })
-    .await;
+    wait_for(&client, "nothing unread", |s| s.sidebar.tutti.unread == 0).await;
     assert_eq!(hub.lock().unwrap().read_marks.len(), 1);
     client
         .run(Command::MarkRead {
-            channel_id: everything.clone(),
+            channel_id: tutti.clone(),
         })
         .await
         .unwrap();
@@ -1638,10 +2143,10 @@ async fn mark_read_is_sent_once_for_each_newest_message() {
         feed(&mut h, EntityPayload::Message(m))
     };
     push(&hub, vec![frame]);
-    wait_for(&client, "one unread", |s| s.sidebar.everything.unread == 1).await;
+    wait_for(&client, "one unread", |s| s.sidebar.tutti.unread == 1).await;
     client
         .run(Command::MarkRead {
-            channel_id: everything.clone(),
+            channel_id: tutti.clone(),
         })
         .await
         .unwrap();
@@ -1655,7 +2160,7 @@ async fn a_burst_of_feed_entries_publishes_few_states() {
     let (url, hub) = start_hub().await;
     let dir = tempfile::tempdir().unwrap();
     let client = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
-    let everything = everything_id(&client);
+    let tutti = tutti_id(&client);
     let frames = {
         let mut h = hub.lock().unwrap();
         let channel_id = h.channel.as_ref().unwrap().id;
@@ -1678,7 +2183,7 @@ async fn a_burst_of_feed_entries_publishes_few_states() {
             panic!("timed out; {states} states");
         };
         states += 1;
-        if bodies_of(&state, &everything)
+        if bodies_of(&state, &tutti)
             .iter()
             .any(|(b, _)| b == "burst 299")
         {
@@ -1710,10 +2215,10 @@ async fn a_message_over_the_hub_limit_is_refused_before_it_is_sent() {
     let (url, hub) = start_hub().await;
     let dir = tempfile::tempdir().unwrap();
     let client = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
-    let everything = everything_id(&client);
+    let tutti = tutti_id(&client);
 
     let err = client
-        .send_message(everything.clone(), text_of(300))
+        .send_message(tutti.clone(), text_of(300))
         .await
         .unwrap_err();
     let ClientError::Hub { code, message } = err else {
@@ -1732,7 +2237,7 @@ async fn a_message_over_the_hub_limit_is_refused_before_it_is_sent() {
     assert!(edit.to_string().contains("256 KiB"), "{edit}");
 
     // Nothing was queued, nothing was sent, and the link never broke.
-    assert!(client.state().timeline(&everything).is_some_and(|t| {
+    assert!(client.state().timeline(&tutti).is_some_and(|t| {
         !t.items
             .iter()
             .any(|i| matches!(i, TimelineItem::Message(m) if m.pending))
@@ -1750,7 +2255,7 @@ async fn a_message_over_the_hub_limit_is_refused_before_it_is_sent() {
 
     // A body at the limit goes out.
     client
-        .send_message(everything.clone(), text_of(256))
+        .send_message(tutti.clone(), text_of(256))
         .await
         .unwrap();
     until("the large message arrives", || {
@@ -1790,7 +2295,7 @@ async fn a_request_too_large_for_a_frame_fails_alone_and_the_link_stays_up() {
     assert_eq!(hub.lock().unwrap().sessions.len(), 1, "no reconnect");
     // The next request works.
     client
-        .send_message(everything_id(&client), "Still here".into())
+        .send_message(tutti_id(&client), "Still here".into())
         .await
         .unwrap();
     until("the next message arrives", || {
@@ -1806,7 +2311,7 @@ async fn a_message_that_is_too_large_in_an_old_outbox_fails_once() {
     let (url, hub) = start_hub().await;
     let dir = tempfile::tempdir().unwrap();
     let first = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
-    let everything = everything_id(&first);
+    let tutti = tutti_id(&first);
     drop(first);
     let store = Store::new(dir.path());
     let client_id = store.load().unwrap().unwrap().config.client_id;
@@ -1815,7 +2320,7 @@ async fn a_message_that_is_too_large_in_an_old_outbox_fails_once() {
             &client_id,
             &[consort_client::cache::PendingSend {
                 client_message_id: "c-big".into(),
-                channel_id: everything,
+                channel_id: tutti,
                 thread_root_id: None,
                 body: text_of(1100),
                 created_at: Timestamp::now().as_millis(),
@@ -1943,31 +2448,31 @@ async fn a_failed_mark_read_is_an_error_and_can_be_tried_again() {
     }
     let dir = tempfile::tempdir().unwrap();
     let client = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
-    let everything = everything_id(&client);
+    let tutti = tutti_id(&client);
     wait_for(&client, "the unread message", |s| {
-        s.sidebar.everything.unread >= 1
+        s.sidebar.tutti.unread >= 1
     })
     .await;
     let err = client
         .run(Command::MarkRead {
-            channel_id: everything.clone(),
+            channel_id: tutti.clone(),
         })
         .await
         .unwrap_err();
     assert!(matches!(err, ClientError::Hub { .. }), "{err:?}");
     assert!(hub.lock().unwrap().read_marks.is_empty());
     assert!(
-        client.state().sidebar.everything.unread >= 1,
+        client.state().sidebar.tutti.unread >= 1,
         "still unread after the failure"
     );
     client
         .run(Command::MarkRead {
-            channel_id: everything.clone(),
+            channel_id: tutti.clone(),
         })
         .await
         .unwrap();
     assert_eq!(hub.lock().unwrap().read_marks.len(), 1);
-    wait_for(&client, "read", |s| s.sidebar.everything.unread == 0).await;
+    wait_for(&client, "read", |s| s.sidebar.tutti.unread == 0).await;
 }
 
 /// Finding 7: a channel that never loaded showed as empty, and the first
@@ -1990,9 +2495,9 @@ async fn a_channel_that_never_loaded_is_not_marked_read() {
     }
     let dir = tempfile::tempdir().unwrap();
     let client = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
-    let everything = everything_id(&client);
+    let tutti = tutti_id(&client);
     assert!(
-        !client.state().timeline(&everything).unwrap().loaded,
+        !client.state().timeline(&tutti).unwrap().loaded,
         "the snapshot failed"
     );
     // One live message arrives. It must not become "the newest message".
@@ -2005,12 +2510,12 @@ async fn a_channel_that_never_loaded_is_not_marked_read() {
     };
     push(&hub, vec![frame]);
     wait_for(&client, "the live message", |s| {
-        bodies_of(s, &everything).iter().any(|(b, _)| b == "live")
+        bodies_of(s, &tutti).iter().any(|(b, _)| b == "live")
     })
     .await;
     let err = client
         .run(Command::MarkRead {
-            channel_id: everything.clone(),
+            channel_id: tutti.clone(),
         })
         .await
         .unwrap_err();
@@ -2020,13 +2525,11 @@ async fn a_channel_that_never_loaded_is_not_marked_read() {
     // The loader gets the snapshot later. Then marking works.
     hub.lock().unwrap().fail_channel_snapshots = 0;
     wait_for(&client, "the channel to load", |s| {
-        s.timeline(&everything).is_some_and(|t| t.loaded)
+        s.timeline(&tutti).is_some_and(|t| t.loaded)
     })
     .await;
     client
-        .run(Command::MarkRead {
-            channel_id: everything,
-        })
+        .run(Command::MarkRead { channel_id: tutti })
         .await
         .unwrap();
     assert_eq!(hub.lock().unwrap().read_marks.len(), 1);
@@ -2040,7 +2543,7 @@ async fn a_failed_reload_after_a_skipped_change_ends_the_link_to_load_again() {
     let (url, hub) = start_hub().await;
     let dir = tempfile::tempdir().unwrap();
     let client = paired_client(&url, dir.path(), options(quick())).await;
-    let everything = everything_id(&client);
+    let tutti = tutti_id(&client);
     let frame = {
         let mut h = hub.lock().unwrap();
         let channel_id = h.channel.as_ref().unwrap().id;
@@ -2063,7 +2566,7 @@ async fn a_failed_reload_after_a_skipped_change_ends_the_link_to_load_again() {
     };
     push(&hub, vec![frame]);
     wait_for(&client, "the message after the second link", |s| {
-        bodies_of(s, &everything)
+        bodies_of(s, &tutti)
             .iter()
             .any(|(b, _)| b == "missed in the feed")
     })
@@ -2085,14 +2588,14 @@ async fn an_unclear_hub_error_sends_the_message_again_with_the_same_id() {
     let (url, hub) = start_hub().await;
     let dir = tempfile::tempdir().unwrap();
     let client = paired_client(&url, dir.path(), options(quick())).await;
-    let everything = everything_id(&client);
+    let tutti = tutti_id(&client);
     hub.lock().unwrap().internal_after_store = 2;
     client
-        .send_message(everything.clone(), "Hello twice".into())
+        .send_message(tutti.clone(), "Hello twice".into())
         .await
         .unwrap();
     wait_for(&client, "the message stored", |s| {
-        bodies_of(s, &everything)
+        bodies_of(s, &tutti)
             .iter()
             .any(|(b, pending)| b == "Hello twice" && !*pending)
     })
@@ -2116,10 +2619,10 @@ async fn an_unclear_hub_error_is_final_after_a_few_tries_and_keeps_the_text() {
     let (url, hub) = start_hub().await;
     let dir = tempfile::tempdir().unwrap();
     let client = paired_client(&url, dir.path(), options(quick())).await;
-    let everything = everything_id(&client);
+    let tutti = tutti_id(&client);
     hub.lock().unwrap().internal_after_store = usize::MAX;
     client
-        .send_message(everything, "Never confirmed".into())
+        .send_message(tutti, "Never confirmed".into())
         .await
         .unwrap();
     let state = wait_for(&client, "the failed send", |s| !s.send_failures.is_empty()).await;
@@ -2161,7 +2664,7 @@ async fn pairing_again_keeps_the_text_of_unsent_messages() {
     let (url_a, _hub_a) = start_hub().await;
     let dir = tempfile::tempdir().unwrap();
     let first = paired_client(&url_a, dir.path(), ClientOptions::desktop()).await;
-    let everything = everything_id(&first);
+    let tutti = tutti_id(&first);
     drop(first);
     let store = Store::new(dir.path());
     let client_id = store.load().unwrap().unwrap().config.client_id;
@@ -2170,7 +2673,7 @@ async fn pairing_again_keeps_the_text_of_unsent_messages() {
             &client_id,
             &[consort_client::cache::PendingSend {
                 client_message_id: "c-wait".into(),
-                channel_id: everything,
+                channel_id: tutti,
                 thread_root_id: None,
                 body: "Text that waited".into(),
                 created_at: Timestamp::now().as_millis(),
@@ -2213,9 +2716,9 @@ async fn answering_an_approval_that_is_closed_closes_its_card() {
     let (url, hub) = start_hub().await;
     let dir = tempfile::tempdir().unwrap();
     let client = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
-    let everything = everything_id(&client);
+    let tutti = tutti_id(&client);
     let card_approval = |s: &ViewState| {
-        s.timeline(&everything).and_then(|t| {
+        s.timeline(&tutti).and_then(|t| {
             t.items.iter().find_map(|i| match i {
                 TimelineItem::TaskCard(c) => c.approval.clone(),
                 _ => None,
@@ -2299,21 +2802,21 @@ async fn opening_the_thread_of_a_previewed_task_loads_the_full_task() {
     let (task_id, _brief, summary) = previewed_task(&hub);
     let dir = tempfile::tempdir().unwrap();
     let client = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
-    let everything = everything_id(&client);
+    let tutti = tutti_id(&client);
 
     // The card keeps the preview. Nothing asked for the full text yet.
     let state = wait_for(&client, "the card", |s| {
-        task_card(s, &everything).is_some_and(|c| c.latest.is_some())
+        task_card(s, &tutti).is_some_and(|c| c.latest.is_some())
     })
     .await;
-    let preview = task_card(&state, &everything).unwrap().latest.unwrap();
+    let preview = task_card(&state, &tutti).unwrap().latest.unwrap();
     assert_eq!(preview, preview_of(&summary));
     assert!(preview.ends_with(CUT_MARK));
     assert!(hub.lock().unwrap().task_gets.is_empty());
 
     client.load_thread(task_id.to_string()).await.unwrap();
     wait_for(&client, "the full review summary", |s| {
-        task_card(s, &everything).is_some_and(|c| c.latest.as_deref() == Some(summary.as_str()))
+        task_card(s, &tutti).is_some_and(|c| c.latest.as_deref() == Some(summary.as_str()))
     })
     .await;
     let asked = hub.lock().unwrap().task_gets.clone();
@@ -2332,9 +2835,9 @@ async fn a_feed_entry_ends_the_preview_of_a_task() {
     let (task_id, _brief, summary) = previewed_task(&hub);
     let dir = tempfile::tempdir().unwrap();
     let client = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
-    let everything = everything_id(&client);
+    let tutti = tutti_id(&client);
     wait_for(&client, "the preview on the card", |s| {
-        task_card(s, &everything)
+        task_card(s, &tutti)
             .is_some_and(|c| c.latest.as_deref() == Some(preview_of(&summary).as_str()))
     })
     .await;
@@ -2346,7 +2849,7 @@ async fn a_feed_entry_ends_the_preview_of_a_task() {
     };
     push(&hub, vec![frame]);
     wait_for(&client, "the full text from the feed", |s| {
-        task_card(s, &everything).is_some_and(|c| c.latest.as_deref() == Some(summary.as_str()))
+        task_card(s, &tutti).is_some_and(|c| c.latest.as_deref() == Some(summary.as_str()))
     })
     .await;
 
@@ -2371,12 +2874,12 @@ async fn an_older_task_get_answer_does_not_overwrite_a_newer_feed_entry() {
     }
     let dir = tempfile::tempdir().unwrap();
     let client = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
-    let everything = everything_id(&client);
-    wait_for(&client, "the card", |s| task_card(s, &everything).is_some()).await;
+    let tutti = tutti_id(&client);
+    wait_for(&client, "the card", |s| task_card(s, &tutti).is_some()).await;
 
     client.load_thread(task_id.to_string()).await.unwrap();
     let newer = |s: &ViewState| {
-        task_card(s, &everything)
+        task_card(s, &tutti)
             .is_some_and(|c| c.latest.as_deref() == Some("The summary after the change."))
     };
     wait_for(&client, "the newer summary", newer).await;
@@ -2409,9 +2912,9 @@ async fn a_card_for_a_task_outside_the_snapshot_loads_the_task() {
     };
     let dir = tempfile::tempdir().unwrap();
     let client = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
-    let everything = everything_id(&client);
+    let tutti = tutti_id(&client);
     wait_for(&client, "the card of the task outside the snapshot", |s| {
-        s.timeline(&everything).is_some_and(|t| {
+        s.timeline(&tutti).is_some_and(|t| {
             t.items
                 .iter()
                 .any(|i| matches!(i, TimelineItem::TaskCard(c) if c.title == "Port the old engine"))
@@ -2436,9 +2939,9 @@ async fn a_card_for_an_unknown_task_is_not_fetched_when_no_task_was_left_out() {
     }
     let dir = tempfile::tempdir().unwrap();
     let client = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
-    let everything = everything_id(&client);
+    let tutti = tutti_id(&client);
     wait_for(&client, "the channel to load", |s| {
-        s.timeline(&everything).is_some_and(|t| t.loaded)
+        s.timeline(&tutti).is_some_and(|t| t.loaded)
     })
     .await;
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -2527,7 +3030,7 @@ async fn a_group_can_be_made_and_a_channel_can_leave_its_group() {
     let (url, hub) = start_hub().await;
     let dir = tempfile::tempdir().unwrap();
     let client = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
-    let channel = everything_id(&client);
+    let channel = tutti_id(&client);
 
     client
         .create_group("  Home projects ".into(), Some(channel.clone()))
@@ -2580,7 +3083,7 @@ async fn a_task_can_be_archived_and_a_channel_can_be_unarchived() {
     let (url, hub) = start_hub().await;
     let dir = tempfile::tempdir().unwrap();
     let client = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
-    let channel = everything_id(&client);
+    let channel = tutti_id(&client);
     let task_id = hub.lock().unwrap().task.as_ref().unwrap().id;
 
     client.archive_task(task_id.to_string()).await.unwrap();
@@ -2809,6 +3312,8 @@ async fn connectors_and_hub_cards_use_their_requests() {
     {
         let mut h = hub.lock().unwrap();
         h.record_answers = true;
+        // This test checks the message for a hub without the skill pipeline.
+        h.skills_unsupported = true;
         let approval = h.approval.as_mut().unwrap();
         let details = ApprovalDetails::Connector(Box::new(ConnectorCard {
             connection_id: consort_proto::ids::ConnectionId::new(),
@@ -2828,7 +3333,7 @@ async fn connectors_and_hub_cards_use_their_requests() {
     }
     let dir = tempfile::tempdir().unwrap();
     let client = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
-    let channel = everything_id(&client);
+    let channel = tutti_id(&client);
     let approval_id = hub
         .lock()
         .unwrap()
@@ -2951,4 +3456,844 @@ async fn connectors_and_hub_cards_use_their_requests() {
         err.to_string(),
         "This hub cannot add skills yet. Update the hub, then try again."
     );
+}
+
+// ---------------------------------------------------------------------------
+// Step 3: the Add skill flow against a fake hub that supports skills.
+
+/// The words of an `unsupported` answer, as the user reads them.
+fn cannot(what: &str) -> String {
+    format!("This hub cannot {what} yet. Update the hub, then try again.")
+}
+
+/// The requests of one type that the hub recorded, in order.
+fn recorded_of(hub: &Shared, kind: &str) -> Vec<serde_json::Value> {
+    hub.lock()
+        .unwrap()
+        .recorded
+        .iter()
+        .filter(|(k, _)| k == kind)
+        .map(|(_, body)| body.clone())
+        .collect()
+}
+
+fn entry_names(state: &ViewState) -> Vec<&str> {
+    state
+        .skill_directory
+        .entries
+        .iter()
+        .map(|e| e.name.as_str())
+        .collect()
+}
+
+fn directory_input(entry_id: &str) -> consort_client::SkillInstallInput {
+    consort_client::SkillInstallInput::Directory {
+        source: None,
+        entry_id: entry_id.into(),
+    }
+}
+
+fn git_input(url: &str, path: Option<&str>) -> consort_client::SkillInstallInput {
+    consort_client::SkillInstallInput::Git {
+        url: url.into(),
+        path: path.map(Into::into),
+        git_ref: None,
+    }
+}
+
+async fn preview_of_skill(
+    client: &Client,
+    source: consort_client::SkillInstallInput,
+) -> Result<consort_client::SkillPreviewView, ClientError> {
+    match client.run_for(Command::PreviewSkill { source }).await? {
+        consort_client::CommandOutput::SkillPreview(view) => Ok(view),
+        other => panic!("a skill preview, not {other:?}"),
+    }
+}
+
+async fn install_skill_input(
+    client: &Client,
+    source: consort_client::SkillInstallInput,
+    enabled: Option<bool>,
+    approval_id: Option<String>,
+) -> Result<String, ClientError> {
+    let output = client
+        .run_for(Command::InstallSkill {
+            source,
+            use_in: consort_client::UseInView::Tags(vec!["work".into()]),
+            enabled,
+            approval_id,
+        })
+        .await?;
+    match output {
+        consort_client::CommandOutput::SkillInstalled(id) => Ok(id),
+        other => panic!("an installed skill, not {other:?}"),
+    }
+}
+
+/// The first page has a cursor, "load more" adds the second page, and a new
+/// search starts again. `search` and `source` reach the hub.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn skill_search_pages_and_load_more_fill_the_directory() {
+    let (url, hub) = start_hub().await;
+    let dir = tempfile::tempdir().unwrap();
+    let client = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
+
+    client
+        .run(Command::SearchSkillDirectory {
+            search: String::new(),
+            source: None,
+        })
+        .await
+        .unwrap();
+    let state = wait_for(&client, "the first page", |s| {
+        s.skill_directory.load == consort_client::LoadState::Loaded
+    })
+    .await;
+    assert_eq!(entry_names(&state), ["pdf-forms", "rust-review"]);
+    assert_eq!(state.skill_directory.next_cursor.as_deref(), Some("2"));
+    assert_eq!(state.skill_directory.unavailable, ["skills.sh"]);
+    let review = &state.skill_directory.entries[1];
+    assert_eq!(review.entry_id, "smithery:rust-review");
+    assert_eq!(review.directory, consort_client::DirectoryKind::Smithery);
+    assert_eq!(
+        review.audits[0].status,
+        consort_client::AuditStatusView::Warning
+    );
+
+    client.run(Command::LoadMoreSkillDirectory).await.unwrap();
+    let state = wait_for(&client, "the second page", |s| {
+        s.skill_directory.entries.len() == 3
+    })
+    .await;
+    assert_eq!(
+        entry_names(&state),
+        ["pdf-forms", "rust-review", "rust-test-writer"]
+    );
+    assert_eq!(state.skill_directory.next_cursor, None, "the last page");
+    assert_eq!(
+        state.skill_directory.more,
+        consort_client::LoadState::NotLoaded
+    );
+    assert_eq!(
+        state.skill_directory.entries[2].source_id.as_deref(),
+        Some(MARKETPLACE_URL)
+    );
+    // With no next page, "load more" asks the hub for nothing.
+    client.run(Command::LoadMoreSkillDirectory).await.unwrap();
+
+    let searches = recorded_of(&hub, "skill_directory.search");
+    assert_eq!(searches.len(), 2);
+    assert!(searches[0]["search"].is_null(), "no words: {}", searches[0]);
+    assert!(searches[0]["cursor"].is_null());
+    assert_eq!(searches[1]["cursor"], "2");
+
+    // New words replace the old results.
+    client
+        .run(Command::SearchSkillDirectory {
+            search: "rust".into(),
+            source: None,
+        })
+        .await
+        .unwrap();
+    let state = wait_for(&client, "the rust search", |s| {
+        s.skill_directory.search == "rust"
+            && s.skill_directory.load == consort_client::LoadState::Loaded
+    })
+    .await;
+    assert_eq!(entry_names(&state), ["rust-review", "rust-test-writer"]);
+    assert_eq!(state.skill_directory.next_cursor, None);
+
+    // A search for one source sends it, and the hub honours it.
+    client
+        .run(Command::SearchSkillDirectory {
+            search: String::new(),
+            source: Some("anthropic".into()),
+        })
+        .await
+        .unwrap();
+    let state = wait_for(&client, "the anthropic search", |s| {
+        s.skill_directory.source.as_deref() == Some("anthropic")
+            && s.skill_directory.load == consort_client::LoadState::Loaded
+    })
+    .await;
+    assert_eq!(entry_names(&state), ["pdf-forms"]);
+    let searches = recorded_of(&hub, "skill_directory.search");
+    assert_eq!(searches.len(), 4);
+    assert_eq!(searches[2]["search"], "rust");
+    assert!(searches[2]["source"].is_null());
+    assert_eq!(searches[3]["source"], "anthropic");
+
+    // Words and a source together: nothing matches, and that is not an error.
+    client
+        .run(Command::SearchSkillDirectory {
+            search: "rust".into(),
+            source: Some("anthropic".into()),
+        })
+        .await
+        .unwrap();
+    let state = wait_for(&client, "the empty search", |s| {
+        s.skill_directory.search == "rust"
+            && s.skill_directory.source.as_deref() == Some("anthropic")
+            && s.skill_directory.load == consort_client::LoadState::Loaded
+    })
+    .await;
+    assert!(state.skill_directory.entries.is_empty());
+}
+
+/// A preview shows the facts of a directory entry and of a git URL. A
+/// blocked skill keeps the reason of the hub.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn skill_preview_shows_the_facts_of_an_entry_and_of_a_git_url() {
+    let (url, hub) = start_hub().await;
+    let dir = tempfile::tempdir().unwrap();
+    let client = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
+
+    let entry = preview_of_skill(&client, directory_input("market:rust-test-writer"))
+        .await
+        .unwrap();
+    assert_eq!(entry.name, "rust-test-writer");
+    assert_eq!(entry.description, "Write Rust tests and run them.");
+    assert_eq!(
+        entry.commit.as_deref(),
+        Some("3f2a91c"),
+        "cut to 7 characters"
+    );
+    assert_eq!(entry.license.as_deref(), Some("MIT"));
+    assert_eq!(entry.scripts, ["scripts/run-tests.sh"]);
+    assert_eq!(entry.file_count, 2);
+    assert!(entry.has_hooks);
+    assert_eq!(entry.blocked_reason, None);
+    assert_eq!(entry.installed_skill_id, None);
+    assert_eq!(entry.audits.len(), 1);
+    assert_eq!(entry.audits[0].source, "Socket");
+    assert_eq!(
+        entry.audits[0].status,
+        consort_client::AuditStatusView::Passed
+    );
+
+    let git = preview_of_skill(
+        &client,
+        git_input("https://github.com/acme/rust-skills", Some("review")),
+    )
+    .await
+    .unwrap();
+    assert_eq!(git.name, "review");
+    assert_eq!(
+        git.description,
+        "A skill from https://github.com/acme/rust-skills."
+    );
+    assert_eq!(git.license.as_deref(), Some("Apache-2.0"));
+    assert!(git.scripts.is_empty());
+    assert_eq!(git.file_count, 1);
+    assert!(!git.has_hooks);
+    assert_eq!(git.blocked_reason, None);
+
+    let blocked = preview_of_skill(
+        &client,
+        git_input("https://github.com/acme/blocked-skill", None),
+    )
+    .await
+    .unwrap();
+    assert_eq!(blocked.name, "blocked-skill");
+    assert_eq!(
+        blocked.blocked_reason.as_deref(),
+        Some("The audit failed: the skill reads files outside its folder.")
+    );
+
+    let sent = recorded_of(&hub, "skill.preview");
+    assert_eq!(sent.len(), 3);
+    assert_eq!(sent[0]["source"]["kind"], "directory");
+    assert_eq!(sent[0]["source"]["entry_id"], "market:rust-test-writer");
+    assert_eq!(sent[1]["source"]["kind"], "git");
+    assert_eq!(
+        sent[1]["source"]["url"],
+        "https://github.com/acme/rust-skills"
+    );
+    assert_eq!(sent[1]["source"]["path"], "review");
+    assert!(
+        hub.lock().unwrap().skills.is_empty(),
+        "a preview installs nothing"
+    );
+    assert!(client.state().skills.is_empty());
+}
+
+/// An install returns the skill ID and adds the skill to the list, with the
+/// scope and the switch that the user chose. A skill with scripts stays off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn installing_a_skill_returns_its_id_and_adds_it_to_the_list() {
+    let (url, hub) = start_hub().await;
+    let dir = tempfile::tempdir().unwrap();
+    let client = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
+
+    let id = install_skill_input(
+        &client,
+        directory_input("anthropic:pdf-forms"),
+        Some(true),
+        None,
+    )
+    .await
+    .unwrap();
+    let state = wait_for(&client, "the skill in the list", |s| s.skill(&id).is_some()).await;
+    let skill = state.skill(&id).unwrap();
+    assert_eq!(skill.name, "pdf-forms");
+    assert!(skill.enabled);
+    assert_eq!(
+        skill.use_in,
+        consort_client::UseInView::Tags(vec!["work".into()])
+    );
+    assert_eq!(skill.commit.as_deref(), Some("3f2a91c"));
+    assert_eq!(skill.license.as_deref(), Some("MIT"));
+    assert!(matches!(
+        &skill.source,
+        consort_client::SkillSourceView::Directory { entry_id, .. } if entry_id == "anthropic:pdf-forms"
+    ));
+    assert_eq!(skill.file_count, 1);
+    assert_eq!(state.skills.len(), 1);
+
+    let sent = recorded_of(&hub, "skill.install");
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0]["source"]["kind"], "directory");
+    assert_eq!(sent[0]["source"]["entry_id"], "anthropic:pdf-forms");
+    assert_eq!(sent[0]["use_in"]["kind"], "tags");
+    assert_eq!(sent[0]["use_in"]["tags"][0], "work");
+    assert_eq!(sent[0]["enabled"], true);
+    assert!(sent[0]["approval_id"].is_null());
+
+    // The preview now names the installed skill.
+    let preview = preview_of_skill(&client, directory_input("anthropic:pdf-forms"))
+        .await
+        .unwrap();
+    assert_eq!(preview.installed_skill_id.as_deref(), Some(id.as_str()));
+
+    // A git skill that the user turns off stays off.
+    let off = install_skill_input(
+        &client,
+        git_input("https://github.com/acme/rust-skills", Some("review")),
+        Some(false),
+        None,
+    )
+    .await
+    .unwrap();
+    let state = wait_for(&client, "the skill that is off", |s| {
+        s.skill(&off).is_some()
+    })
+    .await;
+    assert!(!state.skill(&off).unwrap().enabled);
+    assert_eq!(recorded_of(&hub, "skill.install")[1]["enabled"], false);
+    assert_eq!(
+        recorded_of(&hub, "skill.install")[1]["source"]["kind"],
+        "git"
+    );
+
+    // A skill with scripts is off, whatever the user asked.
+    let scripted = install_skill_input(
+        &client,
+        directory_input("market:rust-test-writer"),
+        Some(true),
+        None,
+    )
+    .await
+    .unwrap();
+    let state = wait_for(&client, "the skill with scripts", |s| {
+        s.skill(&scripted).is_some()
+    })
+    .await;
+    let scripted = state.skill(&scripted).unwrap();
+    assert!(scripted.has_scripts());
+    assert!(!scripted.enabled);
+    assert!(scripted.hooks_removed);
+
+    // The same skill again, and a blocked skill, are refused in the hub's
+    // words. The list does not change.
+    let err = install_skill_input(&client, directory_input("anthropic:pdf-forms"), None, None)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "A skill named pdf-forms is installed already."
+    );
+    let err = install_skill_input(
+        &client,
+        git_input("https://github.com/acme/blocked-skill", None),
+        None,
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("The hub blocks this skill."),
+        "{err}"
+    );
+    assert_eq!(client.state().skills.len(), 3);
+}
+
+fn install_card_state(state: &ViewState) -> Option<consort_client::ApprovalView> {
+    state
+        .timelines
+        .iter()
+        .flat_map(|t| t.items.iter())
+        .find_map(|i| match i {
+            TimelineItem::Approval(c) => Some(c.approval.clone()),
+            _ => None,
+        })
+        .filter(|a| {
+            matches!(
+                a.card.as_deref(),
+                Some(consort_client::HubCardView::SkillInstall(_))
+            )
+        })
+}
+
+/// The install card reaches the timeline as an install card. An install
+/// with its `approval_id` closes it and names the new skill.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_install_card_closes_when_the_skill_is_added_from_it() {
+    use consort_proto::model::SkillInstallCard;
+    let (url, hub) = start_hub().await;
+    let card_id = {
+        let mut h = hub.lock().unwrap();
+        // The hub posts its card as an approval message of Tutti, with no
+        // task. The timeline shows the card from that message.
+        let (message_id, channel_id) = {
+            let approval = h.approval.as_ref().unwrap();
+            (approval.message_id, approval.channel_id)
+        };
+        h.messages.push(Message {
+            id: message_id,
+            channel_id,
+            thread_root_id: None,
+            author: Author::Assistant,
+            author_session_id: None,
+            author_task_id: None,
+            author_routine_id: None,
+            kind: MessageKind::Approval,
+            body: String::new(),
+            attachments: vec![],
+            in_timeline: false,
+            client_message_id: None,
+            reply_count: 0,
+            last_reply_at: None,
+            reactions: vec![],
+            edited_at: None,
+            deleted_at: None,
+            created_at: ts(Timestamp::now().as_millis() - 3_000),
+        });
+        let approval = h.approval.as_mut().unwrap();
+        approval.task_id = None;
+        let details = ApprovalDetails::SkillInstall(Box::new(SkillInstallCard {
+            name: "pdf-forms".into(),
+            description: "Fill in PDF forms.".into(),
+            source: SkillSource::Directory {
+                directory: SkillDirectoryKind::Anthropic,
+                entry_id: "anthropic:pdf-forms".into(),
+                url: "https://github.com/anthropics/skills".into(),
+                path: Some("pdf".into()),
+            },
+            commit: Some(FAKE_COMMIT.into()),
+            license: Some("MIT".into()),
+            scripts: Vec::new(),
+            audits: Vec::new(),
+            use_in: consort_proto::model::UseIn::EveryChannel,
+            blocked_reason: None,
+            skill_id: None,
+        }));
+        approval.options = details.hub_card_options().unwrap();
+        approval.details = details;
+        approval.request_id = consort_proto::model::hub_card_request_id(approval.id);
+        approval.id.to_string()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let client = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
+
+    let state = wait_for(&client, "the install card", |s| {
+        install_card_state(s).is_some()
+    })
+    .await;
+    let card = install_card_state(&state).unwrap();
+    assert_eq!(card.id, card_id);
+    assert_eq!(card.state, consort_client::RequestState::Pending);
+    let Some(consort_client::HubCardView::SkillInstall(view)) = card.card.as_deref() else {
+        panic!("an install card");
+    };
+    assert_eq!(view.name, "pdf-forms");
+    assert_eq!(view.license.as_deref(), Some("MIT"));
+    assert_eq!(view.commit.as_deref(), Some("3f2a91c"));
+    assert_eq!(view.skill_id, None);
+    assert_eq!(
+        card.button_labels
+            .iter()
+            .map(|(_, label)| label.as_str())
+            .collect::<Vec<_>>(),
+        ["Add", "Not now"]
+    );
+
+    // A card that the hub does not know: the install fails, and no skill
+    // is added.
+    let err = install_skill_input(
+        &client,
+        directory_input("anthropic:pdf-forms"),
+        None,
+        Some(ApprovalId::new().to_string()),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.to_string(), "That install card does not exist.");
+    assert!(client.state().skills.is_empty());
+    assert_eq!(
+        install_card_state(&client.state()).unwrap().state,
+        consort_client::RequestState::Pending,
+        "the card still waits"
+    );
+
+    let id = install_skill_input(
+        &client,
+        directory_input("anthropic:pdf-forms"),
+        None,
+        Some(card_id.clone()),
+    )
+    .await
+    .unwrap();
+    let sent = recorded_of(&hub, "skill.install");
+    assert_eq!(sent.last().unwrap()["approval_id"], card_id.as_str());
+
+    // The feed closes the card, and the card names the skill.
+    let state = wait_for(&client, "the card closed", |s| {
+        install_card_state(s).is_some_and(|c| c.state != consort_client::RequestState::Pending)
+    })
+    .await;
+    let card = install_card_state(&state).unwrap();
+    assert_eq!(card.state, consort_client::RequestState::Answered);
+    assert_eq!(card.answer, Some(ApprovalChoice::AllowOnce));
+    let Some(consort_client::HubCardView::SkillInstall(view)) = card.card.as_deref() else {
+        panic!("an install card");
+    };
+    assert_eq!(view.skill_id.as_deref(), Some(id.as_str()));
+    assert!(state.skill(&id).is_some());
+}
+
+/// The sources of the skill directories: list, add and remove. A bad URL
+/// gives an error that says what happened.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn skill_directory_sources_are_listed_added_and_removed() {
+    let (url, hub) = start_hub().await;
+    let dir = tempfile::tempdir().unwrap();
+    let client = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
+    let sources = |s: &ViewState| -> Vec<(String, bool)> {
+        s.skill_directory
+            .sources
+            .iter()
+            .map(|d| (d.id.clone(), d.removable))
+            .collect()
+    };
+
+    client
+        .run(Command::LoadSkillDirectorySources)
+        .await
+        .unwrap();
+    let state = wait_for(&client, "the sources", |s| {
+        !s.skill_directory.sources.is_empty()
+    })
+    .await;
+    assert_eq!(
+        sources(&state),
+        [
+            ("smithery".to_owned(), false),
+            ("anthropic".to_owned(), false),
+            (MARKETPLACE_URL.to_owned(), true),
+        ]
+    );
+    assert_eq!(
+        state.skill_directory.sources[0].kind,
+        consort_client::DirectoryKind::Smithery
+    );
+    assert_eq!(
+        state.skill_directory.sources[2].kind,
+        consort_client::DirectoryKind::Marketplace
+    );
+    assert_eq!(state.skill_directory.sources[2].name, "Team plugins");
+
+    client
+        .run(Command::AddSkillDirectorySource {
+            url: " https://example.com/more/marketplace.json ".into(),
+        })
+        .await
+        .unwrap();
+    let state = wait_for(&client, "the added source", |s| {
+        s.skill_directory.sources.len() == 4
+    })
+    .await;
+    let added = state.skill_directory.sources.last().unwrap();
+    assert_eq!(added.id, "https://example.com/more/marketplace.json");
+    assert_eq!(added.kind, consort_client::DirectoryKind::Marketplace);
+    assert!(added.removable);
+    assert_eq!(
+        recorded_of(&hub, "skill_directory.add_source")[0]["url"],
+        "https://example.com/more/marketplace.json",
+        "the client sends the trimmed URL"
+    );
+
+    // The hub refuses a URL that is not a link. The list does not change.
+    let err = client
+        .run(Command::AddSkillDirectorySource {
+            url: "not a url".into(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "\"not a url\" is not a link to a marketplace.json file. Paste an https:// link, then try again."
+    );
+    assert!(matches!(&err, ClientError::Hub { code, .. } if code == "invalid"));
+    assert_eq!(client.state().skill_directory.sources.len(), 4);
+
+    // An empty URL stops in the client. The hub sees no request.
+    let before = recorded_of(&hub, "skill_directory.add_source").len();
+    let err = client
+        .run(Command::AddSkillDirectorySource { url: "  ".into() })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "Paste the URL of a git repo or a marketplace.json file."
+    );
+    assert_eq!(
+        recorded_of(&hub, "skill_directory.add_source").len(),
+        before
+    );
+
+    // A built-in source stays. An unknown one is not found.
+    let err = client
+        .run(Command::RemoveSkillDirectorySource {
+            id: "smithery".into(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "Smithery is built in and stays in the list."
+    );
+    let err = client
+        .run(Command::RemoveSkillDirectorySource { id: "nope".into() })
+        .await
+        .unwrap_err();
+    assert_eq!(err.to_string(), "That directory is not in the list.");
+    assert_eq!(client.state().skill_directory.sources.len(), 4);
+
+    client
+        .run(Command::RemoveSkillDirectorySource {
+            id: MARKETPLACE_URL.into(),
+        })
+        .await
+        .unwrap();
+    let state = wait_for(&client, "the source removed", |s| {
+        s.skill_directory.sources.len() == 3
+    })
+    .await;
+    assert_eq!(
+        sources(&state),
+        [
+            ("smithery".to_owned(), false),
+            ("anthropic".to_owned(), false),
+            ("https://example.com/more/marketplace.json".to_owned(), true),
+        ]
+    );
+    let removed = recorded_of(&hub, "skill_directory.remove_source");
+    assert_eq!(removed.last().unwrap()["id"], MARKETPLACE_URL);
+}
+
+/// The audit log of a connection comes in pages, newest first, with the
+/// facts of each call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn connection_calls_come_in_pages_with_their_facts() {
+    let (url, hub) = start_hub().await;
+    let connection = consort_proto::ids::ConnectionId::new();
+    let other = consort_proto::ids::ConnectionId::new();
+    {
+        let mut h = hub.lock().unwrap();
+        h.calls = connector_calls(connection, 3);
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let client = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
+    let wanted = connection.to_string();
+
+    let consort_client::CommandOutput::ConnectionCalls(first) = client
+        .run_for(Command::LoadConnectionCalls {
+            connection_id: wanted.clone(),
+            before: None,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("a page of calls");
+    };
+    assert_eq!(first.connection_id, wanted);
+    assert!(first.has_more);
+    assert_eq!(first.calls.len(), 2);
+    let denied = &first.calls[0];
+    assert_eq!(denied.tool, "GMAIL_TOOL_0");
+    assert_eq!(denied.kind, consort_client::ToolKindView::Change);
+    assert_eq!(denied.decision, "Denied by you");
+    assert!(!denied.succeeded);
+    assert_eq!(denied.size_label, "2.0 KB");
+    assert!(
+        denied.time_label.ends_with("AM") || denied.time_label.ends_with("PM"),
+        "a clock time: {}",
+        denied.time_label
+    );
+    assert!(!denied.day_label.is_empty());
+    let allowed = &first.calls[1];
+    assert_eq!(allowed.tool, "GMAIL_TOOL_1");
+    assert_eq!(allowed.kind, consort_client::ToolKindView::Read);
+    assert_eq!(allowed.decision, "Allowed by you");
+    assert!(allowed.succeeded);
+    assert_eq!(allowed.size_label, "412 B");
+
+    // The second page starts after the last call of the first.
+    let consort_client::CommandOutput::ConnectionCalls(second) = client
+        .run_for(Command::LoadConnectionCalls {
+            connection_id: wanted.clone(),
+            before: Some(allowed.id.clone()),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("a page of calls");
+    };
+    assert!(!second.has_more);
+    assert_eq!(second.calls.len(), 1);
+    assert_eq!(second.calls[0].tool, "GMAIL_TOOL_2");
+    assert_eq!(second.calls[0].size_label, "12.4 KB");
+    assert_ne!(second.calls[0].id, allowed.id);
+
+    let sent = recorded_of(&hub, "connection.calls");
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[0]["connection_id"], wanted.as_str());
+    assert!(sent[0]["before"].is_null());
+    assert_eq!(sent[1]["before"], allowed.id.as_str());
+
+    // A connection with no calls gives an empty page.
+    let consort_client::CommandOutput::ConnectionCalls(none) = client
+        .run_for(Command::LoadConnectionCalls {
+            connection_id: other.to_string(),
+            before: None,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("a page of calls");
+    };
+    assert!(none.calls.is_empty());
+    assert!(!none.has_more);
+}
+
+/// A hub that answers `unsupported` gives the generic "cannot ... yet" text
+/// for search, preview, install and the source requests.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unsupported_hub_gives_the_generic_text_for_every_skill_request() {
+    let (url, hub) = start_hub().await;
+    hub.lock().unwrap().skills_unsupported = true;
+    let dir = tempfile::tempdir().unwrap();
+    let client = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
+
+    client
+        .run(Command::SearchSkillDirectory {
+            search: "rust".into(),
+            source: None,
+        })
+        .await
+        .unwrap();
+    let state = wait_for(&client, "the search answer", |s| {
+        matches!(
+            s.skill_directory.load,
+            consort_client::LoadState::Unsupported(_)
+        )
+    })
+    .await;
+    assert_eq!(
+        state.skill_directory.load,
+        consort_client::LoadState::Unsupported(cannot("search skill directories"))
+    );
+    assert!(state.skill_directory.entries.is_empty());
+
+    let err = preview_of_skill(&client, directory_input("anthropic:pdf-forms"))
+        .await
+        .unwrap_err();
+    assert_eq!(err.to_string(), cannot("add skills"));
+    let err = install_skill_input(&client, directory_input("anthropic:pdf-forms"), None, None)
+        .await
+        .unwrap_err();
+    assert_eq!(err.to_string(), cannot("add skills"));
+    let err = client
+        .run(Command::AddSkillDirectorySource {
+            url: "https://example.com/marketplace.json".into(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.to_string(), cannot("add skill directories"));
+    let err = client
+        .run(Command::RemoveSkillDirectorySource {
+            id: MARKETPLACE_URL.into(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(err.to_string(), cannot("remove skill directories"));
+    assert!(client.state().skills.is_empty());
+}
+
+/// An error that is not `unsupported` keeps the hub's own words. The
+/// "cannot ... yet" text is only for an `unsupported` hub.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn other_skill_errors_do_not_give_the_unsupported_text() {
+    let (url, _hub) = start_hub().await;
+    let dir = tempfile::tempdir().unwrap();
+    let client = paired_client(&url, dir.path(), options(quick())).await;
+    let generic = "Update the hub, then try again.";
+
+    // An `invalid` answer.
+    let err = preview_of_skill(&client, git_input("https://github.com/acme/broken", None))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "The hub found no skill at that address. Check the URL, then try again."
+    );
+    assert!(matches!(&err, ClientError::Hub { code, .. } if code == "invalid"));
+    assert!(!err.to_string().contains(generic));
+
+    // An `internal` answer.
+    let err = preview_of_skill(&client, git_input("https://github.com/acme/flaky", None))
+        .await
+        .unwrap_err();
+    assert_eq!(err.to_string(), "The fake hub fails this preview.");
+    assert!(matches!(&err, ClientError::Hub { code, .. } if code == "internal"));
+
+    // The same for an install.
+    let err = install_skill_input(
+        &client,
+        git_input("https://github.com/acme/broken", None),
+        None,
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(&err, ClientError::Hub { code, .. } if code == "invalid"));
+    assert!(!err.to_string().contains(generic));
+
+    // A broken link: the hub closes the socket before it answers.
+    let err = preview_of_skill(&client, git_input("https://github.com/acme/dropped", None))
+        .await
+        .unwrap_err();
+    assert!(!err.to_string().contains(generic), "{err}");
+    assert!(!matches!(&err, ClientError::Hub { code, .. } if code == "unsupported"));
+
+    // The client connects again, and the next preview works.
+    wait_for(&client, "online again", |s| {
+        s.connection == Connection::Online
+    })
+    .await;
+    let ok = preview_of_skill(&client, git_input("https://github.com/acme/fine", None))
+        .await
+        .unwrap();
+    assert_eq!(ok.name, "fine");
 }

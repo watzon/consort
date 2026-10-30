@@ -43,7 +43,7 @@ async fn large_messages_that_arrive_during_a_turn_go_out_over_several_turns() {
     let mut ids: Vec<MessageId> = Vec::new();
     for i in 0..5 {
         let message = world
-            .say(world.everything, &format!("{i}{}", "a".repeat(LARGE)))
+            .say(world.tutti, &format!("{i}{}", "a".repeat(LARGE)))
             .await;
         ids.push(message.id);
     }
@@ -105,11 +105,11 @@ async fn large_messages_that_arrive_during_a_turn_go_out_over_several_turns() {
 async fn a_message_list_of_large_messages_answers_with_a_shorter_page() {
     let hub = TestHub::start().await;
     let mut client = FakeClient::pair_and_connect(&hub).await;
-    let everything = client.everything().await;
+    let tutti = client.tutti().await;
     let mut ids = Vec::new();
     for i in 0..4 {
         let sent = client
-            .request(send(everything, &format!("m{i}"), "x".repeat(LARGE)))
+            .request(send(tutti, &format!("m{i}"), "x".repeat(LARGE)))
             .await
             .unwrap();
         ids.push(sent.message.id);
@@ -119,7 +119,7 @@ async fn a_message_list_of_large_messages_answers_with_a_shorter_page() {
     let page: MessageListResult = tokio::time::timeout(
         Duration::from_secs(5),
         client.request(MessageList {
-            channel_id: everything,
+            channel_id: tutti,
             thread_root_id: None,
             before: None,
             limit: Some(5),
@@ -135,7 +135,7 @@ async fn a_message_list_of_large_messages_answers_with_a_shorter_page() {
     let oldest = page.messages.last().unwrap().id;
     let rest: MessageListResult = client
         .request(MessageList {
-            channel_id: everything,
+            channel_id: tutti,
             thread_root_id: None,
             before: Some(oldest),
             limit: Some(5),
@@ -158,16 +158,16 @@ async fn a_message_list_of_large_messages_answers_with_a_shorter_page() {
 async fn a_channel_snapshot_of_large_messages_answers_and_says_that_more_exist() {
     let hub = TestHub::start().await;
     let mut client = FakeClient::pair_and_connect(&hub).await;
-    let everything = client.everything().await;
+    let tutti = client.tutti().await;
     for i in 0..5 {
         client
-            .request(send(everything, &format!("m{i}"), "x".repeat(LARGE)))
+            .request(send(tutti, &format!("m{i}"), "x".repeat(LARGE)))
             .await
             .unwrap();
     }
     let snapshot = tokio::time::timeout(
         Duration::from_secs(5),
-        client.snapshot(SnapshotScope::Channel(everything)),
+        client.snapshot(SnapshotScope::Channel(tutti)),
     )
     .await
     .expect("sync.snapshot got no answer");
@@ -180,7 +180,7 @@ async fn a_channel_snapshot_of_large_messages_answers_and_says_that_more_exist()
 async fn a_message_over_the_limit_is_refused_and_the_feed_goes_on() {
     let hub = TestHub::start().await;
     let mut watcher = FakeClient::pair_and_connect(&hub).await;
-    let everything = watcher.everything().await;
+    let tutti = watcher.tutti().await;
     let code: ClientPairingCodeResult = watcher.request(ClientPairingCode {}).await.unwrap();
     let mut sender = FakeClient::pair_with_code_and_connect(&hub, &code.code.to_string()).await;
     let snapshot = watcher.snapshot(SnapshotScope::All).await;
@@ -189,13 +189,13 @@ async fn a_message_over_the_limit_is_refused_and_the_feed_goes_on() {
     // Nearly 1 MiB: the frame of the request fits, but its feed entry would
     // not.
     let error = sender
-        .request(send(everything, "big", "y".repeat(MAX_FRAME_BYTES - 400)))
+        .request(send(tutti, "big", "y".repeat(MAX_FRAME_BYTES - 400)))
         .await
         .unwrap_err();
     assert_eq!(error.code, ErrorCode::Invalid);
     assert!(error.message.contains("limit"), "{}", error.message);
     sender
-        .request(send(everything, "small", "small after".to_owned()))
+        .request(send(tutti, "small", "small after".to_owned()))
         .await
         .unwrap();
 
@@ -224,13 +224,13 @@ async fn a_brief_or_channel_text_over_its_limit_is_refused() {
     use consort_proto::model::PlacementRequest;
     let hub = TestHub::start().await;
     let mut client = FakeClient::pair_and_connect(&hub).await;
-    let everything = client.everything().await;
+    let tutti = client.tutti().await;
     // The `all` snapshot holds every open task and every channel, so these
     // texts have small limits: 32 KiB for a brief, 4 KiB for a purpose and
     // 16 KiB for instructions.
     let brief = client
         .request(TaskCreate {
-            channel_id: everything,
+            channel_id: tutti,
             title: "Big".to_owned(),
             brief: "b".repeat(33 * 1024),
             model_selection: None,

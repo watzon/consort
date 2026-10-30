@@ -5,9 +5,10 @@
 
 use consort_client::{
     ApprovalChoice, AuthKind, ChannelKind, Command, CommandOutput, ConnectionChanges,
-    ConnectionStatusView, CredentialFieldView, HubCardView, NewConnection, SecretEnv, ServiceLogo,
-    ServiceView, SkillChanges, SkillFileContentView, SkillFileView, SkillInstallInput,
-    SkillPreviewView, TimelineItem, ToolApprovalsView, ToolKindView, UseInView, ViewState,
+    ConnectionStatusView, ConnectorCallView, CredentialFieldView, HubCardView, NewConnection,
+    SecretEnv, ServiceLogo, ServiceView, SkillChanges, SkillFileContentView, SkillFileView,
+    SkillInstallInput, SkillPreviewView, TimelineItem, ToolApprovalsView, ToolKindView, UseInView,
+    ViewState,
 };
 use gpui_kit::{
     AppContext as _, Context, Entity, Window,
@@ -78,6 +79,23 @@ pub struct AddSkillForm {
     pub use_in: UseInView,
 }
 
+/// The open Activity dialog of a connection: the audit log, newest first.
+#[derive(Clone, Debug, Default)]
+pub struct ActivityForm {
+    pub connection_id: String,
+    pub calls: Vec<ConnectorCallView>,
+    /// Older calls exist.
+    pub has_more: bool,
+    /// The first page loads.
+    pub loading: bool,
+    /// An older page loads.
+    pub loading_more: bool,
+    /// What the hub or the link said when a page failed.
+    pub error: Option<String>,
+    /// Counts the loads, so the answer of an old load is dropped.
+    pub serial: u64,
+}
+
 /// The open files dialog of a skill.
 #[derive(Clone, Debug, Default)]
 pub struct SkillFilesForm {
@@ -111,6 +129,8 @@ pub struct ExtInputs {
     pub skill_search: Entity<InputState>,
     pub git_url: Entity<InputState>,
     pub git_path: Entity<InputState>,
+    /// The URL field of the Add source dialog.
+    pub source_url: Entity<InputState>,
 }
 
 impl ExtInputs {
@@ -131,10 +151,15 @@ impl ExtInputs {
             skill_search: field("Search skills", window, cx),
             git_url: field("https://github.com/owner/repo", window, cx),
             git_path: field("Folder in the repo, such as skills/pdf", window, cx),
+            source_url: field(
+                "https://github.com/owner/repo or a marketplace.json URL",
+                window,
+                cx,
+            ),
         }
     }
 
-    pub fn all(&self) -> [&Entity<InputState>; 7] {
+    pub fn all(&self) -> [&Entity<InputState>; 8] {
         [
             &self.catalog_search,
             &self.connect_name,
@@ -143,6 +168,7 @@ impl ExtInputs {
             &self.skill_search,
             &self.git_url,
             &self.git_path,
+            &self.source_url,
         ]
     }
 }
@@ -157,6 +183,7 @@ pub struct ExtState {
     pub connect: ConnectForm,
     pub add_skill: AddSkillForm,
     pub files: SkillFilesForm,
+    pub activity: ActivityForm,
     /// Connect cards that the user continued: the app opens the sign-in page
     /// once the hub has made the connection.
     pub browser_cards: Vec<String>,
@@ -211,10 +238,10 @@ pub fn toggle_tag(use_in: &UseInView, tag: &str) -> UseInView {
 }
 
 /// The Use in that a new connection or skill starts with: the tags of the
-/// open channel, or every channel from Everything or a channel with no tags.
+/// open channel, or every channel from Tutti or a channel with no tags.
 pub fn default_use_in(state: &ViewState, channel_id: &str) -> UseInView {
     match state.channel(channel_id) {
-        Some(c) if c.kind != ChannelKind::Everything && !c.tags.is_empty() => {
+        Some(c) if c.kind != ChannelKind::Tutti && !c.tags.is_empty() => {
             UseInView::Tags(c.tags.clone())
         }
         _ => UseInView::EveryChannel,
@@ -268,6 +295,7 @@ impl ConsortApp {
             &self.ext_inputs.composio_key,
             &self.ext_inputs.git_url,
             &self.ext_inputs.git_path,
+            &self.ext_inputs.source_url,
         ] {
             subs.push(
                 cx.subscribe_in(
@@ -318,6 +346,7 @@ impl ConsortApp {
             Some(Dialog::AddSkill) if self.ext.add_skill.tab == AddSkillTab::Git => {
                 self.check_git_skill(cx)
             }
+            Some(Dialog::AddSkillSource) => self.add_skill_source(window, cx),
             None if self.page == Page::Settings
                 && self.settings_section == SettingsSection::Connectors =>
             {
@@ -401,7 +430,12 @@ impl ConsortApp {
         self.select_connection(self.ext.connection.clone(), None, cx);
     }
 
-    pub fn enter_skills(&mut self, _cx: &mut Context<Self>) {
+    pub fn enter_skills(&mut self, cx: &mut Context<Self>) {
+        // The sources section lists what the hub searches now.
+        let client = self.client.clone();
+        self.spawn_command(cx, async move {
+            client.run(Command::LoadSkillDirectorySources).await
+        });
         if self
             .ext
             .skill
@@ -1029,6 +1063,98 @@ impl ConsortApp {
         .detach();
     }
 
+    /// Adds the skill source from the URL field of the Add source dialog.
+    pub fn add_skill_source(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let url = self
+            .ext_inputs
+            .source_url
+            .read(cx)
+            .value()
+            .trim()
+            .to_owned();
+        if url.is_empty() {
+            self.dialog_error =
+                Some("Paste the URL of a git repo or a marketplace.json file.".into());
+            cx.notify();
+            return;
+        }
+        let client = self.client.clone();
+        self.submit_dialog(
+            async move { client.run(Command::AddSkillDirectorySource { url }).await },
+            window,
+            cx,
+        );
+    }
+
+    /// Removes a skill source that the user added. Skills that came from it
+    /// stay installed.
+    pub fn remove_skill_source(&mut self, id: String, cx: &mut Context<Self>) {
+        let client = self.client.clone();
+        self.spawn_command(cx, async move {
+            client.run(Command::RemoveSkillDirectorySource { id }).await
+        });
+    }
+
+    /// Loads a page of the activity of a connection. `more` loads the page
+    /// after the calls that show now. Otherwise the list starts again.
+    pub fn load_activity(&mut self, connection_id: String, more: bool, cx: &mut Context<Self>) {
+        let activity = &mut self.ext.activity;
+        let before = if more {
+            if activity.loading_more || activity.connection_id != connection_id {
+                return;
+            }
+            activity.loading_more = true;
+            activity.calls.last().map(|c| c.id.clone())
+        } else {
+            let serial = activity.serial;
+            *activity = ActivityForm {
+                connection_id: connection_id.clone(),
+                loading: true,
+                serial,
+                ..ActivityForm::default()
+            };
+            None
+        };
+        activity.error = None;
+        activity.serial += 1;
+        let serial = activity.serial;
+        cx.notify();
+        let client = self.client.clone();
+        cx.spawn(async move |this, cx| {
+            let result = client
+                .run_for(Command::LoadConnectionCalls {
+                    connection_id: connection_id.clone(),
+                    before,
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                let activity = &mut this.ext.activity;
+                // The user may have closed the dialog or asked again.
+                if activity.serial != serial {
+                    return;
+                }
+                activity.loading = false;
+                activity.loading_more = false;
+                match result {
+                    Ok(CommandOutput::ConnectionCalls(page)) => {
+                        activity.calls.extend(page.calls);
+                        activity.has_more = page.has_more;
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        let reason = err.to_string();
+                        activity.error = Some(format!(
+                            "Consort could not load the activity: {}. Try again.",
+                            reason.trim_end_matches('.')
+                        ));
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// Checks the skill of the Git URL tab.
     pub fn check_git_skill(&mut self, cx: &mut Context<Self>) {
         let url = self.ext_inputs.git_url.read(cx).value().trim().to_owned();
@@ -1254,7 +1380,7 @@ mod tests {
             UseInView::Tags(vec!["work".into()])
         );
         assert_eq!(
-            default_use_in(&state, consort_client::mock::everything_id()),
+            default_use_in(&state, consort_client::mock::tutti_id()),
             UseInView::EveryChannel
         );
         let tags = scope_tags(&state);

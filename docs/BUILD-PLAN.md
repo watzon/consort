@@ -5,8 +5,8 @@ The first build, started 2026-10-29 while the user was away. It builds the deskt
 ## Done means
 
 1. `consort dev --data <dir>` starts a hub on `127.0.0.1:7600` and a worker in the same process, and it prints a setup code.
-2. On first launch, the desktop app asks for the hub URL and the setup code, pairs, and opens the main window on Everything.
-3. A message in Everything starts a coordinator turn on a worker with a harness account. The coordinator's posts appear in the timeline.
+2. On first launch, the desktop app asks for the hub URL and the setup code, pairs, and opens the main window on Tutti.
+3. A message in Tutti starts a coordinator turn on a worker with a harness account. The coordinator's posts appear in the timeline.
 4. The coordinator can start a task. The task shows in the Tasks panel, runs on a worker, posts updates, and opens approvals and decisions that the user answers in the app. It goes to Ready for review, and the user resolves it.
 5. The user can create, rename and archive channels. A channel's purpose and instructions reach its coordinator.
 6. A second worker pairs with `consort worker pair <hub-url> --code <code>`. It shows in the sidebar and in Settings > Workers, with its harness accounts and their sign-in state.

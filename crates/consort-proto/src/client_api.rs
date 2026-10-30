@@ -624,7 +624,7 @@ pub struct ChannelUpdate {
         deserialize_with = "patch::deserialize"
     )]
     pub color: Option<Option<String>>,
-    /// The new coordinator selection. `null` falls back to Everything's.
+    /// The new coordinator selection. `null` falls back to Tutti's.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -693,7 +693,7 @@ pub struct ChannelResult {
     pub channel: Channel,
 }
 
-/// `channel.archive`. The Everything channel cannot be archived.
+/// `channel.archive`. The Tutti channel cannot be archived.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChannelArchive {
     /// The channel.
@@ -707,7 +707,7 @@ fn default_true() -> bool {
     true
 }
 
-/// `channel.delete`. The Everything channel cannot be deleted.
+/// `channel.delete`. The Tutti channel cannot be deleted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChannelDelete {
     /// The channel.
@@ -2931,8 +2931,8 @@ mod tests {
     fn channel_payload_round_trips() {
         let channel = Channel {
             id: chn(),
-            kind: ChannelKind::Everything,
-            name: "Everything".into(),
+            kind: ChannelKind::Tutti,
+            name: "Tutti".into(),
             icon: None,
             color: None,
             group_id: None,

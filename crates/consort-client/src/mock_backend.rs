@@ -158,7 +158,7 @@ impl MockBackend {
                     }
                     None => new.group_id,
                 };
-                let inherited = everything_selection(&state);
+                let inherited = tutti_selection(&state);
                 state.channels.push(ChannelView {
                     id: channel_id_new.clone(),
                     kind: ChannelKind::Standard,
@@ -229,7 +229,7 @@ impl MockBackend {
             Command::ArchiveChannel { channel_id } | Command::DeleteChannel { channel_id } => {
                 if state
                     .channel(&channel_id)
-                    .is_some_and(|c| c.kind == ChannelKind::Everything)
+                    .is_some_and(|c| c.kind == ChannelKind::Tutti)
                 {
                     return Err(ClientError::Hub {
                         code: "conflict".into(),
@@ -334,7 +334,7 @@ impl MockBackend {
             }
             Command::MarkRead { channel_id } => {
                 let sidebar = &mut state.sidebar;
-                for c in std::iter::once(&mut sidebar.everything)
+                for c in std::iter::once(&mut sidebar.tutti)
                     .chain(
                         sidebar
                             .groups
@@ -715,31 +715,31 @@ impl MockBackend {
     }
 }
 
-/// Everything's own model of the assistant.
-fn everything_selection(state: &ViewState) -> Option<SelectionView> {
+/// Tutti's own model of the assistant.
+fn tutti_selection(state: &ViewState) -> Option<SelectionView> {
     state
-        .everything()
+        .tutti()
         .and_then(|c| c.coordinator_selection.as_ref())
         .map(|e| e.selection.clone())
 }
 
 /// Sets or takes away a channel's own model of the assistant, as the hub
-/// does. A new Everything model reaches every channel without its own.
+/// does. A new Tutti model reaches every channel without its own.
 fn set_coordinator_selection(
     state: &mut ViewState,
     channel_id: &str,
     chosen: Option<SelectionView>,
 ) {
-    let is_everything = state
+    let is_tutti = state
         .channel(channel_id)
-        .is_some_and(|c| c.kind == ChannelKind::Everything);
-    if is_everything {
+        .is_some_and(|c| c.kind == ChannelKind::Tutti);
+    if is_tutti {
         for channel in &mut state.channels {
-            let inherits = channel.kind != ChannelKind::Everything
+            let inherits = channel.kind != ChannelKind::Tutti
                 && channel
                     .coordinator_selection
                     .as_ref()
-                    .is_none_or(|e| e.source == SelectionSource::Everything);
+                    .is_none_or(|e| e.source == SelectionSource::Tutti);
             if channel.id == channel_id {
                 channel.coordinator_selection =
                     crate::picker::effective_selection(chosen.clone(), None);
@@ -750,9 +750,9 @@ fn set_coordinator_selection(
         }
         return;
     }
-    let everything = everything_selection(state);
+    let tutti = tutti_selection(state);
     if let Some(channel) = state.channels.iter_mut().find(|c| c.id == channel_id) {
-        channel.coordinator_selection = crate::picker::effective_selection(chosen, everything);
+        channel.coordinator_selection = crate::picker::effective_selection(chosen, tutti);
     }
 }
 
@@ -1058,7 +1058,7 @@ mod tests {
     fn a_sent_message_shows_at_once_and_the_demo_answers() {
         let client = Client::mock().expect("mock");
         let mut sub = client.subscribe();
-        let channel = mock::everything_id().to_owned();
+        let channel = mock::tutti_id().to_owned();
         block_on(async {
             let before = client
                 .state()
@@ -1082,10 +1082,9 @@ mod tests {
     }
 
     #[test]
-    fn everything_cannot_be_archived() {
+    fn tutti_cannot_be_archived() {
         let client = Client::mock().expect("mock");
-        let err =
-            block_on(client.archive_channel(mock::everything_id().into())).expect_err("refused");
+        let err = block_on(client.archive_channel(mock::tutti_id().into())).expect_err("refused");
         assert!(matches!(err, ClientError::Hub { .. }));
     }
 

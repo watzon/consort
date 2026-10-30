@@ -9,7 +9,7 @@ Status: designed with the user on 2026-10-29. Paper artboards (Desktop page):
 - "Add skill dialog"
 - "Channel connectors and skills dialog"
 - "Account settings dialog"
-- "Everything manages connectors and channels"
+- "Tutti manages connectors and channels"
 
 ## What the user asked for
 
@@ -18,7 +18,7 @@ Status: designed with the user on 2026-10-29. Paper artboards (Desktop page):
 3. Every connector that a channel can use is listed by name in the assistant's context, so it never has to "go look in Composio". Two accounts of one service, such as two Gmail accounts, are told apart. Tools stay out of the context until the assistant lists the tools of one connector.
 4. Workers must not drift out of sync, so connectors and skills live on the hub and are scoped with the tags that already exist.
 5. Provider-side extras, such as claude.ai connectors, plugins and skills, have an account toggle. It is on by default.
-6. The assistant can manage all of this. The Everything assistant manages everything. A channel's assistant manages its own channel.
+6. The assistant can manage all of this. The Tutti assistant manages everything. A channel's assistant manages its own channel.
 
 ## Model
 
@@ -30,7 +30,7 @@ Status: designed with the user on 2026-10-29. Paper artboards (Desktop page):
   - A status: active, needs a new sign-in, or failed.
 - **Skill:** a folder that follows the Agent Skills format. It is installed from a source (a git repo plus a path, a directory entry, or an upload) and pinned to a commit SHA plus a content hash. It has an on/off state, a "Use in" scope, a license, a list of scripts, audit results and an update state.
 - **Channel exceptions:** a channel can turn off any connection or skill that its "Use in" scope gives it. It cannot turn on one that the scope does not give it; that needs a change to the item's "Use in".
-- **Effective set for a session:** the connections and skills whose "Use in" matches the channel's tags, minus the channel's exceptions. The Everything channel matches only "every channel" items, unless it has tags of its own.
+- **Effective set for a session:** the connections and skills whose "Use in" matches the channel's tags, minus the channel's exceptions. The Tutti channel matches only "every channel" items, unless it has tags of its own.
 - **Provider extras toggle:** a per-account setting on the worker, on by default. Off means the worker starts that account's harness without its account-synced extras. For Claude Code, that means no claude.ai MCP servers and no synced plugins or skills. Find the supported switches: an env var or setting for claude.ai MCP servers, plus the plugin and skill sync settings. If something cannot be turned off, say so in the dialog.
 
 ## Connectors (Composio)
@@ -95,12 +95,12 @@ It asks the user first with a management approval card when it:
 
 The assistant never handles a secret. A sign-in or a key always goes through a card that the user completes in the app or the browser.
 
-**Everything assistant (audience `EverythingCoordinator`), in addition to the tools it has now:**
+**Tutti assistant (audience `TuttiCoordinator`), in addition to the tools it has now:**
 - Channels:
   - `create_channel { name, purpose, group?, tags?, model?, task_model? }`
   - `update_channel { channel, name?, purpose?, instructions?, group?, tags?, model?, task_model?, repos? }`
   - `archive_channel { channel }`, which asks first.
-- Models: `set_default_model { model selection }`, the Everything default.
+- Models: `set_default_model { model selection }`, the Tutti default.
 - Workers:
   - `set_worker_tags { worker, tags }`, which asks first.
   - `install_tool { worker, tool }`
@@ -239,21 +239,21 @@ The contract as built (the Rust names in `consort-proto`, and the wire names). S
 | `ListInstalledSkills` | `list_installed_skills` | `NoArgs` | `ListInstalledSkillsResult { skills, off_in_this_channel }` | coordinators |
 | `ConnectService` | `connect_service` | `ConnectServiceArgs { service, name, use_in, approvals }` | `ManagementResult` | coordinators |
 | `AddSkill` | `add_skill` | `AddSkillArgs { source, path, use_in }` | `ManagementResult` | coordinators |
-| `CreateChannel` | `create_channel` | `CreateChannelArgs { name, purpose, group, tags, model, task_model }` | `ManagementResult` | Everything |
-| `UpdateChannel` | `update_channel` | `UpdateChannelArgs { channel, name, purpose, instructions, group, tags, model, task_model, repos }` | `ManagementResult` | Everything |
-| `ArchiveChannel` | `archive_channel` | `ArchiveChannelArgs { channel }` | `ManagementResult` | Everything |
-| `SetDefaultModel` | `set_default_model` | `SetDefaultModelArgs { model }` | `ManagementResult` | Everything |
-| `SetWorkerTags` | `set_worker_tags` | `SetWorkerTagsArgs { worker, tags }` | `ManagementResult` | Everything |
-| `InstallTool` | `install_tool` | `InstallToolArgs { worker, tool }` | `ManagementResult` | Everything |
-| `AddAccount` | `add_account` | `AddAccountArgs { worker, provider, name }` | `ManagementResult` | Everything |
-| `StartSignIn` | `start_sign_in` | `StartSignInArgs { worker, account, method }` | `ManagementResult` | Everything |
-| `SetAccountExtras` | `set_account_extras` | `SetAccountExtrasArgs { worker, account, enabled }` | `ManagementResult` | Everything |
-| `SearchConnectorCatalog` | `search_connector_catalog` | `SearchConnectorCatalogArgs { search, category }` | `SearchConnectorCatalogResult { services }` | Everything |
-| `UpdateConnection` | `update_connection` | `UpdateConnectionArgs { connection, name, use_in, approvals }` | `ManagementResult` | Everything |
-| `Disconnect` | `disconnect` | `DisconnectArgs { connection }` | `ManagementResult` | Everything |
-| `SearchSkills` | `search_skills` | `SearchSkillsArgs { search, source }` | `SearchSkillsResult { entries }` | Everything |
-| `UpdateSkill` | `update_skill` | `UpdateSkillArgs { skill, enabled, use_in, accept_new_version }` | `ManagementResult` | Everything |
-| `RemoveSkill` | `remove_skill` | `RemoveSkillArgs { skill }` | `ManagementResult` | Everything |
+| `CreateChannel` | `create_channel` | `CreateChannelArgs { name, purpose, group, tags, model, task_model }` | `ManagementResult` | Tutti |
+| `UpdateChannel` | `update_channel` | `UpdateChannelArgs { channel, name, purpose, instructions, group, tags, model, task_model, repos }` | `ManagementResult` | Tutti |
+| `ArchiveChannel` | `archive_channel` | `ArchiveChannelArgs { channel }` | `ManagementResult` | Tutti |
+| `SetDefaultModel` | `set_default_model` | `SetDefaultModelArgs { model }` | `ManagementResult` | Tutti |
+| `SetWorkerTags` | `set_worker_tags` | `SetWorkerTagsArgs { worker, tags }` | `ManagementResult` | Tutti |
+| `InstallTool` | `install_tool` | `InstallToolArgs { worker, tool }` | `ManagementResult` | Tutti |
+| `AddAccount` | `add_account` | `AddAccountArgs { worker, provider, name }` | `ManagementResult` | Tutti |
+| `StartSignIn` | `start_sign_in` | `StartSignInArgs { worker, account, method }` | `ManagementResult` | Tutti |
+| `SetAccountExtras` | `set_account_extras` | `SetAccountExtrasArgs { worker, account, enabled }` | `ManagementResult` | Tutti |
+| `SearchConnectorCatalog` | `search_connector_catalog` | `SearchConnectorCatalogArgs { search, category }` | `SearchConnectorCatalogResult { services }` | Tutti |
+| `UpdateConnection` | `update_connection` | `UpdateConnectionArgs { connection, name, use_in, approvals }` | `ManagementResult` | Tutti |
+| `Disconnect` | `disconnect` | `DisconnectArgs { connection }` | `ManagementResult` | Tutti |
+| `SearchSkills` | `search_skills` | `SearchSkillsArgs { search, source }` | `SearchSkillsResult { entries }` | Tutti |
+| `UpdateSkill` | `update_skill` | `UpdateSkillArgs { skill, enabled, use_in, accept_new_version }` | `ManagementResult` | Tutti |
+| `RemoveSkill` | `remove_skill` | `RemoveSkillArgs { skill }` | `ManagementResult` | Tutti |
 | `UpdateThisChannel` | `update_this_channel` | `UpdateThisChannelArgs { purpose, instructions, model, task_model, repos }` | `ManagementResult` | channel coordinator |
 | `SetChannelTags` | `set_channel_tags` | `SetChannelTagsArgs { tags }` | `ManagementResult` | channel coordinator |
 | `SetChannelConnector` | `set_channel_connector` | `SetChannelConnectorArgs { connection, enabled }` | `ManagementResult` | channel coordinator |

@@ -159,8 +159,12 @@ pub struct Layout {
     /// The widest a bubble, a task card or an approval card grows in the
     /// timeline.
     pub bubble_max_width: f32,
-    /// The fade at the top of the timeline, under the Three voices mark.
-    pub fade_top: f32,
+    /// The solid canvas at the top of the timeline. It reaches just below
+    /// the Three voices mark and the activity pill, so no bubble shows
+    /// under them. A test checks that it is tall enough for both.
+    pub fade_top_solid: f32,
+    /// The gradient under the solid top, from canvas to clear.
+    pub fade_top_blend: f32,
     /// The fade at the bottom of the timeline, above the composer.
     pub fade_bottom: f32,
 }
@@ -416,12 +420,30 @@ mod tests {
         let s = super::structure();
         assert_eq!(s.layout.bubble_max_width, 560.0);
         assert!(s.layout.bubble_max_width < s.layout.timeline_max_width);
-        assert_eq!((s.layout.fade_top, s.layout.fade_bottom), (96.0, 32.0));
+        assert_eq!(
+            (
+                s.layout.fade_top_solid,
+                s.layout.fade_top_blend,
+                s.layout.fade_bottom
+            ),
+            (92.0, 24.0, 32.0)
+        );
         // 8 frames a second.
         assert_eq!(s.motion.frame_ms, 125);
         assert_eq!(s.motion.done_hold_ms, 1500);
-        // The mark and its pill sit inside the top fade.
-        assert!(s.component.chat.mark_top + s.component.chat.mark < s.layout.fade_top);
+        // The solid top reaches below the mark, the gap and the pill, with a
+        // margin. The pill is one line of the label size, its padding and
+        // its border. The activity pill is not drawn when the assistant
+        // idles, but the solid zone stays, so the edge does not jump.
+        let chat = &s.component.chat;
+        let pill = s.type_scale.label.line + 2.0 * chat.pill_pad_y + 2.0 * s.border_width;
+        let needed = chat.mark_top + chat.mark + s.space.xxs + pill + s.space.xs;
+        assert!(
+            s.layout.fade_top_solid >= needed,
+            "{} < {needed}",
+            s.layout.fade_top_solid
+        );
+        assert!(s.layout.fade_top_solid - needed < s.space.md);
     }
 
     #[test]

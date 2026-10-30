@@ -382,7 +382,7 @@ The hub gives each session the tools for its role. Each tool's `input_schema` is
 | `read_task` | `task_id`, optional `since_item_id`, `before_item_id` and `limit` | The full task, a page of its session items (oldest first) and `has_more`. The task and the items take at most 320 KiB. Without `since_item_id`, the page has the newest items, or the newest ones older than `before_item_id`, and `has_more` says that older items exist. With `since_item_id`, the page has the oldest items after it, and `has_more` says that newer items exist. The default `limit` is 50, and the limit is 200 |
 | `interrupt_task`, `retry_task` | `task_id` | |
 | `routine_list`, `routine_create`, `routine_update`, `routine_delete` | Routine fields | `routine_create` and `routine_update` give `routine`, and `notes` when the hub lowered the placement of a `start_task` action |
-| `suggest_memory` | `note`, `reason` | Channel coordinators only. Sends the note to the Everything coordinator as a global memory suggestion |
+| `suggest_memory` | `note`, `reason` | Channel coordinators only. Sends the note to the Tutti coordinator as a global memory suggestion |
 
 Text in a web page, a file or a message can steer a coordinator. So a task that a coordinator starts, with `start_task` or with a `start_task` routine, gets at most what its channel allows:
 
@@ -392,17 +392,19 @@ Text in a web page, a file or a message can steer a coordinator. So a task that 
 
 The hub does not refuse the task. It runs with less, the tool result lists each change in `notes`, and the task thread gets a `task_limited` notice, so the user sees it too. A task that the user starts from a client has no such limits.
 
-The Everything coordinator also has these tools:
+The wire value of the main channel is `tutti` (`"kind": "tutti"`). Old data and older peers say `everything` (also `everything_coordinator` and `everything_message`). The hub and the clients still read those values. See [ADR 0012](adr/0012-the-main-channel-is-called-tutti.md).
+
+The Tutti coordinator also has these tools:
 
 | Tool | Arguments | Result |
 |---|---|---|
 | `list_channels` | None | Each channel's ID, name, purpose and counts of active tasks |
 | `read_channel` | `channel_id`, optional `since` | The timeline, the tasks and the memory index of that channel |
-| `message_channel` | `channel_id`, `body` | Posts in that channel as a message from Everything and wakes its coordinator |
+| `message_channel` | `channel_id`, `body` | Posts in that channel as a message from Tutti and wakes its coordinator |
 
-Memory tools in the Everything coordinator accept any `scope` for reads. Writes go to `global` only.
+Memory tools in the Tutti coordinator accept any `scope` for reads. Writes go to `global` only.
 
-The Everything coordinator also has the management tools in [Management tools](#management-tools).
+The Tutti coordinator also has the management tools in [Management tools](#management-tools).
 
 ### Tools for task sessions
 
@@ -444,17 +446,17 @@ For the coordinators of every channel:
 |---|---|---|
 | `list_connections` | None | `connections`. A channel's coordinator sees the ones that its channel can use, and `off_in_this_channel` |
 | `list_installed_skills` | None | `skills`, with the same rule, and `off_in_this_channel` |
-| `connect_service` | `service`, `name`, optional `use_in`, `approvals` | Posts a connect card. In a channel, the default `use_in` is the channels with this channel's tags, or this channel alone when it has no tags. In Everything, every channel |
+| `connect_service` | `service`, `name`, optional `use_in`, `approvals` | Posts a connect card. In a channel, the default `use_in` is the channels with this channel's tags, or this channel alone when it has no tags. In Tutti, every channel |
 | `add_skill` | `source` (a git URL, `owner/repo` or a `search_skills` entry ID), optional `path`, `use_in` | Posts an install card with the license, the scripts and the audits. Same defaults for `use_in` |
 
-For the Everything coordinator only:
+For the Tutti coordinator only:
 
 | Tool | Arguments | Notes |
 |---|---|---|
 | `create_channel` | `name`, `purpose`, optional `group` (a group name, made when missing), `tags`, `model`, `task_model` | Runs at once |
 | `update_channel` | `channel`, optional `name`, `purpose`, `instructions`, `group`, `tags`, `model`, `task_model`, `repos` (git remote URLs) | A change to `tags` asks first |
 | `archive_channel` | `channel` | Asks first |
-| `set_default_model` | `model` (a model selection) | Everything's selection |
+| `set_default_model` | `model` (a model selection) | Tutti's selection |
 | `set_worker_tags` | `worker`, `tags` | Asks first |
 | `install_tool` | `worker`, `tool` | As `worker.tool_install` |
 | `add_account` | `worker`, `provider`, `name` | Makes the account, then posts a sign-in card |
@@ -481,7 +483,7 @@ Task sessions have no management tools.
 
 ## Coordinator turn input
 
-The hub wakes a coordinator when one of these events happens in its channel: a user message, a task status change to `review`, `needs_input` or `failed`, a decision answer, a routine run, a message from Everything, a memory suggestion, or the answer to a hub card that the coordinator posted. A memory suggestion comes from a task to its channel coordinator, or from a channel coordinator to the Everything coordinator. The hub runs one turn at a time for each channel. Events that arrive during a turn go into the next turn.
+The hub wakes a coordinator when one of these events happens in its channel: a user message, a task status change to `review`, `needs_input` or `failed`, a decision answer, a routine run, a message from Tutti, a memory suggestion, or the answer to a hub card that the coordinator posted. A memory suggestion comes from a task to its channel coordinator, or from a channel coordinator to the Tutti coordinator. The hub runs one turn at a time for each channel. Events that arrive during a turn go into the next turn.
 
 The hub writes the events into the turn text in this form:
 
@@ -492,7 +494,7 @@ The hub writes the events into the turn text in this form:
   <decision_answered id="dec_..." option="Not now"/>
   <routine id="rtn_..." name="Morning brief">Summarize my calendar and open tasks.</routine>
   <memory_suggestion from="tsk_..." reason="The user said this twice in the thread">Never push to main in sayso. Open a PR.</memory_suggestion>
-  <everything_message id="msg_..." at="2026-10-28T21:49:00Z">Check the release notes before you ship.</everything_message>
+  <tutti_message id="msg_..." at="2026-10-28T21:49:00Z">Check the release notes before you ship.</tutti_message>
   <card_answered id="apr_..." kind="management" outcome="allowed">GitHub Work is now available in 4 more channels.</card_answered>
 </events>
 ```
@@ -555,7 +557,7 @@ A client that does not know these fields shows the preview, which ends with a no
 
 In `channel.update` and `task.update`, a field that is left out does not change. For a field that can be cleared, such as `icon` or `start_at`, `null` clears it. `channel.update` also takes `allowed_local_mcp_servers`, the list of local MCP servers that a task from the assistant may use. The hub trims the names, drops copies, and refuses `hub` and names with `__`.
 
-`channel.create` and `channel.update` take `coordinator_selection` and `task_selection`. In `channel.update`, `null` takes the channel's own selection away, so the channel uses Everything's. A change to the coordinator selection that a channel uses (its own, or Everything's for a channel that has none) ends the channel's idle coordinator session at once, and a running one after its turn. The next turn starts a session with the new model and options. A model option such as `effort` goes to the worker in `session.start` `options`.
+`channel.create` and `channel.update` take `coordinator_selection` and `task_selection`. In `channel.update`, `null` takes the channel's own selection away, so the channel uses Tutti's. A change to the coordinator selection that a channel uses (its own, or Tutti's for a channel that has none) ends the channel's idle coordinator session at once, and a running one after its turn. The next turn starts a session with the new model and options. A model option such as `effort` goes to the worker in `session.start` `options`.
 
 `channel.create` and `channel.update` take `tags`. `worker.set_tags` replaces the user tags of a worker. The hub trims each tag, drops repeats, and refuses a tag that is not 1 to 32 lowercase letters, digits or `-` with `invalid_tag`. A channel's tags are requirements: a coordinator turn, a task or a routine run of the channel runs only on a worker that has every tag, from its user tags or its inventory tags. This is added to any `require.tags` of a task. `worker.set_labels` and the `labels` fields are gone; a `labels` field in an old body still reads as `tags`.
 

@@ -47,10 +47,10 @@ impl Hub {
             .write(move |tx| {
                 if let MemoryScope::Channel(channel_id) = scope {
                     let channel = conversation::channel_or_404(tx.db(), channel_id)?;
-                    // The memory of the Everything channel is the global scope.
-                    if channel.is_everything() {
+                    // The memory of the Tutti channel is the global scope.
+                    if channel.is_tutti() {
                         return Err(HubError::invalid(
-                            "The Everything channel keeps its memory in the global scope. Use `global`.",
+                            "The Tutti channel keeps its memory in the global scope. Use `global`.",
                         ));
                     }
                 }
@@ -314,9 +314,9 @@ mod tests {
         .id
     }
 
-    async fn everything_id(hub: &Hub) -> ChannelId {
+    async fn tutti_id(hub: &Hub) -> ChannelId {
         hub.store
-            .read(conversation::everything_channel)
+            .read(conversation::tutti_channel)
             .await
             .unwrap()
             .id
@@ -562,8 +562,8 @@ mod tests {
             code_of(hub.memory_write(&user(), request).await),
             ErrorCode::NotFound
         );
-        let everything = MemoryScope::Channel(everything_id(&hub).await);
-        let request = write_request(everything, "a.md", "x", ExpectedHash::NotExists);
+        let tutti = MemoryScope::Channel(tutti_id(&hub).await);
+        let request = write_request(tutti, "a.md", "x", ExpectedHash::NotExists);
         assert_eq!(
             code_of(hub.memory_write(&user(), request).await),
             ErrorCode::Invalid

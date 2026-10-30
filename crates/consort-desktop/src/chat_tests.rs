@@ -56,7 +56,7 @@ fn quiet() -> ViewState {
     for task in &mut state.tasks {
         task.status = TaskStatus::Resolved;
     }
-    let tutti = consort_client::mock::everything_id();
+    let tutti = consort_client::mock::tutti_id();
     for timeline in &mut state.timelines {
         if timeline.channel_id == tutti {
             timeline.items.clear();
@@ -76,7 +76,7 @@ fn quiet() -> ViewState {
 }
 
 fn with_tutti(mut state: ViewState, mark: MarkState) -> ViewState {
-    let tutti = consort_client::mock::everything_id();
+    let tutti = consort_client::mock::tutti_id();
     state.activity.retain(|a| a.channel_id != tutti);
     state.activity.push(ChannelActivity {
         channel_id: tutti.into(),
@@ -132,13 +132,13 @@ fn tutti_draws_bubbles_in_two_lanes_with_time_separators(cx: &mut TestAppContext
     // The reply's two bubbles sit at the left, your bubble at the right, and
     // no bubble is wider than the token.
     let reply = cx
-        .debug_bounds("bubble-msg_everything_reply.p1")
+        .debug_bounds("bubble-msg_tutti_reply.p1")
         .expect("the reply's second bubble draws");
     let yours = cx
-        .debug_bounds("bubble-msg_everything_you.p0")
+        .debug_bounds("bubble-msg_tutti_you.p0")
         .expect("your bubble draws");
     let first = cx
-        .debug_bounds("bubble-msg_everything_reply.p0")
+        .debug_bounds("bubble-msg_tutti_reply.p0")
         .expect("the reply's first bubble draws");
     assert_eq!(reply.origin.x, first.origin.x, "one lane");
     assert!(reply.origin.y > first.origin.y);
@@ -389,4 +389,73 @@ fn reduce_motion_stops_the_shimmer_of_a_hovered_button(cx: &mut TestAppContext) 
     assert_eq!(tick, start);
     assert_eq!(version, 0);
     cx.update(|_, cx| cx.set_reduce_motion(false));
+}
+
+/// The top of the chat is solid canvas down to just below the mark and the
+/// activity pill, so no bubble shows under the status line. The first item
+/// of a chat at rest starts below the solid zone and its blend.
+#[gpui::test]
+fn the_first_bubble_starts_below_the_pill_and_the_pill_is_inside_the_solid_top(
+    cx: &mut TestAppContext,
+) {
+    for mark in [MarkState::Working, MarkState::Idle] {
+        // Tutti with one short message, so the chat is at rest at the top.
+        let mut state = with_tutti(mock(), mark);
+        let tutti = consort_client::mock::tutti_id();
+        for timeline in &mut state.timelines {
+            if timeline.channel_id == tutti {
+                timeline.items.retain(|i| i.key() == "msg_tutti_reply");
+            }
+        }
+        let (handle, app) = open(state, cx);
+        let cx = &mut VisualTestContext::from_window(handle, cx);
+        let (solid, blend) = app.read_with(cx, |_, cx| {
+            let layout = ConsortApp::tokens(cx).layout;
+            (layout.fade_top_solid, layout.fade_top_blend)
+        });
+        let first = app.read_with(cx, |app, _| {
+            let items = &app.state.timeline(&app.channel_id).expect("Tutti").items;
+            app.chat_rows
+                .iter()
+                .find_map(|row| match row {
+                    ChatRow::Bubble(b) => {
+                        Some(format!("bubble-{}.p{}", items[b.item].key(), b.part))
+                    }
+                    _ => None,
+                })
+                .expect("a bubble")
+        });
+        let first: &'static str = Box::leak(first.into_boxed_str());
+        draw(cx);
+        let bubble = cx
+            .debug_bounds(first)
+            .unwrap_or_else(|| panic!("{first} draws"));
+        let voices = cx.debug_bounds("three-voices").expect("the mark");
+        let solid_zone = cx.debug_bounds("fade-top-solid").expect("the solid top");
+        assert_eq!(solid_zone.size.height, solid);
+        assert!(voices.bottom() < solid_zone.bottom(), "the mark");
+        if mark == MarkState::Working {
+            let pill = cx.debug_bounds("activity-pill").expect("the pill shows");
+            assert!(
+                pill.bottom() <= solid_zone.bottom(),
+                "the pill ends inside the solid top"
+            );
+            assert!(
+                bubble.origin.y >= pill.bottom(),
+                "the first bubble ({:?}) starts at or below the pill ({:?})",
+                bubble.origin.y,
+                pill.bottom()
+            );
+        } else {
+            assert!(cx.debug_bounds("activity-pill").is_none());
+        }
+        // The same layout with and without the pill, so the edge never
+        // jumps. The first row starts below the solid top and the blend.
+        assert!(
+            bubble.origin.y >= solid_zone.bottom() + blend - px(1.),
+            "{:?} < {:?}",
+            bubble.origin.y,
+            solid_zone.bottom() + blend
+        );
+    }
 }

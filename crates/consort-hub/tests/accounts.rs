@@ -601,11 +601,8 @@ async fn a_snapshot_has_the_running_sign_ins_and_not_the_ended_ones() {
     let snapshot = world.client.snapshot(SnapshotScope::All).await;
     assert!(snapshot.sign_ins.is_empty(), "{:?}", snapshot.sign_ins);
     // A channel snapshot never has sign-ins.
-    let everything = world.client.everything().await;
-    let channel = world
-        .client
-        .snapshot(SnapshotScope::Channel(everything))
-        .await;
+    let tutti = world.client.tutti().await;
+    let channel = world.client.snapshot(SnapshotScope::Channel(tutti)).await;
     assert!(channel.sign_ins.is_empty());
     world.hub.handle.shutdown().await.unwrap();
 }

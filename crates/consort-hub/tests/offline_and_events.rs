@@ -93,7 +93,7 @@ async fn a_message_for_an_offline_worker_waits_and_arrives_after_it_reconnects()
     world
         .client
         .request(MessageSend {
-            channel_id: world.everything,
+            channel_id: world.tutti,
             client_message_id: "offline-1".to_owned(),
             body: "Please add tests.".to_owned(),
             attachments: Vec::new(),

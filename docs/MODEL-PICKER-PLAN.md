@@ -11,7 +11,7 @@ Status: asked for by the user on 2026-10-29. Paper artboards (Desktop page): "Mo
 
 ## Data that already exists
 
-- `Channel.coordinator_selection` and `Channel::effective_coordinator_selection`: a channel without its own selection uses the Everything channel's selection. `channel.update` already takes `coordinator_selection` and `task_selection`.
+- `Channel.coordinator_selection` and `Channel::effective_coordinator_selection`: a channel without its own selection uses the Tutti channel's selection. `channel.update` already takes `coordinator_selection` and `task_selection`.
 - `ModelSelection { account_label, model, options }`. Effort is a model option (`options["effort"]`).
 - `HarnessAccount.models: Vec<ModelInfo>`, and `ModelInfo.options: Vec<OptionDescriptor>`. Codex reports `effort` from `model/list`. ACP adapters report it from session config options (`thought_level` or `effort`). Check that Claude Code (claude-agent-acp) and OpenCode really report it with the managed tools, and fix the adapter where they do not.
 
@@ -29,16 +29,16 @@ One component, `ModelPicker`, with a trigger and a popover.
   - **First view:** Favorites when at least one favorite has a row, else the account of the current selection.
   - **Search:** typing hides the rail and shows the matching models of every account, as rows of the Favorites kind. It filters by model name, model ID, account name and provider name. Escape clears the search first, then closes only the popover.
   - **Keyboard:** Up and Down move in the list, and Enter chooses. Left, with an empty search, moves to the rail. In the rail, Up and Down change the view, and Right, Enter or typing go back to the list.
-  - **Use the Everything model:** a small text button at the right end of the header line, in every view, for a channel that has its own model. It clears the channel's own choice.
+  - **Use the Tutti model:** a small text button at the right end of the header line, in every view, for a channel that has its own model. It clears the channel's own choice.
   - **No signed-in account:** "No account is signed in. Add one in Settings > Workers." with a button that opens it. There is no rail.
 - **Effort control:** a second chip next to the model chip (bars icon plus the level), with a small menu titled "Effort for <model>". It lists the choices of the model's `effort` option, marks the provider default with "Default", and ends with the note "<Provider> offers these levels for this model. More effort thinks longer and uses more of your plan." It is hidden when the model has no effort option. In dialogs the effort control is a select next to the model field.
 - Changing the model keeps the effort if the new model offers that level. Otherwise it falls back to the new model's default.
 
 ## Where it is used
 
-- **Composer in a channel (and in Everything):** the chips show the channel's effective coordinator selection. Choosing a model or an effort sends `channel.update { coordinator_selection }` for that channel at once. In Everything this sets the default for every channel without its own model. The choice applies to the next coordinator turn.
+- **Composer in a channel (and in Tutti):** the chips show the channel's effective coordinator selection. Choosing a model or an effort sends `channel.update { coordinator_selection }` for that channel at once. In Tutti this sets the default for every channel without its own model. The choice applies to the next coordinator turn.
 - **New channel dialog:**
-  - "Model for the assistant" defaults to "Same as Everything".
+  - "Model for the assistant" defaults to "Same as Tutti".
   - "Default account for tasks" becomes "Model for tasks", with effort.
   - Both use the same component.
 - **Channel row menu:** "Model" opens the same picker for the channel's coordinator.
@@ -46,7 +46,7 @@ One component, `ModelPicker`, with a trigger and a popover.
 
 ## Hub
 
-- When `coordinator_selection` changes for a channel, its next coordinator turn uses the new selection. If a coordinator session is open with another account or model, end it after the turn that runs now (do not cut a running turn) so that the next turn starts a session with the new selection. The coordinator's context comes from the hub, so nothing is lost. Do the same for channels that use the Everything default when Everything's selection changes. If a harness can switch model inside a session (ACP `session/set_config_option` or Codex per-turn model), you may use that instead, but test both paths.
+- When `coordinator_selection` changes for a channel, its next coordinator turn uses the new selection. If a coordinator session is open with another account or model, end it after the turn that runs now (do not cut a running turn) so that the next turn starts a session with the new selection. The coordinator's context comes from the hub, so nothing is lost. Do the same for channels that use the Tutti default when Tutti's selection changes. If a harness can switch model inside a session (ACP `session/set_config_option` or Codex per-turn model), you may use that instead, but test both paths.
 - Pass `options` (effort) from the selection to `session.start` and to each turn where the adapter supports it. Check the path end to end.
 - Placement: a selection names an account label and a model. Only workers where that account is signed in and offers that model qualify, and channel tags still apply.
 
@@ -59,7 +59,7 @@ One component, `ModelPicker`, with a trigger and a popover.
 
 ## Client
 
-- Model the picker data in `consort-client` view state: groups (account label, provider kind and logo key, workers, models with id, name and effort choices), the current selection per channel (effective, with a flag that says whether it comes from the channel or from Everything), and the search filter as a pure function with tests.
+- Model the picker data in `consort-client` view state: groups (account label, provider kind and logo key, workers, models with id, name and effort choices), the current selection per channel (effective, with a flag that says whether it comes from the channel or from Tutti), and the search filter as a pure function with tests.
 - Remove the old flat `selections: Vec<String>` once nothing uses it.
 
 ## Tests
@@ -67,6 +67,6 @@ One component, `ModelPicker`, with a trigger and a popover.
 - Client: grouping by account label across workers, signed-out accounts left out, search filtering, effort fallback when the model changes, and the effective selection with its source. The badge rule, the rail order, the first view, Favorites with a gone account or model, a search across accounts, and the cache that applies the preferences from the snapshot and the feed.
 - Proto: the round trip of `preferences.set_favorite_model`, its result, the `preferences` feed entry and the snapshot field.
 - Hub: the hub stores favorites, a request that changes nothing sends nothing, and a change sends a feed upsert that reaches another client.
-- Hub: a selection change ends the open coordinator session after the running turn, the next turn starts with the new model and effort, and the Everything default applies to channels without their own.
+- Hub: a selection change ends the open coordinator session after the running turn, the next turn starts with the new model and effort, and the Tutti default applies to channels without their own.
 - Desktop: the picker opens, filters, scrolls, chooses, and sends the right `channel.update`. The rail takes the arrow keys, typing searches, Escape clears the search first, a click on a star does not choose the model, and a rail button shows its tooltip. Use the existing headless window tests.
 - A live check: `scripts/dev.sh` with a signed-in account, choose a model and an effort in the composer, send a message, and confirm in the hub log that the session started with them.

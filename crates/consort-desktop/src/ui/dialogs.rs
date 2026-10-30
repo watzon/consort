@@ -514,6 +514,8 @@ impl ConsortApp {
             Dialog::Connect => Some(self.connect_dialog(t, window, cx)),
             Dialog::ConfirmDisconnect(id) => Some(self.confirm_disconnect_dialog(id, t, cx)),
             Dialog::AddSkill => Some(self.add_skill_dialog(t, window, cx)),
+            Dialog::AddSkillSource => Some(self.add_skill_source_dialog(t, window, cx)),
+            Dialog::ConnectionActivity(id) => Some(self.connection_activity_dialog(id, t, cx)),
             Dialog::ConfirmRemoveSkill(id) => Some(self.confirm_remove_skill_dialog(id, t, cx)),
             Dialog::SkillFiles(id) => Some(self.skill_files_dialog(id, t, cx)),
             Dialog::ChannelExtensions(id) => Some(self.channel_extensions_dialog(id, t, cx)),
@@ -528,6 +530,8 @@ impl ConsortApp {
             | Dialog::Connect
             | Dialog::ConfirmDisconnect(_)
             | Dialog::AddSkill
+            | Dialog::AddSkillSource
+            | Dialog::ConnectionActivity(_)
             | Dialog::ConfirmRemoveSkill(_)
             | Dialog::SkillFiles(_)
             | Dialog::ChannelExtensions(_)

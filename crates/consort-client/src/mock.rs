@@ -9,7 +9,7 @@ use crate::{
     view::*,
 };
 
-const EVERYTHING: &str = "chn_everything";
+const TUTTI_ID: &str = "chn_tutti";
 const SAYSO: &str = "chn_sayso";
 const LUCY: &str = "chn_miss_lucy_tg";
 const EXT4: &str = "chn_mac_ext4";
@@ -43,8 +43,8 @@ fn text(s: &str) -> String {
 fn channel(id: &str, name: &str, purpose: &str, icon: &str, group: Option<&str>) -> ChannelView {
     ChannelView {
         id: id.into(),
-        kind: if id == EVERYTHING {
-            ChannelKind::Everything
+        kind: if id == TUTTI_ID {
+            ChannelKind::Tutti
         } else {
             ChannelKind::Standard
         },
@@ -56,10 +56,10 @@ fn channel(id: &str, name: &str, purpose: &str, icon: &str, group: Option<&str>)
         coordinator_worker: Some(text("hub")),
         coordinator_selection: Some(EffectiveSelection {
             selection: assistant_model(),
-            source: if id == EVERYTHING {
+            source: if id == TUTTI_ID {
                 SelectionSource::Channel
             } else {
-                SelectionSource::Everything
+                SelectionSource::Tutti
             },
         }),
         repos: Vec::new(),
@@ -214,7 +214,7 @@ fn card(
 }
 
 /// A model selection with no options.
-/// The model of the assistant in Everything: Opus 5.5 with high effort.
+/// The model of the assistant in Tutti: Opus 5.5 with high effort.
 fn assistant_model() -> SelectionView {
     let mut chosen = selection("Claude Personal", "claude-opus-5-5", "Opus 5.5");
     chosen.options = vec![(
@@ -819,7 +819,7 @@ fn tasks() -> Vec<TaskView> {
 fn timelines() -> Vec<TimelineView> {
     let brief = TimelineItem::Message(MessageView {
         id: text("msg_brief"),
-        channel_id: EVERYTHING.into(),
+        channel_id: TUTTI_ID.into(),
         speaker: Speaker::Consort,
         time_label: text("8:00 AM"),
         title: Some(text("Good morning, Chris.")),
@@ -850,28 +850,28 @@ fn timelines() -> Vec<TimelineView> {
     });
     vec![
         TimelineView {
-            channel_id: EVERYTHING.into(),
+            channel_id: TUTTI_ID.into(),
             has_older: true,
             loaded: true,
             items: vec![
-                day("day_everything_today", "Today"),
+                day("day_tutti_today", "Today"),
                 brief,
                 message(
-                    "msg_everything_you",
-                    EVERYTHING,
+                    "msg_tutti_you",
+                    TUTTI_ID,
                     Speaker::You,
                     "9:12 AM",
                     "What is left on the Sayso Windows fix?",
                 ),
                 message(
-                    "msg_everything_reply",
-                    EVERYTHING,
+                    "msg_tutti_reply",
+                    TUTTI_ID,
                     Speaker::Consort,
                     "9:12 AM",
                     "One step is left. Codex wants to build the Windows engine on bigboi, and it waits for your OK. After the build, it pushes the fix to [PR #62](https://github.com/watzon/sayso/pull/62).\n\nThe CI workflow change is still a patch in the PR description, because GitHub does not let a task push workflow files.",
                 ),
                 card(
-                    "msg_everything_card",
+                    "msg_tutti_card",
                     T_SAYSO,
                     "9:13 AM",
                     Some("sayso"),
@@ -1255,7 +1255,7 @@ fn threads() -> Vec<TaskThreadView> {
 /// The view state from the designs.
 pub fn view_state() -> ViewState {
     let mut channels = vec![
-        channel(EVERYTHING, TUTTI, "All channels, one memory", "brace", None),
+        channel(TUTTI_ID, TUTTI, "All channels, one memory", "brace", None),
         channel(
             SAYSO,
             "sayso",
@@ -1399,18 +1399,16 @@ pub fn view_state() -> ViewState {
     state
 }
 
-/// The mock with Everything as "Everything manages connectors and
+/// The mock with Tutti as "Tutti manages connectors and
 /// channels" shows it: a request and the connect card at the end.
 pub fn view_state_with_connect_card() -> ViewState {
     let mut state = view_state();
     if let Some(timeline) = state
         .timelines
         .iter_mut()
-        .find(|t| t.channel_id == EVERYTHING)
+        .find(|t| t.channel_id == TUTTI_ID)
     {
-        timeline
-            .items
-            .extend(crate::mock_extensions::everything_items());
+        timeline.items.extend(crate::mock_extensions::tutti_items());
     }
     stamp_times(&mut state.timelines);
     refresh(&mut state);
@@ -1583,7 +1581,7 @@ fn activity() -> Vec<crate::activity::ChannelActivity> {
     };
     vec![
         entry(
-            EVERYTHING,
+            TUTTI_ID,
             MarkState::Working,
             Some("Running a command in sayso"),
         ),
@@ -1594,9 +1592,9 @@ fn activity() -> Vec<crate::activity::ChannelActivity> {
     ]
 }
 
-/// The id of the Everything channel in the mock.
-pub fn everything_id() -> &'static str {
-    EVERYTHING
+/// The id of the Tutti channel in the mock.
+pub fn tutti_id() -> &'static str {
+    TUTTI_ID
 }
 
 #[cfg(test)]
@@ -1617,7 +1615,7 @@ mod tests {
         assert_eq!(personal.channels[0].name, "sayso");
         assert_eq!(personal.channels[0].status, Some(TaskStatus::NeedsInput));
         assert_eq!(personal.channels[1].status, Some(TaskStatus::Review));
-        assert!(state.everything().is_some());
+        assert!(state.tutti().is_some());
         for timeline in &state.timelines {
             for item in &timeline.items {
                 if let TimelineItem::TaskCard(card) = item {

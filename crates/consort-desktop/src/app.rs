@@ -125,6 +125,10 @@ pub enum Dialog {
     ConfirmDisconnect(String),
     /// The skill directories, a git URL or an upload.
     AddSkill,
+    /// Add a skill source: a git repo or a `marketplace.json` file.
+    AddSkillSource,
+    /// The calls that the assistant made with a connection.
+    ConnectionActivity(String),
     /// Remove a skill.
     ConfirmRemoveSkill(String),
     /// The files of a skill.
@@ -181,9 +185,9 @@ pub struct NewChannelForm {
     /// `group_name` input.
     pub new_group: bool,
     pub workers: Vec<String>,
-    /// "Model for the assistant". `None` is "Same as Everything".
+    /// "Model for the assistant". `None` is "Same as Tutti".
     pub coordinator_selection: Option<SelectionView>,
-    /// "Model for tasks". `None` is "Same as Everything".
+    /// "Model for tasks". `None` is "Same as Tutti".
     pub task_selection: Option<SelectionView>,
     pub isolation: Isolation,
     /// The worker tags that the channel requires.
@@ -358,7 +362,7 @@ impl ConsortApp {
         let state = client.state();
         let drafts = client.load_drafts();
         let overdraw = Self::tokens(cx).layout.list_overdraw;
-        let channel_id = state.everything().map(|c| c.id.clone()).unwrap_or_default();
+        let channel_id = state.tutti().map(|c| c.id.clone()).unwrap_or_default();
         let textarea = |placeholder: &str,
                         rows: (usize, usize),
                         window: &mut Window,
@@ -727,9 +731,9 @@ impl ConsortApp {
         let was_paired = self.state.connection != Connection::NotPaired;
         self.state = state;
         if self.state.channel(&self.channel_id).is_none()
-            && let Some(everything) = self.state.everything()
+            && let Some(tutti) = self.state.tutti()
         {
-            self.channel_id = everything.id.clone();
+            self.channel_id = tutti.id.clone();
         }
         if !self.demo && !was_paired && self.state.connection != Connection::NotPaired {
             self.page = Page::Main;
@@ -1036,7 +1040,7 @@ impl ConsortApp {
             .state
             .channel(&self.channel_id)
             .map(|c| match c.kind {
-                consort_client::ChannelKind::Everything => crate::ui::TUTTI.to_owned(),
+                consort_client::ChannelKind::Tutti => crate::ui::TUTTI.to_owned(),
                 consort_client::ChannelKind::Standard => c.name.clone(),
             })
             .unwrap_or_else(|| crate::ui::TUTTI.to_owned());
@@ -1630,7 +1634,7 @@ impl ConsortApp {
                 .iter()
                 .flat_map(|g| g.channels.iter())
                 .chain(self.state.sidebar.ungrouped.iter())
-                .chain(std::iter::once(&self.state.sidebar.everything))
+                .chain(std::iter::once(&self.state.sidebar.tutti))
                 .any(|c| {
                     matches!(
                         c.status,
@@ -1927,6 +1931,17 @@ impl ConsortApp {
             | Dialog::ConfirmRemoveSkill(_)
             | Dialog::SkillFiles(_)
             | Dialog::ChannelExtensions(_) => {}
+            Dialog::ConnectionActivity(id) => {
+                let id = id.clone();
+                self.load_activity(id, false, cx);
+            }
+            Dialog::AddSkillSource => {
+                let input = self.ext_inputs.source_url.clone();
+                input.update(cx, |input, cx| {
+                    input.set_value("", window, cx);
+                    input.focus(window, cx);
+                });
+            }
             Dialog::ComposioKey => {
                 let input = self.ext_inputs.composio_key.clone();
                 input.update(cx, |input, cx| {
@@ -2354,8 +2369,8 @@ impl ConsortApp {
     }
 
     pub fn ask_consort(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(everything) = self.state.everything().map(|c| c.id.clone()) {
-            self.open_channel(everything, window, cx);
+        if let Some(tutti) = self.state.tutti().map(|c| c.id.clone()) {
+            self.open_channel(tutti, window, cx);
         }
         // The composer may hold a draft. The quote goes after it.
         let composer = self.inputs.composer.clone();
@@ -2565,6 +2580,10 @@ impl ConsortApp {
                 cx,
             ),
             MenuAction::SkillFiles(id) => self.open_skill_files(id, window, cx),
+            MenuAction::ConnectionActivity(id) => {
+                self.open_dialog(Dialog::ConnectionActivity(id), window, cx)
+            }
+            MenuAction::RemoveSkillSource(id) => self.remove_skill_source(id, cx),
             MenuAction::RemoveSkill(id) => {
                 self.open_dialog(Dialog::ConfirmRemoveSkill(id), window, cx)
             }

@@ -16,7 +16,7 @@ use serde_json::json;
 async fn a_user_message_starts_a_coordinator_and_its_post_reaches_the_client() {
     let mut world = World::start().await;
     let message = world
-        .say(world.everything, "What makes a channel special?")
+        .say(world.tutti, "What makes a channel special?")
         .await;
 
     // The hub starts a coordinator session on the worker.
@@ -25,7 +25,7 @@ async fn a_user_message_starts_a_coordinator_and_its_post_reaches_the_client() {
         panic!("expected session.start");
     };
     assert_eq!(start.role, SessionRole::Coordinator);
-    assert_eq!(start.channel_id, world.everything);
+    assert_eq!(start.channel_id, world.tutti);
     assert_eq!(start.model, "opus");
     assert_eq!(start.account_id, world.worker.account_id);
     assert!(start.task_id.is_none());
@@ -34,7 +34,7 @@ async fn a_user_message_starts_a_coordinator_and_its_post_reaches_the_client() {
         "the coordinator rules"
     );
     assert!(
-        start.system_prompt_append.contains("Everything"),
+        start.system_prompt_append.contains("Tutti"),
         "the channel name"
     );
     let turn = start.turn.as_ref().expect("a first turn").text.clone();
@@ -88,7 +88,7 @@ async fn a_user_message_starts_a_coordinator_and_its_post_reaches_the_client() {
     };
     assert_eq!(posted.author, Author::Assistant);
     assert_eq!(posted.author_session_id, Some(session_id));
-    assert_eq!(posted.channel_id, world.everything);
+    assert_eq!(posted.channel_id, world.tutti);
 
     // The turn ends. The coordinator used a posting tool, so the hub adds nothing.
     world
@@ -98,7 +98,7 @@ async fn a_user_message_starts_a_coordinator_and_its_post_reaches_the_client() {
     let page = world
         .client
         .request(MessageList {
-            channel_id: world.everything,
+            channel_id: world.tutti,
             thread_root_id: None,
             before: None,
             limit: None,
@@ -127,7 +127,7 @@ async fn a_second_message_goes_to_the_same_session_as_a_turn() {
         .await;
     // The hub removes the sent turn from the queue only when the worker answers.
     // The first turn was part of session.start, so the next message is a turn.
-    world.say(world.everything, "Second").await;
+    world.say(world.tutti, "Second").await;
     let (request, command) = world.worker.next_command().await;
     let HubToWorker::SessionTurn(turn) = command else {
         panic!(
@@ -159,8 +159,8 @@ async fn messages_during_a_turn_wait_and_go_out_together_after_it() {
     let start = world.start_coordinator("Start").await;
 
     // The turn is open, so these two messages must wait.
-    world.say(world.everything, "Wait one").await;
-    world.say(world.everything, "Wait two").await;
+    world.say(world.tutti, "Wait one").await;
+    world.say(world.tutti, "Wait two").await;
     assert!(
         world
             .worker
@@ -238,7 +238,7 @@ async fn no_reply_needed_ends_a_turn_without_a_post() {
     let page = world
         .client
         .request(MessageList {
-            channel_id: world.everything,
+            channel_id: world.tutti,
             thread_root_id: None,
             before: None,
             limit: None,
@@ -268,7 +268,7 @@ async fn a_lost_coordinator_session_is_replaced_with_a_context_pack() {
         )
         .await;
 
-    world.say(world.everything, "Are you there?").await;
+    world.say(world.tutti, "Are you there?").await;
     let new_start = world.worker.accept_session_start().await;
     assert_ne!(
         new_start.session_id, start.session_id,
@@ -303,12 +303,12 @@ async fn a_lost_session_in_the_middle_of_a_turn_puts_the_events_back() {
 async fn without_a_worker_the_hub_says_why_and_starts_when_one_connects() {
     let hub = TestHub::start().await;
     let mut client = FakeClient::pair_and_connect(&hub).await;
-    let everything = client.everything().await;
+    let tutti = client.tutti().await;
     let snapshot = client.snapshot(SnapshotScope::All).await;
     client.subscribe(snapshot.seq).await.unwrap();
     client
         .request(consort_proto::client_api::MessageSend {
-            channel_id: everything,
+            channel_id: tutti,
             client_message_id: "a".to_owned(),
             body: "Anyone there?".to_owned(),
             attachments: Vec::new(),
@@ -348,7 +348,7 @@ async fn a_paused_worker_does_not_get_a_coordinator() {
         })
         .await
         .unwrap();
-    world.say(world.everything, "Hello?").await;
+    world.say(world.tutti, "Hello?").await;
     assert!(
         world
             .worker
@@ -438,7 +438,7 @@ async fn a_reopened_session_drops_its_old_turn_and_requests() {
         .await;
 
     // A message waits behind the open turn.
-    world.say(world.everything, "Still there?").await;
+    world.say(world.tutti, "Still there?").await;
     assert!(
         world
             .worker

@@ -1,5 +1,5 @@
 //! Arguments and results of the management tools: the tools with which the
-//! Everything assistant manages everything, and a channel's assistant
+//! Tutti assistant manages everything, and a channel's assistant
 //! manages its own channel.
 //!
 //! The hub enforces the scope and the risk rule. A change that adds
@@ -36,7 +36,7 @@ pub struct CreateChannelArgs {
     /// every tag.
     #[serde(default)]
     pub tags: Option<Vec<String>>,
-    /// The model of the channel's assistant. Leave it out for Everything's.
+    /// The model of the channel's assistant. Leave it out for Tutti's.
     #[serde(default)]
     pub model: Option<ModelSelection>,
     /// The default model for tasks.
@@ -164,7 +164,7 @@ pub struct ConnectServiceArgs {
     pub service: String,
     /// The connection name, for example "Gmail Work".
     pub name: String,
-    /// Where it can be used. Everything's default is every channel. A
+    /// Where it can be used. Tutti's default is every channel. A
     /// channel's default is the channels with its tags, or the channel
     /// alone when it has no tags.
     #[serde(default)]
@@ -381,7 +381,7 @@ pub struct SearchConnectorCatalogResult {
     pub services: Vec<ConnectorService>,
 }
 
-/// `list_connections` result. The Everything assistant sees every
+/// `list_connections` result. The Tutti assistant sees every
 /// connection. A channel's assistant sees the connections that its channel
 /// can use, and the ones that the channel turned off.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

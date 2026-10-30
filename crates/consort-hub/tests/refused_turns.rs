@@ -57,7 +57,7 @@ async fn write_in_thread(world: &mut World, card: consort_proto::ids::MessageId,
     world
         .client
         .request(MessageSend {
-            channel_id: world.everything,
+            channel_id: world.tutti,
             client_message_id: format!("cm-{text}"),
             body: text.to_owned(),
             attachments: Vec::new(),
@@ -167,7 +167,7 @@ async fn a_refused_coordinator_turn_runs_when_the_session_ends_its_turn() {
         .send_events(c, vec![turn_ended("t1", TurnEndReason::Completed)])
         .await;
     tokio::time::sleep(Duration::from_millis(200)).await;
-    world.say(world.everything, "First question").await;
+    world.say(world.tutti, "First question").await;
     refuse_next_turn(&mut world.worker, c, "a turn is already running").await;
     world
         .wait_notice(None, &["did not take your message", "tries again"])

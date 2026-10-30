@@ -369,7 +369,7 @@ impl ConsortApp {
             .top_0()
             .left_0()
             .right_0()
-            .h(t.layout.fade_top)
+            .h(t.layout.fade_top())
             // The overlay must not take the clicks and the scroll of the
             // timeline under it, apart from its own parts.
             .child(
@@ -394,7 +394,8 @@ impl ConsortApp {
     ) -> AnyElement {
         let c = &t.colors;
         let empty = self.chat_rows.is_empty();
-        let fade_top = t.layout.fade_top;
+        let fade_solid = t.layout.fade_top_solid;
+        let fade_blend = t.layout.fade_top_blend;
         // At the live edge nothing is cut below, so the bottom fade shows only
         // while the reader is scrolled up.
         let at_end = empty || self.timeline.is_scrolled_to_end().unwrap_or(true);
@@ -445,7 +446,7 @@ impl ConsortApp {
                 d.child(
                     div()
                         .absolute()
-                        .top(t.layout.fade_top)
+                        .top(t.layout.fade_top())
                         .left_0()
                         .right_0()
                         .flex()
@@ -462,16 +463,29 @@ impl ConsortApp {
             })
             // The chat never has a hard edge: it fades into the canvas at the
             // top, under the mark, and above the composer.
+            // The top is solid down to just below the mark and the pill, so no
+            // bubble shows under them. A short gradient follows. The zone is
+            // the same when the pill is hidden, so the edge does not jump.
             .child(
                 div()
+                    .debug_selector(|| "fade-top-solid".into())
                     .absolute()
                     .top_0()
                     .left_0()
                     .right_0()
-                    .h(fade_top)
+                    .h(fade_solid)
+                    .bg(c.surface_canvas),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top(fade_solid)
+                    .left_0()
+                    .right_0()
+                    .h(fade_blend)
                     .bg(linear_gradient(
                         180.,
-                        linear_color_stop(c.surface_canvas, 0.35),
+                        linear_color_stop(c.surface_canvas, 0.),
                         linear_color_stop(c.canvas_clear, 1.),
                     )),
             )
@@ -610,7 +624,7 @@ impl ConsortApp {
         cx: &mut Context<Self>,
     ) -> (gpui_kit::Pixels, AnyElement) {
         let spacing = |spacing: Spacing| match spacing {
-            Spacing::Start => t.layout.fade_top,
+            Spacing::Start => t.layout.fade_top(),
             Spacing::InGroup => t.space.xs,
             Spacing::NewGroup => t.space.lg,
             Spacing::AfterSeparator => gpui_kit::Pixels::ZERO,
@@ -621,7 +635,11 @@ impl ConsortApp {
                     |r| matches!(r, ChatRow::Separator { label: l, .. } if l == label),
                 );
                 (
-                    if first { t.layout.fade_top } else { t.space.lg },
+                    if first {
+                        t.layout.fade_top()
+                    } else {
+                        t.space.lg
+                    },
                     div()
                         .flex()
                         .justify_center()
@@ -1527,11 +1545,11 @@ impl ConsortApp {
         let channel = state.channel(&self.channel_id);
         // A channel without its own model says that it uses Tutti's.
         let inherited = channel.is_some_and(|ch| {
-            ch.kind != ChannelKind::Everything
+            ch.kind != ChannelKind::Tutti
                 && ch
                     .coordinator_selection
                     .as_ref()
-                    .is_some_and(|e| e.source == consort_client::SelectionSource::Everything)
+                    .is_some_and(|e| e.source == consort_client::SelectionSource::Tutti)
         });
         let runs_on = channel
             .and_then(|ch| ch.coordinator_worker.clone())

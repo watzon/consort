@@ -309,13 +309,13 @@ impl FakeClient {
         self.request(SyncSnapshot { scope }).await.unwrap()
     }
 
-    pub async fn everything(&mut self) -> ChannelId {
+    pub async fn tutti(&mut self) -> ChannelId {
         let snapshot = self.snapshot(SnapshotScope::All).await;
         snapshot
             .channels
             .iter()
-            .find(|c| c.is_everything())
-            .expect("the Everything channel")
+            .find(|c| c.is_tutti())
+            .expect("the Tutti channel")
             .id
     }
 
@@ -789,7 +789,7 @@ pub struct World {
     pub hub: TestHub,
     pub client: FakeClient,
     pub worker: FakeWorker,
-    pub everything: ChannelId,
+    pub tutti: ChannelId,
     /// The coordinator session that `start_coordinator` started last.
     pub coordinator_session: Option<SessionId>,
 }
@@ -800,7 +800,7 @@ impl World {
         let hub = TestHub::start().await;
         let mut client = FakeClient::pair_and_connect(&hub).await;
         let worker = FakeWorker::pair_and_connect(&hub).await;
-        let everything = client.everything().await;
+        let tutti = client.tutti().await;
         let snapshot = client.snapshot(SnapshotScope::All).await;
         client.subscribe(snapshot.seq).await.unwrap();
         // Wait until the hub has stored the inventory.
@@ -828,7 +828,7 @@ impl World {
             hub,
             client,
             worker,
-            everything,
+            tutti,
             coordinator_session: None,
         }
     }
@@ -854,13 +854,13 @@ impl World {
         result.message
     }
 
-    /// Waits for the coordinator session of Everything to start and gets
+    /// Waits for the coordinator session of Tutti to start and gets
     /// through its first turn. Returns the `session.start` command.
     pub async fn start_coordinator(
         &mut self,
         text: &str,
     ) -> consort_proto::worker_link::SessionStart {
-        self.say(self.everything, text).await;
+        self.say(self.tutti, text).await;
         let start = self.worker.accept_session_start().await;
         self.worker
             .send_events(
@@ -877,7 +877,7 @@ impl World {
     /// A second connection of the worker exists. The user writes a message
     /// and the hub has to start a session on `back`.
     pub async fn worker_connected_say(&mut self, _back: &mut FakeWorker) {
-        self.say(self.everything, "Are you back?").await;
+        self.say(self.tutti, "Are you back?").await;
     }
 }
 
@@ -919,10 +919,10 @@ impl World {
         (task_id, start)
     }
 
-    /// The task as the Everything channel snapshot shows it.
+    /// The task as the Tutti channel snapshot shows it.
     pub async fn task(&mut self, id: consort_proto::ids::TaskId) -> consort_proto::model::Task {
         self.client
-            .snapshot(SnapshotScope::Channel(self.everything))
+            .snapshot(SnapshotScope::Channel(self.tutti))
             .await
             .tasks
             .into_iter()
@@ -1039,7 +1039,7 @@ impl World {
         let page = self
             .client
             .request(consort_proto::client_api::MessageList {
-                channel_id: self.everything,
+                channel_id: self.tutti,
                 thread_root_id: thread,
                 before: None,
                 limit: Some(200),

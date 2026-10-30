@@ -1,6 +1,6 @@
 //! Mock content for connectors, skills and the hub cards, from the Paper
 //! designs: Settings > Connectors and Skills, the dialogs, "Connectors in a
-//! channel" and "Everything manages connectors and channels".
+//! channel" and "Tutti manages connectors and channels".
 
 use std::sync::Arc;
 
@@ -553,6 +553,14 @@ pub fn directory_sources() -> Vec<DirectorySourceView> {
             url: "https://github.com/anthropics/skills".into(),
             removable: false,
         },
+        // A source that the user added.
+        DirectorySourceView {
+            id: "src_acme".into(),
+            kind: DirectoryKind::Marketplace,
+            name: "acme/skills".into(),
+            url: "https://github.com/acme/skills".into(),
+            removable: true,
+        },
     ]
 }
 
@@ -782,27 +790,27 @@ pub fn hiring_items() -> Vec<TimelineItem> {
     ]
 }
 
-/// The end of the Everything timeline of "Everything manages connectors and
+/// The end of the Tutti timeline of "Tutti manages connectors and
 /// channels": the request and the connect card. Only `--screen
-/// everything-manages` shows them, so the usual Everything stays as designed.
-pub fn everything_items() -> Vec<TimelineItem> {
+/// tutti-manages` shows them, so the usual Tutti stays as designed.
+pub fn tutti_items() -> Vec<TimelineItem> {
     vec![
         message(
-            "msg_everything_hiring",
-            crate::mock::everything_id(),
+            "msg_tutti_hiring",
+            crate::mock::tutti_id(),
             Speaker::You,
             "3:05 PM",
             "Set up a hiring channel for work, and connect my work GitHub so it can see our repos there.",
         ),
         message(
-            "msg_everything_ready",
-            crate::mock::everything_id(),
+            "msg_tutti_ready",
+            crate::mock::tutti_id(),
             Speaker::Consort,
             "3:05 PM",
             "The hiring channel is ready, and its work runs only on your work machines. For GitHub, sign in with your work account below. I'll make it available only in channels tagged work, so it never reaches your personal channels.",
         ),
         card_item(
-            "msg_everything_connect",
+            "msg_tutti_connect",
             "3:05 PM",
             card(
                 APR_CONNECT_GITHUB,

@@ -69,14 +69,14 @@ Turn IDs, harness request IDs and native references are opaque strings that the 
 | Field | Type | Notes |
 |---|---|---|
 | `id` | ID | |
-| `kind` | `everything` or `standard` | Exactly one `everything` channel exists. It has no group and cannot be archived or deleted |
+| `kind` | `tutti` or `standard` | Exactly one `tutti` channel exists. It has no group and cannot be archived or deleted |
 | `name` | text | |
 | `icon`, `color` | text | |
 | `group_id` | ID, optional | |
 | `position` | integer | Order inside the group |
 | `purpose` | text, one line | |
 | `instructions` | markdown | |
-| `coordinator_selection` | model selection | Falls back to the Everything channel's value |
+| `coordinator_selection` | model selection | Falls back to the Tutti channel's value |
 | `task_selection` | model selection | Default for new tasks in this channel |
 | `preferred_workers` | list of worker IDs | Ordered. Placement tries these first |
 | `repo_ids` | list of repo IDs | The `channel_repos` join, in order. Part of the client view |
@@ -89,6 +89,8 @@ Turn IDs, harness request IDs and native references are opaque strings that the 
 | `disabled_skills` | list of skill IDs | Channel exceptions: skills that the channel turned off. Empty by default |
 | `archived_at` | timestamp, optional | |
 | `created_at`, `updated_at` | timestamp | |
+
+Stored data from before hub migration 6 says `everything` for this kind. The migration rewrites it to `tutti`, and the code still reads `everything` as an alias. See [ADR 0012](adr/0012-the-main-channel-is-called-tutti.md).
 
 ### Repo and channel repo
 
@@ -324,7 +326,7 @@ A hub card in a task makes the task Needs input, as any approval does. When a ca
 
 | Field | Type | Notes |
 |---|---|---|
-| `scope` | `global` or a channel ID | The Everything channel's memory is the global memory |
+| `scope` | `global` or a channel ID | The Tutti channel's memory is the global memory |
 | `path` | text | For example `people/kevin.md` |
 | `content` | markdown | |
 | `sha256` | text | Hash of `content` |
@@ -338,12 +340,12 @@ Every write states the hash that it expects, or `not_exists` for a new note. If 
 
 | Writer | Reads | Writes |
 |---|---|---|
-| Everything coordinator | All scopes | `global` |
-| Channel coordinator | `global` and its own channel | Its own channel. It can suggest a global note to the Everything coordinator |
+| Tutti coordinator | All scopes | `global` |
+| Channel coordinator | `global` and its own channel | Its own channel. It can suggest a global note to the Tutti coordinator |
 | Task session | `global` and its channel | Nothing. It can suggest a note to its channel coordinator |
 | User, from a client | All scopes | All scopes |
 
-A suggestion goes one level up: from a task to its channel coordinator, and from a channel coordinator to the Everything coordinator. The coordinator that gets a suggestion decides whether to write the note. The hub never writes a suggestion to memory by itself.
+A suggestion goes one level up: from a task to its channel coordinator, and from a channel coordinator to the Tutti coordinator. The coordinator that gets a suggestion decides whether to write the note. The hub never writes a suggestion to memory by itself.
 
 ### Channel file and artifact
 
@@ -519,7 +521,7 @@ The files of each version are blobs. The hub keeps the file list of each version
 
 ### Effective set
 
-A session gets the connections and skills whose `use_in` matches its channel, minus the channel's exceptions. A skill must also be on and not blocked. The Everything channel matches only `every_channel`, unless it has tags of its own.
+A session gets the connections and skills whose `use_in` matches its channel, minus the channel's exceptions. A skill must also be on and not blocked. The Tutti channel matches only `every_channel`, unless it has tags of its own.
 
 ## Preferences
 

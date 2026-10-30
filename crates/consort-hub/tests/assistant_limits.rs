@@ -58,7 +58,7 @@ async fn worker_has_home_assistant(world: &mut World) {
 async fn an_ask_channel_coordinator_cannot_start_a_full_access_task_in_place() {
     let mut world = World::start().await;
     worker_has_home_assistant(&mut world).await;
-    // The Everything channel defaults to Ask and a worktree, and allows no
+    // The Tutti channel defaults to Ask and a worktree, and allows no
     // local MCP server.
     let coordinator = world
         .start_coordinator("Summarize this web page for me")
@@ -124,7 +124,7 @@ async fn an_ask_channel_coordinator_cannot_start_a_full_access_task_in_place() {
 async fn a_channel_that_allows_more_gives_it_up_to_its_limits() {
     let mut world = World::start().await;
     worker_has_home_assistant(&mut world).await;
-    let mut update = ChannelUpdate::new(world.everything);
+    let mut update = ChannelUpdate::new(world.tutti);
     update.default_approval_mode = Some(ApprovalMode::Auto);
     update.default_isolation = Some(Isolation::InPlace);
     update.allowed_local_mcp_servers = Some(vec![
@@ -177,7 +177,7 @@ async fn a_channel_that_allows_more_gives_it_up_to_its_limits() {
 #[tokio::test]
 async fn a_channel_refuses_a_local_mcp_server_name_that_the_worker_refuses() {
     let mut world = World::start().await;
-    let mut update = ChannelUpdate::new(world.everything);
+    let mut update = ChannelUpdate::new(world.tutti);
     update.allowed_local_mcp_servers = Some(vec!["Hub".to_owned()]);
     let error = world.client.request(update).await.unwrap_err();
     assert_eq!(error.code, consort_proto::error::ErrorCode::Invalid);

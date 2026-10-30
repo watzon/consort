@@ -24,7 +24,7 @@ pub enum Hit {
         id: String,
         name: String,
         icon: String,
-        everything: bool,
+        tutti: bool,
         detail: String,
     },
     Task {
@@ -76,7 +76,7 @@ pub fn search(state: &ViewState, query: &str) -> Vec<Hit> {
                         id: c.id.clone(),
                         name: c.name.clone(),
                         icon: c.icon.clone(),
-                        everything: c.kind == ChannelKind::Everything,
+                        tutti: c.kind == ChannelKind::Tutti,
                         detail: c.purpose.clone(),
                     },
                 )
@@ -216,11 +216,11 @@ impl ConsortApp {
                 Hit::Channel {
                     name,
                     icon: icon_name,
-                    everything,
+                    tutti,
                     detail: d,
                     ..
                 } => (
-                    if *everything {
+                    if *tutti {
                         crate::ui::mark::still_mark(t.icon.size, t)
                     } else {
                         icon(icon_name, t.icon.size, c.text_secondary).into_any_element()
@@ -374,13 +374,7 @@ mod tests {
     fn an_empty_query_lists_channels_then_your_turn() {
         let state = consort_client::mock::view_state();
         let hits = search(&state, "");
-        assert!(matches!(
-            &hits[0],
-            Hit::Channel {
-                everything: true,
-                ..
-            }
-        ));
+        assert!(matches!(&hits[0], Hit::Channel { tutti: true, .. }));
         assert!(hits.len() <= MAX_ROWS);
         assert!(
             hits.iter()

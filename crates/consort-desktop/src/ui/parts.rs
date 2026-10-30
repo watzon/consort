@@ -128,17 +128,30 @@ pub fn status_glyph(
     let _ = id.into();
     let color = status_color(status, t);
     let live = matches!(status, TaskStatus::Working | TaskStatus::NeedsInput);
-    let name = match status {
-        TaskStatus::UpNext => return glyph("status-up-next", size, color).into_any_element(),
-        TaskStatus::Resolved => return glyph("status-resolved", size, color).into_any_element(),
-        TaskStatus::Scheduled => "clock",
-        TaskStatus::Working => "working",
-        TaskStatus::NeedsInput => "needs-input",
-        TaskStatus::Review => "done",
-        TaskStatus::Failed => "failed",
+    let Some(name) = status_icon_name(status) else {
+        let glyph_name = match status {
+            TaskStatus::Resolved => "status-resolved",
+            _ => "status-up-next",
+        };
+        return glyph(glyph_name, size, color).into_any_element();
     };
     let version = crate::ui::motion::shimmer_version(live, cx);
     icon_version(name, version, size, color).into_any_element()
+}
+
+/// The icon of a status, or `None` for the two statuses that have a Consort
+/// glyph (Up next and Resolved). Scheduled work is routine work: it uses the
+/// `routine` metronome in the scheduled color. The `clock` icon is for plain
+/// times.
+pub fn status_icon_name(status: TaskStatus) -> Option<&'static str> {
+    match status {
+        TaskStatus::UpNext | TaskStatus::Resolved => None,
+        TaskStatus::Scheduled => Some("routine"),
+        TaskStatus::Working => Some("working"),
+        TaskStatus::NeedsInput => Some("needs-input"),
+        TaskStatus::Review => Some("done"),
+        TaskStatus::Failed => Some("failed"),
+    }
 }
 
 /// The corners of a card. A card in the chat (`chat`) has
@@ -423,10 +436,29 @@ pub fn editor_style(t: &Tokens) -> gpui_kit::base::input::InputEditorStyle {
 mod tests {
 
     #[test]
+    fn scheduled_work_uses_the_routine_icon_and_not_the_clock() {
+        use consort_client::TaskStatus;
+        assert_eq!(
+            super::status_icon_name(TaskStatus::Scheduled),
+            Some("routine")
+        );
+        assert_eq!(super::status_icon_name(TaskStatus::UpNext), None);
+        assert_eq!(super::status_icon_name(TaskStatus::Resolved), None);
+        for status in [
+            TaskStatus::Working,
+            TaskStatus::NeedsInput,
+            TaskStatus::Review,
+            TaskStatus::Failed,
+        ] {
+            assert_ne!(super::status_icon_name(status), Some("clock"));
+        }
+    }
+
+    #[test]
     fn a_status_glyph_uses_an_icon_of_the_set_or_a_consort_glyph() {
         use gpui_kit::AssetSource as _;
         let assets = crate::assets::Assets;
-        for name in ["clock", "working", "needs-input", "done", "failed"] {
+        for name in ["routine", "working", "needs-input", "done", "failed"] {
             for v in 0..3 {
                 let p = crate::ui::icons::path(name, v);
                 assert!(assets.load(&p).ok().flatten().is_some(), "{p}");

@@ -14,7 +14,7 @@ use crate::view::{ChannelKind, ChannelView, ProviderLogo, SignInChoice, ViewStat
 /// `UseIn`, with channel IDs as text.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum UseInView {
-    /// Every channel, Everything too.
+    /// Every channel, Tutti too.
     #[default]
     EveryChannel,
     /// The channels that have every one of these tags.
@@ -455,6 +455,10 @@ pub struct ConnectorCallView {
     pub succeeded: bool,
     pub error: Option<String>,
     pub time_label: String,
+    /// The day of the call, such as "Today" or "October 12".
+    pub day_label: String,
+    /// The size of the result, such as "1.2 KB".
+    pub size_label: String,
 }
 
 /// A page of the audit log of one connection.
@@ -619,13 +623,13 @@ pub enum HubCardView {
 // Pure functions ---------------------------------------------------------------
 
 /// Whether `channel` is in the scope. The same rule as the proto's
-/// `UseIn::matches`: Everything matches only "every channel" unless it has
+/// `UseIn::matches`: Tutti matches only "every channel" unless it has
 /// tags of its own, and empty tags match nothing.
 pub fn use_in_matches(use_in: &UseInView, channel: &ChannelView) -> bool {
     match use_in {
         UseInView::EveryChannel => true,
         UseInView::Tags(tags) => {
-            if channel.kind == ChannelKind::Everything && channel.tags.is_empty() {
+            if channel.kind == ChannelKind::Tutti && channel.tags.is_empty() {
                 return false;
             }
             !tags.is_empty() && tags.iter().all(|t| channel.tags.contains(t))
@@ -1062,7 +1066,7 @@ pub fn connectors_context(state: &ViewState, channel_id: &str) -> String {
 }
 
 /// A channel to show the context of a connection with: the first channel
-/// that the connection is in, Everything last.
+/// that the connection is in, Tutti last.
 pub fn example_channel<'a>(
     use_in: &UseInView,
     channels: &'a [ChannelView],
@@ -1070,7 +1074,7 @@ pub fn example_channel<'a>(
     let matching = matching_channels(use_in, channels);
     matching
         .iter()
-        .find(|c| c.kind != ChannelKind::Everything)
+        .find(|c| c.kind != ChannelKind::Tutti)
         .or_else(|| matching.first())
         .copied()
 }
@@ -1084,8 +1088,8 @@ mod tests {
         ChannelView {
             id: id.into(),
             name: name.into(),
-            kind: if id == "everything" {
-                ChannelKind::Everything
+            kind: if id == "tutti" {
+                ChannelKind::Tutti
             } else {
                 ChannelKind::Standard
             },
@@ -1096,7 +1100,7 @@ mod tests {
 
     fn channels() -> Vec<ChannelView> {
         vec![
-            channel("everything", "Everything", &[]),
+            channel("tutti", "Tutti", &[]),
             channel("c1", "acme", &["work"]),
             channel("c2", "acme-infra", &["work", "gpu"]),
             channel("c3", "sayso", &["personal"]),
@@ -1138,10 +1142,10 @@ mod tests {
             names(&UseInView::Channels(vec!["c3".into(), "c1".into()])),
             ["acme", "sayso"]
         );
-        // Everything with no tags is not "tagged" anything.
-        let mut tagged_everything = all.clone();
-        tagged_everything[0].tags = vec!["work".into()];
-        assert!(use_in_matches(&tags(&["work"]), &tagged_everything[0]));
+        // Tutti with no tags is not "tagged" anything.
+        let mut tagged_tutti = all.clone();
+        tagged_tutti[0].tags = vec!["work".into()];
+        assert!(use_in_matches(&tags(&["work"]), &tagged_tutti[0]));
         assert!(!use_in_matches(&tags(&["work"]), &all[0]));
     }
 
@@ -1165,7 +1169,7 @@ mod tests {
             ),
         ];
         for (proto, view) in cases {
-            for (i, (everything, channel_tags)) in [
+            for (i, (tutti, channel_tags)) in [
                 (true, vec![]),
                 (true, vec!["work".to_owned()]),
                 (false, vec!["work".to_owned()]),
@@ -1177,8 +1181,8 @@ mod tests {
                 let id = ids[i % 3];
                 let channel = ChannelView {
                     id: id.to_string(),
-                    kind: if everything {
-                        ChannelKind::Everything
+                    kind: if tutti {
+                        ChannelKind::Tutti
                     } else {
                         ChannelKind::Standard
                     },
@@ -1187,8 +1191,8 @@ mod tests {
                 };
                 assert_eq!(
                     use_in_matches(&view, &channel),
-                    proto.matches(id, everything, &channel_tags),
-                    "{view:?} on {channel_tags:?}, everything {everything}"
+                    proto.matches(id, tutti, &channel_tags),
+                    "{view:?} on {channel_tags:?}, tutti {tutti}"
                 );
             }
         }
@@ -1303,9 +1307,9 @@ mod tests {
         let block = connectors_context(&state, "c1");
         assert!(block.contains("gmail_work: Gmail, con_work@example.com"));
         assert!(!block.contains("gmail_personal"));
-        // Everything sees only "every channel" items.
-        let everything = channel_extensions(&state, "everything").unwrap();
-        assert_eq!(everything.enabled_connector_ids(), ["con_me"]);
+        // Tutti sees only "every channel" items.
+        let tutti = channel_extensions(&state, "tutti").unwrap();
+        assert_eq!(tutti.enabled_connector_ids(), ["con_me"]);
     }
 
     #[test]

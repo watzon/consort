@@ -261,8 +261,17 @@ pub struct Layout {
     /// task thread. Its text scrolls past this.
     pub error_text_max_height: Pixels,
     pub bubble_max_width: Pixels,
-    pub fade_top: Pixels,
+    pub fade_top_solid: Pixels,
+    pub fade_top_blend: Pixels,
     pub fade_bottom: Pixels,
+}
+
+impl Layout {
+    /// The whole top fade: the solid canvas under the mark and the pill,
+    /// then the blend. The first row of the chat starts below it.
+    pub fn fade_top(&self) -> Pixels {
+        self.fade_top_solid + self.fade_top_blend
+    }
 }
 
 /// Opacities of dimmed parts, as shares of full color.
@@ -575,7 +584,8 @@ impl Tokens {
                 switcher_name_max: px(s.layout.switcher_name_max),
                 error_text_max_height: px(s.layout.error_text_max_height),
                 bubble_max_width: px(s.layout.bubble_max_width),
-                fade_top: px(s.layout.fade_top),
+                fade_top_solid: px(s.layout.fade_top_solid),
+                fade_top_blend: px(s.layout.fade_top_blend),
                 fade_bottom: px(s.layout.fade_bottom),
             },
             opacity: Opacity {

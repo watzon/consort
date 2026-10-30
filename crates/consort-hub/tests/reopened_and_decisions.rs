@@ -78,7 +78,7 @@ async fn reopened_keeps_a_task_turn_that_still_waits_in_the_queue() {
     world
         .client
         .request(MessageSend {
-            channel_id: world.everything,
+            channel_id: world.tutti,
             client_message_id: "cm-follow-up".to_owned(),
             body: "Also fix the tests.".to_owned(),
             attachments: Vec::new(),
@@ -145,7 +145,7 @@ async fn reopened_keeps_a_coordinator_turn_that_still_waits_in_the_queue() {
         .await;
     tokio::time::sleep(Duration::from_millis(200)).await;
     let (wid, key, acc) = worker_offline(&mut world).await;
-    world.say(world.everything, "What is on my calendar?").await;
+    world.say(world.tutti, "What is on my calendar?").await;
 
     let mut back = FakeWorker::connect(
         &world.hub,
@@ -188,7 +188,7 @@ async fn reopened_keeps_a_coordinator_turn_that_went_out_before_it_was_handled()
         .await;
     tokio::time::sleep(Duration::from_millis(200)).await;
     let (wid, key, acc) = worker_offline(&mut world).await;
-    world.say(world.everything, "What is on my calendar?").await;
+    world.say(world.tutti, "What is on my calendar?").await;
 
     let mut back = FakeWorker::connect(
         &world.hub,
@@ -244,7 +244,7 @@ async fn reopened_ends_a_coordinator_turn_that_went_out_on_an_earlier_connection
         .await;
     tokio::time::sleep(Duration::from_millis(200)).await;
     // A second turn goes out on this connection. Its worker never ends it.
-    world.say(world.everything, "What is on my calendar?").await;
+    world.say(world.tutti, "What is on my calendar?").await;
     let text = next_turn(&mut world.worker, c).await;
     assert!(text.contains("What is on my calendar?"), "{text}");
     let (wid, key, acc) = worker_offline(&mut world).await;

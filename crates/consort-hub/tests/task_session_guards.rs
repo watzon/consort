@@ -100,7 +100,7 @@ async fn a_request_of_a_replaced_session_opens_nothing() {
     assert_eq!(task.status, TaskStatus::Working);
     let snapshot = world
         .client
-        .snapshot(SnapshotScope::Channel(world.everything))
+        .snapshot(SnapshotScope::Channel(world.tutti))
         .await;
     assert!(
         snapshot.approvals.iter().all(|a| a.session_id != s1),
@@ -120,7 +120,7 @@ async fn steer(
     world
         .client
         .request(MessageSend {
-            channel_id: world.everything,
+            channel_id: world.tutti,
             client_message_id: format!("cm-{text}"),
             body: text.to_owned(),
             attachments: Vec::new(),
@@ -282,7 +282,7 @@ async fn an_answer_for_a_closed_request_cancels_the_approval_and_keeps_the_task(
     world.wait_task(task_id, TaskStatus::NeedsInput).await;
     let snapshot = world
         .client
-        .snapshot(SnapshotScope::Channel(world.everything))
+        .snapshot(SnapshotScope::Channel(world.tutti))
         .await;
     let approval = snapshot
         .approvals
@@ -388,7 +388,7 @@ async fn deleting_a_task_drops_its_queued_turn_and_releases_its_workspace() {
     world
         .client
         .request(MessageSend {
-            channel_id: world.everything,
+            channel_id: world.tutti,
             client_message_id: "cm-queued".to_owned(),
             body: "Please also add a test".to_owned(),
             attachments: Vec::new(),

@@ -63,6 +63,8 @@ pub enum MenuAction {
     ReconnectConnection(String),
     /// Ask before a connection is disconnected.
     Disconnect(String),
+    /// The calls that the assistant made with a connection.
+    ConnectionActivity(String),
     /// An approval rule: of a connection, or of the Connect dialog with
     /// `None`.
     SetRule(
@@ -75,6 +77,8 @@ pub enum MenuAction {
     SetSkillEnabled(String, bool),
     SkillFiles(String),
     RemoveSkill(String),
+    /// Remove a skill source that the user added.
+    RemoveSkillSource(String),
     /// The worker ID and the account ID.
     AccountSettings(String, String),
     RemoveComposioKey,
@@ -461,12 +465,21 @@ pub fn floating<V: 'static>(
 #[allow(dead_code)]
 fn _app(_: &App) {}
 
+/// The menu of a skill source row in Settings > Skills: Remove. Only a source
+/// that the user added has a menu. The built-in sources cannot go.
+pub fn skill_source_menu(source: &consort_client::DirectorySourceView) -> Option<Vec<MenuItem>> {
+    source.removable.then(|| {
+        vec![MenuItem::new("Remove", MenuAction::RemoveSkillSource(source.id.clone())).danger()]
+    })
+}
+
 /// The menu of a connection row in Settings > Connectors: Reconnect, Copy
 /// handle and Disconnect.
 pub fn connection_menu(connection_id: &str, handle: &str) -> Vec<MenuItem> {
     let id = connection_id.to_owned();
     vec![
         MenuItem::new("Reconnect", MenuAction::ReconnectConnection(id.clone())),
+        MenuItem::new("Activity", MenuAction::ConnectionActivity(id.clone())),
         MenuItem::new("Copy handle", MenuAction::Copy(handle.to_owned())),
         MenuItem::new("Disconnect", MenuAction::Disconnect(id))
             .danger()
@@ -581,10 +594,14 @@ mod tests {
         let connection = connection_menu("con_1", "gmail_work");
         assert_eq!(
             labels(&connection),
-            ["Reconnect", "Copy handle", "Disconnect"]
+            ["Reconnect", "Activity", "Copy handle", "Disconnect"]
         );
-        assert_eq!(connection[1].action, MenuAction::Copy("gmail_work".into()));
-        assert!(connection[2].danger && connection[2].separator_before);
+        assert_eq!(
+            connection[1].action,
+            MenuAction::ConnectionActivity("con_1".into())
+        );
+        assert_eq!(connection[2].action, MenuAction::Copy("gmail_work".into()));
+        assert!(connection[3].danger && connection[3].separator_before);
         assert_eq!(
             labels(&skill_menu("skl_1", true)),
             ["Turn off", "View files", "Remove"]

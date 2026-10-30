@@ -1,7 +1,7 @@
 //! The views of the app.
 
 /// What the app calls the main channel. The code and the hub still call it
-/// Everything (`ChannelKind::Everything`) until the rename pass.
+/// Tutti (`ChannelKind::Tutti`) until the rename pass.
 pub const TUTTI: &str = "Tutti";
 
 pub mod add_account;

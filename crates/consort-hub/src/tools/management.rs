@@ -236,7 +236,7 @@ impl Hub {
             .read(|conn| Ok((con_store::connections(conn)?, skill_store::skills(conn)?)))
             .await?;
         let id = channel.map_or_else(ChannelId::new, |c| c.id);
-        let everything = channel.is_some_and(Channel::is_everything);
+        let tutti = channel.is_some_and(Channel::is_tutti);
         let empty: Vec<String> = Vec::new();
         let old_tags = channel.map_or(&empty, |c| &c.tags);
         let mut gained = Vec::new();
@@ -250,8 +250,8 @@ impl Hub {
                     .map(|s| (&s.use_in, format!("the skill {}", s.name))),
             );
         for (use_in, name) in names {
-            let before = channel.is_some() && use_in.matches(id, everything, old_tags);
-            let after = use_in.matches(id, everything, tags);
+            let before = channel.is_some() && use_in.matches(id, tutti, old_tags);
+            let after = use_in.matches(id, tutti, tags);
             if after && !before {
                 gained.push(name);
             } else if before && !after {
@@ -342,13 +342,13 @@ impl Hub {
 
     async fn tool_list_connections(&self, ctx: &ToolCtx) -> Result<Value> {
         let channel_id = ctx.channel.id;
-        let everything = ctx.audience == ToolAudience::EverythingCoordinator;
+        let tutti = ctx.audience == ToolAudience::TuttiCoordinator;
         let result = self
             .store
             .read(move |conn| {
                 let channel = conversation::channel_or_404(conn, channel_id)?;
                 let all = con_store::connections(conn)?;
-                let connections: Vec<Connection> = if everything {
+                let connections: Vec<Connection> = if tutti {
                     all
                 } else {
                     all.into_iter()
@@ -371,13 +371,13 @@ impl Hub {
 
     async fn tool_list_installed_skills(&self, ctx: &ToolCtx) -> Result<Value> {
         let channel_id = ctx.channel.id;
-        let everything = ctx.audience == ToolAudience::EverythingCoordinator;
+        let tutti = ctx.audience == ToolAudience::TuttiCoordinator;
         let result = self
             .store
             .read(move |conn| {
                 let channel = conversation::channel_or_404(conn, channel_id)?;
                 let all = skill_store::skills(conn)?;
-                let skills: Vec<Skill> = if everything {
+                let skills: Vec<Skill> = if tutti {
                     all
                 } else {
                     all.into_iter()
@@ -596,9 +596,9 @@ impl Hub {
             .store
             .read(move |conn| conversation::channel_or_404(conn, id))
             .await?;
-        if channel.is_everything() {
+        if channel.is_tutti() {
             return Ok(ManagementResult::refused(
-                "The Everything channel cannot be archived.",
+                "The Tutti channel cannot be archived.",
             ));
         }
         if !approved {
@@ -632,9 +632,9 @@ impl Hub {
         a: SetDefaultModelArgs,
         approved: bool,
     ) -> Result<ManagementResult> {
-        let everything = self.store.read(conversation::everything_channel).await?;
+        let tutti = self.store.read(conversation::tutti_channel).await?;
         self.apply_channel_update(
-            &everything,
+            &tutti,
             None,
             None,
             None,
@@ -866,10 +866,10 @@ impl Hub {
     // Connectors -------------------------------------------------------------------
 
     /// The default scope of a new item from this session: every channel for
-    /// Everything, otherwise the channels with this channel's tags, or this
+    /// Tutti, otherwise the channels with this channel's tags, or this
     /// channel alone (DECISIONS row 345).
     pub(crate) fn default_use_in(ctx: &ToolCtx) -> UseIn {
-        if ctx.audience == ToolAudience::EverythingCoordinator {
+        if ctx.audience == ToolAudience::TuttiCoordinator {
             UseIn::EveryChannel
         } else if ctx.channel.tags.is_empty() {
             UseIn::Channels {

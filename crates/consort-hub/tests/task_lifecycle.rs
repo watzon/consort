@@ -90,7 +90,7 @@ async fn a_task_runs_with_an_approval_and_ends_resolved() {
 
     // The client sees the task and its card in the channel.
     let task = wait_task_status(&mut world, task_id, TaskStatus::Working).await;
-    assert_eq!(task.channel_id, world.everything);
+    assert_eq!(task.channel_id, world.tutti);
     let card = world
         .client
         .wait_feed(|e| matches!(upserted(e), Some(EntityPayload::Message(m)) if m.id == task.card_message_id))
@@ -594,7 +594,7 @@ async fn a_message_in_the_task_thread_reaches_the_session() {
     world
         .client
         .request(MessageSend {
-            channel_id: world.everything,
+            channel_id: world.tutti,
             client_message_id: "thread-1".to_owned(),
             body: "Also update the docs.".to_owned(),
             attachments: Vec::new(),

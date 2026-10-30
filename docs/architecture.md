@@ -11,7 +11,7 @@ This page explains how the system fits together and why. It is the starting poin
 
 ## The shape of the system
 
-The system copies the user-facing shape of Claude Duet: one assistant, an Everything channel, project channels, tasks that run as their own sessions, routines and memory. It changes where the work runs. Duet runs tasks in Anthropic's cloud with Anthropic models. Here, tasks run on the user's own machines, with any harness and any model.
+The system copies the user-facing shape of Claude Duet: one assistant, a Tutti channel, project channels, tasks that run as their own sessions, routines and memory. It changes where the work runs. Duet runs tasks in Anthropic's cloud with Anthropic models. Here, tasks run on the user's own machines, with any harness and any model.
 
 ```
              Phone (Expo or native)        Desktop (GPUI)
@@ -75,7 +75,7 @@ A decision works the same way from the user's side, but the assistant starts it 
 
 ### A routine runs
 
-The hub's scheduler checks `next_run_at` once a second. For a `coordinator_turn` routine, it adds a `routine` wake event to the channel. For a `start_task` routine, it creates a task. The morning brief is a routine in the Everything channel.
+The hub's scheduler checks `next_run_at` once a second. For a `coordinator_turn` routine, it adds a `routine` wake event to the channel. For a `start_task` routine, it creates a task. The morning brief is a routine in the Tutti channel.
 
 ### A machine goes offline
 
@@ -85,13 +85,13 @@ If the home network is down, the phone still reaches the hub. Chat, memory, rout
 
 ## The assistant
 
-### Coordinators and Everything
+### Coordinators and Tutti
 
 Each channel has one coordinator session. The coordinator is the assistant in that channel. Its system prompt holds the channel's purpose, its instructions, the index of global memory and channel memory, and the rules for the hub tools.
 
-The Everything coordinator has three more tools: `list_channels`, `read_channel` and `message_channel`. With those, it can answer questions about any channel, and it can steer a channel by posting a message in that channel. It also has the management tools for channels, workers, accounts, connections and skills (see [Connectors, skills and management](#connectors-skills-and-management)). It writes only global memory. Channel coordinators read global memory and write only their own channel memory. That split comes straight from Duet: the main chat sees everything but owns only the facts about the user.
+The Tutti coordinator has three more tools: `list_channels`, `read_channel` and `message_channel`. With those, it can answer questions about any channel, and it can steer a channel by posting a message in that channel. It also has the management tools for channels, workers, accounts, connections and skills (see [Connectors, skills and management](#connectors-skills-and-management)). It writes only global memory. Channel coordinators read global memory and write only their own channel memory. That split comes straight from Duet: the main chat sees everything but owns only the facts about the user.
 
-Memory changes move up one level at a time. A task that learns something, such as "never push to main", calls `suggest_memory`. Its channel coordinator gets the suggestion in its next turn and decides whether to write a channel memory note. A channel coordinator that learns a fact about the user suggests it to the Everything coordinator in the same way. So the assistant keeps one memory with one owner for each scope, and every note has a coordinator that chose to keep it.
+Memory changes move up one level at a time. A task that learns something, such as "never push to main", calls `suggest_memory`. Its channel coordinator gets the suggestion in its next turn and decides whether to write a channel memory note. A channel coordinator that learns a fact about the user suggests it to the Tutti coordinator in the same way. So the assistant keeps one memory with one owner for each scope, and every note has a coordinator that chose to keep it.
 
 ### Why the coordinator speaks through tools
 
@@ -116,9 +116,9 @@ Because the session is a cache, the user can change a channel's harness or model
 
 ### The model of the assistant
 
-Each channel has a coordinator selection (account, model and options such as the effort). A channel without its own selection uses Everything's, so Everything's selection is the default for every such channel. The user chooses it in the composer, in the New channel dialog, or with Model in the channel menu. The client sends `channel.update { coordinator_selection }` at once, and the hub stores it.
+Each channel has a coordinator selection (account, model and options such as the effort). A channel without its own selection uses Tutti's, so Tutti's selection is the default for every such channel. The user chooses it in the composer, in the New channel dialog, or with Model in the channel menu. The client sends `channel.update { coordinator_selection }` at once, and the hub stores it.
 
-When the selection that a channel uses changes, its own or Everything's for a channel that has none, the hub ends the open coordinator session of that channel if no turn runs. A turn that runs is not cut: the next run of the channel sees that the prompt fingerprint (which holds the selection) changed, ends the session, and starts a new one. The next turn then starts with the new model and options. The hub passes the options in `session.start`. The ACP adapter sets them with `session/set_config_option` after the model. The Codex adapter sends the effort with each turn. The hub does not switch the model inside a session.
+When the selection that a channel uses changes, its own or Tutti's for a channel that has none, the hub ends the open coordinator session of that channel if no turn runs. A turn that runs is not cut: the next run of the channel sees that the prompt fingerprint (which holds the selection) changed, ends the session, and starts a new one. The next turn then starts with the new model and options. The hub passes the options in `session.start`. The ACP adapter sets them with `session/set_config_option` after the model. The Codex adapter sends the effort with each turn. The hub does not switch the model inside a session.
 
 ## Connectors, skills and management
 
@@ -134,7 +134,7 @@ Consort, not the provider of each harness, is the source of the assistant's conn
 - **Skills.** The hub installs a skill from a git repo, a directory entry or an upload, pins it to a commit and a content hash, and stores its files as blobs. The worker gets the skills of a session by hash and writes them where its harness reads skills (a plugin folder for Claude Code, a skills folder for Codex and Gemini CLI, the `skills` paths of OpenCode). A harness with no skill support gets `list_skills` and `read_skill`.
 - **Scope.** Each connection and skill has a "Use in" scope: every channel, the channels with all of some tags, or a list of channels. A channel can turn off an item that its scope gives it (a channel exception). The effective set of a session is fixed when the session starts.
 - **Cards.** A connector approval, a connect card, a sign-in card, an install card and a management approval card are approvals that the hub makes itself (hub cards). They use the approval card, `approval.answer`, push and Needs input. When a card that a coordinator posted closes, the coordinator gets a `card_answered` event.
-- **Management.** The Everything coordinator manages everything, and a channel's coordinator manages its own channel. The hub enforces the risk rule: a narrow or stricter change runs at once, and a change that deletes, widens access, loosens approvals, turns on scripts, changes tags or turns on provider extras waits for the user. The assistant never handles a secret.
+- **Management.** The Tutti coordinator manages everything, and a channel's coordinator manages its own channel. The hub enforces the risk rule: a narrow or stricter change runs at once, and a change that deletes, widens access, loosens approvals, turns on scripts, changes tags or turns on provider extras waits for the user. The assistant never handles a secret.
 - **Provider extras.** Each harness account has a toggle for what it syncs from the provider, such as claude.ai connectors. It is on by default. Off starts the harness without them, as far as the provider lets the worker turn them off.
 
 ## Placement
@@ -262,7 +262,7 @@ These items can change the design, and the research could not settle them:
 ## Build order
 
 1. Spikes for the open questions.
-2. A hub, one worker on the hub machine, and the desktop app with the Everything channel only. The coordinator runs Claude Code through ACP. Messages, memory and tasks run on that one worker.
+2. A hub, one worker on the hub machine, and the desktop app with the Tutti channel only. The coordinator runs Claude Code through ACP. Messages, memory and tasks run on that one worker.
 3. Channels, repos, workers at home, placement, approvals and decisions.
 4. Routines, the Codex native adapter, Pi, OpenCode for Fireworks, worker inventory in the UI and local MCP servers.
 5. `client-ffi`, the mobile app and push notifications.

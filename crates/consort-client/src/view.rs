@@ -6,7 +6,7 @@
 //! "2 min") are made here, so every client shows the same words.
 
 /// The name that every client shows for the main channel
-/// (`ChannelKind::Everything` in code). See `CONTEXT.md`.
+/// (`ChannelKind::Tutti` in code). See `CONTEXT.md`.
 pub const TUTTI: &str = "Tutti";
 
 /// Everything a client draws, at one moment.
@@ -15,7 +15,7 @@ pub struct ViewState {
     pub connection: Connection,
     pub user: UserView,
     pub sidebar: SidebarView,
-    /// Every channel, Everything first.
+    /// Every channel, Tutti first.
     pub channels: Vec<ChannelView>,
     pub groups: Vec<GroupView>,
     /// The channels that the user archived, by name. They have no timeline
@@ -91,17 +91,15 @@ impl ViewState {
         self.channels.iter().find(|c| c.id == id)
     }
 
-    pub fn everything(&self) -> Option<&ChannelView> {
-        self.channels
-            .iter()
-            .find(|c| c.kind == ChannelKind::Everything)
+    pub fn tutti(&self) -> Option<&ChannelView> {
+        self.channels.iter().find(|c| c.kind == ChannelKind::Tutti)
     }
 
     /// The unread count of a channel, from the sidebar. 0 for a channel
     /// that is not there.
     pub fn unread(&self, channel_id: &str) -> u32 {
-        if self.sidebar.everything.id == channel_id {
-            return self.sidebar.everything.unread;
+        if self.sidebar.tutti.id == channel_id {
+            return self.sidebar.tutti.unread;
         }
         self.sidebar
             .groups
@@ -359,12 +357,12 @@ pub struct EffortLevel {
 /// Where the coordinator selection of a channel comes from.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum SelectionSource {
-    /// The channel has its own selection. Everything's own selection also
+    /// The channel has its own selection. Tutti's own selection also
     /// counts as this.
     #[default]
     Channel,
-    /// The channel has none, so it uses Everything's.
-    Everything,
+    /// The channel has none, so it uses Tutti's.
+    Tutti,
 }
 
 /// The coordinator selection that a channel uses, and where it comes from.
@@ -403,7 +401,7 @@ pub struct UserView {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum ChannelKind {
-    Everything,
+    Tutti,
     #[default]
     Standard,
 }
@@ -466,7 +464,7 @@ pub type IconName = String;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SidebarView {
-    pub everything: SidebarChannel,
+    pub tutti: SidebarChannel,
     pub groups: Vec<SidebarGroup>,
     /// Channels with no group, after the groups.
     pub ungrouped: Vec<SidebarChannel>,
@@ -539,7 +537,7 @@ pub struct ChannelView {
     pub group_id: Option<String>,
     /// The worker the coordinator runs on, for the composer hint.
     pub coordinator_worker: Option<String>,
-    /// The model of the coordinator, with the fallback to Everything's.
+    /// The model of the coordinator, with the fallback to Tutti's.
     /// `None` when neither channel has one: placement then chooses.
     pub coordinator_selection: Option<EffectiveSelection>,
     pub repos: Vec<RepoView>,
@@ -963,7 +961,7 @@ pub struct TaskThreadView {
     pub approval_mode: ApprovalMode,
     /// The model of the task, such as "Opus 5.5, Claude Personal, High
     /// effort". The thread composer shows it. `None` when the task has no
-    /// selection and its channel and Everything have none.
+    /// selection and its channel and Tutti have none.
     pub model_label: Option<String>,
 }
 

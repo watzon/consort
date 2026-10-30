@@ -476,3 +476,13 @@ The user was away during the first build, from 2026-10-29. These are the choices
 | 470 | Desktop | Reduce motion is saved with the appearance choice and written only when the user sets it. | Chat redesign notes | Yes |
 | 471 | Desktop | `build.rs` makes the asset table from the files in `assets/`. | Chat redesign notes | Yes |
 | 472 | Desktop | The mark at the top center is 56 px with 4 px above it (`chat.mark`, `chat.mark_top`), not 44 and 6. | At 44 px the frames, which leave room for every working pose, drew the mark at about 30 px | Yes |
+| 473 | Rename | The main channel is Tutti in the code, the wire and the storage. The old values stay readable by serde aliases (`everything`, `everything_coordinator`, `everything_message`). | Consort should not copy the Duet name, and one channel should not have two names | Yes |
+| 474 | Rename | Hub migration 6 rewrites the stored values, and the channel name "Everything" becomes "Tutti". | Old data then shows the right name without help from the alias | Yes |
+| 475 | Rename | A new hub writes `tutti`, so an older client cannot read it. | Hub and clients ship together before the first release. Adding a protocol version for this has no use yet | Yes |
+| 476 | Rename | The wake event element in prompts is `<tutti_message>`. Stored events with the old name still read, and migration 6 renames them. | The model should never see the old name | Yes |
+| 477 | App | `--screen everything` and `--screen everything-manages` stay as aliases. | Old review scripts keep working | Yes |
+| 478 | App | A user-added skill source has Remove in its row menu, with no confirm step. | Installed skills stay when a source goes, and the user can add the source again | Yes |
+| 479 | App | skills.sh is a link under Sources and not a source. | Its API is closed to the hub (see step 3 notes) | Yes |
+| 480 | App | The Activity dialog shows the day and the time, and the size of the result. It does not show the arguments or the result. | The hub keeps only a hash and a size | Yes |
+| 481 | App | The Scheduled status and the Routines item use `routine`. `clock` stays for plain times. | The approved design | Yes |
+| 482 | App | `layout.fade_top` is split into `fade_top_solid` (92) and `fade_top_blend` (24). The solid part is fixed and does not depend on whether the pill shows. | No bubble should show under the status line, and the edge should not jump | Yes |

@@ -143,11 +143,8 @@ mod tests {
         assert_eq!(upserts.len(), 3);
         assert_eq!(upserts.last(), Some(&removed.preferences));
         // A channel snapshot leaves the preferences out.
-        let everything = snapshot.channels[0].id;
-        let channel = hub
-            .snapshot(SnapshotScope::Channel(everything))
-            .await
-            .unwrap();
+        let tutti = snapshot.channels[0].id;
+        let channel = hub.snapshot(SnapshotScope::Channel(tutti)).await.unwrap();
         assert_eq!(channel.preferences, None);
     }
 

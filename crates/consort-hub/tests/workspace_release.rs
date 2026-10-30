@@ -143,8 +143,8 @@ async fn deleting_a_channel_releases_the_workspaces_of_its_tasks() {
 #[tokio::test]
 async fn not_done_after_archive_is_refused_and_retry_starts_again() {
     let mut world = World::start().await;
-    let everything = world.everything;
-    let (task_id, old) = task_in_review(&mut world, everything).await;
+    let tutti = world.tutti;
+    let (task_id, old) = task_in_review(&mut world, tutti).await;
     world.wait_task(task_id, TaskStatus::Review).await;
     world.client.request(TaskResolve { task_id }).await.unwrap();
     world
@@ -198,8 +198,8 @@ async fn not_done_after_archive_is_refused_and_retry_starts_again() {
 #[tokio::test]
 async fn a_task_in_review_whose_session_ended_can_retry() {
     let mut world = World::start().await;
-    let everything = world.everything;
-    let (task_id, s) = task_in_review(&mut world, everything).await;
+    let tutti = world.tutti;
+    let (task_id, s) = task_in_review(&mut world, tutti).await;
     let task = world.wait_task(task_id, TaskStatus::Review).await;
     // A retry while the session runs would end a good session.
     let refused = world
@@ -240,7 +240,7 @@ async fn a_task_in_review_whose_session_ended_can_retry() {
     world
         .client
         .request(MessageSend {
-            channel_id: everything,
+            channel_id: tutti,
             client_message_id: "cm-more".to_owned(),
             body: "One more thing.".to_owned(),
             attachments: Vec::new(),

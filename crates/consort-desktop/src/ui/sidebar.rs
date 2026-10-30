@@ -1,4 +1,4 @@
-//! The sidebar: search, Everything, the groups of channels, New channel, the
+//! The sidebar: search, Tutti, the groups of channels, New channel, the
 //! workers and the account. The macOS traffic lights sit in its top 44 px.
 
 use consort_client::{SidebarChannel, WorkerView};
@@ -62,11 +62,11 @@ impl ConsortApp {
             ))
             .on_click(cx.listener(|this, _, window, cx| this.open_switcher(window, cx)));
 
-        // Before the first snapshot, Everything is an empty row. It would
+        // Before the first snapshot, Tutti is an empty row. It would
         // open a channel with no ID, so it waits with the other channels.
         let waiting = self.waiting();
-        let everything = (!sidebar.everything.id.is_empty())
-            .then(|| self.channel_row(&sidebar.everything, true, &selected, t, cx));
+        let tutti = (!sidebar.tutti.id.is_empty())
+            .then(|| self.channel_row(&sidebar.tutti, true, &selected, t, cx));
 
         let mut groups = div().flex().flex_col();
         for (gi, group) in sidebar.groups.iter().enumerate() {
@@ -247,7 +247,7 @@ impl ConsortApp {
                     .gap(t.space.xxs)
                     .pt(t.space.xs)
                     .child(search)
-                    .children(everything),
+                    .children(tutti),
             )
             .child(
                 div()
@@ -361,7 +361,7 @@ impl ConsortApp {
     fn channel_row(
         &mut self,
         channel: &SidebarChannel,
-        everything: bool,
+        tutti: bool,
         selected: &str,
         t: &Tokens,
         cx: &mut Context<Self>,
@@ -375,7 +375,7 @@ impl ConsortApp {
         };
         let id = channel.id.clone();
         let menu_id = channel.id.clone();
-        let leading = if everything {
+        let leading = if tutti {
             // The Three voices mark, idle and sharp.
             crate::ui::mark::still_mark(t.component.chat.mark_small, t)
         } else {
@@ -413,9 +413,9 @@ impl ConsortApp {
                     .mr(t.space.xs + t.space.xxs),
             )
         })
-        .when(!everything || channel.status.is_some(), |d| d.child(status))
+        .when(!tutti || channel.status.is_some(), |d| d.child(status))
         .on_click(cx.listener(move |this, _, window, cx| this.open_channel(id.clone(), window, cx)))
-        .when(!everything, |d| {
+        .when(!tutti, |d| {
             d.on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &gpui_kit::MouseDownEvent, _, cx| {

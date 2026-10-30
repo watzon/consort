@@ -24,7 +24,10 @@ use crate::{
             service_logo, setting_row, use_in_control,
         },
         menu::{OpenMenu, connection_menu},
-        parts::{ButtonKind, button, detail, error_box, focusable, icon, icon_button, line, text},
+        parts::{
+            ButtonKind, button, detail, error_box, focusable, icon, icon_button, line, selectable,
+            text,
+        },
         window_controls::DragArea as _,
     },
 };
@@ -1094,6 +1097,178 @@ impl ConsortApp {
             body,
             actions,
             Some(logo_tile(&service.logo, t).into_any_element()),
+        )
+    }
+
+    /// The calls that the assistant made with a connection, newest first:
+    /// the tool, the decision, the outcome, the time and the size of the
+    /// result. Older calls load with Show more.
+    pub fn connection_activity_dialog(
+        &mut self,
+        id: &str,
+        t: &Tokens,
+        cx: &mut Context<Self>,
+    ) -> AccountDialogParts {
+        let c = &t.colors;
+        let name = self
+            .state
+            .connection(id)
+            .map(|c| c.name.clone())
+            .unwrap_or_default();
+        let activity = self.ext.activity.clone();
+        // One row is a line of columns. The tool takes the free width.
+        let columns = |tool: AnyElement,
+                       decision: AnyElement,
+                       outcome: AnyElement,
+                       time: AnyElement,
+                       size: AnyElement| {
+            div()
+                .flex()
+                .items_start()
+                .gap(t.space.md)
+                .child(div().flex_1().min_w_0().child(tool))
+                .child(div().w(relative(0.24)).flex_none().child(decision))
+                .child(div().w(relative(0.12)).flex_none().child(outcome))
+                .child(div().w(relative(0.2)).flex_none().child(time))
+                .child(
+                    div()
+                        .w(relative(0.1))
+                        .flex_none()
+                        .flex()
+                        .justify_end()
+                        .child(size),
+                )
+        };
+        let head =
+            |label: &str| text(label.to_owned(), detail(t), c.text_tertiary).into_any_element();
+        let header = columns(
+            head("Tool"),
+            head("Decision"),
+            head("Outcome"),
+            head("Time"),
+            head("Size"),
+        )
+        .pb(t.space.xs)
+        .border_b(t.border_width)
+        .border_color(c.border_subtle);
+        let mut list = div().flex().flex_col();
+        for call in &activity.calls {
+            let (outcome, outcome_color) = if call.succeeded {
+                ("Succeeded", c.status_done)
+            } else {
+                ("Failed", c.status_failed)
+            };
+            let tool = div()
+                .flex()
+                .flex_col()
+                .gap(t.space.xxs)
+                .child(selectable(
+                    SharedString::from(format!("call-tool-{}", call.id)),
+                    call.tool.clone(),
+                    t.text.ui,
+                    c.text_primary,
+                ))
+                .when_some(call.error.clone(), |d, error| {
+                    d.child(selectable(
+                        SharedString::from(format!("call-error-{}", call.id)),
+                        error,
+                        detail(t),
+                        c.status_failed,
+                    ))
+                })
+                .into_any_element();
+            list = list.child(
+                columns(
+                    tool,
+                    text(call.decision.clone(), t.text.ui, c.text_secondary).into_any_element(),
+                    text(outcome, t.text.ui, outcome_color).into_any_element(),
+                    text(
+                        format!("{}, {}", call.day_label, call.time_label),
+                        t.text.ui,
+                        c.text_secondary,
+                    )
+                    .into_any_element(),
+                    text(call.size_label.clone(), t.text.ui, c.text_secondary).into_any_element(),
+                )
+                .id(SharedString::from(format!("call-{}", call.id)))
+                .debug_selector({
+                    let key = format!("call-{}", call.id);
+                    move || key.clone()
+                })
+                .py(t.space.sm)
+                .border_b(t.border_width)
+                .border_color(c.border_subtle),
+            );
+        }
+        let connection_id = id.to_owned();
+        let more_id = connection_id.clone();
+        let body: AnyElement = if let Some(error) = &activity.error
+            && activity.calls.is_empty()
+        {
+            div()
+                .flex()
+                .flex_col()
+                .items_start()
+                .gap(t.space.md)
+                .child(error_box("activity-error", error.clone(), t))
+                .child(
+                    button("activity-retry", "Try again", ButtonKind::Secondary, t)
+                        .debug_selector(|| "activity-retry".into())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.load_activity(connection_id.clone(), false, cx)
+                        })),
+                )
+                .into_any_element()
+        } else if activity.loading {
+            text("Loading the activity", t.text.ui, c.text_tertiary).into_any_element()
+        } else if activity.calls.is_empty() {
+            text(
+                "No calls yet. They show here when the assistant uses this connection.",
+                t.text.ui,
+                c.text_secondary,
+            )
+            .into_any_element()
+        } else {
+            div()
+                .flex()
+                .flex_col()
+                .gap(t.space.md)
+                .child(header)
+                .child(
+                    div()
+                        .id("connection-activity")
+                        .h(t.component.files_view)
+                        .overflow_y_scroll()
+                        .child(list),
+                )
+                .when_some(activity.error.clone(), |d, error| {
+                    d.child(error_box("activity-more-error", error, t))
+                })
+                .when(activity.has_more, |d| {
+                    d.child(
+                        div().flex().child(
+                            button("activity-more", "Show more", ButtonKind::Secondary, t)
+                                .debug_selector(|| "activity-more".into())
+                                .when(activity.loading_more, |b| b.opacity(t.opacity.busy))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.load_activity(more_id.clone(), true, cx)
+                                })),
+                        ),
+                    )
+                })
+                .into_any_element()
+        };
+        let actions = div().flex().justify_end().child(
+            button("dialog-confirm", "Done", ButtonKind::Primary, t)
+                .on_click(cx.listener(|this, _, window, cx| this.close_dialog(window, cx))),
+        );
+        (
+            format!("Activity of {name}"),
+            "The tool calls that the assistant made with this connection, newest first. The hub keeps the size of each result, never the result.".to_owned(),
+            t.layout.dialog_catalog,
+            div().child(body),
+            actions,
+            None,
         )
     }
 

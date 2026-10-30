@@ -161,12 +161,8 @@ mod tests {
     use super::*;
     use crate::hub::test_hub;
 
-    async fn everything_session(hub: &Hub) -> SessionId {
-        let channel = hub
-            .store
-            .read(conversation::everything_channel)
-            .await
-            .unwrap();
+    async fn tutti_session(hub: &Hub) -> SessionId {
+        let channel = hub.store.read(conversation::tutti_channel).await.unwrap();
         let session = Session {
             id: SessionId::new(),
             role: SessionRole::Coordinator,
@@ -194,11 +190,11 @@ mod tests {
         id
     }
 
-    /// The Everything coordinator sees the skill tools of step 3.
+    /// The Tutti coordinator sees the skill tools of step 3.
     #[tokio::test]
-    async fn the_everything_coordinator_sees_the_skill_tools() {
+    async fn the_tutti_coordinator_sees_the_skill_tools() {
         let (hub, _dir) = test_hub().await;
-        let session_id = everything_session(&hub).await;
+        let session_id = tutti_session(&hub).await;
         let names: Vec<String> = hub
             .tool_definitions(session_id)
             .await

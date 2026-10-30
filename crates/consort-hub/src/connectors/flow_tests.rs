@@ -92,9 +92,9 @@ async fn coordinator_session(hub: &Hub, channel_id: ChannelId, harness: &str) ->
     id
 }
 
-async fn everything(hub: &Hub) -> ChannelId {
+async fn tutti(hub: &Hub) -> ChannelId {
     hub.store
-        .read(conversation::everything_channel)
+        .read(conversation::tutti_channel)
         .await
         .unwrap()
         .id
@@ -395,7 +395,7 @@ async fn the_effective_set_follows_use_in_and_channel_exceptions() {
     fake.set_auto_activate(true);
     let work = channel(&hub, "Work", &["work"]).await;
     let home = channel(&hub, "Home", &[]).await;
-    let everything_id = everything(&hub).await;
+    let tutti_id = tutti(&hub).await;
     let tagged = connect(
         &hub,
         "sendgrid",
@@ -429,8 +429,8 @@ async fn the_effective_set_follows_use_in_and_channel_exceptions() {
     };
     assert_eq!(set(work).await, vec!["shared_mail", "work_mail"]);
     assert_eq!(set(home).await, vec!["shared_mail"]);
-    // Everything with no tags matches only "every channel" items.
-    assert_eq!(set(everything_id).await, vec!["shared_mail"]);
+    // Tutti with no tags matches only "every channel" items.
+    assert_eq!(set(tutti_id).await, vec!["shared_mail"]);
     // A channel cannot turn on an item that its scope does not give it.
     let err = hub
         .channel_set_connection_enabled(
@@ -475,9 +475,9 @@ async fn the_effective_set_follows_use_in_and_channel_exceptions() {
 async fn connector_tools_show_only_where_a_connection_is_and_skill_tools_only_without_native_skills()
  {
     let (hub, _dir, fake) = hub_with_fake().await;
-    let everything_id = everything(&hub).await;
-    let acp = coordinator_session(&hub, everything_id, "acp").await;
-    let claude = coordinator_session(&hub, everything_id, "claude").await;
+    let tutti_id = tutti(&hub).await;
+    let acp = coordinator_session(&hub, tutti_id, "acp").await;
+    let claude = coordinator_session(&hub, tutti_id, "claude").await;
     let names = |session| {
         let hub = hub.clone();
         async move {
@@ -504,7 +504,7 @@ async fn connector_tools_show_only_where_a_connection_is_and_skill_tools_only_wi
 async fn a_read_tool_runs_at_once_with_the_exact_account_and_an_audit_record() {
     let (hub, _dir, fake) = hub_with_fake().await;
     let connection = active_gmail(&hub, &fake, ToolApprovals::default()).await;
-    let session = coordinator_session(&hub, everything(&hub).await, "acp").await;
+    let session = coordinator_session(&hub, tutti(&hub).await, "acp").await;
     let listed = call(
         &hub,
         session,
@@ -575,7 +575,7 @@ async fn a_read_tool_runs_at_once_with_the_exact_account_and_an_audit_record() {
 async fn clear_errors_for_missing_connectors_keys_and_sign_ins() {
     let (hub, _dir, fake) = hub_with_fake().await;
     let connection = active_gmail(&hub, &fake, ToolApprovals::default()).await;
-    let session = coordinator_session(&hub, everything(&hub).await, "acp").await;
+    let session = coordinator_session(&hub, tutti(&hub).await, "acp").await;
     assert_eq!(
         call_error(
             &hub,
@@ -631,7 +631,7 @@ async fn clear_errors_for_missing_connectors_keys_and_sign_ins() {
     let extensions = hub
         .store
         .read(|conn| {
-            let id = conversation::everything_channel(conn)?.id;
+            let id = conversation::tutti_channel(conn)?.id;
             crate::connectors::extensions::extensions_for(conn, id)
         })
         .await
@@ -660,7 +660,7 @@ async fn clear_errors_for_missing_connectors_keys_and_sign_ins() {
 async fn a_change_asks_with_a_readable_card_and_runs_after_allow() {
     let (hub, _dir, fake) = hub_with_fake().await;
     active_gmail(&hub, &fake, ToolApprovals::default()).await;
-    let session = coordinator_session(&hub, everything(&hub).await, "acp").await;
+    let session = coordinator_session(&hub, tutti(&hub).await, "acp").await;
     let running = {
         let hub = hub.clone();
         tokio::spawn(async move {
@@ -789,15 +789,15 @@ async fn a_late_answer_runs_the_call_and_wakes_the_coordinator() {
         ..fast()
     });
     active_gmail(&hub, &fake, ToolApprovals::default()).await;
-    let everything_id = everything(&hub).await;
-    let session = coordinator_session(&hub, everything_id, "acp").await;
+    let tutti_id = tutti(&hub).await;
+    let session = coordinator_session(&hub, tutti_id, "acp").await;
     let waiting = call(&hub, session, "run_connector_tool", json!({"connector": "gmail_work", "tool": "GMAIL_SEND_EMAIL", "arguments": {"to": "a@example.com"}})).await;
     assert_eq!(waiting["status"], "waiting_for_user");
     let card = pending_card(&hub).await;
     assert_eq!(waiting["approval_id"], card.id.to_string());
     answer(&hub, card.id, "allow").await;
     let events = wait_for(async || {
-        let events = wakes(&hub, everything_id).await;
+        let events = wakes(&hub, tutti_id).await;
         (!events.is_empty()).then_some(events)
     })
     .await;
@@ -827,11 +827,11 @@ async fn management_changes_follow_the_risk_rule() {
     )
     .await;
     let _ = fake;
-    let everything_id = everything(&hub).await;
+    let tutti_id = tutti(&hub).await;
     for name in ["One", "Two", "Three"] {
         channel(&hub, name, &[]).await;
     }
-    let session = coordinator_session(&hub, everything_id, "acp").await;
+    let session = coordinator_session(&hub, tutti_id, "acp").await;
     // Wider: a management card with the effect.
     let asked = call(
         &hub,
@@ -861,7 +861,7 @@ async fn management_changes_follow_the_risk_rule() {
     })
     .await;
     let events = wait_for(async || {
-        let events = wakes(&hub, everything_id).await;
+        let events = wakes(&hub, tutti_id).await;
         (!events.is_empty()).then_some(events)
     })
     .await;
@@ -883,9 +883,7 @@ async fn management_changes_follow_the_risk_rule() {
     assert_eq!(applied["status"], "applied");
     let notices = hub
         .store
-        .read(move |conn| {
-            conversation::messages_page(conn, everything_id, None, None, 50, usize::MAX)
-        })
+        .read(move |conn| conversation::messages_page(conn, tutti_id, None, None, 50, usize::MAX))
         .await
         .unwrap()
         .0;
@@ -986,7 +984,7 @@ async fn a_channel_assistant_manages_only_its_own_channel() {
         .then_some(())
     })
     .await;
-    // The Everything tools are not there.
+    // The Tutti tools are not there.
     assert_eq!(
         call_error(
             &hub,
@@ -1010,8 +1008,8 @@ async fn a_channel_assistant_manages_only_its_own_channel() {
 #[tokio::test]
 async fn channel_tools_create_at_once_and_ask_before_tags_and_archive() {
     let (hub, _dir) = test_hub().await;
-    let everything_id = everything(&hub).await;
-    let session = coordinator_session(&hub, everything_id, "acp").await;
+    let tutti_id = tutti(&hub).await;
+    let session = coordinator_session(&hub, tutti_id, "acp").await;
     let made = call(
         &hub,
         session,
@@ -1108,8 +1106,8 @@ async fn skills_reach_the_session_and_the_worker_that_was_told() {
         .store_skill(crate::skills::test_skill("notes", false))
         .await
         .unwrap();
-    let everything_id = everything(&hub).await;
-    let session = coordinator_session(&hub, everything_id, "acp").await;
+    let tutti_id = tutti(&hub).await;
+    let session = coordinator_session(&hub, tutti_id, "acp").await;
     let listed = call(&hub, session, "list_skills", json!({})).await;
     assert_eq!(listed["skills"][0]["name"], "notes");
     let read = call(&hub, session, "read_skill", json!({"skill": "notes"})).await;
@@ -1138,7 +1136,7 @@ async fn skills_reach_the_session_and_the_worker_that_was_told() {
     assert_eq!(err.code(), ErrorCode::NotFound);
     let extensions = hub
         .store
-        .write(move |tx| tx.session_extensions(worker, everything_id))
+        .write(move |tx| tx.session_extensions(worker, tutti_id))
         .await
         .unwrap();
     assert_eq!(extensions.skills[0].content_hash, hash);
@@ -1158,7 +1156,7 @@ async fn skills_reach_the_session_and_the_worker_that_was_told() {
     hub.channel_set_skill_enabled(
         &Caller::Hub,
         consort_proto::client_api::ChannelSetSkillEnabled {
-            channel_id: everything_id,
+            channel_id: tutti_id,
             skill_id: skill.id,
             enabled: false,
         },
@@ -1282,8 +1280,8 @@ async fn worker_and_account_tools_ask_where_the_rule_says() {
         .write(move |tx| tx.save_worker(&worker))
         .await
         .unwrap();
-    let everything_id = everything(&hub).await;
-    let session = coordinator_session(&hub, everything_id, "acp").await;
+    let tutti_id = tutti(&hub).await;
+    let session = coordinator_session(&hub, tutti_id, "acp").await;
     let tags = call(
         &hub,
         session,
@@ -1316,7 +1314,7 @@ async fn worker_and_account_tools_ask_where_the_rule_says() {
     // Not now: the coordinator hears about it.
     answer(&hub, card.id, "deny").await;
     let events = wait_for(async || {
-        let events = wakes(&hub, everything_id).await;
+        let events = wakes(&hub, tutti_id).await;
         (!events.is_empty()).then_some(events)
     })
     .await;
@@ -1336,13 +1334,6 @@ async fn worker_and_account_tools_ask_where_the_rule_says() {
     )
     .await;
     assert_eq!(model["status"], "applied");
-    let everything_channel = hub
-        .store
-        .read(conversation::everything_channel)
-        .await
-        .unwrap();
-    assert_eq!(
-        everything_channel.coordinator_selection.unwrap().model,
-        "opus"
-    );
+    let tutti_channel = hub.store.read(conversation::tutti_channel).await.unwrap();
+    assert_eq!(tutti_channel.coordinator_selection.unwrap().model, "opus");
 }

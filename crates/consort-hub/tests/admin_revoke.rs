@@ -183,13 +183,11 @@ async fn a_worker_removed_while_the_hub_is_stopped_loses_its_sessions_at_the_nex
     let hub = TestHub::start_in(dir).await;
     let setup = consort_hub::create_setup_code(hub.dir.path()).unwrap();
     let mut client = FakeClient::pair_with_code_and_connect(&hub, &setup).await;
-    let everything = client.everything().await;
+    let tutti = client.tutti().await;
     let deadline = tokio::time::Instant::now() + WAIT;
     loop {
         let snapshot = client
-            .snapshot(consort_proto::client_api::SnapshotScope::Channel(
-                everything,
-            ))
+            .snapshot(consort_proto::client_api::SnapshotScope::Channel(tutti))
             .await;
         let task = snapshot
             .tasks

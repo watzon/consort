@@ -441,19 +441,84 @@ pub(crate) fn apply(
                 channel.disabled_connections.retain(|c| c != &connection_id);
             }
         }
-        Command::LoadConnectionCalls { connection_id, .. } => {
+        Command::LoadConnectionCalls {
+            connection_id,
+            before,
+        } => {
+            // Two pages: the newest calls, then older ones.
+            let call = |n: u32,
+                        tool: &str,
+                        kind: ToolKindView,
+                        decision: &str,
+                        error: Option<&str>,
+                        day: &str,
+                        time: &str,
+                        size: &str| ConnectorCallView {
+                id: format!("ccl_mock_{n}"),
+                tool: tool.into(),
+                kind,
+                decision: decision.into(),
+                succeeded: error.is_none(),
+                error: error.map(str::to_owned),
+                time_label: time.into(),
+                day_label: day.into(),
+                size_label: size.into(),
+            };
+            let (calls, has_more) = if before.is_none() {
+                (
+                    vec![
+                        call(
+                            3,
+                            "GMAIL_FETCH_EMAILS",
+                            ToolKindView::Read,
+                            "Ran without asking",
+                            None,
+                            "Today",
+                            "2:40 PM",
+                            "12.4 KB",
+                        ),
+                        call(
+                            2,
+                            "GMAIL_SEND_EMAIL",
+                            ToolKindView::Change,
+                            "Allowed by you",
+                            None,
+                            "Today",
+                            "11:02 AM",
+                            "412 B",
+                        ),
+                        call(
+                            1,
+                            "GMAIL_DELETE_THREAD",
+                            ToolKindView::Change,
+                            "Denied by you",
+                            Some("You said no."),
+                            "Yesterday",
+                            "4:15 PM",
+                            "0 B",
+                        ),
+                    ],
+                    true,
+                )
+            } else {
+                (
+                    vec![call(
+                        0,
+                        "GMAIL_LIST_LABELS",
+                        ToolKindView::Read,
+                        "Ran without asking",
+                        None,
+                        "October 12",
+                        "9:30 AM",
+                        "1.2 KB",
+                    )],
+                    false,
+                )
+            };
             return Ok(CommandOutput::ConnectionCalls(ConnectionCallsView {
                 connection_id,
-                calls: vec![ConnectorCallView {
-                    id: "ccl_mock_1".into(),
-                    tool: "GMAIL_FETCH_EMAILS".into(),
-                    kind: ToolKindView::Read,
-                    decision: "Ran without asking".into(),
-                    succeeded: true,
-                    error: None,
-                    time_label: "2:40 PM".into(),
-                }],
-                has_more: false,
+                calls,
+                has_more,
             }));
         }
         Command::SetChannelConnectionEnabled {
@@ -553,7 +618,9 @@ pub(crate) fn apply(
         Command::AddSkillDirectorySource { url } => {
             let url = url.trim().to_owned();
             if url.is_empty() {
-                return Err(invalid("Paste the URL of a marketplace.json file."));
+                return Err(invalid(
+                    "Paste the URL of a git repo or a marketplace.json file.",
+                ));
             }
             state.skill_directory.sources.push(DirectorySourceView {
                 id: format!("src_{new_id}"),

@@ -128,7 +128,7 @@ Each status has one glyph and one color, everywhere: the sidebar, task cards, th
 | Status | Glyph | Color role |
 |---|---|---|
 | Up next | glyph `status-up-next.svg` (dashed ring) | `text.tertiary` |
-| Scheduled | icon `clock` | `status.scheduled` |
+| Scheduled | icon `routine` (the metronome) | `status.scheduled` |
 | Working | icon `working` (an arc on a faint ring), shimmers while live | `status.working` |
 | Needs input | icon `needs-input` (fermata), shimmers while live | `accent.text` |
 | Ready for review | icon `done` (ring with check) | `accent.text` |
@@ -192,7 +192,7 @@ Fixed layout sizes:
 | Side panel width (Tasks, task thread) | 400 |
 | Timeline content width | At most 720 |
 | Bubble and card width in the timeline (`layout.bubble_max_width`) | At most 560 |
-| Top fade, under the mark (`layout.fade_top`) | 96 |
+| Top fade, under the mark: solid part (`layout.fade_top_solid`) and blend (`layout.fade_top_blend`) | 92, 24 |
 | Bottom fade, above the composer (`layout.fade_bottom`) | 32 |
 | Smallest window | 960 by 600 |
 
@@ -220,7 +220,7 @@ The main column has no header. The timeline fills it, the composer sits under it
 - **Notices** are a centered line in UI size and `text.tertiary`, with their time.
 - **The Three voices mark** sits at the top center, `chat.mark` (56 px), `chat.mark_top` from the top. Under it, an activity pill (`surface.card`, `border.subtle`, `full` corners, `chat.pill_pad_y` by `chat.pill_pad_x`, Label size in `text.secondary`) says what the assistant does, only while it works. See [Logo](#logo).
 - **Top actions** sit at the top right, `md` from the edges, `xs` apart: Connectors (for a channel that has connections or skills, with their count), Tasks and New task. Each is `chat.top_action` (32 px) square with a `chat.top_action_icon` (18 px) icon in `text.secondary`. Tasks opens the Tasks panel, has `surface.selected` while the panel is open, and has a `component.state_dot` dot in `accent.fill` while something needs you.
-- **Fades.** The top fade is `layout.fade_top` (96 px) high, from `surface.canvas` at 35 percent to clear, so messages pass under the mark. The bottom fade is `layout.fade_bottom` (32 px) and shows only while the reader is scrolled up.
+- **Fades.** The top fade has two parts. The first part is solid `surface.canvas`, `layout.fade_top_solid` (92 px) high. It ends just below the mark and the activity pill (mark top, mark, `space.xxs`, the pill, and a small margin), so no bubble shows under the status line. A theme test keeps it tall enough. It has the same height when the pill is hidden, so the edge does not jump when work starts or stops. Under it, a gradient of `layout.fade_top_blend` (24 px) goes from `surface.canvas` to clear. The first item of a chat at rest starts below both parts. The bottom fade is `layout.fade_bottom` (32 px) and shows only while the reader is scrolled up.
 - **Composer.** One field on `surface.card` with a `border.strong` line and `chat.composer_radius` (16 px) corners, as wide as the timeline. The send key (`send` icon, `chat.send_button`, `text.tertiary`) sits inside it at the right. Under the field, outside it: add and voice (`component.composer_chip` square), a `border.strong` divider, "Same as Tutti" for a channel with no model of its own, the model chip and the effort chip, a spacer, and "Runs on <worker>" in Label size and `text.tertiary`. The placeholder is "Message <channel>", and "Message Tutti" in the main channel.
 
 ### Chat sizes
@@ -230,7 +230,7 @@ These sizes are in `component.chat` of `structure.json`, except the three in `la
 | Token | Size (px) | Use |
 |---|---|---|
 | `layout.bubble_max_width` | 560 | The widest bubble or card in the timeline |
-| `layout.fade_top`, `layout.fade_bottom` | 96, 32 | The top and bottom fades of the timeline |
+| `layout.fade_top_solid`, `layout.fade_top_blend`, `layout.fade_bottom` | 92, 24, 32 | The solid top, the top blend and the bottom fade of the timeline |
 | `bubble_radius`, `bubble_tail` | 16, 4 | Bubble and card corners, and the small corner |
 | `bubble_pad_x`, `bubble_pad_y` | 14, 10 | The padding of a bubble |
 | `composer_radius`, `send_button` | 16, 32 | The composer field and its send key |

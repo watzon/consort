@@ -133,9 +133,9 @@ fn default_repo_name(url: &str) -> String {
 }
 
 /// Whether a channel sits in this group. `None` is the list of channels
-/// without a group. The Everything channel is in no list.
+/// without a group. The Tutti channel is in no list.
 fn in_group(channel: &Channel, group_id: Option<GroupId>) -> bool {
-    channel.group_id == group_id && !channel.is_everything()
+    channel.group_id == group_id && !channel.is_tutti()
 }
 
 /// Gives the channels of one group the positions 0, 1, 2 and so on, in their
@@ -321,10 +321,8 @@ impl Hub {
                 let mut channel = before.clone();
                 if let Some(name) = request.name {
                     let name = clean_name("channel", &name)?;
-                    if channel.is_everything() && name != channel.name {
-                        return Err(HubError::conflict(
-                            "The Everything channel cannot be renamed.",
-                        ));
+                    if channel.is_tutti() && name != channel.name {
+                        return Err(HubError::conflict("The Tutti channel cannot be renamed."));
                     }
                     channel.name = name;
                 }
@@ -376,9 +374,9 @@ impl Hub {
                 channel.updated_at = tx.now();
                 tx.save_channel(&channel)?;
                 let moved = if channel.coordinator_selection != before.coordinator_selection {
-                    let everything = conversation::everything_channel(tx.db())?;
+                    let tutti = conversation::tutti_channel(tx.db())?;
                     let channels = conversation::channels(tx.db())?;
-                    crate::coordinator::moved_selections(&before, &channel, &everything, &channels)
+                    crate::coordinator::moved_selections(&before, &channel, &tutti, &channels)
                 } else {
                     Vec::new()
                 };
@@ -413,10 +411,8 @@ impl Hub {
             .store
             .write(move |tx| {
                 let mut channel = conversation::channel_or_404(tx.db(), request.channel_id)?;
-                if channel.is_everything() {
-                    return Err(HubError::conflict(
-                        "The Everything channel cannot be archived.",
-                    ));
+                if channel.is_tutti() {
+                    return Err(HubError::conflict("The Tutti channel cannot be archived."));
                 }
                 let now = tx.now();
                 // Archiving twice keeps the first archive time.
@@ -451,10 +447,8 @@ impl Hub {
             .store
             .write(move |tx| {
                 let channel = conversation::channel_or_404(tx.db(), channel_id)?;
-                if channel.is_everything() {
-                    return Err(HubError::conflict(
-                        "The Everything channel cannot be deleted.",
-                    ));
+                if channel.is_tutti() {
+                    return Err(HubError::conflict("The Tutti channel cannot be deleted."));
                 }
                 let reason = "The channel was removed.";
                 let mut fx = crate::link::events::Effects::default();
@@ -489,9 +483,9 @@ impl Hub {
             .store
             .write(move |tx| {
                 let mut channel = conversation::channel_or_404(tx.db(), request.channel_id)?;
-                if channel.is_everything() {
+                if channel.is_tutti() {
                     return Err(HubError::conflict(
-                        "The Everything channel stays at the top. It cannot move.",
+                        "The Tutti channel stays at the top. It cannot move.",
                     ));
                 }
                 if let Some(group_id) = request.group_id {
@@ -1041,11 +1035,8 @@ mod tests {
         .group
     }
 
-    async fn everything(hub: &Hub) -> Channel {
-        hub.store
-            .read(conversation::everything_channel)
-            .await
-            .unwrap()
+    async fn tutti(hub: &Hub) -> Channel {
+        hub.store.read(conversation::tutti_channel).await.unwrap()
     }
 
     async fn channel_now(hub: &Hub, id: ChannelId) -> Channel {
@@ -1097,7 +1088,7 @@ mod tests {
             .await
             .unwrap()
             .into_iter()
-            .filter(|c| c.group_id == group_id && !c.is_everything())
+            .filter(|c| c.group_id == group_id && !c.is_tutti())
             .map(|c| (c.name, c.position))
             .collect()
     }
@@ -1232,19 +1223,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_everything_channel_cannot_be_renamed_archived_deleted_or_moved() {
+    async fn the_tutti_channel_cannot_be_renamed_archived_deleted_or_moved() {
         let (hub, _dir) = test_hub().await;
-        let everything = everything(&hub).await;
+        let tutti = tutti(&hub).await;
         let group = new_group(&hub, "Work").await;
 
-        let mut update = ChannelUpdate::new(everything.id);
+        let mut update = ChannelUpdate::new(tutti.id);
         update.name = Some("Home".to_owned());
         assert_eq!(
             code_of(hub.channel_update(&Caller::Hub, update).await),
             ErrorCode::Conflict
         );
         let archive = ChannelArchive {
-            channel_id: everything.id,
+            channel_id: tutti.id,
             archived: true,
         };
         assert_eq!(
@@ -1252,14 +1243,14 @@ mod tests {
             ErrorCode::Conflict
         );
         let delete = ChannelDelete {
-            channel_id: everything.id,
+            channel_id: tutti.id,
         };
         assert_eq!(
             code_of(hub.channel_delete(&Caller::Hub, delete).await),
             ErrorCode::Conflict
         );
         let moved = ChannelMove {
-            channel_id: everything.id,
+            channel_id: tutti.id,
             group_id: Some(group.id),
             position: 0,
         };
@@ -1269,17 +1260,17 @@ mod tests {
         );
 
         // Other fields and the same name are fine.
-        let mut update = ChannelUpdate::new(everything.id);
-        update.name = Some("Everything".to_owned());
+        let mut update = ChannelUpdate::new(tutti.id);
+        update.name = Some("Tutti".to_owned());
         update.purpose = Some("Ask me anything".to_owned());
         let updated = hub
             .channel_update(&Caller::Hub, update)
             .await
             .unwrap()
             .channel;
-        assert_eq!(updated.name, "Everything");
+        assert_eq!(updated.name, "Tutti");
         assert_eq!(updated.purpose, "Ask me anything");
-        assert_eq!(channel_now(&hub, everything.id).await.group_id, None);
+        assert_eq!(channel_now(&hub, tutti.id).await.group_id, None);
     }
 
     #[tokio::test]

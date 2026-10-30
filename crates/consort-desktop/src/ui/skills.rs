@@ -18,12 +18,12 @@ use crate::{
     extensions::{AddSkillTab, UseInTarget},
     ui::{
         add_account::AccountDialogParts,
-        dialogs::input_box,
+        dialogs::{field_block, input_box},
         ext_parts::{
             dot, faded_scroll, hint, mono_block, page_section, ring, rows_frame, setting_row,
             use_in_control,
         },
-        menu::{OpenMenu, skill_menu},
+        menu::{OpenMenu, skill_menu, skill_source_menu},
         parts::{
             ButtonKind, button, detail, error_box, focusable, icon, icon_button, line, selectable,
             text,
@@ -198,7 +198,8 @@ impl ConsortApp {
                     .id("skills-list")
                     .flex_1()
                     .overflow_y_scroll()
-                    .child(rows),
+                    .child(rows)
+                    .child(self.skill_sources_section(t, cx)),
             );
         let page = match selected.and_then(|id| state.skill(&id).cloned()) {
             Some(skill) => self.skill_page(&skill, t, cx),
@@ -231,6 +232,175 @@ impl ConsortApp {
             .child(list)
             .child(page)
             .into_any_element()
+    }
+
+    /// The sources that the hub searches, under the skill rows. The user can
+    /// add a source, and remove one that they added.
+    fn skill_sources_section(&mut self, t: &Tokens, cx: &mut Context<Self>) -> Div {
+        let c = &t.colors;
+        let sources = self.state.skill_directory.sources.clone();
+        let mut rows = div().flex().flex_col().gap(t.space.xxs);
+        for source in &sources {
+            let menu = skill_source_menu(source);
+            let icon_name = match source.kind {
+                consort_client::DirectoryKind::Smithery => "globe",
+                _ => "git-branch",
+            };
+            let key = SharedString::from(format!("skill-source-{}", source.id));
+            let selector = key.to_string();
+            let mut row = div()
+                .id(key)
+                .debug_selector(move || selector.clone())
+                .flex()
+                .items_center()
+                .gap(t.space.sm + t.space.xxs)
+                .py(t.space.sm)
+                .px(t.space.sm)
+                .rounded(t.radius.md)
+                .child(
+                    div()
+                        .h(t.text.ui.line)
+                        .w(t.icon.size)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(icon(icon_name, t.icon.dense, c.text_tertiary)),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_w_0()
+                        .child(line(source.name.clone(), t.text.ui, c.text_primary))
+                        .child(line(
+                            consort_client::repo_name(&source.url),
+                            detail(t),
+                            c.text_tertiary,
+                        )),
+                );
+            if let Some(items) = menu {
+                let more_items = items.clone();
+                row = row
+                    .hover(|s| s.bg(c.hover_canvas))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                            this.open_menu(OpenMenu::at(event.position, items.clone()), cx);
+                            cx.stop_propagation();
+                        }),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(format!(
+                                "skill-source-more-{}",
+                                source.id
+                            )))
+                            .flex_none()
+                            .cursor_pointer()
+                            .p(t.space.xs)
+                            .rounded(t.radius.sm)
+                            .hover(|s| s.bg(c.hover_raised))
+                            .child(icon("ellipsis", t.icon.dense, c.text_secondary))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                    this.open_menu(
+                                        OpenMenu::at(event.position, more_items.clone()),
+                                        cx,
+                                    );
+                                    cx.stop_propagation();
+                                }),
+                            ),
+                    );
+            }
+            rows = rows.child(row);
+        }
+        // skills.sh is a link, not a source: its API is closed to the hub.
+        rows = rows.child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(t.space.xxs)
+                .py(t.space.sm)
+                .px(t.space.sm)
+                .child(
+                    focusable(div().id("skills-sh-link"), t)
+                        .debug_selector(|| "skills-sh-link".into())
+                        .flex()
+                        .items_center()
+                        .gap(t.space.sm + t.space.xxs)
+                        .cursor_pointer()
+                        .child(icon("external-link", t.icon.dense, c.accent_text))
+                        .child(text("skills.sh", t.text.ui, c.accent_text))
+                        .on_click(cx.listener(|_, _, _, cx| cx.open_url("https://skills.sh"))),
+                )
+                .child(hint(
+                    "It has no public search. Paste owner/repo from it into the Git URL field of Add skill.",
+                    t,
+                )),
+        );
+        div()
+            .flex()
+            .flex_col()
+            .gap(t.space.xs)
+            .p(t.space.sm)
+            .pt(t.space.md)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(t.space.sm)
+                    .px(t.space.sm)
+                    .child(
+                        div()
+                            .flex_1()
+                            .child(text("Sources", t.text.ui_strong, c.text_primary)),
+                    )
+                    .child(
+                        button("add-skill-source", "Add source", ButtonKind::Secondary, t)
+                            .debug_selector(|| "add-skill-source".into())
+                            .child(icon("plus", t.icon.dense, c.text_primary))
+                            .flex_row_reverse()
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_dialog(Dialog::AddSkillSource, window, cx)
+                            })),
+                    ),
+            )
+            .child(div().px(t.space.sm).child(hint(
+                "Add skill searches these. Add a git repo or a marketplace.json file.",
+                t,
+            )))
+            .child(rows)
+    }
+
+    /// Add a skill source: one URL.
+    pub fn add_skill_source_dialog(
+        &mut self,
+        t: &Tokens,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AccountDialogParts {
+        let focused = self.is_skill_focused(&self.ext_inputs.source_url, window, cx);
+        let body = field_block(
+            "URL",
+            input_box(&self.ext_inputs.source_url, focused, t),
+            Some(
+                "A git repo, or the URL of a marketplace.json file. The hub reads it once to check it. Skills that you installed from it stay when you remove it.",
+            ),
+            t,
+        );
+        let actions = self.dialog_actions("Add source", t, cx, |this, window, cx| {
+            this.add_skill_source(window, cx)
+        });
+        (
+            "Add a skill source".to_owned(),
+            "Add skill searches this source with the others.".to_owned(),
+            t.layout.dialog_width,
+            body,
+            actions,
+            None,
+        )
     }
 
     /// The page of one skill.

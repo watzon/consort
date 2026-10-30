@@ -1083,7 +1083,7 @@ mod tests {
             "Claude Personal"
         );
 
-        // "Use the Everything model" sends null.
+        // "Use the Tutti model" sends null.
         let cleared = channel_update(
             id,
             crate::command::ChannelChanges {

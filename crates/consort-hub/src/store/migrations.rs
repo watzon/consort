@@ -13,6 +13,7 @@ pub const MIGRATIONS: &[&str] = &[
     include_str!("schema_v3.sql"),
     include_str!("schema_v4.sql"),
     include_str!("schema_v5.sql"),
+    include_str!("schema_v6.sql"),
 ];
 
 pub fn current_version() -> i64 {
@@ -69,6 +70,145 @@ mod tests {
             )
             .unwrap();
         assert_eq!(hits, 1);
+    }
+
+    /// Opens a database at schema version 5, the last one before Tutti, so a
+    /// test can fill it with rows from the old hub.
+    fn database_at_version_5() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        for sql in &MIGRATIONS[..5] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.execute_batch("PRAGMA user_version = 5").unwrap();
+        conn
+    }
+
+    /// The JSON of a main channel as the old hub stored it.
+    fn old_main_channel_json() -> String {
+        use consort_proto::ids::ChannelId;
+        use consort_proto::model::{ApprovalMode, Channel, ChannelKind, Isolation};
+        use consort_proto::time::Timestamp;
+        let now = Timestamp::now();
+        let channel = Channel {
+            id: ChannelId::new(),
+            kind: ChannelKind::Tutti,
+            name: "Tutti".to_owned(),
+            icon: None,
+            color: None,
+            group_id: None,
+            position: 0,
+            purpose: String::new(),
+            instructions: String::new(),
+            coordinator_selection: None,
+            task_selection: None,
+            preferred_workers: Vec::new(),
+            repo_ids: Vec::new(),
+            default_isolation: Isolation::Worktree,
+            default_approval_mode: ApprovalMode::Ask,
+            allowed_local_mcp_servers: Vec::new(),
+            memory_enabled: true,
+            tags: Vec::new(),
+            disabled_connections: Vec::new(),
+            disabled_skills: Vec::new(),
+            archived_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let json = serde_json::to_string(&channel).unwrap();
+        let old = json
+            .replace("\"kind\":\"tutti\"", "\"kind\":\"everything\"")
+            .replace("\"name\":\"Tutti\"", "\"name\":\"Everything\"");
+        assert!(old.contains("\"kind\":\"everything\""), "{old}");
+        old
+    }
+
+    #[test]
+    fn version_6_rewrites_everything_rows_to_tutti_and_they_read_as_tutti() {
+        use consort_proto::model::{Channel, ChannelKind};
+        use consort_proto::turn_input::WakeEvent;
+
+        let mut conn = database_at_version_5();
+        let channel_json = old_main_channel_json();
+        let channel: serde_json::Value = serde_json::from_str(&channel_json).unwrap();
+        let id = channel["id"].as_str().unwrap().to_owned();
+        conn.execute(
+            "INSERT INTO channels (id, kind, position, data) VALUES (?1, 'everything', 0, ?2)",
+            rusqlite::params![id, channel_json],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO feed (at, channel_id, entity, entity_id, op, payload)
+             VALUES (1, NULL, 'channel', ?1, 'upsert', ?2)",
+            rusqlite::params![id, channel_json],
+        )
+        .unwrap();
+        let old_event = r#"{"type":"everything_message","id":"msg_00000000-0000-0000-0000-000000000001","at":"2026-10-28T21:49:00Z","text":"Check \"type\":\"everything_message\" now."}"#;
+        conn.execute(
+            "INSERT INTO wake_events (channel_id, event, created_at) VALUES (?1, ?2, 1)",
+            rusqlite::params![id, old_event],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO coordinators (channel_id, turn_open, turn_events) VALUES (?1, 1, ?2)",
+            rusqlite::params![id, format!("[{old_event}]")],
+        )
+        .unwrap();
+
+        migrate(&mut conn).unwrap();
+
+        let (kind, data): (String, String) = conn
+            .query_row("SELECT kind, data FROM channels", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(kind, "tutti");
+        let channel: Channel = serde_json::from_str(&data).unwrap();
+        assert_eq!(channel.kind, ChannelKind::Tutti);
+        assert_eq!(channel.name, "Tutti");
+        assert!(!data.contains("everything") && !data.contains("Everything"));
+        let read = crate::store::conversation::tutti_channel(&conn).unwrap();
+        assert_eq!(read.kind, ChannelKind::Tutti);
+
+        let payload: String = conn
+            .query_row("SELECT payload FROM feed", [], |r| r.get(0))
+            .unwrap();
+        let from_feed: Channel = serde_json::from_str(&payload).unwrap();
+        assert_eq!(
+            (from_feed.kind, from_feed.name.as_str()),
+            (ChannelKind::Tutti, "Tutti")
+        );
+        assert!(!payload.contains("everything"));
+
+        let event: String = conn
+            .query_row("SELECT event FROM wake_events", [], |r| r.get(0))
+            .unwrap();
+        assert!(event.contains("\"type\":\"tutti_message\""), "{event}");
+        assert!(matches!(
+            serde_json::from_str::<WakeEvent>(&event).unwrap(),
+            WakeEvent::TuttiMessage { .. }
+        ));
+        let turn: String = conn
+            .query_row("SELECT turn_events FROM coordinators", [], |r| r.get(0))
+            .unwrap();
+        let events: Vec<WakeEvent> = serde_json::from_str(&turn).unwrap();
+        match &events[0] {
+            WakeEvent::TuttiMessage { text, .. } => {
+                // Text that looks like an old event stays as the user wrote it.
+                assert_eq!(text, "Check \"type\":\"everything_message\" now.");
+            }
+            other => panic!("not a Tutti message: {other:?}"),
+        }
+
+        // The unique index now guards `tutti`. A second main channel fails.
+        let second = conn.execute(
+            "INSERT INTO channels (id, kind, position, data) VALUES ('chn_x', 'tutti', 1, '{}')",
+            [],
+        );
+        assert!(second.is_err());
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 6);
     }
 
     #[test]

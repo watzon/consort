@@ -31,13 +31,14 @@ use gpui_kit::{
 actions!(consort, [Quit]);
 
 /// Command line options. `--screen` opens one of the designed screens, for
-/// screenshots and reviews: everything, sayso, tasks, thread, settings,
+/// screenshots and reviews: tutti, sayso, tasks, thread, settings,
 /// workers, add-account, add-account-name, sign-in, channel-tags,
 /// new-channel, add-worker, worker-added, review, failed, error, new-folder,
 /// onboarding, connectors, add-connector, connect, connectors-in-channel,
 /// channel-connectors, skills, add-skill, add-skill-unsupported,
-/// account-settings, hub-cards, everything-manages, tutti, instructions, mark-idle,
-/// mark-working, mark-needs-you, mark-done. `--light` and `--dark` set
+/// account-settings, hub-cards, tutti-manages, instructions, mark-idle,
+/// mark-working, mark-needs-you, mark-done. The old names `everything` and
+/// `everything-manages` still work. `--light` and `--dark` set
 /// the mode, and `--theme <name>` the theme.
 #[derive(Clone, Debug, Default)]
 pub struct Args {
@@ -47,13 +48,23 @@ pub struct Args {
     pub theme: Option<String>,
 }
 
+/// The current name of a screen. The main channel was called Everything, so
+/// `everything` and `everything-manages` still open Tutti's screens.
+fn canonical_screen(name: &str) -> String {
+    match name {
+        "everything" => "tutti".to_owned(),
+        "everything-manages" => "tutti-manages".to_owned(),
+        other => other.to_owned(),
+    }
+}
+
 fn parse_args() -> Args {
     let mut args = Args::default();
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--mock" => args.mock = true,
-            "--screen" => args.screen = it.next(),
+            "--screen" => args.screen = it.next().map(|name| canonical_screen(&name)),
             "--theme" => args.theme = it.next(),
             "--light" => args.appearance = Some(consort_theme::Appearance::Light),
             "--dark" => args.appearance = Some(consort_theme::Appearance::Dark),
@@ -79,7 +90,7 @@ fn main() {
         Client::mock_with(consort_client::mock::view_state_with_requests())
     } else if mock && args.screen.as_deref() == Some("worker-added") {
         Client::mock_with(consort_client::mock::view_state_with_long_detail())
-    } else if mock && args.screen.as_deref() == Some("everything-manages") {
+    } else if mock && args.screen.as_deref() == Some("tutti-manages") {
         Client::mock_with(consort_client::mock::view_state_with_connect_card())
     } else if mock && args.screen.as_deref() == Some("add-skill-unsupported") {
         // The hub answers `unsupported` for the skill directories (step 3).
@@ -179,4 +190,17 @@ fn main() {
                 cx.quit();
             }
         });
+}
+
+#[cfg(test)]
+mod screen_name_tests {
+    use super::canonical_screen;
+
+    #[test]
+    fn the_old_screen_names_open_the_tutti_screens() {
+        assert_eq!(canonical_screen("everything"), "tutti");
+        assert_eq!(canonical_screen("everything-manages"), "tutti-manages");
+        assert_eq!(canonical_screen("tutti"), "tutti");
+        assert_eq!(canonical_screen("skills"), "skills");
+    }
 }

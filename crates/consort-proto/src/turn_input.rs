@@ -2,7 +2,7 @@
 //!
 //! The hub wakes a coordinator when one of these happens in its channel: a
 //! user message, a task status change to `review`, `needs_input` or
-//! `failed`, a decision answer, a routine run, a message from Everything, a
+//! `failed`, a decision answer, a routine run, a message from Tutti, a
 //! memory suggestion, or the answer to a hub card that the coordinator
 //! posted. Events that arrive during a turn go into the next
 //! turn. [`render_events`] writes them as the turn text:
@@ -28,7 +28,7 @@ use crate::status::TaskStatus;
 use crate::time::Timestamp;
 
 /// Where a memory suggestion comes from: a task (to its channel coordinator)
-/// or a channel coordinator (to the Everything coordinator). Serialized as
+/// or a channel coordinator (to the Tutti coordinator). Serialized as
 /// the task ID or the channel ID.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SuggestionSource {
@@ -120,9 +120,11 @@ pub enum WakeEvent {
         /// The note.
         note: String,
     },
-    /// The Everything coordinator posted in this channel with
-    /// `message_channel`.
-    EverythingMessage {
+    /// The Tutti coordinator posted in this channel with
+    /// `message_channel`. Stored events from before the rename say
+    /// `everything_message`.
+    #[serde(alias = "everything_message")]
+    TuttiMessage {
         /// The message.
         id: MessageId,
         /// When it was posted.
@@ -224,7 +226,7 @@ impl WakeEvent {
             Self::DecisionAnswered { .. } => "decision_answered",
             Self::Routine { .. } => "routine",
             Self::MemorySuggestion { .. } => "memory_suggestion",
-            Self::EverythingMessage { .. } => "everything_message",
+            Self::TuttiMessage { .. } => "tutti_message",
             Self::CardAnswered { .. } => "card_answered",
         }
     }
@@ -290,7 +292,7 @@ impl WakeEvent {
                 ],
                 Some(note),
             ),
-            Self::EverythingMessage { id, at, text } => element(
+            Self::TuttiMessage { id, at, text } => element(
                 out,
                 name,
                 &[("id", Some(id.to_string())), ("at", Some(at.to_rfc3339()))],
@@ -370,7 +372,7 @@ mod tests {
                 reason: "The user said this twice in the thread".into(),
                 note: "Never push to main in sayso. Open a PR.".into(),
             },
-            WakeEvent::EverythingMessage {
+            WakeEvent::TuttiMessage {
                 id: msg,
                 at: ts(),
                 text: "Check the release notes.".into(),
@@ -387,10 +389,25 @@ mod tests {
   <decision_answered id=\"dec_00000000-0000-0000-0000-000000000004\" option=\"Not now\"/>
   <routine id=\"rtn_00000000-0000-0000-0000-000000000005\" name=\"Morning brief\">Summarize my calendar and open tasks.</routine>
   <memory_suggestion from=\"tsk_00000000-0000-0000-0000-000000000003\" reason=\"The user said this twice in the thread\">Never push to main in sayso. Open a PR.</memory_suggestion>
-  <everything_message id=\"msg_00000000-0000-0000-0000-000000000001\" at=\"2026-10-28T21:49:00Z\">Check the release notes.</everything_message>
+  <tutti_message id=\"msg_00000000-0000-0000-0000-000000000001\" at=\"2026-10-28T21:49:00Z\">Check the release notes.</tutti_message>
   <memory_suggestion from=\"chn_00000000-0000-0000-0000-000000000006\" reason=\"A fact about the user\">Chris uses Windows for tests.</memory_suggestion>
 </events>";
         assert_eq!(render_events(&events), expected);
+    }
+
+    /// A wake event that the hub stored before the rename says
+    /// `everything_message`. It must still read, and it must write the new
+    /// name.
+    #[test]
+    fn a_stored_everything_message_reads_as_a_tutti_message() {
+        let old = r#"{"type":"everything_message","id":"msg_00000000-0000-0000-0000-000000000001","at":"2026-10-28T21:49:00Z","text":"Check the release notes."}"#;
+        let event: WakeEvent = serde_json::from_str(old).unwrap();
+        assert!(matches!(event, WakeEvent::TuttiMessage { .. }));
+        assert_eq!(event.element_name(), "tutti_message");
+        let written = serde_json::to_value(&event).unwrap();
+        assert_eq!(written["type"], "tutti_message");
+        let again: WakeEvent = serde_json::from_value(written).unwrap();
+        assert_eq!(again, event);
     }
 
     #[test]

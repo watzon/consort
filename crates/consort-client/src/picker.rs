@@ -505,19 +505,19 @@ pub fn with_effort(selection: &SelectionView, value: Option<&str>) -> SelectionV
     out
 }
 
-/// The channel's own coordinator selection, else Everything's.
+/// The channel's own coordinator selection, else Tutti's.
 pub fn effective_selection(
     own: Option<SelectionView>,
-    everything: Option<SelectionView>,
+    tutti: Option<SelectionView>,
 ) -> Option<EffectiveSelection> {
-    match (own, everything) {
+    match (own, tutti) {
         (Some(selection), _) => Some(EffectiveSelection {
             selection,
             source: SelectionSource::Channel,
         }),
         (None, Some(selection)) => Some(EffectiveSelection {
             selection,
-            source: SelectionSource::Everything,
+            source: SelectionSource::Tutti,
         }),
         (None, None) => None,
     }
@@ -783,7 +783,7 @@ mod tests {
         let inherited = effective_selection(None, Some(sel("all"))).unwrap();
         assert_eq!(
             (inherited.selection.model_id.as_str(), inherited.source),
-            ("all", SelectionSource::Everything)
+            ("all", SelectionSource::Tutti)
         );
         assert_eq!(effective_selection(None, None), None);
     }

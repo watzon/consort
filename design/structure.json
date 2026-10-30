@@ -43,7 +43,8 @@
     "switcher_name_max": 240,
     "error_text_max_height": 240,
     "bubble_max_width": 560,
-    "fade_top": 96,
+    "fade_top_solid": 92,
+    "fade_top_blend": 24,
     "fade_bottom": 32
   },
   "opacity": { "answered_dim": 0.6, "busy": 0.7, "danger_hover": 0.9 },

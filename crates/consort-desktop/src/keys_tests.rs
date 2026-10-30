@@ -113,7 +113,7 @@ fn escape_in_the_tag_field_closes_only_the_field(cx: &mut TestAppContext) {
     app.read_with(cx, |app, _| assert_eq!(app.page, Page::Main));
 }
 
-/// The app on mock content in Everything, with the model picker of the
+/// The app on mock content in Tutti, with the model picker of the
 /// composer open.
 fn app_with_the_picker(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<ConsortApp>) {
     let (handle, app) = app_with_a_dialog(cx);
@@ -162,7 +162,7 @@ fn assistant_model(
 }
 
 /// The picker opens, the search filters it, the keyboard chooses, and the
-/// choice goes to the hub as `channel.update` for Everything. The effort
+/// choice goes to the hub as `channel.update` for Tutti. The effort
 /// stays, because the new model offers it. A channel without its own model
 /// follows, and a channel with its own keeps it.
 #[gpui::test]
@@ -207,7 +207,7 @@ fn the_picker_filters_chooses_and_updates_the_channel(cx: &mut TestAppContext) {
         (
             "claude-sonnet-5-5".into(),
             Some("high".into()),
-            SelectionSource::Everything
+            SelectionSource::Tutti
         )
     );
     // sayso has its own model, Sonnet 5.5 of Claude Work, and keeps it.

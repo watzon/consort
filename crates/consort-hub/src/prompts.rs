@@ -75,7 +75,7 @@ fn channel_section(channel: &Channel, global: &str, own: &str) -> String {
     } else {
         out.push_str(global);
     }
-    if !channel.is_everything() {
+    if !channel.is_tutti() {
         let _ = writeln!(out, "\nChannel memory (scope `{}`):", channel.id);
         if own.is_empty() {
             let _ = writeln!(out, "- no notes yet");
@@ -203,6 +203,41 @@ mod tests {
             version: 1,
             updated_by: MemoryAuthor::User,
             updated_at: Timestamp::EPOCH,
+        }
+    }
+
+    /// The main channel is called Tutti. No text that a model sees may use
+    /// the old name, and Tutti's own prompt explains the name once.
+    #[test]
+    fn the_prompts_and_the_tool_texts_name_tutti_and_never_everything() {
+        use consort_proto::tools::{ToolAudience, tools_for};
+
+        let mut tutti = channel();
+        tutti.kind = ChannelKind::Tutti;
+        tutti.name = "Tutti".into();
+        let prompt = coordinator_system_prompt(&tutti, "", "");
+        assert_eq!(
+            prompt.matches("Tutti is the main channel").count(),
+            1,
+            "{prompt}"
+        );
+        assert!(prompt.contains("The user talks to you there about everything"));
+        assert!(prompt.contains("you are the Tutti coordinator"));
+        assert!(prompt.contains("`tutti_message`"));
+
+        let mut texts = vec![
+            prompt,
+            coordinator_system_prompt(&channel(), "", ""),
+            TASK_BASE.to_owned(),
+        ];
+        for audience in ToolAudience::ALL {
+            for tool in tools_for(audience) {
+                texts.push(serde_json::to_string(&tool).unwrap());
+            }
+        }
+        for text in texts {
+            assert!(!text.contains("Everything"), "{text}");
+            assert!(!text.contains("everything_message"), "{text}");
         }
     }
 

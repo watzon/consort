@@ -16,8 +16,8 @@ use crate::time::Timestamp;
 /// Serialized as `"global"` or a channel ID.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum MemoryScope {
-    /// The memory about the user. Every channel reads it. Only the Everything
-    /// coordinator and the user write it. It is the Everything channel's
+    /// The memory about the user. Every channel reads it. Only the Tutti
+    /// coordinator and the user write it. It is the Tutti channel's
     /// memory.
     Global,
     /// The memory of one channel.
@@ -237,13 +237,13 @@ impl JsonSchema for ExpectedHash {
 pub enum MemoryActor {
     /// The user, from a client. Reads and writes every scope.
     User,
-    /// The Everything coordinator. Reads every scope. Writes `global` only.
-    EverythingCoordinator,
+    /// The Tutti coordinator. Reads every scope. Writes `global` only.
+    TuttiCoordinator,
     /// A channel coordinator. Reads `global` and its channel. Writes its
     /// channel.
     ChannelCoordinator(ChannelId),
     /// A task session. Reads `global` and the memory scope of its channel.
-    /// Writes nothing. For a task in Everything, that scope is `global`.
+    /// Writes nothing. For a task in Tutti, that scope is `global`.
     TaskSession(MemoryScope),
 }
 
@@ -251,7 +251,7 @@ impl MemoryActor {
     /// Whether this actor may read notes in `scope`.
     pub fn can_read(&self, scope: MemoryScope) -> bool {
         match self {
-            Self::User | Self::EverythingCoordinator => true,
+            Self::User | Self::TuttiCoordinator => true,
             Self::ChannelCoordinator(own) => {
                 scope == MemoryScope::Global || scope == MemoryScope::Channel(*own)
             }
@@ -263,7 +263,7 @@ impl MemoryActor {
     pub fn can_write(&self, scope: MemoryScope) -> bool {
         match self {
             Self::User => true,
-            Self::EverythingCoordinator => scope == MemoryScope::Global,
+            Self::TuttiCoordinator => scope == MemoryScope::Global,
             Self::ChannelCoordinator(own) => scope == MemoryScope::Channel(*own),
             Self::TaskSession(_) => false,
         }
@@ -275,7 +275,7 @@ impl MemoryActor {
     pub fn own_scope(&self) -> Option<MemoryScope> {
         match self {
             Self::User => None,
-            Self::EverythingCoordinator => Some(MemoryScope::Global),
+            Self::TuttiCoordinator => Some(MemoryScope::Global),
             Self::ChannelCoordinator(own) => Some(MemoryScope::Channel(*own)),
             Self::TaskSession(own) => Some(*own),
         }
@@ -427,10 +427,10 @@ mod tests {
         let user = MemoryActor::User;
         assert!(user.can_read(theirs) && user.can_write(theirs) && user.can_write(g));
 
-        let everything = MemoryActor::EverythingCoordinator;
-        assert!(everything.can_read(g) && everything.can_read(theirs));
-        assert!(everything.can_write(g));
-        assert!(!everything.can_write(theirs));
+        let tutti = MemoryActor::TuttiCoordinator;
+        assert!(tutti.can_read(g) && tutti.can_read(theirs));
+        assert!(tutti.can_write(g));
+        assert!(!tutti.can_write(theirs));
 
         let coordinator = MemoryActor::ChannelCoordinator(own);
         assert!(coordinator.can_read(g) && coordinator.can_read(mine));
@@ -444,7 +444,7 @@ mod tests {
         assert!(!task.can_read(theirs));
         assert!(!task.can_write(mine) && !task.can_write(g));
 
-        assert_eq!(everything.own_scope(), Some(g));
+        assert_eq!(tutti.own_scope(), Some(g));
         assert_eq!(coordinator.own_scope(), Some(mine));
         assert_eq!(user.own_scope(), None);
     }

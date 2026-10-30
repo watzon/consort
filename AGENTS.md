@@ -50,12 +50,13 @@ These come from the user's experience with GPUI. Follow them in every view.
    - A code or command block: Copy code.
    - A task card or task row: Open thread, Resolve (Ready for review only) or Not done (resolved only), Retry (failed only), Stop (working only), Archive (failed or resolved only), Copy task ID.
    - A channel row: Rename, Instructions, Model, Worker tags, Connectors and skills, Change icon, Move to group, Archive, Delete.
-   - A connection row (Settings > Connectors): Reconnect, Copy handle, Disconnect.
+   - A connection row (Settings > Connectors): Reconnect, Activity, Copy handle, Disconnect.
    - A skill row (Settings > Skills): Turn off (Turn on when it is off), View files, Remove.
+   - A skill source row (Settings > Skills): Remove. Only a source that the user added has it.
    - An account row (Settings > Workers): Account settings, Rename, Sign out, Remove.
    - A worker row: Rename, Edit tags, Pause, Remove.
    - The composer: Cut, Copy, Paste, Select all.
-3. **The chat never has a hard edge.** The top and bottom of the timeline fade into the canvas, so text never stops at a sharp line. GPUI has no blur filter for elements, so use layered gradients from the canvas color to transparent (`layout.fade_top`, 96 px, at the top under the Three voices mark, and `layout.fade_bottom`, 32 px, above the composer).
+3. **The chat never has a hard edge.** The top and bottom of the timeline fade into the canvas, so text never stops at a sharp line. GPUI has no blur filter for elements, so use layered gradients from the canvas color to transparent (at the top, a solid part `layout.fade_top_solid`, 92 px, that ends just below the Three voices mark and the activity pill, then a blend `layout.fade_top_blend`, 24 px; and `layout.fade_bottom`, 32 px, above the composer).
 4. **Dropdowns flip.** Any menu, popover or select that can run past the window edge opens downward when there is room and upward when there is not. Use GPUI's anchored positioning with anchor switching, not a fixed offset.
 5. **Colors and sizes come from tokens.** Read colors from the active `consort-theme` theme, and sizes from `design/structure.json` through `consort-theme`. No hex values or ad hoc pixel sizes in view code.
 6. **Copy follows the design system.** Sentence case, verbs on buttons, no all-caps labels, no middle dots between details, no arrows in button text. Errors say what happened and what to do next.

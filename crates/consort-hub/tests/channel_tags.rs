@@ -294,7 +294,7 @@ async fn the_coordinator_of_a_tagged_channel_runs_on_the_tagged_worker() {
 #[tokio::test]
 async fn a_replacement_coordinator_respects_the_tags_after_a_sign_out() {
     let mut world = World::start().await;
-    // Everything is the channel that the World helpers use. Give it a tag
+    // Tutti is the channel that the World helpers use. Give it a tag
     // and put the tag on the first worker only.
     let first = world.worker.worker_id;
     set_tags(&mut world, first, &["work"]).await;
@@ -302,7 +302,7 @@ async fn a_replacement_coordinator_respects_the_tags_after_a_sign_out() {
         .client
         .request(ChannelUpdate {
             tags: Some(tags(&["work"])),
-            ..channel_update(world.everything)
+            ..channel_update(world.tutti)
         })
         .await
         .unwrap();
@@ -349,7 +349,7 @@ async fn a_replacement_coordinator_respects_the_tags_after_a_sign_out() {
     world
         .wait_notice(None, &["assistant_signed_out", "cannot answer"])
         .await;
-    world.say(world.everything, "are you there?").await;
+    world.say(world.tutti, "are you there?").await;
     assert_silent(&mut other, "the untagged worker").await;
     assert_silent(&mut world.worker, "the signed-out worker").await;
     world.hub.handle.shutdown().await.unwrap();
@@ -379,7 +379,7 @@ async fn a_new_channel_tag_moves_the_coordinator_off_a_worker_without_it() {
         .client
         .request(ChannelUpdate {
             tags: Some(tags(&["work"])),
-            ..channel_update(world.everything)
+            ..channel_update(world.tutti)
         })
         .await
         .unwrap();
@@ -409,7 +409,7 @@ async fn a_new_channel_tag_moves_the_coordinator_off_a_worker_without_it() {
     assert_ne!(task_start.session_id, coordinator);
 
     // The next message starts a coordinator on the worker with the tag.
-    world.say(world.everything, "hello again").await;
+    world.say(world.tutti, "hello again").await;
     let start = other.accept_session_start().await;
     assert_eq!(start.role, SessionRole::Coordinator);
     assert!(start.turn.unwrap().text.contains("hello again"));
@@ -426,7 +426,7 @@ async fn a_new_channel_tag_that_the_coordinator_worker_has_changes_nothing() {
         .client
         .request(ChannelUpdate {
             tags: Some(tags(&["work"])),
-            ..channel_update(world.everything)
+            ..channel_update(world.tutti)
         })
         .await
         .unwrap();

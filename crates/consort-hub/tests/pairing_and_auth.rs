@@ -299,7 +299,7 @@ async fn a_revoked_client_cannot_connect_and_is_dropped() {
 
     // The snapshot still works for the first client.
     let snapshot = first.snapshot(SnapshotScope::All).await;
-    assert!(snapshot.channels.iter().any(|c| c.is_everything()));
+    assert!(snapshot.channels.iter().any(|c| c.is_tutti()));
     let _ = PairingCode::from_random_bytes([0; 8]);
     hub.handle.shutdown().await.unwrap();
 }

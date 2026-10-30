@@ -35,12 +35,12 @@ pub const CATALOG_REFRESH_MS: i64 = 24 * 60 * 60 * 1_000;
 /// Where a connection or a skill can be used. Serialized with a `kind`
 /// field.
 ///
-/// The Everything channel matches only [`UseIn::EveryChannel`], unless it
+/// The Tutti channel matches only [`UseIn::EveryChannel`], unless it
 /// has tags of its own.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum UseIn {
-    /// Every channel, Everything too.
+    /// Every channel, Tutti too.
     #[default]
     EveryChannel,
     /// The channels that have every one of these tags.
@@ -57,16 +57,11 @@ pub enum UseIn {
 
 impl UseIn {
     /// Whether a channel with these properties is in the scope.
-    pub fn matches(
-        &self,
-        channel_id: ChannelId,
-        is_everything: bool,
-        channel_tags: &[String],
-    ) -> bool {
+    pub fn matches(&self, channel_id: ChannelId, is_tutti: bool, channel_tags: &[String]) -> bool {
         match self {
             Self::EveryChannel => true,
             Self::Tags { tags } => {
-                if is_everything && channel_tags.is_empty() {
+                if is_tutti && channel_tags.is_empty() {
                     return false;
                 }
                 !tags.is_empty() && tags.iter().all(|t| channel_tags.contains(t))
@@ -77,7 +72,7 @@ impl UseIn {
 
     /// Whether `channel` is in the scope.
     pub fn matches_channel(&self, channel: &Channel) -> bool {
-        self.matches(channel.id, channel.is_everything(), &channel.tags)
+        self.matches(channel.id, channel.is_tutti(), &channel.tags)
     }
 
     /// Trims and checks the tags, drops repeats and repeated channels, and
@@ -789,13 +784,13 @@ mod tests {
         );
         let work = channel(ChannelKind::Standard, &["work", "mail", "x"]);
         let other = channel(ChannelKind::Standard, &["work"]);
-        let everything = channel(ChannelKind::Everything, &[]);
-        let tagged_everything = channel(ChannelKind::Everything, &["work", "mail"]);
+        let tutti = channel(ChannelKind::Tutti, &[]);
+        let tagged_tutti = channel(ChannelKind::Tutti, &["work", "mail"]);
         assert!(tags.matches_channel(&work));
         assert!(!tags.matches_channel(&other));
-        assert!(!tags.matches_channel(&everything));
-        assert!(tags.matches_channel(&tagged_everything));
-        assert!(UseIn::EveryChannel.matches_channel(&everything));
+        assert!(!tags.matches_channel(&tutti));
+        assert!(tags.matches_channel(&tagged_tutti));
+        assert!(UseIn::EveryChannel.matches_channel(&tutti));
         let only = UseIn::Channels {
             channel_ids: vec![other.id],
         };
@@ -840,8 +835,8 @@ mod tests {
 
         let work = channel(ChannelKind::Standard, &["work"]);
         let home = channel(ChannelKind::Standard, &["home"]);
-        let everything = channel(ChannelKind::Everything, &[]);
-        let channels = vec![work.clone(), home.clone(), everything];
+        let tutti = channel(ChannelKind::Tutti, &[]);
+        let channels = vec![work.clone(), home.clone(), tutti];
         let added = UseIn::EveryChannel.added_channels(&use_in, &channels);
         assert_eq!(added.len(), 2);
         assert!(
