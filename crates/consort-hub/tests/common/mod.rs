@@ -671,6 +671,62 @@ impl AwayWorker {
     }
 }
 
+const FREEZE_LIMIT: Duration = Duration::from_secs(30);
+
+/// Freezes the paused tokio clock, so only `advance` moves it.
+///
+/// With `start_paused`, tokio jumps the clock to the next timer whenever the
+/// runtime is idle. The runtime is also idle while it waits for a real
+/// socket or a store write. So on a slow machine the clock can jump past a
+/// timer (for example the 10 s wait of `wait_feed`) before the real work
+/// ends. This guard keeps one task ready, so the runtime is never idle and
+/// the clock moves only when a test calls `advance`.
+///
+/// After `FREEZE_LIMIT` of real time the guard lets go, so a hung test does
+/// not hang. `assert_held` then fails the test.
+pub struct FrozenClock {
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl FrozenClock {
+    pub fn freeze() -> Self {
+        let task = tokio::spawn(async {
+            let started = std::time::Instant::now();
+            while started.elapsed() < FREEZE_LIMIT {
+                tokio::task::yield_now().await;
+            }
+        });
+        Self { task }
+    }
+
+    /// Moves the clock forward and gives the real I/O of the hub time to
+    /// finish what the timers started. Needs a clock that `freeze` holds.
+    pub async fn advance(&self, by: Duration) {
+        self.assert_held();
+        tokio::time::advance(by).await;
+        // The hub's timer reactions use sockets and a store thread. They run
+        // in real time, so wait in real time for them.
+        tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_millis(250)))
+            .await
+            .unwrap();
+    }
+
+    /// Fails the test when the guard let go, because then the clock may have
+    /// moved on its own.
+    pub fn assert_held(&self) {
+        assert!(
+            !self.task.is_finished(),
+            "the clock was not frozen for the whole test"
+        );
+    }
+}
+
+impl Drop for FrozenClock {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 /// Polls until `check` returns Some.
 pub async fn eventually<T, F, Fut>(mut check: F) -> T
 where
