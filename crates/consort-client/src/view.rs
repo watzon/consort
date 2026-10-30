@@ -75,6 +75,9 @@ pub struct ViewState {
     pub channel_files: Vec<crate::files::ChannelFileView>,
     /// The channels whose files are loaded.
     pub files_loaded: Vec<String>,
+    /// Settings > Hub, Settings > Clients, the pairing dialog, and what
+    /// needs the user for notifications. See [`crate::admin`].
+    pub admin: crate::admin::AdminView,
 }
 
 /// A message that the hub refused after it left the composer.

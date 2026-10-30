@@ -294,6 +294,37 @@ impl Store {
     }
 }
 
+impl Store {
+    fn notifications_path(&self) -> PathBuf {
+        self.dir.join("notifications.json")
+    }
+
+    /// The notification settings of this client. A missing or damaged file
+    /// reads as the defaults.
+    pub fn load_notification_settings(&self) -> crate::notify::NotificationSettings {
+        let path = self.notifications_path();
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return crate::notify::NotificationSettings::default();
+        };
+        serde_json::from_str(&text).unwrap_or_else(|err| {
+            tracing::warn!(path = %path.display(), error = %err, "the notification settings file is damaged, so the client uses the defaults");
+            crate::notify::NotificationSettings::default()
+        })
+    }
+
+    /// Saves the notification settings through a temporary file and a
+    /// rename.
+    pub fn save_notification_settings(
+        &self,
+        settings: &crate::notify::NotificationSettings,
+    ) -> Result<(), ClientError> {
+        let path = self.notifications_path();
+        std::fs::create_dir_all(&self.dir).map_err(|e| storage_error(&self.dir, e))?;
+        let text = serde_json::to_string_pretty(settings).map_err(|e| storage_error(&path, e))?;
+        write_private(&path, &text).map_err(|e| storage_error(&path, e))
+    }
+}
+
 /// Writes a file that only this user can read, through a temporary file in
 /// the same folder and a rename, so a reader sees the old file or the new
 /// one and never half of it.
@@ -371,6 +402,23 @@ mod tests {
             },
             key: SigningKey::from_bytes(&[7u8; 32]),
         }
+    }
+
+    #[test]
+    fn notification_settings_round_trip_and_a_damaged_file_gives_the_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+        let defaults = crate::notify::NotificationSettings::default();
+        assert_eq!(store.load_notification_settings(), defaults);
+        let changed = crate::notify::NotificationSettings {
+            show_text: true,
+            routines: true,
+            ..defaults
+        };
+        store.save_notification_settings(&changed).unwrap();
+        assert_eq!(store.load_notification_settings(), changed);
+        std::fs::write(dir.path().join("notifications.json"), "{ nope").unwrap();
+        assert_eq!(store.load_notification_settings(), defaults);
     }
 
     #[test]

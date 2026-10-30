@@ -100,7 +100,7 @@ Workers and clients pair the same way, and both prove their identity with an Ed2
 
 ### Pair a client
 
-The first client uses the setup code that the hub prints on its first start. To pair a later client, a paired client shows a QR code that holds the hub URL and a new pairing code. The new client then follows the worker steps with `POST /v1/pair/client`, with `code`, `public_key`, `name` and `kind` (`desktop`, `ios` or `android`). The hub returns the `client_id`.
+The first client uses the setup code that the hub prints on its first start. To pair a later client, a paired client shows a QR code that holds the hub URL and a new pairing code. The new client then follows the worker steps with `POST /v1/pair/client`, with `code`, `public_key`, `name`, `kind` (`desktop`, `ios` or `android`) and optional `os` (`macos`, `windows` or `linux`). The QR code holds `{"hub_url", "code"}`. The hub returns the `client_id`.
 
 ### Who made a code, and removing a client or a worker
 
@@ -557,8 +557,11 @@ A client that does not know these fields shows the preview, which ends with a no
 | Connections | `connection.connect` (with `service`, `name`, optional `use_in`, `approvals`, `auth_scheme`, `credentials`, `approval_id`; the result is a connect attempt: `connection`, `redirect_url` and `expires_at`), `connection.update` (with `connection_id`, optional `name`, `use_in`, `approvals`), `connection.disconnect`, `connection.reconnect` (with `connection_id`, optional `credentials`), `connection.calls` (with `connection_id`, optional `before`, `limit`; the result has `calls`, newest first, and `has_more`) |
 | Channel exceptions | `channel.set_connection_enabled` (with `channel_id`, `connection_id`, `enabled`), `channel.set_skill_enabled` (with `channel_id`, `skill_id`, `enabled`). The result has `channel` |
 | Skills | `skill_directory.search` (with optional `search`, `source`, `cursor`, `limit`; the result has `entries`, `next_cursor` and `unavailable`), `skill_directory.sources`, `skill_directory.add_source` (with `url`), `skill_directory.remove_source` (with `id`), `skill.preview` (with `source`), `skill.install` (with `source`, optional `use_in`, `enabled`, `approval_id`; the result has `skill`), `skill.update` (with `skill_id`, optional `enabled`, `use_in`, `accept_new_version`), `skill.remove`, `skill.files` (with `skill_id`, optional `version`: `installed` or `pending`), `skill.read_file` (with `skill_id`, `path`, optional `version`) |
-| Clients | `client.pairing_code`, `client.list`, `client.revoke`, `client.push_register` |
+| Clients | `client.pairing_code`, `client.list` (every client with `os` and `paired_by`, and `online`: the clients that are connected now), `client.revoke`, `client.push_register` |
+| Hub | `hub.status` (the result has `status`: `hub_url`, `hub_version`, `protocol_versions`, `data_dir`, `storage` and `backup`), `hub.backup` (starts a backup and answers at once with `progress`; `conflict` while one runs), `hub.backup_settings` (with optional `schedule`, `folder`, `keep`; a field that is left out does not change, so an empty body only reads; the result has `settings`) |
 | Auth | `auth.http_token` |
+
+`hub.status` reports `storage` in bytes: `database_bytes` (`hub.db` with its `-wal` and `-shm` files), `blobs_bytes` (blobs that no skill uses), `skills_bytes` (the blobs of stored skill versions) and `free_bytes` (the free space on the disk of the data folder, left out when the hub cannot read it). `backup` has `settings`, `last` (the last backup that finished or failed, with `file_name`, `path`, `size_bytes`, `trigger`, `started_at`, `finished_at` and `error` when it failed) and `running` (`trigger`, `started_at`, `bytes_done` and `bytes_total`) while a backup runs. A client asks `hub.status` again every second while `running` is set. `hub.backup_settings` refuses a time that is not `HH:MM`, a time zone that the hub does not know, a `keep` outside 1 to 100, a folder that is not an absolute path, and a folder that the hub cannot make or write to, with `invalid`. See [data-model.md](data-model.md#backups) for the archive.
 
 `message.send` with a `client_message_id` that the hub already stored returns the stored message. A client can retry a send without making a duplicate.
 

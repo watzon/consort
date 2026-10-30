@@ -16,6 +16,7 @@ use consort_proto::ids::{ClientId, WorkerId};
 use crate::error::Result;
 use crate::store::{self, machine};
 
+pub use crate::backup::{LOCK_FILE, RestoreError, RestoreReport, restore};
 pub use crate::store::machine::{ClientRecord, Origin, WorkerRecord};
 
 /// What a remove command did.

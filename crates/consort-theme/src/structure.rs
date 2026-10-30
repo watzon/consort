@@ -309,10 +309,58 @@ pub struct Components {
     /// The width of the focus ring that a control shows when the keyboard
     /// focuses it. The ring is `accent.text`.
     pub focus_ring: f32,
+    pub admin: Admin,
     pub files: Files,
     pub sidebar: Sidebar,
     pub chat: Chat,
     pub theme_preview: ThemePreview,
+}
+
+/// The sizes of Settings > Hub, Settings > Clients, the Pair a new app
+/// dialog and Settings > Notifications. From the phase 3 Paper artboards.
+#[derive(Clone, Copy, Debug, Deserialize)]
+pub struct Admin {
+    /// The height of the storage bar, and the legend swatches.
+    pub storage_bar: f32,
+    pub legend_swatch: f32,
+    pub swatch_radius: f32,
+    pub legend_gap: f32,
+    /// The status and the action columns of a client row.
+    pub status_col: f32,
+    pub action_col: f32,
+    /// The tile and the icon of a client row.
+    pub client_tile: f32,
+    pub client_icon: f32,
+    pub row_gap: f32,
+    /// The indent of the inline Revoke confirm, under the name.
+    pub confirm_indent: f32,
+    /// The setup code in the pairing dialog, and its panel padding.
+    pub code_text: TypeStyle,
+    pub code_pad_x: f32,
+    /// The QR code and its padding in its tile.
+    pub qr: f32,
+    pub qr_pad: f32,
+    /// The countdown bar of a pairing code.
+    pub countdown_bar: f32,
+    /// The time select of the backup schedule.
+    pub time_select: f32,
+    /// The copy buttons: in a row, and in the address field.
+    pub copy_button: f32,
+    pub copy_small: f32,
+    /// The Dock icon preview and its badge.
+    pub dock_tile: f32,
+    pub dock_mark: f32,
+    pub dock_badge: f32,
+    pub dock_badge_offset: f32,
+    pub dock_badge_text: TypeStyle,
+    /// The example banner.
+    pub banner_width: f32,
+    pub banner_tile: f32,
+    pub banner_tile_radius: f32,
+    pub banner_mark: f32,
+    pub banner_gap: f32,
+    pub banner_title: TypeStyle,
+    pub banner_text: TypeStyle,
 }
 
 /// The sizes of attachments and channel files: the chips of the composer,
@@ -604,6 +652,29 @@ mod tests {
 
     /// The phase 1 artboards: composer chips, attachments in bubbles, the
     /// light box and the rows of the Files tab.
+    #[test]
+    fn admin_tokens_keep_the_values_of_the_phase_3_designs() {
+        let a = super::structure().component.admin;
+        assert_eq!(
+            (a.storage_bar, a.legend_swatch, a.legend_gap),
+            (6.0, 8.0, 28.0)
+        );
+        assert_eq!(
+            (a.status_col, a.action_col, a.client_tile),
+            (150.0, 72.0, 32.0)
+        );
+        // The confirm text starts under the client name: the row padding,
+        // the tile and the gap.
+        let s = super::structure();
+        assert_eq!(s.space.lg + a.client_tile + a.row_gap, a.confirm_indent);
+        assert_eq!((a.code_text.size, a.code_text.line), (34.0, 42.0));
+        assert_eq!((a.qr, a.qr_pad), (148.0, 8.0));
+        assert_eq!(
+            (a.dock_tile, a.dock_badge, a.banner_width),
+            (40.0, 18.0, 360.0)
+        );
+    }
+
     #[test]
     fn file_tokens_keep_the_values_of_the_phase_1_designs() {
         let f = super::structure().component.files;

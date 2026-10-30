@@ -234,6 +234,9 @@ impl ConsortApp {
             SettingsSection::Workers => self.render_workers(t, window, cx),
             SettingsSection::Connectors => self.render_connectors(t, window, cx),
             SettingsSection::Skills => self.render_skills(t, window, cx),
+            SettingsSection::Hub => self.render_hub(t, window, cx),
+            SettingsSection::Clients => self.render_clients(t, window, cx),
+            SettingsSection::Notifications => self.render_notifications(t, window, cx),
             other => self.render_later(other, t),
         };
         div()
@@ -918,6 +921,9 @@ impl ConsortApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.pick_admin_select(select, option, cx) {
+            return;
+        }
         match resolve_pick(&self.state, &self.new_channel.workers, select, option) {
             Some(Pick::ApprovalMode(mode)) => self.show_notice(
                 format!("The approval mode is set on the worker. Set max_approval_mode to {} in worker.toml.", mode_key(mode)),

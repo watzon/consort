@@ -151,6 +151,8 @@ pub struct Cache {
     /// What the client asked the hub about connectors and skills. These are
     /// not feed entities, so a reload keeps them.
     pub extensions: Extensions,
+    /// The hub status and the paired clients. See [`crate::admin`].
+    pub admin: crate::admin::AdminCache,
 }
 
 /// The parts of the connector and skill views that the client loads on
@@ -198,9 +200,12 @@ impl Cache {
         let threads = std::mem::take(&mut self.loaded_threads);
         let dismissed = std::mem::take(&mut self.sign_ins_dismissed);
         let extensions = std::mem::take(&mut self.extensions);
+        // No snapshot holds clients or the hub status, so they stay.
+        let admin = std::mem::take(&mut self.admin);
         let local_blobs = std::mem::take(&mut self.local_blobs);
         *self = Cache::default();
         self.extensions = extensions;
+        self.admin = admin;
         // The local blob cache is on disk, so it stays.
         self.local_blobs = local_blobs;
         // A sign-in that the user closed stays closed after a reload.
@@ -828,7 +833,14 @@ impl Cache {
                     }
                     self.channel_files.insert(key, file);
                 }
-                // Memory notes, routines and clients have no view yet.
+                EntityPayload::Client(client) => {
+                    let id = client.id.to_string();
+                    if self.admin.clients.get(&id) == Some(&client) {
+                        return false;
+                    }
+                    self.admin.clients.insert(id, client);
+                }
+                // Memory notes and routines have no view yet.
                 _ => return false,
             },
             FeedChange::Delete(kind) => {
@@ -850,6 +862,7 @@ impl Cache {
                     EntityKind::Connection => self.connections.remove(id).is_some(),
                     EntityKind::Skill => self.skills.remove(id).is_some(),
                     EntityKind::ChannelFile => self.channel_files.remove(id).is_some(),
+                    EntityKind::Client => self.admin.clients.remove(id).is_some(),
                     EntityKind::SessionItem => id.split_once(':').is_some_and(|(session, item)| {
                         let Some(items) = self.session_items.get_mut(session) else {
                             return false;

@@ -52,8 +52,8 @@ pub use knowledge::{
 pub use machine::{
     AuthState, Capabilities, Checkout, CheckoutInfo, Client, ClientKind, ExtrasGroup,
     HarnessAccount, Inventory, LocalMcpServerInfo, ModelInfo, OptionChoice, OptionDescriptor,
-    PROVIDER_EXTRAS_NAMES_MAX, ProviderExtras, PushProvider, PushRegistration, Worker, WorkerLoad,
-    WorkerPolicy, WorkerState,
+    PROVIDER_EXTRAS_NAMES_MAX, PairedBy, ProviderExtras, PushProvider, PushRegistration, Worker,
+    WorkerLoad, WorkerPolicy, WorkerState,
 };
 pub use preferences::{
     FAVORITE_FIELD_MAX_CHARS, FAVORITE_MODELS_MAX, FavoriteModel, PREFERENCES_ENTITY_ID,

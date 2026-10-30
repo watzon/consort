@@ -177,6 +177,8 @@ pub enum Dialog {
     MoveFile(String, String),
     /// Pick files from the channel files, for a composer or a reply box.
     ChooseChannelFiles(consort_client::UploadTarget),
+    /// Pair a new app: a setup code, a QR code and the hub address.
+    PairClient,
 }
 
 /// The step of the Add account dialog.
@@ -409,6 +411,8 @@ pub struct ConsortApp {
     pub files_menu_for: Option<String>,
     /// The blobs that the app asked the client to download, so it asks once.
     pub fetching: std::collections::HashSet<String>,
+    /// Settings > Hub, Clients and Notifications, and the notifications.
+    pub admin: crate::admin::AdminState,
     pub focus: FocusHandle,
     styled_for: Option<(gpui_kit::SharedString, consort_theme::Mode)>,
     _subscriptions: Vec<Subscription>,
@@ -466,7 +470,8 @@ impl ConsortApp {
             model_search: field("Search every account", window, cx),
         };
         let ext_inputs = crate::extensions::ExtInputs::new(window, cx);
-        let mut subscriptions = Vec::new();
+        let (admin, admin_subscriptions) = crate::admin::AdminState::new(&client, demo, window, cx);
+        let mut subscriptions = admin_subscriptions;
         subscriptions.push(cx.subscribe_in(
             &inputs.composer,
             window,
@@ -698,12 +703,25 @@ impl ConsortApp {
             hold_drop: false,
             files_menu_for: None,
             fetching: std::collections::HashSet::new(),
+            admin,
             focus: cx.focus_handle(),
             styled_for: None,
             _subscriptions: subscriptions,
         };
         let ext_subscriptions = this.subscribe_ext_inputs(window, cx);
         this._subscriptions.extend(ext_subscriptions);
+        // A click on a notification opens its task thread or its channel.
+        let weak = cx.weak_entity();
+        let handle = window.window_handle();
+        cx.on_system_notification_response(move |response, cx| {
+            let weak = weak.clone();
+            let _ = handle.update(cx, |_, window, cx| {
+                let _ = weak.update(cx, |this, cx| {
+                    this.open_notification(&response.tag, window, cx)
+                });
+            });
+        });
+        this.check_permission(cx);
         this.sync_lists();
         this.update_placeholder(window, cx);
         this.sync_draft_inputs(window, cx);
@@ -842,6 +860,7 @@ impl ConsortApp {
         self.mark_read(cx);
         self.ext_stale = true;
         self.follow_extensions(None, cx);
+        self.follow_admin(cx);
         cx.notify();
     }
 
@@ -1594,7 +1613,9 @@ impl ConsortApp {
                     self.open_menu(OpenMenu::at(at, items), cx);
                 }
             }
-            _ => {}
+            other => {
+                self.open_admin_screen(other, window, cx);
+            }
         }
         cx.notify();
     }
@@ -1955,6 +1976,7 @@ impl ConsortApp {
         if section == SettingsSection::Skills {
             self.enter_skills(cx);
         }
+        self.enter_admin_section(section, cx);
         if self.settings_worker.is_none() {
             self.settings_worker = self
                 .state
@@ -2129,6 +2151,7 @@ impl ConsortApp {
                 self.move_to = consort_client::files::split_path(path).0.to_owned();
             }
             Dialog::ConfirmDeleteFile(..) | Dialog::ChooseChannelFiles(_) => {}
+            Dialog::PairClient => self.start_client_pairing(cx),
             Dialog::ConfirmDeleteChannel(_)
             | Dialog::ConfirmRemoveWorker(_)
             | Dialog::ConfirmRemoveAccount(..)
@@ -2220,6 +2243,9 @@ impl ConsortApp {
     pub fn close_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if matches!(self.dialog, Some(Dialog::AddAccount(_))) {
             self.end_add_account(cx);
+        }
+        if self.dialog == Some(Dialog::PairClient) {
+            self.end_client_pairing(cx);
         }
         if self.dialog == Some(Dialog::AddWorker) {
             let client = self.client.clone();
@@ -3082,6 +3108,7 @@ impl Render for ConsortApp {
         self.style_inputs(&t, cx);
         cx.global::<FrameClock>().begin_frame();
         self.follow_mark(cx);
+        self.apply_window_badge(window);
         self.dialog_confirm.replace(None);
         // A change of channel that came with a state (a deleted channel, a
         // channel that the hub just made) gives the composer its draft too.

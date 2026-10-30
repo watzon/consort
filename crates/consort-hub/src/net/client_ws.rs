@@ -176,6 +176,12 @@ async fn run_client(hub: Hub, mut socket: WebSocket, peer_ip: IpAddr) {
     cancel.cancel();
     hub.clients.unregister(connection);
     let _ = writer.await;
+    // The time of the last connection is when the client was last seen.
+    if !hub.shutdown.is_cancelled()
+        && let Err(err) = hub.touch_client(client_id).await
+    {
+        tracing::debug!(error = %err, "could not record that a client disconnected");
+    }
     tracing::debug!(client_id = %client_id, "a client disconnected");
 }
 

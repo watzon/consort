@@ -123,6 +123,7 @@ pub async fn pair_client_http(hub: &TestHub, code: &str, key: &SigningKey) -> (u
             public_key: public_key(key),
             name: "Test client".to_owned(),
             kind: ClientKind::Desktop,
+            os: Some(consort_proto::model::Os::Macos),
         },
     )
     .await

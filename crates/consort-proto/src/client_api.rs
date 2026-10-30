@@ -41,6 +41,7 @@ use crate::tools::{FilesListResult, MemoryListResult, RoutineResult, SearchResul
 use crate::worker_link::ItemDetailResult;
 
 mod connectors;
+mod hub_admin;
 mod skills;
 
 pub use connectors::{
@@ -51,6 +52,12 @@ pub use connectors::{
     ConnectionUpdate, ConnectorCatalogCategories, ConnectorCatalogCategoriesResult,
     ConnectorCatalogSearch, ConnectorCatalogSearchResult, ConnectorCatalogService,
     ConnectorServiceDetail,
+};
+pub use hub_admin::{
+    BACKUP_KEEP_DEFAULT, BACKUP_KEEP_MAX, BACKUP_KEEP_MIN, BACKUP_TIME_DEFAULT, BackupFrequency,
+    BackupInfo, BackupProgress, BackupRecord, BackupSchedule, BackupSettings, BackupTrigger,
+    HubBackup, HubBackupResult, HubBackupSettings, HubBackupSettingsResult, HubInfo, HubStatus,
+    HubStatusResult, HubStorage, Weekday, parse_time,
 };
 pub use skills::{
     SKILL_DIRECTORY_PAGE_MAX, SkillDirectoryAddSource, SkillDirectoryRemoveSource,
@@ -1529,8 +1536,13 @@ pub struct ClientList {}
 /// The response to `client.list`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientListResult {
-    /// The clients that are not revoked.
+    /// Every client, revoked ones included, in pairing order. A revoked
+    /// client has `revoked_at`.
     pub clients: Vec<Client>,
+    /// The clients that have a connection to the hub now. An older hub
+    /// leaves it out.
+    #[serde(default)]
+    pub online: Vec<ClientId>,
 }
 
 /// `client.revoke`.
@@ -1707,6 +1719,12 @@ message_family! {
         ClientRevoke("client.revoke", ClientRevoke => Empty),
         /// Set the push token.
         ClientPushRegister("client.push_register", ClientPushRegister => Empty),
+        /// The hub's address, versions, data folder, storage and backups.
+        HubStatus("hub.status", HubStatus => HubStatusResult),
+        /// Start a backup now.
+        HubBackup("hub.backup", HubBackup => HubBackupResult),
+        /// Read or change the backup settings.
+        HubBackupSettings("hub.backup_settings", HubBackupSettings => HubBackupSettingsResult),
         /// Star a model, or take the star away.
         PreferencesSetFavoriteModel("preferences.set_favorite_model", PreferencesSetFavoriteModel => PreferencesResult),
         /// Get a bearer token for the blob endpoints.
@@ -2376,6 +2394,19 @@ mod tests {
                 token: "t".into(),
             }
             .into(),
+            HubStatus {}.into(),
+            HubBackup {}.into(),
+            HubBackupSettings {
+                schedule: Some(BackupSchedule {
+                    frequency: BackupFrequency::Daily,
+                    time: "03:00".into(),
+                    weekday: Weekday::Sunday,
+                    time_zone: "America/Chicago".into(),
+                }),
+                folder: Some("/srv/backups/consort".into()),
+                keep: Some(7),
+            }
+            .into(),
             PreferencesSetFavoriteModel {
                 model: FavoriteModel {
                     account_label: "Claude Personal".into(),
@@ -2873,6 +2904,9 @@ mod tests {
             "client.list",
             "client.revoke",
             "client.push_register",
+            "hub.status",
+            "hub.backup",
+            "hub.backup_settings",
             "auth.http_token",
             "preferences.set_favorite_model",
             "composio.set_key",

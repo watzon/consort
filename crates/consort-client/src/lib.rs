@@ -8,6 +8,7 @@
 //! types are plain records and enums, so UniFFI can export them.
 
 pub mod activity;
+pub mod admin;
 pub mod blob;
 pub mod cache;
 pub mod chat;
@@ -21,10 +22,12 @@ pub mod format;
 pub mod hub;
 pub mod limits;
 pub mod mock;
+pub mod mock_admin;
 mod mock_backend;
 mod mock_backend_ext;
 pub mod mock_extensions;
 pub mod mock_files;
+pub mod notify;
 pub mod picker;
 pub mod reduce;
 pub mod skills;
@@ -438,6 +441,27 @@ impl Client {
     pub fn save_drafts(&self, drafts: &Drafts) -> Result<(), ClientError> {
         match &self.drafts {
             Some(store) => store.save_drafts(drafts),
+            None => Ok(()),
+        }
+    }
+
+    /// The notification settings of this app. They live on this computer,
+    /// not on the hub. The mock and tests get the defaults.
+    pub fn load_notification_settings(&self) -> notify::NotificationSettings {
+        self.drafts
+            .as_ref()
+            .map(|store| store.load_notification_settings())
+            .unwrap_or_default()
+    }
+
+    /// Saves the notification settings in the client's folder. Does nothing
+    /// when the client has no folder.
+    pub fn save_notification_settings(
+        &self,
+        settings: &notify::NotificationSettings,
+    ) -> Result<(), ClientError> {
+        match &self.drafts {
+            Some(store) => store.save_notification_settings(settings),
             None => Ok(()),
         }
     }

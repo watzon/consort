@@ -10,6 +10,7 @@ mod accounts;
 mod admin_revoke;
 mod assistant_limits;
 mod attachments;
+mod backup;
 mod channel_tags;
 mod channels_and_routines;
 mod connectors;

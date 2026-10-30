@@ -41,7 +41,12 @@ aes-gcm = { workspace = true }
 zip = { workspace = true }
 # The deflate backend of `zip` (its default `rust_backend`).
 flate2 = { workspace = true }
+# Backup archives.
+tar = { workspace = true }
 tempfile = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
 
 [dev-dependencies]
 tokio-tungstenite = { workspace = true }

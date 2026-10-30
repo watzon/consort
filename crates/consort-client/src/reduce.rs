@@ -834,6 +834,7 @@ fn channel_file_views(cache: &Cache, now: i64) -> Vec<crate::files::ChannelFileV
 }
 
 pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i64) -> ViewState {
+    let online = connection == Connection::Online;
     let artifacts = artifact_tasks(cache);
     let workers_by_id: BTreeMap<String, &model::Worker> =
         cache.workers.iter().map(|(k, v)| (k.clone(), v)).collect();
@@ -1605,6 +1606,7 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
         uploads: Vec::new(),
         channel_files: channel_file_views(cache, now),
         files_loaded: cache.files_loaded.iter().cloned().collect(),
+        admin: crate::admin::admin_view(cache, online, now),
     };
     state.activity = channel_activities(cache, &state);
     // Collapsed groups and unread counts come from the hub, so seed the

@@ -15,6 +15,7 @@ directories.workspace = true
 ed25519-dalek.workspace = true
 futures-util.workspace = true
 gethostname.workspace = true
+iana-time-zone.workspace = true
 # The same Markdown parser that the GPUI text view uses (gpui-base 0.8.1), so
 # the plain text of a message matches what the reader sees.
 markdown.workspace = true

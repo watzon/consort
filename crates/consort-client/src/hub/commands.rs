@@ -789,6 +789,14 @@ async fn run(shared: Arc<Shared>, command: Command) -> Result<CommandOutput, Cli
                 .await?;
         }
         Command::LoadAcpRegistry => load_registry(&shared).await?,
+        // Settings > Hub and Settings > Clients.
+        command @ (Command::LoadHubStatus
+        | Command::BackUpNow
+        | Command::UpdateBackupSettings(_)
+        | Command::LoadClients
+        | Command::RevokeClient { .. }
+        | Command::ClientPairingCode
+        | Command::CancelClientPairing) => return super::admin::run(&shared, command).await,
         // Connectors, skills and the provider extras.
         other => return super::extensions::run(&shared, other).await,
     }
