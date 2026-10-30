@@ -1,11 +1,31 @@
-//! Skills, the storage side: installed skills, their files as blobs, the
-//! client requests that read and change them, `skill_bundle.get` for
-//! workers, and the `list_skills` and `read_skill` hub tools.
+//! Skills: installed skills, their files as blobs, the client requests
+//! that read and change them, `skill_bundle.get` for workers, and the
+//! `list_skills` and `read_skill` hub tools.
 //!
-//! The install pipeline (directories, git, uploads, previews and the update
-//! check) is step 3 of docs/CONNECTORS-SKILLS-PLAN.md. [`Hub::store_skill`]
-//! is the part of it that stores a checked set of files; tests use it to
-//! add a skill.
+//! The install pipeline (step 3 of docs/CONNECTORS-SKILLS-PLAN.md) lives in
+//! the submodules:
+//! - [`directory`]: the skill directories, their cache and search.
+//! - [`git`]: fetches a skill folder at a commit with the `git` CLI.
+//! - [`upload`]: reads an uploaded zip in memory.
+//! - [`package`]: the checks that every source goes through.
+//! - [`install`]: `skill.preview`, `skill.install`, the install card, and
+//!   the `search_skills` and `add_skill` tools.
+//! - [`updates`]: the daily check for a new version.
+
+pub(crate) mod directory;
+pub(crate) mod git;
+pub(crate) mod install;
+pub(crate) mod package;
+pub(crate) mod updates;
+mod upload;
+
+#[cfg(test)]
+pub(crate) mod fake;
+#[cfg(test)]
+mod flow_tests;
+
+pub use directory::SkillSources;
+pub use updates::UpdateReport;
 
 use consort_proto::client_api::{
     SkillFileContent, SkillFiles, SkillFilesResult, SkillReadFile, SkillRemove, SkillResult,
@@ -15,9 +35,8 @@ use consort_proto::error::ErrorCode;
 use consort_proto::frame::Empty;
 use consort_proto::ids::{SkillId, WorkerId};
 use consort_proto::model::{
-    AuditStatus, SKILL_MANIFEST_FILE, SKILL_READ_MAX_BYTES, Sha256Hash, Skill, SkillAudit,
-    SkillBundle, SkillContextEntry, SkillFileInfo, SkillSource, SkillUpdateState, UseIn,
-    skill_content_hash, validate_skill_description, validate_skill_files, validate_skill_name,
+    SKILL_MANIFEST_FILE, SKILL_READ_MAX_BYTES, Sha256Hash, Skill, SkillAudit, SkillBundle,
+    SkillContextEntry, SkillFileInfo, SkillSource, SkillUpdateState, UseIn,
 };
 use consort_proto::tools::{ListSkillsResult, ReadSkillArgs, ReadSkillResult};
 use consort_proto::worker_link::SkillBundleGet;
@@ -25,7 +44,8 @@ use serde_json::Value;
 
 use crate::error::{HubError, Result};
 use crate::hub::{Caller, Hub, ToolCtx};
-use crate::store::{conversation, skills as skill_store};
+use crate::store::{conversation, meta_get, skills as skill_store};
+use package::{Prepared, is_script};
 
 /// The harnesses that load skills from a folder themselves (see the
 /// delivery list in docs/CONNECTORS-SKILLS-PLAN.md). Every other harness
@@ -46,7 +66,7 @@ pub(crate) struct NewSkillFile {
     pub executable: bool,
 }
 
-/// A checked skill to store.
+/// A skill to check and store.
 #[derive(Debug, Clone)]
 pub(crate) struct NewSkill {
     pub source: SkillSource,
@@ -58,6 +78,28 @@ pub(crate) struct NewSkill {
     pub enabled: Option<bool>,
     pub license: Option<String>,
     pub audits: Vec<SkillAudit>,
+}
+
+/// The facts of a skill to store that do not come from its files.
+#[derive(Debug, Clone)]
+pub(crate) struct StoreMeta {
+    pub source: SkillSource,
+    pub commit: Option<String>,
+    pub use_in: UseIn,
+    /// `None` turns on a skill with no scripts, and leaves one with
+    /// scripts off.
+    pub enabled: Option<bool>,
+    pub audits: Vec<SkillAudit>,
+    /// A license that wins over the one of the files.
+    pub license: Option<String>,
+}
+
+/// What a new version changes in the facts of a skill.
+struct PendingFacts {
+    content_hash: Sha256Hash,
+    description: Option<String>,
+    license: Option<String>,
+    hooks_removed: bool,
 }
 
 /// The `name`, `description` and `license` of a `SKILL.md` front matter.
@@ -101,18 +143,8 @@ pub(crate) fn front_matter(text: &str) -> (Option<String>, Option<String>, Optio
     )
 }
 
-/// A script is a file with the executable bit or a file under `scripts/`
-/// (DECISIONS row 350).
-fn is_script(file: &SkillFileInfo) -> bool {
-    file.executable || file.path.starts_with("scripts/")
-}
-
 fn skill_blocked(message: impl Into<String>) -> HubError {
     HubError::new(ErrorCode::SkillBlocked, message)
-}
-
-fn skill_invalid(message: impl Into<String>) -> HubError {
-    HubError::new(ErrorCode::SkillInvalid, message)
 }
 
 impl Hub {
@@ -155,58 +187,50 @@ impl Hub {
     /// Checks and stores a skill: its files as blobs, its version, and the
     /// skill. The name comes from `SKILL.md` and must be unique.
     pub(crate) async fn store_skill(&self, new: NewSkill) -> Result<Skill> {
-        let manifest = new
-            .files
-            .iter()
-            .find(|f| f.path == SKILL_MANIFEST_FILE)
-            .ok_or_else(|| {
-                skill_invalid(format!(
-                    "The skill has no {SKILL_MANIFEST_FILE} at its root."
-                ))
-            })?;
-        let text = std::str::from_utf8(&manifest.bytes)
-            .map_err(|_| skill_invalid(format!("{SKILL_MANIFEST_FILE} is not UTF-8 text.")))?;
-        let (name, description, license) = front_matter(text);
-        let name = name.ok_or_else(|| {
-            skill_invalid(format!(
-                "{SKILL_MANIFEST_FILE} has no name in its front matter."
-            ))
-        })?;
-        let description = description.ok_or_else(|| {
-            skill_invalid(format!(
-                "{SKILL_MANIFEST_FILE} has no description in its front matter."
-            ))
-        })?;
-        validate_skill_name(&name).map_err(|e| skill_invalid(format!("The skill {e}.")))?;
-        validate_skill_description(&description)
-            .map_err(|e| skill_invalid(format!("The skill {e}.")))?;
-        let mut infos = Vec::with_capacity(new.files.len());
-        for file in &new.files {
-            infos.push(SkillFileInfo {
-                path: file.path.clone(),
-                sha256: crate::util::sha256(&file.bytes),
-                size: file.bytes.len() as u64,
-                executable: file.executable,
-            });
+        let prepared = package::prepare(new.files, None)?;
+        self.store_prepared(
+            prepared,
+            StoreMeta {
+                source: new.source,
+                commit: new.commit,
+                use_in: new.use_in,
+                enabled: new.enabled,
+                audits: new.audits,
+                license: new.license,
+            },
+        )
+        .await
+    }
+
+    /// Stores a checked skill. A failed audit blocks it; a skill with
+    /// scripts starts off unless `enabled` says otherwise.
+    pub(crate) async fn store_prepared(
+        &self,
+        prepared: Prepared,
+        meta: StoreMeta,
+    ) -> Result<Skill> {
+        let use_in = self.check_use_in(meta.use_in).await?;
+        if let Some(existing) = self.installed_skill_named(&prepared.name).await? {
+            return Err(HubError::conflict(format!(
+                "A skill named {} is installed already. Remove it first, or update it.",
+                existing.name
+            )));
         }
-        validate_skill_files(&infos).map_err(|e| skill_invalid(format!("The skill {e}.")))?;
-        let use_in = self.check_use_in(new.use_in).await?;
-        for file in new.files {
+        let Prepared {
+            name,
+            description,
+            license,
+            files,
+            infos,
+            content_hash,
+            scripts,
+            hooks_removed,
+        } = prepared;
+        for file in files {
             self.put_blob_bytes(file.bytes).await?;
         }
-        infos.sort_by(|a, b| a.path.cmp(&b.path));
-        let content_hash = skill_content_hash(&infos);
-        let scripts: Vec<String> = infos
-            .iter()
-            .filter(|f| is_script(f))
-            .map(|f| f.path.clone())
-            .collect();
-        let blocked_reason = new
-            .audits
-            .iter()
-            .find(|a| a.status == AuditStatus::Failed)
-            .map(|a| format!("The audit of {} failed.", a.source));
-        let enabled = blocked_reason.is_none() && new.enabled.unwrap_or(scripts.is_empty());
+        let blocked_reason = install::blocked_reason(&meta.audits);
+        let enabled = blocked_reason.is_none() && meta.enabled.unwrap_or(scripts.is_empty());
         let size_bytes = infos.iter().map(|f| f.size).sum();
         let file_count = u32::try_from(infos.len()).unwrap_or(u32::MAX);
         self.store
@@ -221,27 +245,71 @@ impl Hub {
                     id: SkillId::new(),
                     name,
                     description,
-                    source: new.source,
-                    commit: new.commit,
+                    source: meta.source,
+                    commit: meta.commit,
                     content_hash: content_hash.clone(),
-                    license: new.license.or(license),
+                    license: meta.license.or(license),
                     scripts,
-                    audits: new.audits,
+                    audits: meta.audits,
                     enabled,
                     use_in,
                     update: SkillUpdateState::UpToDate,
                     blocked_reason,
-                    hooks_removed: false,
+                    hooks_removed,
                     file_count,
                     size_bytes,
                     installed_at: now,
                     updated_at: now,
                 };
                 tx.save_skill_version(skill.id, &skill.name, &content_hash, &infos)?;
+                if hooks_removed {
+                    tx.meta_set(&updates::hooks_meta_key(content_hash.as_str()), "1")?;
+                }
                 tx.save_skill(&skill)?;
                 Ok(skill)
             })
             .await
+    }
+
+    async fn installed_skill_named(&self, name: &str) -> Result<Option<Skill>> {
+        let name = name.to_owned();
+        self.store
+            .read(move |conn| skill_store::find_skill(conn, &name))
+            .await
+    }
+
+    /// The `description`, the `license` and the hooks flag of the version
+    /// that waits for review, read from its stored `SKILL.md`.
+    async fn pending_facts(&self, id: SkillId) -> Result<Option<PendingFacts>> {
+        let found = self
+            .store
+            .read(move |conn| {
+                let skill = skill_store::skill_or_404(conn, id)?;
+                let SkillUpdateState::Available { content_hash, .. } = &skill.update else {
+                    return Ok(None);
+                };
+                let Some(row) = skill_store::skill_version(conn, content_hash)? else {
+                    return Ok(None);
+                };
+                let hooks =
+                    meta_get(conn, &updates::hooks_meta_key(content_hash.as_str()))?.is_some();
+                Ok(Some((row, hooks)))
+            })
+            .await?;
+        let Some((row, hooks_removed)) = found else {
+            return Ok(None);
+        };
+        let Some(manifest) = row.files.iter().find(|f| f.path == SKILL_MANIFEST_FILE) else {
+            return Ok(None);
+        };
+        let bytes = self.read_blob_bytes(&manifest.sha256).await?;
+        let (_, description, license) = front_matter(&String::from_utf8_lossy(&bytes));
+        Ok(Some(PendingFacts {
+            content_hash: row.content_hash,
+            description,
+            license,
+            hooks_removed,
+        }))
     }
 
     pub(crate) async fn skill_update(
@@ -274,6 +342,11 @@ impl Hub {
             Some(u) => Some(self.check_use_in(u).await?),
             None => None,
         };
+        let facts = if accept_new_version {
+            self.pending_facts(id).await?
+        } else {
+            None
+        };
         self.store
             .write(move |tx| {
                 let before = skill_store::skill_or_404(tx.db(), id)?;
@@ -305,6 +378,15 @@ impl Hub {
                         .collect();
                     skill.file_count = u32::try_from(version.files.len()).unwrap_or(u32::MAX);
                     skill.size_bytes = version.files.iter().map(|f| f.size).sum();
+                    if let Some(facts) = facts.filter(|f| f.content_hash == skill.content_hash) {
+                        if let Some(description) = facts.description {
+                            skill.description = description;
+                        }
+                        if facts.license.is_some() {
+                            skill.license = facts.license;
+                        }
+                        skill.hooks_removed = facts.hooks_removed;
+                    }
                     skill.update = SkillUpdateState::UpToDate;
                     if scripts_changed {
                         skill.enabled = false;
@@ -582,6 +664,7 @@ pub(crate) fn test_skill(name: &str, with_script: bool) -> NewSkill {
 mod tests {
     use super::*;
     use crate::hub::test_hub;
+    use consort_proto::model::{AuditStatus, skill_content_hash};
 
     #[test]
     fn front_matter_reads_plain_quoted_and_folded_values() {

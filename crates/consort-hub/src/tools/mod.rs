@@ -1,6 +1,5 @@
 //! Hub tool dispatch for `tool.list` and `tool.call`.
 
-use consort_proto::error::ErrorBody;
 use consort_proto::ids::SessionId;
 use consort_proto::model::SessionRole;
 use consort_proto::tools::{
@@ -16,12 +15,6 @@ mod chat;
 mod management;
 mod routines;
 mod tasks;
-
-/// The hub tools that the proto defines but the hub does not carry out yet:
-/// the skill sources of step 3 (docs/CONNECTORS-SKILLS-PLAN.md). `tool.list`
-/// leaves them out, so no session sees them, and a call gets
-/// `unsupported`. Take a tool out of this list when its handler is built.
-pub(crate) const NOT_BUILT: &[HubTool] = &[HubTool::SearchSkills, HubTool::AddSkill];
 
 /// The tools that work on the connectors of a session's channel.
 const CONNECTOR_TOOLS: &[HubTool] = &[
@@ -75,8 +68,7 @@ impl Hub {
             .into_iter()
             .filter(|t| {
                 HubTool::from_name(&t.name).is_none_or(|tool| {
-                    !NOT_BUILT.contains(&tool)
-                        && (has_connections || !CONNECTOR_TOOLS.contains(&tool))
+                    (has_connections || !CONNECTOR_TOOLS.contains(&tool))
                         && (!native_skills || !SKILL_TOOLS.contains(&tool))
                 })
             })
@@ -153,10 +145,8 @@ impl Hub {
             C::RunConnectorTool(a) => self.tool_run_connector_tool(ctx, a).await,
             C::ListSkills(_) => self.tool_list_skills(ctx).await,
             C::ReadSkill(a) => self.tool_read_skill(ctx, a).await,
-            // See NOT_BUILT.
-            C::SearchSkills(_) | C::AddSkill(_) => {
-                Err(HubError::Api(ErrorBody::not_built(call.tool().name())))
-            }
+            C::SearchSkills(a) => self.tool_search_skills(a).await,
+            C::AddSkill(a) => self.tool_add_skill(ctx, a).await,
             other => self.tool_management(ctx, other).await,
         }
     }
@@ -164,15 +154,12 @@ impl Hub {
 
 #[cfg(test)]
 mod tests {
-    use consort_proto::client_api::{ClientRequest, SkillDirectorySources, SkillPreview};
-    use consort_proto::error::ErrorCode;
     use consort_proto::ids::{AccountId, WorkerId};
     use consort_proto::model::{ModelOptions, Session, SessionState, Usage};
     use consort_proto::time::Timestamp;
-    use serde_json::json;
 
     use super::*;
-    use crate::hub::{Caller, test_hub};
+    use crate::hub::test_hub;
 
     async fn everything_session(hub: &Hub) -> SessionId {
         let channel = hub
@@ -207,10 +194,9 @@ mod tests {
         id
     }
 
-    /// The tools of the connectors and skills plan are in the proto, but no
-    /// session sees them until the hub carries them out.
+    /// The Everything coordinator sees the skill tools of step 3.
     #[tokio::test]
-    async fn tools_that_are_not_built_stay_out_of_the_list_and_answer_unsupported() {
+    async fn the_everything_coordinator_sees_the_skill_tools() {
         let (hub, _dir) = test_hub().await;
         let session_id = everything_session(&hub).await;
         let names: Vec<String> = hub
@@ -220,46 +206,8 @@ mod tests {
             .into_iter()
             .map(|t| t.name)
             .collect();
-        for tool in NOT_BUILT {
-            assert!(!names.contains(&tool.name().to_owned()), "{}", tool.name());
-        }
-        assert!(names.contains(&"list_channels".to_owned()));
-        let result = hub
-            .call_tool(
-                session_id,
-                "add_skill",
-                json!({"source": "anthropics/skills", "path": "skills/pdf"}),
-            )
-            .await;
-        assert!(result.is_error);
-        let body = result.structured_content.unwrap();
-        assert_eq!(body["error"]["code"], "unsupported");
-        assert!(
-            body["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("add_skill")
-        );
-    }
-
-    #[tokio::test]
-    async fn requests_that_are_not_built_answer_unsupported() {
-        let (hub, _dir) = test_hub().await;
-        for request in [
-            ClientRequest::from(SkillPreview {
-                source: consort_proto::client_api::SkillInstallSource::Git {
-                    url: "https://example.com/skills.git".to_owned(),
-                    path: None,
-                    git_ref: None,
-                },
-            }),
-            ClientRequest::from(SkillDirectorySources {}),
-        ] {
-            let err = crate::api::dispatch(&hub, Caller::Hub, request)
-                .await
-                .unwrap_err();
-            assert_eq!(err.code(), ErrorCode::Unsupported);
-            assert!(err.to_error_body().message.starts_with("Not built yet: "));
+        for name in ["search_skills", "add_skill", "list_channels"] {
+            assert!(names.contains(&name.to_owned()), "{name}");
         }
     }
 }

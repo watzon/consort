@@ -7,8 +7,6 @@
 //! body and returns the proto response type.
 
 use consort_proto::client_api::ClientRequest;
-use consort_proto::error::ErrorBody;
-use consort_proto::frame::MessageFamily;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -112,23 +110,18 @@ pub(crate) async fn dispatch(hub: &Hub, caller: Caller, request: ClientRequest) 
         R::SkillRemove(r) => to_value(&hub.skill_remove(caller, r).await?),
         R::SkillFiles(r) => to_value(&hub.skill_files(caller, r).await?),
         R::SkillReadFile(r) => to_value(&hub.skill_read_file(caller, r).await?),
-        // The skill sources and the install pipeline are step 3 of
-        // docs/CONNECTORS-SKILLS-PLAN.md. Take a request out of this list
-        // when its handler is built.
-        r @ (R::SkillDirectorySearch(_)
-        | R::SkillDirectorySources(_)
-        | R::SkillDirectoryAddSource(_)
-        | R::SkillDirectoryRemoveSource(_)
-        | R::SkillPreview(_)
-        | R::SkillInstall(_)) => Err(not_built(&r)),
+        R::SkillDirectorySearch(r) => to_value(&hub.skill_directory_search(caller, r).await?),
+        R::SkillDirectorySources(r) => to_value(&hub.skill_directory_sources(caller, r).await?),
+        R::SkillDirectoryAddSource(r) => {
+            to_value(&hub.skill_directory_add_source(caller, r).await?)
+        }
+        R::SkillDirectoryRemoveSource(r) => {
+            to_value(&hub.skill_directory_remove_source(caller, r).await?)
+        }
+        R::SkillPreview(r) => to_value(&hub.skill_preview(caller, r).await?),
+        R::SkillInstall(r) => to_value(&hub.skill_install(caller, r).await?),
         R::Hello(_) | R::SyncSnapshot(_) | R::SyncSubscribe(_) | R::AuthHttpToken(_) => Err(
             HubError::invalid("This request belongs to the connection and cannot be routed."),
         ),
     }
-}
-
-/// The `unsupported` error for a request that the hub knows but does not
-/// carry out yet.
-fn not_built(request: &ClientRequest) -> HubError {
-    HubError::Api(ErrorBody::not_built(request.type_name()))
 }

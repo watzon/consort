@@ -493,7 +493,8 @@ async fn connector_tools_show_only_where_a_connection_is_and_skill_tools_only_wi
     assert!(!before.contains(&"run_connector_tool".to_owned()));
     assert!(before.contains(&"list_skills".to_owned()));
     assert!(before.contains(&"list_connections".to_owned()));
-    assert!(!before.contains(&"add_skill".to_owned()));
+    assert!(before.contains(&"add_skill".to_owned()));
+    assert!(before.contains(&"search_skills".to_owned()));
     assert!(!names(claude).await.contains(&"read_skill".to_owned()));
     active_gmail(&hub, &fake, ToolApprovals::default()).await;
     assert!(names(acp).await.contains(&"run_connector_tool".to_owned()));

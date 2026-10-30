@@ -868,7 +868,7 @@ impl Hub {
     /// The default scope of a new item from this session: every channel for
     /// Everything, otherwise the channels with this channel's tags, or this
     /// channel alone (DECISIONS row 345).
-    fn default_use_in(ctx: &ToolCtx) -> UseIn {
+    pub(crate) fn default_use_in(ctx: &ToolCtx) -> UseIn {
         if ctx.audience == ToolAudience::EverythingCoordinator {
             UseIn::EveryChannel
         } else if ctx.channel.tags.is_empty() {

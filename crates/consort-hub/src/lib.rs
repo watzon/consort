@@ -43,6 +43,7 @@ use consort_proto::time::Timestamp;
 use tokio::task::JoinHandle;
 
 pub use error::{HubError, Result};
+pub use skills::UpdateReport;
 
 use crate::hub::Hub;
 use crate::store::machine::{self, Origin, PairingKind};
@@ -145,6 +146,7 @@ pub async fn serve(config: HubConfig) -> Result<HubHandle> {
         scheduler::spawn(&hub),
         maintenance::spawn(&hub),
         spawn_connector_sweep(&hub),
+        spawn_skill_update_check(&hub),
     ];
     hub.recover();
     if let Err(err) = hub.resume_connect_polls().await {
@@ -177,6 +179,36 @@ fn spawn_connector_sweep(hub: &Hub) -> JoinHandle<()> {
     })
 }
 
+/// How often the hub looks whether the daily skill update check is due.
+const SKILL_UPDATE_TICK: Duration = Duration::from_secs(60 * 60);
+
+/// Checks the sources of installed skills for a new version once a day. A
+/// restart does not make the check run again sooner: the time of the last
+/// check is in the store.
+fn spawn_skill_update_check(hub: &Hub) -> JoinHandle<()> {
+    let hub = hub.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                () = hub.shutdown.cancelled() => return,
+                () = tokio::time::sleep(SKILL_UPDATE_TICK) => {}
+            }
+            match hub.check_skill_updates_if_due().await {
+                Ok(Some(report)) => tracing::info!(
+                    checked = report.checked,
+                    available = report.available,
+                    failed = report.failed,
+                    "checked the skills for new versions"
+                ),
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!(error = %err, "could not check the skills for new versions")
+                }
+            }
+        }
+    })
+}
+
 impl HubHandle {
     /// Uses another Composio API base URL, for example a local fake server
     /// in tests or a proxy. The default is the public v3.1 API. The
@@ -185,11 +217,40 @@ impl HubHandle {
         self.hub.connectors.set_base_url(url);
     }
 
+    /// Uses other addresses for the built-in skill directories: the
+    /// Smithery API (default `https://api.smithery.ai`) and Anthropic's
+    /// skills repo (default `https://github.com/anthropics/skills`). Tests
+    /// point them at local fakes. `CONSORT_SMITHERY_URL` and
+    /// `CONSORT_ANTHROPIC_SKILLS_URL` set them at start too. It drops the
+    /// directory caches.
+    pub fn set_skill_directory_urls(&self, smithery: &str, anthropic: &str) {
+        let (smithery, anthropic) = (smithery.to_owned(), anthropic.to_owned());
+        self.hub.skill_sources.set_config(move |c| {
+            c.smithery_url = smithery;
+            c.anthropic_url = anthropic;
+        });
+    }
+
+    /// Allows `file://` and `http://` skill sources. Only tests turn this
+    /// on: a real hub fetches skills over https only.
+    pub fn allow_local_skill_sources(&self, allow: bool) {
+        self.hub
+            .skill_sources
+            .set_config(move |c| c.allow_local = allow);
+    }
+
+    /// Checks every installed skill for a new version now, as the daily
+    /// check does.
+    pub async fn check_skill_updates(&self) -> Result<UpdateReport> {
+        self.hub.check_skill_updates().await
+    }
+
     /// Stores a skill from its files, with the checks of an install: the
     /// `SKILL.md` front matter, the name rule and the file limits. A skill
-    /// with scripts stays off unless `enabled` says otherwise. Each file is
-    /// `(path, bytes, executable)`. The install pipeline of step 3 builds on
-    /// this; until then, tests and tools on the hub machine use it.
+    /// with scripts stays off unless `enabled` says otherwise, and
+    /// Claude-specific `hooks` are removed. Each file is
+    /// `(path, bytes, executable)`. Tests and tools on the hub machine use
+    /// it; clients use `skill.install`.
     pub async fn add_skill_from_files(
         &self,
         file_name: &str,

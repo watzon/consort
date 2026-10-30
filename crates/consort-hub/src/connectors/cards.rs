@@ -275,11 +275,15 @@ impl Hub {
                     .await
                     .map(Some)
             }
-            ApprovalDetails::SkillInstall(card) => Ok(Some(if allowed {
-                format!("The user chose to add the skill {}.", card.name)
-            } else {
-                format!("The user chose not to add the skill {} now.", card.name)
-            })),
+            ApprovalDetails::SkillInstall(card) => {
+                if !allowed {
+                    return Ok(Some(format!(
+                        "The user chose not to add the skill {} now.",
+                        card.name
+                    )));
+                }
+                self.install_from_card(approval, card).await.map(Some)
+            }
             _ => Ok(None),
         }
     }
