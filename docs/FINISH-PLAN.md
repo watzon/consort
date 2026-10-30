@@ -188,3 +188,36 @@ These are fixed during the phases that touch the same code.
   - `data-model.md`: `hub-secret.key`, `composio.key` and the logo cache.
   - Remove the step 2 placeholder list from the connectors plan.
 - **Tests:** git and HTTP time limits with a slow server.
+
+## Design decisions (approved by the user on 2026-10-29)
+
+The Paper designs for phases 1 to 5 are on the Desktop page, from worldY 3200 (phases 1 and 2) and from worldY 6400 (phases 3 to 5). The lists of artboards are in `docs/notes/design-phases-1-2.md` and `docs/notes/design-phases-3-5.md`.
+
+- **The Channel panel:**
+  - It opens from a `#` button at the top right. It does not open by default.
+  - It shares the right side with the Tasks panel, and only one of them is open at a time.
+- **Routines:**
+  - An "Ask the assistant" routine uses the channel's model. A "Start a task" routine has its own model and effort.
+  - A run that would start while the last run still runs is **skipped**. Runs get a third status, `skipped`.
+  - When the hub was down at a run time, it runs once when it comes back, if less than 1 hour late. Otherwise it skips the run.
+- **Memory:**
+  - Settings > Memory shows global memory and each channel's memory, grouped by channel.
+  - A deleted memory note goes to "Recently deleted" for 30 days and can be restored.
+- **Attachments:**
+  - Keep the 256 MB limit.
+  - An attachment belongs to its message. It goes into channel files only through "Save to channel files".
+  - A drop anywhere over the chat attaches. The composer is the only visual target.
+- **Channel settings:**
+  - One dialog with a Save changes button.
+  - It replaces the Rename, Instructions, Model and Worker tags dialogs.
+- **The hub is offline:**
+  - Messages wait in a queue.
+  - Approvals and decisions stay blocked until the hub is back.
+- **The sidebar:**
+  - No "New channel" row at the end.
+  - The Tutti row's "+" makes a channel or a group.
+  - An empty group shows "Add a channel".
+- **Clients:** they do not show the mobile app before phase 6.
+- **Installs and updates:**
+  - Installs come from GitHub Releases on the Consort repo, with an install script in the repo, until there is a domain.
+  - App updates download in the background, then show "Update ready. Restart to install."
