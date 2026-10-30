@@ -122,6 +122,10 @@ Design first: the three pages.
 
 Design first: the thread panel, the search results, the New task dialog, the channel settings dialog, and the task item view.
 
+### Phase 4b: a proactive assistant
+
+Added on 2026-10-30 at the user's request. The plan is [PROACTIVITY-PLAN.md](PROACTIVITY-PLAN.md) and the decision is [ADR 0013](adr/0013-the-assistant-is-proactive-within-limits.md). It covers check-ins, the check-in note, the morning brief, stale-task nudges, follow-ups that the assistant sets, the read-only research pass, offers, levels, quiet hours, snooze, budgets, the proactivity log, and Settings > Proactivity. The guided start, the quick-reply suggestions and the writing bubble of phase 4 item 7 are built with it, because they are proactive behavior.
+
 ### Phase 5: install and run anywhere
 
 1. **Desktop bundle:**
