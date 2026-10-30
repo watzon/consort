@@ -122,6 +122,7 @@ pub struct HubInner {
     pub registry: RegistryCache,
     pub connectors: Connectors,
     pub skill_sources: crate::skills::SkillSources,
+    pub backups: crate::backup::Backups,
     pub shutdown: CancellationToken,
 }
 
@@ -156,6 +157,7 @@ impl Hub {
             registry: RegistryCache::default(),
             connectors: Connectors::open(data_dir),
             skill_sources: crate::skills::SkillSources::open(data_dir),
+            backups: crate::backup::Backups::open(data_dir),
             shutdown: CancellationToken::new(),
         }));
         hub.bootstrap().await?;

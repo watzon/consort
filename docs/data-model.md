@@ -11,6 +11,10 @@ This page lists the entities that the hub, the workers and the clients store, wi
 | Hub | `hub-secret.key` | The 256-bit key that encrypts `composio.key` (mode 0600) |
 | Hub | `composio.key` | The Composio project key, encrypted with a key that the hub makes (mode 0600). See ADR 0011 |
 | Hub | FTS5 tables in `hub.db` | Search index over messages, memory notes and task titles |
+| Hub | `backup.json` | The backup settings (schedule, folder, how many to keep) and the last backup result, written through a temp file and a rename (mode 0600). Not in `hub.db`, so it needs no schema migration. See [Backups](#backups) |
+| Hub | `hub.lock` | A lock that a running hub holds, so a second hub and `consort hub restore` cannot use the folder at the same time |
+| Hub | `backups/` (default) | The backup archives, `consort-<date>-<time>.tar`. The folder is a setting and can be anywhere on the hub machine |
+| Client | `notifications.json` | The notification switches of this client (Settings > Notifications). They do not go to the hub |
 | Worker | `worker.toml` | Hub URL, tags, worker policy, harness accounts, local MCP servers, checkouts |
 | Worker | `worker.db` (SQLite) | Event spool, processed command IDs, local session registry |
 | Worker | `workspaces/` | Worktrees and clones that the worker made for tasks |
@@ -454,7 +458,11 @@ A model selection is a value, not a row: `account_label`, `model` and `options`.
 | `public_key` | Ed25519 public key | |
 | `push` | object, optional | Provider (`apns`, `fcm` or `expo`) and token. The client view has only `push_provider`. The token stays on the hub |
 | `paired_at`, `last_seen_at`, `revoked_at` | timestamp | |
-| `paired_by`, `revoked_by` | text, optional | Hub only, not in the client view. A client ID, or `hub` for the hub machine. `paired_by` is who made the pairing code that the client used. `consort hub client list` shows both |
+| `os` | `macos`, `windows` or `linux`, optional | What the client reported in `POST /v1/pair/client`. Empty for a client that paired before the hub recorded it |
+| `paired_by` | object, optional | Who made the pairing code that the client used: `{"kind": "hub_machine"}` or `{"kind": "client", "client_id": ...}`. In the client view too, so Settings > Clients can say "Paired from MacBook Pro" |
+| `revoked_by` | text, optional | Hub only, not in the client view. A client ID, or `hub` for the hub machine. `consort hub client list` shows it and `paired_by` |
+
+`last_seen_at` changes when the client connects and when its connection ends. `client.list` also names the clients that are connected now (`online`).
 
 A worker has the same `paired_by` and `revoked_by`. Each pairing code records who made it in `created_by`. When a client is removed, the codes that it made and that are not used yet are deleted.
 
@@ -538,6 +546,21 @@ The user's preferences are one record that every client shares. The hub stores i
 | `favorite_models` | list of `{account_label, model}` | The favorite models of the model picker, in the order that the user starred them. At most 200. Each field has at most 200 characters |
 
 A favorite whose account is not signed in on any worker, or whose account no longer offers the model, stays in the list. The clients do not show it until the account or the model comes back. The feed `entity_id` of the record is `preferences`, and its entries have no channel.
+
+## Backups
+
+A backup is one tar archive in the backup folder on the hub machine. The hub names it after its start time in the time zone of the schedule, `consort-2026-10-29-0300.tar` (`-2` and so on when the name is taken). The entries:
+
+| Entry | Contents |
+|---|---|
+| `consort-backup.json` | The manifest, always first: `kind` (`consort-hub-backup`), `format` (1), `hub_version`, `schema_version` (`user_version` of `hub.db`), `created_at` and the number of blobs |
+| `hub.db` | A consistent copy from SQLite's online backup API, made in one step while the hub runs |
+| `hub-secret.key`, `composio.key`, `backup.json` | When they exist. Without `hub-secret.key` the Composio key cannot be read |
+| `blobs/<sha256>` | Every blob, skill files included. A blob never changes after it is written, so a plain copy is consistent |
+
+The hub writes the archive as a hidden `.partial` file and renames it when it is complete, so a half archive never has an archive name. After a backup that worked, it deletes the oldest archives with the archive name so that `keep` stay. Other files in the folder stay.
+
+`backup.json` holds `settings` (`schedule` with `frequency` `off`, `daily` or `weekly`, `time` as `HH:MM`, `weekday` and an IANA `time_zone`; `folder`; `keep`, 1 to 100, default 7), `schedule_changed_at`, `last` (the last backup that finished or failed) and `last_slot` (the schedule slot of the last scheduled backup). A missing or damaged file reads as the defaults: no schedule, `<data>/backups`, keep 7.
 
 ## Feed
 

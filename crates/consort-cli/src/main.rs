@@ -90,6 +90,23 @@ enum HubCommand {
         #[command(subcommand)]
         command: PairedCommand,
     },
+    /// Restore a backup into a data folder. Stop the hub first.
+    ///
+    /// The backup is a consort-<date>.tar file from the backup folder that
+    /// is set in Settings > Hub. A data folder that is not empty needs
+    /// --force: its database, blobs and keys then move to a
+    /// before-restore-<time> folder inside it first.
+    Restore {
+        /// The backup file, for example
+        /// /srv/backups/consort/consort-2026-10-29-0300.tar.
+        backup: PathBuf,
+        /// The data folder of the hub.
+        #[arg(long)]
+        data: Option<PathBuf>,
+        /// Restore into a data folder that is not empty.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 /// What to do with the paired clients or workers.
@@ -408,6 +425,30 @@ fn hub_data(given: Option<PathBuf>, fallback: Option<PathBuf>) -> Result<PathBuf
     }
 }
 
+/// Runs `consort hub restore` and returns the lines to print.
+fn run_restore(backup: &Path, data: &Path, force: bool) -> Result<Vec<String>> {
+    let report =
+        consort_hub::admin::restore(backup, data, force).map_err(|err| anyhow::anyhow!("{err}"))?;
+    let mut lines = vec![format!(
+        "Restored the backup from {} (hub {}, {} blobs) into {}.",
+        report.created_at,
+        report.hub_version,
+        report.blobs,
+        data.display()
+    )];
+    if let Some(aside) = report.moved_aside {
+        lines.push(format!(
+            "The files that were in the data folder are now in {}. Delete that folder when the hub works.",
+            aside.display()
+        ));
+    }
+    lines.push(format!(
+        "Start the hub with `consort hub --data {}`.",
+        data.display()
+    ));
+    Ok(lines)
+}
+
 /// Runs `consort hub client ...` or `consort hub worker ...`.
 fn run_paired(clients: bool, command: PairedCommand, fallback: Option<PathBuf>) -> Result<()> {
     let what = if clients { "client" } else { "worker" };
@@ -477,6 +518,17 @@ async fn run_hub(args: HubArgs) -> Result<()> {
         }
         Some(HubCommand::Client { command }) => return run_paired(true, command, args.data),
         Some(HubCommand::Worker { command }) => return run_paired(false, command, args.data),
+        Some(HubCommand::Restore {
+            backup,
+            data,
+            force,
+        }) => {
+            let data = hub_data(data, args.data)?;
+            for line in run_restore(&backup, &data, force)? {
+                println!("{line}");
+            }
+            return Ok(());
+        }
         None => {}
     }
     let data = match args.data {
@@ -790,6 +842,53 @@ mod tests {
             panic!("expected worker run")
         };
         assert_eq!(log_file, Some(PathBuf::from("/tmp/w.log")));
+    }
+
+    #[test]
+    fn restore_takes_a_file_a_folder_and_force() {
+        let cli = Cli::try_parse_from([
+            "consort",
+            "hub",
+            "restore",
+            "/srv/backups/consort-2026-10-29-0300.tar",
+            "--data",
+            "/var/lib/consort",
+            "--force",
+        ])
+        .unwrap();
+        let Command::Hub(HubArgs {
+            command:
+                Some(HubCommand::Restore {
+                    backup,
+                    data,
+                    force,
+                }),
+            ..
+        }) = cli.command
+        else {
+            panic!("expected hub restore")
+        };
+        assert_eq!(
+            backup,
+            PathBuf::from("/srv/backups/consort-2026-10-29-0300.tar")
+        );
+        assert_eq!(data, Some(PathBuf::from("/var/lib/consort")));
+        assert!(force);
+        assert!(
+            Cli::try_parse_from(["consort", "hub", "restore"]).is_err(),
+            "restore needs a file"
+        );
+    }
+
+    #[test]
+    fn restore_says_what_is_wrong_with_a_file_that_is_not_a_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("notes.tar");
+        std::fs::write(&file, b"plain text").unwrap();
+        let err = run_restore(&file, &dir.path().join("data"), false).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("is not a Consort backup"), "{text}");
+        assert!(text.contains("consort-<date>.tar"), "{text}");
     }
 
     #[test]

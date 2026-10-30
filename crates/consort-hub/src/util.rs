@@ -52,6 +52,37 @@ pub async fn create_private_file(path: &std::path::Path) -> std::io::Result<toki
     options.open(path).await
 }
 
+/// Opens a new file for writing that only the user can read (mode 0600 on
+/// Unix), in blocking code. It fails when the file exists.
+pub fn create_new_private_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+/// Writes a file that only the user can read, through a temp file in the
+/// same folder and a rename, so a reader sees the old file or the new one
+/// and never half of it.
+pub fn write_private_file(path: &std::path::Path, bytes: &[u8]) -> crate::error::Result<()> {
+    use std::io::Write;
+    let temp = path.with_extension(format!("tmp-{}", &random_token()[..12]));
+    let result = (|| {
+        let mut file = create_new_private_file(&temp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&temp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    Ok(result?)
+}
+
 /// Cuts text to at most `max_chars` characters and adds an ellipsis.
 pub fn truncate_chars(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {

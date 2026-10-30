@@ -736,6 +736,16 @@ impl MockBackend {
                     &mut applied.later,
                 )?;
             }
+            // Settings > Hub and Settings > Clients.
+            command @ (Command::LoadHubStatus
+            | Command::BackUpNow
+            | Command::UpdateBackupSettings(_)
+            | Command::LoadClients
+            | Command::RevokeClient { .. }
+            | Command::ClientPairingCode
+            | Command::CancelClientPairing) => {
+                applied.output = crate::mock_admin::apply(&mut state, command, &mut applied.later)?;
+            }
             // Connectors, skills and the provider extras.
             other => {
                 applied.output = crate::mock_backend_ext::apply(

@@ -16,6 +16,7 @@
 
 pub mod admin;
 mod api;
+mod backup;
 mod connectors;
 mod coordinator;
 mod error;
@@ -68,6 +69,8 @@ pub struct HubHandle {
     public_url: String,
     server: JoinHandle<std::io::Result<()>>,
     background: Vec<JoinHandle<()>>,
+    /// The lock on `hub.lock` in the data folder, held while the hub runs.
+    _lock: std::fs::File,
 }
 
 /// Makes a single-use client setup code that is valid for 10 minutes.
@@ -117,6 +120,15 @@ pub async fn serve(config: HubConfig) -> Result<HubHandle> {
             format!("http://{host}")
         }
     };
+    // One hub at a time for a data folder. `consort hub restore` reads the
+    // same lock.
+    store::create_private_dir(&config.data_dir)?;
+    let lock = backup::try_lock(&config.data_dir)?.ok_or_else(|| {
+        HubError::Startup(format!(
+            "another hub uses the data folder {}. Stop it first, or choose another folder.",
+            config.data_dir.display()
+        ))
+    })?;
     let hub = Hub::open(&config.data_dir, public_url.clone()).await?;
 
     let has_client = hub.store.read(machine::active_client_count).await? > 0;
@@ -147,6 +159,7 @@ pub async fn serve(config: HubConfig) -> Result<HubHandle> {
         maintenance::spawn(&hub),
         spawn_connector_sweep(&hub),
         spawn_skill_update_check(&hub),
+        backup::spawn_scheduler(&hub),
     ];
     hub.recover();
     if let Err(err) = hub.resume_connect_polls().await {
@@ -159,6 +172,7 @@ pub async fn serve(config: HubConfig) -> Result<HubHandle> {
         public_url,
         server,
         background,
+        _lock: lock,
     })
 }
 
@@ -278,6 +292,18 @@ impl HubHandle {
                 audits: Vec::new(),
             })
             .await
+    }
+
+    /// Starts the scheduled backup when one is due at `at`, as the hub does
+    /// every 30 seconds. Returns true when it started one. Tests use it to
+    /// run the schedule at a chosen time.
+    pub fn backup_if_due_at(&self, at: Timestamp) -> Result<bool> {
+        self.hub.backup_if_due(at)
+    }
+
+    /// Whether a backup runs now.
+    pub fn backup_running(&self) -> bool {
+        self.hub.backup_running()
     }
 
     /// The address that the hub listens on, with the real port.

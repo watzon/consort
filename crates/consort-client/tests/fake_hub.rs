@@ -62,6 +62,12 @@ struct Hub {
     seq: u64,
     /// The request types of each WebSocket session, in order.
     sessions: Vec<Vec<String>>,
+    /// `hub.status` says that a backup runs for this many more answers.
+    backup_polls_left: u32,
+    /// The backup settings that `hub.backup_settings` keeps.
+    backup_settings: Option<api::BackupSettings>,
+    /// The other paired app that `client.list` names.
+    other_client: Option<consort_proto::model::Client>,
     channel: Option<Channel>,
     task: Option<Task>,
     approval: Option<Approval>,
@@ -1420,6 +1426,136 @@ async fn session(hub: Shared, mut socket: WebSocket) {
                 let _ = socket.send(WsMessage::Close(None)).await;
                 return;
             }
+            "hub.status" => {
+                let mut h = hub.lock().unwrap();
+                h.recorded.push((req.kind.clone(), req.body.clone()));
+                let running = (h.backup_polls_left > 0).then(|| {
+                    h.backup_polls_left -= 1;
+                    api::BackupProgress {
+                        trigger: api::BackupTrigger::Manual,
+                        started_at: Timestamp::now(),
+                        bytes_done: 10,
+                        bytes_total: 40,
+                    }
+                });
+                let finished =
+                    h.recorded.iter().any(|(k, _)| k == "hub.backup") && running.is_none();
+                req.respond_ok(&api::HubStatusResult {
+                    status: api::HubInfo {
+                        hub_url: "https://hub.example.com".into(),
+                        hub_version: "0.6.0".into(),
+                        protocol_versions: vec![1],
+                        data_dir: "/var/lib/consort".into(),
+                        storage: api::HubStorage {
+                            database_bytes: 300,
+                            blobs_bytes: 600,
+                            skills_bytes: 100,
+                            free_bytes: Some(5_000),
+                        },
+                        backup: api::BackupInfo {
+                            settings: h.backup_settings.clone().unwrap_or(api::BackupSettings {
+                                schedule: api::BackupSchedule::default(),
+                                folder: "/var/lib/consort/backups".into(),
+                                keep: 7,
+                            }),
+                            last: finished.then(|| api::BackupRecord {
+                                file_name: "consort-2026-10-29-0300.tar".into(),
+                                path: "/var/lib/consort/backups/consort-2026-10-29-0300.tar".into(),
+                                size_bytes: 40,
+                                trigger: api::BackupTrigger::Manual,
+                                started_at: Timestamp::now(),
+                                finished_at: Timestamp::now(),
+                                error: None,
+                            }),
+                            running,
+                        },
+                    },
+                })
+                .unwrap()
+            }
+            "hub.backup" => {
+                let mut h = hub.lock().unwrap();
+                h.recorded.push((req.kind.clone(), req.body.clone()));
+                h.backup_polls_left = 2;
+                req.respond_ok(&api::HubBackupResult {
+                    progress: api::BackupProgress {
+                        trigger: api::BackupTrigger::Manual,
+                        started_at: Timestamp::now(),
+                        bytes_done: 0,
+                        bytes_total: 40,
+                    },
+                })
+                .unwrap()
+            }
+            "hub.backup_settings" => {
+                let body: api::HubBackupSettings = req.decode_as().unwrap();
+                let mut h = hub.lock().unwrap();
+                h.recorded.push((req.kind.clone(), req.body.clone()));
+                let mut settings = h.backup_settings.clone().unwrap_or(api::BackupSettings {
+                    schedule: api::BackupSchedule::default(),
+                    folder: "/var/lib/consort/backups".into(),
+                    keep: 7,
+                });
+                if let Some(folder) = body.folder.filter(|f| !f.starts_with('/')) {
+                    req.respond_error(ErrorBody::new(
+                        ErrorCode::Invalid,
+                        format!("The backup folder must be a full path on the hub machine. \"{folder}\" is not."),
+                    ))
+                } else {
+                    if let Some(schedule) = body.schedule {
+                        settings.schedule = schedule;
+                    }
+                    if let Some(keep) = body.keep {
+                        settings.keep = keep;
+                    }
+                    h.backup_settings = Some(settings.clone());
+                    req.respond_ok(&api::HubBackupSettingsResult { settings })
+                        .unwrap()
+                }
+            }
+            "client.list" => {
+                let h = hub.lock().unwrap();
+                let me = h.client_id.unwrap();
+                let mine = consort_proto::model::Client {
+                    id: me,
+                    name: "MacBook Pro".into(),
+                    kind: consort_proto::model::ClientKind::Desktop,
+                    public_key: consort_proto::auth::PublicKey::from_bytes([1; 32]),
+                    push_provider: None,
+                    paired_at: Timestamp::now(),
+                    last_seen_at: Some(Timestamp::now()),
+                    revoked_at: None,
+                    os: Some(consort_proto::model::Os::Macos),
+                    paired_by: Some(consort_proto::model::PairedBy::HubMachine),
+                };
+                let mut clients = vec![mine];
+                clients.extend(h.other_client.clone());
+                req.respond_ok(&api::ClientListResult {
+                    clients,
+                    online: vec![me],
+                })
+                .unwrap()
+            }
+            "client.revoke" => {
+                let body: api::ClientRevoke = req.decode_as().unwrap();
+                let mut h = hub.lock().unwrap();
+                h.recorded.push((req.kind.clone(), req.body.clone()));
+                if Some(body.client_id) == h.client_id {
+                    req.respond_error(ErrorBody::new(
+                        ErrorCode::Conflict,
+                        "You cannot revoke the client that you are using.",
+                    ))
+                } else {
+                    req.respond_ok(&Empty {}).unwrap()
+                }
+            }
+            "client.pairing_code" => req
+                .respond_ok(&api::ClientPairingCodeResult {
+                    hub_url: "https://hub.example.com".into(),
+                    code: "KQ7M-4XPD".parse().unwrap(),
+                    expires_at: Timestamp::now().plus_millis(600_000),
+                })
+                .unwrap(),
             other => req.respond_error(ErrorBody::new(
                 ErrorCode::Invalid,
                 format!("The fake hub has no {other}."),
@@ -4761,4 +4897,185 @@ async fn a_skill_zip_goes_up_before_the_preview() {
         .unwrap_err();
     assert!(err.to_string().contains("not a zip file"), "{err}");
     assert_eq!(blob_log(&hub).len(), before);
+}
+
+/// Phase 3: Settings > Hub loads the status, Back up now follows the backup
+/// until it ends, and a schedule change sends this computer's time zone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_hub_page_loads_backs_up_and_changes_the_schedule() {
+    let (url, hub) = start_hub().await;
+    let dir = tempfile::tempdir().unwrap();
+    let client = paired_client(&url, dir.path(), options(quick())).await;
+    client.run(Command::LoadHubStatus).await.unwrap();
+    let state = wait_for(&client, "the hub status", |s| {
+        s.admin.hub.load == consort_client::LoadState::Loaded
+    })
+    .await;
+    assert_eq!(state.admin.hub.address, "https://hub.example.com");
+    assert_eq!(
+        state.admin.hub.storage.summary,
+        "1000 B used, 5 KB free on the hub disk"
+    );
+    assert_eq!(state.admin.hub.backup.keep_label, "The last 7 backups");
+
+    client.run(Command::BackUpNow).await.unwrap();
+    wait_for(&client, "a running backup", |s| s.admin.hub.backup.busy).await;
+    let done = wait_for(&client, "the finished backup", |s| {
+        matches!(
+            s.admin.hub.backup.last,
+            consort_client::admin::LastBackupView::Done { .. }
+        )
+    })
+    .await;
+    assert!(!done.admin.hub.backup.busy);
+    let polls = hub
+        .lock()
+        .unwrap()
+        .recorded
+        .iter()
+        .filter(|(k, _)| k == "hub.status")
+        .count();
+    assert!(polls >= 3, "the client asked {polls} times");
+
+    client
+        .run(Command::UpdateBackupSettings(
+            consort_client::admin::BackupChanges {
+                frequency: Some(consort_client::admin::BackupFrequency::Weekly),
+                weekday: Some(consort_client::admin::Weekday::Friday),
+                ..Default::default()
+            },
+        ))
+        .await
+        .unwrap();
+    let sent = hub
+        .lock()
+        .unwrap()
+        .recorded
+        .iter()
+        .rev()
+        .find(|(k, _)| k == "hub.backup_settings")
+        .map(|(_, body)| body.clone())
+        .unwrap();
+    assert_eq!(sent["schedule"]["frequency"], "weekly");
+    assert_eq!(sent["schedule"]["weekday"], "friday");
+    assert_eq!(sent["schedule"]["time"], "03:00");
+    assert_eq!(
+        sent["schedule"]["time_zone"],
+        consort_client::admin::local_time_zone()
+    );
+    let state = wait_for(&client, "the weekly schedule", |s| {
+        s.admin.hub.backup.frequency == consort_client::admin::BackupFrequency::Weekly
+    })
+    .await;
+    assert_eq!(state.admin.hub.backup.weekday_label, "On Friday");
+
+    // A folder that the hub refuses shows its reason.
+    let err = client
+        .run(Command::UpdateBackupSettings(
+            consort_client::admin::BackupChanges {
+                folder: Some("backups".into()),
+                ..Default::default()
+            },
+        ))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("full path"), "{err}");
+    let state = wait_for(&client, "the folder error", |s| {
+        s.admin.hub.backup.error.is_some()
+    })
+    .await;
+    assert!(
+        state
+            .admin
+            .hub
+            .backup
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("full path")
+    );
+}
+
+/// Phase 3: Settings > Clients lists the apps, revokes another app, and the
+/// pairing dialog sees the app that paired with its code.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_clients_page_lists_revokes_and_sees_a_new_app() {
+    let (url, hub) = start_hub().await;
+    let dir = tempfile::tempdir().unwrap();
+    let client = paired_client(&url, dir.path(), options(quick())).await;
+    let me = hub.lock().unwrap().client_id.unwrap();
+    let other = consort_proto::model::Client {
+        id: ClientId::new(),
+        name: "bigboi".into(),
+        kind: consort_proto::model::ClientKind::Desktop,
+        public_key: consort_proto::auth::PublicKey::from_bytes([2; 32]),
+        push_provider: None,
+        paired_at: Timestamp::now(),
+        last_seen_at: Some(Timestamp::now().plus_millis(-7_200_000)),
+        revoked_at: None,
+        os: Some(consort_proto::model::Os::Windows),
+        paired_by: Some(consort_proto::model::PairedBy::Client { client_id: me }),
+    };
+    hub.lock().unwrap().other_client = Some(other.clone());
+    client.run(Command::LoadClients).await.unwrap();
+    let state = wait_for(&client, "the clients", |s| s.admin.clients.rows.len() == 2).await;
+    let rows = &state.admin.clients.rows;
+    assert!(rows[0].this_app && rows[0].online);
+    assert_eq!(rows[1].name, "bigboi");
+    assert!(
+        rows[1]
+            .detail
+            .starts_with("Desktop app on Windows. Paired from MacBook Pro on ")
+    );
+    assert_eq!(rows[1].status, "Seen 2 hours ago");
+
+    // The app that you use cannot go.
+    let err = client
+        .run(Command::RevokeClient {
+            client_id: me.to_string(),
+        })
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("cannot revoke"), "{err}");
+    client
+        .run(Command::RevokeClient {
+            client_id: other.id.to_string(),
+        })
+        .await
+        .unwrap();
+    wait_for(&client, "the row to go", |s| {
+        s.admin.clients.rows.len() == 1
+    })
+    .await;
+
+    // The pairing dialog waits, then names the new app from the feed.
+    client.run(Command::ClientPairingCode).await.unwrap();
+    let state = wait_for(&client, "a pairing code", |s| s.admin.pairing.is_some()).await;
+    let pairing = state.admin.pairing.clone().unwrap();
+    assert_eq!(pairing.code, "KQ7M-4XPD");
+    assert!(pairing.qr_text.contains("https://hub.example.com"));
+    assert!(pairing.paired.is_none());
+    let new_app = consort_proto::model::Client {
+        id: ClientId::new(),
+        name: "ThinkPad".into(),
+        paired_at: Timestamp::now().plus_millis(1_000),
+        paired_by: Some(consort_proto::model::PairedBy::Client { client_id: me }),
+        os: Some(consort_proto::model::Os::Linux),
+        ..other
+    };
+    let frame = feed(&mut hub.lock().unwrap(), EntityPayload::Client(new_app));
+    push(&hub, vec![frame]);
+    let state = wait_for(&client, "the paired app", |s| {
+        s.admin.pairing.as_ref().is_some_and(|p| p.paired.is_some())
+    })
+    .await;
+    assert_eq!(
+        state.admin.pairing.as_ref().unwrap().paired.as_deref(),
+        Some("ThinkPad")
+    );
+    client.run(Command::CancelClientPairing).await.unwrap();
+    wait_for(&client, "the dialog to close", |s| {
+        s.admin.pairing.is_none()
+    })
+    .await;
 }

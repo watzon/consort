@@ -501,6 +501,28 @@ pub struct Client {
     pub last_seen_at: Option<Timestamp>,
     /// When the user revoked the client.
     pub revoked_at: Option<Timestamp>,
+    /// The operating system that the client reported when it paired. Empty
+    /// for a client that paired before the hub recorded it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os: Option<Os>,
+    /// Who made the pairing code that the client used. Empty when the hub
+    /// does not know.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paired_by: Option<PairedBy>,
+}
+
+/// Who made the pairing code that a client or a worker used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PairedBy {
+    /// A command on the hub machine: the setup code at the first start,
+    /// `consort hub setup-code` or the dev mode.
+    HubMachine,
+    /// A paired client.
+    Client {
+        /// The client that made the code.
+        client_id: ClientId,
+    },
 }
 
 #[cfg(test)]

@@ -305,7 +305,9 @@ impl Hub {
         _request: ClientList,
     ) -> Result<ClientListResult> {
         let clients = self.store.read(machine::clients).await?;
-        Ok(ClientListResult { clients })
+        let mut online: Vec<_> = self.clients.connected_clients().into_iter().collect();
+        online.sort_by_key(ToString::to_string);
+        Ok(ClientListResult { clients, online })
     }
 
     pub(crate) async fn client_revoke(

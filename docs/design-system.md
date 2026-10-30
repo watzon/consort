@@ -317,6 +317,24 @@ Connectors and skills use these sizes. The Add connector and Add skill dialogs a
 
 A service logo is the image that Composio gives. The client loads it (`https` only, at most 256 KiB, SVG, PNG, JPEG, WebP or GIF). Until it loads, and when it does not, the logo is a monogram: the first letter of the service on `surface.selected`.
 
+### Hub, Clients and Notifications
+
+Settings pages that are not lists (Hub, Clients, Notifications) use one column of `settings_detail_max` (760 px), with section titles in Body at the title weight and bordered row groups (`border.subtle`, `lg` corners, rows with 12 by 16 px padding). The values come from the Paper artboards `7JP-0`, `86L-0`, `8L0-0` and `8XN-0`, through `component.admin` in `structure.json`:
+
+| Token | Size (px) | Use |
+|---|---|---|
+| `storage_bar`, `legend_swatch`, `legend_gap` | 6, 8, 28 | The storage bar of Settings > Hub and its legend. The bar shows only Consort's own use, split into database, blobs and skills in `text.primary`, `text.tertiary` and `text.secondary`. Free disk space is a line of text. Status colors stay for state |
+| `time_select` | 120 | The time select (and the day select of a weekly schedule) of the backup schedule. The Keep select is `settings_select` |
+| `status_col`, `action_col` | 150, 72 | The status column (a dot and "Online now" or "Seen 2 hours ago") and the Revoke column of a client row |
+| `client_tile`, `client_icon`, `row_gap` | 32, 16, 14 | The tile at the left of a client row |
+| `confirm_indent` | 62 | The inline Revoke confirm starts under the client name. Its row is on `tint.failed`, with Cancel and a `status.failed` Revoke. The app that you use has no Revoke |
+| `code_text`, `code_pad_x` | 34/42, 18 | The setup code of the Pair a new app dialog, in mono |
+| `qr`, `qr_pad` | 148, 8 | The QR code: dark modules on a light ground in both modes |
+| `countdown_bar` | 3 | The bar under the code that empties over the 10 minutes |
+| `copy_button`, `copy_small` | 28, 26 | The copy button of an address row and of the address field |
+| `dock_tile`, `dock_mark`, `dock_badge` | 40, 24, 18 | The Dock icon preview with its count on `status.failed` |
+| `banner_width`, `banner_tile`, `banner_mark` | 360, 32, 20 | The example banner of Settings > Notifications |
+
 ## Provider logos
 
 Every provider shows with its logo, never as text alone. The logos are in `crates/consort-desktop/assets/providers/` (see the NOTICE there).

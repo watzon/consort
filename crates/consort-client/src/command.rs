@@ -508,6 +508,24 @@ pub enum Command {
         path: String,
         pending: bool,
     },
+    // Settings > Hub and Settings > Clients. See `crate::admin`.
+    /// Asks the hub for its status. While a backup runs, the client asks
+    /// again every second until it ends.
+    LoadHubStatus,
+    /// Starts a backup on the hub now.
+    BackUpNow,
+    /// Changes some backup settings. A schedule change sends this
+    /// computer's time zone.
+    UpdateBackupSettings(crate::admin::BackupChanges),
+    /// Loads the paired apps.
+    LoadClients,
+    RevokeClient {
+        client_id: String,
+    },
+    /// Makes a pairing code for a new app. It shows in
+    /// `ViewState::admin.pairing`.
+    ClientPairingCode,
+    CancelClientPairing,
 }
 
 /// Refuses a channel ID that cannot name a channel. The ID is empty until the

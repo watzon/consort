@@ -8,6 +8,7 @@
 //! - `commands`: what each [`Command`] asks of the hub,
 //! - `url`: the hub URL rules.
 
+mod admin;
 mod commands;
 mod extensions;
 mod files;
@@ -493,6 +494,7 @@ pub async fn pair(
         public_key: PublicKey::from_bytes(key.verifying_key().to_bytes()),
         name: options.name.clone(),
         kind: options.kind,
+        os: consort_proto::model::Os::from_std_os(std::env::consts::OS),
     };
     let mut builder = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))

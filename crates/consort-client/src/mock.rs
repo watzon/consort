@@ -1386,6 +1386,7 @@ pub fn view_state() -> ViewState {
         uploads: Vec::new(),
         channel_files: crate::mock_files::channel_files(),
         files_loaded: vec![text(LIGHTS), text(EXT4)],
+        admin: crate::mock_admin::admin(),
     };
     stamp_times(&mut state.timelines);
     if let Some(account) = state

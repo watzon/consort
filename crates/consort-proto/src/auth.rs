@@ -252,6 +252,9 @@ pub struct PairClientRequest {
     pub name: String,
     /// The kind of client.
     pub kind: ClientKind,
+    /// The operating system of the client. An older client leaves it out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os: Option<Os>,
 }
 
 /// The `200` body of `POST /v1/pair/client`.

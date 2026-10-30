@@ -7,6 +7,9 @@
 // A release build on Windows is a window app, with no console window.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod admin;
+#[cfg(test)]
+mod admin_tests;
 mod app;
 mod assets;
 #[cfg(test)]
@@ -23,6 +26,7 @@ mod fonts;
 #[cfg(test)]
 mod keys_tests;
 mod notice;
+mod notify_platform;
 #[cfg(test)]
 mod phase5_tests;
 mod read_marker;
@@ -46,7 +50,8 @@ actions!(consort, [Quit]);
 /// account-settings, hub-cards, tutti-manages, instructions, mark-idle,
 /// mark-working, mark-needs-you, mark-done. Phase 1: top-tint,
 /// attachments, drop, bubbles, lightbox, files, files-menu, files-drop,
-/// files-empty, thread-attach and add-skill-upload. Phase 5: add-worker,
+/// files-empty, thread-attach and add-skill-upload. Phase 3: hub, clients,
+/// clients-revoke, pair-client and notifications. Phase 5: add-worker,
 /// add-worker-install, worker-added and update-ready. The old names `everything` and
 /// `everything-manages` still work. `--light` and `--dark` set
 /// the mode, and `--theme <name>` the theme.
@@ -146,6 +151,9 @@ fn main() {
                 saved,
                 ui::motion::system_reduce_motion(),
             ));
+            // The identity of the app's notifications (the AppUserModelID
+            // on Windows).
+            cx.set_app_identity("dev.consort.desktop", "Consort");
             cx.on_action(|_: &Quit, cx| cx.quit());
             cx.bind_keys([gpui_kit::KeyBinding::new("cmd-q", Quit, None)]);
             cx.set_menus(vec![

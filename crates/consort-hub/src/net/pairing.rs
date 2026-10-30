@@ -299,6 +299,8 @@ impl Hub {
                     paired_at: tx.now(),
                     last_seen_at: None,
                     revoked_at: None,
+                    os: request.os,
+                    paired_by: origin.map(Origin::paired_by),
                 };
                 tx.save_client(&client)?;
                 tx.set_client_paired_by(client.id, origin)?;
@@ -383,6 +385,7 @@ mod tests {
                 public_key: consort_proto::auth::PublicKey::from_bytes([7; 32]),
                 name: "Guess".to_owned(),
                 kind: consort_proto::model::ClientKind::Desktop,
+                os: None,
             })
             .await;
         assert_eq!(result.unwrap_err().code(), ErrorCode::Unauthorized);

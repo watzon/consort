@@ -102,6 +102,17 @@
     "brand_mark": 26,
     "brand_gap": 8,
     "focus_ring": 2,
+    "admin": {
+      "storage_bar": 6, "legend_swatch": 8, "swatch_radius": 2, "legend_gap": 28,
+      "status_col": 150, "action_col": 72, "client_tile": 32, "client_icon": 16, "row_gap": 14, "confirm_indent": 62,
+      "code_text": { "size": 34, "line": 42, "weight": 400, "tracking": 0.06 }, "code_pad_x": 18,
+      "qr": 148, "qr_pad": 8, "countdown_bar": 3, "time_select": 120, "copy_button": 28, "copy_small": 26,
+      "dock_tile": 40, "dock_mark": 24, "dock_badge": 18, "dock_badge_offset": 7,
+      "dock_badge_text": { "size": 11, "line": 14, "weight": 600, "tracking": 0 },
+      "banner_width": 360, "banner_tile": 32, "banner_tile_radius": 8, "banner_mark": 20, "banner_gap": 10,
+      "banner_title": { "size": 13, "line": 18, "weight": 600, "tracking": 0 },
+      "banner_text": { "size": 13, "line": 18, "weight": 400, "tracking": 0 }
+    },
     "files": {
       "chip_image": 56,
       "chip_file": 240,

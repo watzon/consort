@@ -6,6 +6,7 @@ pub const TUTTI: &str = "Tutti";
 
 pub mod add_account;
 pub mod add_worker;
+pub mod admin_parts;
 pub mod attachments;
 pub mod channel_extensions;
 pub mod channel_panel;
@@ -24,6 +25,9 @@ pub mod onboarding;
 pub mod panels;
 pub mod parts;
 pub mod settings;
+pub mod settings_clients;
+pub mod settings_hub;
+pub mod settings_notifications;
 pub mod sidebar;
 pub mod skills;
 pub mod startup_error;

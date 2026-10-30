@@ -198,6 +198,10 @@ Decision cards, approval cards and task cards are our own components.
 
 GPUI has its own executors and does not run on Tokio. The desktop app gets updates from `client-core` through a channel and updates GPUI entities on the foreground executor. GPUI Kit depends on `gpui-pre` 0.3.10 with an exact version, because the `gpui` crate on crates.io stopped at 0.2.2 in October 2025. We pin both versions exactly.
 
+### Notifications
+
+The desktop app shows a system notification when an approval or a decision waits, when a task moves to Ready for review or Failed, when the assistant posts in a channel that is not on screen, and, when the user turns it on, when a routine posts a result. The rules live in `consort-client` (`notify`): each event notifies once, nothing that was there at the first load notifies, and nothing notifies while its place is on screen in the active window. The desktop app only delivers: GPUI's `show_system_notification` posts it, and a click opens the task thread or the channel. The Dock icon shows the number of approvals and decisions that wait plus the tasks in Ready for review (macOS, through `objc2-app-kit`); Windows and Linux show the number in the window title. The switches live on the client, not on the hub. Message text is off by default. macOS shows notifications only for an app that runs from an app bundle.
+
 ### Mobile
 
 The mobile app is Expo or native Swift and Kotlin. We choose later, after a spike. Either way, the app renders `client-core` view state through generated bindings. Two platform limits shape the design:
@@ -226,7 +230,9 @@ The binary name `app` is a placeholder until the product has a name.
 
 ## Deployment
 
-**Hub.** One binary and one data folder (`hub.db` and `blobs/`). It listens on a local address and does not serve HTTPS itself: a reverse proxy such as Caddy does, with automatic certificates (decision: a documented proxy is enough, no built-in ACME). It runs as a hardened systemd service (`deploy/hub/consort-hub.service`) or as a container (`Dockerfile`, `deploy/hub/docker-compose.yml`). To run a worker on the same machine, install it as a user service with `consort worker install`. Back up `hub.db` with SQLite's online backup, or stream it with Litestream. The steps are in [deploy.md](deploy.md).
+**Hub.** One binary and one data folder (`hub.db` and `blobs/`). It listens on a local address and does not serve HTTPS itself: a reverse proxy such as Caddy does, with automatic certificates (decision: a documented proxy is enough, no built-in ACME). It runs as a hardened systemd service (`deploy/hub/consort-hub.service`) or as a container (`Dockerfile`, `deploy/hub/docker-compose.yml`). To run a worker on the same machine, install it as a user service with `consort worker install`. The steps are in [deploy.md](deploy.md). Settings > Hub backs the hub up: Back up now, or a daily or weekly schedule that the hub runs itself. A backup is one tar archive in a folder on the hub machine, with a consistent copy of `hub.db` from SQLite's online backup, the keys and every blob (see [data-model.md](data-model.md#backups)). The hub keeps the last N archives.
+
+To restore, stop the hub and run `consort hub restore <backup> --data <data folder>` on the hub machine. It refuses to run while a hub uses the folder, refuses a file that is not a Consort backup (or that a newer hub made), and refuses a folder that is not empty unless you add `--force`. With `--force`, the database, the blobs, the keys and the backup settings that were in the folder move to `before-restore-<time>/` in it first, so nothing is lost. The restore checks every blob hash and runs SQLite's integrity check before it changes the folder. Then start the hub as before. The clients and workers that were paired when the backup was made connect again with their keys.
 
 **Worker.** One binary for each OS. The worker must run as the logged-in user, not as a system account, because harness logins live in the profile folders in the user's Consort home (`~/.consort`, or `CONSORT_HOME`), next to the managed tools. The service for each OS:
 

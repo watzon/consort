@@ -4,7 +4,7 @@ use consort_proto::auth::PairingCode;
 use consort_proto::client_api::EntityPayload;
 use consort_proto::frame::FrameId;
 use consort_proto::ids::{ClientId, SessionId, WorkerId};
-use consort_proto::model::{Client, PushProvider, Worker, WorkerState};
+use consort_proto::model::{Client, PairedBy, PushProvider, Worker, WorkerState};
 use consort_proto::time::Timestamp;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
@@ -32,6 +32,14 @@ impl Origin {
         match self {
             Self::Client(id) => id.to_string(),
             Self::HubMachine => HUB_MACHINE.to_owned(),
+        }
+    }
+
+    /// The wire form of who paired a client.
+    pub fn paired_by(self) -> PairedBy {
+        match self {
+            Self::Client(client_id) => PairedBy::Client { client_id },
+            Self::HubMachine => PairedBy::HubMachine,
         }
     }
 
@@ -203,8 +211,20 @@ pub fn client(conn: &Connection, id: ClientId) -> Result<Option<Client>> {
     )
 }
 
+/// Every client, revoked ones included, in pairing order. A client that
+/// paired before the client record held `paired_by` gets it from the
+/// `paired_by` column.
 pub fn clients(conn: &Connection) -> Result<Vec<Client>> {
-    list_docs(conn, "SELECT data FROM clients ORDER BY rowid", [])
+    Ok(client_records(conn)?
+        .into_iter()
+        .map(|record| {
+            let mut client = record.client;
+            if client.paired_by.is_none() {
+                client.paired_by = record.paired_by.map(Origin::paired_by);
+            }
+            client
+        })
+        .collect())
 }
 
 /// The number of clients that are paired and not revoked.
