@@ -632,3 +632,23 @@ The user was away during the first build, from 2026-10-29. These are the choices
 | 626 | Worker | The OpenCode `HOME` stays as it is: an own `HOME` for an account that Consort made, the real `HOME` for an account from `worker.toml`. OpenSSH needs no pin, because `ssh` reads `~/.ssh` through the password database. A test runs `ssh -G` with an own `HOME` that has an `.ssh/config`. | Verified on macOS with OpenSSH 10.3. An own `HOME` for a hand-written account would hide `~/.opencode` and its plugins, which the user wrote | Yes |
 | 627 | Worker | `download_blob`, `download_blob_to_file` and `git_with` give a time-out message that names the limit in words ("did not answer within 400 milliseconds", "did not finish in 2 minutes") and the next step. The HTTP limits are a value (`HttpLimits`) that tests change. | A silent server must end at its limit with a message the user can act on | Yes |
 | 628 | Docs | The protocol says that the connector wait is 4 minutes 45 seconds and describes the `assistant_change` notice (a `notice` message with a JSON body `{kind, text}`). The data model describes `hub-secret.key`, `composio.key` and the logo cache. The "Placeholders for step 2" list is out of the connectors plan. | The three open doc items of the finish plan | Yes |
+| 629 | Hub | A batch is a normal turn only with a user-caused event (message, decision or card answer, rating); else any proactive event makes it proactive; research gets a turn of its own | The stricter rule wins, so a merge never drops the limits | Yes |
+| 630 | Hub | `task_update` carries the kind of the proactive turn that started the task (`proactive_tasks`, schema 11) | Proactive limits travel with the work they cause | Yes |
+| 631 | Hub | A turn of memory suggestions only may use memory tools and post, nothing more | A suggestion is text from a task, not an instruction from the user | Yes |
+| 632 | Hub | `message_channel` is refused in a proactive turn; `message_task` and `retry_task` reach only the turn's own draft tasks | A proactive turn must not start ungated work elsewhere | Yes |
+| 633 | Hub | Connector calls that write or send ask each time in a proactive turn and in a draft task, ignoring earlier allows | "Ask before acting outward" in code | Yes |
+| 634 | Hub | A task started after "Do it" on an offer is a draft task | The offer says the work runs in draft mode | Yes |
+| 635 | Protocol | `session.turn.approval_mode` and `session.start.turn_approval_mode`: a mode for one turn, at most the session's | Proactive and research turns run the coordinator harness in Ask | Yes |
+| 636 | Worker | A harness that cannot change its mode in a session refuses a stricter turn (`policy_denied`) | Fail closed | Yes |
+| 637 | Hub | `set_proactivity` only starts or extends a snooze; never ends one or Pause all | The tool only makes things quieter | Yes |
+| 638 | Hub | At most 10 follow-ups run per channel per day; a follow-up set in a proactive turn is skipped over the budget | No endless chains | Yes |
+| 639 | Hub | The brief and the research pass need 12 hours between runs; the hub walks the next runs of the schedule | A brief every minute is not a brief | Yes |
+| 640 | Hub | Proactive routines follow the "more than 1 hour late" rule; a late follow-up is deleted | Same rule as every routine | Yes |
+| 641 | Hub | The writer thread catches a panic of one job | One bug must not stop every write | Yes |
+| 642 | Backup | Archive names in UTC; prune by manifest time | A local-time name can go back | Yes |
+| 643 | Backup | The temp database copy is 0600 from creation | The backup folder may be shared | Yes |
+| 644 | Hub | Research notes under `research/` post no memory line | The research pass never posts | Yes |
+| 645 | Protocol | `hello` has `hub_epoch`, new at database creation and at restore; the client loads a snapshot when it differs | A restored hub's feed numbers name other changes | Yes |
+| 646 | Client | A generation per pairing; old links and calls never write the cache | Old hub data must not land under a new owner | Yes |
+| 647 | Client | No save while a recover waits for skipped data | The saved cursor never passes data that is not in the file | Yes |
+| 648 | Hub schema | Version 11; version 10 is a no-op kept for the voice build | Two branches add migrations at the same time | Yes |
