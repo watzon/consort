@@ -548,6 +548,19 @@ impl ConsortApp {
                     div(),
                 ),
             },
+            Dialog::ConfirmDeleteFile(..)
+            | Dialog::RenameFile(..)
+            | Dialog::MoveFile(..)
+            | Dialog::ChooseChannelFiles(_) => match self.file_dialog(dialog, t, window, cx) {
+                Some(parts) => parts,
+                None => (
+                    String::new(),
+                    String::new(),
+                    t.layout.dialog_width,
+                    div(),
+                    div(),
+                ),
+            },
             Dialog::AddAccount(_) => {
                 let (title, description, width, body, actions, logo) =
                     self.add_account_dialog(t, window, cx);
@@ -1032,6 +1045,7 @@ impl ConsortApp {
             kind
         };
         let confirm = button("dialog-confirm", label.to_owned(), fill, t)
+            .debug_selector(|| "dialog-confirm".into())
             .when(busy, |b| b.opacity(t.opacity.busy))
             .px(t.space.md + t.space.xxs)
             .on_click(cx.listener(move |this, _, window, cx| on_confirm(this, window, cx)));

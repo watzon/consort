@@ -326,7 +326,54 @@ pub fn directory_entry_view(e: &model::SkillDirectoryEntry) -> DirectoryEntryVie
     }
 }
 
-pub fn install_source(input: &SkillInstallInput) -> Result<SkillInstallSource, ClientError> {
+/// A skill zip that is on the hub: its hash and size, from the upload.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UploadedZip {
+    pub sha256: consort_proto::model::Sha256Hash,
+    pub size: u64,
+}
+
+/// The file name of a skill zip, as the user gave it.
+pub fn zip_file_name(file_path: &str) -> String {
+    std::path::Path::new(file_path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| file_path.to_owned())
+}
+
+/// Refuses a skill zip that the hub would refuse, before the upload: a file
+/// that is not a zip, or one over the skill limit (25 MB).
+pub fn check_skill_zip(file_path: &str, size: u64) -> Result<(), ClientError> {
+    let invalid = |message: String| ClientError::Hub {
+        code: "invalid".into(),
+        message,
+    };
+    if !zip_file_name(file_path)
+        .to_ascii_lowercase()
+        .ends_with(".zip")
+    {
+        return Err(invalid(
+            "This file is not a zip file. Choose a zip file with a SKILL.md at its top.".into(),
+        ));
+    }
+    let limit = consort_proto::model::SKILL_UPLOAD_MAX_BYTES;
+    if size > limit {
+        return Err(invalid(format!(
+            "This zip file is {} MB. The limit for a skill is {} MB. Choose a smaller file.",
+            size.div_ceil(1024 * 1024),
+            limit / (1024 * 1024)
+        )));
+    }
+    Ok(())
+}
+
+/// The source of a skill for `skill.preview` and `skill.install`. An upload
+/// needs the blob that the client sent first (see
+/// `hub::files::Shared::skill_source`).
+pub fn install_source(
+    input: &SkillInstallInput,
+    uploaded: Option<&UploadedZip>,
+) -> Result<SkillInstallSource, ClientError> {
     match input {
         SkillInstallInput::Directory { source, entry_id } => Ok(SkillInstallSource::Directory {
             source: source.clone(),
@@ -347,11 +394,16 @@ pub fn install_source(input: &SkillInstallInput) -> Result<SkillInstallSource, C
                 git_ref: git_ref.clone().filter(|r| !r.trim().is_empty()),
             })
         }
-        // The client cannot upload a blob yet. See docs/notes/step2-desktop.md.
-        SkillInstallInput::Upload { .. } => Err(ClientError::Other(
-            "Consort cannot upload a skill file from this app yet. Put the skill in a git repo, then add it under Git URL."
-                .into(),
-        )),
+        SkillInstallInput::Upload { file_path } => match uploaded {
+            Some(zip) => Ok(SkillInstallSource::Upload {
+                blob_sha256: zip.sha256.clone(),
+                size: zip.size,
+                file_name: zip_file_name(file_path),
+            }),
+            None => Err(ClientError::Other(
+                "Consort did not upload the zip file. Try again".into(),
+            )),
+        },
     }
 }
 

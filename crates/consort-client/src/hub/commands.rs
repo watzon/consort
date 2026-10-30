@@ -52,6 +52,11 @@ impl Backend for HubBackend {
     }
 }
 
+/// Reads an ID of `what` for a request. See [`parse`].
+pub(crate) fn parse_id<T: std::str::FromStr>(id: &str, what: &str) -> Result<T, ClientError> {
+    parse(id, what)
+}
+
 fn parse<T: std::str::FromStr>(id: &str, what: &str) -> Result<T, ClientError> {
     id.parse().map_err(|_| {
         ClientError::Other(format!(
@@ -153,26 +158,37 @@ async fn run(shared: Arc<Shared>, command: Command) -> Result<CommandOutput, Cli
             channel_id,
             body,
             client_message_id,
+            attachments,
         } => {
             // No channel has loaded yet, or the ID is not a channel. The
             // message would wait in the outbox and fail later.
             crate::command::check_channel_id(&channel_id)?;
+            let target = crate::uploads::UploadTarget::Composer {
+                channel_id: channel_id.clone(),
+            };
+            let blobs = shared.wait_for_uploads(&target, &attachments).await?;
             let pending = PendingSend {
                 client_message_id,
                 channel_id,
                 thread_root_id: None,
                 body,
                 created_at: format::now_ms(),
+                attachments: blobs,
             };
-            return queue_send(&shared, pending)
-                .await
-                .map(|()| CommandOutput::Done);
+            queue_send(&shared, pending).await?;
+            shared.take_uploads(&attachments);
+            return Ok(CommandOutput::Done);
         }
         Command::ReplyToTask {
             task_id,
             body,
             client_message_id,
+            attachments,
         } => {
+            let target = crate::uploads::UploadTarget::Reply {
+                task_id: task_id.clone(),
+            };
+            let blobs = shared.wait_for_uploads(&target, &attachments).await?;
             let (channel_id, root) = shared
                 .cache
                 .lock()
@@ -189,10 +205,45 @@ async fn run(shared: Arc<Shared>, command: Command) -> Result<CommandOutput, Cli
                 thread_root_id: Some(root),
                 body,
                 created_at: format::now_ms(),
+                attachments: blobs,
             };
-            return queue_send(&shared, pending)
-                .await
-                .map(|()| CommandOutput::Done);
+            queue_send(&shared, pending).await?;
+            shared.take_uploads(&attachments);
+            return Ok(CommandOutput::Done);
+        }
+        Command::Attach { target, inputs } => {
+            return Ok(CommandOutput::Attached(shared.attach(target, inputs)));
+        }
+        Command::RetryUpload { id } => shared.retry_upload(&id)?,
+        Command::RemoveUpload { id } => shared.remove_upload(&id),
+        Command::LoadChannelFiles { channel_id } => shared.load_files(&channel_id).await?,
+        Command::MoveChannelFile {
+            channel_id,
+            from_path,
+            to_path,
+        } => shared.move_file(&channel_id, from_path, to_path).await?,
+        Command::DeleteChannelFile { channel_id, path } => {
+            shared.delete_file(&channel_id, path).await?
+        }
+        Command::SaveToChannelFiles {
+            channel_id,
+            path,
+            blob,
+        } => shared.put_file(&channel_id, path, blob).await?,
+        Command::FetchBlob { sha256, size, name } => {
+            let path = shared.fetch_blob(&sha256, size).await?;
+            let path = match name {
+                Some(name) => shared.named_copy(&sha256, &path, &name)?,
+                None => path,
+            };
+            return Ok(CommandOutput::LocalFile(path.display().to_string()));
+        }
+        Command::SaveBlob { sha256, size, to } => {
+            let path = shared.fetch_blob(&sha256, size).await?;
+            std::fs::copy(&path, &to).map_err(|e| ClientError::Storage {
+                path: to.clone(),
+                message: e.to_string(),
+            })?;
         }
         Command::EditMessage { message_id, body } => {
             // Refuse a body that the hub would refuse. The caller keeps its

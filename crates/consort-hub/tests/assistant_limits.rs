@@ -5,9 +5,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-mod common;
-
-use common::*;
+use crate::common::*;
 use consort_proto::client_api::ChannelUpdate;
 use consort_proto::frame::{EventFrame, Frame};
 use consort_proto::model::{ApprovalMode, Isolation, LocalMcpServerInfo, RoutineAction};

@@ -38,6 +38,10 @@ use crate::util::truncate_chars;
 /// session is signed out. The worker sends it (`consort-harness` has the
 /// same constant).
 pub(crate) const SIGNED_OUT_CODE: &str = "signed_out";
+/// The `code` of the error event that a worker sends when it could not get
+/// an attachment or a channel file for a session. The hub also posts it as
+/// a notice, so the user sees which file the session did not get.
+pub(crate) const ATTACHMENT_FAILED_CODE: &str = "attachment_failed";
 
 /// Work to do after the transaction commits.
 #[derive(Default)]
@@ -390,6 +394,21 @@ fn apply_event(tx: &mut Tx<'_>, ctx: &mut Ctx<'_>, event: &SessionEvent) -> Resu
         SessionEvent::Error { code, message } => {
             if code == SIGNED_OUT_CODE {
                 on_signed_out(tx, ctx, message)?;
+            }
+            if code == ATTACHMENT_FAILED_CODE {
+                // The user sees it where the files went: in the task thread,
+                // or in the channel of a coordinator.
+                let (thread, task) = match ctx.task.as_ref() {
+                    Some(task) => (Some(task.card_message_id), Some(task.id)),
+                    None => (None, None),
+                };
+                tx.post_notice(
+                    ctx.channel.id,
+                    thread,
+                    task,
+                    ATTACHMENT_FAILED_CODE,
+                    message,
+                )?;
             }
             let item = SessionItem {
                 id: ItemId::new(),
@@ -1039,16 +1058,16 @@ fn task_turn_ended(
     // after it.
     let inbox = work::task_inbox(tx.db(), task_id)?;
     if !inbox.is_empty() && !ctx.session.state.is_final() {
-        let (taken, text) = inbox_batch(&inbox, TURN_TEXT_MAX_BYTES);
+        let (taken, turn) = inbox_batch(&inbox, TURN_TEXT_MAX_BYTES);
         tx.delete_task_inbox(&taken)?;
+        let channel_files =
+            tx.channel_files_for_turn(ctx.session.id, ctx.channel.id, Some(task_id))?;
         tx.queue_command(
             ctx.session.worker_id,
             &HubToWorker::SessionTurn(SessionTurn {
                 session_id: ctx.session.id,
-                turn: TurnInput {
-                    text,
-                    attachments: Vec::new(),
-                },
+                turn,
+                channel_files,
             }),
         )?;
         ctx.runtime.turn_open = true;
@@ -1170,19 +1189,23 @@ pub(crate) fn end_session_by_hub(
     Ok(ctx.fx)
 }
 
-/// The inbox messages that go into one turn: their row IDs and the joined
-/// text. A first message that alone does not fit is cut.
-fn inbox_batch(inbox: &[(i64, String)], room: usize) -> (Vec<i64>, String) {
+/// The inbox messages that go into one turn: their row IDs, and the turn
+/// with the joined text and all their attachments. A first message that
+/// alone does not fit is cut.
+fn inbox_batch(inbox: &[work::InboxMessage], room: usize) -> (Vec<i64>, TurnInput) {
     const GAP: &str = "\n\n";
     let mut taken = Vec::new();
     let mut text = String::new();
+    let mut attachments = Vec::new();
     let mut used = 0;
-    for (id, message) in inbox {
+    for entry in inbox {
+        let (id, message) = (&entry.id, &entry.text);
         let cost = json_len(message) + if taken.is_empty() { 0 } else { json_len(GAP) };
         if used + cost > room {
             if taken.is_empty() {
                 taken.push(*id);
                 text = cut_text(message, room);
+                attachments.extend(entry.attachments.iter().cloned());
             }
             break;
         }
@@ -1190,10 +1213,11 @@ fn inbox_batch(inbox: &[(i64, String)], room: usize) -> (Vec<i64>, String) {
             text.push_str(GAP);
         }
         text.push_str(message);
+        attachments.extend(entry.attachments.iter().cloned());
         used += cost;
         taken.push(*id);
     }
-    (taken, text)
+    (taken, TurnInput { text, attachments })
 }
 
 /// Marks a loaded session as lost because the hub decided so, and saves it.
@@ -1373,6 +1397,7 @@ mod tests {
                 text: "More work".to_owned(),
                 attachments: Vec::new(),
             },
+            channel_files: None,
         })
     }
 

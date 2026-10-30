@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use consort_proto::ids::{ChannelId, SessionId};
 use consort_proto::model::{
-    Channel, FileRef, Isolation, PlacementRequest, Session, SessionRole, SessionState, Usage,
+    BlobRef, Channel, Isolation, PlacementRequest, Session, SessionRole, SessionState, Usage,
 };
 use consort_proto::turn_input::{WakeEvent, render_events};
 use consort_proto::worker_link::{
@@ -164,6 +164,28 @@ impl Coordinators {
 /// bytes as a JSON string. The other events wait for the next turn, which
 /// starts when this one ends. A first event that alone does not fit is cut,
 /// with a note that tells the coordinator how to read all of it.
+/// The attachments of the user messages in a batch of wake events, in the
+/// order of the events. The hub reads them from the stored messages, so a
+/// message that the user deleted in the meantime gives none.
+fn event_attachments(conn: &rusqlite::Connection, events: &[WakeEvent]) -> Result<Vec<BlobRef>> {
+    let mut out: Vec<BlobRef> = Vec::new();
+    for event in events {
+        let WakeEvent::UserMessage { id, .. } = event else {
+            continue;
+        };
+        if let Some(message) = conversation::message(conn, *id)?
+            && message.deleted_at.is_none()
+        {
+            for blob in message.attachments {
+                if !out.contains(&blob) {
+                    out.push(blob);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
 fn turn_batch(events: &[(i64, WakeEvent)], room: usize) -> (Vec<i64>, Vec<WakeEvent>, String) {
     let shell = json_len(&render_events(&[]));
     let mut used = shell;
@@ -295,7 +317,6 @@ struct Inputs {
     global_index: String,
     channel_index: String,
     context: String,
-    files: Vec<FileRef>,
     /// The effective set of connectors and skills, for the fingerprint.
     extensions_key: String,
 }
@@ -355,9 +376,7 @@ impl Hub {
                     .await?;
                 inputs.workers = workers;
                 inputs.open = open;
-                let (context, files) = self.fresh_context(channel_id).await?;
-                inputs.context = context;
-                inputs.files = files;
+                inputs.context = self.fresh_context(channel_id).await?;
                 let (global, own) = self.memory_indexes(&inputs.channel).await?;
                 inputs.global_index = global;
                 inputs.channel_index = own;
@@ -373,6 +392,8 @@ impl Hub {
                     if row.turn_open || row.session_id != Some(session.id) {
                         return Ok(false);
                     }
+                    let attachments = event_attachments(tx.db(), &events)?;
+                    let channel_files = tx.channel_files_for_turn(session.id, channel_id, None)?;
                     tx.delete_wakes(&event_ids)?;
                     tx.save_coordinator(&CoordinatorRow {
                         channel_id,
@@ -396,8 +417,9 @@ impl Hub {
                             session_id: session.id,
                             turn: TurnInput {
                                 text: rendered,
-                                attachments: Vec::new(),
+                                attachments,
                             },
+                            channel_files,
                         }),
                     )?;
                     Ok(true)
@@ -454,7 +476,6 @@ impl Hub {
         let (event_ids, events, rendered) = turn_batch(&inputs.events, room);
         let first_turn = format!("{}\n\n{rendered}", inputs.context);
         let worker_id = placement.worker_id;
-        let files = inputs.files.clone();
         let channel = inputs.channel.clone();
         let started = self
             .store
@@ -484,6 +505,8 @@ impl Hub {
                 };
                 tx.save_session(&session)?;
                 let extensions = tx.session_extensions(worker_id, channel_id)?;
+                let channel_files = tx.channel_files_for_start(session.id, channel_id, None)?;
+                let attachments = event_attachments(tx.db(), &events)?;
                 tx.save_session_runtime(
                     session.id,
                     &SessionRuntime {
@@ -518,12 +541,12 @@ impl Hub {
                         },
                         system_prompt_append: system_prompt,
                         allowed_local_mcp_servers: Vec::new(),
-                        channel_files: files,
+                        channel_files,
                         extensions,
                         resume: None,
                         turn: Some(TurnInput {
                             text: first_turn,
-                            attachments: Vec::new(),
+                            attachments,
                         }),
                     }),
                 )?;
@@ -556,8 +579,8 @@ impl Hub {
         true
     }
 
-    /// The `<context>` block and the channel files for a new session.
-    async fn fresh_context(&self, channel_id: ChannelId) -> Result<(String, Vec<FileRef>)> {
+    /// The `<context>` block for a new session.
+    async fn fresh_context(&self, channel_id: ChannelId) -> Result<String> {
         self.store
             .read(move |conn| {
                 let tasks = work::tasks_in_channel(conn, channel_id, false)?;
@@ -570,14 +593,7 @@ impl Hub {
                     usize::MAX,
                 )?;
                 messages.reverse();
-                let files = knowledge::channel_files(conn, channel_id, None)?
-                    .into_iter()
-                    .map(|f| FileRef {
-                        path: f.path,
-                        sha256: f.blob_sha256,
-                    })
-                    .collect();
-                Ok((prompts::context_pack(&tasks, &messages), files))
+                Ok(prompts::context_pack(&tasks, &messages))
             })
             .await
     }
@@ -671,7 +687,7 @@ impl Hub {
                 } else {
                     (Vec::new(), HashMap::new())
                 };
-                let (context, files) = if session.is_none() {
+                let context = if session.is_none() {
                     let tasks = work::tasks_in_channel(conn, channel_id, false)?;
                     let (mut messages, _) = conversation::messages_page(
                         conn,
@@ -682,16 +698,9 @@ impl Hub {
                         usize::MAX,
                     )?;
                     messages.reverse();
-                    let files = knowledge::channel_files(conn, channel_id, None)?
-                        .into_iter()
-                        .map(|f| FileRef {
-                            path: f.path,
-                            sha256: f.blob_sha256,
-                        })
-                        .collect();
-                    (prompts::context_pack(&tasks, &messages), files)
+                    prompts::context_pack(&tasks, &messages)
                 } else {
-                    (String::new(), Vec::new())
+                    String::new()
                 };
                 let extensions_key =
                     crate::connectors::extensions::effective_set_key(conn, channel_id)?;
@@ -705,7 +714,6 @@ impl Hub {
                     global_index: String::new(),
                     channel_index: String::new(),
                     context,
-                    files,
                     extensions_key,
                 }))
             })

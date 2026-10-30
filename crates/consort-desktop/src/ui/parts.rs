@@ -316,6 +316,37 @@ pub fn button(
     }
 }
 
+/// A secondary button with an icon before its label, such as Upload or
+/// Save.
+pub fn icon_text_button(
+    id: impl Into<ElementId>,
+    icon_name: &str,
+    label: impl Into<SharedString>,
+    t: &Tokens,
+) -> Stateful<Div> {
+    let c = &t.colors;
+    focusable(div().id(id), t)
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .gap(t.space.xs + t.space.xxs)
+        .py(t.space.xs)
+        .px(t.space.md)
+        .rounded(t.radius.md)
+        .bg(c.surface_raised)
+        .border(t.border_width)
+        .border_color(c.border_strong)
+        .type_style(t.text.ui_strong)
+        .text_color(c.text_primary)
+        .cursor_pointer()
+        .whitespace_nowrap()
+        .hover(|s| s.bg(c.hover_raised))
+        .active(|s| s.bg(c.pressed_raised))
+        .child(icon(icon_name, t.icon.dense, c.text_secondary))
+        .child(label.into())
+}
+
 /// A square icon button with `md` corners. `hover` is the hover fill for the
 /// surface it sits on. The keyboard can focus it.
 /// An icon in a square button. While the pointer is on it, the icon

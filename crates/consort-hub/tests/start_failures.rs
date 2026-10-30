@@ -5,9 +5,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-mod common;
-
-use common::*;
+use crate::common::*;
 use consort_proto::error::{ErrorBody, ErrorCode};
 use consort_proto::frame::MessageFamily;
 use consort_proto::model::AuthState;

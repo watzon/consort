@@ -56,7 +56,11 @@ These come from the user's experience with GPUI. Follow them in every view.
    - An account row (Settings > Workers): Account settings, Rename, Sign out, Remove.
    - A worker row: Rename, Edit tags, Pause, Remove.
    - The composer: Cut, Copy, Paste, Select all.
-3. **The chat never has a hard edge.** The top and bottom of the timeline fade into the canvas, so text never stops at a sharp line. GPUI has no blur filter for elements, so use layered gradients from the canvas color to transparent (at the top, a solid part `layout.fade_top_solid`, 92 px, that ends just below the Three voices mark and the activity pill, then a blend `layout.fade_top_blend`, 24 px; and `layout.fade_bottom`, 32 px, above the composer).
+   - An attachment in a message or a thread post: Open, Save, Save to channel files. An artifact is in the channel files already, so it has no Save to channel files.
+   - An attachment chip in the composer or the reply box: Try again (failed only), Remove.
+   - A file row (Channel panel > Files): Open, Download, Rename, Move, Delete. A folder row and a task row of the artifacts have no menu.
+   - The add button of the composer and the reply box (a left click): Upload from this computer, Choose from channel files.
+3. **The chat never has a hard edge.** The top and bottom of the timeline fade into the canvas, so text never stops at a sharp line. GPUI has no blur filter for elements, so use layered gradients. At the top, a progressive tint `layout.top_tint` (the canvas from about 94 percent to clear at 184 px, drawn as three gradient layers) lies under the Three voices mark, the activity pill and the top actions; content under it stays faintly visible. At rest the first item starts at `layout.content_top` (92 px). Above the composer, `layout.fade_bottom` (32 px). Lists that scroll inside a panel or a dialog fade at their edges too.
 4. **Dropdowns flip.** Any menu, popover or select that can run past the window edge opens downward when there is room and upward when there is not. Use GPUI's anchored positioning with anchor switching, not a fixed offset.
 5. **Colors and sizes come from tokens.** Read colors from the active `consort-theme` theme, and sizes from `design/structure.json` through `consort-theme`. No hex values or ad hoc pixel sizes in view code.
 6. **Copy follows the design system.** Sentence case, verbs on buttons, no all-caps labels, no middle dots between details, no arrows in button text. Errors say what happened and what to do next.

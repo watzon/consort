@@ -19,7 +19,7 @@ use crate::{
             ButtonKind, button, detail, focusable, glyph, icon, icon_button, line, selectable,
             text, worker_dot,
         },
-        sidebar::{row, title_bar_height},
+        sidebar::{group_label, row, title_bar_height},
     },
 };
 
@@ -159,27 +159,27 @@ impl ConsortApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let c = &t.colors;
-        let mut nav = div().flex().flex_col();
-        for (gi, (group, items)) in SECTIONS.iter().enumerate() {
-            nav = nav.child(
-                div()
-                    .px(t.space.sm)
-                    .pt(if gi == 0 { t.space.md } else { t.space.lg })
-                    .pb(t.space.xs)
-                    .child(text(*group, t.text.label, c.text_tertiary)),
-            );
+        let sb = t.component.sidebar;
+        let mut nav = div().flex().flex_col().gap(t.space.xxs);
+        for (group, items) in SECTIONS.iter() {
+            nav = nav.child(group_label(t).pt(sb.group_top).child(text(
+                *group,
+                sb.label_text,
+                c.text_tertiary,
+            )));
             for (section, label, icon_name) in items.iter() {
                 let selected = self.settings_section == *section;
                 let section = *section;
                 nav = nav.child(
                     row(t)
                         .id(SharedString::from(format!("settings-{label}")))
+                        .debug_selector(move || format!("settings-{label}"))
                         .cursor_pointer()
                         .when(selected, |d| d.bg(c.surface_selected))
                         .when(!selected, |d| d.hover(|s| s.bg(c.hover_sidebar)))
                         .child(icon(
                             icon_name,
-                            t.icon.size,
+                            sb.row_icon,
                             if selected {
                                 c.text_primary
                             } else {
@@ -189,7 +189,7 @@ impl ConsortApp {
                         .child(
                             text(
                                 *label,
-                                t.text.ui,
+                                sb.row_text,
                                 if selected {
                                     c.text_primary
                                 } else {
@@ -210,7 +210,7 @@ impl ConsortApp {
             .flex_none()
             .w(t.layout.sidebar_width)
             .h_full()
-            .px(t.space.sm)
+            .px(sb.inset)
             .bg(c.surface_sidebar)
             .border_r(t.border_width)
             .border_color(c.border_subtle)
@@ -221,8 +221,8 @@ impl ConsortApp {
                     .mt(t.space.xs)
                     .cursor_pointer()
                     .hover(|s| s.bg(c.hover_sidebar))
-                    .child(icon("chevron-left", t.icon.size, c.text_secondary))
-                    .child(text("Back to Consort", t.text.ui, c.text_primary))
+                    .child(icon("chevron-left", sb.row_icon, c.text_secondary))
+                    .child(text("Back to Consort", sb.row_text, c.text_primary))
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.page = Page::Main;
                         cx.notify();

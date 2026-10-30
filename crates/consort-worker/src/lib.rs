@@ -13,6 +13,7 @@
 mod accounts;
 #[cfg(test)]
 mod accounts_tests;
+pub mod attachments;
 pub mod bridge;
 pub mod cap;
 pub mod config;

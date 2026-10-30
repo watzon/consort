@@ -173,7 +173,7 @@ impl Hub {
             .write(move |tx| match task_id {
                 Some(task_id) => {
                     let text = render_events(std::slice::from_ref(&event));
-                    match deliver_in_tx(&hub, tx, task_id, &text, Actor::System) {
+                    match deliver_in_tx(&hub, tx, task_id, &text, &[], Actor::System) {
                         Ok(delivered) => Ok((Some(delivered.worker_id), delivered.status_changed)),
                         Err(err) => {
                             tracing::warn!(error = %err, "could not give a card answer to its task");

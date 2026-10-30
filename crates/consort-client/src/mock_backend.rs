@@ -74,9 +74,14 @@ impl MockBackend {
         let archiving = matches!(command, Command::ArchiveChannel { .. });
         match command {
             Command::SendMessage {
-                channel_id, body, ..
+                channel_id,
+                body,
+                attachments,
+                ..
             } => {
                 crate::command::check_channel_id(&channel_id)?;
+                timeline_mut(&mut state, &channel_id)?;
+                let attachments = crate::mock_files::take_ready(&mut state, &attachments)?;
                 let timeline = timeline_mut(&mut state, &channel_id)?;
                 timeline.items.push(TimelineItem::Message(MessageView {
                     id: message_id,
@@ -85,21 +90,35 @@ impl MockBackend {
                     time_label: time,
                     created_at: now,
                     body,
+                    attachments,
                     ..MessageView::default()
                 }));
                 reply_to = Some(channel_id);
             }
-            Command::ReplyToTask { task_id, body, .. } => {
+            Command::ReplyToTask {
+                task_id,
+                body,
+                attachments,
+                ..
+            } => {
+                if !state.threads.iter().any(|t| t.task_id == task_id) {
+                    return Err(not_found());
+                }
+                let attachments = crate::mock_files::take_ready(&mut state, &attachments)?;
                 let thread = state
                     .threads
                     .iter_mut()
                     .find(|t| t.task_id == task_id)
                     .ok_or_else(not_found)?;
+                let mut bodies = vec![PostBody::Text(body)];
+                if !attachments.is_empty() {
+                    bodies.push(PostBody::Attachments(attachments));
+                }
                 thread.posts.push(ThreadPost {
                     id: message_id,
                     speaker: Speaker::You,
                     time_label: time,
-                    bodies: vec![PostBody::Text(body)],
+                    bodies,
                     pending: false,
                 });
                 if let Some(task) = state.tasks.iter_mut().find(|t| t.id == task_id)
@@ -700,6 +719,23 @@ impl MockBackend {
                     agents: crate::mock::acp_agents(),
                 };
             }
+            // Files and uploads.
+            command @ (Command::Attach { .. }
+            | Command::RetryUpload { .. }
+            | Command::RemoveUpload { .. }
+            | Command::LoadChannelFiles { .. }
+            | Command::MoveChannelFile { .. }
+            | Command::DeleteChannelFile { .. }
+            | Command::SaveToChannelFiles { .. }
+            | Command::FetchBlob { .. }
+            | Command::SaveBlob { .. }) => {
+                applied.output = crate::mock_files::apply(
+                    &mut state,
+                    command,
+                    &mut self.next_id,
+                    &mut applied.later,
+                )?;
+            }
             // Connectors, skills and the provider extras.
             other => {
                 applied.output = crate::mock_backend_ext::apply(
@@ -956,6 +992,38 @@ impl Backend for MockBackend {
         reply: crate::Reply,
         publish: &watch::Sender<Arc<ViewState>>,
     ) {
+        // A send with uploads that still run waits for them, as on the hub.
+        let waits_for = match &command {
+            Command::SendMessage { attachments, .. } | Command::ReplyToTask { attachments, .. } => {
+                Some(attachments.clone())
+            }
+            _ => None,
+        }
+        .filter(|ids| {
+            !ids.is_empty()
+                && self
+                    .state
+                    .lock()
+                    .is_ok_and(|s| !crate::mock_files::uploads_settled(&s, ids))
+        });
+        if let Some(ids) = waits_for {
+            let state = self.state.clone();
+            let publish = publish.clone();
+            let mut later = MockBackend {
+                state: self.state.clone(),
+                next_id: self.next_id + 1000,
+            };
+            tokio::spawn(async move {
+                while state
+                    .lock()
+                    .is_ok_and(|s| !crate::mock_files::uploads_settled(&s, &ids))
+                {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                let _ = reply.send(later.apply_and_publish(command, &publish));
+            });
+            return;
+        }
         let _ = reply.send(self.apply_and_publish(command, publish));
     }
 }

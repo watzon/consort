@@ -687,22 +687,45 @@ impl ConsortApp {
             .state
             .thread(task_id)
             .and_then(|th| th.model_label.clone());
+        let reply_target = consort_client::UploadTarget::Reply {
+            task_id: task_id.to_owned(),
+        };
+        let reply_chips = self.render_upload_chips(&reply_target, t, cx);
+        let paste_target = reply_target.clone();
+        let add_target = reply_target.clone();
+        let dropping = self
+            .drop_hover
+            .is_some_and(|(over, _)| over == crate::app::DropOver::Reply);
         let reply = div()
             .flex_none()
             .px(t.space.lg)
             .pb(t.space.xl)
             .child(
                 div()
+                    .id("reply-box")
+                    .debug_selector(|| "reply-box".into())
                     .flex()
-                    .items_center()
-                    .gap(t.space.sm)
-                    .py(t.space.sm + t.space.xxs)
-                    .pl(t.space.md + t.space.xxs)
-                    .pr(t.space.sm + t.space.xxs)
+                    .flex_col()
+                    .gap(t.space.xs)
+                    .py(t.space.sm)
+                    .px(t.space.sm)
                     .bg(c.surface_card)
                     .border(t.border_width)
                     .border_color(c.border_strong)
                     .rounded(t.radius.lg)
+                    .when(dropping, |d| {
+                        d.border(t.stroke)
+                            .border_dashed()
+                            .border_color(c.accent_text)
+                            .bg(c.accent_fill.opacity(t.opacity.drop_fill))
+                    })
+                    .capture_action(cx.listener(
+                        move |this, _: &gpui_kit::base::input::Paste, _, cx| {
+                            if this.paste_files(paste_target.clone(), cx) {
+                                cx.stop_propagation();
+                            }
+                        },
+                    ))
                     // The reply box has the same menu as the composer.
                     .on_mouse_down(
                         MouseButton::Right,
@@ -712,44 +735,56 @@ impl ConsortApp {
                             cx.stop_propagation();
                         }),
                     )
+                    .children(reply_chips)
                     .child(
                         div()
-                            .flex_1()
                             .min_w_0()
+                            .px(t.space.xs + t.space.xxs)
                             .type_style(t.text.ui)
                             .child(crate::ui::parts::textarea(&self.inputs.reply, t.text.ui)),
                     )
                     .child(
-                        icon_button(
-                            "reply-attach",
-                            "plus",
-                            t.space.xl + t.space.xs,
-                            t.icon.size,
-                            c.text_secondary,
-                            c.hover_card,
-                            t,
-                            cx,
-                        )
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.show_notice("Attachments come in a later build.".into(), cx)
-                        })),
-                    )
-                    .child(
-                        focusable(div().id("reply-send"), t)
-                            .size(t.space.xl + t.space.xs)
-                            .flex_none()
+                        div()
                             .flex()
                             .items_center()
-                            .justify_center()
-                            .rounded(t.radius.md)
-                            .bg(c.surface_raised)
-                            .border(t.border_width)
-                            .border_color(c.border_strong)
-                            .cursor_pointer()
-                            .hover(|s| s.bg(c.hover_raised))
-                            .child(icon("corner-down-left", t.icon.dense, c.text_primary))
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.send_reply(window, cx)),
+                            .justify_between()
+                            .child(
+                                icon_button(
+                                    "reply-attach",
+                                    "plus",
+                                    t.space.xl + t.space.xs,
+                                    t.icon.size,
+                                    c.text_secondary,
+                                    c.hover_card,
+                                    t,
+                                    cx,
+                                )
+                                .debug_selector(|| "reply-attach".into())
+                                .relative()
+                                .child(self.triggers.track("reply-attach"))
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        this.open_add_menu("reply-attach", add_target.clone(), cx)
+                                    },
+                                )),
+                            )
+                            .child(
+                                focusable(div().id("reply-send"), t)
+                                    .size(t.space.xl + t.space.xs)
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded(t.radius.md)
+                                    .bg(c.surface_raised)
+                                    .border(t.border_width)
+                                    .border_color(c.border_strong)
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(c.hover_raised))
+                                    .child(icon("corner-down-left", t.icon.dense, c.text_primary))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.send_reply(window, cx)
+                                    })),
                             ),
                     ),
             )
@@ -856,6 +891,17 @@ impl ConsortApp {
         };
 
         frame(t)
+            .id("thread-panel")
+            .on_drag_move::<gpui_kit::ExternalPaths>(cx.listener(
+                |this, event: &gpui_kit::DragMoveEvent<gpui_kit::ExternalPaths>, _, cx| {
+                    let inside = event.bounds.contains(&event.event.position);
+                    let count = event.drag(cx).paths().len();
+                    this.drag_files_over(crate::app::DropOver::Reply, inside, count, cx);
+                },
+            ))
+            .on_drop(cx.listener(|this, paths: &gpui_kit::ExternalPaths, _, cx| {
+                this.drop_files(crate::app::DropOver::Reply, paths, cx);
+            }))
             .child(head)
             .children(brief)
             .children(reason)
@@ -1106,6 +1152,7 @@ impl ConsortApp {
                     c.text_tertiary,
                 )
                 .into_any_element(),
+                PostBody::Attachments(list) => self.render_post_attachments(&key, list, t, cx),
             };
             col = col.child(element);
         }

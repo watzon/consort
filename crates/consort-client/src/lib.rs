@@ -8,6 +8,7 @@
 //! types are plain records and enums, so UniFFI can export them.
 
 pub mod activity;
+pub mod blob;
 pub mod cache;
 pub mod chat;
 pub mod command;
@@ -15,6 +16,7 @@ pub mod connectors;
 pub mod derive;
 pub mod error;
 pub mod extensions_view;
+pub mod files;
 pub mod format;
 pub mod hub;
 pub mod limits;
@@ -22,12 +24,14 @@ pub mod mock;
 mod mock_backend;
 mod mock_backend_ext;
 pub mod mock_extensions;
+pub mod mock_files;
 pub mod picker;
 pub mod reduce;
 pub mod skills;
 pub mod store;
 #[cfg(test)]
 mod test_entities;
+pub mod uploads;
 pub mod view;
 
 use std::sync::Arc;
@@ -35,13 +39,15 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, watch};
 
 pub use command::{
-    AcpSpec, ChannelChanges, Command, CommandOutput, ConnectionChanges, NewAccount, NewChannel,
-    NewConnection, SecretEnv, SecretText, SkillChanges,
+    AcpSpec, AttachInput, ChannelChanges, Command, CommandOutput, ConnectionChanges, NewAccount,
+    NewChannel, NewConnection, PastedBytes, SecretEnv, SecretText, SkillChanges,
 };
 pub use connectors::*;
 pub use error::ClientError;
+pub use files::{AttachmentView, ChannelFileView, FilesListing};
 pub use skills::*;
 pub use store::Drafts;
+pub use uploads::{UploadStatus, UploadTarget, UploadView};
 pub use view::*;
 
 pub(crate) type Reply = oneshot::Sender<Result<CommandOutput, ClientError>>;
@@ -248,13 +254,56 @@ impl Client {
     /// Sends a message. The client makes the `client_message_id`, so a retry
     /// never makes a second message.
     pub async fn send_message(&self, channel_id: String, body: String) -> Result<(), ClientError> {
+        self.send_message_with(channel_id, body, Vec::new()).await
+    }
+
+    /// Sends a message with the uploads `attachments` (upload IDs). It
+    /// waits until they are on the hub.
+    pub async fn send_message_with(
+        &self,
+        channel_id: String,
+        body: String,
+        attachments: Vec<String>,
+    ) -> Result<(), ClientError> {
         command::check_channel_id(&channel_id)?;
         self.run(Command::SendMessage {
             channel_id,
             body,
             client_message_id: new_client_message_id(),
+            attachments,
         })
         .await
+    }
+
+    /// Attaches files to a target and returns the upload IDs.
+    pub async fn attach(
+        &self,
+        target: UploadTarget,
+        inputs: Vec<AttachInput>,
+    ) -> Result<Vec<String>, ClientError> {
+        match self.run_for(Command::Attach { target, inputs }).await? {
+            CommandOutput::Attached(ids) => Ok(ids),
+            _ => Ok(Vec::new()),
+        }
+    }
+
+    /// Downloads a blob into the local cache and returns its path. With a
+    /// name, the path is a copy with that file name.
+    pub async fn fetch_blob(
+        &self,
+        sha256: String,
+        size: u64,
+        name: Option<String>,
+    ) -> Result<String, ClientError> {
+        match self
+            .run_for(Command::FetchBlob { sha256, size, name })
+            .await?
+        {
+            CommandOutput::LocalFile(path) => Ok(path),
+            _ => Err(ClientError::Other(
+                "Consort could not find the downloaded file. Try again".into(),
+            )),
+        }
     }
 
     /// Pairs with a hub: `POST /v1/pair/client` with the setup or pairing
@@ -269,10 +318,21 @@ impl Client {
     }
 
     pub async fn reply_to_task(&self, task_id: String, body: String) -> Result<(), ClientError> {
+        self.reply_to_task_with(task_id, body, Vec::new()).await
+    }
+
+    /// Replies in a task thread with the uploads `attachments`.
+    pub async fn reply_to_task_with(
+        &self,
+        task_id: String,
+        body: String,
+        attachments: Vec<String>,
+    ) -> Result<(), ClientError> {
         self.run(Command::ReplyToTask {
             task_id,
             body,
             client_message_id: new_client_message_id(),
+            attachments,
         })
         .await
     }

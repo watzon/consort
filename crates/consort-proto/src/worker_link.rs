@@ -499,6 +499,12 @@ pub struct SessionTurn {
     pub session_id: SessionId,
     /// The input.
     pub turn: TurnInput,
+    /// The channel files, when they changed since the list that the session
+    /// got last. The worker then refreshes its copy in
+    /// `<workspace>/.channel/files/` before the turn starts. `None` means no
+    /// change, and it is what an older hub sends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_files: Option<Vec<FileRef>>,
 }
 
 /// The result of [`SessionTurn`].
@@ -1206,6 +1212,27 @@ They are installed as skills. Use one when the task fits it."
     }
 
     #[test]
+    fn a_turn_carries_the_channel_files_only_when_they_changed() {
+        let old = json!({"session_id": ses().to_string(), "turn": {"text": "Hi"}});
+        let parsed: SessionTurn = serde_json::from_value(old).unwrap();
+        assert_eq!(parsed.channel_files, None);
+        let unchanged = serde_json::to_value(&parsed).unwrap();
+        assert!(unchanged.get("channel_files").is_none());
+
+        let changed = SessionTurn {
+            channel_files: Some(vec![FileRef {
+                path: "notes/plan.md".into(),
+                sha256: crate::model::Sha256Hash::from_bytes([7; 32]),
+            }]),
+            ..parsed
+        };
+        let value = serde_json::to_value(&changed).unwrap();
+        assert_eq!(value["channel_files"][0]["path"], "notes/plan.md");
+        let back: SessionTurn = serde_json::from_value(value).unwrap();
+        assert_eq!(back, changed);
+    }
+
+    #[test]
     fn hub_to_worker_round_trips() {
         let workspace = WorkspaceSpec {
             repos: vec![WorkspaceRepo {
@@ -1244,6 +1271,7 @@ They are installed as skills. Use one when the task fits it."
             SessionTurn {
                 session_id: ses(),
                 turn: TurnInput::default(),
+                channel_files: None,
             }
             .into(),
             SessionSteer {

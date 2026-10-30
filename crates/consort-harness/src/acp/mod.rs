@@ -35,11 +35,12 @@ use crate::approval::{
     CLAUDE_SHELL_TOOLS, OPENCODE_NO_PROJECT_CONFIG, claude_mode, claude_mode_allowed,
     claude_option_mode, gemini_mode, opencode_permission,
 };
+use crate::attachments::{ACP_IMAGE_MAX_BYTES, ImageDelivery, ImageLimits, base64, prepare_turn};
 use crate::process::{self, ProcessSpec, StderrTail, resolve_program};
 use crate::{
     AccountConfig, AccountStatus, Answer, EVENT_CHANNEL_CAPACITY, EventReceiver, Harness,
     HarnessError, HarnessKind, HarnessSession, McpServerSpec, SIGNED_OUT_ERROR_CODE, SessionSpec,
-    SignInMethod, SteerFuture, sign_in_hint, sign_in_hint_for, steer_ready, turn_text,
+    SignInMethod, SteerFuture, sign_in_hint, sign_in_hint_for, steer_ready,
 };
 use crate::{extras, skills};
 use mapper::{AcpMapper, stop_reason};
@@ -228,9 +229,43 @@ pub fn opencode_config(
     config
 }
 
+/// The content blocks of a `session/prompt` or a steer: one text block with
+/// the turn text and the attachment block, then one `image` block for each
+/// image attachment when the agent takes images
+/// (`agentCapabilities.promptCapabilities.image`). An image block holds the
+/// base64 bytes and the media type from the bytes, because the agents read
+/// only `data` and ignore a `file://` URI.
+pub fn prompt_blocks(
+    input: &TurnInput,
+    workspace: &std::path::Path,
+    images: bool,
+    preamble: Option<String>,
+) -> Vec<Value> {
+    let limits = images.then_some(ImageLimits {
+        delivery: ImageDelivery::Inline,
+        max_bytes: ACP_IMAGE_MAX_BYTES,
+    });
+    let prepared = prepare_turn(input, workspace, limits);
+    let text = match preamble {
+        Some(pre) => format!("{pre}\n\n{}", prepared.text),
+        None => prepared.text,
+    };
+    let mut blocks = vec![json!({"type": "text", "text": text})];
+    for image in prepared.images {
+        blocks.push(json!({
+            "type": "image",
+            "mimeType": image.format.mime(),
+            "data": base64(&image.data),
+        }));
+    }
+    blocks
+}
+
 /// The capabilities that an ACP account has before the agent reports its
-/// own. The session refines `resume`, `steer` and `mcp_http` from the
-/// agent's `initialize` response.
+/// own. The session refines `resume`, `steer`, `mcp_http` and `images` from
+/// the agent's `initialize` response. `images` is on here only for the
+/// agents whose image input was checked in their source (see
+/// `docs/notes/phase1-backend.md`).
 pub fn static_capabilities(kind: HarnessKind) -> Capabilities {
     match kind {
         HarnessKind::ClaudeCode => Capabilities {
@@ -238,17 +273,20 @@ pub fn static_capabilities(kind: HarnessKind) -> Capabilities {
             resume: true,
             usage: true,
             mcp_http: true,
+            images: true,
             approval_modes: ApprovalMode::ALL.to_vec(),
             ..Capabilities::default()
         },
         HarnessKind::OpenCode => Capabilities {
             resume: true,
+            images: true,
             approval_modes: ApprovalMode::ALL.to_vec(),
             ..Capabilities::default()
         },
         // Auto is `auto_edit`, the same as Auto edits, and Full access is
         // `yolo` (see `gemini_mode`).
         HarnessKind::GeminiCli => Capabilities {
+            images: true,
             approval_modes: ApprovalMode::ALL.to_vec(),
             ..Capabilities::default()
         },
@@ -871,9 +909,17 @@ impl Actor {
             .and_then(|s| s.get("supported"))
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        // The agent says whether it takes image content blocks. Claude Code
+        // (claude-agent-acp), Gemini CLI and OpenCode say yes.
+        let image = agent_caps
+            .get("promptCapabilities")
+            .and_then(|p| p.get("image"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         self.capabilities.resume = self.capabilities.resume && load;
         self.capabilities.steer = self.capabilities.steer && steering;
         self.capabilities.mcp_http = http;
+        self.capabilities.images = image;
         let agent_version = init
             .get("agentInfo")
             .and_then(|i| i.get("version"))
@@ -1213,13 +1259,10 @@ impl Actor {
                             }
                             let turn_id = TurnId::new(uuid::Uuid::now_v7().to_string());
                             mapper.start_turn(turn_id.clone());
-                            let mut text = turn_text(&input);
-                            if let Some(pre) = preamble.take() {
-                                text = format!("{pre}\n\n{text}");
-                            }
+                            let prompt = prompt_blocks(&input, &self.spec.workspace, self.capabilities.images, preamble.take());
                             let message = match UntypedMessage::new(
                                 "session/prompt",
-                                json!({"sessionId": native.as_str(), "prompt": [{"type": "text", "text": text}]}),
+                                json!({"sessionId": native.as_str(), "prompt": prompt}),
                             ) {
                                 Ok(m) => m,
                                 Err(e) => { let _ = reply.send(Err(protocol_error(&e))); continue; }
@@ -1247,7 +1290,7 @@ impl Actor {
                             }
                             let message = match UntypedMessage::new("_session/steering", json!({
                                 "sessionId": native.as_str(),
-                                "prompt": [{"type": "text", "text": turn_text(&input)}],
+                                "prompt": prompt_blocks(&input, &self.spec.workspace, self.capabilities.images, None),
                                 "_meta": {"steering": {"idleBehavior": "promptRequired"}}
                             })) {
                                 Ok(m) => m,
@@ -1836,6 +1879,7 @@ impl Harness for AcpHarness {
                 capabilities.resume = ready.capabilities.resume;
                 capabilities.steer = ready.capabilities.steer;
                 capabilities.mcp_http = ready.capabilities.mcp_http;
+                capabilities.images = ready.capabilities.images;
                 if ready.bypass == Some(false) {
                     // Claude Code turned `bypassPermissions` off, so Full
                     // access would fail. The worker lowers a Full access

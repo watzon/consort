@@ -177,7 +177,7 @@ fn writable_scope(ctx: &ToolCtx) -> Result<MemoryScope> {
 }
 
 /// Turns channel file paths into blob references.
-fn resolve_attachments(
+pub(super) fn resolve_attachments(
     conn: &Connection,
     channel_id: ChannelId,
     paths: &[String],
@@ -270,7 +270,9 @@ impl Hub {
     }
 
     pub(crate) async fn tool_reply(&self, ctx: &ToolCtx, args: ReplyArgs) -> Result<Value> {
-        require_text(&args.body, "reply")?;
+        if args.attachments.is_empty() {
+            require_text(&args.body, "reply")?;
+        }
         let channel_id = ctx.channel.id;
         let session_id = ctx.session.id;
         let task_id = ctx.task.as_ref().map(|t| t.id);
@@ -284,11 +286,13 @@ impl Hub {
                         args.message_id
                     )));
                 }
+                let attachments = resolve_attachments(tx.db(), channel_id, &args.attachments)?;
                 tx.insert_message(NewMessage {
                     thread_root_id: Some(args.message_id),
                     in_timeline: args.in_timeline,
                     author_session_id: Some(session_id),
                     author_task_id: task_id,
+                    attachments,
                     ..NewMessage::new(channel_id, Author::Assistant, MessageKind::Text, args.body)
                 })
             })
@@ -991,6 +995,7 @@ mod tests {
                     message_id: root.id,
                     body: "answer".to_owned(),
                     in_timeline: true,
+                    attachments: Vec::new(),
                 },
             )
             .await
@@ -1009,6 +1014,7 @@ mod tests {
                     message_id: elsewhere.id,
                     body: "x".to_owned(),
                     in_timeline: false,
+                    attachments: Vec::new(),
                 },
             )
             .await;
@@ -1020,6 +1026,7 @@ mod tests {
                     message_id: root.id,
                     body: String::new(),
                     in_timeline: false,
+                    attachments: Vec::new(),
                 },
             )
             .await;
@@ -1124,6 +1131,7 @@ mod tests {
                     message_id: sent[0].id,
                     body: "reply".to_owned(),
                     in_timeline: false,
+                    attachments: Vec::new(),
                 },
             )
             .await
@@ -1708,6 +1716,7 @@ mod tests {
                     message_id: first.id,
                     body: "in a thread".to_owned(),
                     in_timeline: false,
+                    attachments: Vec::new(),
                 },
             )
             .await

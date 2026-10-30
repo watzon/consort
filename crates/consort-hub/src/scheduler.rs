@@ -276,6 +276,7 @@ fn begin_run(tx: &mut Tx<'_>, id: RoutineId, trigger: RunTrigger) -> Result<Begu
                     start_at: None,
                     created_by: TaskCreator::Routine,
                     routine_id: Some(id),
+                    attachments: Vec::new(),
                 }),
                 started_at: now,
                 schedule_error,

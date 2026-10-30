@@ -483,11 +483,11 @@ fn reduce_motion_stops_the_shimmer_of_a_hovered_button(cx: &mut TestAppContext) 
     cx.update(|_, cx| cx.set_reduce_motion(false));
 }
 
-/// The top of the chat is solid canvas down to just below the mark and the
-/// activity pill, so no bubble shows under the status line. The first item
-/// of a chat at rest starts below the solid zone and its blend.
+/// The top of the chat is a progressive tint, not a solid zone: layers from
+/// the canvas at about 94 percent to clear. The mark, the pill and the top
+/// actions sit on the tint. At rest the first item starts below the pill.
 #[gpui::test]
-fn the_first_bubble_starts_below_the_pill_and_the_pill_is_inside_the_solid_top(
+fn the_top_tint_lies_under_the_mark_and_the_first_bubble_starts_below_the_pill(
     cx: &mut TestAppContext,
 ) {
     for mark in [MarkState::Working, MarkState::Idle] {
@@ -501,9 +501,9 @@ fn the_first_bubble_starts_below_the_pill_and_the_pill_is_inside_the_solid_top(
         }
         let (handle, app) = open(state, cx);
         let cx = &mut VisualTestContext::from_window(handle, cx);
-        let (solid, blend) = app.read_with(cx, |_, cx| {
+        let (content_top, stops) = app.read_with(cx, |_, cx| {
             let layout = ConsortApp::tokens(cx).layout;
-            (layout.fade_top_solid, layout.fade_top_blend)
+            (layout.content_top, layout.top_tint)
         });
         let first = app.read_with(cx, |app, _| {
             let items = &app.state.timeline(&app.channel_id).expect("Tutti").items;
@@ -523,15 +523,31 @@ fn the_first_bubble_starts_below_the_pill_and_the_pill_is_inside_the_solid_top(
             .debug_bounds(first)
             .unwrap_or_else(|| panic!("{first} draws"));
         let voices = cx.debug_bounds("three-voices").expect("the mark");
-        let solid_zone = cx.debug_bounds("fade-top-solid").expect("the solid top");
-        assert_eq!(solid_zone.size.height, solid);
-        assert!(voices.bottom() < solid_zone.bottom(), "the mark");
+        // No solid zone any more.
+        assert!(cx.debug_bounds("fade-top-solid").is_none());
+        // One layer between each pair of stops, end to end, from the top of
+        // the timeline to the clear stop.
+        let layers: Vec<_> = (0..stops.len() - 1)
+            .map(|ix| {
+                let name: &'static str = Box::leak(format!("top-tint-{ix}").into_boxed_str());
+                cx.debug_bounds(name)
+                    .unwrap_or_else(|| panic!("{name} draws"))
+            })
+            .collect();
+        let top = layers[0].origin.y;
+        for (ix, layer) in layers.iter().enumerate() {
+            assert_eq!(layer.origin.y - top, stops[ix].at, "layer {ix} starts");
+            assert_eq!(layer.size.height, stops[ix + 1].at - stops[ix].at);
+        }
+        let tint_bottom = layers[layers.len() - 1].bottom();
+        assert_eq!(tint_bottom - top, px(184.));
+        // The mark and the top actions sit on the tint.
+        assert!(voices.bottom() < tint_bottom, "the mark");
+        let tasks = cx.debug_bounds("tasks-button").expect("the Tasks button");
+        assert!(tasks.bottom() < tint_bottom, "the top actions");
         if mark == MarkState::Working {
             let pill = cx.debug_bounds("activity-pill").expect("the pill shows");
-            assert!(
-                pill.bottom() <= solid_zone.bottom(),
-                "the pill ends inside the solid top"
-            );
+            assert!(pill.bottom() < tint_bottom, "the pill sits on the tint");
             assert!(
                 bubble.origin.y >= pill.bottom(),
                 "the first bubble ({:?}) starts at or below the pill ({:?})",
@@ -541,13 +557,13 @@ fn the_first_bubble_starts_below_the_pill_and_the_pill_is_inside_the_solid_top(
         } else {
             assert!(cx.debug_bounds("activity-pill").is_none());
         }
-        // The same layout with and without the pill, so the edge never
-        // jumps. The first row starts below the solid top and the blend.
+        // The same place with and without the pill, so the chat never
+        // jumps.
         assert!(
-            bubble.origin.y >= solid_zone.bottom() + blend - px(1.),
+            bubble.origin.y >= top + content_top - px(1.),
             "{:?} < {:?}",
             bubble.origin.y,
-            solid_zone.bottom() + blend
+            top + content_top
         );
     }
 }

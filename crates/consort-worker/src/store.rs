@@ -358,6 +358,24 @@ impl Store {
         })
     }
 
+    /// Sets the channel file list in a session's stored start, after a
+    /// `session.turn` brought a new list. A resumed session then knows the
+    /// newest list. Only that field changes.
+    pub fn set_channel_files(
+        &self,
+        id: SessionId,
+        files: &[consort_proto::model::FileRef],
+    ) -> Result<(), WorkerError> {
+        let list = serde_json::to_string(files).map_err(|e| WorkerError::Config(e.to_string()))?;
+        self.with(|c| {
+            c.execute(
+                "UPDATE sessions SET start = json_set(start, '$.channel_files', json(?2)) WHERE session_id = ?1",
+                params![id.to_string(), list],
+            )
+            .map(|_| ())
+        })
+    }
+
     /// Sets a session's native reference.
     pub fn set_native_ref(&self, id: SessionId, native: &NativeRef) -> Result<(), WorkerError> {
         self.with(|c| {
@@ -984,6 +1002,24 @@ pub(crate) mod tests {
         assert_eq!(store.processes().unwrap(), vec![record]);
         store.delete_process(4242).unwrap();
         assert!(store.processes().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_new_channel_file_list_reaches_the_stored_start() {
+        let store = Store::in_memory().unwrap();
+        let id = SessionId::new();
+        store.put_session(&record(id)).unwrap();
+        store.set_session_state(id, SessionState::Idle).unwrap();
+        let files = vec![consort_proto::model::FileRef {
+            path: "docs/plan.md".into(),
+            sha256: consort_proto::model::Sha256Hash::from_bytes([3; 32]),
+        }];
+        store.set_channel_files(id, &files).unwrap();
+        let got = store.session(id).unwrap().unwrap();
+        assert_eq!(got.start.channel_files, files);
+        // Only that field changed.
+        assert_eq!(got.state, SessionState::Idle);
+        assert_eq!(got.start.session_id, id);
     }
 
     #[test]

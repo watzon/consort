@@ -8,9 +8,9 @@ use consort_proto::{
     client_api::{EntityKind, EntityPayload, FeedChange, FeedEntry, Snapshot},
     ids::{ChannelId, TaskId},
     model::{
-        AcpRegistryAgent, Approval, Channel, Connection, Decision, Group, ItemPayload, Message,
-        MessageKind, PREFERENCES_ENTITY_ID, Preferences, ReadMarker, Repo, SessionItem, SignIn,
-        Skill, Task, Worker,
+        AcpRegistryAgent, Approval, BlobRef, Channel, ChannelFile, Connection, Decision, Group,
+        ItemPayload, Message, MessageKind, PREFERENCES_ENTITY_ID, Preferences, ReadMarker, Repo,
+        SessionItem, SignIn, Skill, Task, Worker,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -24,6 +24,10 @@ pub struct PendingSend {
     pub thread_root_id: Option<String>,
     pub body: String,
     pub created_at: i64,
+    /// The uploaded blobs that go out with the message. An outbox file from
+    /// an older version has none.
+    #[serde(default)]
+    pub attachments: Vec<BlobRef>,
 }
 
 /// A message that the hub refused after the user had left the composer, such
@@ -81,6 +85,14 @@ pub struct Cache {
     pub repos: BTreeMap<String, Repo>,
     pub workers: BTreeMap<String, Worker>,
     pub messages: BTreeMap<String, Message>,
+    /// The files of the loaded channels, by their feed entity ID
+    /// (`<channel-id>:<path>`). A deleted file is not here.
+    pub channel_files: BTreeMap<String, ChannelFile>,
+    /// The channels whose files are in the cache: from a channel snapshot
+    /// or from `files.list`.
+    pub files_loaded: BTreeSet<String>,
+    /// The blobs in the local blob cache: the hash and the file.
+    pub local_blobs: BTreeMap<String, String>,
     pub tasks: BTreeMap<String, Task>,
     /// The IDs of the cached tasks whose `brief` and `review_summary` are
     /// previews, because a snapshot cut them (`Snapshot::tasks_cut`). A feed
@@ -186,8 +198,11 @@ impl Cache {
         let threads = std::mem::take(&mut self.loaded_threads);
         let dismissed = std::mem::take(&mut self.sign_ins_dismissed);
         let extensions = std::mem::take(&mut self.extensions);
+        let local_blobs = std::mem::take(&mut self.local_blobs);
         *self = Cache::default();
         self.extensions = extensions;
+        // The local blob cache is on disk, so it stays.
+        self.local_blobs = local_blobs;
         // A sign-in that the user closed stays closed after a reload.
         self.sign_ins_dismissed = dismissed;
         self.pending = pending;
@@ -238,8 +253,69 @@ impl Cache {
             self.has_older
                 .insert(id.clone(), snapshot.messages_has_more);
         }
+        // A channel snapshot holds all the files of the channel, so it
+        // replaces the files that the cache held for it.
+        let prefix = format!("{id}:");
+        let fresh: BTreeSet<String> = snapshot
+            .channel_files
+            .iter()
+            .map(ChannelFile::entity_id)
+            .collect();
+        let at = snapshot.seq;
+        let stale: Vec<String> = self
+            .channel_files
+            .keys()
+            .filter(|k| {
+                k.starts_with(&prefix)
+                    && !fresh.contains(*k)
+                    && !self.changed_after(EntityKind::ChannelFile, k, at)
+            })
+            .cloned()
+            .collect();
+        for key in stale {
+            self.channel_files.remove(&key);
+        }
         self.merge_entities(snapshot);
+        self.files_loaded.insert(id.clone());
         self.channels_loaded.insert(id);
+    }
+
+    /// Replaces the files of one channel with the answer to `files.list`.
+    /// A feed entry that changed a file after `asked_at` wins.
+    pub fn load_files(&mut self, channel_id: &str, files: Vec<ChannelFile>, asked_at: u64) {
+        let prefix = format!("{channel_id}:");
+        let fresh: BTreeSet<String> = files.iter().map(ChannelFile::entity_id).collect();
+        let stale: Vec<String> = self
+            .channel_files
+            .keys()
+            .filter(|k| {
+                k.starts_with(&prefix)
+                    && !fresh.contains(*k)
+                    && !self.changed_after(EntityKind::ChannelFile, k, asked_at)
+            })
+            .cloned()
+            .collect();
+        for key in stale {
+            self.channel_files.remove(&key);
+        }
+        for file in files {
+            self.merge_file(file, asked_at);
+        }
+        self.files_loaded.insert(channel_id.to_owned());
+    }
+
+    /// Adds or replaces one channel file, as from the answer to `files.put`
+    /// or `files.move`, unless a feed entry changed it after `asked_at`.
+    pub fn merge_file(&mut self, file: ChannelFile, asked_at: u64) {
+        let key = file.entity_id();
+        if self.changed_after(EntityKind::ChannelFile, &key, asked_at) {
+            return;
+        }
+        if file.deleted_at.is_some() {
+            self.channel_files.remove(&key);
+        } else {
+            self.channel_files.insert(key, file);
+        }
     }
 
     /// The open channels that have no snapshot in the cache yet. A channel
@@ -266,6 +342,9 @@ impl Cache {
         let mut sessions: BTreeSet<String> = BTreeSet::new();
         let mut cards: BTreeSet<String> = BTreeSet::new();
         let in_channel = |c: &ChannelId| c.to_string() == id;
+        let prefix = format!("{id}:");
+        self.channel_files.retain(|k, _| !k.starts_with(&prefix));
+        self.files_loaded.remove(id);
         self.messages.retain(|_, m| {
             let keep = !in_channel(&m.channel_id);
             if !keep {
@@ -404,6 +483,9 @@ impl Cache {
         snapshot
             .skills
             .retain(|s| !self.changed_after(EntityKind::Skill, &s.id.to_string(), at));
+        snapshot
+            .channel_files
+            .retain(|f| !self.changed_after(EntityKind::ChannelFile, &f.entity_id(), at));
         if self.changed_after(EntityKind::Preferences, PREFERENCES_ENTITY_ID, at) {
             snapshot.preferences = None;
         }
@@ -499,6 +581,11 @@ impl Cache {
         }
         for s in snapshot.skills {
             self.skills.insert(s.id.to_string(), s);
+        }
+        for f in snapshot.channel_files {
+            if f.deleted_at.is_none() {
+                self.channel_files.insert(f.entity_id(), f);
+            }
         }
     }
 
@@ -725,8 +812,23 @@ impl Cache {
                 EntityPayload::Skill(skill) => {
                     self.skills.insert(skill.id.to_string(), skill);
                 }
-                // Memory notes, files, routines and clients have no view
-                // yet.
+                EntityPayload::ChannelFile(file) => {
+                    // Only the files of a channel whose files are loaded:
+                    // a partial list of another channel would look whole.
+                    let channel = file.channel_id.to_string();
+                    if !self.files_loaded.contains(&channel) {
+                        return false;
+                    }
+                    let key = file.entity_id();
+                    if file.deleted_at.is_some() {
+                        return self.channel_files.remove(&key).is_some();
+                    }
+                    if self.channel_files.get(&key) == Some(&file) {
+                        return false;
+                    }
+                    self.channel_files.insert(key, file);
+                }
+                // Memory notes, routines and clients have no view yet.
                 _ => return false,
             },
             FeedChange::Delete(kind) => {
@@ -747,6 +849,7 @@ impl Cache {
                     EntityKind::SignIn => self.sign_ins.remove(id).is_some(),
                     EntityKind::Connection => self.connections.remove(id).is_some(),
                     EntityKind::Skill => self.skills.remove(id).is_some(),
+                    EntityKind::ChannelFile => self.channel_files.remove(id).is_some(),
                     EntityKind::SessionItem => id.split_once(':').is_some_and(|(session, item)| {
                         let Some(items) = self.session_items.get_mut(session) else {
                             return false;
@@ -850,6 +953,150 @@ mod tests {
             deleted_at: None,
             created_at: Timestamp::from_millis(1),
         }
+    }
+
+    fn channel_file(channel: ChannelId, path: &str, byte: u8) -> ChannelFile {
+        ChannelFile {
+            channel_id: channel,
+            path: path.into(),
+            blob_sha256: consort_proto::model::Sha256Hash::from_bytes([byte; 32]),
+            size: 10,
+            mime: "application/pdf".into(),
+            task_id: None,
+            title: None,
+            updated_by: "user".into(),
+            updated_at: Timestamp::from_millis(1),
+            deleted_at: None,
+        }
+    }
+
+    /// The cache dropped the `channel_file` feed entries. It keeps them now
+    /// for the channels whose files it holds.
+    #[test]
+    fn the_cache_keeps_and_reduces_the_files_of_a_loaded_channel() {
+        let mut cache = Cache::default();
+        let (lights, other) = (ChannelId::new(), ChannelId::new());
+        let mut snapshot = snapshot_at(10);
+        snapshot.channel_files = vec![
+            channel_file(lights, "photos/front.jpg", 1),
+            channel_file(lights, "quote.pdf", 2),
+        ];
+        cache.load_channel(lights, snapshot);
+        assert!(cache.files_loaded.contains(&lights.to_string()));
+        assert_eq!(cache.channel_files.len(), 2);
+        // A new file and a change arrive in the feed.
+        assert!(cache.apply(upsert(
+            11,
+            EntityPayload::ChannelFile(channel_file(lights, "wiring.pdf", 3))
+        )));
+        let mut changed = channel_file(lights, "quote.pdf", 4);
+        changed.size = 99;
+        assert!(cache.apply(upsert(12, EntityPayload::ChannelFile(changed))));
+        assert_eq!(cache.channel_files[&format!("{lights}:quote.pdf")].size, 99);
+        // The same entry again changes nothing.
+        let same = cache.channel_files[&format!("{lights}:quote.pdf")].clone();
+        assert!(!cache.apply(upsert(0, EntityPayload::ChannelFile(same))));
+        // A file of a channel whose files are not loaded does not make a
+        // partial list.
+        assert!(!cache.apply(upsert(
+            13,
+            EntityPayload::ChannelFile(channel_file(other, "x.txt", 5))
+        )));
+        assert_eq!(cache.channel_files.len(), 3);
+        // A file with `deleted_at` and a delete entry both remove it.
+        let mut gone = channel_file(lights, "wiring.pdf", 3);
+        gone.deleted_at = Some(Timestamp::from_millis(2));
+        assert!(cache.apply(upsert(14, EntityPayload::ChannelFile(gone))));
+        let delete = FeedEntry {
+            seq: 15,
+            at: Timestamp::from_millis(0),
+            entity_id: format!("{lights}:photos/front.jpg"),
+            channel_id: Some(lights),
+            change: FeedChange::Delete(EntityKind::ChannelFile),
+        };
+        assert!(cache.apply(delete));
+        let left: Vec<_> = cache
+            .channel_files
+            .values()
+            .map(|f| f.path.as_str())
+            .collect();
+        assert_eq!(left, ["quote.pdf"]);
+        // An older `files.list` answer does not bring back the deleted file
+        // or overwrite the newer size.
+        cache.load_files(
+            &lights.to_string(),
+            vec![
+                channel_file(lights, "photos/front.jpg", 1),
+                channel_file(lights, "quote.pdf", 2),
+            ],
+            9,
+        );
+        let left: Vec<_> = cache.channel_files.values().map(|f| f.size).collect();
+        assert_eq!(left, [99]);
+        // A newer answer replaces the list.
+        cache.load_files(
+            &lights.to_string(),
+            vec![channel_file(lights, "new.pdf", 6)],
+            20,
+        );
+        let left: Vec<_> = cache
+            .channel_files
+            .values()
+            .map(|f| f.path.as_str())
+            .collect();
+        assert_eq!(left, ["new.pdf"]);
+        // The files go with their channel.
+        let delete = FeedEntry {
+            seq: 21,
+            at: Timestamp::from_millis(0),
+            entity_id: lights.to_string(),
+            channel_id: Some(lights),
+            change: FeedChange::Delete(EntityKind::Channel),
+        };
+        cache.apply(delete);
+        assert!(cache.channel_files.is_empty());
+        assert!(!cache.files_loaded.contains(&lights.to_string()));
+    }
+
+    #[test]
+    fn the_view_names_the_task_of_an_artifact_attachment() {
+        let mut cache = Cache::default();
+        let (channel, task_id, card_id) = (ChannelId::new(), TaskId::new(), MessageId::new());
+        let mut snapshot = snapshot_at(10);
+        let mut artifact = channel_file(channel, "artifacts/x/comparison.xlsx", 7);
+        artifact.task_id = Some(task_id);
+        snapshot.channel_files = vec![artifact.clone()];
+        snapshot.tasks = vec![task(task_id, channel, card_id, "brief")];
+        snapshot.channels = vec![crate::test_entities::channel(channel, "house-lights")];
+        let mut message = text(MessageId::new(), channel, "Ready.");
+        message.attachments = vec![BlobRef {
+            sha256: artifact.blob_sha256.clone(),
+            name: "comparison.xlsx".into(),
+            mime: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet".into(),
+            size: 10,
+        }];
+        snapshot.messages = vec![message];
+        cache.load_channel(channel, snapshot);
+        let state = crate::reduce::view_state(
+            &cache,
+            crate::view::Connection::Online,
+            crate::view::UserView::default(),
+            0,
+        );
+        let attachment = state
+            .timelines
+            .iter()
+            .flat_map(|t| t.items.iter())
+            .find_map(|i| match i {
+                crate::view::TimelineItem::Message(m) => m.attachments.first().cloned(),
+                _ => None,
+            })
+            .expect("the attachment");
+        assert_eq!(attachment.detail, "XLSX, 10 B");
+        let task = attachment.artifact.expect("an artifact");
+        assert_eq!(task.task_id, task_id.to_string());
+        assert_eq!(state.channel_files.len(), 1);
+        assert_eq!(state.files_loaded, [channel.to_string()]);
     }
 
     fn upsert(seq: u64, payload: EntityPayload) -> FeedEntry {
@@ -1033,6 +1280,7 @@ mod tests {
             thread_root_id: Some("card".into()),
             body: "Unsent words".into(),
             created_at: 1,
+            attachments: Vec::new(),
         });
         cache.fail_pending("The message did not go out.");
         assert!(cache.pending.is_empty());

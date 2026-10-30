@@ -127,6 +127,16 @@ struct Hub {
     skills: Vec<Skill>,
     /// The audit log of connector calls, newest first.
     calls: Vec<ConnectorCall>,
+    /// The tokens that `auth.http_token` gave out, oldest first.
+    http_tokens: Vec<String>,
+    /// The blobs, by hash.
+    blobs: std::collections::HashMap<String, Vec<u8>>,
+    /// Every blob request: the method and the hash.
+    blob_log: Vec<(String, String)>,
+    /// The attachments of every `message.send`, in order.
+    sent_attachments: Vec<Vec<consort_proto::model::BlobRef>>,
+    /// The channel files.
+    files: Vec<consort_proto::model::ChannelFile>,
 }
 
 /// What the real hub writes at the end of a cut text.
@@ -510,11 +520,30 @@ fn fetch_skill(h: &Hub, source: &api::SkillInstallSource) -> Result<Fetched, Err
                     }],
                 )
             }
-            api::SkillInstallSource::Upload { .. } => {
-                return Err(ErrorBody::new(
-                    ErrorCode::Invalid,
-                    "The fake hub takes no uploads.",
-                ));
+            api::SkillInstallSource::Upload {
+                blob_sha256,
+                size,
+                file_name,
+            } => {
+                // As the real hub: the zip must be on the hub first.
+                if h.blobs.get(blob_sha256.as_str()).map(|b| b.len() as u64) != Some(*size) {
+                    return Err(ErrorBody::new(
+                        ErrorCode::Invalid,
+                        "The zip file is not on the hub. Upload it first.",
+                    ));
+                }
+                (
+                    file_name.trim_end_matches(".zip").to_owned(),
+                    "A skill from a zip file.".to_owned(),
+                    SkillSource::Upload {
+                        file_name: file_name.clone(),
+                    },
+                    Vec::new(),
+                    false,
+                    None,
+                    None,
+                    Vec::new(),
+                )
             }
         };
     let mut files = vec![file("SKILL.md", 1_204, false)];
@@ -632,6 +661,52 @@ async fn pair_client(
     let id = ClientId::new();
     hub.client_id = Some(id);
     Json(PairClientResponse { client_id: id }).into_response()
+}
+
+/// Whether a blob request carries a token that `auth.http_token` gave out.
+fn blob_authorized(hub: &Hub, headers: &axum::http::HeaderMap) -> bool {
+    headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .is_some_and(|token| hub.http_tokens.iter().any(|t| t == token))
+}
+
+async fn get_blob(
+    State(hub): State<Shared>,
+    axum::extract::Path(sha): axum::extract::Path<String>,
+    method: axum::http::Method,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    let mut h = hub.lock().unwrap();
+    h.blob_log.push((method.to_string(), sha.clone()));
+    if !blob_authorized(&h, &headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    match h.blobs.get(&sha) {
+        Some(bytes) => (StatusCode::OK, bytes.clone()).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+async fn put_blob(
+    State(hub): State<Shared>,
+    axum::extract::Path(sha): axum::extract::Path<String>,
+    headers: axum::http::HeaderMap,
+    body: axum::body::Bytes,
+) -> axum::response::Response {
+    use sha2::Digest as _;
+    let mut h = hub.lock().unwrap();
+    h.blob_log.push(("PUT".into(), sha.clone()));
+    if !blob_authorized(&h, &headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let digest: [u8; 32] = sha2::Sha256::digest(&body).into();
+    if consort_proto::model::Sha256Hash::from_bytes(digest).as_str() != sha {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    h.blobs.insert(sha, body.to_vec());
+    StatusCode::OK.into_response()
 }
 
 async fn ws(State(hub): State<Shared>, upgrade: WebSocketUpgrade) -> impl IntoResponse {
@@ -816,6 +891,82 @@ async fn session(hub: Shared, mut socket: WebSocket) {
                     req.respond_ok(&Empty {}).unwrap()
                 }
             }
+            "auth.http_token" => {
+                let mut h = hub.lock().unwrap();
+                let token = format!("tok-{}", h.http_tokens.len() + 1);
+                h.http_tokens.push(token.clone());
+                req.respond_ok(&consort_proto::auth::HttpToken {
+                    token,
+                    expires_at: ts(Timestamp::now().as_millis() + 600_000),
+                })
+                .unwrap()
+            }
+            "files.list" => {
+                let body: api::FilesList = req.decode_as().unwrap();
+                let h = hub.lock().unwrap();
+                req.respond_ok(&consort_proto::tools::FilesListResult {
+                    files: h
+                        .files
+                        .iter()
+                        .filter(|f| f.channel_id == body.channel_id)
+                        .cloned()
+                        .collect(),
+                })
+                .unwrap()
+            }
+            "files.put" => {
+                let body: api::FilesPut = req.decode_as().unwrap();
+                let mut h = hub.lock().unwrap();
+                if !h.blobs.contains_key(body.blob_sha256.as_str()) {
+                    req.respond_error(ErrorBody::new(
+                        ErrorCode::Invalid,
+                        "The blob is not on the hub. Upload the blob first.",
+                    ))
+                } else {
+                    let file = consort_proto::model::ChannelFile {
+                        channel_id: body.channel_id,
+                        path: body.path.clone(),
+                        blob_sha256: body.blob_sha256,
+                        size: body.size,
+                        mime: body.mime,
+                        task_id: None,
+                        title: None,
+                        updated_by: "user".into(),
+                        updated_at: Timestamp::now(),
+                        deleted_at: None,
+                    };
+                    h.files
+                        .retain(|f| !(f.channel_id == body.channel_id && f.path == body.path));
+                    h.files.push(file.clone());
+                    req.respond_ok(&api::ChannelFileResult { file }).unwrap()
+                }
+            }
+            "files.move" => {
+                let body: api::FilesMove = req.decode_as().unwrap();
+                let mut h = hub.lock().unwrap();
+                match h
+                    .files
+                    .iter_mut()
+                    .find(|f| f.channel_id == body.channel_id && f.path == body.from_path)
+                {
+                    Some(file) => {
+                        file.path = body.to_path.clone();
+                        let file = file.clone();
+                        req.respond_ok(&api::ChannelFileResult { file }).unwrap()
+                    }
+                    None => req.respond_error(ErrorBody::new(
+                        ErrorCode::NotFound,
+                        "That file does not exist.",
+                    )),
+                }
+            }
+            "files.delete" => {
+                let body: api::FilesDelete = req.decode_as().unwrap();
+                let mut h = hub.lock().unwrap();
+                h.files
+                    .retain(|f| !(f.channel_id == body.channel_id && f.path == body.path));
+                req.respond_ok(&Empty {}).unwrap()
+            }
             "message.send" => {
                 let send_body: MessageSend = req.decode_as().unwrap();
                 let internal = {
@@ -831,6 +982,7 @@ async fn session(hub: Shared, mut socket: WebSocket) {
                     let mut h = hub.lock().unwrap();
                     h.sent_ids.push(send_body.client_message_id.clone());
                     h.sent_bodies.push(send_body.body.clone());
+                    h.sent_attachments.push(send_body.attachments.clone());
                     let known = h
                         .channel
                         .iter()
@@ -888,7 +1040,7 @@ async fn session(hub: Shared, mut socket: WebSocket) {
                     author_routine_id: None,
                     kind: MessageKind::Text,
                     body: send_body.body,
-                    attachments: vec![],
+                    attachments: send_body.attachments.clone(),
                     in_timeline: false,
                     client_message_id: Some(send_body.client_message_id),
                     reply_count: 0,
@@ -1289,6 +1441,7 @@ async fn start_hub() -> (String, Shared) {
     let app = Router::new()
         .route("/v1/pair/client", post(pair_client))
         .route("/v1/client", get(ws))
+        .route("/v1/blobs/{sha256}", get(get_blob).put(put_blob))
         .with_state(hub.clone());
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
@@ -1950,6 +2103,7 @@ async fn the_outbox_survives_a_restart_and_goes_out_in_order() {
         thread_root_id: None,
         body: body.into(),
         created_at: Timestamp::now().as_millis(),
+        attachments: Vec::new(),
     };
     let missing = ChannelId::new().to_string();
     store
@@ -2324,6 +2478,7 @@ async fn a_message_that_is_too_large_in_an_old_outbox_fails_once() {
                 thread_root_id: None,
                 body: text_of(1100),
                 created_at: Timestamp::now().as_millis(),
+                attachments: Vec::new(),
             }],
         )
         .unwrap();
@@ -2677,6 +2832,7 @@ async fn pairing_again_keeps_the_text_of_unsent_messages() {
                 thread_root_id: None,
                 body: "Text that waited".into(),
                 created_at: Timestamp::now().as_millis(),
+                attachments: Vec::new(),
             }],
         )
         .unwrap();
@@ -3170,6 +3326,7 @@ async fn a_message_for_no_channel_is_refused_and_not_queued() {
             channel_id: " ".into(),
             body: "again".into(),
             client_message_id: "cm-1".into(),
+            attachments: Vec::new(),
         })
         .await
         .unwrap_err();
@@ -3958,8 +4115,11 @@ async fn an_install_card_closes_when_the_skill_is_added_from_it() {
     assert_eq!(sent.last().unwrap()["approval_id"], card_id.as_str());
 
     // The feed closes the card, and the card names the skill.
-    let state = wait_for(&client, "the card closed", |s| {
+    // The feed entry of the card and the answer of the install arrive in
+    // either order, so wait for both.
+    let state = wait_for(&client, "the card closed and the skill added", |s| {
         install_card_state(s).is_some_and(|c| c.state != consort_client::RequestState::Pending)
+            && s.skill(&id).is_some()
     })
     .await;
     let card = install_card_state(&state).unwrap();
@@ -4296,4 +4456,309 @@ async fn other_skill_errors_do_not_give_the_unsupported_text() {
         .await
         .unwrap();
     assert_eq!(ok.name, "fine");
+}
+
+// Phase 1: files and attachments --------------------------------------------
+
+fn sha_of(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    let digest: [u8; 32] = sha2::Sha256::digest(bytes).into();
+    consort_proto::model::Sha256Hash::from_bytes(digest).to_string()
+}
+
+fn blob_log(hub: &Shared) -> Vec<(String, String)> {
+    hub.lock().unwrap().blob_log.clone()
+}
+
+/// An attached file goes up once (`HEAD`, then `PUT` with the token from
+/// `auth.http_token`), and `message.send` carries its blob. The same file a
+/// second time needs no `PUT`. A token that the hub forgot is replaced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_attached_file_goes_up_once_and_the_message_carries_it() {
+    let (url, hub) = start_hub().await;
+    let dir = tempfile::tempdir().unwrap();
+    let client = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
+    let tutti = tutti_id(&client);
+    let file = dir.path().join("brightline-quote.pdf");
+    std::fs::write(&file, b"%PDF the quote").unwrap();
+    let sha = sha_of(b"%PDF the quote");
+    let target = consort_client::UploadTarget::Composer {
+        channel_id: tutti.clone(),
+    };
+    let ids = client
+        .attach(
+            target.clone(),
+            vec![consort_client::AttachInput::Path(
+                file.display().to_string(),
+            )],
+        )
+        .await
+        .unwrap();
+    assert_eq!(ids.len(), 1);
+    wait_for(&client, "the upload is ready", |s| {
+        s.uploads
+            .iter()
+            .any(|u| u.status == consort_client::UploadStatus::Ready)
+    })
+    .await;
+    assert_eq!(
+        blob_log(&hub),
+        [
+            ("HEAD".to_owned(), sha.clone()),
+            ("PUT".to_owned(), sha.clone())
+        ]
+    );
+    client
+        .send_message_with(tutti.clone(), "Here is the quote.".into(), ids)
+        .await
+        .unwrap();
+    {
+        let h = hub.lock().unwrap();
+        let sent = h.sent_attachments.last().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].sha256.to_string(), sha);
+        assert_eq!(sent[0].name, "brightline-quote.pdf");
+        assert_eq!(sent[0].mime, "application/pdf");
+        assert_eq!(sent[0].size, 14);
+    }
+    let state = wait_for(&client, "the message with its file", |s| {
+        s.uploads.is_empty()
+            && s.timeline(&tutti).is_some_and(|t| {
+                t.items.iter().any(|i| {
+                    matches!(i, TimelineItem::Message(m)
+                        if m.attachments.iter().any(|a| a.name == "brightline-quote.pdf"))
+                })
+            })
+    })
+    .await;
+    // The file that went up is in the local cache, so its view has a path.
+    let local = state
+        .timeline(&tutti)
+        .and_then(|t| {
+            t.items.iter().find_map(|i| match i {
+                TimelineItem::Message(m) => m.attachments.first().cloned(),
+                _ => None,
+            })
+        })
+        .and_then(|a| a.local_path);
+    assert!(local.is_some());
+
+    // The hub forgets the token. The same file again: the client gets a
+    // new token, asks, and sends nothing, because the hub has the blob.
+    hub.lock().unwrap().http_tokens.clear();
+    let before = blob_log(&hub).len();
+    client
+        .attach(
+            target.clone(),
+            vec![consort_client::AttachInput::Path(
+                file.display().to_string(),
+            )],
+        )
+        .await
+        .unwrap();
+    wait_for(&client, "the second upload is ready", |s| {
+        s.uploads
+            .iter()
+            .any(|u| u.status == consort_client::UploadStatus::Ready)
+    })
+    .await;
+    let log = blob_log(&hub);
+    assert!(
+        log[before..].iter().all(|(method, _)| method == "HEAD"),
+        "{log:?}"
+    );
+    assert_eq!(hub.lock().unwrap().http_tokens.len(), 1, "a new token");
+}
+
+/// A send waits for its uploads. A failed upload stops it with a message
+/// that says what to do, and the text does not go out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_upload_stops_the_send_until_it_is_removed() {
+    let (url, hub) = start_hub().await;
+    let dir = tempfile::tempdir().unwrap();
+    let client = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
+    let tutti = tutti_id(&client);
+    let target = consort_client::UploadTarget::Composer {
+        channel_id: tutti.clone(),
+    };
+    let missing = dir.path().join("gone.heic").display().to_string();
+    let ids = client
+        .attach(
+            target.clone(),
+            vec![consort_client::AttachInput::Path(missing)],
+        )
+        .await
+        .unwrap();
+    let state = wait_for(&client, "the upload fails", |s| {
+        s.uploads
+            .iter()
+            .any(|u| matches!(u.status, consort_client::UploadStatus::Failed(_)))
+    })
+    .await;
+    let consort_client::UploadStatus::Failed(message) = &state.uploads[0].status else {
+        unreachable!()
+    };
+    assert!(message.starts_with("Upload failed."), "{message}");
+    let err = client
+        .send_message_with(tutti.clone(), "With the photo".into(), ids.clone())
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("Try again"), "{err}");
+    assert!(
+        !hub.lock()
+            .unwrap()
+            .sent_bodies
+            .contains(&"With the photo".to_owned())
+    );
+    client
+        .run(Command::RemoveUpload { id: ids[0].clone() })
+        .await
+        .unwrap();
+    client
+        .send_message(tutti.clone(), "Without the photo".into())
+        .await
+        .unwrap();
+    assert!(
+        hub.lock()
+            .unwrap()
+            .sent_bodies
+            .contains(&"Without the photo".to_owned())
+    );
+}
+
+/// The Files tab: `files.list`, an upload into a folder that becomes a
+/// channel file with `files.put`, a move and a delete. A download fills the
+/// local cache.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn channel_files_load_upload_move_download_and_delete() {
+    let (url, hub) = start_hub().await;
+    let dir = tempfile::tempdir().unwrap();
+    let client = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
+    let tutti = tutti_id(&client);
+    client
+        .run(Command::LoadChannelFiles {
+            channel_id: tutti.clone(),
+        })
+        .await
+        .unwrap();
+    wait_for(&client, "the files are loaded", |s| {
+        s.files_loaded.contains(&tutti)
+    })
+    .await;
+    let photo = dir.path().join("roof.png");
+    std::fs::write(&photo, b"not really a png").unwrap();
+    client
+        .attach(
+            consort_client::UploadTarget::ChannelFiles {
+                channel_id: tutti.clone(),
+                folder: "photos".into(),
+            },
+            vec![consort_client::AttachInput::Path(
+                photo.display().to_string(),
+            )],
+        )
+        .await
+        .unwrap();
+    let state = wait_for(&client, "the file is in the channel files", |s| {
+        s.uploads.is_empty() && s.channel_files.iter().any(|f| f.path == "photos/roof.png")
+    })
+    .await;
+    let file = state
+        .channel_files
+        .iter()
+        .find(|f| f.path == "photos/roof.png")
+        .unwrap()
+        .clone();
+    assert_eq!(file.folder, "photos");
+    assert_eq!(file.mime, "image/png");
+    assert_eq!(hub.lock().unwrap().files.len(), 1);
+
+    // A download goes to the cache once, and a named copy can open.
+    let cache = dir.path().join("blobs");
+    std::fs::remove_dir_all(&cache).ok();
+    let path = client
+        .fetch_blob(file.sha256.clone(), file.size, Some("roof.png".into()))
+        .await
+        .unwrap();
+    assert!(path.ends_with("roof.png"));
+    assert_eq!(std::fs::read(&path).unwrap(), b"not really a png");
+    let gets = |hub: &Shared| blob_log(hub).iter().filter(|(m, _)| m == "GET").count();
+    assert_eq!(gets(&hub), 1);
+    client
+        .fetch_blob(file.sha256.clone(), file.size, None)
+        .await
+        .unwrap();
+    assert_eq!(gets(&hub), 1, "the second read comes from the cache");
+
+    client
+        .run(Command::MoveChannelFile {
+            channel_id: tutti.clone(),
+            from_path: "photos/roof.png".into(),
+            to_path: "roof-front.png".into(),
+        })
+        .await
+        .unwrap();
+    wait_for(&client, "the moved file", |s| {
+        s.channel_files.len() == 1 && s.channel_files[0].path == "roof-front.png"
+    })
+    .await;
+    client
+        .run(Command::DeleteChannelFile {
+            channel_id: tutti.clone(),
+            path: "roof-front.png".into(),
+        })
+        .await
+        .unwrap();
+    wait_for(&client, "no file", |s| s.channel_files.is_empty()).await;
+    assert!(hub.lock().unwrap().files.is_empty());
+}
+
+/// Add skill > Upload: the zip goes up through the blob upload first, and
+/// `skill.preview` names it with `Upload { blob_sha256, size, file_name }`.
+/// A file that is not a zip never leaves the computer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_skill_zip_goes_up_before_the_preview() {
+    let (url, hub) = start_hub().await;
+    let dir = tempfile::tempdir().unwrap();
+    let client = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
+    let zip = dir.path().join("porch-lights.zip");
+    std::fs::write(&zip, b"PK zip bytes").unwrap();
+    let output = client
+        .run_for(Command::PreviewSkill {
+            source: consort_client::SkillInstallInput::Upload {
+                file_path: zip.display().to_string(),
+            },
+        })
+        .await
+        .unwrap();
+    let consort_client::CommandOutput::SkillPreview(preview) = output else {
+        panic!("a preview")
+    };
+    assert_eq!(preview.name, "porch-lights");
+    let sha = sha_of(b"PK zip bytes");
+    assert!(blob_log(&hub).contains(&("PUT".to_owned(), sha.clone())));
+    let recorded = hub.lock().unwrap().recorded.clone();
+    let (_, body) = recorded
+        .iter()
+        .rev()
+        .find(|(kind, _)| kind == "skill.preview")
+        .unwrap();
+    assert_eq!(body["source"]["kind"], "upload");
+    assert_eq!(body["source"]["blob_sha256"], sha);
+    assert_eq!(body["source"]["size"], 12);
+    assert_eq!(body["source"]["file_name"], "porch-lights.zip");
+
+    let text = dir.path().join("notes.txt");
+    std::fs::write(&text, b"hello").unwrap();
+    let before = blob_log(&hub).len();
+    let err = client
+        .run_for(Command::PreviewSkill {
+            source: consort_client::SkillInstallInput::Upload {
+                file_path: text.display().to_string(),
+            },
+        })
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("not a zip file"), "{err}");
+    assert_eq!(blob_log(&hub).len(), before);
 }

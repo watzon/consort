@@ -14,6 +14,8 @@ mod edit_keys;
 #[cfg(test)]
 mod ext_tests;
 mod extensions;
+#[cfg(test)]
+mod files_tests;
 mod fonts;
 #[cfg(test)]
 mod keys_tests;
@@ -37,7 +39,9 @@ actions!(consort, [Quit]);
 /// onboarding, connectors, add-connector, connect, connectors-in-channel,
 /// channel-connectors, skills, add-skill, add-skill-unsupported,
 /// account-settings, hub-cards, tutti-manages, instructions, mark-idle,
-/// mark-working, mark-needs-you, mark-done. The old names `everything` and
+/// mark-working, mark-needs-you, mark-done. Phase 1: top-tint,
+/// attachments, drop, bubbles, lightbox, files, files-menu, files-drop,
+/// files-empty, thread-attach and add-skill-upload. The old names `everything` and
 /// `everything-manages` still work. `--light` and `--dark` set
 /// the mode, and `--theme <name>` the theme.
 #[derive(Clone, Debug, Default)]
@@ -103,6 +107,14 @@ fn main() {
         // No account is signed in on any worker.
         let mut state = consort_client::mock::view_state();
         state.model_groups.clear();
+        Client::mock_with(state)
+    } else if mock
+        && let Some(state) = args
+            .screen
+            .as_deref()
+            .and_then(consort_client::mock_files::screen_state)
+    {
+        // The phase 1 screens: files and attachments in house-lights.
         Client::mock_with(state)
     } else if mock {
         Client::mock()

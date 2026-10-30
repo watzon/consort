@@ -88,6 +88,8 @@ pub struct Palette {
     /// Transparent `surface.raised`, the end stop of the fades in a list
     /// that scrolls inside a popover.
     pub raised_clear: Hsla,
+    /// The black behind the light box.
+    pub lightbox: Hsla,
 }
 
 impl Palette {
@@ -154,6 +156,7 @@ impl Palette {
             canvas_clear: hsla(colors.surface.canvas.with_alpha(0.0)),
             sidebar_clear: hsla(colors.surface.sidebar.with_alpha(0.0)),
             raised_clear: hsla(colors.surface.raised.with_alpha(0.0)),
+            lightbox: hsla(Rgb::BLACK.with_alpha(s.derive.lightbox_alpha)),
         }
     }
 }
@@ -261,16 +264,28 @@ pub struct Layout {
     /// task thread. Its text scrolls past this.
     pub error_text_max_height: Pixels,
     pub bubble_max_width: Pixels,
-    pub fade_top_solid: Pixels,
-    pub fade_top_blend: Pixels,
+    /// The space above the first item of a chat at rest, below the mark
+    /// and the activity pill.
+    pub content_top: Pixels,
+    /// The stops of the top tint, from the top down. See
+    /// [`Layout::top_tint_height`].
+    pub top_tint: [TintStop; 4],
     pub fade_bottom: Pixels,
 }
 
+/// One stop of the top tint: a distance from the top, and the opacity of
+/// the canvas color there.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TintStop {
+    pub at: Pixels,
+    pub alpha: f32,
+}
+
 impl Layout {
-    /// The whole top fade: the solid canvas under the mark and the pill,
-    /// then the blend. The first row of the chat starts below it.
-    pub fn fade_top(&self) -> Pixels {
-        self.fade_top_solid + self.fade_top_blend
+    /// The height of the top tint: the place of its last stop, where it is
+    /// clear.
+    pub fn top_tint_height(&self) -> Pixels {
+        self.top_tint[self.top_tint.len() - 1].at
     }
 }
 
@@ -283,6 +298,11 @@ pub struct Opacity {
     pub busy: f32,
     /// A danger button under the pointer.
     pub danger_hover: f32,
+    pub failed_border: f32,
+    pub progress_track: f32,
+    pub drop_fill: f32,
+    pub nav_disabled: f32,
+    pub you_tile: f32,
 }
 
 /// Sizes of single components, from `structure.json`.
@@ -331,15 +351,70 @@ pub struct Components {
     pub button_pad_y: Pixels,
     pub worker_dot: Pixels,
     pub state_dot: Pixels,
-    pub worker_row_pad_y: Pixels,
     pub switch_inset: Pixels,
     pub notes_min_height: Pixels,
     pub brand_mark: Pixels,
     pub brand_gap: Pixels,
     /// The width of the focus ring.
     pub focus_ring: Pixels,
+    pub files: Files,
+    pub sidebar: Sidebar,
     pub chat: Chat,
     pub theme_preview: ThemePreview,
+}
+
+/// The sizes of attachments and channel files. See `structure::Files`.
+#[derive(Clone, Copy, Debug)]
+pub struct Files {
+    pub chip_image: Pixels,
+    pub chip_file: Pixels,
+    pub chip_pad: Pixels,
+    pub chip_gap: Pixels,
+    pub chip_tile: Pixels,
+    pub chip_badge: Pixels,
+    pub chip_close: Pixels,
+    pub chip_close_icon: Pixels,
+    pub progress: Pixels,
+    pub row_progress: Pixels,
+    pub image_tile_w: Pixels,
+    pub image_tile_h: Pixels,
+    pub file_bubble_you: Pixels,
+    pub file_bubble: Pixels,
+    pub bubble_pad_y: Pixels,
+    pub bubble_pad_left: Pixels,
+    pub bubble_action: Pixels,
+    pub drop_icon_tile: Pixels,
+    pub drop_icon: Pixels,
+    pub lightbox_bar: Pixels,
+    pub lightbox_nav: Pixels,
+    pub lightbox_image_w: Pixels,
+    pub lightbox_image_h: Pixels,
+    pub row_pad_y: Pixels,
+    pub size_col: Pixels,
+    pub date_col: Pixels,
+    pub more: Pixels,
+    pub artifact_indent: Pixels,
+}
+
+/// The sizes of the sidebar and the settings rail. See
+/// `structure::Sidebar`.
+#[derive(Clone, Copy, Debug)]
+pub struct Sidebar {
+    pub inset: Pixels,
+    pub row_pad_y: Pixels,
+    pub row_pad_x: Pixels,
+    pub row_gap: Pixels,
+    pub row_icon: Pixels,
+    pub row_text: Type,
+    pub label_text: Type,
+    pub label_pad_y: Pixels,
+    pub group_top: Pixels,
+    pub title_bar: Pixels,
+    pub worker_text: Type,
+    pub worker_pad_y: Pixels,
+    pub avatar: Pixels,
+    pub account_pad_top: Pixels,
+    pub account_pad_bottom: Pixels,
 }
 
 /// The sizes of the chat. See `structure::Chat`.
@@ -378,8 +453,10 @@ pub struct ThemePreview {
 }
 
 impl Components {
-    fn new(c: &structure::Components) -> Components {
+    fn new(c: &structure::Components, scale: f32) -> Components {
         let p = &c.theme_preview;
+        let sb = &c.sidebar;
+        let f = &c.files;
         Components {
             settings_label: px(c.settings_label),
             settings_segmented: px(c.settings_segmented),
@@ -424,12 +501,58 @@ impl Components {
             button_pad_y: px(c.button_pad_y),
             worker_dot: px(c.worker_dot),
             state_dot: px(c.state_dot),
-            worker_row_pad_y: px(c.worker_row_pad_y),
             switch_inset: px(c.switch_inset),
             notes_min_height: px(c.notes_min_height),
             brand_mark: px(c.brand_mark),
             brand_gap: px(c.brand_gap),
             focus_ring: px(c.focus_ring),
+            files: Files {
+                chip_image: px(f.chip_image),
+                chip_file: px(f.chip_file),
+                chip_pad: px(f.chip_pad),
+                chip_gap: px(f.chip_gap),
+                chip_tile: px(f.chip_tile),
+                chip_badge: px(f.chip_badge),
+                chip_close: px(f.chip_close),
+                chip_close_icon: px(f.chip_close_icon),
+                progress: px(f.progress),
+                row_progress: px(f.row_progress),
+                image_tile_w: px(f.image_tile_w),
+                image_tile_h: px(f.image_tile_h),
+                file_bubble_you: px(f.file_bubble_you),
+                file_bubble: px(f.file_bubble),
+                bubble_pad_y: px(f.bubble_pad_y),
+                bubble_pad_left: px(f.bubble_pad_left),
+                bubble_action: px(f.bubble_action),
+                drop_icon_tile: px(f.drop_icon_tile),
+                drop_icon: px(f.drop_icon),
+                lightbox_bar: px(f.lightbox_bar),
+                lightbox_nav: px(f.lightbox_nav),
+                lightbox_image_w: px(f.lightbox_image_w),
+                lightbox_image_h: px(f.lightbox_image_h),
+                row_pad_y: px(f.row_pad_y),
+                size_col: px(f.size_col),
+                date_col: px(f.date_col),
+                more: px(f.more),
+                artifact_indent: px(f.artifact_indent),
+            },
+            sidebar: Sidebar {
+                inset: px(sb.inset),
+                row_pad_y: px(sb.row_pad_y),
+                row_pad_x: px(sb.row_pad_x),
+                row_gap: px(sb.row_gap),
+                row_icon: px(sb.row_icon),
+                row_text: Type::new(&sb.row_text, scale),
+                label_text: Type::new(&sb.label_text, scale),
+                label_pad_y: px(sb.label_pad_y),
+                group_top: px(sb.group_top),
+                title_bar: px(sb.title_bar),
+                worker_text: Type::new(&sb.worker_text, scale),
+                worker_pad_y: px(sb.worker_pad_y),
+                avatar: px(sb.avatar),
+                account_pad_top: px(sb.account_pad_top),
+                account_pad_bottom: px(sb.account_pad_bottom),
+            },
             chat: Chat {
                 bubble_radius: px(c.chat.bubble_radius),
                 bubble_tail: px(c.chat.bubble_tail),
@@ -584,16 +707,24 @@ impl Tokens {
                 switcher_name_max: px(s.layout.switcher_name_max),
                 error_text_max_height: px(s.layout.error_text_max_height),
                 bubble_max_width: px(s.layout.bubble_max_width),
-                fade_top_solid: px(s.layout.fade_top_solid),
-                fade_top_blend: px(s.layout.fade_top_blend),
+                content_top: px(s.layout.content_top),
+                top_tint: s.layout.top_tint.map(|stop| TintStop {
+                    at: px(stop.at),
+                    alpha: stop.alpha,
+                }),
                 fade_bottom: px(s.layout.fade_bottom),
             },
             opacity: Opacity {
                 answered_dim: s.opacity.answered_dim,
                 busy: s.opacity.busy,
                 danger_hover: s.opacity.danger_hover,
+                failed_border: s.opacity.failed_border,
+                progress_track: s.opacity.progress_track,
+                drop_fill: s.opacity.drop_fill,
+                nav_disabled: s.opacity.nav_disabled,
+                you_tile: s.opacity.you_tile,
             },
-            component: Components::new(&s.component),
+            component: Components::new(&s.component, scale),
             icon: Icons {
                 size: px(s.icon.size),
                 dense: px(s.icon.dense_size),
@@ -736,5 +867,20 @@ mod tests {
         assert_eq!(t.component.focus_ring, px(2.0));
         assert_eq!(t.component.theme_preview.sidebar_item, px(20.0));
         assert_eq!(t.component.theme_preview.button_radius, px(2.0));
+        assert_eq!(t.layout.sidebar_width, px(288.0));
+        assert_eq!(t.component.sidebar.row_text.size, px(15.0));
+        assert_eq!(t.component.sidebar.title_bar, px(52.0));
+        assert_eq!(t.layout.content_top, px(92.0));
+        assert_eq!(t.layout.top_tint_height(), px(184.0));
+    }
+
+    /// The sidebar text follows the text size setting, like every other
+    /// text style.
+    #[test]
+    fn the_sidebar_text_follows_the_text_size() {
+        let theme = builtin_themes().into_iter().next().expect("a theme");
+        let larger = Tokens::new(&theme, Mode::Dark, TextSize::Larger);
+        assert_eq!(larger.component.sidebar.row_text.size, px(17.0));
+        assert_eq!(larger.component.sidebar.row_icon, px(18.0));
     }
 }

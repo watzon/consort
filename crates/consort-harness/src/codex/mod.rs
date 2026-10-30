@@ -26,13 +26,14 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::account::prepare_home;
 use crate::approval::{CODEX_SHELL_FEATURES, codex_policy};
+use crate::attachments::{CODEX_IMAGE_MAX_BYTES, ImageDelivery, ImageLimits, prepare_turn};
 use crate::process::{
     self, HarnessProcess, ProcessSpec, parse_version, resolve_program, run_capture,
 };
 use crate::{
     AccountConfig, AccountStatus, Answer, EVENT_CHANNEL_CAPACITY, EventReceiver, Harness,
     HarnessError, HarnessKind, HarnessSession, McpServerSpec, SessionSpec, SteerFuture,
-    sign_in_hint_for, steer_ready, turn_text,
+    sign_in_hint_for, steer_ready,
 };
 use mapper::CodexMapper;
 use protocol::{
@@ -85,9 +86,36 @@ pub fn codex_capabilities() -> Capabilities {
         resume: true,
         usage: true,
         mcp_http: true,
+        // `turn/start` and `turn/steer` take `localImage` items (checked in
+        // the app-server schema of codex-cli 0.166.0).
+        images: true,
         approval_modes: ApprovalMode::ALL.to_vec(),
         ..Capabilities::default()
     }
+}
+
+/// The input items of a turn or a steer: the text with the attachment
+/// block, then a `localImage` item for each image attachment. Codex reads
+/// the image from the workspace itself.
+pub fn turn_input(input: &TurnInput, workspace: &std::path::Path) -> Vec<UserInput> {
+    let prepared = prepare_turn(
+        input,
+        workspace,
+        Some(ImageLimits {
+            delivery: ImageDelivery::Path,
+            max_bytes: CODEX_IMAGE_MAX_BYTES,
+        }),
+    );
+    let mut items = vec![UserInput::text(prepared.text)];
+    items.extend(
+        prepared
+            .images
+            .into_iter()
+            .map(|image| UserInput::LocalImage {
+                path: image.path.to_string_lossy().into_owned(),
+            }),
+    );
+    items
 }
 
 /// Codex's limit for one MCP tool call, in seconds. The hub answers a
@@ -614,6 +642,7 @@ pub(crate) async fn start_thread(
         client,
         events: event_tx,
         mapper: CodexMapper::new(spec.session_id).with_workspace(&spec.workspace),
+        workspace: spec.workspace.clone(),
         pending: HashMap::new(),
         effort,
         counter: 0,
@@ -685,6 +714,8 @@ struct Actor {
     client: RpcClient,
     events: mpsc::Sender<SessionEvent>,
     mapper: CodexMapper,
+    /// The session's workspace, where the worker saves the attachments.
+    workspace: std::path::PathBuf,
     pending: HashMap<RequestId, Pending>,
     effort: Option<String>,
     counter: u64,
@@ -747,7 +778,7 @@ impl Actor {
                                     let client = self.client.clone().with_timeout(STEER_TIMEOUT);
                                     let params = TurnSteerParams {
                                         thread_id: self.thread_id.clone(),
-                                        input: vec![UserInput::text(turn_text(&input))],
+                                        input: turn_input(&input, &self.workspace),
                                         expected_turn_id: turn,
                                     };
                                     tokio::spawn(async move {
@@ -880,7 +911,7 @@ impl Actor {
                 method::TURN_START,
                 &TurnStartParams {
                     thread_id: self.thread_id.clone(),
-                    input: vec![UserInput::text(turn_text(input))],
+                    input: turn_input(input, &self.workspace),
                     effort: self.effort.clone(),
                 },
             )

@@ -50,21 +50,101 @@ async fn probe(kind: HarnessKind) {
 }
 
 async fn one_turn(kind: HarnessKind) {
-    let harness = adapter_for(kind).unwrap();
     let dir = tempfile::tempdir().unwrap();
+    let input = TurnInput {
+        text: "Reply with the single word OK".into(),
+        attachments: vec![],
+    };
+    let text = turn_reply(kind, dir.path(), input).await;
+    assert!(text.to_uppercase().contains("OK"), "reply was {text:?}");
+}
+
+/// A PNG of 32 by 32 red pixels, with stored (not compressed) deflate
+/// blocks, so the test needs no image crate.
+fn red_png() -> Vec<u8> {
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = 0xFFFF_FFFF_u32;
+        for &b in bytes {
+            crc ^= u32::from(b);
+            for _ in 0..8 {
+                crc = if crc & 1 == 1 {
+                    (crc >> 1) ^ 0xEDB8_8320
+                } else {
+                    crc >> 1
+                };
+            }
+        }
+        !crc
+    }
+    fn chunk(out: &mut Vec<u8>, kind: &[u8], data: &[u8]) {
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        let mut body = kind.to_vec();
+        body.extend_from_slice(data);
+        out.extend_from_slice(&body);
+        out.extend_from_slice(&crc32(&body).to_be_bytes());
+    }
+    let side = 32_u32;
+    // Each row: filter type 0 (none), then red pixels.
+    let row: Vec<u8> = std::iter::once(0)
+        .chain([255_u8, 0, 0].repeat(side as usize))
+        .collect();
+    let raw = row.repeat(side as usize);
+    let (mut a, mut b) = (1_u32, 0_u32);
+    for &byte in &raw {
+        a = (a + u32::from(byte)) % 65521;
+        b = (b + a) % 65521;
+    }
+    let mut zlib = vec![0x78, 0x01, 0x01];
+    let len = raw.len() as u16;
+    zlib.extend_from_slice(&len.to_le_bytes());
+    zlib.extend_from_slice(&(!len).to_le_bytes());
+    zlib.extend_from_slice(&raw);
+    zlib.extend_from_slice(&((b << 16) | a).to_be_bytes());
+    let mut ihdr = Vec::new();
+    ihdr.extend_from_slice(&side.to_be_bytes());
+    ihdr.extend_from_slice(&side.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 2, 0, 0, 0]);
+    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+    chunk(&mut png, b"IHDR", &ihdr);
+    chunk(&mut png, b"IDAT", &zlib);
+    chunk(&mut png, b"IEND", &[]);
+    png
+}
+
+/// Saves a red PNG where the worker saves attachments, and asks the model
+/// for its color. The adapter sends it as image input.
+async fn image_turn(kind: HarnessKind) {
+    let dir = tempfile::tempdir().unwrap();
+    let png = red_png();
+    // The hash only names the saved file here, so any value works.
+    let blob = consort_proto::model::BlobRef {
+        sha256: consort_proto::model::Sha256Hash::from_bytes([0x5a; 32]),
+        name: "square.png".into(),
+        mime: "image/png".into(),
+        size: png.len() as u64,
+    };
+    let path = consort_harness::attachments::attachment_path(dir.path(), &blob);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, &png).unwrap();
+    let input = TurnInput {
+        text: "What color is the attached image? Do not open any file or run any tool. Reply with one word.".into(),
+        attachments: vec![blob],
+    };
+    let text = turn_reply(kind, dir.path(), input).await;
+    assert!(text.to_lowercase().contains("red"), "reply was {text:?}");
+}
+
+/// Plays one turn in a new session and returns the last assistant text.
+async fn turn_reply(kind: HarnessKind, dir: &std::path::Path, input: TurnInput) -> String {
+    let harness = adapter_for(kind).unwrap();
     let account = AccountConfig::default_for(kind);
     let (mut session, mut events) = harness
-        .open(&account, spec(dir.path(), ApprovalMode::Ask))
+        .open(&account, spec(dir, ApprovalMode::Ask))
         .await
         .unwrap();
     println!("native ref: {:?}", session.native_ref());
-    let turn = session
-        .turn(TurnInput {
-            text: "Reply with the single word OK".into(),
-            attachments: vec![],
-        })
-        .await
-        .unwrap();
+    println!("images: {}", session.capabilities().images);
+    let turn = session.turn(input).await.unwrap();
     let mut text = String::new();
     let ended = tokio::time::timeout(Duration::from_secs(240), async {
         while let Some(event) = events.recv().await {
@@ -87,8 +167,8 @@ async fn one_turn(kind: HarnessKind) {
     .await
     .unwrap();
     assert_eq!(ended, TurnEndReason::Completed);
-    assert!(text.to_uppercase().contains("OK"), "reply was {text:?}");
     session.close().await.unwrap();
+    text
 }
 
 #[tokio::test]
@@ -125,6 +205,30 @@ async fn opencode_turn() {
 #[ignore = "uses the user's Codex plan"]
 async fn codex_turn() {
     one_turn(HarnessKind::Codex).await;
+}
+
+#[tokio::test]
+#[ignore = "uses the user's Claude plan"]
+async fn claude_image_turn() {
+    image_turn(HarnessKind::ClaudeCode).await;
+}
+
+#[tokio::test]
+#[ignore = "uses the user's Codex plan"]
+async fn codex_image_turn() {
+    image_turn(HarnessKind::Codex).await;
+}
+
+#[tokio::test]
+#[ignore = "uses the user's Gemini account"]
+async fn gemini_image_turn() {
+    image_turn(HarnessKind::GeminiCli).await;
+}
+
+#[tokio::test]
+#[ignore = "uses the user's OpenCode provider; set CONSORT_SMOKE_MODEL to a model with image input"]
+async fn opencode_image_turn() {
+    image_turn(HarnessKind::OpenCode).await;
 }
 
 /// Runs the real `claude auth login --claudeai` in a pseudo-terminal with a

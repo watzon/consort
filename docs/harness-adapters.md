@@ -56,11 +56,33 @@ Four rules keep the adapters honest:
 | `steer` | The session accepts new input while a turn runs |
 | `resume` | The session can continue after the harness process restarts |
 | `fork` | The session can branch from an earlier turn |
-| `images` | Turn input can hold images |
+| `images` | Turn input can hold images. The adapter sends image attachments as image input (see [Attachments and images](#attachments-and-images)) |
 | `plan_mode` | The harness has a plan-only mode |
 | `usage` | The harness reports token counts |
 | `mcp_http` | The harness accepts an HTTP MCP server with a bearer token |
 | `approval_modes` | The approval modes that the adapter can enforce |
+
+## Attachments and images
+
+The worker saves the attachments of a turn in the workspace before the turn starts (see [protocol.md](protocol.md#attachments-and-channel-files-on-the-worker)). `consort_harness::attachments` has the path rule, so the worker and the adapters agree on it. Every adapter puts a short block after the turn text:
+
+```text
+Attached files. They are saved in your workspace, so you can open them:
+- photo.png (image/png, 340.2 KB, also in this message as an image): /path/to/workspace/.consort/attachments/3fa2c1d09e4b-photo.png
+- report.pdf (application/pdf, 1.2 MB): /path/to/workspace/.consort/attachments/9b01aa77c2d4-report.pdf
+- big.zip (application/zip, 300.0 MB): not available. The worker could not download it. Ask the user to send it again.
+```
+
+An adapter whose harness takes image input also sends each image attachment as an image. The adapter reads the format from the first bytes of the file, not from the media type, and sends only PNG, JPEG, GIF and WebP:
+
+| Harness | Image input | Limit |
+|---|---|---|
+| Claude Code (`claude-agent-acp`) | An ACP `image` content block with base64 `data` and `mimeType`, in `session/prompt` and in `_session/steering` | 5 MiB per image |
+| Gemini CLI, OpenCode | An ACP `image` content block, as for Claude Code | 5 MiB per image |
+| Codex | A `localImage` item with the absolute path, in `turn/start` and `turn/steer` | 20 MiB per image. Codex scales a large image down itself |
+| Other ACP agents | An ACP `image` content block, when the agent reports `agentCapabilities.promptCapabilities.image` | 5 MiB per image |
+
+An ACP session sends image blocks only when the agent reports `promptCapabilities.image` in its `initialize` result, and its `images` capability comes from that report. Before a probe, `images` is on for Claude Code, Gemini CLI, OpenCode and Codex, whose image input was checked in their source (see `docs/notes/phase1-backend.md`). A larger image, or another file, goes by its path only.
 
 ## Models and effort
 

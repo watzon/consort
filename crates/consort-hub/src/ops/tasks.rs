@@ -6,7 +6,7 @@ use consort_proto::ids::SessionId;
 use consort_proto::ids::TaskId;
 use consort_proto::model::Isolation;
 use consort_proto::model::{
-    Author, Channel, FileRef, MessageKind, Repo, Session, SessionRole, SessionState, Task, Usage,
+    Author, Channel, MessageKind, Repo, Session, SessionRole, SessionState, Task, Usage,
     ValidationError,
 };
 use consort_proto::status::{Actor, TaskStatus};
@@ -24,7 +24,7 @@ use crate::link::events::{Ctx, Effects, end_session_by_hub, mark_lost_in_tx, que
 use crate::placement::{Placement, PlacementError, PlacementInput, Subject, place};
 use crate::prompts;
 use crate::store::conversation::{self, NewMessage};
-use crate::store::{knowledge, machine, work};
+use crate::store::{machine, work};
 
 const TITLE_MAX_CHARS: usize = 200;
 
@@ -87,6 +87,7 @@ impl Hub {
                     updated_at: now,
                 };
                 tx.save_task(&task)?;
+                tx.save_task_attachments(task.id, &new.attachments)?;
                 Ok(task)
             })
             .await?;
@@ -117,11 +118,10 @@ impl Hub {
                 let workers = machine::workers(conn)?;
                 let open = work::open_session_counts(conn)?;
                 let repos = conversation::repos(conn)?;
-                let files = knowledge::channel_files(conn, channel.id, None)?;
-                Ok(Some((task, channel, workers, open, repos, files)))
+                Ok(Some((task, channel, workers, open, repos)))
             })
             .await?;
-        let Some((task, channel, workers, open, all_repos, files)) = inputs else {
+        let Some((task, channel, workers, open, all_repos)) = inputs else {
             return Ok(());
         };
 
@@ -156,14 +156,7 @@ impl Hub {
         };
         match place(&input) {
             Ok(placement) => {
-                let files: Vec<FileRef> = files
-                    .iter()
-                    .map(|f| FileRef {
-                        path: f.path.clone(),
-                        sha256: f.blob_sha256.clone(),
-                    })
-                    .collect();
-                self.start_task_session(task, channel, placement, &repos, isolation, files)
+                self.start_task_session(task, channel, placement, &repos, isolation)
                     .await
             }
             Err(PlacementError::Wait(reason)) => {
@@ -213,7 +206,6 @@ impl Hub {
         placement: Placement,
         repos: &[Repo],
         isolation: Isolation,
-        files: Vec<FileRef>,
     ) -> Result<()> {
         let worker_id = placement.worker_id;
         let task_id = task.id;
@@ -279,6 +271,9 @@ impl Hub {
                 };
                 tx.save_session(&session)?;
                 let extensions = tx.session_extensions(worker_id, channel_id)?;
+                let channel_files =
+                    tx.channel_files_for_start(session.id, channel_id, Some(task_id))?;
+                let attachments = work::task_attachments(tx.db(), task_id)?;
                 tx.save_session_runtime(
                     session.id,
                     &work::SessionRuntime {
@@ -301,12 +296,12 @@ impl Hub {
                         workspace,
                         system_prompt_append: system_prompt,
                         allowed_local_mcp_servers: local_mcp,
-                        channel_files: files,
+                        channel_files,
                         extensions,
                         resume: None,
                         turn: Some(TurnInput {
                             text: first_turn,
-                            attachments: Vec::new(),
+                            attachments,
                         }),
                     }),
                 )?;
@@ -392,6 +387,7 @@ impl Hub {
                 start_at: request.start_at,
                 created_by,
                 routine_id: None,
+                attachments: Vec::new(),
             })
             .await?;
         Ok(TaskResult { task })

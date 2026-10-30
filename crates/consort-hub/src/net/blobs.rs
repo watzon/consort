@@ -173,6 +173,39 @@ async fn receive(body: Body, temp: &std::path::Path, expected: &Sha256Hash) -> R
     Ok(size)
 }
 
+/// `HEAD /v1/blobs/{sha256}`: whether the hub has the blob, and its size,
+/// without reading it. A client asks this before an upload, to skip a blob
+/// that the hub already has.
+pub(crate) async fn head_blob(
+    State(hub): State<Hub>,
+    Path(name): Path<String>,
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    let result: Result<Response> = async {
+        hub.authorize_http(&method, &uri, &headers).await?;
+        let hash = parse_hash(&name)?;
+        let meta = match tokio::fs::metadata(hub.blob_file(&hash)).await {
+            Ok(meta) => meta,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                return Err(HubError::not_found("The hub has no blob with this hash."));
+            }
+            Err(err) => return Err(err.into()),
+        };
+        Ok((
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "application/octet-stream".to_owned()),
+                (header::CONTENT_LENGTH, meta.len().to_string()),
+            ],
+        )
+            .into_response())
+    }
+    .await;
+    result.unwrap_or_else(|err| error_response(&err))
+}
+
 pub(crate) async fn get_blob(
     State(hub): State<Hub>,
     Path(name): Path<String>,

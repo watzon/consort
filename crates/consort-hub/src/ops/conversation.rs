@@ -9,7 +9,7 @@ use consort_proto::client_api::*;
 use consort_proto::frame::Empty;
 use consort_proto::ids::{ChannelId, GroupId, MessageId, RepoId};
 use consort_proto::model::{
-    Author, Channel, ChannelKind, Group, Message, MessageKind, Reaction, ReadMarker, Repo,
+    Author, BlobRef, Channel, ChannelKind, Group, Message, MessageKind, Reaction, ReadMarker, Repo,
     normalize_tags,
 };
 use consort_proto::status::Actor;
@@ -693,6 +693,27 @@ impl Hub {
 // Messages -----------------------------------------------------------------
 
 impl Hub {
+    /// Checks that the hub has the blob of each attachment, and takes the
+    /// size from the stored blob. A worker downloads each attachment before
+    /// the turn, so a blob that the client never uploaded is refused here.
+    pub(crate) async fn check_attachments(&self, attachments: &mut [BlobRef]) -> Result<()> {
+        for blob in attachments.iter_mut() {
+            let path = self.store.blobs_dir().join(blob.sha256.as_str());
+            let meta = tokio::fs::metadata(&path)
+                .await
+                .ok()
+                .filter(|m| m.is_file())
+                .ok_or_else(|| {
+                    HubError::invalid(format!(
+                        "The hub has no file for the attachment {}. Upload it, then send the message again.",
+                        blob.name
+                    ))
+                })?;
+            blob.size = meta.len();
+        }
+        Ok(())
+    }
+
     pub(crate) async fn message_send(
         &self,
         caller: &Caller,
@@ -703,6 +724,8 @@ impl Hub {
                 "The message is empty. Write some text or attach a file.",
             ));
         }
+        let mut request = request;
+        self.check_attachments(&mut request.attachments).await?;
         let origin = match caller {
             Caller::Client(client_id) => {
                 if request.client_message_id.trim().is_empty() {
@@ -764,7 +787,14 @@ impl Hub {
                 // The delivery to the task session goes into the same
                 // transaction, so a stored message always has its turn,
                 // steer or inbox entry, also when the hub stops right after.
-                match deliver_in_tx(&hub, tx, task.id, &message.body, Actor::User) {
+                match deliver_in_tx(
+                    &hub,
+                    tx,
+                    task.id,
+                    &message.body,
+                    &message.attachments,
+                    Actor::User,
+                ) {
                     Ok(delivered) => Ok(Sent::New {
                         message,
                         delivered: Some((delivered, task.channel_id)),
@@ -1647,16 +1677,27 @@ mod tests {
             .await;
         assert_eq!(code_of(missing), ErrorCode::NotFound);
 
-        // An attachment alone is a message.
+        // An attachment alone is a message, but only when the hub has its
+        // blob. The size comes from the stored blob.
         let mut request = send_request(channel.id, "k3", "");
         request.attachments = vec![BlobRef {
             sha256: crate::util::sha256(b"png"),
             name: "a.png".to_owned(),
             mime: "image/png".to_owned(),
-            size: 3,
+            size: 99,
         }];
+        let no_blob = hub.message_send(&user, request.clone()).await;
+        assert_eq!(code_of(no_blob), ErrorCode::Invalid);
+        std::fs::write(
+            hub.store
+                .blobs_dir()
+                .join(crate::util::sha256(b"png").as_str()),
+            b"png",
+        )
+        .unwrap();
         let sent = send(&hub, &user, request).await;
         assert_eq!(sent.attachments.len(), 1);
+        assert_eq!(sent.attachments[0].size, 3);
 
         hub.channel_archive(
             &Caller::Hub,

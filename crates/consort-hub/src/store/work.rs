@@ -6,7 +6,7 @@ use consort_proto::client_api::{EntityKind, EntityPayload};
 use consort_proto::ids::{
     ChannelId, ItemId, MessageId, RequestId, SessionId, TaskId, TurnId, WorkerId,
 };
-use consort_proto::model::{Approval, Decision, Session, SessionItem, Task};
+use consort_proto::model::{Approval, BlobRef, Decision, Session, SessionItem, Task};
 use consort_proto::status::TaskStatus;
 use consort_proto::time::Timestamp;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -183,6 +183,10 @@ impl Tx<'_> {
                 .execute("DELETE FROM session_items WHERE session_id = ?1", [sid])?;
             self.db()
                 .execute("DELETE FROM session_runtime WHERE session_id = ?1", [sid])?;
+            self.db().execute(
+                "DELETE FROM session_channel_files WHERE session_id = ?1",
+                [sid],
+            )?;
             self.db()
                 .execute("DELETE FROM sessions WHERE id = ?1", [sid])?;
         }
@@ -212,8 +216,13 @@ impl Tx<'_> {
             self.purge_message(&card)?;
         }
         self.unindex_search("task", &id)?;
-        self.db()
-            .execute("DELETE FROM tasks WHERE id = ?1", [&id])?;
+        for sql in [
+            "DELETE FROM task_inbox WHERE task_id = ?1",
+            "DELETE FROM task_attachments WHERE task_id = ?1",
+            "DELETE FROM tasks WHERE id = ?1",
+        ] {
+            self.db().execute(sql, [&id])?;
+        }
         self.emit_delete(EntityKind::Task, id, Some(channel))
     }
 }
@@ -534,20 +543,91 @@ impl Tx<'_> {
 
 // Task inbox -------------------------------------------------------------
 
+/// A message for a task session that waits for the current turn to end.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboxMessage {
+    /// The row ID.
+    pub id: i64,
+    /// The text.
+    pub text: String,
+    /// The attachments of the message.
+    pub attachments: Vec<BlobRef>,
+}
+
 /// Messages for a task session that wait for the current turn to end, oldest
-/// first, with their row IDs.
-pub fn task_inbox(conn: &Connection, task_id: TaskId) -> Result<Vec<(i64, String)>> {
-    let mut stmt =
-        conn.prepare_cached("SELECT id, text FROM task_inbox WHERE task_id = ?1 ORDER BY id")?;
-    let rows = stmt.query_map([task_id.to_string()], |row| Ok((row.get(0)?, row.get(1)?)))?;
-    Ok(rows.collect::<std::result::Result<_, _>>()?)
+/// first.
+pub fn task_inbox(conn: &Connection, task_id: TaskId) -> Result<Vec<InboxMessage>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, text, attachments FROM task_inbox WHERE task_id = ?1 ORDER BY id",
+    )?;
+    let rows = stmt.query_map([task_id.to_string()], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, text, attachments) = row?;
+        out.push(InboxMessage {
+            id,
+            text,
+            attachments: serde_json::from_str(&attachments)?,
+        });
+    }
+    Ok(out)
+}
+
+/// The attachments that a coordinator gave a task with `start_task`. Each
+/// session of the task gets them with its first turn.
+pub fn task_attachments(conn: &Connection, task_id: TaskId) -> Result<Vec<BlobRef>> {
+    let text: Option<String> = conn
+        .query_row(
+            "SELECT attachments FROM task_attachments WHERE task_id = ?1",
+            [task_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match text {
+        Some(text) => Ok(serde_json::from_str(&text)?),
+        None => Ok(Vec::new()),
+    }
 }
 
 impl Tx<'_> {
-    pub fn push_task_inbox(&mut self, task_id: TaskId, text: &str) -> Result<()> {
+    pub fn push_task_inbox(
+        &mut self,
+        task_id: TaskId,
+        text: &str,
+        attachments: &[BlobRef],
+    ) -> Result<()> {
         self.db().execute(
-            "INSERT INTO task_inbox (task_id, text, created_at) VALUES (?1, ?2, ?3)",
-            params![task_id.to_string(), text, self.now().as_millis()],
+            "INSERT INTO task_inbox (task_id, text, attachments, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                task_id.to_string(),
+                text,
+                serde_json::to_string(attachments)?,
+                self.now().as_millis()
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Keeps the attachments of a new task for the first turn of its
+    /// sessions.
+    pub fn save_task_attachments(
+        &mut self,
+        task_id: TaskId,
+        attachments: &[BlobRef],
+    ) -> Result<()> {
+        if attachments.is_empty() {
+            return Ok(());
+        }
+        self.db().execute(
+            "INSERT INTO task_attachments (task_id, attachments) VALUES (?1, ?2)
+             ON CONFLICT(task_id) DO UPDATE SET attachments = excluded.attachments",
+            params![task_id.to_string(), serde_json::to_string(attachments)?],
         )?;
         Ok(())
     }

@@ -19,6 +19,32 @@ impl fmt::Debug for SecretText {
     }
 }
 
+/// The bytes of a pasted file. `Debug` shows only the size.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PastedBytes(pub std::sync::Arc<Vec<u8>>);
+
+impl fmt::Debug for PastedBytes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "<{} bytes>", self.0.len())
+    }
+}
+
+/// What the user attaches.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AttachInput {
+    /// A file on this computer, from the file dialog or a drop.
+    Path(String),
+    /// An image from the clipboard. The client keeps a copy in its cache
+    /// folder, then uploads it like a file.
+    Pasted {
+        name: String,
+        mime: String,
+        bytes: PastedBytes,
+    },
+    /// A file that is on the hub already, such as a channel file.
+    Blob(consort_proto::model::BlobRef),
+}
+
 /// The ACP agent of a new account.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AcpSpec {
@@ -49,6 +75,10 @@ pub enum CommandOutput {
     AccountCreated(String),
     /// `sign_in.start` started a sign-in with this ID.
     SignInStarted(String),
+    /// `Command::Attach` added uploads with these IDs, one for each file.
+    Attached(Vec<String>),
+    /// A blob is in the local cache at this path.
+    LocalFile(String),
     /// `connection.connect` or `connection.reconnect` started a connect
     /// attempt. The connection's status follows it in the view state.
     ConnectStarted {
@@ -149,10 +179,15 @@ pub enum Command {
         hub_url: String,
         code: String,
     },
+    /// Sends a message. It waits until the uploads in `attachments` are on
+    /// the hub, then sends their blobs with the text and takes the uploads
+    /// away. A failed upload stops the send with an error.
     SendMessage {
         channel_id: String,
         body: String,
         client_message_id: String,
+        /// Upload IDs, from [`CommandOutput::Attached`].
+        attachments: Vec<String>,
     },
     DeleteMessage {
         message_id: String,
@@ -165,6 +200,61 @@ pub enum Command {
         task_id: String,
         body: String,
         client_message_id: String,
+        /// Upload IDs, as for `SendMessage`.
+        attachments: Vec<String>,
+    },
+    // Files.
+    /// Attaches files to a composer, a reply box or a folder of channel
+    /// files. Each file becomes an upload that starts at once. The output
+    /// is [`CommandOutput::Attached`]. A file that is too large or cannot be
+    /// read still gets an upload, in the failed state, so the chip says
+    /// what happened.
+    Attach {
+        target: crate::uploads::UploadTarget,
+        inputs: Vec<AttachInput>,
+    },
+    /// Starts a failed upload again.
+    RetryUpload {
+        id: String,
+    },
+    /// Takes an upload away.
+    RemoveUpload {
+        id: String,
+    },
+    /// Loads the files of a channel (`files.list`).
+    LoadChannelFiles {
+        channel_id: String,
+    },
+    /// Renames or moves a channel file (`files.move`).
+    MoveChannelFile {
+        channel_id: String,
+        from_path: String,
+        to_path: String,
+    },
+    DeleteChannelFile {
+        channel_id: String,
+        path: String,
+    },
+    /// Puts a blob that is on the hub in the channel files (`files.put`),
+    /// such as an attachment of a message.
+    SaveToChannelFiles {
+        channel_id: String,
+        path: String,
+        blob: consort_proto::model::BlobRef,
+    },
+    /// Downloads a blob into the local cache. With a name, the output is a
+    /// copy with that file name, so another app can open it. The output is
+    /// [`CommandOutput::LocalFile`].
+    FetchBlob {
+        sha256: String,
+        size: u64,
+        name: Option<String>,
+    },
+    /// Downloads a blob and writes a copy to `to`.
+    SaveBlob {
+        sha256: String,
+        size: u64,
+        to: String,
     },
     CreateChannel(NewChannel),
     UpdateChannel {

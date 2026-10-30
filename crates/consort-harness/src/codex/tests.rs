@@ -947,3 +947,43 @@ fn a_state_setup_race_is_recognized() {
     )));
     assert!(!is_state_init_race(&HarnessError::Closed));
 }
+
+#[test]
+fn image_attachments_become_local_image_items() {
+    let workspace = tempfile::tempdir().unwrap();
+    let save = |name: &str, bytes: &[u8], byte: u8| {
+        let blob = consort_proto::model::BlobRef {
+            sha256: consort_proto::model::Sha256Hash::from_bytes([byte; 32]),
+            name: name.into(),
+            mime: "image/png".into(),
+            size: bytes.len() as u64,
+        };
+        let path = crate::attachments::attachment_path(workspace.path(), &blob);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        (blob, path)
+    };
+    let (png, png_path) = save("shot.png", crate::attachments::tests::PNG, 1);
+    // The media type says PNG, but the bytes are text: it goes by path only.
+    let (fake, _) = save("fake.png", b"not an image", 2);
+    let items = turn_input(
+        &TurnInput {
+            text: "Look".into(),
+            attachments: vec![png, fake],
+        },
+        workspace.path(),
+    );
+    let json = serde_json::to_value(&items).unwrap();
+    assert_eq!(json.as_array().unwrap().len(), 2, "{json}");
+    assert_eq!(json[0]["type"], "text");
+    assert_eq!(json[0]["text_elements"], json!([]));
+    let text = json[0]["text"].as_str().unwrap();
+    assert!(text.starts_with("Look\n\nAttached files."), "{text}");
+    assert!(text.contains("shot.png (image/png, 16 bytes, also in this message as an image)"));
+    assert!(text.contains("fake.png (image/png, 12 bytes): "));
+    assert_eq!(
+        json[1],
+        json!({"type": "localImage", "path": png_path.to_string_lossy()})
+    );
+    assert!(codex_capabilities().images);
+}

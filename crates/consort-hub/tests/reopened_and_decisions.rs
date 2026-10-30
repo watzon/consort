@@ -4,11 +4,9 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-mod common;
-
 use std::time::Duration;
 
-use common::*;
+use crate::common::*;
 use consort_proto::auth::OpenSession;
 use consort_proto::client_api::{DecisionAnswerRequest, MessageSend};
 use consort_proto::ids::{AccountId, DecisionId, WorkerId};

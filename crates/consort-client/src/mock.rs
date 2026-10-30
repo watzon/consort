@@ -1383,6 +1383,9 @@ pub fn view_state() -> ViewState {
             ..SkillDirectoryView::default()
         },
         activity: activity(),
+        uploads: Vec::new(),
+        channel_files: crate::mock_files::channel_files(),
+        files_loaded: vec![text(LIGHTS), text(EXT4)],
     };
     stamp_times(&mut state.timelines);
     if let Some(account) = state
@@ -1401,6 +1404,14 @@ pub fn view_state() -> ViewState {
 
 /// The mock with Tutti as "Tutti manages connectors and
 /// channels" shows it: a request and the connect card at the end.
+/// The mock with the files of the phase 1 designs. See
+/// [`crate::mock_files::with_files`].
+pub fn view_state_with_files() -> ViewState {
+    let mut state = crate::mock_files::with_files(view_state());
+    refresh(&mut state);
+    state
+}
+
 pub fn view_state_with_connect_card() -> ViewState {
     let mut state = view_state();
     if let Some(timeline) = state

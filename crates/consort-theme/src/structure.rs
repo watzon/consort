@@ -159,14 +159,25 @@ pub struct Layout {
     /// The widest a bubble, a task card or an approval card grows in the
     /// timeline.
     pub bubble_max_width: f32,
-    /// The solid canvas at the top of the timeline. It reaches just below
-    /// the Three voices mark and the activity pill, so no bubble shows
-    /// under them. A test checks that it is tall enough for both.
-    pub fade_top_solid: f32,
-    /// The gradient under the solid top, from canvas to clear.
-    pub fade_top_blend: f32,
+    /// The space above the first item of a chat at rest. It reaches just
+    /// below the Three voices mark and the activity pill. A test checks
+    /// that it is tall enough for both.
+    pub content_top: f32,
+    /// The progressive tint at the top of the timeline: the canvas color at
+    /// each stop's opacity, from the top down. The last stop is clear and
+    /// sets the height of the tint. GPUI gradients have two stops, so the
+    /// view draws one gradient layer between each pair of stops.
+    pub top_tint: [TintStop; 4],
     /// The fade at the bottom of the timeline, above the composer.
     pub fade_bottom: f32,
+}
+
+/// One stop of the top tint: a distance from the top in px, and the opacity
+/// of the canvas color there.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
+pub struct TintStop {
+    pub at: f32,
+    pub alpha: f32,
 }
 
 /// Opacities of dimmed parts, as shares of full color.
@@ -178,6 +189,19 @@ pub struct Opacity {
     pub busy: f32,
     /// A danger button under the pointer.
     pub danger_hover: f32,
+    /// The border of a failed upload chip: `status.failed` at this share.
+    pub failed_border: f32,
+    /// The track of an upload progress bar: `status.working` at this share.
+    pub progress_track: f32,
+    /// The soft fill of the composer while files are dragged over the chat:
+    /// `accent.fill` at this share, over `surface.card`.
+    pub drop_fill: f32,
+    /// A Previous or Next button of the light box at the first or last
+    /// picture.
+    pub nav_disabled: f32,
+    /// The file tile in a file bubble in your lane: the scrim at this
+    /// share, so the tile reads on `accent.surface`.
+    pub you_tile: f32,
 }
 
 /// Sizes of single components that no other token covers. Each one comes
@@ -274,8 +298,6 @@ pub struct Components {
     pub worker_dot: f32,
     /// The dot of a sign-in state.
     pub state_dot: f32,
-    /// The vertical padding of a worker row in the sidebar: 26 px rows.
-    pub worker_row_pad_y: f32,
     /// The inset of the switch thumb.
     pub switch_inset: f32,
     /// The least height of the notes box in the Instructions dialog.
@@ -287,8 +309,96 @@ pub struct Components {
     /// The width of the focus ring that a control shows when the keyboard
     /// focuses it. The ring is `accent.text`.
     pub focus_ring: f32,
+    pub files: Files,
+    pub sidebar: Sidebar,
     pub chat: Chat,
     pub theme_preview: ThemePreview,
+}
+
+/// The sizes of attachments and channel files: the chips of the composer,
+/// the attachments in bubbles, the drop state, the light box and the rows
+/// of the Files tab. From the phase 1 Paper artboards.
+#[derive(Clone, Copy, Debug, Deserialize)]
+pub struct Files {
+    /// An image chip in the composer: a square thumbnail.
+    pub chip_image: f32,
+    /// A file chip in the composer.
+    pub chip_file: f32,
+    pub chip_pad: f32,
+    pub chip_gap: f32,
+    /// The tile with the file icon in a chip or a file bubble.
+    pub chip_tile: f32,
+    /// The round remove badge on an image chip.
+    pub chip_badge: f32,
+    /// The remove button of a file chip, and its icon.
+    pub chip_close: f32,
+    pub chip_close_icon: f32,
+    /// The height of the progress bar of an upload in a chip.
+    pub progress: f32,
+    /// The height of the progress bar of an upload in the Files tab.
+    pub row_progress: f32,
+    /// A picture in a bubble group.
+    pub image_tile_w: f32,
+    pub image_tile_h: f32,
+    /// A file bubble in your lane, and a file or artifact bubble in the
+    /// assistant lane.
+    pub file_bubble_you: f32,
+    pub file_bubble: f32,
+    pub bubble_pad_y: f32,
+    pub bubble_pad_left: f32,
+    /// The Save and Open buttons of a file bubble on hover.
+    pub bubble_action: f32,
+    /// The round tile and the icon of the drop state of the composer.
+    pub drop_icon_tile: f32,
+    pub drop_icon: f32,
+    /// The top and bottom bars of the light box.
+    pub lightbox_bar: f32,
+    /// The round Previous and Next buttons of the light box.
+    pub lightbox_nav: f32,
+    /// The largest picture in the light box.
+    pub lightbox_image_w: f32,
+    pub lightbox_image_h: f32,
+    /// A row of the Files tab.
+    pub row_pad_y: f32,
+    /// The size and date columns of a row of the Files tab.
+    pub size_col: f32,
+    pub date_col: f32,
+    /// The "more" button of a row.
+    pub more: f32,
+    /// The indent of an artifact under its task.
+    pub artifact_indent: f32,
+}
+
+/// The sizes of the sidebar and the settings rail. From the approved Paper
+/// artboard "Base: Tutti with top tint and larger sidebar, dark".
+#[derive(Clone, Copy, Debug, Deserialize)]
+pub struct Sidebar {
+    /// The space between the sidebar edges and its rows.
+    pub inset: f32,
+    /// The padding of a row: 36 px rows with the row text.
+    pub row_pad_y: f32,
+    pub row_pad_x: f32,
+    /// The gap between the icon and the name of a row.
+    pub row_gap: f32,
+    /// The icon and the status glyph of a row.
+    pub row_icon: f32,
+    /// The text of a row: Search, Tutti, a channel, a settings section.
+    pub row_text: TypeStyle,
+    /// A group label, the Workers label and a settings group label.
+    pub label_text: TypeStyle,
+    pub label_pad_y: f32,
+    /// The space above a group.
+    pub group_top: f32,
+    /// The title bar strip at the top, where the macOS window buttons sit.
+    pub title_bar: f32,
+    /// The name of a worker row.
+    pub worker_text: TypeStyle,
+    /// The padding of a worker row: 30 px rows.
+    pub worker_pad_y: f32,
+    /// The avatar in the account row.
+    pub avatar: f32,
+    pub account_pad_top: f32,
+    pub account_pad_bottom: f32,
 }
 
 /// The sizes of the chat: bubbles, the composer, the top actions and the
@@ -349,6 +459,8 @@ pub struct Derive {
     pub selection_alpha: f32,
     pub status_tint_alpha: f32,
     pub scrim_alpha: ScrimAlpha,
+    /// The black behind the light box.
+    pub lightbox_alpha: f32,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -374,7 +486,7 @@ mod tests {
     #[test]
     fn structure_parses() {
         let s: super::Structure = serde_json::from_str(super::STRUCTURE_JSON).expect("parses");
-        assert_eq!(s.layout.sidebar_width, 248.0);
+        assert_eq!(s.layout.sidebar_width, 288.0);
         assert_eq!(s.type_scale.body.size, 15.0);
         assert_eq!(s.space.page, 48.0);
     }
@@ -420,30 +532,45 @@ mod tests {
         let s = super::structure();
         assert_eq!(s.layout.bubble_max_width, 560.0);
         assert!(s.layout.bubble_max_width < s.layout.timeline_max_width);
-        assert_eq!(
-            (
-                s.layout.fade_top_solid,
-                s.layout.fade_top_blend,
-                s.layout.fade_bottom
-            ),
-            (92.0, 24.0, 32.0)
-        );
+        assert_eq!((s.layout.content_top, s.layout.fade_bottom), (92.0, 32.0));
         // 8 frames a second.
         assert_eq!(s.motion.frame_ms, 125);
         assert_eq!(s.motion.done_hold_ms, 1500);
-        // The solid top reaches below the mark, the gap and the pill, with a
-        // margin. The pill is one line of the label size, its padding and
-        // its border. The activity pill is not drawn when the assistant
-        // idles, but the solid zone stays, so the edge does not jump.
+        // At rest, the first item starts below the mark, the gap and the
+        // pill, with a margin. The pill is one line of the label size, its
+        // padding and its border. The activity pill is not drawn when the
+        // assistant idles, but the space stays, so the chat does not jump.
         let chat = &s.component.chat;
         let pill = s.type_scale.label.line + 2.0 * chat.pill_pad_y + 2.0 * s.border_width;
         let needed = chat.mark_top + chat.mark + s.space.xxs + pill + s.space.xs;
         assert!(
-            s.layout.fade_top_solid >= needed,
+            s.layout.content_top >= needed,
             "{} < {needed}",
-            s.layout.fade_top_solid
+            s.layout.content_top
         );
-        assert!(s.layout.fade_top_solid - needed < s.space.md);
+        assert!(s.layout.content_top - needed < s.space.md);
+    }
+
+    /// The top tint of the Paper artboard "Base: Tutti with top tint and
+    /// larger sidebar": the canvas at about 94 percent at the top, 84 at
+    /// 56 px, 50 at 108 px, and clear at 184 px. The tint gets lighter all
+    /// the way down, and it reaches below the place where the first item
+    /// starts, so content that moves up under the mark stays faintly
+    /// visible.
+    #[test]
+    fn the_top_tint_gets_lighter_from_the_top_to_clear() {
+        let s = super::structure();
+        let stops = s.layout.top_tint;
+        assert_eq!(
+            stops.map(|t| (t.at, t.alpha)),
+            [(0.0, 0.94), (56.0, 0.84), (108.0, 0.5), (184.0, 0.0)]
+        );
+        for pair in stops.windows(2) {
+            assert!(pair[0].at < pair[1].at);
+            assert!(pair[0].alpha > pair[1].alpha);
+        }
+        assert!(stops[0].alpha < 1.0, "content stays faintly visible");
+        assert!(stops[3].at > s.layout.content_top);
     }
 
     #[test]
@@ -452,9 +579,48 @@ mod tests {
         assert_eq!(o.answered_dim, 0.6);
         assert_eq!(o.busy, 0.7);
         assert_eq!(o.danger_hover, 0.9);
-        for share in [o.answered_dim, o.busy, o.danger_hover] {
+        assert_eq!(
+            (
+                o.failed_border,
+                o.progress_track,
+                o.drop_fill,
+                o.nav_disabled
+            ),
+            (0.45, 0.22, 0.06, 0.4)
+        );
+        for share in [
+            o.answered_dim,
+            o.busy,
+            o.danger_hover,
+            o.failed_border,
+            o.progress_track,
+            o.drop_fill,
+            o.nav_disabled,
+            o.you_tile,
+        ] {
             assert!(share > 0.0 && share < 1.0);
         }
+    }
+
+    /// The phase 1 artboards: composer chips, attachments in bubbles, the
+    /// light box and the rows of the Files tab.
+    #[test]
+    fn file_tokens_keep_the_values_of_the_phase_1_designs() {
+        let f = super::structure().component.files;
+        assert_eq!(
+            (f.chip_image, f.chip_file, f.chip_tile),
+            (56.0, 240.0, 38.0)
+        );
+        // A file chip is as high as an image chip.
+        assert_eq!(f.chip_tile + 2.0 * f.chip_pad + 2.0, f.chip_image);
+        assert_eq!((f.image_tile_w, f.image_tile_h), (228.0, 168.0));
+        // Two pictures and their gap fit in a bubble.
+        let s = super::structure();
+        assert!(2.0 * f.image_tile_w + s.space.xs <= s.layout.bubble_max_width);
+        assert_eq!((f.file_bubble_you, f.file_bubble), (280.0, 360.0));
+        assert_eq!((f.lightbox_bar, f.lightbox_nav), (56.0, 40.0));
+        assert_eq!((f.size_col, f.date_col, f.more), (64.0, 52.0, 20.0));
+        assert!(s.derive.lightbox_alpha > s.derive.scrim_alpha.dark);
     }
 
     #[test]
@@ -503,7 +669,18 @@ mod tests {
         assert_eq!(c.button_pad_y * 2.0 + 20.0, 30.0);
         assert_eq!(c.worker_dot, 7.0);
         assert_eq!(c.state_dot, 6.0);
-        assert_eq!(c.worker_row_pad_y * 2.0 + 20.0, 26.0);
+        // The larger sidebar: 288 px, 36 px rows with 15 px text and 18 px
+        // icons, 13 px labels, a 52 px title bar, 30 px worker rows with
+        // 14 px names and a 28 px avatar.
+        let sb = c.sidebar;
+        assert_eq!(sb.row_pad_y * 2.0 + sb.row_text.line, 36.0);
+        assert_eq!((sb.row_text.size, sb.row_icon), (15.0, 18.0));
+        assert_eq!((sb.row_pad_x, sb.row_gap, sb.inset), (10.0, 10.0, 10.0));
+        assert_eq!((sb.label_text.size, sb.label_text.weight), (13.0, 500));
+        assert_eq!(sb.title_bar, 52.0);
+        assert_eq!(sb.worker_text.size, 14.0);
+        assert_eq!(sb.worker_pad_y * 2.0 + sb.worker_text.line, 30.0);
+        assert_eq!(sb.avatar, 28.0);
         assert_eq!(c.switch_inset, 3.0);
         assert_eq!(c.focus_ring, 2.0);
         let chat = c.chat;

@@ -321,6 +321,9 @@ pub struct ReplyArgs {
     /// Also show the reply in the timeline.
     #[serde(default)]
     pub in_timeline: bool,
+    /// Channel file paths to attach.
+    #[serde(default)]
+    pub attachments: Vec<String>,
 }
 
 /// `update_message`.
@@ -426,6 +429,10 @@ pub struct StartTaskArgs {
     /// Start later, at this time.
     #[serde(default)]
     pub start_at: Option<Timestamp>,
+    /// Channel file paths to give the task with its brief. The task gets
+    /// them as attachments of its first turn.
+    #[serde(default)]
+    pub attachments: Vec<String>,
 }
 
 /// `message_task`.
@@ -435,6 +442,9 @@ pub struct MessageTaskArgs {
     pub task_id: TaskId,
     /// The message, in markdown.
     pub body: String,
+    /// Channel file paths to attach.
+    #[serde(default)]
+    pub attachments: Vec<String>,
 }
 
 /// `list_tasks`.
@@ -687,10 +697,10 @@ hub_tools! {
     // Coordinators.
     /// `post_message`.
     PostMessage("post_message", PostMessageArgs, COORDINATORS,
-        "Post a message in the channel timeline. You can post several short messages in one turn."),
+        "Post a message in the channel timeline. You can post several short messages in one turn. To attach channel files, give their paths from files_list."),
     /// `reply`.
     Reply("reply", ReplyArgs, COORDINATORS,
-        "Reply in the thread of a message. Set in_timeline to also show the reply in the timeline."),
+        "Reply in the thread of a message. Set in_timeline to also show the reply in the timeline. To attach channel files, give their paths from files_list."),
     /// `update_message`.
     UpdateMessage("update_message", UpdateMessageArgs, COORDINATORS,
         "Change the text of one of your own messages."),
@@ -717,10 +727,10 @@ hub_tools! {
         "Write a text file in the channel files."),
     /// `start_task`.
     StartTask("start_task", StartTaskArgs, COORDINATORS,
-        "Start a task. The task runs in its own session on a worker and reports in its own thread. Placement uses the channel defaults for anything that you leave out."),
+        "Start a task. The task runs in its own session on a worker and reports in its own thread. Placement uses the channel defaults for anything that you leave out. To give the task channel files, put their paths in attachments."),
     /// `message_task`.
     MessageTask("message_task", MessageTaskArgs, COORDINATORS,
-        "Send a message to a task. It starts a new turn, or steers the running turn when the harness can steer."),
+        "Send a message to a task. It starts a new turn, or steers the running turn when the harness can steer. To attach channel files, give their paths from files_list."),
     /// `list_tasks`.
     ListTasks("list_tasks", ListTasksArgs, COORDINATORS,
         "List the tasks in this channel. A long brief or review summary is cut to a preview here. Use read_task for the full task."),

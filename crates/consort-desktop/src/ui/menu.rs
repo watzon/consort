@@ -88,6 +88,99 @@ pub enum MenuAction {
     /// is the ID of the thing picked, so a state change between the opening
     /// of the menu and the click cannot move the pick to another row.
     Select(&'static str, String),
+    /// Open an attachment with the app of the system.
+    OpenAttachment(consort_client::AttachmentView),
+    /// Save a copy of an attachment on this computer.
+    SaveAttachment(consort_client::AttachmentView),
+    /// Put an attachment in the files of a channel.
+    SaveToChannelFiles(String, consort_client::AttachmentView),
+    /// The add menu: Upload from this computer.
+    AttachFromComputer(consort_client::UploadTarget),
+    /// The add menu: Choose from channel files.
+    AttachFromChannel(consort_client::UploadTarget),
+    RetryUpload(String),
+    RemoveUpload(String),
+    /// A channel file: Open, Download.
+    OpenFile(consort_client::ChannelFileView),
+    DownloadFile(consort_client::ChannelFileView),
+    /// A channel file: the channel ID and the path.
+    RenameFile(String, String),
+    MoveFile(String, String),
+    DeleteFile(String, String),
+}
+
+/// The menu of an attachment in a message or a thread post: Open, Save, and
+/// Save to channel files. An artifact is in the channel files already, so it
+/// has no Save to channel files.
+pub fn attachment_menu(
+    attachment: &consort_client::AttachmentView,
+    channel_id: &str,
+) -> Vec<MenuItem> {
+    let mut items = vec![
+        MenuItem::new("Open", MenuAction::OpenAttachment(attachment.clone())),
+        MenuItem::new("Save", MenuAction::SaveAttachment(attachment.clone())),
+    ];
+    if attachment.artifact.is_none() {
+        items.push(
+            MenuItem::new(
+                "Save to channel files",
+                MenuAction::SaveToChannelFiles(channel_id.to_owned(), attachment.clone()),
+            )
+            .separated(),
+        );
+    }
+    items
+}
+
+/// The menu of a file row in the Files tab: Open, Download, Rename, Move,
+/// then Delete in `status.failed`.
+pub fn file_menu(file: &consort_client::ChannelFileView) -> Vec<MenuItem> {
+    let (channel, path) = (file.channel_id.clone(), file.path.clone());
+    vec![
+        MenuItem::new("Open", MenuAction::OpenFile(file.clone())),
+        MenuItem::new("Download", MenuAction::DownloadFile(file.clone())),
+        MenuItem::new(
+            "Rename",
+            MenuAction::RenameFile(channel.clone(), path.clone()),
+        ),
+        MenuItem::new("Move", MenuAction::MoveFile(channel.clone(), path.clone())),
+        MenuItem::new("Delete", MenuAction::DeleteFile(channel, path))
+            .danger()
+            .separated(),
+    ]
+}
+
+/// The add menu of the composer and the reply box.
+pub fn add_menu(target: &consort_client::UploadTarget) -> Vec<MenuItem> {
+    vec![
+        MenuItem::new(
+            "Upload from this computer",
+            MenuAction::AttachFromComputer(target.clone()),
+        )
+        .icon("upload"),
+        MenuItem::new(
+            "Choose from channel files",
+            MenuAction::AttachFromChannel(target.clone()),
+        )
+        .icon("folder"),
+    ]
+}
+
+/// The menu of an attachment chip in the composer or the reply box: Try
+/// again (a failed upload only), then Remove.
+pub fn upload_menu(upload: &consort_client::UploadView) -> Vec<MenuItem> {
+    let mut items = Vec::new();
+    if matches!(upload.status, consort_client::UploadStatus::Failed(_)) {
+        items.push(MenuItem::new(
+            "Try again",
+            MenuAction::RetryUpload(upload.id.clone()),
+        ));
+    }
+    items.push(MenuItem::new(
+        "Remove",
+        MenuAction::RemoveUpload(upload.id.clone()),
+    ));
+    items
 }
 
 /// The message box that a Cut, Copy, Paste or Select all acts on.
@@ -607,6 +700,56 @@ mod tests {
             ["Turn off", "View files", "Remove"]
         );
         assert_eq!(labels(&skill_menu("skl_1", false))[0], "Turn on");
+    }
+
+    /// AGENTS.md rule 2: the new menus of phase 1 keep their names and
+    /// their order.
+    #[test]
+    fn the_file_menus_keep_the_names_and_the_order() {
+        let file = consort_client::ChannelFileView {
+            channel_id: "chn_1".into(),
+            path: "photos/front.jpg".into(),
+            ..Default::default()
+        };
+        let items = file_menu(&file);
+        assert_eq!(
+            labels(&items),
+            ["Open", "Download", "Rename", "Move", "Delete"]
+        );
+        assert!(items[4].danger && items[4].separator_before);
+        assert_eq!(
+            items[3].action,
+            MenuAction::MoveFile("chn_1".into(), "photos/front.jpg".into())
+        );
+        let attachment = consort_client::AttachmentView::default();
+        assert_eq!(
+            labels(&attachment_menu(&attachment, "chn_1")),
+            ["Open", "Save", "Save to channel files"]
+        );
+        let artifact = consort_client::AttachmentView {
+            artifact: Some(consort_client::files::ArtifactTask::default()),
+            ..Default::default()
+        };
+        assert_eq!(
+            labels(&attachment_menu(&artifact, "chn_1")),
+            ["Open", "Save"]
+        );
+        let target = consort_client::UploadTarget::Composer {
+            channel_id: "chn_1".into(),
+        };
+        assert_eq!(
+            labels(&add_menu(&target)),
+            ["Upload from this computer", "Choose from channel files"]
+        );
+        let failed = consort_client::UploadView {
+            status: consort_client::UploadStatus::Failed("x".into()),
+            ..Default::default()
+        };
+        assert_eq!(labels(&upload_menu(&failed)), ["Try again", "Remove"]);
+        assert_eq!(
+            labels(&upload_menu(&consort_client::UploadView::default())),
+            ["Remove"]
+        );
     }
 
     #[test]

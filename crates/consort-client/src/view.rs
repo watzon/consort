@@ -68,6 +68,13 @@ pub struct ViewState {
     /// What the assistant of each channel does now, for the Three voices
     /// mark and its activity line. A channel that is not here is idle.
     pub activity: Vec<crate::activity::ChannelActivity>,
+    /// The files that the user attached and that are not sent yet, of every
+    /// composer, reply box and Files tab. See [`crate::uploads`].
+    pub uploads: Vec<crate::uploads::UploadView>,
+    /// The files of the channels whose files are loaded.
+    pub channel_files: Vec<crate::files::ChannelFileView>,
+    /// The channels whose files are loaded.
+    pub files_loaded: Vec<String>,
 }
 
 /// A message that the hub refused after it left the composer.
@@ -684,6 +691,8 @@ pub struct MessageView {
     pub reply_count: u32,
     /// The message is still on its way to the hub.
     pub pending: bool,
+    /// The files attached to the message.
+    pub attachments: Vec<crate::files::AttachmentView>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -925,6 +934,8 @@ pub enum PostBody {
         kind: String,
         text: String,
     },
+    /// The files attached to the post.
+    Attachments(Vec<crate::files::AttachmentView>),
 }
 
 #[derive(Clone, Debug, PartialEq)]

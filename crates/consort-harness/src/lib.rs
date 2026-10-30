@@ -19,6 +19,7 @@
 pub mod account;
 pub mod acp;
 pub mod approval;
+pub mod attachments;
 pub mod codex;
 pub mod extras;
 mod items;
@@ -35,6 +36,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 pub use account::{AccountConfig, AccountRuntime};
+pub use attachments::turn_text;
 pub use consort_proto::ids::{NativeRef, RequestId, SessionId, TurnId};
 pub use consort_proto::model::SignInMethod;
 pub use consort_proto::model::{ApprovalMode, AuthState, Capabilities, ModelInfo, ModelOptions};
@@ -358,16 +360,6 @@ pub trait HarnessSession: Send {
     async fn close(self: Box<Self>) -> Result<(), HarnessError>;
 }
 
-/// The text of a turn input for a harness that takes only text. Attachments
-/// are listed by name, because this build does not download them yet.
-pub fn turn_text(input: &TurnInput) -> String {
-    if input.attachments.is_empty() {
-        return input.text.clone();
-    }
-    let names: Vec<&str> = input.attachments.iter().map(|a| a.name.as_str()).collect();
-    format!("{}\n\n(Attached files: {})", input.text, names.join(", "))
-}
-
 /// The folder of a command approval. `given` is the folder that the harness
 /// names, and `workspace` is the session's workspace, where the harness
 /// starts commands. A relative folder is in the workspace. When the harness
@@ -470,20 +462,6 @@ mod tests {
             sign_in_hint(HarnessKind::OpenCode, ""),
             "Run `opencode auth login` on this machine."
         );
-    }
-
-    #[test]
-    fn turn_text_lists_attachments() {
-        let input = TurnInput {
-            text: "Look".into(),
-            attachments: vec![consort_proto::model::BlobRef {
-                sha256: consort_proto::model::Sha256Hash::from_bytes([0; 32]),
-                name: "a.png".into(),
-                mime: "image/png".into(),
-                size: 1,
-            }],
-        };
-        assert_eq!(turn_text(&input), "Look\n\n(Attached files: a.png)");
     }
 
     #[test]

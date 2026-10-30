@@ -1180,6 +1180,7 @@ pub(crate) mod tests {
                 text: "Again".into(),
                 attachments: vec![],
             },
+            channel_files: None,
         }
         .into();
         let turn_id = FrameId::new("cmd-turn");
@@ -1341,6 +1342,7 @@ pub(crate) mod tests {
         let turn: HubToWorker = SessionTurn {
             session_id,
             turn: TurnInput::default(),
+            channel_files: None,
         }
         .into();
         lock(&core.inflight).insert("c9".to_owned());

@@ -489,7 +489,14 @@ pub(crate) fn steer_command_failed_tx(
         return Ok(fx);
     };
     let result = if task.current_session_id == Some(session.id) {
-        deliver_without_steer(hub, tx, task.id, &steer.turn.text, Actor::User)
+        deliver_without_steer(
+            hub,
+            tx,
+            task.id,
+            &steer.turn.text,
+            &steer.turn.attachments,
+            Actor::User,
+        )
     } else {
         Err(HubError::conflict("The session of this task has ended."))
     };

@@ -76,6 +76,29 @@ pub struct CardRow {
     pub spacing: Spacing,
 }
 
+/// What an attachment row of a message shows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AttachmentPart {
+    /// The pictures of the message, as tiles in a grid: indexes into
+    /// [`crate::view::MessageView::attachments`].
+    Images(Vec<usize>),
+    /// One file that is not a picture, as a file bubble or chip.
+    File(usize),
+}
+
+/// The attachments of a message, in the lane of its speaker. Your pictures
+/// sit above your text, and your files are file bubbles. The assistant's
+/// attachments follow its text.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AttachmentRow {
+    pub item: usize,
+    /// The index of this row among the attachment rows of the message.
+    pub part: usize,
+    pub lane: Lane,
+    pub kind: AttachmentPart,
+    pub spacing: Spacing,
+}
+
 /// One row of the chat.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ChatRow {
@@ -85,6 +108,8 @@ pub enum ChatRow {
         label: String,
     },
     Bubble(BubbleRow),
+    /// Pictures or a file of a message.
+    Attachment(AttachmentRow),
     Card(CardRow),
     /// A system notice: a quiet centered line.
     Notice {
@@ -107,6 +132,7 @@ impl ChatRow {
                 b.part,
                 if b.last_in_group { "e" } else { "" }
             ),
+            ChatRow::Attachment(a) => format!("{}#a{}", item_key(a.item), a.part),
             ChatRow::Card(c) => item_key(c.item).to_owned(),
             ChatRow::Notice { item, .. } => item_key(*item).to_owned(),
         }
@@ -327,9 +353,55 @@ pub fn rows(items: &[TimelineItem]) -> Vec<ChatRow> {
                 } else {
                     parts.push((m.body.clone(), false));
                 }
-                if parts.iter().all(|(_, title)| *title) {
+                // A message with only files has no text bubble.
+                if lane == Lane::You || m.body.trim().is_empty() {
+                    parts.retain(|(markdown, title)| *title || !markdown.trim().is_empty());
+                }
+                if parts.iter().all(|(_, title)| *title) && m.attachments.is_empty() {
                     // A message with no text still gets its bubble.
                     parts.push((String::new(), false));
+                }
+                // The attachment rows: the pictures in one grid, then each
+                // file.
+                let images: Vec<usize> = m
+                    .attachments
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, a)| a.image)
+                    .map(|(i, _)| i)
+                    .collect();
+                let mut files: Vec<AttachmentPart> = Vec::new();
+                if !images.is_empty() {
+                    files.push(AttachmentPart::Images(images));
+                }
+                files.extend(
+                    m.attachments
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, a)| !a.image)
+                        .map(|(i, _)| AttachmentPart::File(i)),
+                );
+                let mut push_attachments =
+                    |out: &mut Vec<ChatRow>,
+                     open_lane: &mut Option<Lane>,
+                     after_separator: &mut bool| {
+                        for (part, kind) in std::mem::take(&mut files).into_iter().enumerate() {
+                            let in_group = *open_lane == Some(lane);
+                            let spacing = spacing_for(in_group, *after_separator, out.is_empty());
+                            out.push(ChatRow::Attachment(AttachmentRow {
+                                item: ix,
+                                part,
+                                lane,
+                                kind,
+                                spacing,
+                            }));
+                            *after_separator = false;
+                            *open_lane = Some(lane);
+                        }
+                    };
+                // Your files come before your text.
+                if lane == Lane::You {
+                    push_attachments(&mut out, &mut open_lane, &mut after_separator);
                 }
                 let last_text = parts.iter().rposition(|(_, title)| !title);
                 for (part, (markdown, title)) in parts.into_iter().enumerate() {
@@ -352,6 +424,7 @@ pub fn rows(items: &[TimelineItem]) -> Vec<ChatRow> {
                     open_lane = Some(lane);
                     last_bubble = Some(out.len() - 1);
                 }
+                push_attachments(&mut out, &mut open_lane, &mut after_separator);
             }
             TimelineItem::TaskCard(_) | TimelineItem::Approval(_) | TimelineItem::Decision(_) => {
                 close(&mut out, &mut last_bubble, &mut open_lane);
@@ -664,6 +737,79 @@ mod tests {
         ];
         let rows = rows(&items);
         assert!(matches!(rows[1], ChatRow::Notice { item: 1, .. }));
+        assert!(bubbles(&rows)[0].last_in_group);
+    }
+
+    fn with_files(item: TimelineItem, names: &[&str]) -> TimelineItem {
+        let TimelineItem::Message(mut m) = item else {
+            panic!("a message")
+        };
+        m.attachments = names
+            .iter()
+            .map(|n| crate::files::AttachmentView {
+                name: (*n).into(),
+                image: n.ends_with(".jpg"),
+                ..crate::files::AttachmentView::default()
+            })
+            .collect();
+        TimelineItem::Message(m)
+    }
+
+    #[test]
+    fn your_pictures_and_files_come_before_your_text_and_the_assistants_after() {
+        let items = vec![
+            day("Today"),
+            with_files(
+                msg("m1", Speaker::You, 0, "7:40 PM", "Here are the photos."),
+                &["front.jpg", "side.jpg", "quote.pdf"],
+            ),
+            with_files(
+                msg(
+                    "m2",
+                    Speaker::Consort,
+                    1,
+                    "7:41 PM",
+                    "The comparison is ready.",
+                ),
+                &["comparison.xlsx"],
+            ),
+            with_files(msg("m3", Speaker::You, 2, "7:42 PM", ""), &["notes.pdf"]),
+        ];
+        let rows = rows(&items);
+        let kinds: Vec<String> = rows
+            .iter()
+            .map(|r| match r {
+                ChatRow::Separator { .. } => "sep".to_owned(),
+                ChatRow::Bubble(b) => format!("bubble {}", b.item),
+                ChatRow::Attachment(a) => format!("{:?} {}", a.kind, a.item),
+                ChatRow::Card(_) => "card".to_owned(),
+                ChatRow::Notice { .. } => "notice".to_owned(),
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "sep",
+                "Images([0, 1]) 1",
+                "File(2) 1",
+                "bubble 1",
+                "bubble 2",
+                "File(0) 2",
+                // A message with only a file has no empty text bubble.
+                "File(0) 3",
+            ]
+        );
+        // The rows of one message keep one group; each has its own key.
+        let ChatRow::Attachment(first) = &rows[1] else {
+            panic!("pictures")
+        };
+        assert_eq!(first.spacing, Spacing::AfterSeparator);
+        let ChatRow::Attachment(file) = &rows[2] else {
+            panic!("file")
+        };
+        assert_eq!(file.spacing, Spacing::InGroup);
+        assert_ne!(rows[1].key(&items), rows[2].key(&items));
+        // Your text bubble is the last of your group, so it has the tail.
         assert!(bubbles(&rows)[0].last_in_group);
     }
 }

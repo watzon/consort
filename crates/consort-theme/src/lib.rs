@@ -24,7 +24,7 @@ pub use runtime::{
     write_choice,
 };
 pub use structure::{Structure, structure};
-pub use tokens::{ActiveTokens, Palette, TextSize, Tokens, Type, TypeExt};
+pub use tokens::{ActiveTokens, Palette, TextSize, TintStop, Tokens, Type, TypeExt};
 
 /// The built-in themes, parsed. Spruce comes first.
 pub fn builtin_themes() -> Vec<ThemeFile> {

@@ -19,12 +19,13 @@ gethostname.workspace = true
 # the plain text of a message matches what the reader sees.
 markdown.workspace = true
 rand.workspace = true
-reqwest.workspace = true
+reqwest = { workspace = true, features = ["stream"] }
+sha2.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time", "macros", "net"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time", "macros", "net", "fs", "io-util"] }
 tokio-tungstenite.workspace = true
 url.workspace = true
 uuid.workspace = true

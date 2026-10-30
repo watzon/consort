@@ -16,7 +16,8 @@ use consort_proto::error::{ErrorBody, ErrorCode};
 use consort_proto::frame::FrameId;
 use consort_proto::ids::{AccountId, ItemId, RequestId, SessionId};
 use consort_proto::model::{
-    ApprovalDetails, ApprovalMode, Capabilities, RequestOptionKind, SessionState, Sha256Hash,
+    ApprovalDetails, ApprovalMode, Capabilities, FileRef, RequestOptionKind, SessionState,
+    Sha256Hash,
 };
 use consort_proto::tools::{ToolCallResult, ToolDefinition};
 use consort_proto::worker_link::{
@@ -26,6 +27,7 @@ use consort_proto::worker_link::{
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
+use crate::attachments::{ATTACHMENT_FAILED_CODE, BlobCache, BlobFetch, ChannelCopy, Failure};
 use crate::config::{RUNTIME_DIR, create_private_dir, local_server_name_problem};
 use crate::core::{Core, GroupLog};
 use crate::mcp::{self, McpEndpoint, ToolBackend, ToolCache};
@@ -409,6 +411,41 @@ struct Runtime {
     /// The skills of the session. The worker removes their folder when the
     /// session ends.
     skills: Option<consort_harness::skills::SessionSkills>,
+    /// The session's workspace, once the start or the resume knows it.
+    workspace: Option<std::path::PathBuf>,
+    /// The read-only copy of the channel files in the workspace.
+    channel_copy: ChannelCopy,
+    /// The newest channel file list that the hub sent.
+    channel_files: Vec<FileRef>,
+    /// The last copy of the channel files missed a file, so the next turn
+    /// tries again.
+    channel_retry: bool,
+}
+
+/// Gets blobs over HTTP with the worker's signature.
+struct LinkBlobs {
+    core: Arc<Core>,
+}
+
+#[async_trait]
+impl BlobFetch for LinkBlobs {
+    async fn fetch(
+        &self,
+        sha256: &Sha256Hash,
+        max_bytes: u64,
+        dest: &std::path::Path,
+    ) -> Result<(), WorkerError> {
+        crate::http::download_blob_to_file(
+            &self.core.hub_url,
+            self.core.worker_id,
+            &self.core.identity,
+            sha256,
+            max_bytes,
+            dest,
+        )
+        .await
+        .map(|_| ())
+    }
 }
 
 fn harness_body(err: consort_harness::HarnessError) -> ErrorBody {
@@ -462,6 +499,69 @@ enum Outcome {
 }
 
 impl Runtime {
+    /// Tells the user, through the hub, about each file that the session did
+    /// not get.
+    fn report_failures(&self, failures: &[Failure], what: &str) {
+        for failure in failures {
+            tracing::warn!(session = %self.session_id, file = %failure.name, error = %failure.error, "a session did not get a file");
+            self.core.record_event(
+                self.session_id,
+                &SessionEvent::Error {
+                    code: ATTACHMENT_FAILED_CODE.to_owned(),
+                    message: failure.message(what),
+                },
+            );
+        }
+    }
+
+    /// Makes the channel file copy in the workspace current. `files` is a
+    /// new list from the hub, or `None` when the list did not change. With
+    /// `None`, the worker only tries again the files that failed before.
+    async fn refresh_channel_files(&mut self, files: Option<Vec<FileRef>>) {
+        let changed = files.is_some();
+        if let Some(files) = files {
+            if let Err(err) = self.core.store.set_channel_files(self.session_id, &files) {
+                tracing::warn!(session = %self.session_id, error = %err, "could not store the new channel file list");
+            }
+            self.channel_files = files;
+        }
+        if !changed && !self.channel_retry {
+            return;
+        }
+        let Some(workspace) = self.workspace.clone() else {
+            return;
+        };
+        let cache = BlobCache::new(&self.core.consort_home);
+        let fetch = LinkBlobs {
+            core: self.core.clone(),
+        };
+        let failures = self
+            .channel_copy
+            .sync(&cache, &fetch, &workspace, &self.channel_files)
+            .await;
+        self.channel_retry = !failures.is_empty();
+        self.report_failures(&failures, "channel file");
+    }
+
+    /// Saves the attachments of a turn or a steer in the workspace before
+    /// the harness gets the input.
+    async fn save_attachments(&mut self, input: &TurnInput) {
+        if input.attachments.is_empty() {
+            return;
+        }
+        let Some(workspace) = self.workspace.clone() else {
+            return;
+        };
+        let cache = BlobCache::new(&self.core.consort_home);
+        let fetch = LinkBlobs {
+            core: self.core.clone(),
+        };
+        let failures =
+            crate::attachments::save_attachments(&cache, &fetch, &workspace, &input.attachments)
+                .await;
+        self.report_failures(&failures, "attachment");
+    }
+
     fn harness(&mut self) -> Result<&mut Box<dyn HarnessSession>, ErrorBody> {
         self.harness
             .as_mut()
@@ -770,12 +870,6 @@ impl Runtime {
                 prepared
             }
         };
-        if !start.channel_files.is_empty() {
-            tracing::warn!(
-                count = start.channel_files.len(),
-                "this build does not download channel files yet"
-            );
-        }
         let workspace_path = prepared.path.to_string_lossy().into_owned();
         let starting = SessionRecord {
             start: start.clone(),
@@ -793,6 +887,12 @@ impl Runtime {
                 state: SessionState::Starting,
             },
         );
+        // The channel files, before the harness opens, so the first turn
+        // sees them. Git does not see the worker's folders in a repo.
+        workspace::exclude_worker_folders(&prepared.path).await;
+        self.workspace = Some(prepared.path.clone());
+        self.refresh_channel_files(Some(start.channel_files.clone()))
+            .await;
         let resume = start.resume.as_ref().map(|r| r.native_ref.clone());
         if let Err(failure) = self.open(&start, &prepared.path, resume).await {
             // The same stop signal can reach the harness a moment before
@@ -822,6 +922,7 @@ impl Runtime {
         }
         let native_ref = self.harness.as_ref().and_then(|h| h.native_ref());
         if let Some(turn) = start.turn {
+            self.save_attachments(&turn).await;
             let result = match self.harness() {
                 Ok(h) => h.turn(turn).await.map_err(harness_body),
                 Err(e) => Err(e),
@@ -868,6 +969,10 @@ impl Runtime {
         self.core
             .record_event(self.session_id, &SessionEvent::Reopened);
         let path = std::path::PathBuf::from(&record.workspace_path);
+        // The copy of the channel files stays as it is. The next turn with a
+        // new list refreshes it.
+        self.workspace = Some(path.clone());
+        self.channel_files = record.start.channel_files.clone();
         if let Err(failure) = self.open(&record.start, &path, Some(native)).await {
             self.lost("resume_failed", &failure.body.message);
             return false;
@@ -962,6 +1067,10 @@ impl Runtime {
         let empty = || Ok(json!({}));
         match command {
             HubToWorker::SessionTurn(turn) => {
+                if self.harness.is_some() {
+                    self.refresh_channel_files(turn.channel_files).await;
+                    self.save_attachments(&turn.turn).await;
+                }
                 let result = match self.harness() {
                     Ok(h) => h.turn(turn.turn).await.map_err(harness_body),
                     Err(e) => Err(e),
@@ -1079,11 +1188,20 @@ pub(crate) async fn run_session(
         pump: None,
         tool_lease: None,
         skills: None,
+        workspace: None,
+        channel_copy: ChannelCopy::default(),
+        channel_files: Vec::new(),
+        channel_retry: false,
     };
     while let Some(job) = jobs.recv().await {
         match job {
             Job::Command { id, command } => {
                 if let HubToWorker::SessionSteer(steer) = *command {
+                    // The files are saved first, so the harness can open
+                    // them. An interrupt waits for this download.
+                    if runtime.capabilities.steer && runtime.harness.is_some() {
+                        runtime.save_attachments(&steer.turn).await;
+                    }
                     runtime.begin_steer(id, steer);
                     continue;
                 }

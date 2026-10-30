@@ -142,7 +142,7 @@ impl Hub {
                                     transition(tx, &mut task, TaskStatus::Working, Actor::System, None, None)?;
                                     tx.save_task(&task)?;
                                 }
-                                deliver_in_tx(&hub, tx, task_id, &render_events(&[event]), Actor::System)
+                                deliver_in_tx(&hub, tx, task_id, &render_events(&[event]), &[], Actor::System)
                             };
                             match delivered {
                                 Ok(delivered) => worker_id = Some(delivered.worker_id),

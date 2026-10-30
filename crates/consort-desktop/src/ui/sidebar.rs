@@ -1,5 +1,7 @@
 //! The sidebar: search, Tutti, the groups of channels, New channel, the
-//! workers and the account. The macOS traffic lights sit in its top 44 px.
+//! workers and the account. The macOS traffic lights sit in its title bar
+//! strip (`component.sidebar.title_bar`). The sizes come from
+//! `component.sidebar` in `design/structure.json`.
 
 use consort_client::{SidebarChannel, WorkerView};
 use consort_theme::{Tokens, TypeExt as _};
@@ -20,18 +22,31 @@ use crate::{
 
 /// The height of the title bar strip, where the traffic lights sit.
 pub fn title_bar_height(t: &Tokens) -> gpui_kit::Pixels {
-    t.space.xxl + t.space.md
+    t.component.sidebar.title_bar
 }
 
-/// A sidebar row: 28 px, `md` corners, 8 px inset.
+/// A sidebar row: 36 px with the row text, `lg` corners. The settings rail
+/// uses it too.
 pub fn row(t: &Tokens) -> Div {
+    let sb = t.component.sidebar;
     div()
         .flex()
         .items_center()
-        .gap(t.space.sm)
-        .py(t.space.xs)
-        .px(t.space.sm)
-        .rounded(t.radius.md)
+        .gap(sb.row_gap)
+        .py(sb.row_pad_y)
+        .px(sb.row_pad_x)
+        .rounded(t.radius.lg)
+}
+
+/// A group label in the sidebar or the settings rail.
+pub fn group_label(t: &Tokens) -> Div {
+    let sb = t.component.sidebar;
+    div()
+        .flex()
+        .items_center()
+        .gap(t.space.xs)
+        .py(sb.label_pad_y)
+        .px(sb.row_pad_x)
 }
 
 impl ConsortApp {
@@ -42,22 +57,24 @@ impl ConsortApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let c = &t.colors;
+        let sb = t.component.sidebar;
         let state = self.state.clone();
         let sidebar = &state.sidebar;
         let selected = self.channel_id.clone();
 
         let search = focusable(row(t).id("search"), t)
+            .debug_selector(|| "sidebar-search".into())
             .cursor_pointer()
             .hover(|s| s.bg(c.hover_sidebar))
-            .child(icon("search", t.icon.size, c.text_secondary))
-            .child(text("Search", t.text.ui, c.text_secondary).flex_1())
+            .child(icon("search", sb.row_icon, c.text_secondary))
+            .child(text("Search", sb.row_text, c.text_secondary).flex_1())
             .child(text(
                 if cfg!(target_os = "macos") {
                     "⌘K"
                 } else {
                     "Ctrl+K"
                 },
-                t.text.caption,
+                t.text.ui,
                 c.text_tertiary,
             ))
             .on_click(cx.listener(|this, _, window, cx| this.open_switcher(window, cx)));
@@ -76,26 +93,25 @@ impl ConsortApp {
                 .flex()
                 .flex_col()
                 .gap(t.space.xxs)
-                .pt(if gi == 0 { t.space.lg } else { t.space.md })
+                .pt(sb.group_top)
                 .child(
                     focusable(
-                        div().id(SharedString::from(format!("group-{}", group.id))),
+                        group_label(t)
+                            .id(SharedString::from(format!("group-{}", group.id)))
+                            .when(gi == 0, |d| {
+                                d.debug_selector(|| "sidebar-group-label".into())
+                            }),
                         t,
                     )
-                    .flex()
-                    .items_center()
-                    .gap(t.space.xs)
-                    .py(t.space.xs)
-                    .px(t.space.sm)
                     .cursor_pointer()
-                    .child(text(group.name.clone(), t.text.label, c.text_tertiary))
+                    .child(text(group.name.clone(), sb.label_text, c.text_tertiary))
                     .child(icon(
                         if collapsed {
                             "chevron-right"
                         } else {
                             "chevron-down"
                         },
-                        t.space.md,
+                        t.icon.dense,
                         c.text_tertiary,
                     ))
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -128,12 +144,12 @@ impl ConsortApp {
                     .flex()
                     .flex_col()
                     .gap(t.space.xs)
-                    .pt(t.space.lg)
-                    .px(t.space.sm)
-                    .child(text(waiting.title, t.text.ui, c.text_secondary)),
+                    .pt(sb.group_top)
+                    .px(sb.row_pad_x)
+                    .child(text(waiting.title, sb.row_text, c.text_secondary)),
             );
         } else if !sidebar.ungrouped.is_empty() || sidebar.groups.is_empty() {
-            let mut block = div().flex().flex_col().gap(t.space.xxs).pt(t.space.md);
+            let mut block = div().flex().flex_col().gap(t.space.xxs).pt(sb.group_top);
             for channel in &sidebar.ungrouped {
                 block = block.child(self.channel_row(channel, false, &selected, t, cx));
             }
@@ -154,12 +170,8 @@ impl ConsortApp {
             .border_t(t.border_width)
             .border_color(c.border_subtle)
             .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .py(t.space.xs)
-                    .px(t.space.sm)
-                    .child(text("Workers", t.text.label, c.text_tertiary).flex_1())
+                group_label(t)
+                    .child(text("Workers", sb.label_text, c.text_tertiary).flex_1())
                     .child(text(
                         format!(
                             "{} of {} online",
@@ -177,15 +189,17 @@ impl ConsortApp {
             div()
                 .flex()
                 .items_center()
-                .gap(t.space.sm)
-                .pt(t.space.sm)
-                .pb(t.space.xs)
-                .px(t.space.sm)
+                .gap(sb.row_gap)
+                .pt(sb.account_pad_top)
+                .pb(sb.account_pad_bottom)
+                .px(sb.row_pad_x)
                 .border_t(t.border_width)
                 .border_color(c.border_subtle)
                 .child(
                     div()
-                        .size(t.space.xl)
+                        .id("sidebar-avatar")
+                        .debug_selector(|| "sidebar-avatar".into())
+                        .size(sb.avatar)
                         .flex_none()
                         .rounded(t.radius.full)
                         .bg(c.surface_selected)
@@ -200,13 +214,13 @@ impl ConsortApp {
                                 .child(state.user.initials.clone()),
                         ),
                 )
-                .child(text(state.user.name.clone(), t.text.ui, c.text_primary).flex_1())
+                .child(text(state.user.name.clone(), sb.row_text, c.text_primary).flex_1())
                 .child(
                     crate::ui::parts::icon_button(
                         "open-settings",
                         "settings",
-                        t.space.xl,
-                        t.icon.size,
+                        t.component.composer_chip,
+                        sb.row_icon,
                         c.text_tertiary,
                         c.hover_sidebar,
                         t,
@@ -218,12 +232,14 @@ impl ConsortApp {
                 );
 
         div()
+            .id("sidebar")
+            .debug_selector(|| "sidebar".into())
             .flex()
             .flex_col()
             .flex_none()
             .w(t.layout.sidebar_width)
             .h_full()
-            .px(t.space.sm)
+            .px(sb.inset)
             .pb(t.space.sm)
             .bg(c.surface_sidebar)
             .border_r(t.border_width)
@@ -239,7 +255,7 @@ impl ConsortApp {
                         .drag_area(),
                 )
             })
-            .when(!cfg!(target_os = "macos"), |d| d.pt(t.space.sm))
+            .when(!cfg!(target_os = "macos"), |d| d.pt(sb.inset))
             .child(
                 div()
                     .flex()
@@ -267,22 +283,18 @@ impl ConsortApp {
     /// no timeline in the app, so a row does not open it.
     fn archived_block(&mut self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
         let c = &t.colors;
+        let sb = t.component.sidebar;
         let state = self.state.clone();
         let open = self.archived_open;
         let mut block = div()
             .flex()
             .flex_col()
             .gap(t.space.xxs)
-            .pt(t.space.md)
+            .pt(sb.group_top)
             .child(
-                focusable(div().id("archived-header"), t)
-                    .flex()
-                    .items_center()
-                    .gap(t.space.xs)
-                    .py(t.space.xs)
-                    .px(t.space.sm)
+                focusable(group_label(t).id("archived-header"), t)
                     .cursor_pointer()
-                    .child(text("Archived", t.text.label, c.text_tertiary))
+                    .child(text("Archived", sb.label_text, c.text_tertiary))
                     .child(text(
                         state.archived_channels.len().to_string(),
                         t.text.caption,
@@ -294,7 +306,7 @@ impl ConsortApp {
                         } else {
                             "chevron-right"
                         },
-                        t.space.md,
+                        t.icon.dense,
                         c.text_tertiary,
                     ))
                     .on_click(cx.listener(|this, _, _, cx| {
@@ -311,8 +323,8 @@ impl ConsortApp {
             block = block.child(
                 row(t)
                     .id(SharedString::from(format!("archived-{}", channel.id)))
-                    .child(icon(&channel.icon, t.icon.size, c.text_tertiary))
-                    .child(line(channel.name.clone(), t.text.ui, c.text_tertiary).flex_1())
+                    .child(icon(&channel.icon, sb.row_icon, c.text_tertiary))
+                    .child(line(channel.name.clone(), sb.row_text, c.text_tertiary).flex_1())
                     .child(
                         button(
                             SharedString::from(format!("unarchive-{}", channel.id)),
@@ -347,11 +359,12 @@ impl ConsortApp {
 
     fn new_channel_row(&mut self, t: &Tokens, cx: &mut Context<Self>) -> AnyElement {
         let c = &t.colors;
+        let sb = t.component.sidebar;
         focusable(row(t).id("new-channel"), t)
             .cursor_pointer()
             .hover(|s| s.bg(c.hover_sidebar))
-            .child(icon("plus", t.icon.size, c.text_tertiary))
-            .child(text("New channel", t.text.ui, c.text_tertiary))
+            .child(icon("plus", sb.row_icon, c.text_tertiary))
+            .child(text("New channel", sb.row_text, c.text_tertiary))
             .on_click(
                 cx.listener(|this, _, window, cx| this.open_dialog(Dialog::NewChannel, window, cx)),
             )
@@ -367,6 +380,7 @@ impl ConsortApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let c = &t.colors;
+        let sb = t.component.sidebar;
         let is_selected = self.page == Page::Main && channel.id == selected;
         let name_color = if is_selected || channel.attention {
             c.text_primary
@@ -377,22 +391,25 @@ impl ConsortApp {
         let menu_id = channel.id.clone();
         let leading = if tutti {
             // The Three voices mark, idle and sharp.
-            crate::ui::mark::still_mark(t.component.chat.mark_small, t)
+            crate::ui::mark::still_mark(sb.row_icon, t)
         } else {
-            icon(&channel.icon, t.icon.size, c.text_secondary).into_any_element()
+            icon(&channel.icon, sb.row_icon, c.text_secondary).into_any_element()
         };
         let status = match channel.status {
             Some(status) => status_glyph(
                 SharedString::from(format!("sidebar-status-{}", channel.id)),
                 status,
-                t.icon.size,
+                sb.row_icon,
                 t,
                 cx,
             ),
-            None => div().size(t.icon.size).flex_none().into_any_element(),
+            None => div().size(sb.row_icon).flex_none().into_any_element(),
         };
+        let selector = format!("sidebar-channel-{}", channel.id);
         focusable(
-            row(t).id(SharedString::from(format!("channel-{}", channel.id))),
+            row(t)
+                .id(SharedString::from(format!("channel-{}", channel.id)))
+                .debug_selector(move || selector),
             t,
         )
         .cursor_pointer()
@@ -400,7 +417,7 @@ impl ConsortApp {
         .when(!is_selected, |d| d.hover(|s| s.bg(c.hover_sidebar)))
         .child(leading)
         .child(
-            line(channel.name.clone(), t.text.ui, name_color)
+            line(channel.name.clone(), sb.row_text, name_color)
                 .flex_1()
                 .when(is_selected, |d| d.font_weight(t.text.ui_strong.weight)),
         )
@@ -435,31 +452,37 @@ impl ConsortApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let c = &t.colors;
+        let sb = t.component.sidebar;
         let id = worker.id.clone();
         let menu_id = worker.id.clone();
         let paused = worker.paused;
         focusable(
-            div().id(SharedString::from(format!("worker-{}", worker.id))),
+            div()
+                .id(SharedString::from(format!("worker-{}", worker.id)))
+                .debug_selector({
+                    let selector = format!("sidebar-worker-{}", worker.id);
+                    move || selector
+                }),
             t,
         )
         .flex()
         .items_center()
-        .gap(t.space.sm)
-        .py(t.component.worker_row_pad_y)
-        .px(t.space.sm)
-        .rounded(t.radius.md)
+        .gap(sb.row_gap)
+        .py(sb.worker_pad_y)
+        .px(sb.row_pad_x)
+        .rounded(t.radius.lg)
         .cursor_pointer()
         .hover(|s| s.bg(c.hover_sidebar))
         .child(worker_dot(
             worker.online,
             t.component.worker_dot,
-            t.icon.size,
+            sb.row_icon,
             t,
         ))
         .child(
             line(
                 worker.name.clone(),
-                t.text.ui,
+                sb.worker_text,
                 if worker.online {
                     c.text_secondary
                 } else {

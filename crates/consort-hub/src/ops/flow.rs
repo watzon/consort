@@ -2,7 +2,7 @@
 //! status transitions and message delivery to a task session.
 
 use consort_proto::ids::{ChannelId, MessageId, TaskId, WorkerId};
-use consort_proto::model::{Author, Message, MessageKind, Session, SessionRole, Task};
+use consort_proto::model::{Author, BlobRef, Message, MessageKind, Session, SessionRole, Task};
 use consort_proto::status::{Actor, TaskStatus};
 use consort_proto::tools::MessageDelivery;
 use consort_proto::turn_input::WakeEvent;
@@ -122,9 +122,10 @@ pub(crate) fn deliver_in_tx(
     tx: &mut Tx<'_>,
     task_id: TaskId,
     text: &str,
+    attachments: &[BlobRef],
     actor: Actor,
 ) -> Result<Delivered> {
-    deliver(hub, tx, task_id, text, actor, true)
+    deliver(hub, tx, task_id, text, attachments, actor, true)
 }
 
 /// Like [`deliver_in_tx`], but never steers: while a turn is open, the text
@@ -134,9 +135,10 @@ pub(crate) fn deliver_without_steer(
     tx: &mut Tx<'_>,
     task_id: TaskId,
     text: &str,
+    attachments: &[BlobRef],
     actor: Actor,
 ) -> Result<Delivered> {
-    deliver(hub, tx, task_id, text, actor, false)
+    deliver(hub, tx, task_id, text, attachments, actor, false)
 }
 
 fn deliver(
@@ -144,6 +146,7 @@ fn deliver(
     tx: &mut Tx<'_>,
     task_id: TaskId,
     text: &str,
+    attachments: &[BlobRef],
     actor: Actor,
     may_steer: bool,
 ) -> Result<Delivered> {
@@ -191,7 +194,7 @@ fn deliver(
         .unwrap_or(false);
     let turn = TurnInput {
         text: text.to_owned(),
-        attachments: Vec::new(),
+        attachments: attachments.to_vec(),
     };
     // A session has one turn at a time. While a turn is open, the text
     // steers it when the worker is online and the harness can steer, and
@@ -206,12 +209,18 @@ fn deliver(
         )?;
         MessageDelivery::Steer
     } else if runtime.turn_open {
-        tx.push_task_inbox(task_id, text)?;
+        tx.push_task_inbox(task_id, text, attachments)?;
         MessageDelivery::Queued
     } else {
+        let channel_files =
+            tx.channel_files_for_turn(session_id, task.channel_id, Some(task_id))?;
         tx.queue_command(
             session.worker_id,
-            &HubToWorker::SessionTurn(SessionTurn { session_id, turn }),
+            &HubToWorker::SessionTurn(SessionTurn {
+                session_id,
+                turn,
+                channel_files,
+            }),
         )?;
         runtime.turn_open = true;
         // A refused turn sends the task back where it came from.
@@ -239,13 +248,14 @@ impl Hub {
         &self,
         task_id: TaskId,
         text: String,
+        attachments: Vec<BlobRef>,
         actor: Actor,
     ) -> Result<MessageDelivery> {
         let hub = self.clone();
         let (delivered, channel) = self
             .store
             .write(move |tx| {
-                let delivered = deliver_in_tx(&hub, tx, task_id, &text, actor)?;
+                let delivered = deliver_in_tx(&hub, tx, task_id, &text, &attachments, actor)?;
                 let task = work::task_or_404(tx.db(), task_id)?;
                 Ok((delivered, task.channel_id))
             })

@@ -764,7 +764,77 @@ fn channel_activities(cache: &Cache, state: &ViewState) -> Vec<crate::activity::
         .collect()
 }
 
+/// The artifact task of each blob in the channel files, by hash.
+fn artifact_tasks(cache: &Cache) -> BTreeMap<String, crate::files::ArtifactTask> {
+    cache
+        .channel_files
+        .values()
+        .filter_map(|f| {
+            let task_id = f.task_id?;
+            let task = cache.tasks.get(&task_id.to_string());
+            Some((
+                f.blob_sha256.to_string(),
+                crate::files::ArtifactTask {
+                    task_id: task_id.to_string(),
+                    task_name: task
+                        .map(|t| t.title.clone())
+                        .or_else(|| f.title.clone())
+                        .unwrap_or_else(|| "A task".to_owned()),
+                    status: task.map(|t| task_status(t.status)).unwrap_or_default(),
+                },
+            ))
+        })
+        .collect()
+}
+
+/// The views of the blobs that a message names.
+fn attachment_views(
+    blobs: &[model::BlobRef],
+    artifacts: &BTreeMap<String, crate::files::ArtifactTask>,
+    cache: &Cache,
+) -> Vec<crate::files::AttachmentView> {
+    blobs
+        .iter()
+        .map(|b| {
+            let sha = b.sha256.to_string();
+            crate::files::attachment_view(
+                b,
+                artifacts.get(&sha).cloned(),
+                cache.local_blobs.get(&sha).cloned(),
+            )
+        })
+        .collect()
+}
+
+/// The files of the loaded channels, for the Files tab.
+fn channel_file_views(cache: &Cache, now: i64) -> Vec<crate::files::ChannelFileView> {
+    cache
+        .channel_files
+        .values()
+        .map(|f| {
+            let (folder, name) = crate::files::split_path(&f.path);
+            let sha = f.blob_sha256.to_string();
+            crate::files::ChannelFileView {
+                channel_id: f.channel_id.to_string(),
+                path: f.path.clone(),
+                name: name.to_owned(),
+                folder: folder.to_owned(),
+                local_path: cache.local_blobs.get(&sha).cloned(),
+                sha256: sha,
+                size: f.size,
+                mime: f.mime.clone(),
+                image: crate::uploads::is_image(&f.mime),
+                size_label: format::file_size_label(f.size),
+                date_label: format::file_date_label(f.updated_at.as_millis(), now),
+                updated_at: f.updated_at.as_millis(),
+                task_id: f.task_id.map(|t| t.to_string()),
+            }
+        })
+        .collect()
+}
+
 pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i64) -> ViewState {
+    let artifacts = artifact_tasks(cache);
     let workers_by_id: BTreeMap<String, &model::Worker> =
         cache.workers.iter().map(|(k, v)| (k.clone(), v)).collect();
     let worker_name = |id: &consort_proto::ids::WorkerId| {
@@ -1089,6 +1159,7 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                     edited: m.edited_at.is_some(),
                     reply_count: m.reply_count,
                     pending: false,
+                    attachments: attachment_views(&m.attachments, &artifacts, cache),
                 }));
             }
         }
@@ -1106,6 +1177,7 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                 created_at: p.created_at,
                 body: p.body.clone(),
                 pending: true,
+                attachments: attachment_views(&p.attachments, &artifacts, cache),
                 ..MessageView::default()
             }));
         }
@@ -1155,11 +1227,19 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                 _ => Some(PostBody::Text(m.body.clone())),
             };
             if let Some(body) = body {
+                let mut bodies = vec![body];
+                if !m.attachments.is_empty() {
+                    bodies.push(PostBody::Attachments(attachment_views(
+                        &m.attachments,
+                        &artifacts,
+                        cache,
+                    )));
+                }
                 posts.push(ThreadPost {
                     id: m.id.to_string(),
                     speaker: speaker(m),
                     time_label: format::time_label(m.created_at.as_millis()),
-                    bodies: vec![body],
+                    bodies,
                     pending: false,
                 });
             }
@@ -1169,11 +1249,19 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
             .iter()
             .filter(|p| p.thread_root_id.as_deref() == Some(root.to_string().as_str()))
         {
+            let mut bodies = vec![PostBody::Text(p.body.clone())];
+            if !p.attachments.is_empty() {
+                bodies.push(PostBody::Attachments(attachment_views(
+                    &p.attachments,
+                    &artifacts,
+                    cache,
+                )));
+            }
             posts.push(ThreadPost {
                 id: format!("pending-{}", p.client_message_id),
                 speaker: Speaker::You,
                 time_label: format::time_label(p.created_at),
-                bodies: vec![PostBody::Text(p.body.clone())],
+                bodies,
                 pending: true,
             });
         }
@@ -1512,6 +1600,11 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
         service_tools: cache.extensions.service_tools.values().cloned().collect(),
         skill_directory: cache.extensions.directory.clone(),
         activity: Vec::new(),
+        // The uploads live in the hub backend, not in the cache. It adds
+        // them after this.
+        uploads: Vec::new(),
+        channel_files: channel_file_views(cache, now),
+        files_loaded: cache.files_loaded.iter().cloned().collect(),
     };
     state.activity = channel_activities(cache, &state);
     // Collapsed groups and unread counts come from the hub, so seed the
@@ -2063,6 +2156,7 @@ mod tests {
             thread_root_id: None,
             body: "Hi".into(),
             created_at: NOW,
+            attachments: Vec::new(),
         });
         let state = view(&w.cache);
         let items = &state
@@ -2624,6 +2718,7 @@ mod tests {
             thread_root_id: None,
             body: "Hi".into(),
             created_at: NOW,
+            attachments: Vec::new(),
         });
         w.cache.has_older.insert(w.sayso.to_string(), true);
         w.cache.channels_loaded.insert(w.sayso.to_string());
@@ -3181,6 +3276,7 @@ mod tests {
             thread_root_id: None,
             body: "A long message that the user wrote offline".into(),
             created_at: NOW,
+            attachments: Vec::new(),
         });
         w.cache.pending.push(PendingSend {
             client_message_id: "cm-2".into(),
@@ -3188,6 +3284,7 @@ mod tests {
             thread_root_id: None,
             body: "Stays".into(),
             created_at: NOW,
+            attachments: Vec::new(),
         });
         w.cache.seq = 5;
         let changed = w.cache.apply(FeedEntry {

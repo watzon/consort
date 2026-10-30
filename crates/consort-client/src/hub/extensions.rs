@@ -567,7 +567,7 @@ pub(super) async fn run(
         Command::PreviewSkill { source } => {
             let preview = shared
                 .call(SkillPreview {
-                    source: install_source(&source)?,
+                    source: shared.skill_source(&source).await?,
                 })
                 .await
                 .map_err(|e| unsupported(e, "add skills"))?;
@@ -592,7 +592,7 @@ pub(super) async fn run(
         } => {
             let result = shared
                 .call(SkillInstall {
-                    source: install_source(&source)?,
+                    source: shared.skill_source(&source).await?,
                     use_in: use_in_proto(&use_in)?,
                     enabled,
                     approval_id: approval_id.map(|id| parse(&id, "card")).transpose()?,

@@ -152,7 +152,7 @@ Every hub command is a request. The envelope `id` of a hub command is its comman
 | Type | Body | Result |
 |---|---|---|
 | `session.start` | `session_id`, `role`, `channel_id`, `task_id` (for a task session), `account_id`, `model`, `options`, `approval_mode`, `workspace` (see below), `system_prompt_append`, `allowed_local_mcp_servers`, `channel_files` (a list of `path` and `sha256`), optional `extensions` (see [Connectors and skills of a session](#connectors-and-skills-of-a-session)), optional `resume` with a `native_ref`, optional first `turn` | `workspace_path` and optional `native_ref` |
-| `session.turn` | `session_id`, `turn` (`text` and `attachments`) | `turn_id` |
+| `session.turn` | `session_id`, `turn` (`text` and `attachments`), optional `channel_files` (a list of `path` and `sha256`). The hub sends `channel_files` only when the list changed since the session got it last (see [Blobs](#blobs)) | `turn_id` |
 | `session.steer` | `session_id`, `turn` | None. The worker sends `policy_denied` if the harness cannot steer. The worker refuses a steer when no turn runs, for example because the turn ended first. The hub does not lose the text of a refused steer (see [Delivery rules](#delivery-rules)) |
 | `session.interrupt` | `session_id` | None |
 | `session.respond` | `session_id`, `request_id`, `answer` (`option_id` and, for a question, `text`) | None. `not_found` means that the harness has closed the request already: the hub shows the approval or decision as `canceled`, posts a notice, and lets `turn.ended` or the session state decide the task status. Any other refusal fails a task that waits on the answer, with Retry |
@@ -248,6 +248,7 @@ The `code` of an `error` event is one of these:
 | `option_failed` | ACP adapter | The harness refused a model option, for example the model or the effort. The session goes on with the harness default |
 | `elicitation_declined` | Codex adapter | An MCP server asked for input. The worker declined it, because Consort does not support MCP elicitation yet |
 | `codex_error` | Codex adapter | Codex reported an error that it will not retry |
+| `attachment_failed` | Worker | The worker could not get an attachment or a channel file for the session: the download failed, the hash did not match, the file is larger than 256 MiB, or the path is not safe. The message names the file. The session goes on without it. The hub also posts the message as a notice, in the task thread or in the channel timeline |
 | `mode_reset` | ACP adapter | The agent raised its permission mode above the worker's limit, and the adapter set it back |
 | `mode_reset_failed` | ACP adapter | The adapter could not set a raised permission mode back, so it stopped the agent. The session is lost |
 | `approval_too_long` | Worker | An approval was too long to show in full, so the worker denied it. The model gets the same reason as a steer when the harness can steer |
@@ -329,7 +330,7 @@ A sign-in is one run of a provider's sign-in flow for one account. The user star
 
 ### Blobs
 
-`PUT /v1/blobs/{sha256}` uploads a blob. `GET /v1/blobs/{sha256}` downloads it. Clients authenticate with `Authorization: Bearer <token>`, with the token from `auth.http_token`. The hub checks the headers before it reads the body, so a request without valid credentials gets `401` at once. It rejects an upload whose content does not match the hash, and an upload larger than 256 MiB.
+`PUT /v1/blobs/{sha256}` uploads a blob. `GET /v1/blobs/{sha256}` downloads it. `HEAD /v1/blobs/{sha256}` says whether the hub has it (`200` with `Content-Length`, or `404`) without reading it, so a client can skip an upload. Clients authenticate with `Authorization: Bearer <token>`, with the token from `auth.http_token`. The hub checks the headers before it reads the body, so a request without valid credentials gets `401` at once. It rejects an upload whose content does not match the hash, and an upload larger than 256 MiB.
 
 Workers authenticate with three headers:
 
@@ -339,7 +340,13 @@ Workers authenticate with three headers:
 | `X-Consort-Timestamp` | The request time in Unix milliseconds. The hub refuses a time more than 5 minutes from its own clock |
 | `X-Consort-Signature` | The hex Ed25519 signature over the UTF-8 bytes `consort-http-v1\n<METHOD>\n<origin>\n<path>\n<timestamp>\n<worker id>` |
 
-At `session.start`, the worker downloads the channel files that it does not have and puts a read-only copy in `<workspace>/.channel/files/`.
+#### Attachments and channel files on the worker
+
+The worker gets every file of a session with the signed `GET /v1/blobs/{sha256}`. It checks the SHA-256 and keeps the file in a cache by hash, `<consort home>/cache/blobs/<sha256>`. Each use checks the hash again. A file larger than 256 MiB, a download that fails and a hash that does not match fail only that file, with an `attachment_failed` error event.
+
+- **Attachments.** Before a turn or a steer reaches the harness, the worker saves each attachment at `<workspace>/.consort/attachments/<first 12 hex characters of the hash>-<name>`. The name loses path separators, control characters and the characters that Windows refuses, loses dots and spaces at its ends, and has at most 100 bytes. The adapter tells the model the name, the type, the size and the path of each attachment, and sends images as image input where the harness takes them (see [harness-adapters.md](harness-adapters.md#attachments-and-images)).
+- **Channel files.** At `session.start`, the worker makes a read-only copy of `channel_files` in `<workspace>/.channel/files/`. A task session's list has no files under `artifacts/<its own task id>/`. When a `session.turn` has `channel_files`, the worker makes the copy match the new list before the turn starts: it writes new and changed files, and removes files that are gone and files that the session added or changed. The worker never sends the copy back to the hub. A session publishes a file with `publish_artifact`, and a coordinator writes one with `files_write`.
+- In a workspace that is a git checkout, the worker adds `/.channel/` and `/.consort/` to the repo's `info/exclude`, so git does not see them.
 
 ## Hub tools
 
@@ -367,7 +374,7 @@ The hub gives each session the tools for its role. Each tool's `input_schema` is
 | Tool | Arguments | Result |
 |---|---|---|
 | `post_message` | `body`, optional `attachments` (channel file paths) | `message_id` |
-| `reply` | `message_id`, `body`, optional `in_timeline` | `message_id` |
+| `reply` | `message_id`, `body`, optional `in_timeline` and `attachments` (channel file paths) | `message_id` |
 | `update_message` | `message_id`, `body` | Only for the session's own messages |
 | `react` | `message_id`, `emoji` | |
 | `no_reply_needed` | None | Ends the turn with no visible reply |
@@ -376,8 +383,8 @@ The hub gives each session the tools for its role. Each tool's `input_schema` is
 | `memory_write` | `path`, `content`, `expected_sha256` or `"not_exists"` | New `sha256`, or `stale_write` |
 | `memory_delete` | `path`, `expected_sha256` | |
 | `files_write` | `path`, `content` | Text files only |
-| `start_task` | `title`, `brief`, optional `model_selection`, `worker_id`, `require`, `repos`, `isolation`, `approval_mode` and `start_at` (RFC 3339) | `task_id`, `status`, optional `status_reason`, and `notes` when the hub lowered the request (see below) |
-| `message_task` | `task_id`, `body` | Starts a turn, or steers the running turn when the harness can steer. `delivery` is `turn`, `steer` or `queued` |
+| `start_task` | `title`, `brief`, optional `model_selection`, `worker_id`, `require`, `repos`, `isolation`, `approval_mode`, `start_at` (RFC 3339) and `attachments` (channel file paths, which go with the first turn of each session of the task) | `task_id`, `status`, optional `status_reason`, and `notes` when the hub lowered the request (see below) |
+| `message_task` | `task_id`, `body`, optional `attachments` (channel file paths) | Starts a turn, or steers the running turn when the harness can steer. `delivery` is `turn`, `steer` or `queued` |
 | `list_tasks` | optional `status` | Tasks in this channel. A brief or review summary longer than 1 KiB is cut to a preview |
 | `read_task` | `task_id`, optional `since_item_id`, `before_item_id` and `limit` | The full task, a page of its session items (oldest first) and `has_more`. The task and the items take at most 320 KiB. Without `since_item_id`, the page has the newest items, or the newest ones older than `before_item_id`, and `has_more` says that older items exist. With `since_item_id`, the page has the oldest items after it, and `has_more` says that newer items exist. The default `limit` is 50, and the limit is 200 |
 | `interrupt_task`, `retry_task` | `task_id` | |
@@ -554,6 +561,8 @@ A client that does not know these fields shows the preview, which ends with a no
 | Auth | `auth.http_token` |
 
 `message.send` with a `client_message_id` that the hub already stored returns the stored message. A client can retry a send without making a duplicate.
+
+A client uploads each attachment with `PUT /v1/blobs/{sha256}` before `message.send`. The hub refuses an attachment whose blob it does not have, with `invalid`, and takes the `size` from the stored blob. The attachments of a user message go with the message to the session: in the coordinator's turn, or in the task's turn, steer or inbox for a message in a task thread.
 
 In `channel.update` and `task.update`, a field that is left out does not change. For a field that can be cleared, such as `icon` or `start_at`, `null` clears it. `channel.update` also takes `allowed_local_mcp_servers`, the list of local MCP servers that a task from the assistant may use. The hub trims the names, drops copies, and refuses `hub` and names with `__`.
 

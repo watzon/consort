@@ -1138,6 +1138,8 @@ impl ConsortApp {
                 hint(
                     if preview.has_hooks {
                         "It had Claude hooks. Consort takes them out.".to_owned()
+                    } else if preview.audits.is_empty() {
+                        "No audits. Only a skill directory can give audit results.".to_owned()
                     } else {
                         "From the directory that lists it.".to_owned()
                     },

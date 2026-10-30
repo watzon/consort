@@ -5,7 +5,9 @@
 pub const TUTTI: &str = "Tutti";
 
 pub mod add_account;
+pub mod attachments;
 pub mod channel_extensions;
+pub mod channel_panel;
 pub mod connectors;
 pub mod dialogs;
 pub mod ext_parts;

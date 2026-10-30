@@ -170,6 +170,12 @@ pub enum UserInput {
         /// Rich text spans. Always empty here.
         text_elements: Vec<Value>,
     },
+    /// An image file that Codex reads itself (`localImage`). The path is
+    /// absolute.
+    LocalImage {
+        /// The image file.
+        path: String,
+    },
 }
 
 impl UserInput {

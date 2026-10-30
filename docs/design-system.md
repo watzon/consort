@@ -161,7 +161,7 @@ Consort uses one family: Atkinson Hyperlegible Next for text and Atkinson Hyperl
 | Body | 15 / 24 | 400 | Message text. At most 68 characters per line |
 | UI | 13 / 20 | 400 | Sidebar rows, lists, menus and buttons |
 | UI strong | 13 / 20 | 500 | Button labels, card titles and the speaker name |
-| Label | 12 / 16 | 500 | Group names in the sidebar and field labels |
+| Label | 12 / 16 | 500 | Field labels |
 | Caption | 11 / 16 | 400 | Timestamps and small details |
 | Mono | 13 / 20 | 400 | Code blocks. Inline code is 0.92 em of the surrounding text |
 
@@ -188,11 +188,12 @@ Fixed layout sizes:
 
 | Item | Size (px) |
 |---|---|
-| Sidebar width | 248 |
-| Side panel width (Tasks, task thread) | 400 |
+| Sidebar width | 288 |
+| Side panel width (Tasks, task thread, Channel panel) | 400 |
 | Timeline content width | At most 720 |
 | Bubble and card width in the timeline (`layout.bubble_max_width`) | At most 560 |
-| Top fade, under the mark: solid part (`layout.fade_top_solid`) and blend (`layout.fade_top_blend`) | 92, 24 |
+| Space above the first item at rest, below the mark and the pill (`layout.content_top`) | 92 |
+| Top tint (`layout.top_tint`): canvas opacity at 0, 56, 108 and 184 px | 94, 84, 50, 0 percent |
 | Bottom fade, above the composer (`layout.fade_bottom`) | 32 |
 | Smallest window | 960 by 600 |
 
@@ -219,8 +220,9 @@ The main column has no header. The timeline fills it, the composer sits under it
 - **Cards.** Task cards, approval cards and decision cards sit in the assistant lane at bubble width, with `chat.bubble_radius` corners and a `chat.bubble_tail` corner at the top left. Above each one is a task line: a curved connector (`glyphs/task-connector.svg`, `chat.task_connector`, `border.strong`), the status icon, the task name in UI strong, and its state in the status color ("Needs you" for Needs input). A task card in another channel adds "in <channel>" in `text.tertiary`. A card has no header row of its own: its first row is what asks or the newest update, with the approval mode and the worker pill at the right. A resolved task with nothing pending is the task line alone, with its summary. An approval or a decision of the channel's assistant has the task line "Approval" or "Decision", with "Needs you", "Answered" or "Closed".
 - **Notices** are a centered line in UI size and `text.tertiary`, with their time.
 - **The Three voices mark** sits at the top center, `chat.mark` (56 px), `chat.mark_top` from the top. Under it, an activity pill (`surface.card`, `border.subtle`, `full` corners, `chat.pill_pad_y` by `chat.pill_pad_x`, Label size in `text.secondary`) says what the assistant does, only while it works. See [Logo](#logo).
-- **Top actions** sit at the top right, `md` from the edges, `xs` apart: Connectors (for a channel that has connections or skills, with their count), Tasks and New task. Each is `chat.top_action` (32 px) square with a `chat.top_action_icon` (18 px) icon in `text.secondary`. Tasks opens the Tasks panel, has `surface.selected` while the panel is open, and has a `component.state_dot` dot in `accent.fill` while something needs you.
-- **Fades.** The top fade has two parts. The first part is solid `surface.canvas`, `layout.fade_top_solid` (92 px) high. It ends just below the mark and the activity pill (mark top, mark, `space.xxs`, the pill, and a small margin), so no bubble shows under the status line. A theme test keeps it tall enough. It has the same height when the pill is hidden, so the edge does not jump when work starts or stops. Under it, a gradient of `layout.fade_top_blend` (24 px) goes from `surface.canvas` to clear. The first item of a chat at rest starts below both parts. The bottom fade is `layout.fade_bottom` (32 px) and shows only while the reader is scrolled up.
+- **Top actions** sit at the top right, `md` from the edges, `xs` apart: Connectors (for a channel that has connections or skills, with their count), Channel (the `channel` hash icon, which opens the Channel panel), Tasks and New task. Each is `chat.top_action` (32 px) square with a `chat.top_action_icon` (18 px) icon in `text.secondary`. Tasks opens the Tasks panel, has `surface.selected` while the panel is open, and has a `component.state_dot` dot in `accent.fill` while something needs you.
+- **Top tint.** The top of the timeline darkens progressively, as in Claude Duet. It is no solid zone: content that moves up under the mark stays faintly visible. `layout.top_tint` sets the canvas color at four stops: about 94 percent at the top, 84 percent at 56 px, 50 percent at 108 px, and clear at 184 px. A GPUI gradient has two stops, so the view draws one gradient layer between each pair of stops (three layers). The mark, the activity pill and the top actions sit on the tint. At rest, the first item starts `layout.content_top` (92 px) from the top, just below the mark and the pill (mark top, mark, `space.xxs`, the pill, and a small margin). A theme test keeps it tall enough. It stays the same when the pill is hidden, so the chat does not jump when work starts or stops.
+- **Bottom fade.** `layout.fade_bottom` (32 px) above the composer, shown only while the reader is scrolled up.
 - **Composer.** One field on `surface.card` with a `border.strong` line and `chat.composer_radius` (16 px) corners, as wide as the timeline. The send key (`send` icon, `chat.send_button`, `text.tertiary`) sits inside it at the right. Under the field, outside it: add and voice (`component.composer_chip` square), a `border.strong` divider, "Same as Tutti" for a channel with no model of its own, the model chip and the effort chip, a spacer, and "Runs on <worker>" in Label size and `text.tertiary`. The placeholder is "Message <channel>", and "Message Tutti" in the main channel.
 
 ### Chat sizes
@@ -230,7 +232,7 @@ These sizes are in `component.chat` of `structure.json`, except the three in `la
 | Token | Size (px) | Use |
 |---|---|---|
 | `layout.bubble_max_width` | 560 | The widest bubble or card in the timeline |
-| `layout.fade_top_solid`, `layout.fade_top_blend`, `layout.fade_bottom` | 92, 24, 32 | The solid top, the top blend and the bottom fade of the timeline |
+| `layout.content_top`, `layout.fade_bottom` | 92, 32 | The space above the first item at rest, and the bottom fade of the timeline |
 | `bubble_radius`, `bubble_tail` | 16, 4 | Bubble and card corners, and the small corner |
 | `bubble_pad_x`, `bubble_pad_y` | 14, 10 | The padding of a bubble |
 | `composer_radius`, `send_button` | 16, 32 | The composer field and its send key |
@@ -239,6 +241,38 @@ These sizes are in `component.chat` of `structure.json`, except the three in `la
 | `mark`, `mark_small`, `mark_top` | 56, 16, 4 | The mark over the timeline, in the sidebar, and its top space |
 | `pill_pad_x`, `pill_pad_y` | 10, 3 | The padding of the activity pill |
 | `brief_number` | 16 | The number column of a brief's list |
+
+### The sidebar
+
+The sidebar and the settings rail use `component.sidebar` in `structure.json`. The values come from the Paper artboard "Base: Tutti with top tint and larger sidebar, dark".
+
+| Token | Size (px) | Use |
+|---|---|---|
+| `layout.sidebar_width` | 288 | The sidebar and the settings rail |
+| `inset` | 10 | The space between the sidebar edges and its rows |
+| `row_pad_y`, `row_pad_x`, `row_gap` | 7, 10, 10 | A row: 36 px high with its text, `lg` corners, also on the selected row |
+| `row_text`, `row_icon` | 15 / 22, 18 | The name and the icon of a row, and the status glyph |
+| `label_text`, `label_pad_y`, `group_top` | 13 / 18 weight 500, 6, 20 | A group label, the Workers label and a settings group label |
+| `title_bar` | 52 | The strip at the top where the macOS window buttons sit |
+| `worker_text`, `worker_pad_y` | 14 / 20, 5 | A worker row: 30 px |
+| `avatar`, `account_pad_top`, `account_pad_bottom` | 28, 10, 6 | The account row |
+
+### Attachments
+
+The sizes are in `component.files` of `structure.json`. The values come from the phase 1 Paper artboards.
+
+- **The add button** in the composer and the reply box opens a menu: Upload from this computer (the system file dialog) and Choose from channel files. A pasted picture or copied file also attaches.
+- **Chips** sit in the field, above the text, and wrap. A picture is a `chip_image` (56 px) thumbnail with `lg` corners and a round remove badge on hover. Any other file is a `chip_file` (240 px) chip on `surface.raised` with a `chip_tile` (38 px) tile, the name, and the type and size ("PDF, 2.4 MB"). An upload shows a `progress` (4 px) bar in `status.working` on a track at `opacity.progress_track`, and its share ("62%"). A failed upload has a `status.failed` border at `opacity.failed_border`, a tinted tile, the message ("Upload failed. The hub is offline.") as selectable text, and Try again.
+- **Send waits** until every upload of the message is on the hub. A failed upload stops the send, and the text stays in the box.
+- **Drop.** Files dragged anywhere over the chat attach to the composer. The composer is the only visual target: it grows, gets a dashed `accent.text` border and an `accent.fill` fill at `opacity.drop_fill`, and shows the upload icon on a `tint_accent` disc, "Drop to attach 3 files" and "Up to 256 MB each". Text that you typed stays visible.
+- **Bubbles.** Your pictures are `image_tile_w` by `image_tile_h` (228 by 168 px) tiles, two in a row, above your text. Your files are `file_bubble_you` (280 px) file bubbles on `accent.surface`. The assistant's files follow its text as `file_bubble` (360 px) bubbles on `surface.card`. An artifact names its task with the status glyph, and its size. On hover a file bubble shows Save and Open.
+- **Light box.** A click on a picture opens it large on `lightbox` (black at `derive.lightbox_alpha`), with its name and details, Save, Open, close, Previous and Next, and "1 of 2". The arrow keys step, and Escape closes it.
+
+### The Channel panel
+
+The `#` top action opens the Channel panel. It shares the right side with the Tasks panel: only one of them is open at a time. It is 400 px wide, with the channel name and purpose in its header, and the tabs Files, Routines and Memory. Routines and Memory come with phase 2. Until then their tabs are disabled, and they say "Comes with phase 2" on hover.
+
+The Files tab lists folders first, then files, then a section Artifacts with one group per task (the status glyph, the task name and its status). Each row has the size in a `size_col` (64 px) column and the date ("Today" or "Oct 24") in a `date_col` (52 px) column. The row menu is Open, Download, Rename, Move, then Delete in `status.failed`, and Delete asks first. Upload and a drop on the panel put files in the open folder. An empty channel shows its empty state, which is also a drop zone. The list scrolls inside the panel with fades.
 
 Settings > Workers uses these sizes from `component` in `structure.json`:
 
@@ -323,7 +357,7 @@ One component chooses a model everywhere: the composer, the New channel dialog, 
 | Token | Radius (px) | Use |
 |---|---|---|
 | `sm` | 4 | Badges, inline code and keyboard keys |
-| `md` | 6 | Buttons, inputs, sidebar rows and list rows |
+| `md` | 6 | Buttons, inputs and list rows. Sidebar rows use `lg` |
 | `lg` | 10 | Cards outside the chat, menus and popovers |
 | `xl` | 14 | Panels, dialogs and the app icon at 64 px |
 | `full` | 9999 | Avatars, status dots and pills |
@@ -371,7 +405,7 @@ The logo is the Three voices mark: three dabs of pigment, one for each voice of 
 - **Frames.** GPUI cannot run an SVG noise filter at every frame, so `design/mark/generate.mjs` renders every frame ahead of time into `assets/mark/`: idle (3 frames: one pose, three edges), working (12 poses, each with its hand-drawn edge), needs you (24 frames), and done (1 frame). Each set is in dark pigments (`dark/`) and light pigments (`light/`). GPUI's image renderer (resvg) draws the paint filter and the blends.
 - **Small sizes.** At 16 to 20 px, use the sharp frames (`dark-sharp/`, `light-sharp/`), which have no paint edges.
 - **States.** Idle keeps one pose and its edges shimmer at 4 fps, so the mark looks alive at rest. Working: the voices circle each other. Needs you: gold comes forward and beats twice a second. Done: the voices close into a chord for `motion.done_hold_ms` (1.5 s) after work ends, then the mark goes back to idle or to needs you.
-- **Where.** The mark is the logo on onboarding and on the start-up error, the Tutti row in the sidebar and in the switcher (idle, sharp, 16 px, always still), and the title bar on Windows and Linux. The app icons in `design/logo/` are the idle mark on `surface.card`.
+- **Where.** The mark is the logo on onboarding and on the start-up error, the Tutti row in the sidebar (idle, sharp, `component.sidebar.row_icon`, 18 px, always still) and in the switcher (16 px), and the title bar on Windows and Linux. The app icons in `design/logo/` are the idle mark on `surface.card`.
 - **Wordmark.** "consort" in lowercase, Atkinson Hyperlegible Next 600, to the right of the mark. The mark is about 1.2 times the font size high.
 
 ## Text in the UI

@@ -1205,7 +1205,7 @@ async fn a_late_answer_in_a_task_reaches_the_task_as_a_message() {
             .unwrap();
         inbox
             .into_iter()
-            .map(|(_, t)| t)
+            .map(|m| m.text)
             .chain(commands.into_iter().map(|(c, _)| c.body.to_string()))
             .find(|t| t.contains("card_answered"))
     })

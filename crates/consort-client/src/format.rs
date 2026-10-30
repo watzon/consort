@@ -41,6 +41,25 @@ pub fn size_label(bytes: u64) -> String {
     format!("{:.1} MB", kb / KB)
 }
 
+/// The size of a file, as the file chips and the Files tab show it: "512 B",
+/// "6 KB", "48 KB", "1.2 MB", "14.2 MB", "1.1 GB". Kilobytes have no
+/// decimal; megabytes and gigabytes have one.
+pub fn file_size_label(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let kb = bytes as f64 / KB;
+    if kb < KB {
+        return format!("{} KB", kb.round().max(1.0) as u64);
+    }
+    let mb = kb / KB;
+    if mb < KB {
+        return format!("{mb:.1} MB");
+    }
+    format!("{:.1} GB", mb / KB)
+}
+
 /// "Today", "Yesterday", "Tuesday" within a week, then "October 12".
 pub fn day_label(ms: i64, now_ms: i64) -> String {
     let (Some(day), Some(now)) = (local(ms), local(now_ms)) else {
@@ -56,6 +75,21 @@ pub fn day_label(ms: i64, now_ms: i64) -> String {
         2..=6 => day.format("%A").to_string(),
         _ if day.year() == now.year() => day.format("%B %-d").to_string(),
         _ => day.format("%B %-d, %Y").to_string(),
+    }
+}
+
+/// The date of a file: "Today" for today, else the short date ("Oct 24"),
+/// with the year when it is not this year ("Oct 24, 2025").
+pub fn file_date_label(ms: i64, now_ms: i64) -> String {
+    let (Some(day), Some(now)) = (local(ms), local(now_ms)) else {
+        return String::new();
+    };
+    if day.date_naive() == now.date_naive() {
+        "Today".into()
+    } else if day.year() == now.year() {
+        day.format("%b %-d").to_string()
+    } else {
+        day.format("%b %-d, %Y").to_string()
     }
 }
 
@@ -299,6 +333,11 @@ pub fn now_ms() -> i64 {
 mod tests {
     #[test]
     fn a_size_reads_in_a_few_characters() {
+        assert_eq!(super::file_size_label(512), "512 B");
+        assert_eq!(super::file_size_label(48 * 1024), "48 KB");
+        assert_eq!(super::file_size_label(380 * 1024), "380 KB");
+        assert_eq!(super::file_size_label(2_516_582), "2.4 MB");
+        assert_eq!(super::file_size_label(3 * 1024 * 1024 * 1024), "3.0 GB");
         assert_eq!(super::size_label(0), "0 B");
         assert_eq!(super::size_label(512), "512 B");
         assert_eq!(super::size_label(1536), "1.5 KB");

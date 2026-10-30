@@ -609,6 +609,8 @@ mod fake_agent {
         ask_after_cancel: bool,
         /// The agent never answers.
         silent: bool,
+        /// The agent reports `promptCapabilities.image`.
+        images: bool,
     }
 
     /// The config options of the fake session.
@@ -674,7 +676,7 @@ mod fake_agent {
                 Some("initialize") => {
                     send(&mut write, reply(json!({
                         "protocolVersion": 1,
-                        "agentCapabilities": {"loadSession": true, "mcpCapabilities": {"http": true}},
+                        "agentCapabilities": {"loadSession": true, "mcpCapabilities": {"http": true}, "promptCapabilities": {"image": behavior.images, "embeddedContext": true}},
                         "agentInfo": {"name": "fake", "version": "9.9.9"},
                         "authMethods": [],
                         "_meta": {"steering": {"supported": true}}
@@ -1790,6 +1792,138 @@ mod fake_agent {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         assert!(!runs(pid), "the agent still runs");
+    }
+
+    /// Saves an attachment where the worker saves it, and returns its
+    /// reference.
+    fn save_attachment(
+        workspace: &std::path::Path,
+        name: &str,
+        bytes: &[u8],
+    ) -> consort_proto::model::BlobRef {
+        let blob = consort_proto::model::BlobRef {
+            sha256: consort_proto::model::Sha256Hash::from_bytes([bytes.len() as u8; 32]),
+            name: name.into(),
+            mime: "application/octet-stream".into(),
+            size: bytes.len() as u64,
+        };
+        let path = crate::attachments::attachment_path(workspace, &blob);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        blob
+    }
+
+    #[tokio::test]
+    async fn claude_gets_images_as_image_blocks_in_a_turn_and_a_steer() {
+        let s = spec();
+        let workspace = s.workspace.clone();
+        let behavior = Behavior {
+            images: true,
+            ..Behavior::default()
+        };
+        let (result, log) = connect_with(HarnessKind::ClaudeCode, s, behavior).await;
+        let (session, _events, ready) = result.unwrap();
+        assert!(ready.capabilities.images);
+        let mut session: Box<dyn HarnessSession> = Box::new(session);
+        assert!(session.capabilities().images);
+        let png = save_attachment(&workspace, "shot.png", crate::attachments::tests::PNG);
+        let pdf = save_attachment(&workspace, "spec.pdf", b"%PDF-1.7 tiny");
+        session
+            .turn(TurnInput {
+                text: "What is in these?".into(),
+                attachments: vec![png.clone(), pdf.clone()],
+            })
+            .await
+            .unwrap();
+        session
+            .steer(TurnInput {
+                text: "And this one.".into(),
+                attachments: vec![png.clone()],
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let log = log.lock().unwrap();
+        let prompt = &log
+            .iter()
+            .find(|m| m["method"] == "session/prompt")
+            .unwrap()["params"]["prompt"];
+        let blocks = prompt.as_array().unwrap();
+        assert_eq!(blocks.len(), 2, "{prompt}");
+        let text = blocks[0]["text"].as_str().unwrap();
+        let png_path = crate::attachments::attachment_path(&workspace, &png);
+        let pdf_path = crate::attachments::attachment_path(&workspace, &pdf);
+        assert!(
+            text.starts_with("What is in these?\n\nAttached files."),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "also in this message as an image): {}",
+                png_path.display()
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "spec.pdf (application/octet-stream, 13 bytes): {}",
+                pdf_path.display()
+            )),
+            "{text}"
+        );
+        assert_eq!(blocks[1]["type"], "image");
+        assert_eq!(blocks[1]["mimeType"], "image/png");
+        assert_eq!(
+            blocks[1]["data"],
+            crate::attachments::base64(crate::attachments::tests::PNG)
+        );
+        let steer = &log
+            .iter()
+            .find(|m| m["method"] == "_session/steering")
+            .unwrap()["params"]["prompt"];
+        assert_eq!(steer[1]["type"], "image", "{steer}");
+    }
+
+    #[tokio::test]
+    async fn an_agent_without_image_input_gets_paths_only() {
+        let s = spec();
+        let workspace = s.workspace.clone();
+        let (result, log) = connect_with(HarnessKind::GeminiCli, s, Behavior::default()).await;
+        let (session, _events, ready) = result.unwrap();
+        assert!(
+            !ready.capabilities.images,
+            "the agent did not report images"
+        );
+        let mut session: Box<dyn HarnessSession> = Box::new(session);
+        let png = save_attachment(&workspace, "shot.png", crate::attachments::tests::PNG);
+        session
+            .turn(TurnInput {
+                text: "Look".into(),
+                attachments: vec![png],
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let log = log.lock().unwrap();
+        let prompt = &log
+            .iter()
+            .find(|m| m["method"] == "session/prompt")
+            .unwrap()["params"]["prompt"];
+        assert_eq!(prompt.as_array().unwrap().len(), 1, "{prompt}");
+        let text = prompt[0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("shot.png (application/octet-stream, 16 bytes): "),
+            "{text}"
+        );
+        assert!(!text.contains("as an image"));
+    }
+
+    #[test]
+    fn the_static_image_capability_is_on_only_for_checked_agents() {
+        assert!(static_capabilities(HarnessKind::ClaudeCode).images);
+        assert!(static_capabilities(HarnessKind::GeminiCli).images);
+        assert!(static_capabilities(HarnessKind::OpenCode).images);
+        assert!(!static_capabilities(HarnessKind::Acp).images);
     }
 }
 

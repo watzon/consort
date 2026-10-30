@@ -2,7 +2,7 @@
 //! this file. Other owners call these functions and do not change them.
 
 use consort_proto::ids::{ChannelId, RoutineId};
-use consort_proto::model::{ApprovalMode, ModelSelection, PlacementRequest, TaskCreator};
+use consort_proto::model::{ApprovalMode, BlobRef, ModelSelection, PlacementRequest, TaskCreator};
 use consort_proto::time::Timestamp;
 
 use crate::hub::Hub;
@@ -19,6 +19,8 @@ pub(crate) struct NewTask {
     pub start_at: Option<Timestamp>,
     pub created_by: TaskCreator,
     pub routine_id: Option<RoutineId>,
+    /// Files for the first turn of each session of the task.
+    pub attachments: Vec<BlobRef>,
 }
 
 impl Hub {

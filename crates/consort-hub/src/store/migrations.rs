@@ -14,6 +14,7 @@ pub const MIGRATIONS: &[&str] = &[
     include_str!("schema_v4.sql"),
     include_str!("schema_v5.sql"),
     include_str!("schema_v6.sql"),
+    include_str!("schema_v7.sql"),
 ];
 
 pub fn current_version() -> i64 {
@@ -208,7 +209,26 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, current_version());
+    }
+
+    #[test]
+    fn version_7_keeps_waiting_inbox_messages_with_no_attachments() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        for sql in &MIGRATIONS[..6] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.execute_batch("PRAGMA user_version = 6").unwrap();
+        conn.execute(
+            "INSERT INTO task_inbox (task_id, text, created_at) VALUES ('tsk_1', 'Hi', 1)",
+            [],
+        )
+        .unwrap();
+        migrate(&mut conn).unwrap();
+        let attachments: String = conn
+            .query_row("SELECT attachments FROM task_inbox", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(attachments, "[]");
     }
 
     #[test]

@@ -10,6 +10,7 @@
 
 mod commands;
 mod extensions;
+mod files;
 mod link;
 mod outbox;
 mod url;
@@ -168,6 +169,11 @@ pub(crate) struct Shared {
     waiters: Mutex<std::collections::HashMap<String, oneshot::Sender<outbox::SendOutcome>>>,
     /// The outbox as last written to disk.
     saved_outbox: Mutex<Vec<PendingSend>>,
+    /// The files that the user attached and that are not sent yet.
+    uploads: Mutex<crate::uploads::Uploads>,
+    /// The last token from `auth.http_token` and when it ends, in Unix
+    /// milliseconds.
+    http_token: Mutex<Option<(String, i64)>>,
 }
 
 impl Shared {
@@ -232,6 +238,8 @@ impl Shared {
             logo_wake: Notify::new(),
             waiters: Mutex::new(std::collections::HashMap::new()),
             saved_outbox: Mutex::new(outbox),
+            uploads: Mutex::new(crate::uploads::Uploads::default()),
+            http_token: Mutex::new(None),
         });
         shared.publish_now();
         Ok(shared)
@@ -272,6 +280,22 @@ impl Shared {
         );
         drop(cache);
         state.worker_pairing = pairing;
+        if let Ok(uploads) = self.uploads.lock() {
+            state.uploads = uploads.views();
+        }
+        // A blob from the hub shows its thumbnail once it is in the cache.
+        let local = self
+            .cache
+            .lock()
+            .map(|c| c.local_blobs.clone())
+            .unwrap_or_default();
+        for upload in &mut state.uploads {
+            if upload.local_path.is_none()
+                && let Some(sha) = &upload.sha256
+            {
+                upload.local_path = local.get(sha).cloned();
+            }
+        }
         self.logo_wake.notify_one();
         self.publish.send_if_modified(|current| {
             if **current == state {

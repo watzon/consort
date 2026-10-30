@@ -670,7 +670,7 @@ pub(crate) fn apply(
                     }
                 }
                 SkillInstallInput::Git { url, path, .. } => {
-                    crate::extensions_view::install_source(&source)?;
+                    crate::extensions_view::install_source(&source, None)?;
                     let name = path
                         .as_deref()
                         .and_then(|p| p.trim_matches('/').rsplit('/').next())
@@ -692,9 +692,23 @@ pub(crate) fn apply(
                         ..SkillPreviewView::default()
                     }
                 }
-                SkillInstallInput::Upload { .. } => {
-                    crate::extensions_view::install_source(&source)?;
-                    SkillPreviewView::default()
+                SkillInstallInput::Upload { file_path } => {
+                    // The mock checks the zip as the hub backend does, then
+                    // shows the skill that the zip would bring.
+                    let size = std::fs::metadata(file_path).map(|m| m.len()).map_err(|e| {
+                        ClientError::Storage {
+                            path: file_path.clone(),
+                            message: e.to_string(),
+                        }
+                    })?;
+                    crate::extensions_view::check_skill_zip(file_path, size)?;
+                    let name = crate::extensions_view::zip_file_name(file_path);
+                    SkillPreviewView {
+                        name: name.trim_end_matches(".zip").to_owned(),
+                        description: "A skill from a zip file on this computer.".into(),
+                        file_count: 2,
+                        ..SkillPreviewView::default()
+                    }
                 }
             };
             return Ok(CommandOutput::SkillPreview(preview));

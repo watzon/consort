@@ -243,6 +243,7 @@ pub(crate) async fn test_task_session(
             start_at: Some(Timestamp::now().plus_millis(86_400_000)),
             created_by: TaskCreator::User,
             routine_id: None,
+            attachments: Vec::new(),
         })
         .await
         .unwrap();

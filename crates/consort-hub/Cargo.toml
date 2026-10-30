@@ -5,6 +5,12 @@ edition.workspace = true
 license.workspace = true
 publish = false
 description = "The Consort hub server: SQLite store, feed, pairing, coordinators, placement, hub tools and routines."
+# The integration tests are one binary (tests/main.rs), not one per file.
+autotests = false
+
+[[test]]
+name = "integration"
+path = "tests/main.rs"
 
 [lints]
 workspace = true

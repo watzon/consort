@@ -4,9 +4,7 @@
 // Test code may unwrap (AGENTS.md: "No unwrap or expect outside tests").
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-mod common;
-
-use common::*;
+use crate::common::*;
 use consort_proto::client_api::{
     ChannelCreate, ChannelUpdate, EntityPayload, MessageSend, RoutineCreate, RoutineDelete,
     RoutineRunNow, RoutineRuns, SnapshotScope, TaskItemDetail,

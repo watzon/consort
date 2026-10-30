@@ -292,6 +292,7 @@ async fn pair_connect_run_a_session_and_resend_after_reconnect() {
                     text: "Again".into(),
                     attachments: vec![],
                 },
+                channel_files: None,
             }
             .into(),
         )
@@ -334,6 +335,7 @@ async fn pair_connect_run_a_session_and_resend_after_reconnect() {
             SessionTurn {
                 session_id: SessionId::new(),
                 turn: TurnInput::default(),
+                channel_files: None,
             }
             .into(),
         )
@@ -438,6 +440,7 @@ async fn sessions_resume_after_a_worker_restart() {
                     text: "Still there?".into(),
                     attachments: vec![],
                 },
+                channel_files: None,
             }
             .into(),
         )
@@ -525,6 +528,7 @@ async fn the_worker_allows_hub_tools_without_asking_the_hub() {
                     text: "Post it".into(),
                     attachments: vec![],
                 },
+                channel_files: None,
             }
             .into(),
         )

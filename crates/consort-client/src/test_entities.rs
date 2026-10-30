@@ -52,3 +52,36 @@ pub(crate) fn skill(name: &str, at: i64) -> Skill {
         updated_at: Timestamp::from_millis(at),
     }
 }
+
+/// A plain channel with the given ID and name.
+pub(crate) fn channel(
+    id: consort_proto::ids::ChannelId,
+    name: &str,
+) -> consort_proto::model::Channel {
+    use consort_proto::model::{ApprovalMode, Channel, ChannelKind, Isolation};
+    Channel {
+        id,
+        kind: ChannelKind::Standard,
+        name: name.into(),
+        icon: None,
+        color: None,
+        group_id: None,
+        position: 0,
+        purpose: String::new(),
+        instructions: String::new(),
+        coordinator_selection: None,
+        task_selection: None,
+        preferred_workers: vec![],
+        repo_ids: vec![],
+        default_isolation: Isolation::Worktree,
+        default_approval_mode: ApprovalMode::AutoEdits,
+        allowed_local_mcp_servers: vec![],
+        memory_enabled: true,
+        disabled_connections: Vec::new(),
+        disabled_skills: Vec::new(),
+        archived_at: None,
+        created_at: Timestamp::from_millis(1),
+        updated_at: Timestamp::from_millis(1),
+        tags: Vec::new(),
+    }
+}

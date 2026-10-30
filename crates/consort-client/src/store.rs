@@ -453,6 +453,7 @@ mod tests {
             thread_root_id: None,
             body: body.into(),
             created_at: 5,
+            attachments: Vec::new(),
         }
     }
 

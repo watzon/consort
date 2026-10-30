@@ -4,8 +4,8 @@ use consort_proto::client_api::{EntityKind, EntityPayload};
 use consort_proto::error::ErrorCode;
 use consort_proto::ids::{ChannelId, SessionId, TaskId};
 use consort_proto::model::{
-    ChannelFile, ExpectedHash, MemoryAuthor, MemoryNote, MemoryNoteSummary, MemoryScope,
-    Sha256Hash, memory_note_entity_id,
+    ARTIFACTS_DIR, ChannelFile, ExpectedHash, FileRef, MemoryAuthor, MemoryNote, MemoryNoteSummary,
+    MemoryScope, Sha256Hash, memory_note_entity_id,
 };
 use consort_proto::time::Timestamp;
 use consort_proto::tools::SearchHit;
@@ -286,7 +286,87 @@ pub fn task_artifacts(
         .collect())
 }
 
+/// The channel files that a session sees in `<workspace>/.channel/files/`:
+/// every file of the channel, except the artifacts of the session's own
+/// task. A task finds its own artifacts in its workspace.
+pub fn session_channel_files(
+    conn: &Connection,
+    channel_id: ChannelId,
+    task_id: Option<TaskId>,
+) -> Result<Vec<FileRef>> {
+    let own = task_id.map(|t| format!("{ARTIFACTS_DIR}/{t}/"));
+    Ok(channel_files(conn, channel_id, None)?
+        .into_iter()
+        .filter(|f| f.deleted_at.is_none())
+        .filter(|f| own.as_deref().is_none_or(|own| !f.path.starts_with(own)))
+        .map(|f| FileRef {
+            path: f.path,
+            sha256: f.blob_sha256,
+        })
+        .collect())
+}
+
+/// A digest of a channel file list, to see whether it changed.
+fn file_list_digest(files: &[FileRef]) -> String {
+    let mut text = String::new();
+    for file in files {
+        text.push_str(&file.path);
+        text.push('\0');
+        text.push_str(file.sha256.as_str());
+        text.push('\n');
+    }
+    sha256(text.as_bytes()).to_string()
+}
+
 impl Tx<'_> {
+    /// The channel files for the `session.start` of a session. The hub
+    /// keeps a digest of the list, so a later turn sends the list again only
+    /// when it changed (see [`Tx::channel_files_for_turn`]).
+    pub fn channel_files_for_start(
+        &mut self,
+        session_id: SessionId,
+        channel_id: ChannelId,
+        task_id: Option<TaskId>,
+    ) -> Result<Vec<FileRef>> {
+        let files = session_channel_files(self.db(), channel_id, task_id)?;
+        self.save_channel_files_digest(session_id, &file_list_digest(&files))?;
+        Ok(files)
+    }
+
+    /// The channel files for the next `session.turn` of a session: the list
+    /// when it changed since the session got it last, else `None`.
+    pub fn channel_files_for_turn(
+        &mut self,
+        session_id: SessionId,
+        channel_id: ChannelId,
+        task_id: Option<TaskId>,
+    ) -> Result<Option<Vec<FileRef>>> {
+        let files = session_channel_files(self.db(), channel_id, task_id)?;
+        let digest = file_list_digest(&files);
+        let known: Option<String> = self
+            .db()
+            .query_row(
+                "SELECT digest FROM session_channel_files WHERE session_id = ?1",
+                [session_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if known.as_deref() == Some(digest.as_str()) {
+            return Ok(None);
+        }
+        self.save_channel_files_digest(session_id, &digest)?;
+        Ok(Some(files))
+    }
+
+    fn save_channel_files_digest(&mut self, session_id: SessionId, digest: &str) -> Result<()> {
+        self.db().execute(
+            "INSERT INTO session_channel_files (session_id, digest) VALUES (?1, ?2)
+             ON CONFLICT(session_id) DO UPDATE SET digest = excluded.digest",
+            params![session_id.to_string(), digest],
+        )?;
+        Ok(())
+    }
+
     pub fn save_channel_file(&mut self, file: &ChannelFile) -> Result<()> {
         self.db().execute(
             "INSERT INTO channel_files (channel_id, path, data) VALUES (?1, ?2, ?3)

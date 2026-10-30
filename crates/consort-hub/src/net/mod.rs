@@ -29,7 +29,9 @@ pub(crate) fn router(hub: Hub) -> Router {
         // after it has checked the request headers.
         .route(
             "/v1/blobs/{sha256}",
-            put(blobs::put_blob).get(blobs::get_blob),
+            put(blobs::put_blob)
+                .get(blobs::get_blob)
+                .head(blobs::head_blob),
         )
         .with_state(hub)
 }

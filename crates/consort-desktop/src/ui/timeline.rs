@@ -34,6 +34,34 @@ use crate::{
     },
 };
 
+/// The progressive tint at the top of the timeline: one gradient layer
+/// between each pair of stops of `layout.top_tint`, because a GPUI gradient
+/// has two stops. Each layer is the canvas color at the opacity of its
+/// stops, so the tint gets lighter from the window top to clear.
+pub fn top_tint(t: &Tokens) -> Vec<Div> {
+    let stops = t.layout.top_tint;
+    let canvas = t.colors.surface_canvas;
+    stops
+        .windows(2)
+        .enumerate()
+        .map(|(ix, pair)| {
+            let (from, to) = (pair[0], pair[1]);
+            div()
+                .debug_selector(move || format!("top-tint-{ix}"))
+                .absolute()
+                .top(from.at)
+                .left_0()
+                .right_0()
+                .h(to.at - from.at)
+                .bg(linear_gradient(
+                    180.,
+                    linear_color_stop(canvas.opacity(from.alpha), 0.),
+                    linear_color_stop(canvas.opacity(to.alpha), 1.),
+                ))
+        })
+        .collect()
+}
+
 /// What the timeline says when the open channel did not load.
 const UNLOADED_TEXT: &str = "Cannot load this channel. Retrying.";
 
@@ -184,13 +212,26 @@ impl ConsortApp {
         let sidebar = self.render_sidebar(t, window, cx);
         // No header: the timeline fills the column, and the Three voices
         // mark and the top actions float over its top fade.
+        // A drop anywhere over the chat attaches the files to the composer.
+        // The composer is the only place that shows it.
         let column = div()
+            .id("chat-column")
             .relative()
             .flex()
             .flex_col()
             .flex_1()
             .min_w_0()
             .h_full()
+            .on_drag_move::<gpui_kit::ExternalPaths>(cx.listener(
+                |this, event: &gpui_kit::DragMoveEvent<gpui_kit::ExternalPaths>, _, cx| {
+                    let inside = event.bounds.contains(&event.event.position);
+                    let count = event.drag(cx).paths().len();
+                    this.drag_files_over(crate::app::DropOver::Chat, inside, count, cx);
+                },
+            ))
+            .on_drop(cx.listener(|this, paths: &gpui_kit::ExternalPaths, _, cx| {
+                this.drop_files(crate::app::DropOver::Chat, paths, cx);
+            }))
             .child(self.render_timeline(t, window, cx))
             .child(self.render_composer(t, cx))
             .child(self.render_top_overlay(t, window, cx));
@@ -198,6 +239,7 @@ impl ConsortApp {
             Panel::None => None,
             Panel::Tasks => Some(self.render_tasks_panel(t, window, cx)),
             Panel::Thread(task_id) => Some(self.render_thread_panel(&task_id, t, window, cx)),
+            Panel::Channel => Some(self.render_channel_panel(t, window, cx)),
         };
         div()
             .flex()
@@ -313,6 +355,12 @@ impl ConsortApp {
                 )
             })
             .on_click(cx.listener(|this, _, _, cx| this.toggle_tasks(cx)));
+        // The Channel panel: files now, routines and memory in phase 2.
+        let channel_open = self.panel == Panel::Channel;
+        let channel_button = action("channel-button", "channel", self, cx)
+            .debug_selector(|| "channel-button".into())
+            .when(channel_open, |d| d.bg(c.surface_selected))
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_channel_panel(cx)));
         let new_task = action("new-task", "compose", self, cx)
             .debug_selector(|| "new-task".into())
             .on_click(cx.listener(|this, _, window, cx| this.start_task_draft(window, cx)));
@@ -366,6 +414,7 @@ impl ConsortApp {
             .items_center()
             .gap(t.space.xs)
             .children(extensions)
+            .child(channel_button)
             .child(tasks)
             .child(new_task);
         div()
@@ -373,7 +422,7 @@ impl ConsortApp {
             .top_0()
             .left_0()
             .right_0()
-            .h(t.layout.fade_top())
+            .h(t.layout.content_top)
             // The overlay must not take the clicks and the scroll of the
             // timeline under it, apart from its own parts.
             .child(
@@ -398,8 +447,6 @@ impl ConsortApp {
     ) -> AnyElement {
         let c = &t.colors;
         let empty = self.chat_rows.is_empty();
-        let fade_solid = t.layout.fade_top_solid;
-        let fade_blend = t.layout.fade_top_blend;
         // At the live edge nothing is cut below, so the bottom fade shows only
         // while the reader is scrolled up.
         let at_end = empty || self.timeline.is_scrolled_to_end().unwrap_or(true);
@@ -450,7 +497,7 @@ impl ConsortApp {
                 d.child(
                     div()
                         .absolute()
-                        .top(t.layout.fade_top())
+                        .top(t.layout.content_top)
                         .left_0()
                         .right_0()
                         .flex()
@@ -465,34 +512,11 @@ impl ConsortApp {
                         ),
                 )
             })
-            // The chat never has a hard edge: it fades into the canvas at the
-            // top, under the mark, and above the composer.
-            // The top is solid down to just below the mark and the pill, so no
-            // bubble shows under them. A short gradient follows. The zone is
-            // the same when the pill is hidden, so the edge does not jump.
-            .child(
-                div()
-                    .debug_selector(|| "fade-top-solid".into())
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .right_0()
-                    .h(fade_solid)
-                    .bg(c.surface_canvas),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .top(fade_solid)
-                    .left_0()
-                    .right_0()
-                    .h(fade_blend)
-                    .bg(linear_gradient(
-                        180.,
-                        linear_color_stop(c.surface_canvas, 0.),
-                        linear_color_stop(c.canvas_clear, 1.),
-                    )),
-            )
+            // The chat never has a hard edge. At the top a progressive tint
+            // darkens it under the mark, the pill and the top actions, so
+            // content that moves up stays faintly visible. Above the
+            // composer it fades into the canvas.
+            .children(top_tint(t))
             .when(!at_end, |d| {
                 d.child(
                     div()
@@ -628,7 +652,7 @@ impl ConsortApp {
         cx: &mut Context<Self>,
     ) -> (gpui_kit::Pixels, AnyElement) {
         let spacing = |spacing: Spacing| match spacing {
-            Spacing::Start => t.layout.fade_top(),
+            Spacing::Start => t.layout.content_top,
             Spacing::InGroup => t.space.xs,
             Spacing::NewGroup => t.space.lg,
             Spacing::AfterSeparator => gpui_kit::Pixels::ZERO,
@@ -640,7 +664,7 @@ impl ConsortApp {
                 );
                 (
                     if first {
-                        t.layout.fade_top()
+                        t.layout.content_top
                     } else {
                         t.space.lg
                     },
@@ -660,6 +684,9 @@ impl ConsortApp {
                 spacing(card.spacing),
                 self.render_card_row(card.item, t, cx),
             ),
+            ChatRow::Attachment(row) => {
+                (spacing(row.spacing), self.render_attachment_row(row, t, cx))
+            }
             ChatRow::Notice { item, spacing: s } => {
                 let notice = self
                     .state
@@ -1570,6 +1597,18 @@ impl ConsortApp {
             self.render_effort_trigger("composer-effort", target.clone(), TriggerStyle::Chip, t, cx)
         });
         let input = crate::ui::parts::textarea(&self.inputs.composer, t.text.body);
+        let target = consort_client::UploadTarget::Composer {
+            channel_id: self.channel_id.clone(),
+        };
+        let chips = self.render_upload_chips(&target, t, cx);
+        let dropping = self
+            .drop_hover
+            .filter(|(over, _)| *over == crate::app::DropOver::Chat)
+            .map(|(_, count)| count)
+            .filter(|_| self.waiting().is_none());
+        let drop_zone = dropping.map(|count| self.render_drop_zone(count, t));
+        let paste_target = target.clone();
+        let add_target = target.clone();
         let send = icon_button(
             "send",
             "send",
@@ -1684,29 +1723,54 @@ impl ConsortApp {
                     .id("composer")
                     .debug_selector(|| "composer".into())
                     .flex()
-                    .items_end()
-                    .gap(t.space.sm)
+                    .flex_col()
+                    .gap(t.space.xs)
                     .w_full()
                     .max_w(t.layout.timeline_max_width)
                     // No channel has loaded: the box takes no text.
                     .when(self.waiting().is_some(), |d| d.opacity(t.opacity.busy))
-                    .py(t.space.sm)
-                    .pl(t.space.lg)
-                    .pr(t.space.sm)
+                    .p(t.space.sm)
                     .bg(c.surface_card)
                     .border(t.border_width)
                     .border_color(c.border_strong)
                     .rounded(chat.composer_radius)
+                    // Files dragged over the chat: the field is the drop
+                    // zone, with a dashed accent border and a soft fill.
+                    .when(dropping.is_some(), |d| {
+                        d.border(t.stroke)
+                            .border_dashed()
+                            .border_color(c.accent_text)
+                            .bg(c.accent_fill.opacity(t.opacity.drop_fill))
+                            .pb(t.space.md + t.space.xxs)
+                    })
+                    // A picture or a copied file on the clipboard attaches.
+                    // Text pastes as usual.
+                    .capture_action(cx.listener(
+                        move |this, _: &gpui_kit::base::input::Paste, _, cx| {
+                            if this.paste_files(paste_target.clone(), cx) {
+                                cx.stop_propagation();
+                            }
+                        },
+                    ))
+                    .children(chips)
                     .child(
                         div()
-                            .flex_1()
-                            .min_w_0()
-                            .py(t.space.xs)
-                            .type_style(t.text.body)
-                            .text_color(c.text_primary)
-                            .child(input),
+                            .flex()
+                            .items_end()
+                            .gap(t.space.sm)
+                            .pl(t.space.sm)
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .py(t.space.xs)
+                                    .type_style(t.text.body)
+                                    .text_color(c.text_primary)
+                                    .child(input),
+                            )
+                            .child(send),
                     )
-                    .child(send)
+                    .children(drop_zone)
                     .on_mouse_down(
                         MouseButton::Right,
                         cx.listener(|this, event: &MouseDownEvent, _, cx| {
@@ -1727,9 +1791,13 @@ impl ConsortApp {
                     .max_w(t.layout.timeline_max_width)
                     .px(t.space.xs)
                     .child(
-                        tool("attach", "plus", cx).on_click(cx.listener(|this, _, _, cx| {
-                            this.show_notice("Attachments come in a later build.".into(), cx)
-                        })),
+                        tool("attach", "plus", cx)
+                            .debug_selector(|| "attach".into())
+                            .relative()
+                            .child(self.triggers.track("composer-attach"))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.open_add_menu("composer-attach", add_target.clone(), cx)
+                            })),
                     )
                     .child(
                         tool("voice", "voice", cx).on_click(cx.listener(|this, _, _, cx| {

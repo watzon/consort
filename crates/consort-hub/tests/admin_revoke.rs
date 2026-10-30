@@ -6,9 +6,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-mod common;
-
-use common::*;
+use crate::common::*;
 use consort_hub::admin::{self, Origin};
 use consort_proto::client_api::{
     ClientPairingCode, ClientRevoke, EntityPayload, WorkerPairingCode,

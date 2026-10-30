@@ -249,7 +249,7 @@ async fn send_pending(shared: &Arc<Shared>, p: &PendingSend) -> Result<(), Clien
         })?,
         client_message_id: p.client_message_id.clone(),
         body: p.body.clone(),
-        attachments: Vec::new(),
+        attachments: p.attachments.clone(),
         thread_root_id: match &p.thread_root_id {
             Some(id) => Some(id.parse().map_err(|_| {
                 invalid("Consort cannot use this thread. Restart Consort, then try again")

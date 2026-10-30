@@ -4,11 +4,9 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-mod common;
-
 use std::time::Duration;
 
-use common::*;
+use crate::common::*;
 use consort_proto::client_api::*;
 use consort_proto::error::ErrorCode;
 use consort_proto::frame::MessageFamily;

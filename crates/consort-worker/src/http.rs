@@ -1,4 +1,4 @@
-//! HTTP calls to the hub: pairing and blob uploads.
+//! HTTP calls to the hub: pairing, and blob uploads and downloads.
 
 use consort_proto::auth::{
     HEADER_SIGNATURE, HEADER_TIMESTAMP, HEADER_WORKER_ID, PAIR_WORKER_PATH, PairWorkerRequest,
@@ -189,6 +189,77 @@ pub async fn download_blob(
         body.extend_from_slice(&chunk);
     }
     Ok(body)
+}
+
+/// Downloads a blob with `GET /v1/blobs/{sha256}` and the worker signature
+/// headers into the new file `dest`, so a large blob does not stay in
+/// memory. The download stops when the hub sends more than `max_bytes`. The
+/// caller checks the hash. A large blob may take long, so this client has no
+/// limit for the whole request, only for the connect and for each read.
+pub async fn download_blob_to_file(
+    hub_url: &str,
+    worker_id: WorkerId,
+    identity: &Identity,
+    sha256: &Sha256Hash,
+    max_bytes: u64,
+    dest: &std::path::Path,
+) -> Result<u64, WorkerError> {
+    use tokio::io::AsyncWriteExt as _;
+    let origin = normalize_origin(hub_url).map_err(|e| WorkerError::Config(e.to_string()))?;
+    let path = blob_path(sha256);
+    let timestamp = Timestamp::now();
+    let signature = identity.sign(&http_signing_payload(
+        "GET", &origin, &path, timestamp, worker_id,
+    ));
+    let url = format!("{}{path}", http_base(hub_url));
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .read_timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| WorkerError::Network(e.to_string()))?;
+    let mut response = client
+        .get(&url)
+        .header(HEADER_WORKER_ID, worker_id.to_string())
+        .header(HEADER_TIMESTAMP, timestamp.as_millis().to_string())
+        .header(HEADER_SIGNATURE, signature.to_hex())
+        .send()
+        .await
+        .map_err(|e| WorkerError::Network(e.to_string()))?;
+    if !response.status().is_success() {
+        return Err(hub_error(response).await);
+    }
+    let too_large = || {
+        WorkerError::Network(format!(
+            "the hub sent a blob that is larger than {max_bytes} bytes"
+        ))
+    };
+    if response.content_length().is_some_and(|len| len > max_bytes) {
+        return Err(too_large());
+    }
+    let io = |source| WorkerError::Io {
+        context: format!("could not write {}", dest.display()),
+        source,
+    };
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(dest)
+        .await
+        .map_err(io)?;
+    let mut written: u64 = 0;
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| WorkerError::Network(e.to_string()))?
+    {
+        written = written.saturating_add(chunk.len() as u64);
+        if written > max_bytes {
+            return Err(too_large());
+        }
+        file.write_all(&chunk).await.map_err(io)?;
+    }
+    file.flush().await.map_err(io)?;
+    Ok(written)
 }
 
 #[cfg(test)]

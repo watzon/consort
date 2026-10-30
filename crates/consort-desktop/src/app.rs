@@ -68,6 +68,38 @@ pub enum Panel {
     None,
     Tasks,
     Thread(String),
+    /// The Channel panel of the open channel: Files, Routines and Memory.
+    Channel,
+}
+
+/// The tabs of the Channel panel. Only Files is built. Routines and Memory
+/// come with phase 2 and are disabled tabs until then.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChannelTab {
+    Files,
+    Routines,
+    Memory,
+}
+
+/// A picture opened large, with the other pictures of the same message or
+/// list to step through.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Lightbox {
+    pub images: Vec<consort_client::AttachmentView>,
+    pub index: usize,
+    /// Who sent it and when: "You sent it today at 7:40 PM."
+    pub caption: String,
+}
+
+/// Where files that the user drags over the window go.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DropOver {
+    /// The chat column: they attach to the composer.
+    Chat,
+    /// The Channel panel: they go into its open folder.
+    Files,
+    /// The task thread: they attach to the reply box.
+    Reply,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -137,6 +169,14 @@ pub enum Dialog {
     ChannelExtensions(String),
     /// The settings of an account: the worker ID and the account ID.
     AccountSettings(String, String),
+    /// Delete a channel file: the channel ID and the path.
+    ConfirmDeleteFile(String, String),
+    /// Rename a channel file: the channel ID and the path.
+    RenameFile(String, String),
+    /// Move a channel file to another folder: the channel ID and the path.
+    MoveFile(String, String),
+    /// Pick files from the channel files, for a composer or a reply box.
+    ChooseChannelFiles(consort_client::UploadTarget),
 }
 
 /// The step of the Add account dialog.
@@ -352,6 +392,23 @@ pub struct ConsortApp {
     pub key_error: Option<String>,
     /// The connector state changed: the render follows it with a window.
     ext_stale: bool,
+    /// The tab of the Channel panel.
+    pub channel_tab: ChannelTab,
+    /// The open folder of the Files tab, empty for the top folder.
+    pub files_folder: String,
+    /// Files are dragged over the window: where they would go, and how
+    /// many there are.
+    pub drop_hover: Option<(DropOver, usize)>,
+    /// The open light box.
+    pub lightbox: Option<Lightbox>,
+    /// The folder chosen in the open Move dialog.
+    pub move_to: String,
+    /// A screen holds the drop state with no drag, for a screenshot.
+    pub hold_drop: bool,
+    /// The file whose "more" button a screen opens the row menu under.
+    pub files_menu_for: Option<String>,
+    /// The blobs that the app asked the client to download, so it asks once.
+    pub fetching: std::collections::HashSet<String>,
     pub focus: FocusHandle,
     styled_for: Option<(gpui_kit::SharedString, consort_theme::Mode)>,
     _subscriptions: Vec<Subscription>,
@@ -633,6 +690,14 @@ impl ConsortApp {
             pending_connection_name: None,
             key_error: None,
             ext_stale: false,
+            channel_tab: ChannelTab::Files,
+            files_folder: String::new(),
+            drop_hover: None,
+            lightbox: None,
+            move_to: String::new(),
+            hold_drop: false,
+            files_menu_for: None,
+            fetching: std::collections::HashSet::new(),
             focus: cx.focus_handle(),
             styled_for: None,
             _subscriptions: subscriptions,
@@ -1333,6 +1398,112 @@ impl ConsortApp {
                     .collect();
                 self.new_channel.tags = vec!["personal".to_owned()];
             }
+            // Phase 1: files and attachments, in house-lights.
+            "attachments" | "drop" | "bubbles" | "lightbox" | "files" | "files-menu"
+            | "files-drop" | "thread-attach" => {
+                use consort_client::mock_files::{LIGHTS, ROOF_TASK};
+                self.open_channel(LIGHTS.into(), window, cx);
+                let text = match screen {
+                    "attachments" => {
+                        "Here are the roofline photos and the quote from Brightline. Can you compare it with the other two?"
+                    }
+                    "drop" => "Here are the roofline photos and the quote from Brightline.",
+                    _ => "",
+                };
+                self.inputs
+                    .composer
+                    .update(cx, |input, cx| input.set_value(text, window, cx));
+                match screen {
+                    "drop" => {
+                        self.drop_hover = Some((DropOver::Chat, 3));
+                        self.hold_drop = true;
+                    }
+                    "lightbox" => {
+                        let images = self
+                            .state
+                            .timeline(LIGHTS)
+                            .and_then(|tl| {
+                                tl.items.iter().find_map(|i| match i {
+                                    consort_client::TimelineItem::Message(m)
+                                        if m.attachments.iter().any(|a| a.image) =>
+                                    {
+                                        Some(m.attachments.clone())
+                                    }
+                                    _ => None,
+                                })
+                            })
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter(|a| a.image)
+                            .collect();
+                        self.open_lightbox(images, 0, "You sent it today at 7:40 PM.".into(), cx);
+                    }
+                    "files" | "files-menu" | "files-drop" => {
+                        self.panel = Panel::Channel;
+                        if screen == "files-drop" {
+                            self.drop_hover = Some((DropOver::Files, 2));
+                            self.hold_drop = true;
+                        }
+                        if screen == "files-menu" {
+                            self.files_menu_for = Some("wiring-plan.pdf".into());
+                            cx.on_next_frame(window, |this, window, cx| {
+                                cx.on_next_frame(window, |this, _, cx| {
+                                    let file = this
+                                        .state
+                                        .channel_files
+                                        .iter()
+                                        .find(|f| f.path == "wiring-plan.pdf")
+                                        .cloned();
+                                    if let (Some(file), Some(bounds)) =
+                                        (file, this.triggers.get("files-menu-anchor"))
+                                    {
+                                        let items = crate::ui::menu::file_menu(&file);
+                                        this.open_menu(OpenMenu::under(bounds, items, false), cx);
+                                    }
+                                });
+                                let _ = this;
+                            });
+                        }
+                    }
+                    "thread-attach" => {
+                        self.open_thread(ROOF_TASK.into(), window, cx);
+                        self.inputs.reply.update(cx, |input, cx| {
+                            input.set_value(
+                                "Add the garage side too. The run there is 22 ft.",
+                                window,
+                                cx,
+                            )
+                        });
+                        cx.on_next_frame(window, |this, window, cx| {
+                            cx.on_next_frame(window, |this, _, cx| {
+                                let target = consort_client::UploadTarget::Reply {
+                                    task_id: ROOF_TASK.into(),
+                                };
+                                this.open_add_menu("reply-attach", target, cx);
+                            });
+                            let _ = this;
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            "files-empty" => {
+                self.open_channel(consort_client::mock_files::EMPTY_CHANNEL.into(), window, cx);
+                self.panel = Panel::Channel;
+            }
+            "add-skill-upload" => {
+                self.open_settings(SettingsSection::Skills, cx);
+                self.open_dialog(Dialog::AddSkill, window, cx);
+                self.ext.add_skill.tab = crate::extensions::AddSkillTab::Upload;
+                if let Some(path) = consort_client::mock_files::skill_zip_path() {
+                    self.ext.add_skill.upload_path = Some(path.clone());
+                    self.preview_skill(
+                        consort_client::SkillInstallInput::Upload { file_path: path },
+                        "upload".into(),
+                        cx,
+                    );
+                }
+            }
             "onboarding" => self.page = Page::Onboarding,
             "edit" => {
                 let mine = self.state.timeline(&self.channel_id).and_then(|t| {
@@ -1431,6 +1602,9 @@ impl ConsortApp {
     // Navigation
 
     pub fn open_channel(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.channel_id != id {
+            self.files_folder.clear();
+        }
         self.channel_id = id;
         self.page = Page::Main;
         // The composer holds the draft of this channel from now on.
@@ -1439,6 +1613,21 @@ impl ConsortApp {
         self.update_placeholder(window, cx);
         self.track_unloaded(cx);
         self.mark_read(cx);
+        cx.notify();
+    }
+
+    /// Opens the Channel panel, or closes it when it is open. It takes the
+    /// place of the Tasks panel or a task thread.
+    pub fn toggle_channel_panel(&mut self, cx: &mut Context<Self>) {
+        self.panel = if self.panel == Panel::Channel {
+            Panel::None
+        } else {
+            Panel::Channel
+        };
+        if self.panel == Panel::Channel {
+            self.load_channel_files(cx);
+        }
+        self.sync_lists();
         cx.notify();
     }
 
@@ -1931,6 +2120,15 @@ impl ConsortApp {
                     .map(|c| c.tags.clone())
                     .unwrap_or_default();
             }
+            Dialog::RenameFile(_, path) => {
+                let name = consort_client::files::split_path(path).1.to_owned();
+                self.set_field(Field::Name, &name, window, cx);
+                focus_input(&self.inputs.name, window, cx);
+            }
+            Dialog::MoveFile(_, path) => {
+                self.move_to = consort_client::files::split_path(path).0.to_owned();
+            }
+            Dialog::ConfirmDeleteFile(..) | Dialog::ChooseChannelFiles(_) => {}
             Dialog::ConfirmDeleteChannel(_)
             | Dialog::ConfirmRemoveWorker(_)
             | Dialog::ConfirmRemoveAccount(..)
@@ -2210,7 +2408,11 @@ impl ConsortApp {
             return;
         }
         let body = self.inputs.composer.read(cx).value().trim().to_owned();
-        if body.is_empty() {
+        let target = consort_client::UploadTarget::Composer {
+            channel_id: self.channel_id.clone(),
+        };
+        let attachments = self.upload_ids(&target);
+        if body.is_empty() && attachments.is_empty() {
             return;
         }
         let client = self.client.clone();
@@ -2218,10 +2420,15 @@ impl ConsortApp {
         let sent_to = channel_id.clone();
         let input = self.inputs.composer.clone();
         let sent = body.clone();
-        // The text stays in the box until the client takes the message.
+        // The text stays in the box until the client takes the message. The
+        // client waits for the uploads first.
         self.run_guarded(
             "composer".into(),
-            async move { client.send_message(channel_id, body).await },
+            async move {
+                client
+                    .send_message_with(channel_id, body, attachments)
+                    .await
+            },
             Kept::Draft("Your message is still in the box."),
             move |this, window, cx| {
                 if this.composer_for == sent_to {
@@ -2243,7 +2450,11 @@ impl ConsortApp {
             return;
         };
         let body = self.inputs.reply.read(cx).value().trim().to_owned();
-        if body.is_empty() {
+        let target = consort_client::UploadTarget::Reply {
+            task_id: task_id.clone(),
+        };
+        let attachments = self.upload_ids(&target);
+        if body.is_empty() && attachments.is_empty() {
             return;
         }
         let client = self.client.clone();
@@ -2252,7 +2463,7 @@ impl ConsortApp {
         let sent_to = task_id.clone();
         self.run_guarded(
             "reply".into(),
-            async move { client.reply_to_task(task_id, body).await },
+            async move { client.reply_to_task_with(task_id, body, attachments).await },
             Kept::Draft("Your reply is still in the box."),
             move |this, window, cx| {
                 if this.reply_for.as_deref() == Some(sent_to.as_str()) {
@@ -2607,6 +2818,37 @@ impl ConsortApp {
             }
             MenuAction::TextEdit(target, op) => self.text_edit(target, op, window, cx),
             MenuAction::Select(id, option) => self.pick_select(id, &option, window, cx),
+            // Files and attachments.
+            MenuAction::OpenAttachment(att) => self.open_blob(att.sha256, att.size, att.name, cx),
+            MenuAction::SaveAttachment(att) => self.save_blob(att.sha256, att.size, att.name, cx),
+            MenuAction::SaveToChannelFiles(channel_id, att) => {
+                self.save_to_channel_files(channel_id, att, cx)
+            }
+            MenuAction::AttachFromComputer(target) => self.choose_files(target, cx),
+            MenuAction::AttachFromChannel(target) => {
+                self.open_dialog(Dialog::ChooseChannelFiles(target), window, cx)
+            }
+            MenuAction::RetryUpload(id) => self.spawn_command(cx, async move {
+                client
+                    .run(consort_client::Command::RetryUpload { id })
+                    .await
+            }),
+            MenuAction::RemoveUpload(id) => self.spawn_command(cx, async move {
+                client
+                    .run(consort_client::Command::RemoveUpload { id })
+                    .await
+            }),
+            MenuAction::OpenFile(file) => self.open_blob(file.sha256, file.size, file.name, cx),
+            MenuAction::DownloadFile(file) => self.save_blob(file.sha256, file.size, file.name, cx),
+            MenuAction::RenameFile(channel_id, path) => {
+                self.open_dialog(Dialog::RenameFile(channel_id, path), window, cx)
+            }
+            MenuAction::MoveFile(channel_id, path) => {
+                self.open_dialog(Dialog::MoveFile(channel_id, path), window, cx)
+            }
+            MenuAction::DeleteFile(channel_id, path) => {
+                self.open_dialog(Dialog::ConfirmDeleteFile(channel_id, path), window, cx)
+            }
         }
         cx.notify();
     }
@@ -2678,6 +2920,17 @@ impl ConsortApp {
                         self.run_menu(action, window, cx);
                     }
                 }
+                _ => return,
+            }
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+        if self.lightbox.is_some() && self.dialog.is_none() {
+            match key {
+                "escape" => self.lightbox = None,
+                "left" => self.step_lightbox(-1),
+                "right" => self.step_lightbox(1),
                 _ => return,
             }
             cx.stop_propagation();
@@ -2846,6 +3099,10 @@ impl Render for ConsortApp {
             self.ext_stale = false;
             self.follow_extensions(Some(window), cx);
         }
+        // A drag of files that ended or left the window shows no drop state.
+        if self.drop_hover.is_some() && !cx.has_active_drag() && !self.hold_drop {
+            self.drop_hover = None;
+        }
         let body = match self.page {
             Page::Onboarding => self.render_onboarding(&t, window, cx),
             Page::Settings => self.render_settings(&t, window, cx),
@@ -2883,6 +3140,9 @@ impl Render for ConsortApp {
                     .child(body)
                     .when_some(self.dialog.clone(), |layer, dialog| {
                         layer.child(self.render_dialog(&dialog, &t, window, cx))
+                    })
+                    .when(self.lightbox.is_some(), |layer| {
+                        layer.child(self.render_lightbox(&t, window, cx))
                     })
                     .when_some(self.notices.current().cloned(), |layer, notice| {
                         layer.child(self.render_notice(notice, &t, cx))

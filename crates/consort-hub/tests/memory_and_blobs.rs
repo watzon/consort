@@ -3,9 +3,7 @@
 // Test code may unwrap (AGENTS.md: "No unwrap or expect outside tests").
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-mod common;
-
-use common::*;
+use crate::common::*;
 use consort_proto::auth::AuthHttpToken;
 use consort_proto::auth::{
     HEADER_SIGNATURE, HEADER_TIMESTAMP, HEADER_WORKER_ID, blob_path, http_signing_payload,
@@ -372,6 +370,25 @@ async fn blobs_need_a_token_or_a_worker_signature_and_check_the_hash() {
     let missing = format!("{}{}", hub.url, blob_path(&hash_of(b"missing")));
     let response = http.get(&missing).bearer_auth(&token).send().await.unwrap();
     assert_eq!(response.status(), 404);
+    // HEAD says whether the hub has a blob, and its size, without the body.
+    let response = http.head(&url).bearer_auth(&token).send().await.unwrap();
+    assert_eq!(response.status(), 200);
+    // reqwest's content_length() gives the received body size, which is 0
+    // for HEAD, so read the header.
+    let length = response.headers()[reqwest::header::CONTENT_LENGTH]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(length, bytes.len().to_string());
+    let response = http
+        .head(&missing)
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 404);
+    let response = http.head(&url).send().await.unwrap();
+    assert_eq!(response.status(), 401, "HEAD needs a token too");
 
     // The blob becomes a channel file.
     let tutti = client.tutti().await;

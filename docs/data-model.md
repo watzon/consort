@@ -15,6 +15,8 @@ This page lists the entities that the hub, the workers and the clients store, wi
 | Worker | `workspaces/` | Worktrees and clones that the worker made for tasks |
 | Worker | `<consort home>/profiles/<name>/` | The profile folder of each account, named after the account name when the worker made it (`profile_dir` in `worker.toml`): the harness's own config and login, and `env.json` with the secret variables (mode 0600 on Unix) |
 | Worker | `<consort home>/tools/<tool>/<version>/` | The managed tools that the worker installed |
+| Worker | `<consort home>/cache/blobs/<sha256>` | Attachments and channel files that the worker downloaded, checked by hash (mode 0600 on Unix). Sessions get copies in their workspace |
+| Worker | `<workspace>/.consort/attachments/` and `<workspace>/.channel/files/` | The attachments of a session's turns, and the read-only copy of the channel files (see [protocol.md](protocol.md#attachments-and-channel-files-on-the-worker)) |
 | Worker | Each harness's own files | Raw session transcripts and harness logins. The worker never copies these to the hub |
 | Client | `cache.db` (SQLite) | A partial copy of hub entities and the last feed sequence number |
 

@@ -219,9 +219,14 @@ impl Hub {
         // Read the channel again: the user may have changed its limits
         // since the session started.
         let channel_id = ctx.channel.id;
-        let channel = self
+        let paths = args.attachments.clone();
+        let (channel, attachments) = self
             .store
-            .read(move |conn| conversation::channel_or_404(conn, channel_id))
+            .read(move |conn| {
+                let channel = conversation::channel_or_404(conn, channel_id)?;
+                let attachments = super::chat::resolve_attachments(conn, channel_id, &paths)?;
+                Ok((channel, attachments))
+            })
             .await?;
         let mut placement = PlacementRequest {
             worker_id: args.worker_id,
@@ -245,6 +250,7 @@ impl Hub {
                 start_at: args.start_at,
                 created_by: TaskCreator::Assistant,
                 routine_id: None,
+                attachments,
             })
             .await?;
         if !limited.is_empty() {
@@ -282,29 +288,40 @@ impl Hub {
         args: MessageTaskArgs,
     ) -> Result<Value> {
         let (task_id, channel_id) = (args.task_id, ctx.channel.id);
-        let task = self
+        let paths = args.attachments.clone();
+        let (task, attachments) = self
             .store
             .read(move |conn| {
-                work::task(conn, task_id)?
+                let task = work::task(conn, task_id)?
                     .filter(|t| t.channel_id == channel_id)
-                    .ok_or_else(|| HubError::not_found("This channel has no task with this ID."))
+                    .ok_or_else(|| HubError::not_found("This channel has no task with this ID."))?;
+                let attachments = super::chat::resolve_attachments(conn, channel_id, &paths)?;
+                Ok((task, attachments))
             })
             .await?;
         let delivery = self
-            .deliver_to_task(task.id, args.body.clone(), Actor::Coordinator)
+            .deliver_to_task(
+                task.id,
+                args.body.clone(),
+                attachments.clone(),
+                Actor::Coordinator,
+            )
             .await?;
         let session = ctx.session.clone();
         let body = args.body;
         self.store
             .write(move |tx| {
-                tx.post_in_task_thread(
-                    &task,
-                    Some(&session),
+                let mut new = conversation::NewMessage::new(
+                    task.channel_id,
                     Author::Assistant,
                     MessageKind::Text,
-                    &body,
-                )
-                .map(|_| ())
+                    body,
+                );
+                new.thread_root_id = Some(task.card_message_id);
+                new.author_task_id = Some(task.id);
+                new.author_session_id = Some(session.id);
+                new.attachments = attachments;
+                tx.insert_message(new).map(|_| ())
             })
             .await?;
         to_value(&MessageTaskResult {
@@ -529,11 +546,19 @@ impl Hub {
                 "The file was not uploaded. The worker uploads it before it calls this tool.",
             ));
         };
-        if !self.store.blobs_dir().join(sha.as_str()).exists() {
-            return Err(HubError::invalid(
-                "The hub has no blob for this file. Upload it again.",
-            ));
+        // The size comes from the blob that the hub stored, not from the
+        // call, so the channel file always tells the truth.
+        let stored = tokio::fs::metadata(self.store.blobs_dir().join(sha.as_str()))
+            .await
+            .ok()
+            .filter(|m| m.is_file())
+            .ok_or_else(|| {
+                HubError::invalid("The hub has no blob for this file. Upload it again.")
+            })?;
+        if stored.len() != size {
+            tracing::warn!(session_id = %ctx.session.id, claimed = size, stored = stored.len(), "an artifact call gave a size that does not match its blob");
         }
+        let size = stored.len();
         let path = artifact_path(task.id, &args.path);
         consort_proto::model::validate_relative_path("path", &path)?;
         let file = ChannelFile {

@@ -454,6 +454,7 @@ mod tests {
                 start_at: None,
                 created_by: TaskCreator::User,
                 routine_id: None,
+                attachments: Vec::new(),
             })
             .await
             .unwrap();
@@ -621,6 +622,7 @@ mod tests {
                 text: "More".to_owned(),
                 attachments: Vec::new(),
             },
+            channel_files: None,
         });
         let worker_id = session.worker_id;
         let id = hub

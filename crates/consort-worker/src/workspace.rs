@@ -157,6 +157,62 @@ async fn git_until(
     git_with(args, cwd, env, step_limit(deadline, limit)?).await
 }
 
+/// The worker's own folders in a workspace: the channel file copy and the
+/// saved attachments. Patterns for `.git/info/exclude`.
+const WORKER_FOLDERS: [&str; 2] = ["/.channel/", "/.consort/"];
+
+/// Keeps the worker's folders out of git when the workspace is a git
+/// checkout: it adds them to the repo's `info/exclude`, which git reads but
+/// never commits. So a session that runs `git add -A` does not commit the
+/// channel files or the attachments. A failure is logged and changes
+/// nothing else.
+pub async fn exclude_worker_folders(workspace: &Path) {
+    if std::fs::symlink_metadata(workspace.join(".git")).is_err() {
+        return;
+    }
+    let path = match git(
+        &["rev-parse", "--git-path", "info/exclude"],
+        Some(workspace),
+    )
+    .await
+    {
+        Ok(out) => match path_from_git(out.trim_ascii_end()) {
+            Some(path) if path.is_absolute() => path,
+            Some(path) => workspace.join(path),
+            None => return,
+        },
+        Err(err) => {
+            tracing::warn!(workspace = %workspace.display(), error = %err, "could not find the git exclude file of a workspace");
+            return;
+        }
+    };
+    let current = std::fs::read_to_string(&path).unwrap_or_default();
+    let missing: Vec<&str> = WORKER_FOLDERS
+        .iter()
+        .copied()
+        .filter(|p| !current.lines().any(|line| line.trim() == *p))
+        .collect();
+    if missing.is_empty() {
+        return;
+    }
+    let mut text = current;
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str("# Consort worker folders\n");
+    for pattern in missing {
+        text.push_str(pattern);
+        text.push('\n');
+    }
+    let written = path
+        .parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|()| std::fs::write(&path, text));
+    if let Err(err) = written {
+        tracing::warn!(file = %path.display(), error = %err, "could not keep the worker folders out of git");
+    }
+}
+
 /// A folder name for a repo, from the last part of its URL.
 pub fn repo_folder_name(repo: &WorkspaceRepo) -> String {
     let last = repo
