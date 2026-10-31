@@ -11,7 +11,9 @@ use consort_proto::frame::{
     Frame, FrameError, FrameId, MAX_FRAME_BYTES, MessageFamily, RequestFrame,
 };
 use consort_proto::ids::{SessionId, WorkerId};
-use consort_proto::worker_link::{HubToWorker, QUEUED_COMMAND_TTL_MS, SessionStartResult};
+use consort_proto::session_host_link::{
+    HubToSessionHost, QUEUED_COMMAND_TTL_MS, SessionStartResult,
+};
 use serde_json::Value;
 
 use super::events::Effects;
@@ -42,7 +44,7 @@ fn command_timeout(kind: &str) -> Duration {
     }
 }
 
-fn encode(id: FrameId, command: &HubToWorker) -> Result<RequestFrame> {
+fn encode(id: FrameId, command: &HubToSessionHost) -> Result<RequestFrame> {
     match Frame::family_request(id, command)? {
         Frame::Request(request) => Ok(request),
         _ => Err(HubError::internal("a command did not encode as a request")),
@@ -55,8 +57,36 @@ impl Tx<'_> {
     ///
     /// A command that does not fit in one frame could never go out, so it
     /// is refused here, and the transaction fails.
-    pub fn queue_command(&mut self, worker_id: WorkerId, command: &HubToWorker) -> Result<FrameId> {
+    pub fn queue_command(
+        &mut self,
+        worker_id: WorkerId,
+        command: &HubToSessionHost,
+    ) -> Result<FrameId> {
         self.queue_command_keyed(worker_id, command.session_id(), command)
+    }
+
+    /// Stores a command for an execution worker. Call [`Hub::pump_worker`]
+    /// after the transaction commits.
+    pub fn queue_exec_command(
+        &mut self,
+        worker_id: WorkerId,
+        command: &consort_proto::execution_link::HubToExecution,
+    ) -> Result<FrameId> {
+        let request = match Frame::family_request(FrameId::generate(), command)? {
+            Frame::Request(request) => request,
+            _ => return Err(HubError::internal("a command did not encode as a request")),
+        };
+        let now = self.now();
+        self.enqueue_command(&QueuedCommand {
+            id: request.id.clone(),
+            worker_id,
+            session_id: None,
+            kind: request.kind,
+            body: request.body,
+            created_at: now,
+            expires_at: now.plus_millis(QUEUED_COMMAND_TTL_MS),
+        })?;
+        Ok(request.id)
     }
 
     /// Like [`Tx::queue_command`], in the queue of `key`. Commands of one key
@@ -66,7 +96,7 @@ impl Tx<'_> {
         &mut self,
         worker_id: WorkerId,
         key: Option<SessionId>,
-        command: &HubToWorker,
+        command: &HubToSessionHost,
     ) -> Result<FrameId> {
         let request = encode(FrameId::generate(), command)?;
         if let Err(FrameError::TooLarge { size }) = Frame::Request(request.clone()).to_text() {
@@ -221,7 +251,8 @@ impl Hub {
                 kind: command.kind.clone(),
                 body: command.body.clone(),
             };
-            if let Ok(HubToWorker::SessionRespond(respond)) = request.decode::<HubToWorker>()
+            if let Ok(HubToSessionHost::SessionRespond(respond)) =
+                request.decode::<HubToSessionHost>()
                 && let Err(err) = self
                     .answer_expired(respond.session_id, respond.request_id)
                     .await
@@ -247,7 +278,7 @@ impl Hub {
     pub(crate) async fn worker_rpc(
         &self,
         worker_id: WorkerId,
-        command: HubToWorker,
+        command: HubToSessionHost,
     ) -> Result<Value> {
         let link = self
             .links
@@ -319,30 +350,30 @@ fn apply_command_result(
         kind: command.kind.clone(),
         body: command.body.clone(),
     };
-    let Ok(decoded) = request.decode::<HubToWorker>() else {
+    let Ok(decoded) = request.decode::<HubToSessionHost>() else {
         return Ok(Effects::default());
     };
     match (decoded, result) {
-        (HubToWorker::SessionStart(start), Ok(value)) => {
+        (HubToSessionHost::SessionStart(start), Ok(value)) => {
             let started: SessionStartResult = serde_json::from_value(value)?;
             session_started_tx(tx, start.session_id, started)
         }
-        (HubToWorker::SessionStart(start), Err(error)) => {
+        (HubToSessionHost::SessionStart(start), Err(error)) => {
             session_start_failed_tx(hub, tx, start.session_id, error)
         }
-        (HubToWorker::SessionTurn(turn), Err(error))
+        (HubToSessionHost::SessionTurn(turn), Err(error))
             if turn.model_change.is_some() && error.code == ErrorCode::Unsupported =>
         {
             model_change_refused_tx(hub, tx, &turn, error)
         }
-        (HubToWorker::SessionTurn(turn), Err(error)) => {
+        (HubToSessionHost::SessionTurn(turn), Err(error)) => {
             turn_command_failed_tx(hub, tx, turn.session_id, error)
         }
-        (HubToWorker::SessionSteer(steer), Err(error)) => {
+        (HubToSessionHost::SessionSteer(steer), Err(error)) => {
             tracing::info!(session_id = %steer.session_id, %error, "a worker refused a steer, so the hub delivers the text in another way");
             steer_command_failed_tx(hub, tx, &steer, &error)
         }
-        (HubToWorker::SessionRespond(respond), Err(error)) => {
+        (HubToSessionHost::SessionRespond(respond), Err(error)) => {
             tracing::warn!(session_id = %respond.session_id, %error, "a worker refused an answer");
             answer_command_failed_tx(tx, &respond, &error)
         }
@@ -350,7 +381,7 @@ fn apply_command_result(
             tracing::warn!(kind = other.type_name(), %error, "a worker refused a command");
             Ok(Effects::default())
         }
-        (HubToWorker::SessionTurn(turn), Ok(_)) => {
+        (HubToSessionHost::SessionTurn(turn), Ok(_)) => {
             // The worker set the model of the turn. The session runs it now.
             if let Some(change) = &turn.model_change {
                 model_applied_tx(tx, turn.session_id, change)?;
@@ -379,9 +410,9 @@ mod tests {
         Approval, ApprovalDetails, ApprovalStatus, Message, ModelOptions, PlacementRequest,
         Session, SessionRole, SessionState, TaskCreator, Usage,
     };
+    use consort_proto::session_host_link::{RequestAnswer, SessionRespond};
     use consort_proto::status::TaskStatus;
     use consort_proto::time::Timestamp;
-    use consort_proto::worker_link::{RequestAnswer, SessionRespond};
     use serde_json::json;
     use tokio_util::sync::CancellationToken;
 
@@ -438,10 +469,11 @@ mod tests {
     #[tokio::test]
     async fn a_queued_command_that_is_too_large_is_refused() {
         let (hub, _dir) = crate::hub::test_hub().await;
-        let command = HubToWorker::SessionStop(consort_proto::worker_link::SessionStop {
-            session_id: SessionId::new(),
-            reason: "x".repeat(MAX_FRAME_BYTES),
-        });
+        let command =
+            HubToSessionHost::SessionStop(consort_proto::session_host_link::SessionStop {
+                session_id: SessionId::new(),
+                reason: "x".repeat(MAX_FRAME_BYTES),
+            });
         let result = hub
             .store
             .write(move |tx| tx.queue_command(WorkerId::new(), &command))
@@ -473,6 +505,7 @@ mod tests {
             .unwrap();
         let worker_id = WorkerId::new();
         let session = Session {
+            execution_worker_id: None,
             id: SessionId::new(),
             role: SessionRole::Task,
             channel_id: channel.id,
@@ -514,6 +547,8 @@ mod tests {
                     request_id: "req-1".into(),
                     summary: "Run tests".to_owned(),
                     details: ApprovalDetails::Command {
+                        blocked: Vec::new(),
+                        check_note: None,
                         command: "cargo test".to_owned(),
                         cwd: None,
                     },
@@ -526,7 +561,7 @@ mod tests {
                 })?;
                 let id = tx.queue_command(
                     worker_id,
-                    &HubToWorker::SessionRespond(SessionRespond {
+                    &HubToSessionHost::SessionRespond(SessionRespond {
                         session_id,
                         request_id: "req-1".into(),
                         answer: RequestAnswer {
@@ -596,7 +631,7 @@ mod tests {
             outbox,
         ));
         hub.links.register(link.clone());
-        let stop = HubToWorker::SessionStop(consort_proto::worker_link::SessionStop {
+        let stop = HubToSessionHost::SessionStop(consort_proto::session_host_link::SessionStop {
             session_id: session.id,
             reason: "test".to_owned(),
         });
@@ -630,9 +665,9 @@ mod tests {
     async fn a_result_that_arrives_twice_is_handled_once() {
         let (hub, _dir) = crate::hub::test_hub().await;
         let (task, session) = crate::hub::test_task_session(&hub).await;
-        let turn = HubToWorker::SessionTurn(consort_proto::worker_link::SessionTurn {
+        let turn = HubToSessionHost::SessionTurn(consort_proto::session_host_link::SessionTurn {
             session_id: session.id,
-            turn: consort_proto::worker_link::TurnInput {
+            turn: consort_proto::session_host_link::TurnInput {
                 text: "More".to_owned(),
                 attachments: Vec::new(),
             },
@@ -682,7 +717,9 @@ mod tests {
             .write(move |tx| {
                 tx.queue_command(
                     worker_id,
-                    &HubToWorker::InventoryRefresh(consort_proto::worker_link::InventoryRefresh {}),
+                    &HubToSessionHost::InventoryRefresh(
+                        consort_proto::session_host_link::InventoryRefresh {},
+                    ),
                 )
             })
             .await

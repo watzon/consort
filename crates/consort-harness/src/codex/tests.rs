@@ -3,7 +3,7 @@ use consort_proto::ids::SessionId;
 use consort_proto::model::{
     ApprovalDetails, FileChangeKind, ItemPayload, ItemStatus, RequestOptionKind,
 };
-use consort_proto::worker_link::RequestBody;
+use consort_proto::session_host_link::RequestBody;
 use protocol::UserInputQuestion;
 
 fn items(events: &[SessionEvent]) -> Vec<(ItemPayload, ItemStatus)> {
@@ -134,11 +134,11 @@ fn commands_output_and_file_changes() {
     assert_eq!(approval.summary, "Edit 3 files");
     let mcp = m.map_notification("item/completed", &json!({
         "threadId": "th", "turnId": "t1",
-        "item": {"type": "mcpToolCall", "id": "m1", "server": "hub", "tool": "post_update", "arguments": {"body": "hi"},
+        "item": {"type": "mcpToolCall", "id": "m1", "server": "consort", "tool": "post_update", "arguments": {"body": "hi"},
                  "result": {"content": [{"type": "text", "text": "{\"ok\":true}"}]}, "status": "completed"}
     }));
     assert!(
-        matches!(&items(&mcp)[0], (ItemPayload::ToolCall(t), ItemStatus::Completed) if t.server.as_deref() == Some("hub") && t.output.as_deref() == Some("{\"ok\":true}"))
+        matches!(&items(&mcp)[0], (ItemPayload::ToolCall(t), ItemStatus::Completed) if t.server.as_deref() == Some("consort") && t.output.as_deref() == Some("{\"ok\":true}"))
     );
 }
 
@@ -271,6 +271,30 @@ fn a_failed_turn_reports_its_kind_from_structured_data_first() {
         .0,
         Some(consort_proto::model::TurnErrorKind::ExpiredSignIn)
     );
+    // An overload and a closed connection are an outage.
+    for (turn, info) in [
+        ("o1", json!("serverOverloaded")),
+        ("o2", json!("internalServerError")),
+        (
+            "o3",
+            json!({"httpConnectionFailed": {"httpStatusCode": 503}}),
+        ),
+        (
+            "o4",
+            json!({"responseStreamDisconnected": {"httpStatusCode": null}}),
+        ),
+    ] {
+        assert_eq!(
+            ended(
+                &mut m,
+                turn,
+                json!({"message": "Failed.", "codexErrorInfo": info})
+            )
+            .0,
+            Some(consort_proto::model::TurnErrorKind::ProviderOutage),
+            "{turn}"
+        );
+    }
     // A known text is the fallback, with its reset time.
     let (kind, resets) = ended(
         &mut m,
@@ -315,7 +339,7 @@ fn approvals_and_questions() {
     );
     assert_eq!(cmd.summary, "Run `rm -rf build`");
     assert!(
-        matches!(&cmd.body, RequestBody::Approval(ApprovalDetails::Command { command, cwd: Some(c) }) if command == "rm -rf build" && c == "/w")
+        matches!(&cmd.body, RequestBody::Approval(ApprovalDetails::Command { command, cwd: Some(c), .. }) if command == "rm -rf build" && c == "/w")
     );
     let ids: Vec<_> = cmd
         .options
@@ -347,7 +371,7 @@ fn approvals_and_questions() {
     );
     let ws = workspace.to_string_lossy().into_owned();
     assert!(
-        matches!(&net.body, RequestBody::Approval(ApprovalDetails::Command { command, cwd: Some(c) }) if command == "curl x" && c == &ws),
+        matches!(&net.body, RequestBody::Approval(ApprovalDetails::Command { command, cwd: Some(c), .. }) if command == "curl x" && c == &ws),
         "{:?}",
         net.body
     );
@@ -402,13 +426,12 @@ fn thread_params_follow_the_approval_table_and_mcp_config() {
         coordinator: false,
         system_prompt_append: "Be brief.".into(),
         mcp_servers: vec![McpServerSpec {
-            name: "hub".into(),
+            name: "consort".into(),
             url: "http://127.0.0.1:1/mcp/ses".into(),
             bearer_token: Some("tok".into()),
             bridge: None,
         }],
         env: BTreeMap::new(),
-        extras_enabled: true,
         skills: None,
         resume: None,
         process_watcher: None,
@@ -421,21 +444,21 @@ fn thread_params_follow_the_approval_table_and_mcp_config() {
     assert_eq!(params["cwd"], "/w", "the workspace goes in the request");
     // The token goes through the stdio pipe, not the process environment.
     assert_eq!(
-        params["config"]["mcp_servers"]["hub"]["http_headers"]["Authorization"],
+        params["config"]["mcp_servers"]["consort"]["http_headers"]["Authorization"],
         "Bearer tok"
     );
     // A connector call can wait minutes for approval; Codex's default is 60 s.
     assert_eq!(
-        params["config"]["mcp_servers"]["hub"]["tool_timeout_sec"],
+        params["config"]["mcp_servers"]["consort"]["tool_timeout_sec"],
         super::MCP_TOOL_TIMEOUT_SECS
     );
     assert!(
-        params["config"]["mcp_servers"]["hub"]
+        params["config"]["mcp_servers"]["consort"]
             .get("bearer_token_env_var")
             .is_none()
     );
     assert_eq!(
-        params["config"]["mcp_servers"]["hub"]["url"],
+        params["config"]["mcp_servers"]["consort"]["url"],
         "http://127.0.0.1:1/mcp/ses"
     );
     assert!(params["config"].get("features").is_none());
@@ -450,7 +473,7 @@ fn thread_params_follow_the_approval_table_and_mcp_config() {
 }
 
 #[test]
-fn extras_off_stops_apps_plugins_and_cloud_skills_for_one_thread() {
+fn provider_extras_are_always_off_for_one_thread() {
     let mut spec = SessionSpec {
         session_id: SessionId::new(),
         workspace: "/w".into(),
@@ -463,17 +486,11 @@ fn extras_off_stops_apps_plugins_and_cloud_skills_for_one_thread() {
         system_prompt_append: String::new(),
         mcp_servers: vec![],
         env: BTreeMap::new(),
-        extras_enabled: true,
         skills: None,
-        resume: Some(NativeRef::new("th1")),
+        resume: None,
         process_watcher: None,
     };
-    // Extras on: nothing about apps or plugins, on a new and a resumed thread.
-    let on = serde_json::to_value(thread_params(&spec, session_config(&spec))).unwrap();
-    assert!(on["config"]["features"].get("apps").is_none(), "{on}");
-    assert!(on["config"].get("cloud").is_none(), "{on}");
-
-    spec.extras_enabled = false;
+    // A new thread and a resumed thread get the same keys.
     for resume in [None, Some(NativeRef::new("th1"))] {
         spec.resume = resume;
         let off = serde_json::to_value(thread_params(&spec, session_config(&spec))).unwrap();
@@ -649,7 +666,6 @@ mod fake_server {
             system_prompt_append: String::new(),
             mcp_servers: vec![],
             env: BTreeMap::new(),
-            extras_enabled: true,
             skills: Some(crate::skills::SessionSkills::new(
                 std::path::PathBuf::from(root),
                 vec!["pdf-forms".into()],
@@ -668,7 +684,7 @@ mod fake_server {
         let (client, inbound) = RpcClient::start(write, read);
         let spec = spec_with_skills("/runtime/ses_1/skills");
         let (session, mut events) =
-            start_thread(spec, serde_json::Map::new(), client, inbound, None)
+            start_thread(spec, serde_json::Map::new(), client, inbound, None, false)
                 .await
                 .unwrap();
         {
@@ -691,9 +707,10 @@ mod fake_server {
         let (client, inbound) = RpcClient::start(write, read);
         let mut plain = spec_with_skills("/x");
         plain.skills = None;
-        let (other, _events) = start_thread(plain, serde_json::Map::new(), client, inbound, None)
-            .await
-            .unwrap();
+        let (other, _events) =
+            start_thread(plain, serde_json::Map::new(), client, inbound, None, false)
+                .await
+                .unwrap();
         assert_eq!(log2.lock().unwrap().len(), 1);
         Box::new(other).close().await.unwrap();
         // No note when Codex took the folder.
@@ -715,7 +732,7 @@ mod fake_server {
         let (client, inbound) = RpcClient::start(write, read);
         let spec = spec_with_skills("/runtime/reject/skills");
         let (session, mut events) =
-            start_thread(spec, serde_json::Map::new(), client, inbound, None)
+            start_thread(spec, serde_json::Map::new(), client, inbound, None, false)
                 .await
                 .unwrap();
         let note = next_matching(&mut events, |e| matches!(e, SessionEvent::Error { .. })).await;
@@ -748,13 +765,12 @@ mod fake_server {
             system_prompt_append: String::new(),
             mcp_servers: vec![],
             env: BTreeMap::new(),
-            extras_enabled: true,
             skills: None,
             resume: None,
             process_watcher: None,
         };
         let (session, mut events) =
-            start_thread(spec, serde_json::Map::new(), client, inbound, None)
+            start_thread(spec, serde_json::Map::new(), client, inbound, None, false)
                 .await
                 .unwrap();
         let mut session: Box<dyn HarnessSession> = Box::new(session);
@@ -949,13 +965,12 @@ mod fake_server {
             system_prompt_append: String::new(),
             mcp_servers: vec![],
             env: BTreeMap::new(),
-            extras_enabled: true,
             skills: None,
             resume: None,
             process_watcher: None,
         };
         let (session, mut events) =
-            start_thread(spec, serde_json::Map::new(), client, inbound, None)
+            start_thread(spec, serde_json::Map::new(), client, inbound, None, false)
                 .await
                 .unwrap();
         let mut session: Box<dyn HarnessSession> = Box::new(session);
@@ -1016,13 +1031,12 @@ mod fake_server {
             system_prompt_append: String::new(),
             mcp_servers: vec![],
             env: BTreeMap::new(),
-            extras_enabled: true,
             skills: None,
             resume: None,
             process_watcher: None,
         };
         let (session, mut events) =
-            start_thread(spec, serde_json::Map::new(), client, inbound, None)
+            start_thread(spec, serde_json::Map::new(), client, inbound, None, false)
                 .await
                 .unwrap();
         assert!(session.capabilities().switch_model);
@@ -1101,13 +1115,12 @@ mod fake_server {
             system_prompt_append: String::new(),
             mcp_servers: vec![],
             env: BTreeMap::new(),
-            extras_enabled: true,
             skills: None,
             resume: None,
             process_watcher: None,
         };
         let (session, mut events) =
-            start_thread(spec, serde_json::Map::new(), client, inbound, None)
+            start_thread(spec, serde_json::Map::new(), client, inbound, None, false)
                 .await
                 .unwrap();
         let mut session: Box<dyn HarnessSession> = Box::new(session);
@@ -1181,7 +1194,7 @@ fn account_read_gives_the_email_and_plan() {
     let status = account_status(&account, none);
     assert_eq!(status.auth_state, AuthState::SignedOut);
     assert!(
-        status.auth_detail.unwrap().contains("Settings > Workers"),
+        status.auth_detail.unwrap().contains("Settings > Providers"),
         "a profile account signs in from the app"
     );
 }
@@ -1252,7 +1265,6 @@ fn a_codex_coordinator_turns_the_web_search_off() {
         system_prompt_append: String::new(),
         mcp_servers: vec![],
         env: BTreeMap::new(),
-        extras_enabled: true,
         skills: None,
         resume: None,
         process_watcher: None,
@@ -1262,4 +1274,64 @@ fn a_codex_coordinator_turns_the_web_search_off() {
     assert_eq!(config["features"]["shell_tool"], false);
     spec.coordinator = false;
     assert!(session_config(&spec).get("web_search").is_none());
+}
+
+/// A session in the boundary: the same keys for every approval mode, no
+/// shell or web, and no Codex prompt for a Consort tool.
+#[test]
+fn a_session_in_the_boundary_has_one_fixed_config() {
+    let mut config = thread_config(
+        &[McpServerSpec {
+            name: "consort".into(),
+            url: "http://127.0.0.1:1/mcp".into(),
+            bearer_token: None,
+            bridge: None,
+        }],
+        true,
+    );
+    boundary_config(&mut config);
+    let value = Value::Object(config);
+    for feature in ["shell_tool", "unified_exec", "multi_agent", "view_image"] {
+        assert_eq!(value["features"][feature], json!(false), "{feature}");
+    }
+    assert_eq!(value["web_search"], json!("disabled"));
+    assert_eq!(
+        value["mcp_servers"]["consort"]["default_tools_approval_mode"],
+        json!("approve")
+    );
+
+    for mode in ApprovalMode::ALL {
+        let spec = SessionSpec {
+            session_id: SessionId::new(),
+            workspace: "/w".into(),
+            runtime_dir: "/r".into(),
+            model: String::new(),
+            options: ModelOptions::default(),
+            approval_mode: mode,
+            allow_shell: true,
+            coordinator: false,
+            system_prompt_append: "Hub text.".into(),
+            mcp_servers: Vec::new(),
+            env: BTreeMap::new(),
+            skills: None,
+            resume: None,
+            process_watcher: None,
+        };
+        let mut params = thread_params(&spec, serde_json::Map::new());
+        boundary_params(&mut params, true);
+        assert_eq!(params.approval_policy.as_deref(), Some("never"));
+        assert_eq!(params.sandbox.as_deref(), Some("read-only"));
+        let note = params.developer_instructions.unwrap();
+        assert!(note.starts_with("Hub text.") && note.contains("consort MCP server"));
+    }
+}
+
+#[test]
+fn codex_runs_in_the_boundary_and_its_sign_in_is_not_off() {
+    let harness = CodexHarness;
+    let account = AccountConfig::default_for(HarnessKind::Codex);
+    assert_eq!(
+        harness.boundary_support(&account),
+        crate::boundary::BoundarySupport::Proven
+    );
 }

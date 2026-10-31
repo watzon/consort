@@ -78,6 +78,24 @@ pub fn day_label(ms: i64, now_ms: i64) -> String {
     }
 }
 
+/// A time in the future: "today at 3:40 PM", "tomorrow at 3:40 PM", or the
+/// short date and time ("Oct 31, 3:40 PM") for a later day.
+pub fn when_label(ms: i64, now_ms: i64) -> String {
+    let (Some(day), Some(now)) = (local(ms), local(now_ms)) else {
+        return String::new();
+    };
+    let clock = day.format("%-I:%M %p").to_string();
+    match day
+        .date_naive()
+        .signed_duration_since(now.date_naive())
+        .num_days()
+    {
+        0 => format!("today at {clock}"),
+        1 => format!("tomorrow at {clock}"),
+        _ => day.format("%b %-d, %-I:%M %p").to_string(),
+    }
+}
+
 /// The date of a file: "Today" for today, else the short date ("Oct 24"),
 /// with the year when it is not this year ("Oct 24, 2025").
 pub fn file_date_label(ms: i64, now_ms: i64) -> String {

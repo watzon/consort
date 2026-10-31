@@ -162,11 +162,21 @@ impl ConsortApp {
                         .when(opens, |d| {
                             d.cursor_pointer().hover(|s| s.bg(c.hover_sidebar))
                         })
+                        .when(item.blocked, |d| {
+                            d.child(icon("failed", t.icon.dense, c.status_failed))
+                        })
                         .child(
                             line(item.text.clone(), detail(t), c.text_secondary)
                                 .font_family(t.font_mono.clone())
-                                .flex_1(),
+                                .flex_1()
+                                .min_w_0(),
                         )
+                        .when(item.blocked, |d| {
+                            d.child(
+                                text("Blocked by the check", detail(t), c.text_tertiary)
+                                    .flex_none(),
+                            )
+                        })
                         .when(opens, |d| {
                             d.child(icon("chevron-right", t.icon.dense, c.text_tertiary))
                                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -233,7 +243,11 @@ impl ConsortApp {
                 .gap(t.space.sm)
                 .py(t.space.xs)
                 .px(t.space.sm)
-                .child(text("Archived", t.text.label, c.text_tertiary).flex_1())
+                .child(
+                    text("Archived", t.text.label, c.text_tertiary)
+                        .flex_1()
+                        .min_w_0(),
+                )
                 .child(
                     button(
                         "archived-toggle",

@@ -1,61 +1,55 @@
-//! The Consort worker daemon.
+//! The Consort execution worker. A worker is a machine where work runs. It
+//! holds no account and it runs no harness.
 //!
 //! A worker pairs with a hub once ([`pair`]), then runs ([`run`]): it keeps
-//! a WebSocket to the hub, runs sessions with the harness adapters from
-//! `consort-harness`, spools their events in SQLite until the hub
-//! acknowledges them, gives each session a local MCP endpoint for the hub
-//! tools, and makes workspaces with `git`. The protocol is in
-//! `docs/protocol.md`; the local files are in `docs/data-model.md`
-//! ("Worker-local state").
+//! one WebSocket to the hub, makes workspaces with `git`, and answers the
+//! file, process and local MCP requests of the execution protocol
+//! (`consort_proto::execution_link`). A journal in SQLite runs each change
+//! once, and keeps the record of each process across a restart.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
-mod accounts;
-#[cfg(test)]
-mod accounts_tests;
 pub mod attachments;
-pub mod bridge;
-pub mod cap;
 pub mod config;
 mod core;
 mod error;
-pub mod http;
-pub mod identity;
-pub mod item_details;
-pub mod link;
-pub mod mcp;
-pub mod profile;
-mod sessions;
-mod signin;
-pub mod skills;
-pub mod store;
+pub mod exec;
+pub mod journal;
+pub mod limits;
+pub mod local_mcp;
+pub mod paths;
+pub mod process;
 pub mod tags;
 pub mod tools;
 pub mod workspace;
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use consort_proto::auth::{PairWorkerRequest, PairingCode};
+use consort_link::http;
+use consort_link::identity::Identity;
+use consort_link::link::Link;
+use consort_proto::auth::{PAIR_WORKER_PATH, PairWorkerRequest, PairingCode};
 use consort_proto::ids::WorkerId;
 use consort_proto::model::Os;
-use tokio::sync::{Notify, watch};
+use tokio::sync::watch;
 
-pub use crate::core::{Harnesses, default_harnesses};
 pub use crate::error::WorkerError;
-pub use crate::sessions::Coalescer;
 
-use crate::config::{DB_FILE, KEY_FILE, LOCK_FILE, WorkerToml, create_private_dir};
-use crate::core::Core;
-use crate::identity::Identity;
-use crate::link::Link;
-use crate::sessions::Job;
-use crate::store::Store;
+use crate::attachments::BlobCache;
+use crate::config::{
+    CACHE_DIR, DB_FILE, KEY_FILE, LOCK_FILE, PROCESSES_DIR, WorkerToml, create_private_dir,
+};
+use crate::core::{Core, CoreHub};
+use crate::exec::Exec;
+use crate::journal::Journal;
+use crate::limits::Limits;
+use crate::paths::PathRules;
+use crate::process::Processes;
 
-/// Takes the exclusive lock on the worker lock file of a config folder.
-/// The lock lasts as long as the returned file is open. Another process
-/// that holds it makes this fail with [`WorkerError::AlreadyRunning`].
+/// Takes the exclusive lock on the lock file of a config folder. The lock
+/// lasts as long as the returned file is open.
 pub fn lock_config_dir(dir: &Path) -> Result<std::fs::File, WorkerError> {
     let path = dir.join(LOCK_FILE);
     let file = std::fs::OpenOptions::new()
@@ -69,47 +63,21 @@ pub fn lock_config_dir(dir: &Path) -> Result<std::fs::File, WorkerError> {
         Err(std::fs::TryLockError::WouldBlock) => {
             Err(WorkerError::AlreadyRunning(dir.display().to_string()))
         }
-        Err(std::fs::TryLockError::Error(e)) => Err(WorkerError::io(
+        Err(std::fs::TryLockError::Error(err)) => Err(WorkerError::io(
             format!("could not lock {}", path.display()),
-            e,
+            err,
         )),
     }
 }
 
-/// Where the worker keeps its files.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// How the worker runs.
+#[derive(Debug, Clone)]
 pub struct WorkerConfig {
-    /// The folder with `worker.toml`, the key, `worker.db` and
-    /// `workspaces/`.
+    /// The folder of the worker.
     pub config_dir: PathBuf,
-    /// The Consort home, with the profile folders and the managed tools.
-    /// `None` means [`profile::consort_home`]: `CONSORT_HOME`, else
-    /// `~/.consort`.
-    pub consort_home: Option<PathBuf>,
-    /// Whether the worker checks its managed tools for updates once a day.
-    /// Tests turn it off, so they make no network request.
-    pub check_tool_updates: bool,
 }
 
-impl WorkerConfig {
-    /// The settings for a config folder, with the default Consort home and
-    /// the daily update check.
-    pub fn new(config_dir: PathBuf) -> Self {
-        Self {
-            config_dir,
-            consort_home: None,
-            check_tool_updates: true,
-        }
-    }
-
-    /// The default folder: the platform's config folder plus `consort/worker`.
-    pub fn default_dir() -> Option<PathBuf> {
-        directories::ProjectDirs::from("", "", "consort").map(|d| d.config_dir().join("worker"))
-    }
-}
-
-/// Pairs this machine with a hub, with a pairing code from a client.
-/// Writes the key and `worker.toml`, and returns the new worker ID.
+/// Pairs this machine as a worker. Returns its ID.
 pub async fn pair(
     hub_url: &str,
     code: &str,
@@ -131,7 +99,7 @@ pub async fn pair(
         arch: std::env::consts::ARCH.to_owned(),
         name: name.clone(),
     };
-    let worker_id = http::pair_worker(hub_url, &request).await?;
+    let worker_id = http::pair_machine(hub_url, PAIR_WORKER_PATH, &request).await?;
     let mut toml = WorkerToml::load(config_dir)?;
     toml.hub_url = Some(http::base_url(hub_url));
     toml.worker_id = Some(worker_id);
@@ -152,7 +120,8 @@ pub struct WorkerHandle {
     worker_id: WorkerId,
     core: Arc<Core>,
     shutdown: watch::Sender<bool>,
-    tasks: Vec<tokio::task::JoinHandle<()>>,
+    task: tokio::task::JoinHandle<()>,
+    lock: std::fs::File,
 }
 
 impl std::fmt::Debug for WorkerHandle {
@@ -189,65 +158,24 @@ impl WorkerHandle {
         .unwrap_or(false)
     }
 
-    /// Stops the worker. Open sessions stay in `worker.db`, so the next run
-    /// resumes them.
-    ///
-    /// The stopping flag turns on first. A harness that exits from now on,
-    /// for example because the same signal reached it, does not make its
-    /// session lost.
+    /// Stops the worker. The processes go on, and the next run finds them.
     pub async fn shutdown(self) -> Result<(), WorkerError> {
-        self.core.stopping.send_replace(true);
-        self.core.cancel_all_sign_ins();
         let _ = self.shutdown.send(true);
-        let handles: Vec<_> = {
-            let mut sessions = match self.core.sessions.lock() {
-                Ok(s) => s,
-                Err(p) => p.into_inner(),
-            };
-            sessions.drain().map(|(_, h)| h).collect()
-        };
-        for handle in &handles {
-            let _ = handle.jobs.send(Job::Shutdown);
+        let mut task = self.task;
+        if tokio::time::timeout(Duration::from_secs(5), &mut task)
+            .await
+            .is_err()
+        {
+            task.abort();
         }
-        for handle in handles {
-            let mut task = handle.task;
-            if tokio::time::timeout(Duration::from_secs(10), &mut task)
-                .await
-                .is_err()
-            {
-                task.abort();
-            }
-        }
-        for task in self.tasks {
-            let mut task = task;
-            if tokio::time::timeout(Duration::from_secs(5), &mut task)
-                .await
-                .is_err()
-            {
-                task.abort();
-            }
-        }
-        // Everything has stopped, so the next worker may use the folder.
-        let lock = match self.core.lock.lock() {
-            Ok(mut l) => l.take(),
-            Err(p) => p.into_inner().take(),
-        };
-        drop(lock);
+        *self.core.exec.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        drop(self.lock);
         Ok(())
     }
 }
 
-/// Runs the worker with the adapters in this build. It connects to the
-/// hub and reconnects with jittered backoff until [`WorkerHandle::shutdown`].
+/// Runs the worker until [`WorkerHandle::shutdown`].
 pub async fn run(config: WorkerConfig) -> Result<WorkerHandle, WorkerError> {
-    run_with(config, default_harnesses()).await
-}
-
-/// Runs the worker with the given harness adapters. Tests pass a fake.
-pub async fn run_with(
-    config: WorkerConfig,
-    harnesses: Harnesses,
-) -> Result<WorkerHandle, WorkerError> {
     let dir = config.config_dir;
     let toml = WorkerToml::load(&dir)?;
     let (Some(hub_url), Some(worker_id)) = (toml.hub_url.clone(), toml.worker_id) else {
@@ -256,139 +184,53 @@ pub async fn run_with(
     if let Some(warning) = http::cleartext_warning(&hub_url) {
         tracing::warn!("{warning}");
     }
-    // The folder holds the key, the spool and the workspaces. An older build
-    // made it with the default mode.
     create_private_dir(&dir)
         .map_err(|e| WorkerError::io(format!("could not create {}", dir.display()), e))?;
-    // One worker per folder. A second worker would kill the first one's
-    // harness groups below, and both would write the same spool.
     let lock = lock_config_dir(&dir)?;
-    if toml.auto_discover.is_some() {
-        tracing::info!(
-            "worker.toml has `auto_discover`, which this build ignores: a worker no longer adds accounts by itself. Add accounts in Settings > Workers"
-        );
+    let identity = Identity::load(&dir.join(KEY_FILE))?;
+    let journal = Arc::new(Journal::open(&dir.join(DB_FILE))?);
+    let files = journal.prune(consort_proto::time::Timestamp::now())?;
+    for file in files {
+        let _ = std::fs::remove_file(file);
     }
-    let consort_home = match config.consort_home {
-        Some(home) => home,
-        None => profile::consort_home().ok_or_else(|| {
-            WorkerError::Config(format!(
-                "could not find the home folder; set {}",
-                profile::HOME_VAR
-            ))
-        })?,
-    };
-    create_private_dir(&consort_home)
-        .map_err(|e| WorkerError::io(format!("could not create {}", consort_home.display()), e))?;
-    let tools = tools::Tools::new(
-        consort_home.join(profile::TOOLS_DIR),
-        config.check_tool_updates,
-    )
-    .map_err(|e| WorkerError::Config(format!("could not open the managed tools: {e}")))?;
-    let detected_tags = tokio::task::spawn_blocking(tags::detected_tags)
-        .await
-        .unwrap_or_default();
-    let key_path = dir.join(KEY_FILE);
-    if !key_path.exists() {
-        return Err(WorkerError::NotPaired);
-    }
-    let identity = Identity::load(&key_path)?;
-    let store = Store::open(&dir.join(DB_FILE))?;
-    let _ = store.prune_commands(consort_proto::time::Timestamp::now());
-    // A worker that was killed can leave harness process groups behind on
-    // Unix. Kill the ones that it recorded before sessions resume.
-    #[cfg(unix)]
-    let store = tokio::task::spawn_blocking(move || {
-        crate::core::kill_stale_groups(&store);
-        store
-    })
-    .await
-    .map_err(|e| WorkerError::Config(format!("could not check old harness processes: {e}")))?;
-    // The stdio bridge is this program's `mcp-bridge` subcommand. Tests and
-    // embedders that run from another program set CONSORT_BRIDGE_PROGRAM.
-    let bridge_program = std::env::var_os("CONSORT_BRIDGE_PROGRAM")
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::current_exe().ok().filter(|p| {
-                p.file_stem()
-                    .and_then(|s| s.to_str())
-                    .is_some_and(|s| s.starts_with("consort"))
-            })
-        });
+    let processes = Arc::new(Processes::new(journal.clone(), dir.join(PROCESSES_DIR)));
+    processes.adopt().await?;
+    let limits = Arc::new(Limits::load(journal.clone())?);
+    let link = Link::new();
     let core = Arc::new(Core {
         config_dir: dir.clone(),
-        config: RwLock::new(toml),
         identity,
         worker_id,
         hub_url,
-        store,
-        link: Link::new(),
-        harnesses,
-        sessions: Mutex::new(Default::default()),
-        statuses: Mutex::new(Default::default()),
-        login_expired: Mutex::default(),
-        spool_notify: Notify::new(),
-        inventory_notify: Notify::new(),
-        last_inventory_hash: Mutex::new(None),
-        bridge_program,
-        inflight: Mutex::new(Default::default()),
-        stopping: watch::channel(false).0,
-        lock: Mutex::new(Some(lock)),
-        consort_home,
-        tools: Arc::new(tools),
-        sign_ins: Mutex::new(Default::default()),
-        browser_sign_in: tokio::sync::Mutex::new(()),
-        detected_tags,
+        link: link.clone(),
+        journal: journal.clone(),
+        exec: Mutex::new(None),
+        detected_tags: core::detected_tags(),
+        blob_cache: BlobCache::new(
+            &dir.join(CACHE_DIR)
+                .parent()
+                .map_or(dir.clone(), Path::to_path_buf),
+        ),
+        channel_copies: tokio::sync::Mutex::default(),
+        toml: toml.clone(),
+        limits: limits.clone(),
     });
-
-    // Resume the sessions that were open when the worker stopped.
-    crate::core::restore_sessions(&core)?;
-
-    let (shutdown, shutdown_rx) = watch::channel(false);
-    let tasks = vec![
-        tokio::spawn(link::maintain(
-            core.link.clone(),
-            core.clone(),
-            shutdown_rx.clone(),
-        )),
-        tokio::spawn(crate::core::spool_loop(core.clone(), shutdown_rx.clone())),
-        tokio::spawn(crate::core::inventory_loop(
-            core.clone(),
-            shutdown_rx.clone(),
-        )),
-        tokio::spawn(crate::accounts::tools_loop(core.clone(), shutdown_rx)),
-    ];
+    let exec = Arc::new(Exec::new(
+        journal,
+        processes,
+        limits,
+        toml.local_mcp_servers.clone(),
+        PathRules::native(),
+        Arc::new(CoreHub(Arc::downgrade(&core))),
+    ));
+    *core.exec.lock().unwrap_or_else(|e| e.into_inner()) = Some(exec);
+    let (shutdown, rx) = watch::channel(false);
+    let task = tokio::spawn(consort_link::link::maintain(link, core.clone(), rx));
     Ok(WorkerHandle {
         worker_id,
         core,
         shutdown,
-        tasks,
+        task,
+        lock,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn one_worker_per_config_folder() {
-        let dir = tempfile::tempdir().unwrap();
-        let first = lock_config_dir(dir.path()).unwrap();
-        let second = lock_config_dir(dir.path());
-        assert!(
-            matches!(&second, Err(WorkerError::AlreadyRunning(_))),
-            "{second:?}"
-        );
-        assert!(second.unwrap_err().to_string().contains("--config-dir"));
-        // The lock ends with the worker. A process that another test forks
-        // holds the open file until its `exec` closes it (the file is
-        // close-on-exec), so try a few times.
-        drop(first);
-        let again = (0..50).find_map(|_| {
-            lock_config_dir(dir.path()).ok().or_else(|| {
-                std::thread::sleep(std::time::Duration::from_millis(20));
-                None
-            })
-        });
-        assert!(again.is_some());
-    }
 }

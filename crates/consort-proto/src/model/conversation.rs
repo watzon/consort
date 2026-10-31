@@ -2,8 +2,11 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::access::AccessGrant;
 use super::common::{BlobRef, ModelSelection};
+use super::fallback::CoordinatorFallback;
 use super::knowledge::MemoryScope;
+use super::monid::MonidChannelAccess;
 use super::proactivity::{ProactiveMark, ProactiveTasks, ProactivityLevel, Suggestion};
 use super::work::{ApprovalMode, Isolation};
 use crate::ids::{
@@ -108,6 +111,52 @@ pub struct Channel {
     /// draft mode.
     #[serde(default)]
     pub proactive_tasks: ProactiveTasks,
+    /// Set while the assistant of this channel runs on a fallback of the
+    /// path. The hub clears it when the assistant goes back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coordinator_fallback: Option<Box<CoordinatorFallback>>,
+    /// Set while the assistant of this channel cannot answer a message that
+    /// waits. It is live state, not a message: the hub clears it when a turn
+    /// goes out, and at every start of the hub.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coordinator_blocked: Option<Box<CoordinatorBlocked>>,
+    /// What this channel may do with Monid.
+    #[serde(default, skip_serializing_if = "is_default_monid")]
+    pub monid: MonidChannelAccess,
+    /// Temporary access that the user gave to this channel or its tasks.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub access_grants: Vec<AccessGrant>,
+}
+
+fn is_default_monid(access: &MonidChannelAccess) -> bool {
+    *access == MonidChannelAccess::default()
+}
+
+/// Why the assistant of a channel cannot answer now. The app shows it as a
+/// status line above the composer, only while a message of the user waits.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CoordinatorBlocked {
+    /// The kind of cause.
+    pub kind: CoordinatorBlockedKind,
+    /// A full sentence that says what is wrong.
+    pub reason: String,
+    /// The name of the account that is signed out. It is set only for
+    /// `signed_out`, when the assistant waits for a sign-in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+}
+
+/// The cause of a [`CoordinatorBlocked`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoordinatorBlockedKind {
+    /// Placement finds no worker or account for the assistant.
+    NoPlacement,
+    /// The account of the assistant is signed out.
+    SignedOut,
+    /// A session or a turn of the assistant did not start. The hub tries
+    /// again.
+    StartFailed,
 }
 
 impl Channel {
@@ -208,6 +257,11 @@ pub enum TurnErrorKind {
     RateLimit,
     /// The sign-in of the account expired, or the account is signed out.
     ExpiredSignIn,
+    /// The provider is down or overloaded: a 5xx error, an overloaded
+    /// error, or a connection that the provider closed. The harness says so
+    /// in structured data or in a known text. After three failed tries, the
+    /// fallback path moves the work.
+    ProviderOutage,
     /// The worker restarted during the turn.
     WorkerRestarted,
     /// Anything else. Also what a kind from a newer peer reads as.
@@ -222,6 +276,7 @@ impl TurnErrorKind {
         match self {
             Self::RateLimit => "rate_limit",
             Self::ExpiredSignIn => "expired_sign_in",
+            Self::ProviderOutage => "provider_outage",
             Self::WorkerRestarted => "worker_restarted",
             Self::Unknown => "unknown",
         }
@@ -233,6 +288,7 @@ impl TurnErrorKind {
         match name {
             "rate_limit" => Self::RateLimit,
             "expired_sign_in" => Self::ExpiredSignIn,
+            "provider_outage" => Self::ProviderOutage,
             "worker_restarted" => Self::WorkerRestarted,
             _ => Self::Unknown,
         }

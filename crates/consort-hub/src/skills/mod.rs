@@ -43,8 +43,8 @@ use consort_proto::model::{
     SKILL_MANIFEST_FILE, SKILL_READ_MAX_BYTES, Sha256Hash, Skill, SkillAudit, SkillBundle,
     SkillContextEntry, SkillFileInfo, SkillSource, SkillUpdateState, UseIn,
 };
+use consort_proto::session_host_link::SkillBundleGet;
 use consort_proto::tools::{ListSkillsResult, ReadSkillArgs, ReadSkillResult};
-use consort_proto::worker_link::SkillBundleGet;
 use serde_json::Value;
 
 use crate::error::{HubError, Result};
@@ -54,8 +54,9 @@ use package::{Prepared, is_script};
 
 /// The harnesses that load skills from a folder themselves (see the
 /// delivery list in docs/CONNECTORS-SKILLS-PLAN.md). Every other harness
-/// gets `list_skills` and `read_skill`.
-const NATIVE_SKILL_HARNESSES: &[&str] = &["claude", "codex", "gemini", "opencode"];
+/// gets `list_skills` and `read_skill`. Claude Code runs on the hub with no
+/// native tools, so its `Skill` tool is off and it gets those two tools.
+const NATIVE_SKILL_HARNESSES: &[&str] = &["codex", "gemini", "opencode"];
 
 /// Whether a harness loads skills itself. `harness` is the account's
 /// harness name, such as `claude` or `acp`.
@@ -684,7 +685,7 @@ mod tests {
 
     #[test]
     fn only_some_harnesses_load_skills() {
-        assert!(harness_loads_skills("claude"));
+        assert!(!harness_loads_skills("claude"));
         assert!(harness_loads_skills("codex"));
         assert!(!harness_loads_skills("acp"));
         assert!(!harness_loads_skills("fake"));

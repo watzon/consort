@@ -56,6 +56,12 @@ pub enum ErrorCode {
     ComposioNotConfigured,
     /// Composio refused a request or did not answer. The message says why.
     ComposioError,
+    /// The hub has no Monid key. The user adds one in Settings > Connectors.
+    MonidNotConfigured,
+    /// Monid refuses the key.
+    MonidKeyRefused,
+    /// Monid refused a request or did not answer. The message says why.
+    MonidError,
     /// The action needs the user first, for example a connection that needs
     /// a new sign-in. The message says what the user must do.
     NeedsUser,
@@ -72,7 +78,7 @@ pub enum ErrorCode {
 
 impl ErrorCode {
     /// Every known code, in the order of protocol.md.
-    pub const ALL: [ErrorCode; 22] = [
+    pub const ALL: [ErrorCode; 25] = [
         Self::Unauthorized,
         Self::ProtocolMismatch,
         Self::Invalid,
@@ -92,6 +98,9 @@ impl ErrorCode {
         Self::ConnectorNotAvailable,
         Self::ComposioNotConfigured,
         Self::ComposioError,
+        Self::MonidNotConfigured,
+        Self::MonidKeyRefused,
+        Self::MonidError,
         Self::NeedsUser,
         Self::SkillBlocked,
         Self::SkillInvalid,
@@ -119,6 +128,9 @@ impl ErrorCode {
             Self::ConnectorNotAvailable => "connector_not_available",
             Self::ComposioNotConfigured => "composio_not_configured",
             Self::ComposioError => "composio_error",
+            Self::MonidNotConfigured => "monid_not_configured",
+            Self::MonidKeyRefused => "monid_key_refused",
+            Self::MonidError => "monid_error",
             Self::NeedsUser => "needs_user",
             Self::SkillBlocked => "skill_blocked",
             Self::SkillInvalid => "skill_invalid",
@@ -134,8 +146,15 @@ impl ErrorCode {
             Self::NotFound | Self::WorkerUnknown | Self::ConnectorNotAvailable => 404,
             Self::StaleWrite | Self::Conflict | Self::ResyncRequired | Self::NeedsUser => 409,
             Self::PolicyDenied | Self::SkillBlocked => 403,
-            Self::WorkerOffline | Self::NoMatchingAccount | Self::ComposioNotConfigured => 503,
-            Self::SignInFailed | Self::ToolInstallFailed | Self::ComposioError => 502,
+            Self::WorkerOffline
+            | Self::NoMatchingAccount
+            | Self::ComposioNotConfigured
+            | Self::MonidNotConfigured => 503,
+            Self::SignInFailed
+            | Self::ToolInstallFailed
+            | Self::ComposioError
+            | Self::MonidKeyRefused
+            | Self::MonidError => 502,
             Self::Unsupported => 501,
             Self::Internal | Self::Unknown => 500,
         }

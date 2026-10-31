@@ -104,7 +104,7 @@ impl ConsortApp {
                             this.set_row_hover(&hover_key, *on, cx)
                         }))
                         .child(text(group.name.clone(), sb.label_text, c.text_tertiary))
-                        .child(div().flex_1().child(icon(
+                        .child(div().flex_1().min_w_0().child(icon(
                             if collapsed {
                                 "chevron-right"
                             } else {
@@ -182,7 +182,11 @@ impl ConsortApp {
             .border_color(c.border_subtle)
             .child(
                 group_label(t)
-                    .child(text("Workers", sb.label_text, c.text_tertiary).flex_1())
+                    .child(
+                        text("Workers", sb.label_text, c.text_tertiary)
+                            .flex_1()
+                            .min_w_0(),
+                    )
                     .child(text(
                         // The hub is down, so nobody knows which worker is
                         // online.
@@ -231,7 +235,11 @@ impl ConsortApp {
                                 .child(state.user.initials.clone()),
                         ),
                 )
-                .child(text(state.user.name.clone(), sb.row_text, c.text_primary).flex_1())
+                .child(
+                    text(state.user.name.clone(), sb.row_text, c.text_primary)
+                        .flex_1()
+                        .min_w_0(),
+                )
                 .child(
                     crate::ui::parts::icon_button(
                         "open-settings",
@@ -288,11 +296,13 @@ impl ConsortApp {
                 div()
                     .id("channels")
                     .flex_1()
+                    .min_w_0()
                     .min_h_0()
                     .overflow_y_scroll()
                     .child(groups),
             )
             .child(workers)
+            .children(self.sign_in_notices(t, cx))
             .children(self.update_notice(t, cx))
             .child(account)
             .into_any_element()
@@ -344,7 +354,11 @@ impl ConsortApp {
                 row(t)
                     .id(SharedString::from(format!("archived-{}", channel.id)))
                     .child(icon(&channel.icon, sb.row_icon, c.text_tertiary))
-                    .child(line(channel.name.clone(), sb.row_text, c.text_tertiary).flex_1())
+                    .child(
+                        line(channel.name.clone(), sb.row_text, c.text_tertiary)
+                            .flex_1()
+                            .min_w_0(),
+                    )
                     .child(
                         button(
                             SharedString::from(format!("unarchive-{}", channel.id)),
@@ -425,6 +439,7 @@ impl ConsortApp {
         .child(
             line(channel.name.clone(), sb.row_text, name_color)
                 .flex_1()
+                .min_w_0()
                 .when(is_selected, |d| d.font_weight(t.text.ui_strong.weight)),
         )
         .when(channel.unread > 0 && channel.status.is_none(), |d| {
@@ -509,7 +524,8 @@ impl ConsortApp {
                     c.text_tertiary
                 },
             )
-            .flex_1(),
+            .flex_1()
+            .min_w_0(),
         )
         .child(
             text(

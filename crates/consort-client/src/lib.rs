@@ -7,13 +7,16 @@
 //! any executor, so GPUI can await them on its foreground executor. Public
 //! types are plain records and enums, so UniFFI can export them.
 
+pub mod access;
 pub mod activity;
 pub mod admin;
 pub mod approval_text;
+pub mod assistant_status;
 pub mod blob;
 pub mod cache;
 pub mod chat;
 pub mod command;
+pub mod command_check;
 pub mod connectors;
 pub mod convo;
 pub mod derive;
@@ -21,6 +24,7 @@ pub mod document;
 pub mod drafts;
 pub mod error;
 pub mod extensions_view;
+pub mod fallback;
 pub mod files;
 pub mod format;
 pub mod hub;
@@ -33,10 +37,12 @@ mod mock_backend_ext;
 pub mod mock_convo;
 pub mod mock_extensions;
 pub mod mock_files;
+pub mod mock_monid;
 pub mod mock_offline;
 pub mod mock_proactivity;
 pub mod mock_routines;
 pub mod mock_voice;
+pub mod monid;
 pub mod notify;
 pub mod offline;
 pub mod persist;
@@ -61,14 +67,31 @@ use std::sync::Arc;
 
 use tokio::sync::{mpsc, oneshot, watch};
 
+pub use assistant_status::AssistantStatusView;
 pub use command::{
     AcpSpec, AttachInput, ChannelChanges, Command, CommandOutput, ConnectionChanges, NewAccount,
     NewChannel, NewConnection, PastedBytes, SecretEnv, SecretText, SkillChanges,
 };
+pub use command_check::{
+    BoundaryView, CONFIDENCE_LIMITS, CheckDetailView, CheckEndpointChoice, CheckSourceKind,
+    CommandCheckChoice, CommandCheckView, EndpointView, TestResultView,
+};
 pub use connectors::*;
+pub use consort_proto::model::DEFAULT_CONFIDENCE_LIMIT;
+pub use consort_proto::session_host_link::MONID_PROMPT_BLOCK;
 pub use drafts::{DraftOutcomeView, ShownDraftView, draft_title};
 pub use error::ClientError;
+pub use fallback::{
+    ChannelFallbackView, FALLBACK_STEPS_MAX, FallbackCauseView, FallbackNoticeKind,
+    FallbackNoticeView, FallbackPathView, FallbackScopeView, FallbackStepView, PathLineView,
+    PathOutcomeView, StepSkip,
+};
 pub use files::{AttachmentView, ChannelFileView, FilesListing};
+pub use monid::{
+    MonidAccessView, MonidCallDetailView, MonidCallRowView, MonidCallStateView, MonidCardView,
+    MonidLimitsView, MonidSettingsView, MonidToolView, MonidUnattendedView, MonidView,
+    find_call_row, money_text,
+};
 pub use skills::*;
 pub use store::Drafts;
 pub use turn_errors::{ErrorAction, ErrorCardView, TryAgainTarget, TurnErrorKindView, TurnFailed};
@@ -599,6 +622,24 @@ impl Client {
         self.run(Command::SetWorkerTags { worker_id, tags }).await
     }
 
+    /// Changes the limits of a worker. A `None` keeps its value. It fails when
+    /// the worker is offline.
+    pub async fn set_worker_policy(
+        &self,
+        worker_id: String,
+        max_approval_mode: Option<ApprovalMode>,
+        allowed_roots: Option<Vec<String>>,
+        allow_shell: Option<bool>,
+    ) -> Result<(), ClientError> {
+        self.run(Command::SetWorkerPolicy {
+            worker_id,
+            max_approval_mode,
+            allowed_roots,
+            allow_shell,
+        })
+        .await
+    }
+
     /// Stars a model in the model picker, or takes the star away. The hub
     /// keeps the favorites, so every client shows them.
     pub async fn set_favorite_model(
@@ -615,9 +656,50 @@ impl Client {
         .await
     }
 
-    /// Allows work to move to another account at a usage limit, or stops it.
-    pub async fn set_account_fallback(&self, enabled: bool) -> Result<(), ClientError> {
-        self.run(Command::SetAccountFallback { enabled }).await
+    /// Replaces the source of the command check.
+    pub async fn set_command_check(&self, choice: CommandCheckChoice) -> Result<(), ClientError> {
+        self.run(Command::SetCommandCheck { choice }).await
+    }
+
+    /// Adds an API endpoint, or changes one.
+    pub async fn save_endpoint(
+        &self,
+        id: Option<String>,
+        name: String,
+        base_url: String,
+        api_key: Option<String>,
+    ) -> Result<(), ClientError> {
+        self.run(Command::SaveEndpoint {
+            id,
+            name,
+            base_url,
+            api_key,
+        })
+        .await
+    }
+
+    /// Removes an API endpoint.
+    pub async fn remove_endpoint(&self, id: String) -> Result<(), ClientError> {
+        self.run(Command::RemoveEndpoint { id }).await
+    }
+
+    /// Replaces the fallback path: the built-in row and the steps, in
+    /// order.
+    pub async fn set_fallback_path(
+        &self,
+        other_accounts: bool,
+        steps: Vec<SelectionView>,
+    ) -> Result<(), ClientError> {
+        self.run(Command::SetFallbackPath {
+            other_accounts,
+            steps,
+        })
+        .await
+    }
+
+    /// Takes the assistant of a channel back to its first choice now.
+    pub async fn go_back(&self, channel_id: String) -> Result<(), ClientError> {
+        self.run(Command::GoBack { channel_id }).await
     }
 
     /// Makes an account on a worker and returns its ID.
@@ -625,7 +707,7 @@ impl Client {
         match self.run_for(Command::CreateAccount(account)).await? {
             CommandOutput::AccountCreated(id) => Ok(id),
             _ => Err(ClientError::Other(
-                "The hub did not say which account it made. Open Settings > Workers to find it"
+                "The hub did not say which account it made. Open Settings > Providers to find it"
                     .into(),
             )),
         }

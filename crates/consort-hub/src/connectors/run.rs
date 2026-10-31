@@ -178,14 +178,18 @@ impl Hub {
     /// ID. Returns it with its Composio account.
     async fn connection_in_set(&self, ctx: &ToolCtx, key: &str) -> Result<(Connection, String)> {
         let channel = ctx.channel.clone();
+        let task_id = ctx.task.as_ref().map(|t| t.id);
         let key = key.trim().to_owned();
         let wanted = key.clone();
-        let (set, row) = self
+        let (set, row, other) = self
             .store
             .read(move |conn| {
                 // Read the channel again: its exceptions may have changed.
                 let channel = crate::store::conversation::channel_or_404(conn, channel.id)?;
-                let set = con_store::effective_connections(conn, &channel)?;
+                let set = con_store::effective_connections_for(conn, &channel, task_id)?;
+                let other = con_store::requestable_connections(conn, &channel, task_id)?
+                    .into_iter()
+                    .find(|c| c.handle.eq_ignore_ascii_case(&wanted) || c.id.to_string() == wanted);
                 let found = set
                     .iter()
                     .find(|c| c.handle.eq_ignore_ascii_case(&wanted) || c.id.to_string() == wanted)
@@ -194,9 +198,18 @@ impl Hub {
                     .map(|id| con_store::connection_row(conn, id))
                     .transpose()?
                     .flatten();
-                Ok((set, row))
+                Ok((set, row, other))
             })
             .await?;
+        if let Some(other) = other {
+            return Err(HubError::new(
+                ErrorCode::ConnectorNotAvailable,
+                format!(
+                    "This channel does not have {}. Call request_access with connection {} to ask the user for it.",
+                    other.name, other.handle
+                ),
+            ));
+        }
         let Some(row) = row else {
             let names: Vec<&str> = set.iter().map(|c| c.handle.as_str()).collect();
             let message = if names.is_empty() {
@@ -742,13 +755,16 @@ impl Hub {
         };
         // The scope may have changed while the card waited.
         let channel_id = approval.channel_id;
+        let approval_task = approval.task_id;
         let still_in_set = self
             .store
             .read(move |conn| {
                 let channel = crate::store::conversation::channel_or_404(conn, channel_id)?;
-                Ok(con_store::effective_connections(conn, &channel)?
-                    .iter()
-                    .any(|c| c.id == id))
+                Ok(
+                    con_store::effective_connections_for(conn, &channel, approval_task)?
+                        .iter()
+                        .any(|c| c.id == id),
+                )
             })
             .await?;
         let account = row
@@ -825,17 +841,6 @@ impl Hub {
                 err.to_error_body().message
             ),
         })
-    }
-
-    /// Whether the session's channel can use at least one connection.
-    pub(crate) async fn channel_has_connections(&self, ctx: &ToolCtx) -> Result<bool> {
-        let channel_id = ctx.channel.id;
-        self.store
-            .read(move |conn| {
-                let channel = crate::store::conversation::channel_or_404(conn, channel_id)?;
-                Ok(!con_store::effective_connections(conn, &channel)?.is_empty())
-            })
-            .await
     }
 }
 

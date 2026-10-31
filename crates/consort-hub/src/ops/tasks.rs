@@ -1,25 +1,28 @@
 //! Tasks: creation, placement, and the client API handlers.
 
 use consort_proto::client_api::*;
+use consort_proto::execution_link::{ExecWorkspaceRelease, HubToExecution};
 use consort_proto::frame::Empty;
 use consort_proto::ids::SessionId;
 use consort_proto::ids::TaskId;
+use consort_proto::ids::WorkerId;
 use consort_proto::model::{
     Author, Channel, MessageKind, Repo, Session, SessionRole, SessionState, Task, Usage,
     ValidationError,
 };
 use consort_proto::model::{Isolation, ModelSelection};
+use consort_proto::session_host_link::{
+    HubToSessionHost, InventoryRefresh, ItemDetail, ItemDetailResult, SessionExecution,
+    SessionInterrupt, SessionStart, TurnInput, WorkspaceRelease, WorkspaceRepo, WorkspaceSpec,
+};
 use consort_proto::status::{Actor, TaskStatus};
 use consort_proto::time::Timestamp;
-use consort_proto::worker_link::{
-    HubToWorker, InventoryRefresh, ItemDetail, ItemDetailResult, SessionInterrupt, SessionStart,
-    TurnInput, WorkspaceRelease, WorkspaceRepo, WorkspaceSpec,
-};
 
 use super::flow::transition;
 use super::hooks::NewTask;
 use super::model_switch::check_selection_for_started_task;
 use crate::error::{HubError, Result};
+use crate::fallback;
 use crate::hub::{Caller, Hub};
 use crate::limits::{BRIEF_MAX_BYTES, check_text};
 use crate::link::events::{Ctx, Effects, end_session_by_hub, mark_lost_in_tx, queue_stop};
@@ -85,6 +88,8 @@ impl Hub {
                     review_summary: None,
                     resolved_at: None,
                     session_ended: false,
+                    monid_calls: 0,
+                    monid_cost_micros: 0,
                     archived_at: None,
                     created_at: now,
                     updated_at: now,
@@ -131,11 +136,14 @@ impl Hub {
                 let open = work::open_session_counts(conn)?;
                 let repos = conversation::repos(conn)?;
                 let tutti = conversation::tutti_channel(conn)?;
-                let limited = machine::limited_accounts(conn, Timestamp::now())?;
-                Ok(Some((task, channel, workers, open, repos, tutti, limited)))
+                let holds = machine::account_holds(conn, Timestamp::now())?;
+                let path = crate::store::preferences::preferences(conn)?.fallback_path;
+                Ok(Some((
+                    task, channel, workers, open, repos, tutti, holds, path,
+                )))
             })
             .await?;
-        let Some((task, channel, workers, open, all_repos, tutti, limited)) = inputs else {
+        let Some((task, channel, workers, open, all_repos, tutti, holds, path)) = inputs else {
             return Ok(());
         };
 
@@ -163,11 +171,26 @@ impl Hub {
             .task_selection
             .clone()
             .or_else(|| channel.effective_coordinator_selection(&tutti).cloned());
+        // A first choice that is held (a limit or an outage) gives way to the
+        // fallback path before placement runs.
+        let by_label = fallback::holds_by_label(&workers, &holds);
+        let walk = fallback::Walk {
+            path: &path,
+            workers: &workers,
+            holds: &by_label,
+            mode: task.approval_mode,
+        };
+        let chosen_start = chosen
+            .as_ref()
+            .map(|selection| fallback::choose_start(&walk, Some(selection)));
+        let inherited_start = inherited
+            .as_ref()
+            .map(|selection| fallback::choose_start(&walk, Some(selection)));
+        let default_start = fallback::choose_start(&walk, None);
         let input = PlacementInput {
             subject: Subject::Task,
             workers: &workers,
             open_sessions: &open,
-            limited: &limited,
             selection: None,
             request: &task.placement,
             approval_mode: task.approval_mode,
@@ -182,15 +205,27 @@ impl Hub {
                 ..input
             })
         };
-        let placed = match (&chosen, &inherited) {
-            (Some(selection), _) => on(selection),
-            (None, Some(selection)) => on(selection).or_else(|_| place(&input)),
-            (None, None) => place(&input),
+        let default_placed = || match &default_start.selection {
+            Some(selection) => on(selection),
+            None => place(&input),
+        };
+        let (placed, moved) = match (&chosen_start, &inherited_start) {
+            (Some(start), _) => (
+                start.selection.as_ref().map_or_else(|| place(&input), on),
+                start.moved.clone(),
+            ),
+            (None, Some(start)) => match start.selection.as_ref().map(on) {
+                Some(Ok(placement)) => (Ok(placement), start.moved.clone()),
+                _ => (default_placed(), default_start.moved.clone()),
+            },
+            (None, None) => (default_placed(), default_start.moved.clone()),
         };
         match placed {
             Ok(placement) => {
-                self.start_task_session(task, channel, placement, &repos, isolation)
-                    .await
+                self.start_task_session(
+                    task, channel, placement, &repos, isolation, moved, &workers,
+                )
+                .await
             }
             Err(PlacementError::Wait(reason)) => {
                 self.store
@@ -232,6 +267,7 @@ impl Hub {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn start_task_session(
         &self,
         task: Task,
@@ -239,8 +275,14 @@ impl Hub {
         placement: Placement,
         repos: &[Repo],
         isolation: Isolation,
+        moved: Option<fallback::Moved>,
+        workers: &[consort_proto::model::Worker],
     ) -> Result<()> {
-        let worker_id = placement.worker_id;
+        // The CLI runs on the session host, and the tools on the worker.
+        let worker_id = placement.session_host_id;
+        let execution_worker_id = placement.worker_id;
+        let execution_worker_name = placement.worker_name.clone();
+        let fallback_workers = workers.to_vec();
         let task_id = task.id;
         let channel_id = channel.id;
         let workspace_repos: Vec<WorkspaceRepo> = placement
@@ -293,6 +335,7 @@ impl Hub {
                     channel_id,
                     task_id: Some(task_id),
                     worker_id,
+                    execution_worker_id: Some(execution_worker_id),
                     account_id: placement.account_id,
                     harness: placement.harness.clone(),
                     model: placement.model.clone(),
@@ -321,7 +364,7 @@ impl Hub {
                 )?;
                 tx.queue_command(
                     worker_id,
-                    &HubToWorker::SessionStart(SessionStart {
+                    &HubToSessionHost::SessionStart(SessionStart {
                         session_id: session.id,
                         role: SessionRole::Task,
                         channel_id,
@@ -341,6 +384,10 @@ impl Hub {
                             attachments,
                         }),
                         turn_approval_mode: None,
+                        execution: Some(SessionExecution {
+                            worker_id: execution_worker_id,
+                            worker_name: execution_worker_name.clone(),
+                        }),
                     }),
                 )?;
                 transition(
@@ -353,7 +400,7 @@ impl Hub {
                 )?;
                 task.current_session_id = Some(session.id);
                 task.session_ended = false;
-                task.worker_id = Some(worker_id);
+                task.worker_id = Some(execution_worker_id);
                 // The task stays on this account and model until the user
                 // changes it, also when the channel changes later.
                 task.model_selection = Some(ModelSelection {
@@ -362,6 +409,33 @@ impl Hub {
                     options: session.options.clone(),
                 });
                 tx.save_task(&task)?;
+                if let Some(moved) = &moved {
+                    let (text, notice) = fallback::moved_notice(
+                        consort_proto::model::FallbackScope::Task,
+                        &fallback_workers,
+                        moved,
+                    );
+                    crate::fallback_flow::post_fallback_notice(
+                        tx,
+                        channel_id,
+                        Some(task.card_message_id),
+                        Some(task_id),
+                        "account_fallback",
+                        &text,
+                        &notice,
+                    )?;
+                    for (text, notice) in fallback::signed_out_notices(&moved.lines) {
+                        crate::fallback_flow::post_fallback_notice(
+                            tx,
+                            channel_id,
+                            Some(task.card_message_id),
+                            Some(task_id),
+                            "fallback_signed_out",
+                            &text,
+                            &notice,
+                        )?;
+                    }
+                }
                 Ok(true)
             })
             .await?;
@@ -693,7 +767,7 @@ impl Hub {
         let session = session.ok_or_else(|| HubError::conflict("The task has no session."))?;
         self.worker_rpc(
             session.worker_id,
-            HubToWorker::SessionInterrupt(SessionInterrupt {
+            HubToSessionHost::SessionInterrupt(SessionInterrupt {
                 session_id: session.id,
             }),
         )
@@ -785,7 +859,7 @@ impl Hub {
         let value = self
             .worker_rpc(
                 session.worker_id,
-                HubToWorker::ItemDetail(ItemDetail {
+                HubToSessionHost::ItemDetail(ItemDetail {
                     session_id: request.session_id,
                     item_id: request.item_id,
                 }),
@@ -882,7 +956,7 @@ impl Hub {
     ) -> Result<()> {
         self.worker_rpc(
             worker_id,
-            HubToWorker::InventoryRefresh(InventoryRefresh {}),
+            HubToSessionHost::InventoryRefresh(InventoryRefresh {}),
         )
         .await?;
         Ok(())
@@ -941,28 +1015,49 @@ pub(crate) fn release_task(
             queue_stop(hub, tx, &mut fx, &ended, reason)?;
         }
     }
-    // The newest session on each worker, newest first.
-    let mut newest: Vec<&Session> = Vec::new();
+    // Each worker that the task used keeps a workspace.
+    let mut workers: Vec<WorkerId> = Vec::new();
     for session in sessions.iter().rev() {
-        if !newest.iter().any(|s| s.worker_id == session.worker_id) {
-            newest.push(session);
+        if let Some(worker) = session.execution_worker_id
+            && !workers.contains(&worker)
+        {
+            workers.push(worker);
         }
     }
-    for session in newest {
-        let removed =
-            machine::worker(tx.db(), session.worker_id)?.is_none_or(|w| w.revoked_at.is_some());
+    for worker in workers {
+        let removed = machine::worker(tx.db(), worker)?.is_none_or(|w| w.revoked_at.is_some());
         if removed {
             continue;
         }
-        tx.queue_command_keyed(
-            session.worker_id,
-            Some(session.id),
-            &HubToWorker::WorkspaceRelease(WorkspaceRelease {
+        tx.queue_exec_command(
+            worker,
+            &HubToExecution::WorkspaceRelease(ExecWorkspaceRelease {
+                key: task.id.to_string(),
+                delete: true,
+            }),
+        )?;
+        fx.pump.push(worker);
+    }
+    // The session host keeps a folder for the harness of the task.
+    let mut hosts: Vec<WorkerId> = Vec::new();
+    for session in &sessions {
+        if !hosts.contains(&session.worker_id) {
+            hosts.push(session.worker_id);
+        }
+    }
+    for host in hosts {
+        let removed = machine::worker(tx.db(), host)?.is_none_or(|w| w.revoked_at.is_some());
+        if removed {
+            continue;
+        }
+        tx.queue_command(
+            host,
+            &HubToSessionHost::WorkspaceRelease(WorkspaceRelease {
                 task_id: task.id,
                 delete: true,
             }),
         )?;
-        fx.pump.push(session.worker_id);
+        fx.pump.push(host);
     }
     Ok(fx)
 }
@@ -1073,6 +1168,8 @@ mod tests {
                     request_id: "req-1".into(),
                     summary: "Run tests".to_owned(),
                     details: ApprovalDetails::Command {
+                        blocked: Vec::new(),
+                        check_note: None,
                         command: "cargo test".to_owned(),
                         cwd: None,
                     },

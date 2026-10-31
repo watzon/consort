@@ -67,6 +67,9 @@ pub struct ProcessSpec {
     pub args: Vec<String>,
     /// Extra environment variables.
     pub env: BTreeMap<String, String>,
+    /// Start with no variables from this process. A CLI inside the boundary
+    /// gets only `env`.
+    pub env_clear: bool,
     /// Environment variables to remove.
     pub env_remove: Vec<String>,
     /// The working folder.
@@ -93,6 +96,8 @@ pub struct HarnessProcess {
     stderr_tail: Arc<Mutex<String>>,
     /// The watcher and the process group that it knows about.
     group: Option<(WatcherHandle, u32)>,
+    /// What must live as long as the process, such as its boundary.
+    held: Option<Box<dyn std::any::Any + Send + Sync>>,
 }
 
 impl std::fmt::Debug for HarnessProcess {
@@ -118,6 +123,9 @@ fn build_command(spec: &ProcessSpec) -> tokio::process::Command {
         tokio::process::Command::new(&spec.program)
     };
     cmd.args(&spec.args);
+    if spec.env_clear {
+        cmd.env_clear();
+    }
     for key in &spec.env_remove {
         cmd.env_remove(key);
     }
@@ -193,10 +201,16 @@ pub fn spawn(spec: &ProcessSpec) -> Result<HarnessProcess, HarnessError> {
         stdout,
         stderr_tail,
         group,
+        held: None,
     })
 }
 
 impl HarnessProcess {
+    /// Keeps `value` for as long as this process value lives.
+    pub fn hold(&mut self, value: Box<dyn std::any::Any + Send + Sync>) {
+        self.held = Some(value);
+    }
+
     /// Takes the child's stdin.
     pub fn take_stdin(&mut self) -> Option<ChildStdin> {
         self.stdin.take()
@@ -296,6 +310,7 @@ pub async fn run_capture(
     timeout: Duration,
 ) -> Result<String, HarnessError> {
     let spec = ProcessSpec {
+        env_clear: false,
         program: program.to_path_buf(),
         args: args.iter().map(|s| (*s).to_owned()).collect(),
         env: env.clone(),

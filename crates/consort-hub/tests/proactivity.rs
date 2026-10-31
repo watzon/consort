@@ -20,8 +20,8 @@ use consort_proto::model::{
     ProactiveOutcome, ProactiveRating, ProactivityLevel, QuietHours, RoutineKind, SessionState,
     SnoozeChoice, SuggestionAction,
 };
+use consort_proto::session_host_link::TurnEndReason;
 use consort_proto::time::Timestamp;
-use consort_proto::worker_link::TurnEndReason;
 use serde_json::json;
 
 use consort_proto::frame::MessageFamily;
@@ -218,7 +218,7 @@ async fn a_proactive_turn_drops_its_text_and_marks_its_posts() {
     let next = due.plus_millis(6 * HOUR + 10 * MINUTE);
     world.hub.handle.run_routines_at(next).await;
     let (_, command) = world.worker.next_command().await;
-    let consort_proto::worker_link::HubToWorker::SessionTurn(turn) = command else {
+    let consort_proto::session_host_link::HubToSessionHost::SessionTurn(turn) = command else {
         panic!("a turn in the same session");
     };
     assert!(turn.turn.text.contains("<check_in"));
@@ -341,7 +341,7 @@ async fn a_new_channel_gets_the_guided_start_with_quick_replies() {
     // The user taps Yes: a normal turn, so its posts carry no mark.
     world.say(channel.id, "Yes").await;
     let (_, command) = world.worker.next_command().await;
-    let consort_proto::worker_link::HubToWorker::SessionTurn(turn) = command else {
+    let consort_proto::session_host_link::HubToSessionHost::SessionTurn(turn) = command else {
         panic!("a turn");
     };
     assert!(turn.turn.text.contains("<user_message"));
@@ -462,7 +462,7 @@ async fn too_noisy_wakes_the_coordinator_with_the_rated_message() {
         .await
         .unwrap();
     let (_, command) = world.worker.next_command().await;
-    let consort_proto::worker_link::HubToWorker::SessionTurn(turn) = command else {
+    let consort_proto::session_host_link::HubToSessionHost::SessionTurn(turn) = command else {
         panic!("a turn");
     };
     assert!(
@@ -680,7 +680,7 @@ async fn a_stale_task_wakes_its_coordinator_once() {
     let noon = Timestamp::parse_rfc3339(&format!("{day}T12:00:00Z")).unwrap();
     world.hub.handle.nudge_stale_tasks_at(noon).await.unwrap();
     let (_, command) = world.worker.next_command().await;
-    let consort_proto::worker_link::HubToWorker::SessionTurn(nudge) = command else {
+    let consort_proto::session_host_link::HubToSessionHost::SessionTurn(nudge) = command else {
         panic!("the nudge turn");
     };
     assert!(

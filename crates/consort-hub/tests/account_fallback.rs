@@ -9,13 +9,13 @@
 use std::time::Duration;
 
 use crate::common::*;
-use consort_proto::client_api::{ChannelUpdate, PreferencesSetAccountFallback};
+use consort_proto::client_api::{ChannelUpdate, PreferencesSetFallbackPath};
 use consort_proto::ids::{AccountId, SessionId, TaskId};
-use consort_proto::model::{ModelSelection, SessionState, TurnErrorKind};
-use consort_proto::status::TaskStatus;
-use consort_proto::worker_link::{
-    HubToWorker, SessionEvent, SessionStart, SessionStartResult, TurnEndReason,
+use consort_proto::model::{FallbackPath, ModelSelection, SessionState, TurnErrorKind};
+use consort_proto::session_host_link::{
+    HubToSessionHost, SessionEvent, SessionStart, SessionStartResult, TurnEndReason,
 };
+use consort_proto::status::TaskStatus;
 use serde_json::json;
 
 const FIRST: &str = "Claude Code Personal 1";
@@ -62,7 +62,7 @@ async fn assistant_runs_on(world: &mut World, label: &str) {
 async fn next_start(worker: &mut FakeWorker) -> SessionStart {
     loop {
         let (request, command) = worker.next_command().await;
-        if let HubToWorker::SessionStart(start) = command {
+        if let HubToSessionHost::SessionStart(start) = command {
             worker
                 .respond_ok(
                     &request,
@@ -114,29 +114,6 @@ async fn a_task_runs_on_the_account_and_model_of_the_assistant() {
 /// The account of the assistant is a default. A task that the assistant puts
 /// on a worker without that account still starts.
 #[tokio::test]
-async fn a_task_on_a_worker_without_the_account_of_the_assistant_still_starts() {
-    let mut world = World::start().await;
-    two_accounts(&mut world).await;
-    assistant_runs_on(&mut world, SECOND).await;
-    let mut other = FakeWorker::pair_and_connect(&world.hub).await;
-    other.send_inventory().await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let coordinator = world.start_coordinator("Please do this").await;
-    let started = world
-        .worker
-        .tool_json(
-            coordinator.session_id,
-            "start_task",
-            json!({"title": "Build", "brief": "Build it", "worker_id": other.worker_id}),
-        )
-        .await;
-    assert!(started["task_id"].is_string(), "{started}");
-    let start = other.accept_session_start().await;
-    assert_eq!(start.account_id, other.account_id);
-    world.hub.handle.shutdown().await.unwrap();
-}
-
-#[tokio::test]
 async fn a_task_at_a_limit_moves_to_the_other_account_and_stays_there() {
     let mut world = World::start().await;
     let (first, second) = two_accounts(&mut world).await;
@@ -179,12 +156,17 @@ async fn a_task_fails_when_every_account_is_at_its_limit() {
 }
 
 #[tokio::test]
-async fn a_task_fails_at_a_limit_when_the_user_turned_the_move_off() {
+async fn a_task_fails_at_a_limit_when_the_user_turned_the_built_in_row_off() {
     let mut world = World::start().await;
     two_accounts(&mut world).await;
     world
         .client
-        .request(PreferencesSetAccountFallback { enabled: false })
+        .request(PreferencesSetFallbackPath {
+            path: FallbackPath {
+                other_accounts: false,
+                steps: Vec::new(),
+            },
+        })
         .await
         .unwrap();
     let (task_id, start) = task_on_first_account(&mut world).await;

@@ -379,11 +379,14 @@ impl ConsortApp {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(text(
-                        format!("No icon matches \"{}\". Try another word.", query.trim()),
-                        t.text.ui,
-                        c.text_secondary,
-                    ))
+                    .child(
+                        text(
+                            format!("No icon matches \"{}\". Try another word.", query.trim()),
+                            t.text.ui,
+                            c.text_secondary,
+                        )
+                        .min_w_0(),
+                    )
                     .into_any_element(),
             );
         }
@@ -463,11 +466,11 @@ impl ConsortApp {
                 div()
                     .flex()
                     .items_center()
-                    .child(
-                        div()
-                            .flex_1()
-                            .child(text("All icons", t.text.heading, c.text_primary)),
-                    )
+                    .child(div().flex_1().min_w_0().child(text(
+                        "All icons",
+                        t.text.heading,
+                        c.text_primary,
+                    )))
                     .child(
                         icon_button(
                             "icon-picker-close",
@@ -491,11 +494,11 @@ impl ConsortApp {
                     .flex()
                     .items_center()
                     .gap(t.space.md)
-                    .child(
-                        div()
-                            .flex_1()
-                            .child(text(HINT, t.text.label, c.text_tertiary)),
-                    )
+                    .child(div().flex_1().min_w_0().child(text(
+                        HINT,
+                        t.text.label,
+                        c.text_tertiary,
+                    )))
                     .child(
                         button("icon-picker-cancel", "Cancel", ButtonKind::Secondary, t).on_click(
                             cx.listener(|this, _, window, cx| this.close_icon_picker(window, cx)),

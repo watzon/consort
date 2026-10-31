@@ -104,6 +104,7 @@ pub(crate) async fn run(shared: &Shared, command: Command) -> Result<CommandOutp
                             prompt: Some(form.prompt.clone()),
                             action: Some(action(&form, placement)),
                             enabled: Some(form.enabled),
+                            monid: None,
                         })
                         .await?
                         .routine
@@ -129,6 +130,26 @@ pub(crate) async fn run(shared: &Shared, command: Command) -> Result<CommandOutp
                     prompt: None,
                     action: None,
                     enabled: Some(enabled),
+                    monid: None,
+                })
+                .await?
+                .routine;
+            if let Ok(mut cache) = shared.cache.lock() {
+                cache.routines.insert(routine_id, routine);
+            }
+            shared.publish();
+        }
+        Command::SetRoutineMonid { routine_id, monid } => {
+            let routine = shared
+                .call(RoutineUpdate {
+                    routine_id: parse_id(&routine_id, "routine")?,
+                    channel_id: None,
+                    name: None,
+                    schedule: None,
+                    prompt: None,
+                    action: None,
+                    enabled: None,
+                    monid: Some(monid.map(|m| m.to_proto())),
                 })
                 .await?
                 .routine;

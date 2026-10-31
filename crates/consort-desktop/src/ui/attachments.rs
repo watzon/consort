@@ -484,6 +484,7 @@ impl ConsortApp {
                 div()
                     .flex()
                     .flex_1()
+                    .min_w_0()
                     .min_h_0()
                     .items_center()
                     .justify_center()
@@ -503,6 +504,7 @@ impl ConsortApp {
                             .id("lightbox-image")
                             .debug_selector(|| "lightbox-image".into())
                             .flex_1()
+                            .min_w_0()
                             .h_full()
                             .max_w(f.lightbox_image_w)
                             .max_h(f.lightbox_image_h)
@@ -671,7 +673,12 @@ impl ConsortApp {
                 .flex()
                 .items_center()
                 .gap(t.space.sm)
-                .child(div().flex_1().child(progress_bar(upload, f.progress, t)))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .child(progress_bar(upload, f.progress, t)),
+                )
                 .child(text(label.clone(), t.text.caption, c.text_tertiary).flex_none())
                 .into_any_element(),
             UploadStatus::Preparing => {
@@ -1115,7 +1122,11 @@ impl ConsortApp {
                 .cursor_pointer()
                 .hover(|s| s.bg(c.hover_raised))
                 .child(icon(file_icon(&att.mime), t.icon.dense, c.text_secondary))
-                .child(line(att.name.clone(), t.text.ui, c.text_primary).flex_1())
+                .child(
+                    line(att.name.clone(), t.text.ui, c.text_primary)
+                        .flex_1()
+                        .min_w_0(),
+                )
                 .child(text(att.size_label.clone(), detail(t), c.text_tertiary).flex_none())
                 .on_click(cx.listener(move |this, _, _, cx| match image_index {
                     Some(index) => this.open_lightbox(images.clone(), index, String::new(), cx),

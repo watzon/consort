@@ -109,7 +109,7 @@ impl ConsortApp {
                                 c.text_tertiary,
                             ))
                             .child(icon("folder", t.icon.size, c.text_secondary))
-                            .child(line(name, t.text.ui, c.text_primary).flex_1())
+                            .child(line(name, t.text.ui, c.text_primary).flex_1().min_w_0())
                             .child(text(count.to_string(), detail(t), c.text_tertiary))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 if !this.knowledge.closed.remove(&key) {
@@ -161,7 +161,8 @@ impl ConsortApp {
                             .child(
                                 line(name, t.text.mono, c.text_primary)
                                     .font_family(t.font_mono.clone())
-                                    .flex_1(),
+                                    .flex_1()
+                                    .min_w_0(),
                             )
                             .when(just_now, |d| {
                                 d.child(
@@ -230,7 +231,7 @@ impl ConsortApp {
             );
         if loaded && notes.is_empty() {
             let new_scope = scope.clone();
-            return div().flex_1().min_h_0().p(t.space.lg).child(
+            return div().flex_1().min_w_0().min_h_0().p(t.space.lg).child(
                 div()
                     .debug_selector(|| "memory-empty".into())
                     .flex()
@@ -280,6 +281,7 @@ impl ConsortApp {
             .flex()
             .flex_col()
             .flex_1()
+            .min_w_0()
             .min_h_0()
             .child(
                 div()
@@ -295,6 +297,7 @@ impl ConsortApp {
                         div()
                             .debug_selector(|| "memory-summary".into())
                             .flex_1()
+                            .min_w_0()
                             .child(text(summary, t.text.ui, c.text_secondary)),
                     )
                     .child(new_button),
@@ -434,6 +437,7 @@ impl ConsortApp {
                 div()
                     .id("note-scroll")
                     .flex_1()
+                    .min_w_0()
                     .min_h_0()
                     .overflow_y_scroll()
                     .py(t.space.lg)
@@ -584,6 +588,7 @@ impl ConsortApp {
             .flex()
             .flex_col()
             .flex_1()
+            .min_w_0()
             .min_h_0()
             .gap(t.space.md)
             .when(place == Place::Panel, |d| d.p(t.space.lg))
@@ -593,6 +598,7 @@ impl ConsortApp {
                     .id("note-editor")
                     .debug_selector(|| "note-editor".into())
                     .flex_1()
+                    .min_w_0()
                     .min_h(t.component.knowledge.editor_min_height)
                     .overflow_y_scroll()
                     .py(t.space.md)
@@ -617,7 +623,11 @@ impl ConsortApp {
                     .flex_none()
                     .items_center()
                     .gap(t.space.sm)
-                    .child(text("Markdown", detail(t), c.text_tertiary).flex_1())
+                    .child(
+                        text("Markdown", detail(t), c.text_tertiary)
+                            .flex_1()
+                            .min_w_0(),
+                    )
                     .child(
                         button("note-cancel", "Cancel", ButtonKind::Secondary, t)
                             .on_click(cx.listener(|this, _, _, cx| this.cancel_note_edit(cx))),
@@ -748,7 +758,11 @@ impl ConsortApp {
                 .when(deleted_on, |d| d.bg(c.surface_selected))
                 .when(!deleted_on, |d| d.hover(|s| s.bg(c.hover_sidebar)))
                 .child(icon("archive", t.icon.size, c.text_secondary))
-                .child(line("Recently deleted", t.text.ui, c.text_primary).flex_1())
+                .child(
+                    line("Recently deleted", t.text.ui, c.text_primary)
+                        .flex_1()
+                        .min_w_0(),
+                )
                 .child(text(deleted_count.to_string(), detail(t), c.text_tertiary))
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.knowledge.settings_deleted = true;
@@ -794,7 +808,11 @@ impl ConsortApp {
                     .pr(t.space.sm)
                     .border_b(t.border_width)
                     .border_color(c.border_subtle)
-                    .child(text("Memory", t.text.title, c.text_primary).flex_1())
+                    .child(
+                        text("Memory", t.text.title, c.text_primary)
+                            .flex_1()
+                            .min_w_0(),
+                    )
                     .child(
                         icon_text_button("settings-memory-new", "plus", "New note", t)
                             .px(t.space.sm + t.space.xxs)
@@ -815,6 +833,7 @@ impl ConsortApp {
                 div()
                     .relative()
                     .flex_1()
+                    .min_w_0()
                     .min_h_0()
                     .child(
                         div()
@@ -1004,6 +1023,7 @@ impl ConsortApp {
             .flex()
             .flex_col()
             .flex_1()
+            .min_w_0()
             .min_h_0()
             .gap(t.space.xl)
             .overflow_y_scroll()
@@ -1096,6 +1116,7 @@ impl ConsortApp {
                     .flex()
                     .flex_col()
                     .flex_1()
+                    .min_w_0()
                     .min_h_0()
                     .overflow_y_scroll()
                     .py(t.space.md)
@@ -1232,6 +1253,7 @@ impl ConsortApp {
             .flex()
             .flex_col()
             .flex_1()
+            .min_w_0()
             .min_h_0()
             .gap(t.space.xl)
             .pt(t.space.page - t.space.sm)
@@ -1272,6 +1294,7 @@ impl ConsortApp {
                 div()
                     .flex()
                     .flex_1()
+                    .min_w_0()
                     .min_h_0()
                     .gap(t.space.xl)
                     .child(list)
@@ -1370,6 +1393,7 @@ impl ConsortApp {
             .flex()
             .flex_col()
             .flex_1()
+            .min_w_0()
             .min_h_0()
             .gap(t.space.xl)
             .overflow_y_scroll()

@@ -86,6 +86,7 @@ impl Render for StartupError {
             .child(
                 div()
                     .flex_1()
+                    .min_w_0()
                     .flex()
                     .items_center()
                     .justify_center()

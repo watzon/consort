@@ -19,8 +19,10 @@ use consort_proto::model::{
     AuthState, DecisionAnswer, HarnessAccount, ItemStatus, ModelInfo, ModelSelection, OptionValue,
     SessionState,
 };
+use consort_proto::session_host_link::{
+    HubToSessionHost, SessionStart, SessionTurn, TurnEndReason,
+};
 use consort_proto::status::TaskStatus;
-use consort_proto::worker_link::{HubToWorker, SessionStart, SessionTurn, TurnEndReason};
 use serde_json::json;
 
 fn selection(label: &str, model: &str, effort: Option<&str>) -> ModelSelection {
@@ -85,7 +87,7 @@ async fn reply(world: &mut World, task_id: TaskId, text: &str) {
 
 async fn next_turn(world: &mut World) -> (consort_proto::frame::RequestFrame, SessionTurn) {
     let (request, command) = world.worker.next_command().await;
-    let HubToWorker::SessionTurn(turn) = command else {
+    let HubToSessionHost::SessionTurn(turn) = command else {
         panic!("expected session.turn, got {}", command.type_name());
     };
     (request, turn)
@@ -117,16 +119,16 @@ async fn switch_commands(world: &mut World) -> (SessionId, SessionStart) {
     while stopped.is_none() || started.is_none() {
         let (request, command) = world.worker.next_command().await;
         match command {
-            HubToWorker::SessionStop(stop) => {
+            HubToSessionHost::SessionStop(stop) => {
                 world.worker.respond_ok(&request, &json!({})).await;
                 stopped = Some(stop.session_id);
             }
-            HubToWorker::SessionStart(start) => {
+            HubToSessionHost::SessionStart(start) => {
                 world
                     .worker
                     .respond_ok(
                         &request,
-                        &consort_proto::worker_link::SessionStartResult {
+                        &consort_proto::session_host_link::SessionStartResult {
                             workspace_path: "/tmp/workspace".to_owned(),
                             native_ref: None,
                         },
@@ -290,7 +292,7 @@ async fn a_harness_that_refuses_the_change_gets_a_new_session_with_the_context()
     let task = world.task(task_id).await;
     assert_eq!(task.status, TaskStatus::Working);
     assert_eq!(task.current_session_id, Some(new_start.session_id));
-    assert_eq!(task.worker_id, Some(world.worker.worker_id));
+    assert_eq!(task.worker_id, Some(world.worker.exec_id));
     // Events of the old session do not move the task.
     world
         .worker
@@ -395,7 +397,7 @@ async fn a_task_in_needs_input_gets_its_new_session_and_loses_no_answer() {
     // The second answer reaches the new session. It is not lost.
     answer_yes(&mut world, second).await;
     let (_, command) = world.worker.next_command().await;
-    let HubToWorker::SessionSteer(steer) = command else {
+    let HubToSessionHost::SessionSteer(steer) = command else {
         panic!("expected session.steer, got {}", command.type_name());
     };
     assert_eq!(steer.session_id, new_start.session_id);
@@ -500,7 +502,7 @@ async fn a_retry_starts_the_new_session_with_the_saved_model() {
             vec![
                 state(SessionState::Active),
                 turn_started("t1"),
-                consort_proto::worker_link::SessionEvent::TurnEnded {
+                consort_proto::session_host_link::SessionEvent::TurnEnded {
                     turn_id: "t1".into(),
                     reason: TurnEndReason::Failed,
                     error: Some("boom".to_owned()),

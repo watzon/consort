@@ -167,6 +167,9 @@ pub struct Links {
     /// session on. A `reopened` event ends an open turn only when the turn
     /// went out on an earlier connection. See [`Links::turn_sent_on`].
     turns_sent: Mutex<HashMap<SessionId, u64>>,
+    /// How many turns of a task session went on by themselves after a
+    /// restart of the session host, since the hub started.
+    restart_resumes: Mutex<HashMap<SessionId, u32>>,
     /// A shorter command timeout for unit tests.
     #[cfg(test)]
     pub(crate) command_timeout: Mutex<Option<Duration>>,
@@ -222,9 +225,23 @@ impl Links {
         self.turns_sent.lock().ok()?.get(&session_id).copied()
     }
 
+    /// Counts one more resume of the session after a restart. Returns the new
+    /// count.
+    pub(crate) fn count_restart_resume(&self, session_id: SessionId) -> u32 {
+        let Ok(mut map) = self.restart_resumes.lock() else {
+            return u32::MAX;
+        };
+        let count = map.entry(session_id).or_insert(0);
+        *count += 1;
+        *count
+    }
+
     /// Forgets the turn record of a session that has ended.
     pub(crate) fn forget_turn(&self, session_id: SessionId) {
         if let Ok(mut map) = self.turns_sent.lock() {
+            map.remove(&session_id);
+        }
+        if let Ok(mut map) = self.restart_resumes.lock() {
             map.remove(&session_id);
         }
     }

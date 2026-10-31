@@ -14,8 +14,8 @@ use consort_proto::error::{ErrorBody, ErrorCode};
 use consort_proto::frame::MessageFamily;
 use consort_proto::ids::{SessionId, TaskId};
 use consort_proto::model::{ApprovalStatus, ItemStatus, SessionState};
+use consort_proto::session_host_link::{HubToSessionHost, SessionEvent, TurnEndReason};
 use consort_proto::status::TaskStatus;
-use consort_proto::worker_link::{HubToWorker, SessionEvent, TurnEndReason};
 use serde_json::json;
 
 /// Fails the first turn of a task and retries it. Returns the old and the
@@ -131,7 +131,7 @@ async fn steer(
         .unwrap();
     let (request, command) = world.worker.next_command().await;
     assert!(
-        matches!(command, HubToWorker::SessionSteer(_)),
+        matches!(command, HubToSessionHost::SessionSteer(_)),
         "{}",
         command.type_name()
     );
@@ -172,7 +172,7 @@ async fn a_refused_steer_waits_for_the_turn_to_end_and_then_starts_a_turn() {
         )
         .await;
     let (_, command) = world.worker.next_command().await;
-    let HubToWorker::SessionTurn(turn) = command else {
+    let HubToSessionHost::SessionTurn(turn) = command else {
         panic!("expected session.turn, got {}", command.type_name());
     };
     assert_eq!(turn.session_id, s1);
@@ -215,7 +215,7 @@ async fn a_steer_refused_after_the_turn_ended_starts_a_new_turn() {
         )
         .await;
     let (_, command) = world.worker.next_command().await;
-    let HubToWorker::SessionTurn(turn) = command else {
+    let HubToSessionHost::SessionTurn(turn) = command else {
         panic!("expected session.turn, got {}", command.type_name());
     };
     assert_eq!(turn.turn.text, "One more thing");
@@ -303,7 +303,7 @@ async fn an_answer_for_a_closed_request_cancels_the_approval_and_keeps_the_task(
         .await
         .unwrap();
     let (request, command) = world.worker.next_command().await;
-    assert!(matches!(command, HubToWorker::SessionRespond(_)));
+    assert!(matches!(command, HubToSessionHost::SessionRespond(_)));
     world
         .worker
         .respond_error(
@@ -346,13 +346,13 @@ async fn an_answer_for_a_closed_request_cancels_the_approval_and_keeps_the_task(
 /// answers both. Fails on any other command.
 async fn expect_stop_then_release(world: &mut World, session_id: SessionId, task_id: TaskId) {
     let (request, command) = world.worker.next_command().await;
-    let HubToWorker::SessionStop(stop) = command else {
+    let HubToSessionHost::SessionStop(stop) = command else {
         panic!("expected session.stop, got {}", command.type_name());
     };
     assert_eq!(stop.session_id, session_id);
     world.worker.respond_ok(&request, &json!({})).await;
     let (request, command) = world.worker.next_command().await;
-    let HubToWorker::WorkspaceRelease(release) = command else {
+    let HubToSessionHost::WorkspaceRelease(release) = command else {
         panic!("expected workspace.release, got {}", command.type_name());
     };
     assert_eq!(release.task_id, task_id);
@@ -430,12 +430,12 @@ async fn deleting_a_task_drops_its_queued_turn_and_releases_its_workspace() {
     while !released {
         let (request, command) = world.worker.next_command().await;
         match command {
-            HubToWorker::SessionStop(stop) => {
+            HubToSessionHost::SessionStop(stop) => {
                 assert_eq!(stop.session_id, s1);
                 stops += 1;
                 world.worker.respond_ok(&request, &json!({})).await;
             }
-            HubToWorker::WorkspaceRelease(release) => {
+            HubToSessionHost::WorkspaceRelease(release) => {
                 assert!(stops > 0, "the release came before the stop");
                 assert_eq!(release.task_id, task_id);
                 assert!(release.delete);

@@ -61,7 +61,7 @@ pub fn detect() -> Machine {
     if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         gpus.push("apple");
     }
-    if consort_harness::process::resolve_program("nvidia-smi").is_some() {
+    if which::which("nvidia-smi").is_ok() {
         gpus.push("nvidia");
     }
     #[cfg(target_os = "linux")]

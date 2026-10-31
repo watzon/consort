@@ -229,7 +229,7 @@ The main column has no header. The timeline fills it, the composer sits under it
 - **Top actions** sit at the top right, `md` from the edges, `xs` apart: Connectors (for a channel that has connections or skills, with their count), Channel (the `channel` hash icon, which opens the Channel panel), Tasks and New task. Each is `chat.top_action` (32 px) square with a `chat.top_action_icon` (18 px) icon in `text.secondary`. Tasks opens the Tasks panel, has `surface.selected` while the panel is open, and has a `component.state_dot` dot in `accent.fill` while something needs you.
 - **Top tint.** The top of the timeline darkens progressively, as in Claude Duet. It is no solid zone: content that moves up under the mark stays faintly visible. `layout.top_tint` sets the canvas color at four stops: 97 percent at the top, 94 percent at the bottom of the mark (60 px), 80 percent at the bottom of the pill (86 px), and clear at 108 px. Content under the mark and the pill is only a faint trace, as the user asked on 2026-10-29 ("once you get to the avatar position, it needs to darken significantly"). A GPUI gradient has two stops, so the view draws one gradient layer between each pair of stops (three layers). The mark, the activity pill and the top actions sit on the tint. At rest, the first item starts `layout.content_top` (98 px) from the top, just below the mark and the pill (mark top, mark, `space.xxs`, the pill, and a small margin). A theme test keeps it tall enough. It stays the same when the pill is hidden, so the chat does not jump when work starts or stops.
 - **Bottom fade.** `layout.fade_bottom` (32 px) above the composer, shown only while the reader is scrolled up.
-- **Composer.** One field on `surface.card` with a `border.strong` line and `chat.composer_radius` (16 px) corners, as wide as the timeline. The send key (`send` icon, `chat.send_button`, `text.tertiary`) sits inside it at the right. Under the field, outside it: add and the mic (`component.composer_chip` square; the mic is the `voice` icon, and a click focuses the box and asks the system to start dictation, see [Dictation](#dictation)), a `border.strong` divider, "Same as Tutti" for a channel with no model of its own, the model chip and the effort chip, a spacer, and "Runs on <worker>" in Label size and `text.tertiary`. The placeholder is "Message <channel>", and "Message Tutti" in the main channel. The task thread uses the same component (`ui/composer.rs`): the same padding, field and tool row, so with a panel open the two fields and the two tool rows line up at the bottom of the window. Its placeholder is "Reply to this task". In a narrow place the tool row drops "Runs on" first, and then the account name in the chips. It never wraps and never overflows.
+- **Composer.** One field on `surface.card` with a `border.strong` line and `chat.composer_radius` (16 px) corners, as wide as the timeline. The field starts at one row. It grows upward with its text to five rows, and then the text scrolls inside it. Its bottom edge and the tool row stay still. The send key (`send` icon, `chat.send_button`, `text.tertiary`) sits inside it in the bottom right corner at every height. The text keeps out of the column of the send key on every row, so words do not move to another line when the field grows. Under the field, outside it: add and the mic (`component.composer_chip` square; the mic is the `voice` icon, and a click starts dictation, see [Dictation](#dictation)), a `border.strong` divider, "Same as Tutti" for a channel with no model of its own, the model chip and the effort chip, a spacer, and "Runs on <worker>" in Label size and `text.tertiary`. The placeholder is "Message <channel>", and "Message Tutti" in the main channel. The task thread uses the same component (`ui/composer.rs`): the same padding, field and tool row, so with a panel open the two fields and the two tool rows line up at the bottom of the window. Its placeholder is "Reply to this task". In a narrow place the tool row drops "Runs on" first, and then the account name in the chips. It never wraps and never overflows.
 
 ### Chat sizes
 
@@ -296,7 +296,9 @@ The sizes are in `component.knowledge` of `structure.json`. The values come from
 - **The version history** has a `version_list` (240 px) list and a preview. A changed line has a `change_bar` (3 px) bar in `status.working` on `tint.working`, not red or green, because a change is not an error.
 - **The memory saved line** sits in the assistant lane: the `memory` icon at `line_icon` (14 px), the words in `text.tertiary` and the note path in mono as a link.
 
-Settings > Workers uses these sizes from `component` in `structure.json`:
+Settings > Providers lists only the tools that the user knows as a provider, such as Claude Code, Codex, OpenCode, Gemini CLI and the registry agents. Helper tools (Node.js and the Claude Code ACP adapter) have no row and no section. Their install state and their failures show on the row of the provider that needs them.
+
+Settings > Workers and Settings > Providers use these sizes from `component` in `structure.json`. The account rows and the tool rows are in Providers, and each ends with a three dots button of `row_dots` (28 px):
 
 | Token | Size (px) | Use |
 |---|---|---|
@@ -324,7 +326,9 @@ The model picker uses these sizes from `component`:
 | `picker_rail_marker`, `picker_rail_marker_height` | 3, 20 | The accent bar that marks the selected rail button |
 | `effort_menu` | 240 | The width of the effort menu |
 | `effort_select` | 150 | The effort select next to a model field in a dialog |
-| `composer_chip` | 28 | The height of the model chip and the effort chip in the composer |
+| `composer_chip` | 28 | The height of the model chip and the effort chip in the composer. The mic is this size, at rest and live |
+| `dictation_select`, `dictation_cleanup_select` | 220, 270 | The Language and Input device selects, and the Cleanup model select, of Settings > Dictation |
+| `chat.mic_stop`, `chat.mic_bar`, `chat.mic_bar_gap`, `chat.mic_bar_max`, `chat.mic_dot` | 7, 2, 1, 12, 6 | The live mic: its stop mark, its three level bars, and the failed dot |
 
 Connectors and skills use these sizes. The Add connector and Add skill dialogs are `layout.dialog_catalog` (760 px) wide. Their list scrolls inside the dialog and fades at its edges.
 
@@ -342,6 +346,8 @@ A service logo is the image that Composio gives. The client loads it (`https` on
 ### The assistant on its own
 
 The values come from the Paper artboards `FYE-0`, `G2C-0`, `G8V-0`, `F6N-0`, `FDX-0` and `FJC-0`, through `component.proactivity` in `structure.json`.
+
+- **Settings > Models** is a settings page of `settings_detail_max`, first in the Assistant group of the settings rail, with the `chip` icon. It has the fallback path (the first row with a lock, the built-in row "Other accounts with the same model" with a switch, the steps, the add row, and the fixed end row "Stop and show the error") and "How the path works". Sizes are in `component.fallback` of `structure.json`. A step row has a handle, its number, the logo, the model, its effort and a remove button. A step moves by drag, by Alt+Up and Alt+Down, or by the menu of the row. The first step on another harness asks in a confirm dialog. The model chip of an assistant on a fallback has a marker dot and a menu (Go back to the first choice, Choose another model, Edit path). Move notices in the timeline have a Details toggle with the lines of the walk.
 
 - **Settings > Proactivity** is a settings page of `settings_detail_max`. Its parts, in order: When the assistant may start things (Pause all, Quiet hours, Snooze, Follow-ups), Each channel, Today, and Activity. The settings rail item is "Proactivity" with the `eye` icon, after Routines.
 - **The quiet hours** are two `time_box` (72 px) boxes in mono with no chevron, and a `zone_select` (168 px) time zone select.
@@ -452,9 +458,30 @@ An error is in the place where the user looks for the answer (DECISIONS 732 to 7
 - **A message that the hub refused** stays in your lane, dimmed (`opacity.answered_dim`), with the reason under it and the link "Put back in the message box".
 - **Corner notifications** (`notice.rs`, Paper E3 and E4) are for the actions of the app: a save, a rename, an upload, a hub that did not answer. A notification is `notice_width` (360 px) wide, `space.lg` from the right, on `surface.raised` with `shadow.float`, `notice_bottom` (124 px) above the bottom edge. An error has the `failed` icon, a UI semibold title, the text in UI `text.secondary`, an optional action and the `close` button. It stays until the user closes it. An information notice is one line and leaves after 6 s. Three show at most, with the newest at the bottom. More errors wait, and a line under the stack says how many. In a window under `compact_width` (760 px), and in a wider window where the stack would cover the right lane of the chat (under 1144 px with the sidebar shown, and no panel), the stack is as wide as the window less a 16 px margin on each side, `notice_compact_top` (88 px) from the top. The information notices have an `info` icon, which the design does not show.
 
+### Monid and access requests
+
+The Paper page "Redesign, Oct 30", section 13 (M1, M2, M4 to M9), shows these surfaces.
+
+- A Monid card and an access card are approval cards. The requested choice comes first. Deny is last. A card does not fill the width of the timeline.
+- A call row is one line with the tool, the status and the cost. It opens to show the input, the output and the cost details. This text is selectable.
+- A task card shows "Monid: N calls so far" and the total.
+- Settings > Connectors shows Monid as the first row of the list when the hub has a key. The footer under the list also has Monid.
+- The Channel panel shows a Temporary access section only when a grant runs. Each row has End.
+- Money uses the mono type, so that amounts line up.
+
 ### Dictation
 
-The mic button sits in the tool row of the composer, after add. A click focuses the message box and asks the system to start dictation. If the system does not start it, or the system is Windows or Linux, an information notice shows the hint ("To dictate, press Windows key+H.", or the macOS shortcut). The call that starts dictation on macOS is not wired, because it needs `unsafe` code (DECISIONS 738).
+Dictation runs on this computer (`consort-dictation`, on the Sayso SDK). The plan is [DICTATION-PLAN.md](DICTATION-PLAN.md), and the designs are in [notes/design-dictation.md](notes/design-dictation.md).
+
+- **Start and stop.** A click on the mic, or the shortcut (Control Option D by default). A tap of the shortcut starts and stops. A hold of more than about 300 ms is push to talk. The composer and the reply box work the same way.
+- **The words.** Heard words come at the caret in `text.tertiary`, between the draft on each side. They turn `text.primary` when dictation ends. There is no accept step. The whole dictation is one undo step.
+- **The state.** While the state is starting, listening or finishing, the field border is `accent.text` at `opacity.dictation_border`, and the placeholder of an empty box is "Listening". The mic keeps its 28 px square and has `accent.fill` at `opacity.tint`: a `chat.mic_stop` stop mark and three level bars while it listens, and a spinner while it finishes. The slot at the right of the tool row says "Getting the speech model ready", "Esc cancels" or "Fixing the text". This slot drops first in a narrow place.
+- **Esc** removes only the dictated words, and the caret goes back. It shows no notice.
+- **An edit.** A change in the draft keeps dictation going. A change in the dictated words gives them to the user and ends dictation.
+- **Stop after silence** ends dictation as Stop does and never sends. An information notice says "Dictation stopped after 30 seconds of silence." with the number of the setting, and leaves after 6 s.
+- **Send while dictating** stops dictation and holds the message. The notice has Send now. Send now sends the words on screen, without the words still to come.
+- **Failures** use the corner notice styles. Information with a button stays until the user closes it or the state ends. Cleanup failed is one that leaves after 6 s, and the words stay as heard. The mic has a `status.failed` dot (`chat.mic_dot`) for no permission, no microphone, no key and a lost connection.
+- **Settings > Dictation** holds the engine, the cleanup, the silence limit, the language, the microphone and the shortcut. These stay on this computer. So does the Deepgram key. S1-mini always shows as "S1-mini by Superwhisper".
 
 ## Provider logos
 
@@ -481,7 +508,7 @@ One component chooses a model everywhere: the composer, the New channel dialog, 
 - **First view.** The picker opens on Favorites when at least one favorite has a row, else on the account of the current model, with the keyboard on the current model.
 - **Keyboard.** Up and Down move in the list. Left (with an empty search) moves to the rail, where Up and Down change the view and the selected button shows the focus ring. Right, Enter or typing go back to the list. Enter in the list chooses.
 - **Scroll.** The list scrolls inside the popover. It fades into `surface.raised` at the top and the bottom while more rows are there.
-- **No account.** "No account is signed in. Add one in Settings > Workers." with the button Open Settings. The popover then has no rail, and it is as high as its content.
+- **No account.** "No account is signed in. Add one in Settings > Providers." with the button Open Settings. The popover then has no rail, and it is as high as its content.
 - **Effort.** A second chip next to the model chip: the `effort` icon and the level. Its menu is `component.effort_menu` (240 px) wide, with the title "Effort for <model>", one row per level, "Default" after the provider's default level, and the note "<Provider> offers these levels for this model. More effort thinks longer and uses more of your plan." When the provider does not name its default, the first row is Default, which takes the effort out. The chip is not there for a model with no effort levels. In a dialog, the effort is a select of `component.effort_select` (150 px) next to the model field. A new model keeps the effort when it offers that level. Otherwise the effort goes back to the new model's default.
 - **Task threads** have the model chip and the effort chip in the tool row of their composer, as the chat has. The picker lists only the models of the worker that holds the task. A pick of the same account applies from the next turn. A pick of another account says "This starts a new session in the same folder." under its row. A task that cannot change its model (it is Resolved) shows the chips with no chevron, and they do not open.
 
@@ -554,3 +581,13 @@ The logo is the Three voices mark: three dabs of pigment, one for each voice of 
 - Do not add arrows to button or link text.
 - An error says what happened and what to do next. An empty state names the situation and the next action.
 - Write in the style of ASD-STE100: short sentences, one instruction per sentence, and the same word for the same thing everywhere.
+
+## Assistant status line
+
+When the assistant of a channel cannot answer, the chat shows one status line just above the composer, in the place of the link line ("Connecting to the hub"): the `circle-alert` icon, the reason in Detail `text.secondary` as selectable text, and, when one account is signed out, a Quiet Sign in again button at the right end. The icon is `status.failed` when the button is there, else `text.secondary`. The line is not a message and has no time. It shows only while a message of the user waits for an answer (or a turn cannot start). It waits 30 seconds after a start of the hub, and it goes away by itself when the assistant can answer. It does not show while the link line shows. The sign-in notice in the sidebar stays as it is.
+
+A one-line system notice in the timeline has its time at the right, on the baseline of the first line of its text. GPUI aligns the bottoms of text boxes, not their baselines, so the row starts both boxes at the top and moves the time down by the difference of the two baselines (`parts::baseline_lead`).
+
+## Sign-in notice
+
+An account whose login expired has a notice in the sidebar, above the update notice. It uses the box of the update notice. The text is "<account> needs a new sign-in." Sign in again is a small bordered button under the text, and it opens the sign-in of that account. The notice has no close button. It leaves when the sign-in works or when the user removes the account.

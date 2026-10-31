@@ -8,9 +8,10 @@
 //! shows the state and sends the user's choices.
 
 use chrono::{DateTime, Local, Utc};
+pub use consort_proto::model::VOICE_NOTE_PATH;
 use consort_proto::model::{
-    self, ConnectorCard, MemoryScope, VOICE_NOTE_PATH, VoiceGuide, VoiceRule, VoiceSettings,
-    context_description, context_label, memory_note_entity_id,
+    self, ConnectorCard, MemoryScope, VoiceGuide, VoiceRule, VoiceSettings, context_description,
+    context_label, memory_note_entity_id,
 };
 use consort_proto::status::TaskStatus as ProtoStatus;
 
@@ -683,7 +684,8 @@ pub fn voice_task_steps(summary: &str) -> (String, Vec<String>) {
     let mut rest = Vec::new();
     for line in summary.lines() {
         match line.trim().strip_prefix("- ") {
-            Some(step) => steps.push(step.trim().to_owned()),
+            // A card shows plain text, so `**` must not show.
+            Some(step) => steps.push(crate::format::plain_text(step.trim())),
             None if !line.trim().is_empty() => rest.push(line.trim().to_owned()),
             None => {}
         }

@@ -11,11 +11,13 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::access::{ACCESS_CARD_ALWAYS, ACCESS_CARD_TEMPORARY, AccessDuration, AccessRequestCard};
 use super::account::SignInMethod;
 use super::common::ValidationError;
 use super::connector::{
     ApprovalRule, DisplayField, ToolApprovals, ToolKind, UseIn, canonical_json,
 };
+use super::monid::{MONID_CARD_ALLOW_TASK, MONID_CARD_ALWAYS, MONID_CARD_NEVER, MonidCard};
 use super::skill::{SkillAudit, SkillSource};
 use super::voice::{CommitmentFlag, OutgoingKind, VoiceUse};
 use crate::ids::{
@@ -48,6 +50,11 @@ pub enum ApprovalKind {
     SignIn,
     /// Install a skill (the install card).
     SkillInstall,
+    /// Run a paid tool through Monid (a hub card).
+    Monid,
+    /// Give a session a connection or Monid that its channel lacks (a hub
+    /// card).
+    AccessRequest,
 }
 
 impl ApprovalKind {
@@ -64,6 +71,8 @@ impl ApprovalKind {
             Self::ConnectService => "connect_service",
             Self::SignIn => "sign_in",
             Self::SkillInstall => "skill_install",
+            Self::Monid => "monid",
+            Self::AccessRequest => "access_request",
         }
     }
 
@@ -76,6 +85,8 @@ impl ApprovalKind {
                 | Self::ConnectService
                 | Self::SignIn
                 | Self::SkillInstall
+                | Self::Monid
+                | Self::AccessRequest
         )
     }
 }
@@ -103,6 +114,12 @@ pub enum ApprovalDetails {
         command: String,
         /// The folder it runs in.
         cwd: Option<String>,
+        /// Why Consort asks, when the command check is the reason.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        check_note: Option<String>,
+        /// The commands that the command check blocked before this one.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        blocked: Vec<String>,
     },
     /// Change files.
     FileChange {
@@ -146,6 +163,12 @@ pub enum ApprovalDetails {
     /// The install card, with the safety facts. Add installs the skill. Not
     /// now drops it.
     SkillInstall(Box<SkillInstallCard>),
+    /// A Monid call that asks. Allow runs it. It has more options than other
+    /// hub cards.
+    Monid(Box<MonidCard>),
+    /// A session asks for access. The options give temporary or lasting
+    /// access, or deny it.
+    AccessRequest(Box<AccessRequestCard>),
 }
 
 /// A connector tool call whose approval rule asks the user. The card
@@ -342,6 +365,8 @@ impl ApprovalDetails {
             Self::ConnectService(_) => ApprovalKind::ConnectService,
             Self::SignIn(_) => ApprovalKind::SignIn,
             Self::SkillInstall(_) => ApprovalKind::SkillInstall,
+            Self::Monid(_) => ApprovalKind::Monid,
+            Self::AccessRequest(_) => ApprovalKind::AccessRequest,
         }
     }
 
@@ -358,6 +383,12 @@ impl ApprovalDetails {
     /// now for a sign-in card, and Add and Not now for an install card.
     /// `None` for an approval from a harness.
     pub fn hub_card_options(&self) -> Option<Vec<RequestOption>> {
+        if let Self::AccessRequest(card) = self {
+            return Some(access_card_options(card));
+        }
+        if let Self::Monid(card) = self {
+            return Some(monid_card_options(card));
+        }
         let (allow, deny) = match self {
             Self::Connector(card) => match card.outgoing {
                 Some(OutgoingKind::Send) => ("Send", "Not now"),
@@ -388,6 +419,69 @@ impl ApprovalDetails {
 }
 
 /// What choosing a request option means.
+/// The options of an access card. The length that the session asked for is
+/// first. The user can always pick the other one.
+fn access_card_options(card: &AccessRequestCard) -> Vec<RequestOption> {
+    let option = |id: &str, label: &str, kind| RequestOption {
+        id: id.to_owned(),
+        label: label.to_owned(),
+        kind,
+        description: None,
+    };
+    let temporary = option(
+        ACCESS_CARD_TEMPORARY,
+        &card.temporary_label,
+        RequestOptionKind::AllowOnce,
+    );
+    let always = option(
+        ACCESS_CARD_ALWAYS,
+        "Always allow here",
+        RequestOptionKind::AllowAlways,
+    );
+    let deny = option(HUB_CARD_DENY, "Deny", RequestOptionKind::DenyOnce);
+    match card.requested {
+        AccessDuration::Temporary => vec![temporary, always, deny],
+        AccessDuration::Permanent => vec![always, temporary, deny],
+    }
+}
+
+/// The options of a Monid card. A card over a limit answers for this call
+/// only, so it offers nothing that lasts.
+fn monid_card_options(card: &MonidCard) -> Vec<RequestOption> {
+    let option = |id: &str, label: &str, kind| RequestOption {
+        id: id.to_owned(),
+        label: label.to_owned(),
+        kind,
+        description: None,
+    };
+    let mut options = vec![option(
+        HUB_CARD_ALLOW,
+        "Allow once",
+        RequestOptionKind::AllowOnce,
+    )];
+    if card.over_limit.is_none() {
+        options.push(option(
+            MONID_CARD_ALLOW_TASK,
+            "Allow for this task",
+            RequestOptionKind::AllowAlways,
+        ));
+    }
+    options.push(option(HUB_CARD_DENY, "Deny", RequestOptionKind::DenyOnce));
+    if card.over_limit.is_none() {
+        options.push(option(
+            MONID_CARD_ALWAYS,
+            "Always allow this tool here",
+            RequestOptionKind::AllowAlways,
+        ));
+    }
+    options.push(option(
+        MONID_CARD_NEVER,
+        "Never use this tool here",
+        RequestOptionKind::DenyAlways,
+    ));
+    options
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RequestOptionKind {
@@ -804,6 +898,8 @@ mod tests {
     #[test]
     fn approval_details_have_kind() {
         let details = ApprovalDetails::Command {
+            blocked: Vec::new(),
+            check_note: None,
             command: "rm -rf target".into(),
             cwd: Some("/w".into()),
         };

@@ -20,6 +20,10 @@ const REVOKE_CHECK_TICKS: u64 = 2;
 /// How often, in seconds, the hub ends the sign-ins that got no update.
 const SIGN_IN_CHECK_TICKS: u64 = 5;
 
+/// How often, in seconds, the hub looks for an assistant that can go back to
+/// its first choice.
+const FALLBACK_RETURN_TICKS: u64 = 2;
+
 pub(crate) fn spawn(hub: &Hub) -> JoinHandle<()> {
     let hub = hub.clone();
     tokio::spawn(async move {
@@ -41,6 +45,11 @@ pub(crate) fn spawn(hub: &Hub) -> JoinHandle<()> {
                 && let Err(err) = hub.apply_revokes_from_disk().await
             {
                 tracing::warn!(error = %err, "could not check for removed clients and workers");
+            }
+            if ticks.is_multiple_of(FALLBACK_RETURN_TICKS)
+                && let Err(err) = hub.return_fallbacks().await
+            {
+                tracing::warn!(error = %err, "could not send an assistant back to its first choice");
             }
             if ticks.is_multiple_of(SIGN_IN_CHECK_TICKS)
                 && let Err(err) = hub.expire_sign_ins().await

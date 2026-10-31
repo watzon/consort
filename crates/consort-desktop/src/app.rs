@@ -17,7 +17,7 @@ use gpui_kit::{
     AppContext as _, ClipboardItem, Context, Entity, FocusHandle, Focusable, InteractiveElement,
     IntoElement, KeyDownEvent, ListAlignment, ListState, ParentElement, Render, Styled,
     Subscription, Window,
-    component::input::{InputEvent, InputState, TextareaState},
+    component::input::{EditorState, InputEvent, InputState, TextareaState},
     div,
     prelude::FluentBuilder as _,
 };
@@ -120,12 +120,17 @@ pub enum SettingsSection {
     Workers,
     Clients,
     Hub,
+    /// The harness tools, the accounts and the API endpoints.
+    Providers,
+    /// The fallback path and the command check.
+    Models,
     Connectors,
     Skills,
     Memory,
     Routines,
     Proactivity,
     Voice,
+    Dictation,
 }
 
 /// The open dialog.
@@ -134,14 +139,21 @@ pub enum Dialog {
     /// The New channel dialog: a name and an icon. The group, if any, is in
     /// `ConsortApp::convo.new_channel_group`.
     NewChannel,
+    /// The Deepgram key of Settings > Dictation.
+    DeepgramKey,
     AddWorker,
     RenameWorker(String),
     EditTags(String),
+    /// The allowed folders of a worker.
+    WorkerFolders(String),
     /// A small dialog that names a new group. With a channel ID, the channel
     /// moves into the group once it exists.
     NewGroup(Option<String>),
     ConfirmDeleteChannel(String),
     ConfirmRemoveWorker(String),
+    /// The first step of the fallback path on another harness. The step
+    /// waits in `ConsortApp::fallback_ui`.
+    ConfirmOtherHarnessStep,
     /// A link whose words do not match its address: the address to show.
     ConfirmOpenLink(String),
     /// Add account, for a worker. The form is in `ConsortApp::add_account`.
@@ -150,8 +162,15 @@ pub enum Dialog {
     RenameAccount(String, String),
     /// Remove an account: the worker ID and the account ID.
     ConfirmRemoveAccount(String, String),
+    /// Add an API endpoint, or edit the one with this ID. The fields are in
+    /// `ConsortApp::check_inputs`.
+    Endpoint(Option<String>),
+    /// Remove an API endpoint.
+    ConfirmRemoveEndpoint(String),
     /// Change or remove the Composio key.
     ComposioKey,
+    /// Add Monid, or change or remove its key.
+    MonidKey,
     /// The connector catalog.
     AddConnector,
     /// Connect a service. The form is in `ConsortApp::ext.connect`.
@@ -251,8 +270,8 @@ pub struct Onboarding {
 
 /// Text inputs, made once and reused.
 pub struct Inputs {
-    pub composer: Entity<TextareaState>,
-    pub reply: Entity<TextareaState>,
+    pub composer: Entity<EditorState>,
+    pub reply: Entity<EditorState>,
     pub decision_answer: Entity<TextareaState>,
     pub edit: Entity<TextareaState>,
     pub name: Entity<InputState>,
@@ -272,6 +291,7 @@ pub struct Inputs {
     pub api_key: Entity<InputState>,
     /// A new tag for a worker.
     pub tag: Entity<InputState>,
+    pub folder: Entity<InputState>,
     /// The search of the model picker.
     pub model_search: Entity<InputState>,
 }
@@ -290,6 +310,7 @@ pub struct ConsortApp {
     pub settings_worker: Option<String>,
     pub channel_id: String,
     pub dialog: Option<Dialog>,
+    pub dictation: crate::dictation::DictationUi,
     pub menu: Option<OpenMenu>,
     pub menu_anchor: Option<OpenMenu>,
     /// The open model picker.
@@ -311,6 +332,11 @@ pub struct ConsortApp {
     /// Phase 4: threads, reactions, search, New task, channel settings,
     /// groups and About. See `crate::convo`.
     pub convo: crate::convo::ConvoState,
+    /// What the Models page keeps while the user edits the fallback path.
+    pub fallback_ui: crate::fallback::FallbackUi,
+    /// The endpoint dialog and the command check of Settings > Models.
+    pub check_ui: crate::ui::command_check::CheckUi,
+    pub check_inputs: crate::ui::command_check::CheckInputs,
     pub convo_inputs: crate::convo::ConvoInputs,
     pub add_account: AddAccountForm,
     /// The worker whose Add tag field is open.
@@ -441,6 +467,9 @@ pub struct ConsortApp {
     pub knowledge_inputs: crate::knowledge::KnowledgeInputs,
     /// Settings > Proactivity, the ratings and the quick replies.
     pub proactivity: crate::proactivity::ProactivityUi,
+    /// Monid: its page, its panel view and its dialog. See `crate::monid`.
+    pub monid_ui: crate::monid::MonidUi,
+    pub monid_inputs: crate::monid::MonidInputs,
     /// Settings > Voice and the draft cards. See `crate::voice`.
     pub voice: crate::voice::VoiceUi,
     pub voice_inputs: crate::voice::VoiceInputs,
@@ -473,8 +502,8 @@ impl ConsortApp {
             cx.new(|cx| InputState::new(window, cx).placeholder(placeholder))
         };
         let inputs = Inputs {
-            composer: textarea("Message Consort", (1, 10), window, cx),
-            reply: textarea("Reply to the task", (1, 6), window, cx),
+            composer: cx.new(|cx| crate::ui::parts::message_box("Message Consort", window, cx)),
+            reply: cx.new(|cx| crate::ui::parts::message_box("Reply to the task", window, cx)),
             decision_answer: textarea("Write your answer", (2, 6), window, cx),
             edit: textarea("Message", (1, 10), window, cx),
             name: field("Name", window, cx),
@@ -492,16 +521,21 @@ impl ConsortApp {
                     .masked(true)
             }),
             tag: field("New tag", window, cx),
+            folder: field("/home/me/code", window, cx),
             model_search: field("Search every account", window, cx),
         };
         let ext_inputs = crate::extensions::ExtInputs::new(window, cx);
+        let (check_inputs, check_subscriptions) =
+            crate::ui::command_check::CheckInputs::new(window, cx);
         let (convo_inputs, convo_subscriptions) = crate::convo::ConvoInputs::new(window, cx);
         let (admin, admin_subscriptions) = crate::admin::AdminState::new(&client, demo, window, cx);
         let mut subscriptions = admin_subscriptions;
         let knowledge_inputs = crate::knowledge::KnowledgeInputs::new(window, cx);
         let voice_inputs = crate::voice::VoiceInputs::new(window, cx);
+        let monid_inputs = crate::monid::MonidInputs::new(window, cx);
         subscriptions.extend(knowledge_inputs.subscribe(window, cx));
         subscriptions.extend(convo_subscriptions);
+        subscriptions.extend(check_subscriptions);
         subscriptions.push(cx.subscribe_in(
             &inputs.composer,
             window,
@@ -658,6 +692,8 @@ impl ConsortApp {
         let mut this = ConsortApp {
             client,
             demo,
+            // A demo and a test have no engine. A test sends the updates.
+            dictation: crate::dictation::DictationUi::new(demo || cfg!(test)),
             state: state.clone(),
             page,
             panel: Panel::None,
@@ -681,6 +717,9 @@ impl ConsortApp {
             notices: Notices::default(),
             announced_failures: std::collections::HashSet::new(),
             convo: crate::convo::ConvoState::default(),
+            fallback_ui: crate::fallback::FallbackUi::default(),
+            check_ui: crate::ui::command_check::CheckUi::default(),
+            check_inputs,
             convo_inputs,
             add_account: AddAccountForm::default(),
             tag_entry: None,
@@ -747,6 +786,8 @@ impl ConsortApp {
             knowledge: crate::knowledge::KnowledgeState::default(),
             knowledge_inputs,
             proactivity: crate::proactivity::ProactivityUi::default(),
+            monid_ui: crate::monid::MonidUi::default(),
+            monid_inputs,
             voice: crate::voice::VoiceUi::default(),
             voice_inputs,
             focus: cx.focus_handle(),
@@ -755,6 +796,8 @@ impl ConsortApp {
         };
         let ext_subscriptions = this.subscribe_ext_inputs(window, cx);
         this._subscriptions.extend(ext_subscriptions);
+        let monid_subscriptions = this.subscribe_monid_inputs(window, cx);
+        this._subscriptions.extend(monid_subscriptions);
         // A click on a notification opens its task thread or its channel.
         let weak = cx.weak_entity();
         let handle = window.window_handle();
@@ -802,15 +845,17 @@ impl ConsortApp {
         }
         self.styled_for = Some(key);
         let style = crate::ui::parts::editor_style(t);
-        for area in [
-            &self.inputs.composer,
-            &self.inputs.reply,
-            &self.inputs.decision_answer,
-            &self.inputs.edit,
-        ]
-        .into_iter()
-        .chain(self.knowledge_inputs.areas())
-        .chain(self.voice_inputs.areas())
+        for message_box in [&self.inputs.composer, &self.inputs.reply] {
+            let style = style.clone();
+            message_box.update(cx, |s, cx| {
+                s.set_editor_style(style);
+                cx.notify();
+            });
+        }
+        for area in [&self.inputs.decision_answer, &self.inputs.edit]
+            .into_iter()
+            .chain(self.knowledge_inputs.areas())
+            .chain(self.voice_inputs.areas())
         {
             let style = style.clone();
             area.update(cx, |s, cx| {
@@ -834,8 +879,10 @@ impl ConsortApp {
         ]
         .into_iter()
         .chain(self.ext_inputs.all())
+        .chain(self.check_inputs.all())
         .chain(self.knowledge_inputs.fields())
         .chain(self.voice_inputs.fields())
+        .chain(self.monid_inputs.fields())
         {
             let style = style.clone();
             field.update(cx, |s, cx| {
@@ -1299,6 +1346,10 @@ impl ConsortApp {
                     self.open_thread(task, window, cx);
                 }
             }
+            "dictation-settings" => self.open_settings(SettingsSection::Dictation, cx),
+            screen if screen.starts_with("dictation-") => {
+                crate::dictation::open_dictation_screen(self, screen, window, cx);
+            }
             // A long error and a second one that waits behind it.
             "error" => {
                 let body = "Please look at the failing build and tell me why it fails. ".repeat(24);
@@ -1348,6 +1399,14 @@ impl ConsortApp {
                     self.open_channel(id, window, cx);
                 }
                 self.panel = Panel::Tasks;
+            }
+            "composer-grown" | "composer-full" => {
+                let words = if screen == "composer-full" { 160 } else { 60 };
+                let text = "The composer grows upward as you type. ".repeat(words / 7);
+                self.inputs.composer.update(cx, |input, cx| {
+                    input.set_value(text, window, cx);
+                    input.focus(window, cx);
+                });
             }
             "thread" => {
                 if let Some(id) = sayso {
@@ -1413,6 +1472,62 @@ impl ConsortApp {
             }
             "hub-cards" => {
                 self.open_channel(consort_client::mock_extensions::HIRING.into(), window, cx);
+            }
+            // Monid (ADR 0016) and access requests (ADR 0017), in
+            // house-lights, where the mock keeps them.
+            "monid-cards" | "monid-access" | "monid-task" => {
+                self.open_channel("chn_house_lights".into(), window, cx);
+            }
+            "monid-calls" => {
+                self.open_channel("chn_house_lights".into(), window, cx);
+                for id in [
+                    consort_client::mock_monid::CALL_ELEVEN,
+                    consort_client::mock_monid::CALL_BLOCKED,
+                    consort_client::mock_monid::CALL_STOPPED_BY_MONID,
+                ] {
+                    let _ = self
+                        .client
+                        .run_blocking(consort_client::Command::LoadMonidCall {
+                            call_id: id.into(),
+                        });
+                    self.monid_ui
+                        .open_calls
+                        .insert(crate::monid::call_key("chat", id));
+                }
+                self.state = self.client.state();
+            }
+            "monid-panel" | "monid-view" => {
+                self.open_channel_connectors("chn_house_lights".into(), window, cx);
+                if screen == "monid-view" {
+                    let _ = self
+                        .client
+                        .run_blocking(consort_client::Command::LoadMonidCalls {
+                            channel_id: "chn_house_lights".into(),
+                        });
+                    self.state = self.client.state();
+                    self.open_monid_panel(window, cx);
+                }
+            }
+            "monid-settings" => self.open_monid_page(window, cx),
+            "monid-add" | "monid-no-key" => {
+                self.open_settings(SettingsSection::Connectors, cx);
+                if screen == "monid-add" {
+                    self.open_monid_key_dialog(false, window, cx);
+                }
+            }
+            "monid-offer" => {
+                self.open_settings(SettingsSection::Connectors, cx);
+                self.open_dialog(Dialog::AddConnector, window, cx);
+            }
+            "monid-routines" => self.open_settings(SettingsSection::Routines, cx),
+            "monid-routine" => {
+                self.open_settings(SettingsSection::Routines, cx);
+                self.open_routine_in_settings("rtn_sunset_check", cx);
+            }
+            "monid-full-access" => {
+                self.open_channel("chn_house_lights".into(), window, cx);
+                self.open_new_task(window, cx);
+                self.convo.new_task.approval_mode = consort_client::ApprovalMode::FullAccess;
             }
             "account-settings" => {
                 self.open_settings(SettingsSection::Workers, cx);
@@ -1901,7 +2016,7 @@ impl ConsortApp {
     /// Enter in a field submits the open dialog or the onboarding form. A
     /// dialog that destroys something, or that asks for many lines, does not
     /// take Enter: its button does.
-    fn submit_on_enter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn submit_on_enter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.dialog.is_some() {
             let confirm = self.dialog_confirm.borrow().clone();
             if let Some(confirm) = confirm {
@@ -1930,7 +2045,7 @@ impl ConsortApp {
             || matches!(self.dialog, Some(Dialog::AddAccount(_)))
             || self
                 .state
-                .workers
+                .session_host
                 .iter()
                 .flat_map(|w| w.tools.iter())
                 .any(|t| t.state == consort_client::ToolState::Installing)
@@ -2124,17 +2239,12 @@ impl ConsortApp {
     /// Loads the ACP registry once, when an account of a registry agent
     /// needs its logo. The client does nothing when it has the registry.
     pub fn load_registry_for_logos(&mut self, cx: &mut Context<Self>) {
-        let needed = self
-            .state
-            .workers
-            .iter()
-            .flat_map(|w| w.accounts.iter())
-            .any(|a| {
-                matches!(
-                    a.logo,
-                    consort_client::ProviderLogo::Registry { svg: None, .. }
-                )
-            });
+        let needed = self.state.accounts().map(|(_, a)| a).any(|a| {
+            matches!(
+                a.logo,
+                consort_client::ProviderLogo::Registry { svg: None, .. }
+            )
+        });
         if needed && self.state.acp_registry.load == consort_client::RegistryLoad::NotLoaded {
             let client = self.client.clone();
             cx.spawn(async move |_, _| {
@@ -2186,6 +2296,7 @@ impl ConsortApp {
                 self.set_field(Field::Name, &tags, window, cx);
                 focus_input(&self.inputs.name, window, cx);
             }
+            Dialog::DeepgramKey => self.clear_deepgram_key_field(window, cx),
             Dialog::AddWorker => {
                 self.add_worker_os = crate::ui::add_worker::default_os();
                 self.add_worker_step = crate::ui::add_worker::AddWorkerStep::default();
@@ -2228,6 +2339,15 @@ impl ConsortApp {
                 let client = self.client.clone();
                 self.spawn_command(cx, async move { client.load_acp_registry().await });
             }
+            Dialog::WorkerFolders(_) => {
+                let folder = self.inputs.folder.clone();
+                folder.update(cx, |input, cx| input.set_value("", window, cx));
+                focus_input(&folder, window, cx);
+            }
+            Dialog::Endpoint(id) => {
+                let id = id.clone();
+                self.prepare_endpoint_dialog(id.as_deref(), window, cx);
+            }
             Dialog::RenameAccount(worker_id, account_id) => {
                 let name = self
                     .state
@@ -2255,7 +2375,9 @@ impl ConsortApp {
             | Dialog::ConfirmDeleteNote(..) => {}
             Dialog::ConfirmDeleteChannel(_)
             | Dialog::ConfirmRemoveWorker(_)
+            | Dialog::ConfirmOtherHarnessStep
             | Dialog::ConfirmRemoveAccount(..)
+            | Dialog::ConfirmRemoveEndpoint(_)
             | Dialog::ConfirmOpenLink(_)
             | Dialog::Connect
             | Dialog::ConfirmDisconnect(_)
@@ -2271,6 +2393,14 @@ impl ConsortApp {
                     input.set_value("", window, cx);
                     input.focus(window, cx);
                 });
+            }
+            Dialog::MonidKey => {
+                let input = self.monid_inputs.key.clone();
+                input.update(cx, |input, cx| {
+                    input.set_value("", window, cx);
+                    input.focus(window, cx);
+                });
+                self.load_monid_status(cx);
             }
             Dialog::ComposioKey => {
                 let input = self.ext_inputs.composio_key.clone();
@@ -2326,7 +2456,6 @@ impl ConsortApp {
                 });
             }
             Dialog::AccountSettings(worker_id, account_id) => {
-                self.ext.extras_list_open = false;
                 let name = self
                     .state
                     .worker(worker_id)
@@ -2513,8 +2642,8 @@ impl ConsortApp {
 
     /// Empties a message box after its text went out, if the box still holds
     /// what was sent. Text that the user typed meanwhile stays.
-    pub(crate) fn clear_draft_if_sent(
-        input: &Entity<TextareaState>,
+    pub(crate) fn clear_draft_if_sent<M: gpui_kit::component::input::InputModeKind>(
+        input: &Entity<gpui_kit::base::input::InputBaseState<M>>,
         sent: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -2528,6 +2657,9 @@ impl ConsortApp {
     pub fn send_message(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // No channel has loaded: there is nowhere to send to.
         if self.waiting().is_some() {
+            return;
+        }
+        if self.hold_send_for_dictation(crate::ui::menu::TextTarget::Composer, cx) {
             return;
         }
         let body = self.inputs.composer.read(cx).value().trim().to_owned();
@@ -2572,6 +2704,9 @@ impl ConsortApp {
         let Panel::Thread(task_id) = self.panel.clone() else {
             return;
         };
+        if self.hold_send_for_dictation(crate::ui::menu::TextTarget::Reply, cx) {
+            return;
+        }
         let body = self.inputs.reply.read(cx).value().trim().to_owned();
         let target = consort_client::UploadTarget::Reply {
             task_id: task_id.clone(),
@@ -2695,7 +2830,7 @@ impl ConsortApp {
 
     /// Adds a quote after the draft in a message box. The draft stays.
     fn quote_into(
-        input: &Entity<TextareaState>,
+        input: &Entity<EditorState>,
         text: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -2761,6 +2896,7 @@ impl ConsortApp {
                 self.open_message_thread(message_id, window, cx)
             }
             MenuAction::Convo(action) => self.run_convo(action, window, cx),
+            MenuAction::Fallback(action) => self.run_fallback(action, window, cx),
             MenuAction::EditMessage(message_id, text) => {
                 self.editing = Some(message_id);
                 let end = text.len();
@@ -2851,6 +2987,23 @@ impl ConsortApp {
             }
             MenuAction::ChannelTags(id) | MenuAction::ChannelModel(id) => {
                 self.open_dialog(Dialog::ChannelSettings(id), window, cx)
+            }
+            MenuAction::CheckTools(worker_id) => {
+                self.spawn_command(cx, async move { client.check_tools(worker_id).await });
+                self.show_notice("Checking for updates.".into(), cx);
+            }
+            MenuAction::InstallTool(worker_id, tool) => {
+                self.spawn_command(
+                    cx,
+                    async move { client.install_tool(worker_id, tool).await },
+                )
+            }
+            MenuAction::EditEndpoint(id) => {
+                self.open_dialog(Dialog::Endpoint(Some(id)), window, cx)
+            }
+            MenuAction::TestEndpoint(id) => self.test_saved_endpoint(id, cx),
+            MenuAction::RemoveEndpoint(id) => {
+                self.open_dialog(Dialog::ConfirmRemoveEndpoint(id), window, cx)
             }
             MenuAction::RenameAccount(worker_id, account_id) => {
                 self.open_dialog(Dialog::RenameAccount(worker_id, account_id), window, cx)
@@ -2947,6 +3100,7 @@ impl ConsortApp {
                 self.open_dialog(Dialog::ConfirmDeleteFile(channel_id, path), window, cx)
             }
             MenuAction::Knowledge(action) => self.run_knowledge_menu(action, window, cx),
+            MenuAction::Monid(action) => self.run_monid_action(action, window, cx),
         }
         cx.notify();
     }
@@ -3002,6 +3156,10 @@ impl ConsortApp {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.dictation_key_down(event, window, cx) {
+            cx.stop_propagation();
+            return;
+        }
         let key = event.keystroke.key.as_str();
         if self.effort_key(key, window, cx) {
             cx.stop_propagation();
@@ -3023,7 +3181,11 @@ impl ConsortApp {
                 "down" => menu.step(1),
                 "up" => menu.step(-1),
                 "enter" => {
-                    if let Some(item) = menu.highlighted.and_then(|i| menu.items.get(i)) {
+                    if let Some(item) = menu
+                        .highlighted
+                        .and_then(|i| menu.items.get(i))
+                        .filter(|item| !item.disabled)
+                    {
                         let action = item.action.clone();
                         self.run_menu(action, window, cx);
                     }
@@ -3214,7 +3376,8 @@ impl Render for ConsortApp {
             Page::Settings => self.render_settings(&t, window, cx),
             Page::Main => self.render_main(&t, window, cx),
         };
-        let has_notices = self.notices.visible().next().is_some();
+        let has_notices =
+            self.notices.visible().next().is_some() || self.dictation.notice.is_some();
         let menu = self.menu.clone();
         let picker = self.render_picker(&t, window, cx);
         let picker_tip = self.render_picker_tooltip(&t);
@@ -3225,6 +3388,9 @@ impl Render for ConsortApp {
             .key_context("Consort")
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::on_key_down))
+            .on_key_up(cx.listener(|this, event: &gpui_kit::KeyUpEvent, _, cx| {
+                this.dictation_key_up(event, cx);
+            }))
             .on_action(
                 cx.listener(|this, _: &crate::convo::ShowAbout, window, cx| {
                     this.open_dialog(Dialog::About, window, cx)
@@ -3247,6 +3413,7 @@ impl Render for ConsortApp {
                 div()
                     .relative()
                     .flex_1()
+                    .min_w_0()
                     .min_h_0()
                     .w_full()
                     .child(body)

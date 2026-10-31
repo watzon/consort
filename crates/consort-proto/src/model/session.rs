@@ -67,6 +67,10 @@ pub struct Session {
     pub task_id: Option<TaskId>,
     /// The worker. A session never moves to another worker.
     pub worker_id: WorkerId,
+    /// The execution worker where the tools of a task session run. `None`
+    /// for a coordinator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_worker_id: Option<WorkerId>,
     /// The harness account on that worker.
     pub account_id: AccountId,
     /// `claude`, `codex`, `pi`, `opencode` or `acp:<agent-id>`.
@@ -162,6 +166,49 @@ pub struct ReasoningPayload {
     pub text: String,
 }
 
+/// What the command check answered about one command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandCheckVerdict {
+    /// The command ran with no question to the user.
+    Allowed,
+    /// The command did not run, and the agent got the reason.
+    Blocked,
+    /// The check did not answer, or it was not sure. The user decides.
+    Asked,
+}
+
+/// The rule that a decision model tested. A decision model gives no reason.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandCheckRule {
+    /// The question.
+    pub question: String,
+    /// The answer.
+    pub answer: String,
+    /// The confidence of the answer, in percent.
+    pub confidence: u8,
+    /// The confidence limit, in percent.
+    pub limit: u8,
+}
+
+/// The result of the command check, for the timeline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandCheckOutcome {
+    /// What it answered.
+    pub verdict: CommandCheckVerdict,
+    /// The source, such as `Haiku 5.5 of Claude Work`.
+    pub source: String,
+    /// The reason from a chat model or an account model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The rule from a decision model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule: Option<CommandCheckRule>,
+    /// The error, when the check failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 /// The payload of a `command` item.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandPayload {
@@ -179,6 +226,9 @@ pub struct CommandPayload {
     pub exit_code: Option<i32>,
     /// How long it ran, in milliseconds.
     pub duration_ms: Option<u64>,
+    /// What the command check answered, when it ran.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check: Option<CommandCheckOutcome>,
 }
 
 impl CommandPayload {
@@ -239,7 +289,7 @@ pub struct FileChangePayload {
 /// The payload of a `tool_call` item.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCallPayload {
-    /// The MCP server name, when the tool comes from one. `hub` for hub tools.
+    /// The MCP server name, when the tool comes from one. `consort` for the Consort tools.
     pub server: Option<String>,
     /// The tool name.
     pub tool: String,
@@ -393,6 +443,7 @@ mod tests {
             session_id: "ses_00000000-0000-0000-0000-000000000002".parse().unwrap(),
             turn_id: TurnId::new("t1"),
             payload: ItemPayload::Command(CommandPayload {
+                check: None,
                 command: "cargo test".into(),
                 cwd: Some("/w".into()),
                 output: "ok".into(),

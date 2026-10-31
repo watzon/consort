@@ -270,6 +270,21 @@ impl TurnError {
         self.codex_error_info.as_ref().and_then(Value::as_str) == Some("unauthorized")
     }
 
+    /// Whether Codex says that the connection to the provider failed or
+    /// closed. These kinds are objects, such as
+    /// `{"httpConnectionFailed": {"httpStatusCode": 503}}`.
+    fn is_connection_failure(&self) -> bool {
+        self.codex_error_info.as_ref().is_some_and(|info| {
+            [
+                "httpConnectionFailed",
+                "responseStreamConnectionFailed",
+                "responseStreamDisconnected",
+            ]
+            .iter()
+            .any(|key| info.get(key).is_some())
+        })
+    }
+
     /// The kind of the failure. `codexErrorInfo` is structured data, so it
     /// decides first: `usageLimitExceeded` and `rateLimitExceeded` are a
     /// rate limit, and `unauthorized` is an expired sign-in. Without a
@@ -290,6 +305,14 @@ impl TurnError {
             },
             Some("unauthorized") => crate::FailureInfo {
                 kind: TurnErrorKind::ExpiredSignIn,
+                resets_at: None,
+            },
+            Some("serverOverloaded" | "internalServerError") => crate::FailureInfo {
+                kind: TurnErrorKind::ProviderOutage,
+                resets_at: None,
+            },
+            _ if self.is_connection_failure() => crate::FailureInfo {
+                kind: TurnErrorKind::ProviderOutage,
                 resets_at: None,
             },
             _ => by_text(),

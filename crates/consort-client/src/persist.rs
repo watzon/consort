@@ -817,6 +817,8 @@ mod tests {
             review_summary: Some("Ready.".into()),
             resolved_at: None,
             session_ended: false,
+            monid_calls: 0,
+            monid_cost_micros: 0,
             archived_at: None,
             created_at: at(1),
             updated_at: at(2),
@@ -825,6 +827,7 @@ mod tests {
 
     fn worker(id: WorkerId) -> Worker {
         Worker {
+            kind: Default::default(),
             id,
             name: "bigboi".into(),
             hostname: "bigboi.local".into(),
@@ -905,6 +908,7 @@ mod tests {
             next_run_at: Some(at(100)),
             last_run_at: None,
             last_run_status: None,
+            monid: None,
             kind: Default::default(),
             origin: Default::default(),
             created_at: None,
@@ -966,6 +970,8 @@ mod tests {
             request_id: RequestId::new("req_1"),
             summary: "Codex wants to run a command.".into(),
             details: ApprovalDetails::Command {
+                blocked: Vec::new(),
+                check_note: None,
                 command: "cargo build".into(),
                 cwd: Some("C:\\Code\\sayso".into()),
             },
@@ -1063,11 +1069,11 @@ mod tests {
         cache.channels_loaded.insert(channel_id.to_string());
         cache.loaded_threads.insert(card.to_string());
         cache.preferences = Preferences {
-            account_fallback: true,
             favorite_models: vec![FavoriteModel {
                 account_label: "Claude Work".into(),
                 model: "opus-5.5".into(),
             }],
+            ..Preferences::default()
         };
         let connection =
             test_entities::connection("Work Gmail", consort_proto::model::UseIn::EveryChannel, 4);

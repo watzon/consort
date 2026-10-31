@@ -2,11 +2,13 @@
 //! status transitions and message delivery to a task session.
 
 use consort_proto::ids::{ChannelId, MessageId, TaskId, WorkerId};
-use consort_proto::model::{Author, BlobRef, Message, MessageKind, Session, SessionRole, Task};
+use consort_proto::model::{
+    Author, BlobRef, CoordinatorBlocked, Message, MessageKind, Session, SessionRole, Task,
+};
+use consort_proto::session_host_link::{HubToSessionHost, SessionSteer, SessionTurn, TurnInput};
 use consort_proto::status::{Actor, TaskStatus};
 use consort_proto::tools::MessageDelivery;
 use consort_proto::turn_input::WakeEvent;
-use consort_proto::worker_link::{HubToWorker, SessionSteer, SessionTurn, TurnInput};
 
 use crate::error::{HubError, Result};
 use crate::hub::Hub;
@@ -31,6 +33,9 @@ pub(crate) struct TurnFailure {
     pub account: Option<String>,
     /// The error text of the worker, unchanged.
     pub raw: Option<String>,
+    /// What the fallback path tried, when no entry could take the work. The
+    /// error card lists one line for each entry.
+    pub path: Vec<consort_proto::model::PathLine>,
 }
 
 /// The body of a `turn_failed` notice. `text` is the line that older
@@ -51,6 +56,11 @@ pub(crate) fn turn_failed_body(text: &str, failure: &TurnFailure) -> String {
         }
         if let Some(raw) = &failure.raw {
             object.insert("raw".to_owned(), raw.clone().into());
+        }
+        if !failure.path.is_empty()
+            && let Ok(value) = serde_json::to_value(&failure.path)
+        {
+            object.insert("path".to_owned(), value);
         }
     }
     body.to_string()
@@ -102,6 +112,28 @@ impl Tx<'_> {
         self.insert_message(new)
     }
 
+    /// Sets or clears the live state "the assistant cannot answer" of a
+    /// channel (see [`CoordinatorBlocked`]). It is not a message: it never
+    /// stays in the timeline. A write that changes nothing saves nothing, so
+    /// a cause that lasts sends one feed entry, however many times the hub
+    /// tries again.
+    pub(crate) fn set_coordinator_blocked(
+        &mut self,
+        channel_id: ChannelId,
+        blocked: Option<CoordinatorBlocked>,
+    ) -> Result<()> {
+        let mut channel = crate::store::conversation::channel_or_404(self.db(), channel_id)?;
+        let blocked = blocked.map(|mut b| {
+            b.reason = cut_text(&b.reason, NOTICE_TEXT_MAX_BYTES);
+            Box::new(b)
+        });
+        if channel.coordinator_blocked == blocked {
+            return Ok(());
+        }
+        channel.coordinator_blocked = blocked;
+        self.save_channel(&channel)
+    }
+
     /// Posts in the thread of a task card.
     pub fn post_in_task_thread(
         &mut self,
@@ -131,6 +163,30 @@ pub(crate) fn transition(
     reason: Option<String>,
     wake_text: Option<String>,
 ) -> Result<bool> {
+    change_status(tx, task, to, actor, reason, wake_text, true)
+}
+
+/// Moves a task to Needs input for an approval. The coordinator does not wake:
+/// the user sees the card and gets the notification, and the coordinator can
+/// neither answer an approval nor add to it.
+pub(crate) fn wait_for_approval(
+    tx: &mut Tx<'_>,
+    task: &mut Task,
+    actor: Actor,
+    reason: Option<String>,
+) -> Result<bool> {
+    change_status(tx, task, TaskStatus::NeedsInput, actor, reason, None, false)
+}
+
+fn change_status(
+    tx: &mut Tx<'_>,
+    task: &mut Task,
+    to: TaskStatus,
+    actor: Actor,
+    reason: Option<String>,
+    wake_text: Option<String>,
+    wake: bool,
+) -> Result<bool> {
     // A reason often holds text from a worker, so it is cut, not refused.
     let reason = reason.map(|r| cut_text(&r, NOTICE_TEXT_MAX_BYTES));
     if task.status == to {
@@ -148,7 +204,7 @@ pub(crate) fn transition(
     task.resolved_at = (to == TaskStatus::Resolved).then_some(now);
     // For stale-task nudges: when the task entered this status.
     tx.note_task_status(task)?;
-    if to.wakes_coordinator() {
+    if wake && to.wakes_coordinator() {
         let text = wake_text
             .or_else(|| task.status_reason.clone())
             .or_else(|| task.review_summary.clone())
@@ -330,7 +386,7 @@ fn deliver(
     let delivery = if runtime.turn_open && online && steer && may_steer {
         tx.queue_command(
             session.worker_id,
-            &HubToWorker::SessionSteer(SessionSteer { session_id, turn }),
+            &HubToSessionHost::SessionSteer(SessionSteer { session_id, turn }),
         )?;
         MessageDelivery::Steer
     } else if runtime.turn_open {
@@ -341,7 +397,7 @@ fn deliver(
             tx.channel_files_for_turn(session_id, task.channel_id, Some(task_id))?;
         tx.queue_command(
             session.worker_id,
-            &HubToWorker::SessionTurn(SessionTurn {
+            &HubToSessionHost::SessionTurn(SessionTurn {
                 session_id,
                 turn,
                 channel_files,

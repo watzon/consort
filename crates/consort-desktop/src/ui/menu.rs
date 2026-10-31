@@ -25,6 +25,8 @@ pub enum MenuAction {
     /// Phase 4: reactions, groups, tasks and channel settings. See
     /// `crate::convo`.
     Convo(crate::convo::ConvoAction),
+    /// A step of the fallback path, or a way back from a fallback.
+    Fallback(crate::fallback::FallbackAction),
     /// Edit a message in place: its ID and its text.
     EditMessage(String, String),
     DeleteMessage(String),
@@ -56,7 +58,17 @@ pub enum MenuAction {
     /// The model picker for a channel's assistant.
     ChannelModel(String),
     /// The worker ID and the account ID.
+    /// Check for tool updates on the session host.
+    CheckTools(String),
+    /// Install a tool on the session host: its row and the tool.
+    InstallTool(String, String),
     RenameAccount(String, String),
+    /// Edit an API endpoint, by its ID.
+    EditEndpoint(String),
+    /// Test an API endpoint, by its ID.
+    TestEndpoint(String),
+    /// Remove an API endpoint, by its ID.
+    RemoveEndpoint(String),
     SignOutAccount(String, String),
     RemoveAccount(String, String),
     PauseWorker(String, bool),
@@ -111,6 +123,8 @@ pub enum MenuAction {
     DeleteFile(String, String),
     /// A routine or memory item, or a select of their dialogs.
     Knowledge(crate::knowledge::KnowledgeAction),
+    /// A Monid call row, a Monid tool row, or a button of a Monid card.
+    Monid(crate::monid::MonidAction),
 }
 
 /// The menu of an attachment in a message or a thread post: Open, Save, and
@@ -222,7 +236,38 @@ pub fn worker_menu(worker_id: &str, paused: bool) -> Vec<MenuItem> {
     ]
 }
 
-/// The menu of an account row in Settings > Workers: Account settings,
+/// The menu of a tool row in Settings > Providers: Check for updates, Copy
+/// install path and Reinstall. A tool that is not installed has only Install.
+pub fn tool_menu(worker_id: &str, tool_id: &str, folder: &str, missing: bool) -> Vec<MenuItem> {
+    let install = MenuAction::InstallTool(worker_id.to_owned(), tool_id.to_owned());
+    if missing {
+        return vec![MenuItem::new("Install", install)];
+    }
+    vec![
+        MenuItem::new(
+            "Check for updates",
+            MenuAction::CheckTools(worker_id.to_owned()),
+        ),
+        MenuItem::new(
+            "Copy install path",
+            MenuAction::Copy(format!("{folder}/{tool_id}")),
+        ),
+        MenuItem::new("Reinstall", install),
+    ]
+}
+
+/// The menu of an endpoint row in Settings > Providers: Edit, Copy base URL,
+/// Test connection, then Remove after a line.
+pub fn endpoint_menu(id: &str, base_url: &str) -> Vec<MenuItem> {
+    vec![
+        MenuItem::new("Edit", MenuAction::EditEndpoint(id.to_owned())),
+        MenuItem::new("Copy base URL", MenuAction::Copy(base_url.to_owned())),
+        MenuItem::new("Test connection", MenuAction::TestEndpoint(id.to_owned())),
+        MenuItem::new("Remove", MenuAction::RemoveEndpoint(id.to_owned())).separated(),
+    ]
+}
+
+/// The menu of an account row in Settings > Providers: Account settings,
 /// Rename, Sign out and Remove. Sign out is there only for an account that is signed in or has a
 /// saved key.
 pub fn account_menu(worker_id: &str, account_id: &str, can_sign_out: bool) -> Vec<MenuItem> {
@@ -301,6 +346,11 @@ pub struct MenuItem {
     pub checked: bool,
     pub icon: Option<&'static str>,
     pub separator_before: bool,
+    /// The item shows dimmed and does nothing. `trailing` may say why.
+    pub disabled: bool,
+    /// Quiet words at the right end of the item, such as "Available at
+    /// 4:10 PM".
+    pub trailing: Option<SharedString>,
 }
 
 impl MenuItem {
@@ -312,7 +362,21 @@ impl MenuItem {
             checked: false,
             icon: None,
             separator_before: false,
+            disabled: false,
+            trailing: None,
         }
+    }
+
+    /// Dims the item and makes it do nothing.
+    pub fn disabled(mut self, disabled: bool) -> MenuItem {
+        self.disabled = disabled;
+        self
+    }
+
+    /// Quiet words at the right end of the item.
+    pub fn trailing(mut self, words: impl Into<SharedString>) -> MenuItem {
+        self.trailing = Some(words.into());
+        self
     }
 
     pub fn danger(mut self) -> MenuItem {
@@ -354,6 +418,17 @@ pub struct OpenMenu {
     pub highlighted: Option<usize>,
     /// The quick emoji row at the top of a message menu.
     pub reactions: Option<crate::convo::ReactionBar>,
+    /// A title and a few words above the items, such as "On a fallback".
+    pub header: Option<MenuHeader>,
+}
+
+/// The words at the top of a menu.
+#[derive(Clone, Debug)]
+pub struct MenuHeader {
+    pub title: SharedString,
+    pub body: SharedString,
+    /// A dot before the title, in the color of the fallback marker.
+    pub marker: bool,
 }
 
 impl OpenMenu {
@@ -364,6 +439,7 @@ impl OpenMenu {
             width: None,
             highlighted: None,
             reactions: None,
+            header: None,
         }
     }
 
@@ -374,6 +450,7 @@ impl OpenMenu {
             width: match_width.then_some(bounds.size.width),
             highlighted: None,
             reactions: None,
+            header: None,
         }
     }
 
@@ -383,11 +460,18 @@ impl OpenMenu {
         if len == 0 {
             return;
         }
-        let next = match self.highlighted {
+        let mut next = match self.highlighted {
             None if delta > 0 => 0,
             None => len - 1,
             Some(i) => (i as isize + delta).rem_euclid(len),
         };
+        // A disabled item cannot take the highlight.
+        for _ in 0..len {
+            if !self.items[next as usize].disabled {
+                break;
+            }
+            next = (next + delta.signum()).rem_euclid(len);
+        }
         self.highlighted = Some(next as usize);
     }
 }
@@ -395,7 +479,7 @@ impl OpenMenu {
 /// The bounds of named triggers, recorded while they paint, so a select can
 /// open under its trigger.
 #[derive(Clone, Default)]
-pub struct TriggerBounds(Rc<RefCell<HashMap<&'static str, Bounds<Pixels>>>>);
+pub struct TriggerBounds(Rc<RefCell<HashMap<SharedString, Bounds<Pixels>>>>);
 
 impl TriggerBounds {
     pub fn get(&self, id: &str) -> Option<Bounds<Pixels>> {
@@ -403,11 +487,12 @@ impl TriggerBounds {
     }
 
     /// An invisible child that records the bounds of its parent.
-    pub fn track(&self, id: &'static str) -> impl IntoElement {
+    pub fn track(&self, id: impl Into<SharedString>) -> impl IntoElement {
         let store = self.0.clone();
+        let id = id.into();
         canvas(
             move |bounds, _, _| {
-                store.borrow_mut().insert(id, bounds);
+                store.borrow_mut().insert(id.clone(), bounds);
             },
             |_, _, _, _| {},
         )
@@ -461,6 +546,53 @@ pub fn render_menu<V: 'static>(
                     .bg(c.border_subtle),
             );
     }
+    if let Some(header) = &menu.header {
+        list = list
+            .w(t.component.convo.menu_width + t.space.xxl)
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(t.space.xs)
+                    .px(t.space.sm)
+                    .pt(t.space.sm)
+                    .pb(t.space.sm + t.space.xxs)
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(t.space.xs + t.space.xxs)
+                            .when(header.marker, |d| {
+                                d.child(
+                                    div()
+                                        .size(t.component.state_dot)
+                                        .flex_none()
+                                        .rounded(t.radius.full)
+                                        .bg(c.accent_text),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .type_style(t.text.ui_strong)
+                                    .text_color(c.text_primary)
+                                    .child(header.title.clone()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .type_style(t.text.caption)
+                            .text_color(c.text_secondary)
+                            .child(header.body.clone()),
+                    ),
+            )
+            .child(
+                div()
+                    .mb(t.space.xs)
+                    .mx(t.space.sm)
+                    .h(t.border_width)
+                    .bg(c.border_subtle),
+            );
+    }
     for (ix, item) in menu.items.iter().enumerate() {
         if item.separator_before && ix > 0 {
             list = list.child(
@@ -478,7 +610,8 @@ pub fn render_menu<V: 'static>(
         } else {
             c.text_primary
         };
-        let highlighted = menu.highlighted == Some(ix);
+        let disabled = item.disabled;
+        let highlighted = menu.highlighted == Some(ix) && !disabled;
         let hover = if item.danger {
             c.tint_failed
         } else {
@@ -493,19 +626,39 @@ pub fn render_menu<V: 'static>(
                 .h(t.space.xxl - t.space.xs)
                 .px(t.space.sm)
                 .rounded(t.radius.md)
-                .text_color(color)
-                .cursor_pointer()
-                .when(highlighted, |d| d.bg(hover))
-                .hover(move |s| s.bg(hover))
+                .text_color(if disabled { c.text_tertiary } else { color })
+                .when(!disabled, |d| {
+                    d.cursor_pointer()
+                        .when(highlighted, |d| d.bg(hover))
+                        .hover(move |s| s.bg(hover))
+                })
                 .when_some(item.icon, |d, name| {
                     d.child(icon(name, t.icon.size, c.text_secondary))
                 })
-                .child(div().flex_1().whitespace_nowrap().child(item.label.clone()))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .whitespace_nowrap()
+                        .child(item.label.clone()),
+                )
+                .when_some(item.trailing.clone(), |d, words| {
+                    d.child(
+                        div()
+                            .flex_none()
+                            .whitespace_nowrap()
+                            .type_style(t.text.caption)
+                            .text_color(c.text_tertiary)
+                            .child(words),
+                    )
+                })
                 .when(item.checked, |d| {
                     d.child(icon("check", t.icon.dense, c.accent_text))
                 })
                 .on_click(cx.listener(move |this, _, window, cx| {
-                    pick(this, action.clone(), window, cx);
+                    if !disabled {
+                        pick(this, action.clone(), window, cx);
+                    }
                 })),
         );
     }
@@ -686,6 +839,35 @@ mod tests {
         assert_eq!(
             labels(&archived_channel_menu("chn_1")),
             ["Unarchive", "Delete"]
+        );
+    }
+
+    #[test]
+    fn the_tool_menu_keeps_the_names_and_the_order() {
+        let names: Vec<_> = tool_menu("w", "codex", "~/tools", false)
+            .iter()
+            .map(|i| i.label.to_string())
+            .collect();
+        assert_eq!(
+            names,
+            ["Check for updates", "Copy install path", "Reinstall"]
+        );
+        let missing: Vec<_> = tool_menu("w", "codex", "~/tools", true)
+            .iter()
+            .map(|i| i.label.to_string())
+            .collect();
+        assert_eq!(missing, ["Install"]);
+    }
+
+    #[test]
+    fn the_endpoint_menu_keeps_the_names_and_the_order() {
+        let names: Vec<_> = endpoint_menu("end_1", "https://x")
+            .iter()
+            .map(|i| i.label.to_string())
+            .collect();
+        assert_eq!(
+            names,
+            ["Edit", "Copy base URL", "Test connection", "Remove"]
         );
     }
 

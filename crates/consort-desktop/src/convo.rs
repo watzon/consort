@@ -1261,23 +1261,6 @@ impl ConsortApp {
     }
 }
 
-/// How to dictate into the composer, for its tooltip. Consort has no voice
-/// button of its own: the system's dictation types into the focused box
-/// through GPUI's text input, and starting it from a button needs `unsafe`
-/// AppKit calls (see `docs/notes/phase4.md`). `None` on a system with no
-/// built-in dictation.
-pub fn dictation_hint() -> Option<&'static str> {
-    if cfg!(target_os = "macos") {
-        Some(
-            "To dictate, press the dictation shortcut of macOS. Set it in System Settings, Keyboard, Dictation.",
-        )
-    } else if cfg!(target_os = "windows") {
-        Some("To dictate, press Windows key+H.")
-    } else {
-        None
-    }
-}
-
 /// The group IDs after `dragged` moves before `before`, or to the end.
 pub fn reorder(mut ids: Vec<String>, dragged: &str, before: Option<&str>) -> Vec<String> {
     let Some(from) = ids.iter().position(|id| id == dragged) else {

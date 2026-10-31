@@ -8,10 +8,10 @@ use crate::common::*;
 use consort_proto::client_api::{MessageSend, SnapshotScope, SyncSnapshot, TaskCreate, TaskGet};
 use consort_proto::ids::{ItemId, MessageId};
 use consort_proto::model::{ItemStatus, SessionState};
+use consort_proto::session_host_link::TurnEndReason;
 use consort_proto::status::TaskStatus;
 use consort_proto::time::Timestamp;
 use consort_proto::tools::{FetchThreadResult, ReadTaskResult};
-use consort_proto::worker_link::TurnEndReason;
 use serde_json::json;
 
 /// Finding 3: 34 tasks with 31 KiB briefs made both snapshots fail with
@@ -177,7 +177,7 @@ async fn read_task_pages_long_items() {
             &format!("{i}{}", "y".repeat(150 * 1024)),
             ItemStatus::Completed,
         );
-        if let consort_proto::worker_link::SessionEvent::Item(item) = &event {
+        if let consort_proto::session_host_link::SessionEvent::Item(item) = &event {
             items.push(item.id);
         }
         world.worker.send_events(sid, vec![event]).await;

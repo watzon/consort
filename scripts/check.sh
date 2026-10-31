@@ -21,7 +21,8 @@ step() { printf '\n== %s\n' "$1"; }
 start=$SECONDS
 
 step "Format"
-cargo fmt --all --check
+# Without --all: --all also checks path dependencies, and Sayso is one for now.
+cargo fmt --check
 
 step "Lint"
 cargo clippy "${scope[@]}" --all-targets --quiet -- -D warnings

@@ -19,6 +19,8 @@ pub enum TurnErrorKindView {
     RateLimit,
     /// The sign-in of the account ended.
     ExpiredSignIn,
+    /// The provider was down or overloaded for three tries.
+    ProviderOutage,
     /// The worker restarted during the turn.
     WorkerRestarted,
     /// Anything else, and every notice from before the kinds existed.
@@ -31,6 +33,7 @@ impl From<TurnErrorKind> for TurnErrorKindView {
         match kind {
             TurnErrorKind::RateLimit => Self::RateLimit,
             TurnErrorKind::ExpiredSignIn => Self::ExpiredSignIn,
+            TurnErrorKind::ProviderOutage => Self::ProviderOutage,
             TurnErrorKind::WorkerRestarted => Self::WorkerRestarted,
             TurnErrorKind::Unknown => Self::Unknown,
         }
@@ -45,6 +48,8 @@ pub enum ErrorAction {
     ChooseAnotherModel,
     /// Open the account of the failed turn, to sign in again.
     SignInAgain,
+    /// Open Settings > Models, where the user edits the fallback path.
+    EditPath,
     /// `Client::try_again` with the target of the card.
     TryAgain,
 }
@@ -55,6 +60,7 @@ impl ErrorAction {
         match self {
             Self::ChooseAnotherModel => "Choose another model",
             Self::SignInAgain => "Sign in again",
+            Self::EditPath => "Edit path",
             Self::TryAgain => "Try again",
         }
     }
@@ -91,6 +97,9 @@ pub struct ErrorCardView {
     pub account: Option<String>,
     /// When a limit resets, in Unix milliseconds.
     pub resets_at: Option<i64>,
+    /// One line for each step that the path tried or skipped. Empty when the
+    /// hub sent no path. The card then reads as an error of one account.
+    pub path: Vec<crate::fallback::PathLineView>,
     /// What `Client::try_again` does. `None` when nothing can be tried
     /// again.
     pub try_again: Option<TryAgainTarget>,
@@ -109,6 +118,8 @@ pub struct TurnFailed {
     pub account: Option<String>,
     /// The raw text of the worker, or the notice text of an old notice.
     pub raw: String,
+    /// The lines of the path report, as the hub sent them.
+    pub path: Vec<consort_proto::model::PathLine>,
 }
 
 /// Reads a notice body. `None` when the body is not a `turn_failed`
@@ -129,6 +140,8 @@ pub fn parse_turn_failed(body: &str) -> Option<TurnFailed> {
         account: Option<String>,
         #[serde(default)]
         raw: Option<String>,
+        #[serde(default)]
+        path: Vec<consort_proto::model::PathLine>,
     }
     let parsed: Parsed = serde_json::from_str(body).ok()?;
     if parsed.kind != "turn_failed" {
@@ -147,12 +160,14 @@ pub fn parse_turn_failed(body: &str) -> Option<TurnFailed> {
             .raw
             .filter(|r| !r.trim().is_empty())
             .unwrap_or(parsed.text),
+        path: parsed.path,
     })
 }
 
 /// The title of a card.
 pub fn title(kind: TurnErrorKindView, account: Option<&str>) -> String {
     match (kind, account) {
+        (TurnErrorKindView::ProviderOutage, _) => "The model provider did not answer".to_owned(),
         (TurnErrorKindView::RateLimit, Some(a)) => format!("{a} reached its weekly limit"),
         (TurnErrorKindView::RateLimit, None) => "The account reached its weekly limit".to_owned(),
         (TurnErrorKindView::ExpiredSignIn, Some(a)) => format!("{a} needs a new sign-in"),
@@ -211,6 +226,11 @@ pub fn explanation(
             "The sign-in of {} ended. Sign in again, then try again. You can also choose another model.",
             account.unwrap_or("the account")
         ),
+        TurnErrorKindView::ProviderOutage => format!(
+            "The provider of {} was down or overloaded for {} tries. Choose another model to go on now, or try again later.",
+            account.unwrap_or("the account"),
+            consort_proto::model::OUTAGE_TRIES
+        ),
         TurnErrorKindView::WorkerRestarted => {
             "The worker stopped and started again, so this turn did not finish. Try again."
                 .to_owned()
@@ -226,7 +246,7 @@ pub fn explanation(
 /// nothing to try again.
 pub fn actions(kind: TurnErrorKindView, can_try_again: bool) -> Vec<ErrorAction> {
     let mut actions = match kind {
-        TurnErrorKindView::RateLimit => {
+        TurnErrorKindView::RateLimit | TurnErrorKindView::ProviderOutage => {
             vec![ErrorAction::ChooseAnotherModel, ErrorAction::TryAgain]
         }
         TurnErrorKindView::ExpiredSignIn => vec![
@@ -252,20 +272,54 @@ pub fn error_card(
     quiet: bool,
     now: i64,
 ) -> ErrorCardView {
-    let title = title(failed.kind, failed.account.as_deref());
-    ErrorCardView {
-        kind: failed.kind,
-        explanation: explanation(
+    // A turn that no step of the path could answer has its own words.
+    let path_failed = !failed.path.is_empty()
+        && matches!(
+            failed.kind,
+            TurnErrorKindView::RateLimit | TurnErrorKindView::ProviderOutage
+        );
+    let title = if path_failed {
+        "No model in the path could answer".to_owned()
+    } else {
+        title(failed.kind, failed.account.as_deref())
+    };
+    let explanation = if path_failed {
+        let who = if matches!(try_again, Some(TryAgainTarget::Task { .. })) {
+            "The task stopped"
+        } else {
+            "Your message was not answered"
+        };
+        format!("{who}. Consort tried every step. Choose a model to go on now, or edit the path.")
+    } else {
+        explanation(
             failed.kind,
             failed.account.as_deref(),
             failed.resets_at,
             now,
+        )
+    };
+    let mut actions = if quiet {
+        Vec::new()
+    } else {
+        actions(failed.kind, try_again.is_some())
+    };
+    if path_failed
+        && !quiet
+        && let Some(at) = actions
+            .iter()
+            .position(|a| *a == ErrorAction::ChooseAnotherModel)
+    {
+        actions.insert(at + 1, ErrorAction::EditPath);
+    }
+    ErrorCardView {
+        kind: failed.kind,
+        path: crate::fallback::path_line_views(
+            &failed.path,
+            now,
+            matches!(try_again, Some(TryAgainTarget::Task { .. })),
         ),
-        actions: if quiet {
-            Vec::new()
-        } else {
-            actions(failed.kind, try_again.is_some())
-        },
+        explanation,
+        actions,
         details: failed.raw.clone(),
         account: failed.account.clone(),
         resets_at: failed.resets_at,
@@ -286,6 +340,7 @@ mod tests {
             resets_at: None,
             account: Some("Claude Work".to_owned()),
             raw: "raw text".to_owned(),
+            path: Vec::new(),
         }
     }
 
@@ -320,6 +375,19 @@ mod tests {
             title(TurnErrorKindView::ExpiredSignIn, None),
             "The account needs a new sign-in"
         );
+    }
+
+    #[test]
+    fn a_provider_outage_has_its_own_words_and_actions() {
+        let body = r#"{"kind":"turn_failed","text":"x","error_kind":"provider_outage","account":"Codex Work"}"#;
+        let failed = parse_turn_failed(body).unwrap();
+        assert_eq!(failed.kind, TurnErrorKindView::ProviderOutage);
+        let card = error_card(&failed, None, false, 0);
+        assert_eq!(card.title, "The model provider did not answer");
+        assert!(card.explanation.contains("3 tries"));
+        assert_eq!(card.actions, [ErrorAction::ChooseAnotherModel]);
+        assert!(card.path.is_empty());
+        assert_eq!(ErrorAction::EditPath.label(), "Edit path");
     }
 
     #[test]

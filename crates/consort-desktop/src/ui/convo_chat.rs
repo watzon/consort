@@ -78,6 +78,7 @@ pub fn render_reaction_bar<V: 'static>(
             .id("quick-emoji-more")
             .flex()
             .flex_1()
+            .min_w_0()
             .items_center()
             .justify_center()
             .h(v.quick_emoji)
@@ -306,7 +307,7 @@ impl ConsortApp {
             }
         }
         if let Some(feedback) = feedback {
-            row = row.child(div().flex_1()).child(feedback);
+            row = row.child(div().flex_1().min_w_0()).child(feedback);
         }
         lane.child(row).into_any_element()
     }
@@ -620,7 +621,13 @@ impl ConsortApp {
                     .items_center()
                     .gap(t.space.sm)
                     .child(text(reply_count_label(count), detail(t), c.text_tertiary))
-                    .child(div().flex_1().h(t.border_width).bg(c.border_subtle)),
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .h(t.border_width)
+                            .bg(c.border_subtle),
+                    ),
             );
         }
         let replies = thread.map(|t| t.replies).unwrap_or_default();
@@ -746,6 +753,7 @@ impl ConsortApp {
                 div()
                     .id("message-thread-scroll")
                     .flex_1()
+                    .min_w_0()
                     .min_h_0()
                     .overflow_y_scroll()
                     .flex()

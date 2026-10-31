@@ -5,9 +5,11 @@ use std::collections::HashSet;
 use std::sync::Mutex;
 
 use consort_proto::client_api::*;
+use consort_proto::error::ErrorCode;
+use consort_proto::execution_link::{HubToExecution, PolicySet};
 use consort_proto::frame::Empty;
 use consort_proto::ids::{ClientId, WorkerId};
-use consort_proto::model::normalize_tags;
+use consort_proto::model::{MachineKind, WorkerPolicy, normalize_tags};
 
 use crate::error::{HubError, Result};
 use crate::hub::{Caller, Hub};
@@ -22,6 +24,9 @@ impl Caller {
         }
     }
 }
+
+/// How long a worker has to save a change of its limits.
+const POLICY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The clients and workers that this hub process knows as removed. A
 /// command on the hub machine (`consort hub client revoke`) writes to the
@@ -153,6 +158,73 @@ impl Hub {
                 let mut worker = machine::worker_or_404(tx.db(), request.worker_id)?;
                 if worker.tags != tags {
                     worker.tags = tags;
+                    tx.save_worker(&worker)?;
+                }
+                Ok(worker)
+            })
+            .await?;
+        self.retry_waiting_work();
+        Ok(WorkerResult { worker })
+    }
+
+    /// Forwards a change of the limits to the worker. The worker keeps and
+    /// enforces them, so a worker that is offline cannot take the change. The
+    /// answer goes in the stored inventory, so that the placement and the
+    /// clients see the limits at once.
+    pub(crate) async fn worker_set_policy(
+        &self,
+        _caller: &Caller,
+        request: WorkerSetPolicy,
+    ) -> Result<WorkerResult> {
+        let worker_id = request.worker_id;
+        if request.max_approval_mode.is_none()
+            && request.allowed_roots.is_none()
+            && request.allow_shell.is_none()
+        {
+            return Err(HubError::invalid("The request names no limit to change."));
+        }
+        let worker = self
+            .store
+            .read(move |conn| machine::worker_or_404(conn, worker_id))
+            .await?;
+        if worker.kind != MachineKind::Execution {
+            return Err(HubError::invalid(
+                "The session host has no worker limits. Choose a worker.",
+            ));
+        }
+        let offline = || {
+            HubError::new(
+                ErrorCode::WorkerOffline,
+                format!(
+                    "{} is offline, so its limits did not change. Try again when the worker is online.",
+                    worker.name
+                ),
+            )
+        };
+        if !self.links.is_online(worker_id) {
+            return Err(offline());
+        }
+        let message = HubToExecution::PolicySet(PolicySet {
+            max_approval_mode: request.max_approval_mode,
+            allowed_roots: request.allowed_roots,
+            allow_shell: request.allow_shell,
+        });
+        let policy: WorkerPolicy = self
+            .exec_request(worker_id, &message, POLICY_TIMEOUT)
+            .await
+            .map_err(|err| match err {
+                HubError::Api(body) if body.code == ErrorCode::WorkerOffline => offline(),
+                other => other,
+            })?;
+        let worker = self
+            .store
+            .write(move |tx| {
+                let mut worker = machine::worker_or_404(tx.db(), worker_id)?;
+                if let Some(inventory) = worker.inventory.as_mut()
+                    && inventory.policy != policy
+                {
+                    inventory.policy = policy;
+                    inventory.hash = inventory.compute_hash();
                     tx.save_worker(&worker)?;
                 }
                 Ok(worker)

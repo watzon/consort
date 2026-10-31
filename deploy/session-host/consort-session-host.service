@@ -1,0 +1,64 @@
+# The Consort session host as a systemd service, on the hub machine.
+#
+# It holds the accounts and runs the harness CLIs. It is a separate service
+# because consort-hub.service sets ProtectHome, RestrictNamespaces and
+# MemoryDenyWriteExecute, and a CLI runtime and bubblewrap cannot run under
+# those settings. It has its own user, so it cannot read hub.db, and the hub
+# cannot read the profiles of the accounts.
+#
+# Install (see docs/deploy.md):
+#   sudo apt install bubblewrap git
+#   sudo useradd --system --home-dir /var/lib/consort-session-host --shell /usr/sbin/nologin consort-session
+#   sudo install -m 0644 deploy/session-host/consort-session-host.service /etc/systemd/system/
+#   sudo -u consort-session consort session-host pair --hub http://127.0.0.1:7600 --code <code> \
+#     --config-dir /var/lib/consort-session-host/config --consort-home /var/lib/consort-session-host/home
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now consort-session-host
+#
+# A session does not start when bubblewrap cannot run. On Ubuntu 24.04 and later,
+# AppArmor can stop bubblewrap from making a user namespace. Add a profile for
+# /usr/bin/bwrap with the `userns` rule, or set
+# kernel.apparmor_restrict_unprivileged_userns=0.
+[Unit]
+Description=Consort session host
+After=network-online.target consort-hub.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=consort-session
+Group=consort-session
+StateDirectory=consort-session-host
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/consort-session-host
+Environment=HOME=/var/lib/consort-session-host
+EnvironmentFile=-/etc/consort/session-host.env
+ExecStart=/usr/local/bin/consort session-host run \
+  --config-dir /var/lib/consort-session-host/config \
+  --consort-home /var/lib/consort-session-host/home
+Restart=on-failure
+RestartSec=5
+# A restart interrupts the sessions. The CLIs stop with the process group, and
+# the session host resumes them after it checks the open operations.
+KillMode=control-group
+TimeoutStopSec=30
+
+# The hardening that a CLI runtime and bubblewrap allow. There is no
+# ProtectHome, RestrictNamespaces or MemoryDenyWriteExecute here: Node needs
+# writable and executable memory, and bubblewrap needs namespaces.
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

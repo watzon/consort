@@ -114,6 +114,7 @@ pub struct HubInner {
     pub setup: SetupState,
     pub settings: Settings,
     pub links: Links,
+    pub command_checks: crate::command_check::CheckCounters,
     pub clients: ClientRegistry,
     pub coordinators: Coordinators,
     pub pairing_limiter: PairingLimiter,
@@ -150,6 +151,7 @@ impl Hub {
             settings: Settings { public_url, origin },
             setup: SetupState::default(),
             links: Links::default(),
+            command_checks: crate::command_check::CheckCounters::default(),
             clients: ClientRegistry::default(),
             coordinators: Coordinators::default(),
             pairing_limiter: PairingLimiter::default(),
@@ -198,8 +200,20 @@ impl Hub {
                         created_at: now,
                         updated_at: now,
                         proactive_tasks: Default::default(),
+                        coordinator_fallback: None,
+                        coordinator_blocked: None,
+                        monid: Default::default(),
+                        access_grants: Vec::new(),
                         proactivity: None,
                     })?;
+                }
+                // The state "the assistant cannot answer" is live. A stored
+                // one is from before the restart, so it goes away: the
+                // session host and the workers have not connected yet.
+                for channel in conversation::channels(tx.db())? {
+                    if channel.coordinator_blocked.is_some() {
+                        tx.set_coordinator_blocked(channel.id, None)?;
+                    }
                 }
                 // No worker is connected yet.
                 tx.mark_all_workers_offline()
@@ -267,6 +281,7 @@ pub(crate) async fn test_task_session(
         .await
         .unwrap();
     let worker = Worker {
+        kind: Default::default(),
         id: WorkerId::new(),
         name: "Laptop".to_owned(),
         hostname: "laptop".to_owned(),
@@ -284,6 +299,7 @@ pub(crate) async fn test_task_session(
         revoked_at: None,
     };
     let session = Session {
+        execution_worker_id: None,
         id: SessionId::new(),
         role: SessionRole::Task,
         channel_id: channel.id,

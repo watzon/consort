@@ -310,3 +310,10 @@ fn a_flag_says_why_the_phrase_is_marked_and_the_tick_counts_the_flags() {
     card.flags.push(flag("b", "x"));
     assert_eq!(card.check_label(), "I checked the marked lines");
 }
+
+#[test]
+fn the_steps_of_the_voice_task_are_plain_text() {
+    let (rest, steps) = voice_task_steps("Done.\n- **Gmail:** 8 mails read\n- Slack");
+    assert_eq!(rest, "Done.");
+    assert_eq!(steps, ["Gmail: 8 mails read", "Slack"]);
+}

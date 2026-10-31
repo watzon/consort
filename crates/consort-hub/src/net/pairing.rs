@@ -16,7 +16,7 @@ use consort_proto::auth::{
 };
 use consort_proto::error::{ErrorBody, ErrorCode, HttpErrorBody};
 use consort_proto::ids::{ClientId, WorkerId};
-use consort_proto::model::{Client, Worker, WorkerState};
+use consort_proto::model::{Client, MachineKind, Worker, WorkerState};
 use consort_proto::time::Timestamp;
 use serde::de::DeserializeOwned;
 
@@ -164,6 +164,24 @@ pub(crate) async fn pair_worker(
     }
 }
 
+pub(crate) async fn pair_session_host(
+    State(hub): State<Hub>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    body: Bytes,
+) -> Response {
+    if !hub.pairing_limiter.allow(addr.ip()) {
+        return too_many();
+    }
+    let request: PairWorkerRequest = match parse_body(&body) {
+        Ok(request) => request,
+        Err(response) => return *response,
+    };
+    match hub.pair_machine(request, MachineKind::SessionHost).await {
+        Ok(response) => Json(response).into_response(),
+        Err(err) => error_response(&err),
+    }
+}
+
 pub(crate) async fn pair_client(
     State(hub): State<Hub>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -227,18 +245,26 @@ impl Hub {
         &self,
         request: PairWorkerRequest,
     ) -> Result<PairWorkerResponse> {
-        self.check_code(PairingKind::Worker, &request.code).await?;
+        self.pair_machine(request, MachineKind::Execution).await
+    }
+
+    /// Pairs a worker or the session host. A code of one kind does not work
+    /// for the other, so a worker can never pair as the session host.
+    pub(crate) async fn pair_machine(
+        &self,
+        request: PairWorkerRequest,
+        kind: MachineKind,
+    ) -> Result<PairWorkerResponse> {
+        let pairing = match kind {
+            MachineKind::Execution => PairingKind::Worker,
+            MachineKind::SessionHost => PairingKind::SessionHost,
+        };
+        self.check_code(pairing, &request.code).await?;
         let id = self
             .store
             .write(move |tx| {
-                let origin =
-                    machine::pairing_code_origin(tx.db(), PairingKind::Worker, &request.code)?;
-                if !machine::consume_pairing_code(
-                    tx.db(),
-                    PairingKind::Worker,
-                    &request.code,
-                    tx.now(),
-                )? {
+                let origin = machine::pairing_code_origin(tx.db(), pairing, &request.code)?;
+                if !machine::consume_pairing_code(tx.db(), pairing, &request.code, tx.now())? {
                     return Err(bad_code());
                 }
                 let now = tx.now();
@@ -247,6 +273,7 @@ impl Hub {
                     .filter(|n| !n.trim().is_empty())
                     .unwrap_or_else(|| request.hostname.clone());
                 let worker = Worker {
+                    kind,
                     id: WorkerId::new(),
                     name,
                     hostname: request.hostname,
@@ -268,7 +295,7 @@ impl Hub {
                 Ok(worker.id)
             })
             .await?;
-        tracing::info!(worker_id = %id, "paired a worker");
+        tracing::info!(worker_id = %id, kind = ?kind, "paired a machine");
         Ok(PairWorkerResponse { worker_id: id })
     }
 

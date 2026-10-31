@@ -1,5 +1,6 @@
 //! Hub tool dispatch for `tool.list` and `tool.call`.
 
+use consort_proto::execution_link::ExecTool;
 use consort_proto::ids::SessionId;
 use consort_proto::model::SessionRole;
 use consort_proto::tools::{
@@ -12,7 +13,7 @@ use crate::hub::{Hub, ToolCtx};
 use crate::store::{conversation, work};
 
 pub(crate) mod chat;
-mod management;
+pub(crate) mod management;
 mod routines;
 mod tasks;
 
@@ -22,6 +23,9 @@ const CONNECTOR_TOOLS: &[HubTool] = &[
     HubTool::GetConnectorTool,
     HubTool::RunConnectorTool,
 ];
+
+/// The tools that need Monid in the channel.
+const MONID_TOOLS: &[HubTool] = &[HubTool::GetMonidTool, HubTool::RunMonidTool];
 
 /// The tools that read skills, for a harness that does not load skills
 /// itself.
@@ -83,7 +87,17 @@ impl Hub {
         session_id: SessionId,
     ) -> Result<Vec<ToolDefinition>> {
         let ctx = self.tool_ctx(session_id).await?;
-        let has_connections = self.channel_has_connections(&ctx).await?;
+        // These tools stay listed when the channel lacks the service: a
+        // session can ask for access, and its tools work from that moment.
+        let (has_connections, has_monid) = self
+            .store
+            .read(|conn| {
+                Ok((
+                    !crate::store::connectors::connections(conn)?.is_empty(),
+                    crate::store::monid::key_present(conn)?,
+                ))
+            })
+            .await?;
         let native_skills = crate::skills::harness_loads_skills(&ctx.session.harness);
         // `voice_guide` and `propose_voice_rule` are listed only while the
         // voice is on. A voice task gets only its own tools.
@@ -92,17 +106,25 @@ impl Hub {
             .read(|conn| Ok(crate::store::voice::settings(conn)?.enabled))
             .await?;
         let voice_task = self.is_voice_task(ctx.task.as_ref()).await?;
-        Ok(tools_for(ctx.audience)
+        let mut tools: Vec<ToolDefinition> = tools_for(ctx.audience)
             .into_iter()
             .filter(|t| {
                 HubTool::from_name(&t.name).is_none_or(|tool| {
                     (has_connections || !CONNECTOR_TOOLS.contains(&tool))
+                        && (has_monid || !MONID_TOOLS.contains(&tool))
+                        && (has_connections || has_monid || tool != HubTool::SearchTools)
                         && (!native_skills || !SKILL_TOOLS.contains(&tool))
                         && (voice_on || !VOICE_TOOLS.contains(&tool))
                         && (!voice_task || VOICE_TASK_TOOLS.contains(&tool))
                 })
             })
-            .collect())
+            .collect();
+        // A session with a worker does its work through the tools of the
+        // worker. The session host runs them, and the hub decides about each.
+        if ctx.session.execution_worker_id.is_some() {
+            tools.extend(ExecTool::ALL.into_iter().map(ExecTool::definition));
+        }
+        Ok(tools)
     }
 
     /// Runs one `tool.call`. Errors become an `is_error` result.
@@ -160,6 +182,7 @@ impl Hub {
             C::FetchThread(a) => self.tool_fetch_thread(ctx, a).await,
             C::MemoryWrite(a) => self.tool_memory_write(ctx, a).await,
             C::MemoryDelete(a) => self.tool_memory_delete(ctx, a).await,
+            C::FilesRead(a) => self.tool_files_read(ctx, a).await,
             C::FilesWrite(a) => self.tool_files_write(ctx, a).await,
             C::StartTask(a) => self.tool_start_task(ctx, a).await,
             C::MessageTask(a) => self.tool_message_task(ctx, a).await,
@@ -184,6 +207,10 @@ impl Hub {
             C::ListConnectorTools(a) => self.tool_list_connector_tools(ctx, a).await,
             C::GetConnectorTool(a) => self.tool_get_connector_tool(ctx, a).await,
             C::RunConnectorTool(a) => self.tool_run_connector_tool(ctx, a).await,
+            C::SearchTools(a) => self.tool_search_tools(ctx, a).await,
+            C::RequestAccess(a) if a.skill.is_none() => self.tool_request_access(ctx, a).await,
+            C::GetMonidTool(a) => self.tool_get_monid_tool(ctx, a).await,
+            C::RunMonidTool(a) => self.tool_run_monid_tool(ctx, a).await,
             C::ListSkills(_) => self.tool_list_skills(ctx).await,
             C::ReadSkill(a) => self.tool_read_skill(ctx, a).await,
             C::VoiceGuide(a) => self.tool_voice_guide(ctx, a).await,
@@ -209,6 +236,7 @@ mod tests {
     async fn tutti_session(hub: &Hub) -> SessionId {
         let channel = hub.store.read(conversation::tutti_channel).await.unwrap();
         let session = Session {
+            execution_worker_id: None,
             id: SessionId::new(),
             role: SessionRole::Coordinator,
             channel_id: channel.id,

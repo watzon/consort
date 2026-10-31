@@ -263,6 +263,10 @@ fn seed(hub: &mut Hub) {
         updated_at: ts(now - 10_000),
         tags: Vec::new(),
         proactive_tasks: Default::default(),
+        coordinator_fallback: None,
+        coordinator_blocked: None,
+        monid: Default::default(),
+        access_grants: Vec::new(),
         proactivity: None,
     });
     hub.messages.push(Message {
@@ -306,6 +310,8 @@ fn seed(hub: &mut Hub) {
         review_summary: None,
         resolved_at: None,
         session_ended: false,
+        monid_calls: 0,
+        monid_cost_micros: 0,
         archived_at: None,
         created_at: ts(now - 5_000),
         updated_at: ts(now - 5_000),
@@ -319,6 +325,8 @@ fn seed(hub: &mut Hub) {
         request_id: RequestId::new("req-1"),
         summary: "Codex wants to run a command".into(),
         details: ApprovalDetails::Command {
+            blocked: Vec::new(),
+            check_note: None,
             command: "cargo build --release".into(),
             cwd: Some("C:\\Code\\sayso".into()),
         },
@@ -1034,6 +1042,7 @@ async fn session(hub: Shared, mut socket: WebSocket) {
                     next_run_at: Some(ts(Timestamp::now().as_millis() + 3_600_000)),
                     last_run_at: None,
                     last_run_status: None,
+                    monid: None,
                     created_at: None,
                     kind: Default::default(),
                     origin: Default::default(),
@@ -1549,6 +1558,81 @@ async fn session(hub: Shared, mut socket: WebSocket) {
                     ErrorCode::Unsupported,
                     format!("Not built yet: {}.", req.kind),
                 ))
+            }
+            kind if kind.starts_with("monid.")
+                || kind == "channel.set_monid"
+                || kind == "channel.end_access" =>
+            {
+                let mut h = hub.lock().unwrap();
+                h.recorded.push((req.kind.clone(), req.body.clone()));
+                let status = || consort_proto::model::MonidStatus {
+                    key_present: true,
+                    key_hint: Some("3f9a".into()),
+                    balance_micros: Some(49_340_000),
+                    spent_month_micros: 3_870_000,
+                    ..Default::default()
+                };
+                let call = |state| consort_proto::model::MonidCall {
+                    id: consort_proto::ids::MonidCallId::new(),
+                    channel_id: consort_proto::ids::ChannelId::new(),
+                    session_id: consort_proto::ids::SessionId::new(),
+                    task_id: None,
+                    message_id: None,
+                    approval_id: None,
+                    provider: "elevenlabs".into(),
+                    endpoint: "/text-to-speech".into(),
+                    name: "ElevenLabs text to speech".into(),
+                    state,
+                    rate: "$0.08 per 1,000 characters".into(),
+                    cost_micros: 49_600,
+                    run_id: Some("01KQ".into()),
+                    stoppable: false,
+                    input: serde_json::json!({"text": "Hello"}),
+                    output: serde_json::json!({"ok": true}),
+                    output_blob: None,
+                    error: None,
+                    files: Vec::new(),
+                    duration_ms: 2_100,
+                    at: Timestamp::from_millis(1_793_300_000_000),
+                };
+                match kind {
+                    "monid.status"
+                    | "monid.set_key"
+                    | "monid.remove_key"
+                    | "monid.update_settings" => req
+                        .respond_ok(&api::MonidStatusResult { status: status() })
+                        .unwrap(),
+                    "monid.search" => req
+                        .respond_ok(&api::MonidCatalogSearchResult {
+                            tools: vec![api::MonidCatalogTool {
+                                provider: "elevenlabs".into(),
+                                provider_name: "ElevenLabs".into(),
+                                endpoint: "/text-to-speech".into(),
+                                name: "ElevenLabs text to speech".into(),
+                                rate: "$0.08 per 1,000 characters".into(),
+                            }],
+                        })
+                        .unwrap(),
+                    "monid.call" => req
+                        .respond_ok(&api::MonidCallResult {
+                            call: call(consort_proto::model::MonidCallState::Completed),
+                        })
+                        .unwrap(),
+                    "monid.stop" => req
+                        .respond_ok(&api::MonidCallResult {
+                            call: call(consort_proto::model::MonidCallState::Stopped),
+                        })
+                        .unwrap(),
+                    "monid.calls" => req
+                        .respond_ok(&api::MonidCallListResult {
+                            calls: vec![call(consort_proto::model::MonidCallState::Completed)],
+                        })
+                        .unwrap(),
+                    _ => {
+                        let channel = h.channel.clone().unwrap();
+                        req.respond_ok(&api::ChannelResult { channel }).unwrap()
+                    }
+                }
             }
             "skill_directory.search" => {
                 let body: api::SkillDirectorySearch = req.decode_as().unwrap();
@@ -3914,6 +3998,181 @@ async fn deleting_a_channel_keeps_the_text_of_its_waiting_messages() {
         done.is_ok(),
         "the send call hangs after the channel was deleted"
     );
+}
+
+/// Monid: each command sends its request, and the answer fills the view.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn monid_commands_use_their_requests() {
+    use consort_client::{
+        MonidAccessView, MonidSettingsView, MonidToolView, MonidUnattendedView, SecretText,
+    };
+    let (url, hub) = start_hub().await;
+    hub.lock().unwrap().record_answers = true;
+    {
+        // The approval is a Monid card with its menu.
+        let mut h = hub.lock().unwrap();
+        let approval = h.approval.as_mut().unwrap();
+        let details = ApprovalDetails::Monid(Box::new(consort_proto::model::MonidCard {
+            provider: "elevenlabs".into(),
+            endpoint: "/text-to-speech".into(),
+            name: "ElevenLabs text to speech".into(),
+            rate: "$0.08 per 1,000 characters".into(),
+            estimate_micros: Some(50_000),
+            input: serde_json::json!({"text": "Hello"}),
+            over_limit: None,
+            ask_rule: None,
+        }));
+        approval.options = details.hub_card_options().unwrap();
+        approval.details = details;
+        approval.request_id = consort_proto::model::hub_card_request_id(approval.id);
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let client = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
+    let channel = tutti_id(&client);
+    let approval_id = hub
+        .lock()
+        .unwrap()
+        .approval
+        .as_ref()
+        .unwrap()
+        .id
+        .to_string();
+
+    client.run(Command::LoadMonidStatus).await.unwrap();
+    let state = wait_for(&client, "the Monid status", |s| s.monid.key_present).await;
+    assert_eq!(state.monid.balance_micros, Some(49_340_000));
+    assert_eq!(state.monid.key_text(), "Ends in 3f9a");
+
+    client
+        .run(Command::SetMonidKey {
+            api_key: SecretText("monid_live_secret".into()),
+            settings: Some(MonidSettingsView {
+                routines: MonidUnattendedView::RunWithoutAsking,
+                ..MonidSettingsView::default()
+            }),
+        })
+        .await
+        .unwrap();
+    // An empty key never goes to the hub.
+    assert!(
+        client
+            .run(Command::SetMonidKey {
+                api_key: SecretText("  ".into()),
+                settings: None,
+            })
+            .await
+            .is_err()
+    );
+    client
+        .run(Command::UpdateMonidSettings {
+            settings: MonidSettingsView::default(),
+        })
+        .await
+        .unwrap();
+    let access = MonidAccessView::default().with_blocked(MonidToolView {
+        provider: "apify".into(),
+        endpoint: Some("/google-maps".into()),
+        name: "Apify Google Maps scraper".into(),
+    });
+    client
+        .run(Command::SetChannelMonid {
+            channel_id: channel.clone(),
+            access,
+        })
+        .await
+        .unwrap();
+    client
+        .run(Command::SearchMonid {
+            query: "speech".into(),
+        })
+        .await
+        .unwrap();
+    let state = wait_for(&client, "the search result", |s| {
+        !s.monid.search.hits.is_empty()
+    })
+    .await;
+    assert_eq!(state.monid.search.hits[0].name, "ElevenLabs text to speech");
+    let call_id = consort_proto::ids::MonidCallId::new().to_string();
+    client
+        .run(Command::LoadMonidCalls {
+            channel_id: channel.clone(),
+        })
+        .await
+        .unwrap();
+    let state = wait_for(&client, "the recent calls", |s| {
+        s.monid
+            .calls
+            .get(&channel)
+            .is_some_and(|c| !c.calls.is_empty())
+    })
+    .await;
+    assert_eq!(state.monid.calls[&channel].calls[0].summary, "$0.0496");
+    client
+        .run(Command::LoadMonidCall {
+            call_id: call_id.clone(),
+        })
+        .await
+        .unwrap();
+    client
+        .run(Command::StopMonidCall {
+            call_id: call_id.clone(),
+        })
+        .await
+        .unwrap();
+    client
+        .run(Command::AnswerApprovalOption {
+            approval_id: approval_id.clone(),
+            option_id: "always".into(),
+        })
+        .await
+        .unwrap();
+    // An option that the card does not have never goes out.
+    assert!(
+        client
+            .run(Command::AnswerApprovalOption {
+                approval_id: approval_id.clone(),
+                option_id: "launch".into(),
+            })
+            .await
+            .is_err()
+    );
+    client
+        .run(Command::EndAccess {
+            channel_id: channel.clone(),
+            grant_id: consort_proto::ids::AccessGrantId::new().to_string(),
+        })
+        .await
+        .unwrap();
+
+    let recorded = hub.lock().unwrap().recorded.clone();
+    let kinds: Vec<&str> = recorded.iter().map(|(k, _)| k.as_str()).collect();
+    assert_eq!(
+        kinds,
+        [
+            "monid.status",
+            "monid.set_key",
+            "monid.update_settings",
+            "channel.set_monid",
+            "monid.search",
+            "monid.calls",
+            "monid.call",
+            "monid.stop",
+            "approval.answer",
+            "channel.end_access",
+        ]
+    );
+    assert_eq!(recorded[1].1["settings"]["routines"], "run_without_asking");
+    assert_eq!(recorded[3].1["channel_id"], channel.as_str());
+    assert_eq!(
+        recorded[3].1["access"]["blocked"][0]["endpoint"],
+        "/google-maps"
+    );
+    assert_eq!(recorded[4].1["query"], "speech");
+    assert_eq!(recorded[5].1["channel_id"], channel.as_str());
+    assert_eq!(recorded[6].1["id"], call_id.as_str());
+    assert_eq!(recorded[7].1["id"], call_id.as_str());
+    assert_eq!(recorded[8].1["option_id"], "always");
+    assert_eq!(recorded[9].1["channel_id"], channel.as_str());
 }
 
 /// Step 2: a hub card is answered with `approval.answer` and the hub's

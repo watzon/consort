@@ -66,6 +66,14 @@ impl Default for NotificationSettings {
     }
 }
 
+/// An account whose login expired.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExpiredAccount {
+    pub worker_id: String,
+    pub account_id: String,
+    pub label: String,
+}
+
 /// What a notification is about.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum NotificationKind {
@@ -88,6 +96,11 @@ pub enum NotificationTarget {
     Task { channel_id: String, task_id: String },
     /// A channel's timeline.
     Channel { channel_id: String },
+    /// The sign-in of an account.
+    SignIn {
+        worker_id: String,
+        account_id: String,
+    },
     /// Nowhere: the app only comes to the front.
     App,
 }
@@ -174,6 +187,8 @@ pub struct AttentionView {
     pub messages: Vec<IncomingMessage>,
     /// Quiet hours or a snooze is on now: nothing notifies.
     pub quiet: bool,
+    /// The accounts whose login expired.
+    pub expired_accounts: Vec<ExpiredAccount>,
 }
 
 /// How many assistant messages the attention view keeps.
@@ -277,7 +292,27 @@ pub(crate) fn attention(cache: &Cache) -> AttentionView {
         .iter()
         .filter(|t| t.status == TaskStatus::Review)
         .count();
+    let expired_accounts = cache
+        .workers
+        .values()
+        .filter(|w| w.revoked_at.is_none())
+        .flat_map(|w| {
+            let accounts = w.inventory.iter().flat_map(|i| i.accounts.iter());
+            accounts
+                .filter(|a| {
+                    a.enabled
+                        && a.auth_state == consort_proto::model::AuthState::Error
+                        && crate::reduce::login_expired(a.auth_detail.as_deref())
+                })
+                .map(|a| ExpiredAccount {
+                    worker_id: w.id.to_string(),
+                    account_id: a.account_id.to_string(),
+                    label: a.label.clone(),
+                })
+        })
+        .collect();
     AttentionView {
+        expired_accounts,
         loaded: cache.loaded,
         count: u32::try_from(waiting.len() + review).unwrap_or(u32::MAX),
         waiting,
@@ -405,6 +440,24 @@ fn message_notification(message: &IncomingMessage, show_text: bool) -> Notificat
     }
 }
 
+/// An account needs a new sign-in. The name of an account is not private, so
+/// the "show text" switch does not hide it.
+fn expired_notification(account: &ExpiredAccount) -> Notification {
+    Notification {
+        tag: format!("consort:sign-in:{}", account.account_id),
+        kind: NotificationKind::Failed,
+        title: "Consort".to_owned(),
+        body: format!(
+            "{} needs a new sign-in. The assistant cannot use it until you sign in again.",
+            account.label
+        ),
+        target: NotificationTarget::SignIn {
+            worker_id: account.worker_id.clone(),
+            account_id: account.account_id.clone(),
+        },
+    }
+}
+
 /// The notification of the Test notification button.
 pub fn test_notification() -> Notification {
     Notification {
@@ -468,6 +521,8 @@ fn on_screen(target: &NotificationTarget, focus: &Focus) -> bool {
         NotificationTarget::Channel { channel_id } => {
             focus.channel_id.as_deref() == Some(channel_id)
         }
+        // The sidebar of the active window says it already.
+        NotificationTarget::SignIn { .. } => true,
         NotificationTarget::App => false,
     }
 }
@@ -482,6 +537,8 @@ pub struct Notifier {
     task_status: BTreeMap<String, TaskStatus>,
     /// Messages at or before this time are known.
     messages_until: i64,
+    /// The accounts whose expired login was seen.
+    seen_expired: BTreeSet<String>,
 }
 
 impl Notifier {
@@ -522,6 +579,19 @@ impl Notifier {
         }
         // An answered item never waits again, so it can go.
         self.seen_waiting.retain(|id| pending.contains(id));
+
+        for account in &attention.expired_accounts {
+            if self.seen_expired.insert(account.account_id.clone()) {
+                keep(expired_notification(account), settings.failed, &mut out);
+            }
+        }
+        // A login that works again can expire again.
+        self.seen_expired.retain(|id| {
+            attention
+                .expired_accounts
+                .iter()
+                .any(|a| &a.account_id == id)
+        });
 
         let mut statuses = BTreeMap::new();
         for task in &attention.tasks {
@@ -632,11 +702,56 @@ mod tests {
             tasks,
             messages,
             quiet: false,
+            expired_accounts: Vec::new(),
         }
     }
 
     fn away() -> Focus {
         Focus::default()
+    }
+
+    #[test]
+    fn an_expired_login_notifies_once_and_opens_its_sign_in() {
+        let settings = NotificationSettings::default();
+        let mut n = Notifier::new();
+        let mut view = loaded(vec![], vec![], vec![]);
+        assert!(n.observe(&view, &away(), &settings).is_empty());
+        view.expired_accounts = vec![ExpiredAccount {
+            worker_id: "wrk_host".into(),
+            account_id: "acc_2".into(),
+            label: "Claude Code (Personal 2)".into(),
+        }];
+        let shown = n.observe(&view, &away(), &settings);
+        assert_eq!(shown.len(), 1);
+        assert!(shown[0].body.starts_with("Claude Code (Personal 2) needs"));
+        assert_eq!(
+            shown[0].target,
+            NotificationTarget::SignIn {
+                worker_id: "wrk_host".into(),
+                account_id: "acc_2".into(),
+            }
+        );
+        assert!(n.observe(&view, &away(), &settings).is_empty());
+
+        // After a sign-in, a later expiry notifies again.
+        let expired = std::mem::take(&mut view.expired_accounts);
+        assert!(n.observe(&view, &away(), &settings).is_empty());
+        view.expired_accounts = expired;
+        assert_eq!(n.observe(&view, &away(), &settings).len(), 1);
+    }
+
+    #[test]
+    fn an_active_window_shows_an_expired_login_in_the_sidebar_only() {
+        let settings = NotificationSettings::default();
+        let mut n = Notifier::new();
+        let mut view = loaded(vec![], vec![], vec![]);
+        n.observe(&view, &away(), &settings);
+        view.expired_accounts = vec![ExpiredAccount::default()];
+        let active = Focus {
+            active: true,
+            ..Focus::default()
+        };
+        assert!(n.observe(&view, &active, &settings).is_empty());
     }
 
     #[test]

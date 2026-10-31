@@ -52,6 +52,13 @@ pub enum PickerTarget {
     /// thread. A choice calls `Client::set_task_model`. The picker offers
     /// only the models of the worker that holds the task.
     Task(String),
+    /// A new step of the fallback path, in Settings > Models. A choice adds
+    /// the step. A model that the path has shows "Step N" and cannot be
+    /// chosen again.
+    FallbackStep,
+    /// The model of the command check, in Settings > Models. A choice saves
+    /// at once. "Choose for me" gives the choice back to Consort.
+    CommandCheck,
 }
 
 /// The part of the picker that the arrow keys move in. The search field
@@ -137,6 +144,56 @@ pub fn step(highlighted: Option<usize>, delta: isize, len: usize) -> Option<usiz
     Some(next as usize)
 }
 
+/// The items and the header of the chip menu on a fallback.
+pub fn fallback_menu(
+    fallback: &consort_client::ChannelFallbackView,
+    channel_id: &str,
+) -> (Vec<crate::ui::menu::MenuItem>, crate::ui::menu::MenuHeader) {
+    use crate::{
+        fallback::FallbackAction,
+        ui::menu::{MenuAction, MenuHeader, MenuItem},
+    };
+    use consort_client::FallbackCauseView;
+    let from = &fallback.from;
+    let why = match fallback.cause {
+        FallbackCauseView::UsageLimit => format!("{} reached its usage limit.", from.account_label),
+        FallbackCauseView::Outage => format!("{} did not answer.", from.account_label),
+    };
+    let body = format!(
+        "{why} The assistant uses {}{}.",
+        fallback.to.account_label,
+        fallback
+            .available_label
+            .as_deref()
+            .and_then(|l| l.strip_prefix("Available at "))
+            .map(|at| format!(" until {at}"))
+            .unwrap_or_default()
+    );
+    let mut go_back = MenuItem::new(
+        format!("Go back to {}", from.model_name),
+        MenuAction::Fallback(FallbackAction::GoBack(channel_id.to_owned())),
+    );
+    if let Some(label) = &fallback.available_label {
+        go_back = go_back.disabled(true).trailing(label.clone());
+    }
+    let items = vec![
+        go_back,
+        MenuItem::new(
+            "Choose another model",
+            MenuAction::Fallback(FallbackAction::ChooseModel(channel_id.to_owned())),
+        ),
+        MenuItem::new("Edit path", MenuAction::Fallback(FallbackAction::EditPath)),
+    ];
+    (
+        items,
+        MenuHeader {
+            title: "On a fallback".into(),
+            body: body.into(),
+            marker: true,
+        },
+    )
+}
+
 /// The note under the effort levels.
 pub fn effort_note(provider: &str) -> String {
     format!(
@@ -162,6 +219,8 @@ impl ConsortApp {
             PickerTarget::SettingsAssistant => self.convo.settings.selection.clone(),
             PickerTarget::NewTask => self.convo.new_task.selection.clone(),
             PickerTarget::Task(id) => self.state.thread(id).and_then(|th| th.selection.clone()),
+            PickerTarget::FallbackStep => None,
+            PickerTarget::CommandCheck => self.state.command_check.account_model().cloned(),
         }
     }
 
@@ -206,6 +265,13 @@ impl ConsortApp {
         account: &str,
         model_id: &str,
     ) -> Option<String> {
+        if *target == PickerTarget::FallbackStep {
+            return self
+                .state
+                .fallback_path
+                .step_number(account, model_id)
+                .map(|n| format!("Step {n}"));
+        }
         let PickerTarget::Task(id) = target else {
             return None;
         };
@@ -250,6 +316,8 @@ impl ConsortApp {
             PickerTarget::NewTask => self.convo.new_task.selection.is_some(),
             // A task always has a model of its own.
             PickerTarget::Task(_) => false,
+            PickerTarget::FallbackStep => false,
+            PickerTarget::CommandCheck => self.state.command_check.choice.account_model.is_some(),
         }
     }
 
@@ -285,6 +353,10 @@ impl ConsortApp {
             }
             PickerTarget::SettingsAssistant => self.convo.settings.selection = selection,
             PickerTarget::NewTask => self.convo.new_task.selection = selection,
+            // `choose_model_row` adds the step: it has the window that the
+            // confirm dialog needs.
+            PickerTarget::FallbackStep => {}
+            PickerTarget::CommandCheck => self.set_check_account_model(selection, cx),
             PickerTarget::Task(id) => {
                 // The hub saves the pick at once and a running turn goes
                 // on. The thread shows the new pick when the hub answers.
@@ -410,6 +482,13 @@ impl ConsortApp {
         cx: &mut Context<Self>,
     ) {
         if self.dialog.is_none() {
+            if matches!(
+                target,
+                PickerTarget::FallbackStep | PickerTarget::CommandCheck
+            ) {
+                self.focus.focus(window, cx);
+                return;
+            }
             let input = match target {
                 PickerTarget::Task(_) => &self.inputs.reply,
                 _ => &self.inputs.composer,
@@ -467,6 +546,20 @@ impl ConsortApp {
             &groups[row.group],
             &groups[row.group].models[row.model],
         );
+        if open.target == PickerTarget::FallbackStep {
+            // A model that the path has stays in the list and shows its step.
+            if self
+                .state
+                .fallback_path
+                .step_number(&chosen.account_label, &chosen.model_id)
+                .is_some()
+            {
+                return;
+            }
+            self.close_picker(window, cx);
+            self.add_fallback_step(chosen, window, cx);
+            return;
+        }
         self.close_picker(window, cx);
         // A pick of the model that the channel uses already, from
         // Tutti, makes it the channel's own.
@@ -689,7 +782,12 @@ impl ConsortApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let c = &t.colors;
-        let selection = self.picker_selection(&target);
+        // An assistant on a fallback shows the model that it runs on now.
+        let fallback = self.channel_fallback(&target);
+        let selection = fallback
+            .as_ref()
+            .map(|f| f.to.clone())
+            .or_else(|| self.picker_selection(&target));
         let locked = self.picker_locked(&target);
         let open = !locked
             && self
@@ -735,6 +833,24 @@ impl ConsortApp {
             .items_center()
             .gap(t.space.xs + t.space.xxs)
             .min_w_0()
+            .when(fallback.is_some(), |d| {
+                // The marker: the assistant is on a fallback.
+                d.child(
+                    div()
+                        .id("fallback-marker")
+                        .debug_selector(|| "fallback-marker".into())
+                        .flex_none()
+                        .size(t.component.state_dot)
+                        .rounded(t.radius.full)
+                        .bg(c.accent_text)
+                        .tooltip(|_, cx| {
+                            gpui_kit::AppContext::new(cx, |_| {
+                                crate::ui::convo_sidebar::Tip("On a fallback".into())
+                            })
+                            .into()
+                        }),
+                )
+            })
             .when_some(logo, |d, logo| {
                 d.child(provider_logo(&logo, t.icon.dense, c.text_primary))
             })
@@ -792,10 +908,51 @@ impl ConsortApp {
         trigger
             .when(!locked, |d| {
                 d.on_click(cx.listener(move |this, _, window, cx| {
+                    // On a fallback, the chip opens its own menu first.
+                    if let PickerTarget::Assistant(channel_id) = &target_click
+                        && this.channel_fallback(&target_click).is_some()
+                    {
+                        this.open_fallback_menu(id, channel_id.clone(), cx);
+                        return;
+                    }
                     this.open_picker_under(id, target_click.clone(), window, cx)
                 }))
             })
             .into_any_element()
+    }
+
+    /// The fallback that the assistant of this target runs on, if any.
+    pub fn channel_fallback(
+        &self,
+        target: &PickerTarget,
+    ) -> Option<consort_client::ChannelFallbackView> {
+        let PickerTarget::Assistant(id) = target else {
+            return None;
+        };
+        self.state.channel(id).and_then(|c| c.fallback.clone())
+    }
+
+    /// The menu of the chip while the assistant runs on a fallback: what
+    /// happened, Go back, Choose another model and Edit path. It opens under
+    /// the chip, or above it near the bottom of the window.
+    pub fn open_fallback_menu(
+        &mut self,
+        trigger: &'static str,
+        channel_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        let (Some(bounds), Some(fallback)) = (
+            self.triggers.get(trigger),
+            self.channel_fallback(&PickerTarget::Assistant(channel_id.clone())),
+        ) else {
+            return;
+        };
+        let (menu, header) = fallback_menu(&fallback, &channel_id);
+        let mut open = crate::ui::menu::OpenMenu::under(bounds, menu, false);
+        open.header = Some(header);
+        self.effort_menu = None;
+        self.picker = None;
+        self.open_menu(open, cx);
     }
 
     /// Whether a popover for this target may show now. A dialog picker shows
@@ -810,6 +967,10 @@ impl ConsortApp {
                 matches!(self.dialog, Some(crate::app::Dialog::Routine(_)))
             }
             PickerTarget::NewTask => self.dialog == Some(crate::app::Dialog::NewTask),
+            PickerTarget::FallbackStep | PickerTarget::CommandCheck => {
+                self.page == crate::app::Page::Settings
+                    && self.settings_section == SettingsSection::Models
+            }
         }
     }
 
@@ -826,7 +987,11 @@ impl ConsortApp {
     /// the account name, and whether the chip has a provider logo. The
     /// composer measures these to decide what fits.
     pub fn chip_texts(&self, target: &PickerTarget) -> (String, String, bool) {
-        match self.picker_selection(target) {
+        let shown = self
+            .channel_fallback(target)
+            .map(|f| f.to)
+            .or_else(|| self.picker_selection(target));
+        match shown {
             Some(s) => {
                 let logo = self.state.account_logo(&s.account_label).is_some();
                 if s.model_id.is_empty() {
@@ -963,15 +1128,9 @@ impl ConsortApp {
             .border_b(t.border_width)
             .border_color(c.border_subtle)
             .child(icon("search", t.icon.dense, c.text_tertiary))
-            .child(
-                div()
-                    .flex_1()
-                    .text_color(c.text_primary)
-                    .child(crate::ui::parts::input(
-                        &self.inputs.model_search,
-                        t.text.ui,
-                    )),
-            );
+            .child(div().flex_1().min_w_0().text_color(c.text_primary).child(
+                crate::ui::parts::input(&self.inputs.model_search, t.text.ui),
+            ));
         let main = div()
             .flex()
             .flex_col()
@@ -994,7 +1153,7 @@ impl ConsortApp {
                         groups
                             .iter()
                             .find(|g| &g.account_label == label)
-                            .map(|g| g.workers.join(", "))
+                            .map(|g| g.provider.clone())
                             .unwrap_or_default(),
                     ),
                 }
@@ -1082,7 +1241,11 @@ impl ConsortApp {
             .pb(t.space.xs)
             .px(t.space.md + t.space.xxs)
             .child(line(title, semibold, c.text_primary).flex_none())
-            .child(line(detail_text, t.text.caption, c.text_tertiary).flex_1())
+            .child(
+                line(detail_text, t.text.caption, c.text_tertiary)
+                    .flex_1()
+                    .min_w_0(),
+            )
             .when(self.picker_can_inherit(&target), |d| {
                 d.child(
                     focusable(div().id("use-tutti-model"), t)
@@ -1093,7 +1256,11 @@ impl ConsortApp {
                         .type_style(detail(t))
                         .text_color(c.text_secondary)
                         .hover(|s| s.text_color(c.text_primary).bg(c.hover_raised))
-                        .child(format!("Use the {} model", crate::ui::TUTTI))
+                        .child(if target == PickerTarget::CommandCheck {
+                            "Choose for me".to_owned()
+                        } else {
+                            format!("Use the {} model", crate::ui::TUTTI)
+                        })
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.close_picker(window, cx);
                             this.apply_selection(&target, None, cx);
@@ -1225,7 +1392,7 @@ impl ConsortApp {
                     .model_groups
                     .iter()
                     .find(|g| &g.account_label == label)
-                    .map(|g| g.workers.join(", "))
+                    .map(|g| g.provider.clone())
                     .unwrap_or_default(),
             ),
         };
@@ -1337,6 +1504,7 @@ impl ConsortApp {
             .flex()
             .flex_col()
             .flex_1()
+            .min_w_0()
             .min_h_0()
             .overflow_hidden()
             .child(list)
@@ -1525,7 +1693,7 @@ impl ConsortApp {
             .gap(t.space.sm)
             .p(t.space.md)
             .child(text(
-                "No account is signed in. Add one in Settings > Workers.",
+                "No account is signed in. Add one in Settings > Providers.",
                 t.text.ui,
                 c.text_secondary,
             ))
@@ -1688,7 +1856,8 @@ fn effort_row(
                 },
                 c.text_primary,
             )
-            .flex_1(),
+            .flex_1()
+            .min_w_0(),
         );
     if row.is_default {
         d = d.child(text(

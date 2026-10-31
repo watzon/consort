@@ -27,6 +27,10 @@ pub enum UseInTarget {
     ConnectDialog,
     /// The open Add skill dialog.
     AddSkillDialog,
+    /// The Monid page of Settings > Connectors.
+    Monid,
+    /// The Add Monid dialog.
+    MonidDialog,
 }
 
 /// The tab of the Add skill dialog.
@@ -196,8 +200,6 @@ pub struct ExtState {
     /// The connections whose sign-in page the app opened.
     pub opened: Vec<String>,
     pub sign_in_card: Option<SignInCardWait>,
-    /// The provider extras list is open in the account dialog.
-    pub extras_list_open: bool,
     /// Counts catalog and directory searches typed, so a search runs only
     /// after the typing stops.
     pub search_serial: u64,
@@ -464,6 +466,7 @@ impl ConsortApp {
             cx,
             async move { client.run(Command::LoadComposioStatus).await },
         );
+        self.load_monid_status(cx);
         if self
             .ext
             .connection
@@ -500,6 +503,9 @@ impl ConsortApp {
         cx: &mut Context<Self>,
     ) {
         self.ext.connection = id.clone();
+        if id.is_some() {
+            self.monid_ui.page = false;
+        }
         let Some(connection) = id.and_then(|id| self.state.connection(&id).cloned()) else {
             cx.notify();
             return;
@@ -603,6 +609,8 @@ impl ConsortApp {
             ),
             UseInTarget::ConnectDialog => self.ext.connect.use_in = use_in,
             UseInTarget::AddSkillDialog => self.ext.add_skill.use_in = use_in,
+            UseInTarget::Monid => self.update_monid_settings(cx, move |s| s.use_in = use_in),
+            UseInTarget::MonidDialog => self.monid_ui.add.use_in = use_in,
         }
         cx.notify();
     }
@@ -622,6 +630,8 @@ impl ConsortApp {
                 .unwrap_or_default(),
             UseInTarget::ConnectDialog => self.ext.connect.use_in.clone(),
             UseInTarget::AddSkillDialog => self.ext.add_skill.use_in.clone(),
+            UseInTarget::Monid => self.state.monid.settings.use_in.clone(),
+            UseInTarget::MonidDialog => self.monid_ui.add.use_in.clone(),
         }
     }
 

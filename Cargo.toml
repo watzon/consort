@@ -21,10 +21,13 @@ unwrap_used = "warn"
 consort-proto = { path = "crates/consort-proto" }
 consort-theme = { path = "crates/consort-theme" }
 consort-harness = { path = "crates/consort-harness" }
+consort-session-host = { path = "crates/consort-session-host" }
+consort-link = { path = "crates/consort-link" }
 consort-worker = { path = "crates/consort-worker" }
 consort-hub = { path = "crates/consort-hub" }
 consort-client = { path = "crates/consort-client" }
 consort-testkit = { path = "crates/consort-testkit" }
+consort-dictation = { path = "crates/consort-dictation" }
 
 # Wire contract (added by the proto agent)
 serde = { version = "1.0.229", features = ["derive"] }
@@ -71,6 +74,7 @@ axum = "0.8"
 rusqlite = { version = "0.41", features = ["bundled", "backup"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 sha2 = "0.10"
+regex = "1"
 toml = "1"
 process-wrap = { version = "10", features = ["tokio1"] }
 tracing = "0.1"

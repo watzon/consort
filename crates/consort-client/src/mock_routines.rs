@@ -123,7 +123,7 @@ fn sunset_runs() -> Vec<RoutineRunView> {
             3,
             RoutineRunStatus::Error,
             Some(
-                "Claude Work is signed out on hub. Sign in again in Settings > Workers, then select Run now.",
+                "Claude Work is signed out. Sign in again in Settings > Providers, then select Run now.",
             ),
         ),
         run(
@@ -168,6 +168,7 @@ fn routine(
         next_run_at: None,
         last_run_at: None,
         last_run_status: None,
+        monid: None,
         runs: Vec::new(),
         runs_loaded: false,
         created_at: None,
@@ -514,7 +515,7 @@ pub fn saved_line() -> TimelineItem {
             version: 4,
             created: false,
             suggested_by: "Price out roofline lighting".into(),
-        }), draft: None, error: None,
+        }), draft: None, fallback: None, error: None, monid: None,
     })
 }
 
@@ -580,6 +581,7 @@ fn from_form(id: String, form: &RoutineForm, now: i64) -> Result<RoutineView, Cl
         },
         last_run_at: None,
         last_run_status: None,
+        monid: None,
         runs: Vec::new(),
         runs_loaded: true,
         created_at: None,

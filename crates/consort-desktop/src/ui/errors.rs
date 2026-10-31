@@ -142,7 +142,7 @@ impl ConsortApp {
         for action in &card.actions {
             row = row.child(self.render_error_action(*action, card, key, &place, t, cx));
         }
-        row = row.child(div().flex_1());
+        row = row.child(div().flex_1().min_w_0());
         if has_details {
             let toggle = details_key.clone();
             row = row.child(
@@ -205,6 +205,16 @@ impl ConsortApp {
             .rounded(t.component.chat.bubble_radius)
             .rounded_bl(t.component.chat.bubble_tail)
             .child(head)
+            .when(!card.path.is_empty(), |d| {
+                d.child(
+                    crate::ui::models::path_lines(&card.path, key, true, t)
+                        .pl(t.icon.size + t.space.sm + t.space.xxs)
+                        .debug_selector({
+                            let id = format!("error-path-{key}");
+                            move || id.clone()
+                        }),
+                )
+            })
             .when(show_row, |d| d.child(row))
             .when(has_details && details_open, |d| {
                 d.child(
@@ -268,8 +278,8 @@ impl ConsortApp {
     /// - Choose another model: the model picker of the composer of the
     ///   place, under its chip (or at the click when the chip is not there).
     /// - Sign in again: the sign-in of the account of the turn. When no
-    ///   worker has an account with this name, the Workers page of Settings
-    ///   shows the accounts, so the click always leads somewhere.
+    ///   account has this name, the Providers page of Settings shows the
+    ///   accounts, so the click always leads somewhere.
     pub fn run_error_action(
         &mut self,
         action: ErrorAction,
@@ -297,11 +307,12 @@ impl ConsortApp {
                     .unwrap_or(MenuAnchor::Point(at));
                 self.open_picker(target, anchor, window, cx);
             }
+            ErrorAction::EditPath => self.open_settings(crate::app::SettingsSection::Models, cx),
             ErrorAction::SignInAgain => match self.account_of_error(card, place) {
                 Some((worker_id, account_id)) => {
                     self.open_sign_in(worker_id, account_id, window, cx)
                 }
-                None => self.open_settings(crate::app::SettingsSection::Workers, cx),
+                None => self.open_settings(crate::app::SettingsSection::Providers, cx),
             },
         }
     }
@@ -332,6 +343,12 @@ impl ConsortApp {
                 .thread(id)
                 .and_then(|th| th.placement.as_ref().map(|p| p.worker_name.clone())),
         };
+        self.account_named(name, preferred.as_deref())
+    }
+
+    /// The worker and the ID of the account with this name. The worker
+    /// `preferred` goes first, then the session host, then any worker.
+    pub fn account_named(&self, name: &str, preferred: Option<&str>) -> Option<(String, String)> {
         let found = |worker: &consort_client::WorkerView| {
             worker
                 .accounts
@@ -342,8 +359,9 @@ impl ConsortApp {
         self.state
             .workers
             .iter()
-            .filter(|w| Some(&w.name) == preferred.as_ref())
+            .filter(|w| Some(w.name.as_str()) == preferred)
             .find_map(found)
+            .or_else(|| self.state.session_host.iter().find_map(found))
             .or_else(|| self.state.workers.iter().find_map(found))
     }
 

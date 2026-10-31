@@ -2,7 +2,7 @@
 
 use consort_proto::error::{ErrorBody, ErrorCode};
 
-/// The errors of the worker.
+/// The errors of the execution worker.
 #[derive(Debug, thiserror::Error)]
 pub enum WorkerError {
     /// A file could not be read or written.
@@ -14,8 +14,8 @@ pub enum WorkerError {
         #[source]
         source: std::io::Error,
     },
-    /// `worker.toml` is not valid.
-    #[error("worker.toml is not valid: {0}")]
+    /// The configuration of the worker is not valid.
+    #[error("the worker configuration is not valid: {0}")]
     Config(String),
     /// Another worker runs with the same config folder.
     #[error(
@@ -25,41 +25,21 @@ pub enum WorkerError {
     /// The worker is not paired yet.
     #[error("this worker is not paired. Run `consort worker pair <hub-url> --code <code>` first")]
     NotPaired,
-    /// The key file is not valid.
-    #[error("the worker key is not valid: {0}")]
-    Key(String),
     /// The worker database failed.
     #[error("the worker database failed: {0}")]
     Store(#[from] rusqlite::Error),
-    /// The hub refused or failed a request.
-    #[error("the hub answered {}: {message}", code.as_str())]
-    Hub {
-        /// The error code.
-        code: ErrorCode,
-        /// The message.
-        message: String,
-    },
-    /// The hub could not be reached.
-    #[error("could not reach the hub: {0}")]
-    Network(String),
-    /// The worker is not connected to the hub.
-    #[error("the worker is not connected to the hub")]
-    Offline,
+    /// The link to the hub failed.
+    #[error(transparent)]
+    Link(#[from] consort_link::LinkError),
     /// The worker policy does not allow this.
     #[error("{0}")]
     Policy(String),
     /// A workspace could not be made.
     #[error("{0}")]
     Workspace(String),
-    /// A harness failed.
-    #[error(transparent)]
-    Harness(#[from] consort_harness::HarnessError),
-    /// The worker is shutting down.
-    #[error("the worker is shutting down")]
-    ShuttingDown,
-    /// A frame is larger than the 1 MiB frame limit.
-    #[error("the frame is too large to send: {0}")]
-    TooLarge(String),
+    /// The hub could not be reached.
+    #[error("could not reach the hub: {0}")]
+    Network(String),
 }
 
 impl WorkerError {
@@ -75,18 +55,6 @@ impl WorkerError {
     pub fn to_error_body(&self) -> ErrorBody {
         match self {
             Self::Policy(message) => ErrorBody::new(ErrorCode::PolicyDenied, message.clone()),
-            Self::Hub { code, message } => ErrorBody::new(*code, message.clone()),
-            Self::Harness(consort_harness::HarnessError::Unsupported(what)) => ErrorBody::new(
-                ErrorCode::PolicyDenied,
-                format!("this harness session cannot {what}"),
-            ),
-            Self::Harness(consort_harness::HarnessError::UnknownRequest(id)) => ErrorBody::new(
-                ErrorCode::NotFound,
-                format!("no open harness request has the ID `{id}`"),
-            ),
-            Self::Harness(consort_harness::HarnessError::InvalidAnswer(m)) => {
-                ErrorBody::new(ErrorCode::Invalid, m.clone())
-            }
             Self::Workspace(message) => ErrorBody::new(ErrorCode::Invalid, message.clone()),
             other => ErrorBody::new(ErrorCode::Internal, other.to_string()),
         }

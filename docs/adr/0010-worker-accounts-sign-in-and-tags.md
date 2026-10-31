@@ -1,5 +1,7 @@
 # Accounts live on workers, the app runs the sign-in, and tags choose workers
 
+Revised by [ADR 0015](0015-the-hub-machine-owns-accounts-and-agents.md). Accounts, profile folders and managed tools now live in the session host on the hub machine, not on a worker. Sign-in from the app, one profile folder per account and channel tags for tasks stay.
+
 Each account of a provider belongs to one worker and has its own profile folder in the worker's Consort home. The user makes accounts and signs in from the app, through the provider's own sign-in flow, which runs on the worker. Each worker installs and updates its own copy of each harness CLI. The user puts tags on workers and channels, and all work from a channel runs only on workers that have every tag of the channel.
 
 This replaces part of ADR 0004. Logins still stay on workers. What changes is how they get there: the user no longer signs in on the worker machine with the harness's own command, and the worker no longer picks up a login that already exists on the machine.

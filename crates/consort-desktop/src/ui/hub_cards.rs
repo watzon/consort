@@ -132,11 +132,9 @@ impl ConsortApp {
                         .child(glyph)
                         .child(service_logo(&card.logo, t.icon.dense, t))
                         .child(summary)
-                        .child(text(
-                            card.rule_note.clone(),
-                            t.text.caption,
-                            c.text_tertiary,
-                        )),
+                        .child(
+                            text(card.rule_note.clone(), t.text.caption, c.text_tertiary).min_w_0(),
+                        ),
                 );
                 // A draft card is a card of its own (`ui/drafts.rs`).
                 {
@@ -201,7 +199,7 @@ impl ConsortApp {
                             .items_center()
                             .gap(t.space.sm)
                             .child(self.card_outcome_or_buttons(approval, whole, key, t, cx))
-                            .child(div().flex_1())
+                            .child(div().flex_1().min_w_0())
                             .child(div().font_family(t.font_mono.clone()).child(selectable(
                                 SharedString::from(format!("{key}-tool")),
                                 tool,
@@ -326,7 +324,7 @@ impl ConsortApp {
                                 ))
                                 .child(text(
                                     format!(
-                                        "The sign-in for {} runs in the sign-in dialog, the same as in Settings > Workers. The assistant never sees your login.",
+                                        "The sign-in for {} runs in the sign-in dialog, the same as in Settings > Providers. The assistant never sees your login.",
                                         sign_in.provider
                                     ),
                                     detail(t),
@@ -360,6 +358,32 @@ impl ConsortApp {
                     );
                 }
                 frame = frame.child(self.card_outcome_or_buttons(approval, whole, key, t, cx));
+            }
+            HubCardView::Monid(monid) => {
+                frame = frame
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(t.space.sm)
+                            .child(glyph)
+                            .child(summary),
+                    )
+                    .child(self.render_monid_card_body(monid, key, t))
+                    .child(self.card_outcome_or_buttons(approval, whole, key, t, cx));
+            }
+            HubCardView::Access(access) => {
+                frame = frame
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(t.space.sm)
+                            .child(glyph)
+                            .child(summary),
+                    )
+                    .child(self.render_access_card_body(access, key, t))
+                    .child(self.card_outcome_or_buttons(approval, whole, key, t, cx));
             }
             HubCardView::SkillInstall(install) => {
                 let (_, audits) = audit_summary(&install.audits);
@@ -614,14 +638,15 @@ impl ConsortApp {
                     .as_ref()
                     .and_then(|id| self.state.connection(id).cloned());
                 match connection {
-                    Some(connection) => match &connection.status {
-                        ConnectionStatusView::Active => {
-                            line(format!("{} is connected.", connection.name))
-                        }
-                        ConnectionStatusView::Connecting { redirect_url, .. } => {
-                            let url = redirect_url.clone();
-                            let id = connection.id.clone();
-                            div()
+                    Some(connection) => {
+                        match &connection.status {
+                            ConnectionStatusView::Active => {
+                                line(format!("{} is connected.", connection.name))
+                            }
+                            ConnectionStatusView::Connecting { redirect_url, .. } => {
+                                let url = redirect_url.clone();
+                                let id = connection.id.clone();
+                                div()
                                 .flex()
                                 .items_center()
                                 .gap(t.space.sm)
@@ -636,7 +661,7 @@ impl ConsortApp {
                                     "Waiting for you to finish the sign-in in your browser.",
                                     t.text.ui,
                                     c.text_secondary,
-                                ))
+                                ).flex_1().min_w_0())
                                 .when_some(url, |d, url| {
                                     d.child(
                                         button(
@@ -654,13 +679,14 @@ impl ConsortApp {
                                     )
                                 })
                                 .into_any_element()
+                            }
+                            ConnectionStatusView::NeedsSignIn { .. }
+                            | ConnectionStatusView::Failed { .. } => line(format!(
+                                "The sign-in of {} did not finish. Reconnect it in Settings > Connectors.",
+                                connection.name
+                            )),
                         }
-                        ConnectionStatusView::NeedsSignIn { .. }
-                        | ConnectionStatusView::Failed { .. } => line(format!(
-                            "The sign-in of {} did not finish. Reconnect it in Settings > Connectors.",
-                            connection.name
-                        )),
-                    },
+                    }
                     None => line("You continued. The hub is starting the sign-in.".into()),
                 }
             }
@@ -738,6 +764,9 @@ impl ConsortApp {
                 "You allowed it. The hub is adding the skill.".to_owned()
             }),
             (HubCardView::SkillInstall(_), false) => line("Not added.".into()),
+            (HubCardView::Monid(_), true) => line("You allowed it. The call ran.".into()),
+            (HubCardView::Monid(_), false) => line("You said no. The call did not run.".into()),
+            (HubCardView::Access(card), _) => line(card.answered_line()),
         }
     }
 }

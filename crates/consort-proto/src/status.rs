@@ -194,7 +194,8 @@ impl TaskStatus {
     }
 
     /// Whether the hub wakes the channel's coordinator with a `task_update`
-    /// when a task enters this status.
+    /// when a task enters this status. An approval is the exception: it moves
+    /// its task to Needs input and wakes nothing.
     pub fn wakes_coordinator(self) -> bool {
         matches!(self, Self::Review | Self::NeedsInput | Self::Failed)
     }

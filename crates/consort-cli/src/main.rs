@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
-use consort_worker::WorkerConfig;
-use consort_worker::config::WorkerToml;
+use consort_session_host::HostConfig;
+use consort_session_host::config::HostToml;
 
 mod service;
 mod service_cmd;
@@ -37,10 +37,29 @@ enum Command {
         #[command(subcommand)]
         command: WorkerCommand,
     },
+    /// Pair or run the session host: the process on the hub machine that
+    /// holds the accounts and runs the harnesses.
+    SessionHost {
+        #[command(subcommand)]
+        command: SessionHostCommand,
+    },
     /// Run a hub and a worker in one process, for development. The worker
     /// keeps its profile folders and managed tools in <data>/home, unless
     /// CONSORT_HOME is set.
     Dev(DevArgs),
+    /// Runs a harness inside the Linux boundary. The session host starts this
+    /// inside `bwrap`: it opens the ports of the egress proxy and the MCP
+    /// endpoints in the empty network, then runs the harness.
+    #[cfg(unix)]
+    #[command(name = "boundary-run", hide = true)]
+    BoundaryRun {
+        /// `<port>=<socket>`: a local port and the Unix socket behind it.
+        #[arg(long = "bridge")]
+        bridges: Vec<String>,
+        /// The program and its arguments.
+        #[arg(last = true, required = true)]
+        command: Vec<String>,
+    },
     /// Bridge stdio to a session's local MCP endpoint. The token comes from
     /// CONSORT_MCP_TOKEN.
     McpBridge {
@@ -72,6 +91,12 @@ struct HubArgs {
 enum HubCommand {
     /// Make a new client setup code. Works while the hub runs.
     SetupCode {
+        /// The data folder of the hub.
+        #[arg(long)]
+        data: Option<PathBuf>,
+    },
+    /// Make a code that pairs the session host. Works while the hub runs.
+    SessionHostCode {
         /// The data folder of the hub.
         #[arg(long)]
         data: Option<PathBuf>,
@@ -183,6 +208,34 @@ enum WorkerCommand {
     Status(service_cmd::ServiceArgs),
 }
 
+#[derive(Subcommand)]
+enum SessionHostCommand {
+    /// Pair the session host with the hub on this machine.
+    Pair {
+        /// The hub URL. The session host runs on the hub machine, so this is
+        /// usually http://127.0.0.1:7600.
+        hub_url: String,
+        /// The pairing code that `consort hub session-host-code` prints.
+        #[arg(long, env = "CONSORT_PAIRING_CODE", hide_env_values = true)]
+        code: Option<String>,
+        /// The session host folder.
+        #[arg(long, env = "CONSORT_SESSION_HOST_DIR")]
+        config_dir: PathBuf,
+    },
+    /// Run the session host until Ctrl-C, SIGTERM or SIGHUP.
+    Run {
+        /// The session host folder.
+        #[arg(long, env = "CONSORT_SESSION_HOST_DIR")]
+        config_dir: PathBuf,
+        /// The Consort home, with the account profiles and the managed tools.
+        #[arg(long, env = "CONSORT_HOME")]
+        consort_home: Option<PathBuf>,
+        /// Write the log to this file, not to the terminal.
+        #[arg(long)]
+        log_file: Option<PathBuf>,
+    },
+}
+
 #[derive(Args)]
 struct DevArgs {
     /// The data folder. The hub uses it, and the worker uses <data>/worker.
@@ -235,9 +288,9 @@ fn default_hub_dir() -> Result<PathBuf> {
 fn worker_dir(given: Option<PathBuf>) -> Result<PathBuf> {
     match given {
         Some(dir) => Ok(dir),
-        None => {
-            WorkerConfig::default_dir().context("could not find a config folder; pass --config-dir")
-        }
+        None => directories::ProjectDirs::from("", "", "consort")
+            .map(|d| d.config_dir().join("worker"))
+            .context("could not find a config folder; pass --config-dir"),
     }
 }
 
@@ -516,6 +569,14 @@ async fn run_hub(args: HubArgs) -> Result<()> {
             println!("It works once and is valid for 10 minutes.");
             return Ok(());
         }
+        Some(HubCommand::SessionHostCode { data }) => {
+            let data = hub_data(data, args.data)?;
+            let code = consort_hub::create_session_host_code(&data)
+                .context("could not make a session host code")?;
+            println!("Session host code: {code}");
+            println!("It works once and is valid for 10 minutes.");
+            return Ok(());
+        }
         Some(HubCommand::Client { command }) => return run_paired(true, command, args.data),
         Some(HubCommand::Worker { command }) => return run_paired(false, command, args.data),
         Some(HubCommand::Restore {
@@ -559,20 +620,41 @@ async fn run_hub(args: HubArgs) -> Result<()> {
 }
 
 async fn run_worker(config_dir: PathBuf) -> Result<()> {
-    let worker = consort_worker::run(WorkerConfig::new(config_dir.clone()))
-        .await
-        .with_context(|| format!("could not start the worker in {}", config_dir.display()))?;
+    let worker = consort_worker::run(consort_worker::WorkerConfig {
+        config_dir: config_dir.clone(),
+    })
+    .await
+    .with_context(|| format!("could not start the worker in {}", config_dir.display()))?;
     println!("Worker {} runs. Press Ctrl-C to stop.", worker.worker_id());
     wait_for_stop().await;
     worker.shutdown().await?;
     Ok(())
 }
 
+async fn run_session_host(config_dir: PathBuf, consort_home: Option<PathBuf>) -> Result<()> {
+    let host = consort_session_host::run(HostConfig {
+        consort_home,
+        ..HostConfig::new(config_dir.clone())
+    })
+    .await
+    .with_context(|| {
+        format!(
+            "could not start the session host in {}",
+            config_dir.display()
+        )
+    })?;
+    println!("The session host runs. Press Ctrl-C to stop.");
+    tracing::info!(id = %host.worker_id(), "the session host runs");
+    wait_for_stop().await;
+    host.shutdown().await?;
+    Ok(())
+}
+
 /// Pairs the dev worker with the dev hub, unless it is paired with it
 /// already.
 async fn pair_dev_worker(hub: &consort_hub::HubHandle, dir: &Path) -> Result<()> {
-    let toml = WorkerToml::load(dir)?;
-    let url = consort_worker::http::base_url(&hub.public_url());
+    let toml = consort_worker::config::WorkerToml::load(dir)?;
+    let url = consort_link::http::base_url(&hub.public_url());
     if toml.hub_url.as_deref() == Some(url.as_str())
         && toml.worker_id.is_some()
         && dir.join(consort_worker::config::KEY_FILE).exists()
@@ -596,6 +678,71 @@ async fn pair_dev_worker(hub: &consort_hub::HubHandle, dir: &Path) -> Result<()>
     Ok(())
 }
 
+/// Pairs the dev session host with the dev hub, unless it is paired with it
+/// already.
+async fn pair_dev_session_host(hub: &consort_hub::HubHandle, dir: &Path) -> Result<()> {
+    let toml = HostToml::load(dir)?;
+    let url = consort_link::http::base_url(&hub.public_url());
+    if toml.hub_url.as_deref() == Some(url.as_str())
+        && toml.worker_id.is_some()
+        && dir.join(consort_session_host::config::KEY_FILE).exists()
+    {
+        return Ok(());
+    }
+    let code = hub
+        .new_session_host_pairing_code()
+        .await
+        .context("the hub could not make a session host code")?;
+    consort_session_host::pair(&url, &code, dir, Some("hub".to_owned()), Vec::new())
+        .await
+        .context("could not pair the session host")?;
+    Ok(())
+}
+
+/// Starts the session host as its own process, as a real hub machine runs it.
+/// A hub restart then does not stop a turn.
+fn spawn_session_host(dir: &Path, consort_home: &Path) -> Result<tokio::process::Child> {
+    let program = std::env::current_exe().context("could not find this program")?;
+    tokio::process::Command::new(program)
+        .args(["session-host", "run", "--config-dir"])
+        .arg(dir)
+        .arg("--consort-home")
+        .arg(consort_home)
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .context("could not start the session host")
+}
+
+/// Stops the session host, which closes its harness processes. After 10
+/// seconds, it kills the process.
+async fn stop_session_host(mut child: tokio::process::Child) {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        let _ = tokio::process::Command::new("kill")
+            .args(["-s", "TERM", &pid.to_string()])
+            .status()
+            .await;
+    }
+    if tokio::time::timeout(Duration::from_secs(10), child.wait())
+        .await
+        .is_err()
+    {
+        let _ = child.kill().await;
+    }
+}
+
+/// The accounts of an older dev hub were on its worker. There is no migration.
+fn refuse_old_dev_folder(data: &Path) -> Result<()> {
+    if data.join("hub.db").exists() && !data.join("session-host").exists() {
+        bail!(
+            "{} is from before the hub owned the accounts. Delete this folder to start again with a new hub",
+            data.display()
+        );
+    }
+    Ok(())
+}
+
 /// The Consort home of `consort dev`: `CONSORT_HOME` when it is set, else
 /// `<data>/home`, so a dev run keeps its profiles and tools apart from the
 /// user's own `~/.consort`.
@@ -606,6 +753,7 @@ fn dev_consort_home(data: &Path, env: Option<std::ffi::OsString>) -> PathBuf {
 }
 
 async fn run_dev(args: DevArgs) -> Result<()> {
+    refuse_old_dev_folder(&args.data)?;
     let hub = consort_hub::serve(consort_hub::HubConfig {
         data_dir: args.data.clone(),
         listen: args.listen,
@@ -613,13 +761,14 @@ async fn run_dev(args: DevArgs) -> Result<()> {
     })
     .await
     .context("could not start the hub")?;
+    let host_dir = args.data.join("session-host");
+    pair_dev_session_host(&hub, &host_dir).await?;
+    let consort_home = dev_consort_home(&args.data, std::env::var_os("CONSORT_HOME"));
+    let session_host = spawn_session_host(&host_dir, &consort_home)?;
     let worker_dir = args.data.join("worker");
     pair_dev_worker(&hub, &worker_dir).await?;
-    let consort_home = dev_consort_home(&args.data, std::env::var_os("CONSORT_HOME"));
-    let worker = consort_worker::run(WorkerConfig {
+    let worker = consort_worker::run(consort_worker::WorkerConfig {
         config_dir: worker_dir.clone(),
-        consort_home: Some(consort_home.clone()),
-        check_tool_updates: true,
     })
     .await?;
     if !worker.wait_connected(Duration::from_secs(10)).await {
@@ -639,11 +788,13 @@ async fn run_dev(args: DevArgs) -> Result<()> {
         worker_dir.display()
     );
     println!(
-        "Profile folders and managed tools are in {}.",
+        "The session host uses {}. Profile folders and managed tools are in {}.",
+        host_dir.display(),
         consort_home.display()
     );
     println!("Press Ctrl-C to stop.");
     wait_for_stop().await;
+    stop_session_host(session_host).await;
     worker.shutdown().await?;
     hub.shutdown()
         .await
@@ -652,13 +803,13 @@ async fn run_dev(args: DevArgs) -> Result<()> {
 }
 
 async fn run_bridge(url: &str) -> Result<()> {
-    let Ok(token) = std::env::var(consort_worker::bridge::TOKEN_VAR) else {
+    let Ok(token) = std::env::var(consort_session_host::bridge::TOKEN_VAR) else {
         bail!(
             "set {} to the session's MCP token",
-            consort_worker::bridge::TOKEN_VAR
+            consort_session_host::bridge::TOKEN_VAR
         );
     };
-    consort_worker::bridge::run_stdio(url, &token).await?;
+    consort_session_host::bridge::run_stdio(url, &token).await?;
     Ok(())
 }
 
@@ -668,6 +819,9 @@ async fn main() -> Result<()> {
     let log_file = match &cli.command {
         Command::Worker {
             command: WorkerCommand::Run { log_file, .. },
+        }
+        | Command::SessionHost {
+            command: SessionHostCommand::Run { log_file, .. },
         } => log_file.as_deref(),
         _ => None,
     };
@@ -683,7 +837,7 @@ async fn main() -> Result<()> {
                 config_dir,
             } => {
                 let dir = worker_dir(config_dir)?;
-                if let Some(warning) = consort_worker::http::cleartext_warning(&hub_url) {
+                if let Some(warning) = consort_link::http::cleartext_warning(&hub_url) {
                     eprintln!("Warning: {warning}");
                 }
                 let code = pairing_code(code, &mut std::io::stdin().lock())?;
@@ -712,15 +866,76 @@ async fn main() -> Result<()> {
                 service_cmd::status(args, &dir)
             }
         },
+        Command::SessionHost { command } => match command {
+            SessionHostCommand::Pair {
+                hub_url,
+                code,
+                config_dir,
+            } => {
+                let code = pairing_code(code, &mut std::io::stdin().lock())?;
+                let id = consort_session_host::pair(&hub_url, &code, &config_dir, None, Vec::new())
+                    .await?;
+                println!(
+                    "Paired the session host as {id}. The configuration is in {}.",
+                    config_dir.display()
+                );
+                Ok(())
+            }
+            SessionHostCommand::Run {
+                config_dir,
+                consort_home,
+                ..
+            } => run_session_host(config_dir, consort_home).await,
+        },
         Command::Dev(args) => run_dev(args).await,
+        #[cfg(unix)]
+        Command::BoundaryRun { bridges, command } => run_boundary(&bridges, &command).await,
         Command::McpBridge { url } => run_bridge(&url).await,
     }
+}
+
+/// Runs the harness inside the Linux boundary. This process ends with its code.
+#[cfg(unix)]
+async fn run_boundary(bridges: &[String], command: &[String]) -> Result<()> {
+    let mut parsed = Vec::with_capacity(bridges.len());
+    for bridge in bridges {
+        let (port, socket) = bridge
+            .split_once('=')
+            .with_context(|| format!("`{bridge}` is not <port>=<socket>"))?;
+        let port: u16 = port
+            .parse()
+            .with_context(|| format!("`{port}` is not a port"))?;
+        parsed.push((port, std::path::PathBuf::from(socket)));
+    }
+    let (program, args) = command.split_first().context("no program to run")?;
+    let code = consort_harness::boundary::run_inside(&parsed, program, args).await;
+    std::process::exit(code);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[cfg(unix)]
+    #[test]
+    fn the_boundary_helper_takes_its_bridges_and_its_command() {
+        let cli = Cli::try_parse_from([
+            "consort",
+            consort_harness::boundary::INSIDE_SUBCOMMAND,
+            "--bridge",
+            "5001=/run/consort/5001.sock",
+            "--",
+            "/usr/bin/node",
+            "--flag",
+        ])
+        .unwrap();
+        let Command::BoundaryRun { bridges, command } = cli.command else {
+            panic!("not boundary-run");
+        };
+        assert_eq!(bridges, ["5001=/run/consort/5001.sock"]);
+        assert_eq!(command, ["/usr/bin/node", "--flag"]);
+    }
 
     #[test]
     fn cli_parses() {

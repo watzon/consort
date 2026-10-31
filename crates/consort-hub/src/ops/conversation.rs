@@ -303,6 +303,10 @@ impl Hub {
                     created_at: now,
                     updated_at: now,
                     proactive_tasks: Default::default(),
+                    coordinator_fallback: None,
+                    coordinator_blocked: None,
+                    monid: Default::default(),
+                    access_grants: Vec::new(),
                     proactivity: None,
                 };
                 tx.save_channel(&channel)?;
@@ -328,8 +332,7 @@ impl Hub {
             request.instructions.as_deref().unwrap_or_default(),
         )?;
         let tags_in_request = request.tags.is_some();
-        let hub = self.clone();
-        let (channel, fx, moved) = self
+        let (channel, moved) = self
             .store
             .write(move |tx| {
                 let before = conversation::channel_or_404(tx.db(), request.channel_id)?;
@@ -390,7 +393,7 @@ impl Hub {
                     channel.proactive_tasks = tasks;
                 }
                 if channel == before {
-                    return Ok((channel, Default::default(), Vec::new()));
+                    return Ok((channel, Vec::new()));
                 }
                 channel.updated_at = tx.now();
                 tx.save_channel(&channel)?;
@@ -405,19 +408,9 @@ impl Hub {
                 } else {
                     Vec::new()
                 };
-                // Work that runs keeps running. The coordinator moves off a
-                // worker that does not have every new tag.
-                let fx = if channel.tags != before.tags {
-                    crate::link::events::move_coordinator_off_unqualified_worker(
-                        &hub, tx, &channel,
-                    )?
-                } else {
-                    Default::default()
-                };
-                Ok((channel, fx, moved))
+                Ok((channel, moved))
             })
             .await?;
-        self.run_effects(fx);
         // The next coordinator turn of each moved channel uses the new model.
         self.coordinator_selection_changed(moved).await;
         if tags_in_request {
@@ -1881,6 +1874,8 @@ mod tests {
                     review_summary: None,
                     resolved_at: None,
                     session_ended: false,
+                    monid_calls: 0,
+                    monid_cost_micros: 0,
                     archived_at: None,
                     created_at: now,
                     updated_at: now,

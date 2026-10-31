@@ -3,7 +3,7 @@ use consort_proto::ids::SessionId;
 use consort_proto::model::{
     ApprovalDetails, FileChangeKind, ItemPayload, ItemStatus, RequestOptionKind,
 };
-use consort_proto::worker_link::RequestBody;
+use consort_proto::session_host_link::RequestBody;
 use serde_json::json;
 
 fn mapper() -> AcpMapper {
@@ -135,12 +135,12 @@ fn edits_plans_mcp_tools_and_thoughts() {
         matches!(&items(&new_file)[0].0, ItemPayload::FileChange(f) if f.changes[0].change == FileChangeKind::Add)
     );
     let tool = m.map_update(&json!({
-        "sessionUpdate": "tool_call", "toolCallId": "m1", "title": "mcp__hub__post_update", "kind": "other",
+        "sessionUpdate": "tool_call", "toolCallId": "m1", "title": "mcp__consort__post_update", "kind": "other",
         "rawInput": {"body": "Halfway."}
     }));
     match &items(&tool)[0].0 {
         ItemPayload::ToolCall(t) => {
-            assert_eq!(t.server.as_deref(), Some("hub"));
+            assert_eq!(t.server.as_deref(), Some("consort"));
             assert_eq!(t.tool, "post_update");
             assert_eq!(t.arguments["body"], "Halfway.");
         }
@@ -424,7 +424,7 @@ fn launch_recipes() {
 #[test]
 fn mcp_servers_use_http_or_the_bridge() {
     let servers = vec![McpServerSpec {
-        name: "hub".into(),
+        name: "consort".into(),
         url: "http://127.0.0.1:5000/mcp/ses_x".into(),
         bearer_token: Some("tok".into()),
         bridge: Some(crate::StdioCommand {
@@ -590,13 +590,12 @@ mod fake_agent {
             coordinator: false,
             system_prompt_append: "You are a coordinator.".into(),
             mcp_servers: vec![McpServerSpec {
-                name: "hub".into(),
+                name: "consort".into(),
                 url: "http://127.0.0.1:9/mcp/ses".into(),
                 bearer_token: Some("tok".into()),
                 bridge: None,
             }],
             env: BTreeMap::new(),
-            extras_enabled: true,
             skills: None,
             resume: None,
             process_watcher: None,
@@ -785,6 +784,8 @@ mod fake_agent {
                     // A prompt that the test wants to fail. -32000 is the ACP
                     // code for "authentication required".
                     let text = msg["params"]["prompt"][0]["text"].as_str().unwrap_or("");
+                    // The first prompt of some harnesses has a preamble.
+                    let text = text.rsplit('\n').next().unwrap_or(text);
                     let failure = match text {
                         "Expire" => Some((-32000, "Authentication required")),
                         "Break" => Some((-32603, "Internal error")),
@@ -977,7 +978,7 @@ mod fake_agent {
             unreachable!()
         };
         assert!(
-            matches!(&opened.body, consort_proto::worker_link::RequestBody::Approval(ApprovalDetails::Command { command, .. }) if command == "git push")
+            matches!(&opened.body, consort_proto::session_host_link::RequestBody::Approval(ApprovalDetails::Command { command, .. }) if command == "git push")
         );
         assert!(
             session
@@ -1020,7 +1021,7 @@ mod fake_agent {
         assert!(matches!(
             closed,
             SessionEvent::RequestClosed {
-                outcome: consort_proto::worker_link::RequestOutcome::Allowed,
+                outcome: consort_proto::session_host_link::RequestOutcome::Allowed,
                 ..
             }
         ));
@@ -1146,7 +1147,7 @@ mod fake_agent {
     }
 
     #[tokio::test]
-    async fn a_prompt_that_needs_a_login_reports_signed_out_and_the_next_step() {
+    async fn a_claude_prompt_that_needs_a_login_reports_an_expired_login() {
         let (client_side, agent_side) = tokio::io::duplex(1 << 16);
         let log = Arc::new(Mutex::new(Vec::new()));
         tokio::spawn(run_agent(agent_side, log));
@@ -1162,7 +1163,37 @@ mod fake_agent {
         .await
         .unwrap();
         let mut session: Box<dyn HarnessSession> = Box::new(session);
-        let hint = "Authentication required. Run `claude` on this machine and sign in with /login.";
+        // The probe cannot see this state, so a sign-out mark would not last.
+        let turn = events_of_turn(&mut session, &mut events, "Expire").await;
+        assert!(
+            turn.iter()
+                .any(|e| matches!(e, SessionEvent::Error { code, message }
+            if code == crate::LOGIN_EXPIRED_ERROR_CODE && message == crate::LOGIN_EXPIRED_MESSAGE))
+        );
+        assert!(!turn.iter().any(
+            |e| matches!(e, SessionEvent::Error { code, .. } if code == crate::SIGNED_OUT_ERROR_CODE)
+        ));
+        session.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_prompt_that_needs_a_login_reports_signed_out_and_the_next_step() {
+        let (client_side, agent_side) = tokio::io::duplex(1 << 16);
+        let log = Arc::new(Mutex::new(Vec::new()));
+        tokio::spawn(run_agent(agent_side, log));
+        let (read, write) = tokio::io::split(client_side);
+        let (session, mut events, _ready) = connect(
+            HarnessKind::GeminiCli,
+            spec(),
+            write,
+            read,
+            None,
+            StderrTail::empty(),
+        )
+        .await
+        .unwrap();
+        let mut session: Box<dyn HarnessSession> = Box::new(session);
+        let hint = "Authentication required. Run `gemini` on this machine and sign in.";
 
         let turn = events_of_turn(&mut session, &mut events, "Expire").await;
         let signed_out = turn
@@ -1309,67 +1340,7 @@ mod fake_agent {
         let session: Box<dyn HarnessSession> = Box::new(session);
         assert_eq!(
             config_sets(&log),
-            vec!["model=sonnet", "effort=high", "mode=auto"]
-        );
-        session.close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn a_model_without_auto_opens_in_accept_edits_and_does_not_fail() {
-        // The model comes first, so the adapter has dropped `auto` before the
-        // mode is set. The open asks for nothing it cannot get.
-        let mut auto = spec();
-        auto.approval_mode = ApprovalMode::Auto;
-        auto.model = "haiku".into();
-        let behavior = Behavior {
-            no_auto_on_haiku: true,
-            ..Behavior::default()
-        };
-        let (result, log) = connect_with(HarnessKind::ClaudeCode, auto, behavior).await;
-        let (session, _events, _ready) = result.unwrap();
-        let session: Box<dyn HarnessSession> = Box::new(session);
-        assert_eq!(config_sets(&log), vec!["model=haiku"]);
-        session.close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn a_model_change_in_the_session_sets_the_mode_again() {
-        let mut auto = spec();
-        auto.approval_mode = ApprovalMode::Auto;
-        let behavior = Behavior {
-            no_auto_on_haiku: true,
-            ..Behavior::default()
-        };
-        let (result, log) = connect_with(HarnessKind::ClaudeCode, auto, behavior).await;
-        let (session, _events, _ready) = result.unwrap();
-        assert!(session.capabilities().switch_model);
-        let mut session: Box<dyn HarnessSession> = Box::new(session);
-        assert_eq!(
-            config_sets(&log),
-            vec!["model=sonnet", "effort=high", "mode=auto"]
-        );
-
-        // To a model without `auto`: the adapter drops the mode and refuses
-        // `auto`. The change works, and the session goes on in
-        // `acceptEdits`.
-        session
-            .set_model("haiku", &ModelOptions::new())
-            .await
-            .unwrap();
-        let sets = config_sets(&log);
-        assert_eq!(sets[3..], ["model=haiku", "mode=auto"], "{sets:?}");
-
-        // Back to a model with `auto`: the mode is set again, and now it
-        // sticks. Without this, the session would stay in `acceptEdits`.
-        let options: ModelOptions = [("effort".to_owned(), OptionValue::Text("high".into()))]
-            .into_iter()
-            .collect();
-        session.set_model("sonnet", &options).await.unwrap();
-        let sets = config_sets(&log);
-        assert_eq!(
-            sets[5..],
-            ["model=sonnet", "effort=high", "mode=auto"],
-            "{sets:?}"
+            vec!["model=sonnet", "effort=high", "mode=default"]
         );
         session.close().await.unwrap();
     }
@@ -1445,13 +1416,19 @@ mod fake_agent {
             let load = log.iter().find(|m| m["method"] == "session/load").unwrap();
             let meta = &load["params"]["_meta"];
             assert_eq!(meta["systemPrompt"]["append"], "You are a coordinator.");
+            // A load without the generated configuration would bring back
+            // all native tools.
+            assert_eq!(meta["claudeCode"]["options"]["tools"], json!([]));
+            assert_eq!(meta["claudeCode"]["options"]["settingSources"], json!([]));
+            // The provider extras are off on a load, the same as on a new
+            // session.
+            let settings = &meta["claudeCode"]["options"]["settings"];
+            assert_eq!(settings["disableClaudeAiConnectors"], true);
+            assert_eq!(settings["syncClaudeAiSkills"], false);
+            assert_eq!(settings["syncClaudeAiPlugins"], false);
             assert_eq!(
-                meta["claudeCode"]["options"]["settingSources"],
-                json!(["user"])
-            );
-            assert_eq!(
-                meta["claudeCode"]["options"]["disallowedTools"],
-                json!(["Bash", "PowerShell", "Monitor"])
+                meta["claudeCode"]["options"]["env"]["ENABLE_CLAUDEAI_MCP_SERVERS"],
+                "false"
             );
             assert!(
                 log.iter()
@@ -1460,70 +1437,6 @@ mod fake_agent {
                         && m["params"]["value"] == "default"),
                 "the resumed session gets its mode again"
             );
-        }
-        Box::new(session).close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn extras_off_and_skills_reach_session_new_and_session_load() {
-        let dir = tempfile::tempdir().unwrap();
-        let skills =
-            crate::skills::SessionSkills::new(dir.path().join("skills"), vec!["pdf-forms".into()]);
-        let plugin = crate::skills::claude_plugin_dir(&skills)
-            .to_string_lossy()
-            .into_owned();
-        for resume in [None, Some(NativeRef::new("s1"))] {
-            let mut s = spec();
-            s.extras_enabled = false;
-            s.skills = Some(skills.clone());
-            s.resume = resume.clone();
-            let (result, log) = connect_with(HarnessKind::ClaudeCode, s, Behavior::default()).await;
-            let (session, _events, _ready) = result.unwrap();
-            {
-                let log = log.lock().unwrap();
-                let method = if resume.is_some() {
-                    "session/load"
-                } else {
-                    "session/new"
-                };
-                let request = log.iter().find(|m| m["method"] == method).unwrap();
-                let options = &request["params"]["_meta"]["claudeCode"]["options"];
-                assert_eq!(
-                    options["settings"],
-                    json!({
-                        "disableClaudeAiConnectors": true,
-                        "syncClaudeAiSkills": false,
-                        "syncClaudeAiPlugins": false
-                    }),
-                    "{method}"
-                );
-                assert_eq!(
-                    options["env"],
-                    json!({"ENABLE_CLAUDEAI_MCP_SERVERS": "false"}),
-                    "{method}"
-                );
-                assert_eq!(
-                    options["plugins"],
-                    json!([{"type": "local", "path": plugin}]),
-                    "{method}"
-                );
-            }
-            Box::new(session).close().await.unwrap();
-        }
-    }
-
-    #[tokio::test]
-    async fn extras_on_send_no_settings_or_plugins() {
-        let (result, log) =
-            connect_with(HarnessKind::ClaudeCode, spec(), Behavior::default()).await;
-        let (session, _events, _ready) = result.unwrap();
-        {
-            let log = log.lock().unwrap();
-            let new = log.iter().find(|m| m["method"] == "session/new").unwrap();
-            let options = &new["params"]["_meta"]["claudeCode"]["options"];
-            assert!(options.get("settings").is_none(), "{options}");
-            assert!(options.get("env").is_none(), "{options}");
-            assert!(options.get("plugins").is_none(), "{options}");
         }
         Box::new(session).close().await.unwrap();
     }
@@ -1667,105 +1580,6 @@ mod fake_agent {
         assert_ne!(process.cwd.as_deref(), Some(s.workspace.as_path()));
     }
 
-    /// The first turn of the fake agent with `plan_exit` asks to leave plan
-    /// mode. Returns the request.
-    async fn plan_exit_request(
-        mode: ApprovalMode,
-    ) -> (
-        Box<dyn HarnessSession>,
-        EventReceiver,
-        consort_proto::worker_link::RequestOpened,
-    ) {
-        let mut s = spec();
-        s.approval_mode = mode;
-        let behavior = Behavior {
-            plan_exit: true,
-            bypass: true,
-            ..Behavior::default()
-        };
-        let (result, _log) = connect_with(HarnessKind::ClaudeCode, s, behavior).await;
-        let (session, mut events, _ready) = result.unwrap();
-        let mut session: Box<dyn HarnessSession> = Box::new(session);
-        session
-            .turn(TurnInput {
-                text: "Plan it".into(),
-                attachments: vec![],
-            })
-            .await
-            .unwrap();
-        let SessionEvent::RequestOpened(opened) =
-            next_matching(&mut events, |e| matches!(e, SessionEvent::RequestOpened(_))).await
-        else {
-            unreachable!()
-        };
-        (session, events, opened)
-    }
-
-    #[tokio::test]
-    async fn options_that_raise_the_mode_are_not_offered() {
-        let ids = |opened: &consort_proto::worker_link::RequestOpened| -> Vec<String> {
-            opened.options.iter().map(|o| o.id.clone()).collect()
-        };
-        // Ask: only "manually approve edits" and "keep planning" stay. The
-        // client's "Allow for task" picks the first allow-always option, so
-        // it can no longer move the session to auto mode.
-        let (mut session, mut events, opened) = plan_exit_request(ApprovalMode::Ask).await;
-        assert_eq!(ids(&opened), vec!["exit-plan-default", "reject"]);
-        assert!(matches!(
-            session
-                .respond(
-                    opened.request_id.clone(),
-                    Answer {
-                        option_id: Some("exit-plan-auto".into()),
-                        text: None
-                    }
-                )
-                .await,
-            Err(HarnessError::InvalidAnswer(_))
-        ));
-        session
-            .respond(
-                opened.request_id,
-                Answer {
-                    option_id: Some("exit-plan-default".into()),
-                    text: None,
-                },
-            )
-            .await
-            .unwrap();
-        next_matching(&mut events, |e| matches!(e, SessionEvent::TurnEnded { .. })).await;
-        session.close().await.unwrap();
-
-        // Auto edits maps to `acceptEdits`, so auto mode and bypass go, and
-        // "auto-accept edits" stays.
-        let (session, _events, opened) = plan_exit_request(ApprovalMode::AutoEdits).await;
-        assert_eq!(
-            ids(&opened),
-            vec!["exit-plan-accept-edits", "exit-plan-default", "reject"]
-        );
-        session.close().await.unwrap();
-
-        // Auto maps to Claude Code's `auto` mode, so auto mode stays and
-        // only bypass goes.
-        let (session, _events, opened) = plan_exit_request(ApprovalMode::Auto).await;
-        assert_eq!(
-            ids(&opened),
-            vec![
-                "exit-plan-clear-auto",
-                "exit-plan-auto",
-                "exit-plan-accept-edits",
-                "exit-plan-default",
-                "reject"
-            ]
-        );
-        session.close().await.unwrap();
-
-        // Full access keeps every option.
-        let (session, _events, opened) = plan_exit_request(ApprovalMode::FullAccess).await;
-        assert_eq!(opened.options.len(), 6);
-        session.close().await.unwrap();
-    }
-
     /// Plays the first turn of the fake agent, which asks for a permission,
     /// and allows it.
     async fn allow_first_request(
@@ -1830,164 +1644,6 @@ mod fake_agent {
                 })
                 .await
                 .is_ok()
-        );
-        session.close().await.unwrap();
-    }
-
-    /// The values of the `mode` option that the worker set, in order.
-    fn mode_sets(log: &Arc<Mutex<Vec<Value>>>) -> Vec<String> {
-        log.lock()
-            .unwrap()
-            .iter()
-            .filter(|m| {
-                m["method"] == "session/set_config_option" && m["params"]["configId"] == "mode"
-            })
-            .map(|m| m["params"]["value"].as_str().unwrap().to_owned())
-            .collect()
-    }
-
-    #[tokio::test]
-    async fn auto_opens_claude_in_its_own_auto_mode() {
-        let mut auto = spec();
-        auto.approval_mode = ApprovalMode::Auto;
-        let (result, log) = connect_with(HarnessKind::ClaudeCode, auto, Behavior::default()).await;
-        let (session, _events, _ready) = result.unwrap();
-        let session: Box<dyn HarnessSession> = Box::new(session);
-        assert_eq!(mode_sets(&log), vec!["auto"]);
-        session.close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn auto_falls_back_to_accept_edits_when_claude_has_no_auto_mode() {
-        // The adapter does not offer `auto`: the open asks for nothing it
-        // cannot get, and the session goes on in `acceptEdits`.
-        let mut auto = spec();
-        auto.approval_mode = ApprovalMode::Auto;
-        let behavior = Behavior {
-            no_auto: true,
-            ..Behavior::default()
-        };
-        let (result, log) = connect_with(HarnessKind::ClaudeCode, auto.clone(), behavior).await;
-        let (session, _events, _ready) = result.unwrap();
-        let session: Box<dyn HarnessSession> = Box::new(session);
-        assert!(mode_sets(&log).is_empty(), "{:?}", mode_sets(&log));
-        session.close().await.unwrap();
-
-        // The account refuses `auto`: the open does not fail.
-        let behavior = Behavior {
-            refuse_auto: true,
-            ..Behavior::default()
-        };
-        let (result, log) = connect_with(HarnessKind::ClaudeCode, auto.clone(), behavior).await;
-        let (session, _events, _ready) = result.unwrap();
-        let session: Box<dyn HarnessSession> = Box::new(session);
-        assert_eq!(mode_sets(&log), vec!["auto"]);
-        session.close().await.unwrap();
-
-        // The adapter answers but keeps `acceptEdits`, as it does when the
-        // model does not support `auto`.
-        let behavior = Behavior {
-            ignore_mode: true,
-            ..Behavior::default()
-        };
-        let (result, _log) = connect_with(HarnessKind::ClaudeCode, auto, behavior).await;
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn a_mode_change_to_auto_accepts_the_fallback_of_the_adapter() {
-        // The fake keeps `acceptEdits` for every change after the open, as
-        // the adapter does for a model without `auto` mode.
-        let behavior = Behavior {
-            ignore_mode: true,
-            ..Behavior::default()
-        };
-        let mut edits = spec();
-        edits.approval_mode = ApprovalMode::AutoEdits;
-        let (result, _log) = connect_with(HarnessKind::ClaudeCode, edits, behavior).await;
-        let (session, _events, _ready) = result.unwrap();
-        let mut session: Box<dyn HarnessSession> = Box::new(session);
-        assert!(session.set_approval_mode(ApprovalMode::Auto).await.is_ok());
-        session.close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn auto_mode_is_only_a_move_up_from_auto() {
-        // Auto edits: a move to `auto` is set back.
-        let behavior = Behavior {
-            escalate: Some("auto"),
-            ..Behavior::default()
-        };
-        let mut edits = spec();
-        edits.approval_mode = ApprovalMode::AutoEdits;
-        let (result, log) = connect_with(HarnessKind::ClaudeCode, edits, behavior).await;
-        let (session, mut events, _ready) = result.unwrap();
-        let mut session: Box<dyn HarnessSession> = Box::new(session);
-        allow_first_request(&mut session, &mut events).await;
-        let reset = next_matching(&mut events, |e| matches!(e, SessionEvent::Error { .. })).await;
-        assert!(
-            matches!(&reset, SessionEvent::Error { code, message } if code == "mode_reset" && message.contains("`auto`") && message.contains("`acceptEdits`")),
-            "{reset:?}"
-        );
-        assert_eq!(mode_sets(&log), vec!["acceptEdits"]);
-        session.close().await.unwrap();
-
-        // Auto: the session is in `auto` already, and nothing is set back.
-        let behavior = Behavior {
-            escalate: Some("auto"),
-            ..Behavior::default()
-        };
-        let mut auto = spec();
-        auto.approval_mode = ApprovalMode::Auto;
-        let (result, log) = connect_with(HarnessKind::ClaudeCode, auto, behavior).await;
-        let (session, mut events, _ready) = result.unwrap();
-        let mut session: Box<dyn HarnessSession> = Box::new(session);
-        allow_first_request(&mut session, &mut events).await;
-        next_matching(&mut events, |e| matches!(e, SessionEvent::TurnEnded { .. })).await;
-        assert_eq!(mode_sets(&log), vec!["auto"], "only the open sets a mode");
-        session.close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn a_claude_session_changes_its_mode_for_a_turn_and_back() {
-        let mut auto = spec();
-        auto.approval_mode = ApprovalMode::Auto;
-        let (result, log) = connect_with(HarnessKind::ClaudeCode, auto, Behavior::default()).await;
-        let (session, _events, _ready) = result.unwrap();
-        let mut session: Box<dyn HarnessSession> = Box::new(session);
-        session.set_approval_mode(ApprovalMode::Ask).await.unwrap();
-        session.set_approval_mode(ApprovalMode::Auto).await.unwrap();
-        let sets: Vec<String> = log
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|m| {
-                m["method"] == "session/set_config_option" && m["params"]["configId"] == "mode"
-            })
-            .map(|m| m["params"]["value"].as_str().unwrap().to_owned())
-            .collect();
-        // The fake agent starts in `acceptEdits`, so the open sets `auto`.
-        assert_eq!(sets, vec!["auto", "default", "auto"]);
-        session.close().await.unwrap();
-
-        // A mode that the agent does not take fails, so the worker refuses
-        // the turn.
-        let mut auto = spec();
-        auto.approval_mode = ApprovalMode::AutoEdits;
-        let behavior = Behavior {
-            refuse_reset: true,
-            ..Behavior::default()
-        };
-        let (result, _log) = connect_with(HarnessKind::ClaudeCode, auto, behavior).await;
-        let (session, _events, _ready) = result.unwrap();
-        let mut session: Box<dyn HarnessSession> = Box::new(session);
-        // The fake refuses every mode change after the first one.
-        session.set_approval_mode(ApprovalMode::Ask).await.unwrap();
-        assert!(
-            session
-                .set_approval_mode(ApprovalMode::AutoEdits)
-                .await
-                .is_err()
         );
         session.close().await.unwrap();
     }
@@ -2075,108 +1731,6 @@ mod fake_agent {
             .expect("the request was answered");
         assert_eq!(answer["result"]["outcome"]["outcome"], "cancelled");
         session.close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn full_access_without_bypass_is_unavailable() {
-        let mut s = spec();
-        s.approval_mode = ApprovalMode::FullAccess;
-        let (result, _log) =
-            connect_with(HarnessKind::ClaudeCode, s.clone(), Behavior::default()).await;
-        assert!(
-            matches!(&result, Err(HarnessError::ModeUnavailable(_))),
-            "{:?}",
-            result.as_ref().err()
-        );
-        let behavior = Behavior {
-            bypass: true,
-            ..Behavior::default()
-        };
-        let (result, _log) = connect_with(HarnessKind::ClaudeCode, s, behavior).await;
-        let (session, _events, ready) = result.unwrap();
-        assert_eq!(ready.bypass, Some(true));
-        Box::new(session).close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn full_access_without_bypass_opens_in_auto_with_its_limits() {
-        let mut s = spec();
-        s.approval_mode = ApprovalMode::FullAccess;
-        let logs = Arc::new(Mutex::new(Vec::new()));
-        let seen = logs.clone();
-        let (session, _events) = open_with_fallback(HarnessKind::ClaudeCode, s, |spec| {
-            let seen = seen.clone();
-            async move {
-                let (result, log) =
-                    connect_with(HarnessKind::ClaudeCode, spec, Behavior::default()).await;
-                seen.lock().unwrap().push(log);
-                result
-            }
-        })
-        .await
-        .unwrap();
-        assert!(
-            !session
-                .capabilities()
-                .approval_modes
-                .contains(&ApprovalMode::FullAccess)
-        );
-        let logs = logs.lock().unwrap().clone();
-        assert_eq!(logs.len(), 2, "a second agent opens the session");
-        let second = logs[1].lock().unwrap().clone();
-        let new = second
-            .iter()
-            .find(|m| m["method"] == "session/new")
-            .unwrap();
-        assert_eq!(
-            new["params"]["_meta"]["claudeCode"]["options"]["settingSources"],
-            json!(["user"]),
-            "the lower mode does not load the repo's settings"
-        );
-        assert_eq!(
-            new["params"]["_meta"]["claudeCode"]["options"]["allowDangerouslySkipPermissions"],
-            false
-        );
-        Box::new(session).close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn a_probe_sees_whether_bypass_is_offered() {
-        let (client_side, agent_side) = tokio::io::duplex(1 << 16);
-        let log = Arc::new(Mutex::new(Vec::new()));
-        tokio::spawn(run_agent_with(agent_side, log.clone(), Behavior::default()));
-        let (read, write) = tokio::io::split(client_side);
-        let (session, _events, ready) = connect_for(
-            HarnessKind::ClaudeCode,
-            spec(),
-            write,
-            read,
-            None,
-            StderrTail::empty(),
-            true,
-        )
-        .await
-        .unwrap();
-        assert_eq!(ready.bypass, Some(false));
-        // The probe read the options of each model.
-        let models = models_from_config(&ready.config_options, &ready.model_options);
-        assert_eq!(models.len(), 3);
-        assert_eq!(models[0].options.len(), 1, "Opus has an effort option");
-        assert!(models[2].options.is_empty(), "Haiku has none");
-        let new = log
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|m| m["method"] == "session/new")
-            .cloned()
-            .unwrap();
-        let options = &new["params"]["_meta"]["claudeCode"]["options"];
-        assert_eq!(options["settingSources"], json!(["user"]));
-        assert!(
-            options.get("allowDangerouslySkipPermissions").is_none(),
-            "a probe lets Claude Code show its bypass mode: {options}"
-        );
-        Box::new(session).close().await.unwrap();
     }
 
     #[tokio::test]
@@ -2426,7 +1980,6 @@ fn the_skill_folder_goes_into_the_opencode_config() {
         system_prompt_append: String::new(),
         mcp_servers: vec![],
         env: BTreeMap::new(),
-        extras_enabled: true,
         skills: Some(skills),
         resume: None,
         process_watcher: None,
@@ -2446,56 +1999,140 @@ fn the_skill_folder_goes_into_the_opencode_config() {
     assert!(!process.env["OPENCODE_CONFIG_CONTENT"].contains("skills"));
 }
 
-#[test]
-fn claude_meta_keeps_repo_settings_and_the_shell_out() {
-    let dir = tempfile::tempdir().unwrap();
-    let workspace = dir.path().join("repo");
-    std::fs::create_dir_all(workspace.join(".claude")).unwrap();
-    std::fs::write(workspace.join("CLAUDE.md"), "Use tabs.\n").unwrap();
-    let outside = dir.path().join("outside.txt");
-    std::fs::write(&outside, "do not read me").unwrap();
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(&outside, workspace.join(".claude").join("CLAUDE.md")).unwrap();
-    let mut spec = SessionSpec {
+fn meta_spec(dir: &Path, mode: ApprovalMode, coordinator: bool) -> SessionSpec {
+    SessionSpec {
         session_id: SessionId::new(),
-        workspace: workspace.clone(),
-        runtime_dir: dir.path().to_path_buf(),
+        workspace: dir.to_path_buf(),
+        runtime_dir: dir.to_path_buf(),
         model: String::new(),
         options: Default::default(),
-        approval_mode: ApprovalMode::AutoEdits,
-        allow_shell: false,
-        coordinator: false,
+        approval_mode: mode,
+        allow_shell: true,
+        coordinator,
         system_prompt_append: "You are a task.".into(),
         mcp_servers: vec![],
         env: BTreeMap::new(),
-        extras_enabled: true,
         skills: None,
         resume: None,
         process_watcher: None,
-    };
-    let meta = claude_meta(&spec);
-    let append = meta["systemPrompt"]["append"].as_str().unwrap();
-    assert!(append.starts_with("You are a task."), "{append}");
-    assert!(append.contains("Use tabs."), "{append}");
-    assert!(
-        !append.contains("do not read me"),
-        "a linked CLAUDE.md is not read: {append}"
-    );
-    let options = &meta["claudeCode"]["options"];
-    assert_eq!(options["settingSources"], json!(["user"]));
-    assert_eq!(options["allowDangerouslySkipPermissions"], false);
-    assert_eq!(
-        options["disallowedTools"],
-        json!(["Bash", "PowerShell", "Monitor"])
-    );
+    }
+}
 
-    // Full access with the shell on keeps Claude Code's own settings, and
-    // Claude Code loads CLAUDE.md itself.
-    spec.approval_mode = ApprovalMode::FullAccess;
-    spec.allow_shell = true;
-    let meta = claude_meta(&spec);
-    assert_eq!(meta["systemPrompt"]["append"], "You are a task.");
-    assert!(meta.get("claudeCode").is_none(), "{meta}");
+/// The contract of the generated configuration. Change it only with a new
+/// run of `docs/research/hub-boundary-experiment.md`.
+#[test]
+fn the_generated_config_is_one_fixed_shape_for_all_modes() {
+    let dir = tempfile::tempdir().unwrap();
+    // A repo setting and a repo instruction change nothing.
+    std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
+    std::fs::write(dir.path().join("CLAUDE.md"), "Use tabs.\n").unwrap();
+    let expected = json!({
+        "systemPrompt": {"append": "You are a task."},
+        "claudeCode": {"options": {
+            "tools": [],
+            "settingSources": [],
+            "strictMcpConfig": true,
+            "allowedTools": ["mcp__consort"],
+            "plugins": [],
+            "agents": {},
+            "promptSuggestions": false,
+            "allowDangerouslySkipPermissions": false,
+            "settings": {
+                "disableAllHooks": true,
+                "disableClaudeAiConnectors": true,
+                "syncClaudeAiSkills": false,
+                "syncClaudeAiPlugins": false,
+                "autoMemoryEnabled": false,
+            },
+            "env": {
+                "ENABLE_CLAUDEAI_MCP_SERVERS": "false",
+                "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
+            },
+        }},
+    });
+    for mode in ApprovalMode::ALL {
+        for coordinator in [false, true] {
+            assert_eq!(
+                claude_meta(&meta_spec(dir.path(), mode, coordinator)),
+                expected
+            );
+        }
+    }
+}
+
+#[test]
+fn a_one_shot_has_no_tools_and_reads_the_result() {
+    let args = claude_one_shot_args(&crate::OneShot {
+        model: "haiku".into(),
+        system: "policy".into(),
+        prompt: "cmd".into(),
+    });
+    let line = args.join(" ");
+    assert!(
+        line.contains("--tools  --setting-sources  --strict-mcp-config"),
+        "{line}"
+    );
+    assert!(line.contains("--no-session-persistence"));
+    assert!(!line.contains("cmd"), "the question goes on stdin");
+    assert_eq!(
+        claude_one_shot_text(r#"{"result":"ALLOW","is_error":false}"#).unwrap(),
+        "ALLOW"
+    );
+    assert!(claude_one_shot_text(r#"{"result":"Not logged in","is_error":true}"#).is_err());
+    assert!(claude_one_shot_text("hung text").is_err());
+}
+
+#[tokio::test]
+async fn a_one_shot_with_no_boundary_does_not_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let account = AccountConfig::default_for(HarnessKind::ClaudeCode);
+    let err = claude_one_shot(
+        &account,
+        dir.path(),
+        &crate::OneShot {
+            model: "haiku".into(),
+            system: String::new(),
+            prompt: String::new(),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("only inside the boundary"),
+        "{err}"
+    );
+}
+
+#[test]
+fn only_claude_code_is_proven_for_the_boundary() {
+    use crate::boundary::BoundarySupport;
+    for kind in [
+        HarnessKind::OpenCode,
+        HarnessKind::GeminiCli,
+        HarnessKind::Acp,
+    ] {
+        let account = AccountConfig::default_for(kind);
+        let harness = AcpHarness::new(kind);
+        assert!(matches!(
+            harness.boundary_support(&account),
+            BoundarySupport::Off(_)
+        ));
+    }
+    let account = AccountConfig::default_for(HarnessKind::ClaudeCode);
+    assert_eq!(
+        AcpHarness::new(HarnessKind::ClaudeCode).boundary_support(&account),
+        BoundarySupport::Proven
+    );
+}
+
+#[tokio::test]
+async fn the_start_watchdog_stops_a_hung_cli() {
+    let result: Result<(), HarnessError> = start_watchdog(
+        Duration::from_millis(10),
+        std::future::pending::<Result<(), HarnessError>>(),
+    )
+    .await;
+    assert!(matches!(result, Err(HarnessError::Timeout(_))));
 }
 
 /// A workspace folder that is one git repo.
@@ -2730,27 +2367,10 @@ fn coordinator_spec(dir: &std::path::Path, allow_shell: bool, coordinator: bool)
         system_prompt_append: String::new(),
         mcp_servers: vec![],
         env: BTreeMap::new(),
-        extras_enabled: true,
         skills: None,
         resume: None,
         process_watcher: None,
     }
-}
-
-#[test]
-fn a_claude_coordinator_loses_the_shell_and_the_web() {
-    let dir = tempfile::tempdir().unwrap();
-    let meta = claude_meta(&coordinator_spec(dir.path(), false, true));
-    assert_eq!(
-        meta["claudeCode"]["options"]["disallowedTools"],
-        json!(["Bash", "PowerShell", "Monitor", "WebFetch", "WebSearch"])
-    );
-    // A task keeps the web.
-    let meta = claude_meta(&coordinator_spec(dir.path(), false, false));
-    assert_eq!(
-        meta["claudeCode"]["options"]["disallowedTools"],
-        json!(["Bash", "PowerShell", "Monitor"])
-    );
 }
 
 #[test]
@@ -2776,7 +2396,7 @@ fn a_gemini_coordinator_gets_a_policy_that_denies_shell_and_web_and_allows_hub_t
     }
     assert!(policy.contains("decision = \"deny\""), "{policy}");
     assert!(
-        policy.contains("mcpName = \"hub\"\ntoolName = \"*\"\ndecision = \"allow\""),
+        policy.contains("mcpName = \"consort\"\ntoolName = \"*\"\ndecision = \"allow\""),
         "{policy}"
     );
     // The mode flag stays, and Gemini still asks in Ask mode for the rest.
@@ -2808,7 +2428,7 @@ fn an_opencode_coordinator_denies_the_web_and_allows_hub_tools() {
     assert_eq!(config["permission"]["bash"], "deny");
     assert_eq!(config["permission"]["webfetch"], "deny");
     assert_eq!(config["permission"]["websearch"], "deny");
-    assert_eq!(config["permission"]["hub_*"], "allow");
+    assert_eq!(config["permission"]["consort_*"], "allow");
     // A task keeps the web, as its mode says.
     let spec = coordinator_spec(dir.path(), true, false);
     let process = agent_process_spec(HarnessKind::OpenCode, &account, &spec, &found).unwrap();

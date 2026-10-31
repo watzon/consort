@@ -9,9 +9,9 @@ use async_trait::async_trait;
 use consort_proto::error::ErrorBody;
 use consort_proto::ids::SessionId;
 use consort_proto::model::Sha256Hash;
+use consort_proto::session_host_link::ToolCall;
 use consort_proto::tools::{HubTool, ToolCallResult, ToolDefinition};
-use consort_proto::worker_link::ToolCall;
-use consort_worker::mcp::{self, ToolBackend};
+use consort_session_host::mcp::{self, ToolBackend};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -38,9 +38,14 @@ impl ToolBackend for Backend {
 async fn bridge_forwards_stdio_to_the_endpoint() {
     let dir = tempfile::tempdir().unwrap();
     let backend = Arc::new(Backend::default());
-    let endpoint = mcp::start(SessionId::new(), dir.path().to_path_buf(), backend.clone())
-        .await
-        .unwrap();
+    let endpoint = mcp::start(
+        SessionId::new(),
+        dir.path().to_path_buf(),
+        backend.clone(),
+        None,
+    )
+    .await
+    .unwrap();
 
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_consort"))
         .args(["mcp-bridge", "--url", &endpoint.url])
@@ -71,7 +76,7 @@ async fn bridge_forwards_stdio_to_the_endpoint() {
         let value: Value = serde_json::from_str(&line).unwrap();
         by_id.insert(value["id"].as_i64().unwrap(), value);
     }
-    assert_eq!(by_id[&1]["result"]["serverInfo"]["name"], "consort-hub");
+    assert_eq!(by_id[&1]["result"]["serverInfo"]["name"], "consort");
     assert_eq!(by_id[&2]["result"]["tools"][0]["name"], "post_update");
     assert_eq!(by_id[&3]["result"]["isError"], false);
     assert_eq!(backend.calls.lock().unwrap()[0].arguments["body"], "Hi.");
@@ -86,9 +91,14 @@ async fn bridge_forwards_stdio_to_the_endpoint() {
 async fn bridge_ignores_proxy_variables() {
     let dir = tempfile::tempdir().unwrap();
     let backend = Arc::new(Backend::default());
-    let endpoint = mcp::start(SessionId::new(), dir.path().to_path_buf(), backend.clone())
-        .await
-        .unwrap();
+    let endpoint = mcp::start(
+        SessionId::new(),
+        dir.path().to_path_buf(),
+        backend.clone(),
+        None,
+    )
+    .await
+    .unwrap();
     // A "proxy" that counts the requests that carry the session token.
     // It does not count every connection: other programs on a developer
     // machine sometimes connect to new local ports, and that made this
@@ -145,10 +155,7 @@ async fn bridge_ignores_proxy_variables() {
         .unwrap()
         .unwrap();
     let value: Value = serde_json::from_str(&line).unwrap();
-    assert_eq!(
-        value["result"]["serverInfo"]["name"], "consort-hub",
-        "{value}"
-    );
+    assert_eq!(value["result"]["serverInfo"]["name"], "consort", "{value}");
     assert_eq!(*connections.lock().unwrap(), 0, "nothing went to the proxy");
     drop(stdin);
     let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;

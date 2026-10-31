@@ -152,6 +152,7 @@ impl ConsortApp {
         let mut segmented = div()
             .flex()
             .flex_1()
+            .min_w_0()
             .gap(t.space.xxs)
             .p(t.space.xxs)
             .bg(c.surface_card)
@@ -164,6 +165,7 @@ impl ConsortApp {
                 .debug_selector(move || id.to_string())
                 .flex()
                 .flex_1()
+                .whitespace_nowrap()
                 .justify_center()
                 .gap(t.space.xs + t.space.xxs)
                 .py(t.space.xs)
@@ -213,8 +215,14 @@ impl ConsortApp {
                 crate::ui::memory::memory_hint(&name, tutti),
             ),
             ChannelTab::Connectors => (
-                self.render_connectors_tab(tutti, t, cx),
-                format!("Changes apply to the next session in {name}."),
+                self.render_connectors_tab(tutti, t, _window, cx),
+                if self.monid_ui.panel
+                    && consort_client::monid::channel_row(&self.state, &self.channel_id).is_some()
+                {
+                    "Search adds a tool to this list. A change applies to the next call.".to_owned()
+                } else {
+                    format!("Changes apply to the next session in {name}.")
+                },
             ),
         };
         div()
@@ -294,6 +302,7 @@ impl ConsortApp {
                 div()
                     .debug_selector(|| "files-summary".into())
                     .flex_1()
+                    .min_w_0()
                     .child(text(listing.summary.clone(), t.text.ui, c.text_secondary)),
             );
         } else {
@@ -347,7 +356,11 @@ impl ConsortApp {
                     .cursor_pointer()
                     .hover(|s| s.bg(c.hover_sidebar))
                     .child(icon("folder", t.icon.size, c.text_secondary))
-                    .child(line(folder.name.clone(), t.text.ui, c.text_primary).flex_1())
+                    .child(
+                        line(folder.name.clone(), t.text.ui, c.text_primary)
+                            .flex_1()
+                            .min_w_0(),
+                    )
                     .child(column(folder.count_label.clone(), f.size_col, t))
                     .child(column(folder.date_label.clone(), f.date_col, t))
                     .child(div().size(f.more).flex_none())
@@ -486,7 +499,9 @@ impl ConsortApp {
                             cx,
                         ))
                         .child(
-                            line(group.task.task_name.clone(), t.text.ui, c.text_primary).flex_1(),
+                            line(group.task.task_name.clone(), t.text.ui, c.text_primary)
+                                .flex_1()
+                                .min_w_0(),
                         )
                         .child(text(
                             group.task.status.label(),
@@ -507,12 +522,14 @@ impl ConsortApp {
             .flex()
             .flex_col()
             .flex_1()
+            .min_w_0()
             .min_h_0()
             .child(toolbar)
             .child(
                 div()
                     .relative()
                     .flex_1()
+                    .min_w_0()
                     .min_h_0()
                     .child(
                         div()
@@ -622,7 +639,7 @@ impl ConsortApp {
         cx: &mut Context<Self>,
     ) -> Div {
         let c = &t.colors;
-        div().flex_1().min_h_0().p(t.space.lg).child(
+        div().flex_1().min_w_0().min_h_0().p(t.space.lg).child(
             div()
                 .id("files-empty")
                 .debug_selector(|| "files-empty".into())
@@ -704,7 +721,11 @@ impl ConsortApp {
             .when(menu_open, |d| d.bg(c.surface_selected))
             .when(!menu_open, |d| d.hover(|s| s.bg(c.hover_sidebar)))
             .child(icon(file_icon(&file.mime), t.icon.size, c.text_secondary))
-            .child(line(file.name.clone(), t.text.ui, c.text_primary).flex_1())
+            .child(
+                line(file.name.clone(), t.text.ui, c.text_primary)
+                    .flex_1()
+                    .min_w_0(),
+            )
             .child(column(file.size_label.clone(), f.size_col, t))
             .child(column(file.date_label.clone(), f.date_col, t))
             .child(
@@ -890,7 +911,7 @@ impl ConsortApp {
                             .when(chosen, |d| d.bg(c.surface_selected))
                             .when(!chosen, |d| d.hover(|s| s.bg(c.hover_raised)))
                             .child(icon("folder", t.icon.size, c.text_secondary))
-                            .child(line(label, t.text.ui, c.text_primary).flex_1())
+                            .child(line(label, t.text.ui, c.text_primary).flex_1().min_w_0())
                             .when(chosen, |d| {
                                 d.child(icon("check", t.icon.dense, c.accent_text))
                             })
@@ -981,7 +1002,11 @@ impl ConsortApp {
                         .cursor_pointer()
                         .hover(|s| s.bg(c.hover_raised))
                         .child(icon(file_icon(&file.mime), t.icon.size, c.text_secondary))
-                        .child(line(file.path.clone(), t.text.ui, c.text_primary).flex_1())
+                        .child(
+                            line(file.path.clone(), t.text.ui, c.text_primary)
+                                .flex_1()
+                                .min_w_0(),
+                        )
                         .child(text(file.size_label.clone(), detail(t), c.text_tertiary))
                         .on_click(cx.listener(
                             move |this, _, window, cx| {

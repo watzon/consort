@@ -11,8 +11,8 @@ use consort_proto::client_api::{
 };
 use consort_proto::ids::{SessionId, TaskId};
 use consort_proto::model::{ItemStatus, SessionState, WorkerState};
+use consort_proto::session_host_link::{HubToSessionHost, SequencedEvent, TurnEndReason};
 use consort_proto::status::TaskStatus;
-use consort_proto::worker_link::{HubToWorker, SequencedEvent, TurnEndReason};
 use serde_json::json;
 
 async fn wait_worker_state(world: &mut World, state: WorkerState) {
@@ -137,14 +137,14 @@ async fn a_message_for_an_offline_worker_waits_and_arrives_after_it_reconnects()
     assert_eq!(stored.get(&coordinator_session), Some(&2));
 
     let (request, command) = back.next_command().await;
-    let HubToWorker::SessionTurn(turn) = command else {
+    let HubToSessionHost::SessionTurn(turn) = command else {
         panic!("expected the queued session.turn");
     };
     assert_eq!(turn.session_id, task_session);
     assert_eq!(turn.turn.text, "Please add tests.");
     back.respond_ok(
         &request,
-        &consort_proto::worker_link::SessionTurnResult {
+        &consort_proto::session_host_link::SessionTurnResult {
             turn_id: "t2".into(),
         },
     )
@@ -169,7 +169,7 @@ async fn a_command_without_an_answer_is_sent_again_after_a_reconnect() {
         .await;
     // The hub sends the task_update turn first. Take it without an answer.
     let (first_request, first_command) = world.worker.next_command().await;
-    let HubToWorker::SessionTurn(first_turn) = first_command else {
+    let HubToSessionHost::SessionTurn(first_turn) = first_command else {
         panic!("expected session.turn");
     };
     assert_eq!(first_turn.session_id, coordinator_session_id);
@@ -202,7 +202,7 @@ async fn a_command_without_an_answer_is_sent_again_after_a_reconnect() {
         again_request.id, first_request.id,
         "the same command ID, so the worker can deduplicate"
     );
-    let HubToWorker::SessionTurn(again) = again_command else {
+    let HubToSessionHost::SessionTurn(again) = again_command else {
         panic!("expected the same session.turn");
     };
     assert_eq!(again.turn.text, first_turn.turn.text);
@@ -287,7 +287,7 @@ async fn events_for_an_unknown_session_are_refused() {
         .peer
         .call_raw(
             "session.events",
-            serde_json::to_value(consort_proto::worker_link::SessionEvents {
+            serde_json::to_value(consort_proto::session_host_link::SessionEvents {
                 session_id: SessionId::new(),
                 events: vec![SequencedEvent {
                     seq: 1,
@@ -323,7 +323,7 @@ async fn a_session_that_the_hub_does_not_know_gets_a_stop_command() {
     )
     .await;
     let (_, command) = back.next_command().await;
-    let HubToWorker::SessionStop(stop) = command else {
+    let HubToSessionHost::SessionStop(stop) = command else {
         panic!("expected session.stop");
     };
     assert_eq!(stop.session_id, stray);
@@ -359,7 +359,8 @@ async fn revoking_a_worker_closes_its_connection_and_it_cannot_return() {
         .unwrap();
     assert!(world.worker.peer.closed(WAIT).await);
 
-    let mut peer = Peer::connect(&world.hub.ws_url(consort_proto::auth::WORKER_WS_PATH)).await;
+    let mut peer =
+        Peer::connect(&world.hub.ws_url(consort_proto::auth::SESSION_HOST_WS_PATH)).await;
     let error = authenticate(
         &mut peer,
         &world.hub.origin(),
@@ -418,4 +419,48 @@ async fn tags_rename_and_a_state_change_reach_the_client() {
     assert_eq!(worker.tags, vec!["gpu".to_owned()]);
     wait_worker_state(&mut world, WorkerState::Online).await;
     world.hub.handle.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_hub_refuses_a_change_of_the_limits_for_an_offline_worker() {
+    let mut world = World::start().await;
+    let code = world.hub.handle.new_worker_pairing_code().await.unwrap();
+    let key = new_key();
+    let (status, body) = pair_worker_http(&world.hub, &code, &key).await;
+    assert_eq!(status, 200, "{body}");
+    let paired: consort_proto::auth::PairWorkerResponse = serde_json::from_value(body).unwrap();
+    let change = |worker_id| consort_proto::client_api::WorkerSetPolicy {
+        worker_id,
+        max_approval_mode: None,
+        allowed_roots: None,
+        allow_shell: Some(false),
+    };
+
+    let refused = world
+        .client
+        .request(change(paired.worker_id))
+        .await
+        .unwrap_err();
+    let text = format!("{refused:?}");
+    assert!(text.contains("WorkerOffline"), "{text}");
+    assert!(
+        text.contains("Try again when the worker is online"),
+        "{text}"
+    );
+
+    // The session host has no limits of this kind.
+    let host = world.worker.worker_id;
+    let refused = world.client.request(change(host)).await.unwrap_err();
+    assert!(format!("{refused:?}").contains("Invalid"), "{refused:?}");
+
+    // A request that names no limit changes nothing.
+    let refused = world
+        .client
+        .request(consort_proto::client_api::WorkerSetPolicy {
+            allow_shell: None,
+            ..change(world.worker.exec_id)
+        })
+        .await
+        .unwrap_err();
+    assert!(format!("{refused:?}").contains("Invalid"), "{refused:?}");
 }

@@ -87,40 +87,12 @@ pub fn install_command(os: Os, pairing: Option<&PairingCodeView>) -> Option<Stri
     Some(worker_install_command(os, &pairing.hub_url, &pairing.code))
 }
 
-/// The checklist of step 3.
+/// The checklist of step 3. A worker holds no accounts and no harness tools.
 pub fn connect_checklist(worker: &WorkerView) -> Vec<String> {
-    let found: Vec<&str> = worker
-        .tools
-        .iter()
-        .filter(|t| {
-            matches!(
-                t.state,
-                consort_client::ToolState::Ready | consort_client::ToolState::UpdateAvailable
-            )
-        })
-        .map(|t| t.name.as_str())
-        .collect();
-    let tools = if found.is_empty() {
-        "The worker downloads Claude Code and Codex when you add an account.".to_owned()
-    } else {
-        let names = match found.as_slice() {
-            [one] => (*one).to_owned(),
-            [first, second] => format!("{first} and {second}"),
-            [rest @ .., last] => format!("{}, and {last}", rest.join(", ")),
-            [] => String::new(),
-        };
-        match worker.accounts.len() {
-            0 if found.len() == 1 => format!("Found {names}. It has no account yet."),
-            0 if found.len() == 2 => format!("Found {names}. Neither has an account yet."),
-            0 => format!("Found {names}. None has an account yet."),
-            1 => format!("Found {names}. One account is set up."),
-            n => format!("Found {names}. {n} accounts are set up."),
-        }
-    };
     vec![
         "Installed and paired with the hub".to_owned(),
         format!("Starts when you sign in to {}", worker.os.label()),
-        tools,
+        "Ready to run work. Accounts stay on the hub machine.".to_owned(),
     ]
 }
 
@@ -157,7 +129,13 @@ impl ConsortApp {
         let mut row = div().flex().items_center().gap(t.space.sm + t.space.xxs);
         for (i, label) in labels.iter().enumerate() {
             if i > 0 {
-                row = row.child(div().flex_1().h(t.border_width).bg(c.border_strong));
+                row = row.child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .h(t.border_width)
+                        .bg(c.border_strong),
+                );
             }
             let mark = step_mark(i, current);
             let circle = div()
@@ -498,6 +476,7 @@ impl ConsortApp {
                                 .child(
                                     div()
                                         .flex_1()
+                                        .min_w_0()
                                         .flex()
                                         .items_baseline()
                                         .type_style(t.text.label)
@@ -628,16 +607,7 @@ impl ConsortApp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use consort_client::{ToolState, ToolView};
-
-    fn tool(name: &str, state: ToolState) -> ToolView {
-        ToolView {
-            id: name.to_lowercase().replace(' ', "-"),
-            name: name.to_owned(),
-            state,
-            ..ToolView::default()
-        }
-    }
+    use consort_client::ToolView;
 
     fn worker(tools: Vec<ToolView>, accounts: usize) -> WorkerView {
         WorkerView {
@@ -717,37 +687,15 @@ mod tests {
     }
 
     #[test]
-    fn the_checklist_names_the_tools_and_the_accounts() {
-        let two = worker(
-            vec![
-                tool("Claude Code", ToolState::Ready),
-                tool("Codex", ToolState::Ready),
-                tool("Gemini CLI", ToolState::Missing),
-            ],
-            0,
-        );
+    fn the_checklist_says_that_accounts_stay_on_the_hub_machine() {
+        let new = worker(vec![], 0);
         assert_eq!(
-            connect_checklist(&two),
+            connect_checklist(&new),
             [
                 "Installed and paired with the hub",
                 "Starts when you sign in to Windows",
-                "Found Claude Code and Codex. Neither has an account yet.",
+                "Ready to run work. Accounts stay on the hub machine.",
             ]
-        );
-        let one = worker(vec![tool("Claude Code", ToolState::UpdateAvailable)], 0);
-        assert_eq!(
-            connect_checklist(&one)[2],
-            "Found Claude Code. It has no account yet."
-        );
-        let with_accounts = worker(vec![tool("Claude Code", ToolState::Ready)], 1);
-        assert_eq!(
-            connect_checklist(&with_accounts)[2],
-            "Found Claude Code. One account is set up."
-        );
-        let none = worker(vec![tool("Claude Code", ToolState::Missing)], 0);
-        assert_eq!(
-            connect_checklist(&none)[2],
-            "The worker downloads Claude Code and Codex when you add an account."
         );
     }
 

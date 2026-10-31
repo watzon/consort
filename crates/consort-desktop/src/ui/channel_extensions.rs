@@ -1,8 +1,7 @@
-//! The Connectors tab of the Channel panel, and the account settings dialog
-//! with the provider extras toggle.
+//! The Connectors tab of the Channel panel, and the account settings dialog.
 
-use consort_client::{ChannelItemView, channel_extensions};
-use consort_theme::{Tokens, TypeExt as _};
+use consort_client::{ChannelItemView, channel_extensions, monid::channel_row};
+use consort_theme::Tokens;
 use gpui_kit::{
     AnyElement, Context, Div, InteractiveElement, IntoElement, ParentElement, SharedString,
     StatefulInteractiveElement as _, Styled, Window, div, linear_color_stop, linear_gradient,
@@ -16,32 +15,10 @@ use crate::{
         dialogs::input_box,
         ext_parts::{hint, service_logo},
         menu::MenuAction,
-        parts::{
-            ButtonKind, button, detail, focusable, icon_text_button, line, provider_logo, text,
-        },
+        parts::{ButtonKind, button, detail, icon_text_button, line, provider_logo, text},
         settings::switch,
     },
 };
-
-/// The site where a provider's extras are set up, for the account dialog.
-fn extras_site(harness: &str, provider: &str) -> String {
-    match harness {
-        "claude" => "claude.ai".to_owned(),
-        "codex" => "chatgpt.com".to_owned(),
-        "gemini" => "gemini.google.com".to_owned(),
-        _ => format!("the {provider} website"),
-    }
-}
-
-/// The short name of a provider's account, such as Claude.
-fn account_kind(harness: &str, provider: &str) -> String {
-    match harness {
-        "claude" => "Claude".to_owned(),
-        "codex" => "ChatGPT".to_owned(),
-        "gemini" => "Google".to_owned(),
-        _ => provider.to_owned(),
-    }
-}
 
 impl ConsortApp {
     /// One row of the Connectors tab: the logo, the name, the line, and a
@@ -130,9 +107,12 @@ impl ConsortApp {
 
     /// The count of the Connectors tab: what a session in the channel gets.
     pub fn connectors_tab_count(&self, channel_id: &str) -> usize {
+        let monid = consort_client::monid::channel_row(&self.state, channel_id)
+            .is_some_and(|row| row.enabled);
         channel_extensions(&self.state, channel_id)
             .map(|set| set.enabled_connector_ids().len() + set.enabled_skill_ids().len())
             .unwrap_or(0)
+            + usize::from(monid)
     }
 
     /// The Add a connector button: the Add connector dialog, or the setup in
@@ -151,16 +131,21 @@ impl ConsortApp {
         &mut self,
         tutti: bool,
         t: &Tokens,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Div {
         let c = &t.colors;
         let channel_id = self.channel_id.clone();
         let Some(set) = channel_extensions(&self.state, &channel_id) else {
-            return div().flex_1().p(t.space.lg).child(hint(
+            return div().flex_1().min_w_0().p(t.space.lg).child(hint(
                 "This channel is gone. It may have been deleted in another client.",
                 t,
             ));
         };
+        // The Monid view takes the place of the list.
+        if self.monid_ui.panel && channel_row(&self.state, &channel_id).is_some() {
+            return self.render_monid_view(&channel_id, t, window, cx);
+        }
         let toolbar =
             div()
                 .flex()
@@ -201,9 +186,19 @@ impl ConsortApp {
         };
         let mut connectors = frame();
         let n = set.connectors.len();
+        let monid_shown = channel_row(&self.state, &channel_id).is_some();
         for (i, item) in set.connectors.iter().enumerate() {
-            connectors =
-                connectors.child(self.channel_item_row(&channel_id, item, true, i + 1 == n, t, cx));
+            connectors = connectors.child(self.channel_item_row(
+                &channel_id,
+                item,
+                true,
+                i + 1 == n && !monid_shown,
+                t,
+                cx,
+            ));
+        }
+        if let Some(row) = self.monid_channel_row(&channel_id, true, t, cx) {
+            connectors = connectors.child(row);
         }
         let mut skills = frame();
         let n = set.skills.len();
@@ -237,11 +232,12 @@ impl ConsortApp {
             .pt(t.space.sm)
             .pb(t.space.lg)
             .child(hint(intro, t))
+            .children(self.temporary_access_section(&channel_id, t, cx))
             .child(section(
                 "Connectors",
                 connectors,
                 "No connectors yet. Choose Add a connector.",
-                !set.connectors.is_empty(),
+                !set.connectors.is_empty() || monid_shown,
             ))
             .child(section(
                 "Skills",
@@ -255,12 +251,14 @@ impl ConsortApp {
             .flex()
             .flex_col()
             .flex_1()
+            .min_w_0()
             .min_h_0()
             .child(toolbar)
             .child(
                 div()
                     .relative()
                     .flex_1()
+                    .min_w_0()
                     .min_h_0()
                     .child(list.size_full())
                     // The list scrolls inside the panel with soft edges, as
@@ -294,7 +292,7 @@ impl ConsortApp {
             )
     }
 
-    /// The settings of one account: its name and the provider extras.
+    /// The settings of one account: its name.
     pub fn account_settings_dialog(
         &mut self,
         worker_id: &str,
@@ -324,142 +322,6 @@ impl ConsortApp {
                 .focus_handle(cx)
                 .is_focused(window)
         };
-        let kind = account_kind(&account.harness, &account.provider);
-        let site = extras_site(&account.harness, &account.provider);
-        let on = account.extras_enabled;
-        let (w, a) = (worker_id.to_owned(), account_id.to_owned());
-        let toggle =
-            switch("account-extras", on, t).on_click(cx.listener(move |this, _, _, cx| {
-                let client = this.client.clone();
-                let (worker_id, account_id) = (w.clone(), a.clone());
-                this.spawn_command(cx, async move {
-                    client
-                        .run(consort_client::Command::SetAccountExtras {
-                            worker_id,
-                            account_id,
-                            enabled: !on,
-                        })
-                        .await
-                });
-            }));
-        let mut extras = div()
-            .flex()
-            .flex_col()
-            .rounded(t.radius.lg)
-            .border(t.border_width)
-            .border_color(c.border_subtle)
-            .bg(c.surface_card)
-            .child(
-                div()
-                    .flex()
-                    .items_start()
-                    .gap(t.space.md)
-                    .p(t.space.lg - t.space.xxs)
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .flex_1()
-                            .min_w_0()
-                            .gap(t.space.xs)
-                            .child(text(
-                                format!("Use connectors, plugins and skills from this {kind} account"),
-                                t.text.ui_strong,
-                                c.text_primary,
-                            ))
-                            .child(text(
-                                if on {
-                                    format!("{kind} adds the ones set up on {site} to every session of this account. Consort does not see them, so its approvals and activity log do not cover them.")
-                                } else {
-                                    format!("Off. Sessions of this account start without the ones set up on {site}. They use only the connectors and skills of Consort.")
-                                },
-                                detail(t),
-                                c.text_secondary,
-                            )),
-                    )
-                    .child(div().flex_none().child(toggle)),
-            );
-        match &account.extras {
-            Some(found) => {
-                let list_open = self.ext.extras_list_open;
-                let count = |n: u32, word: &str| {
-                    div()
-                        .flex()
-                        .gap(t.space.xs)
-                        .child(text(n.to_string(), t.text.ui_strong, c.text_primary))
-                        .child(text(word.to_owned(), t.text.ui, c.text_secondary))
-                };
-                let mut panel = div()
-                    .flex()
-                    .flex_col()
-                    .gap(t.space.sm)
-                    .p(t.space.lg - t.space.xxs)
-                    .border_t(t.border_width)
-                    .border_color(c.border_subtle)
-                    .bg(c.surface_sidebar)
-                    .rounded_b(t.radius.lg)
-                    .child(text(
-                        format!("Synced from {site} at the last session"),
-                        detail(t),
-                        c.text_tertiary,
-                    ))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(t.space.lg)
-                            .child(count(found.mcp_servers.count, "connectors"))
-                            .child(count(found.plugins.count, "plugins"))
-                            .child(count(found.skills.count, "skills"))
-                            .child(div().flex_1())
-                            .child(
-                                focusable(div().id("extras-list-toggle"), t)
-                                    .rounded(t.radius.sm)
-                                    .cursor_pointer()
-                                    .type_style(t.text.ui)
-                                    .text_color(c.text_secondary)
-                                    .hover(|s| s.text_color(c.text_primary))
-                                    .child(if list_open {
-                                        "Hide the list"
-                                    } else {
-                                        "Show the list"
-                                    })
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.ext.extras_list_open = !this.ext.extras_list_open;
-                                        cx.notify();
-                                    })),
-                            ),
-                    );
-                let names = found.names_line(if list_open { usize::MAX } else { 6 });
-                if let Some(names) = names {
-                    panel = panel.child(text(names, detail(t), c.text_secondary));
-                }
-                if !found.cannot_turn_off.is_empty() {
-                    panel = panel.child(text(
-                        format!(
-                            "Consort cannot turn these off: {}.",
-                            consort_client::join_and(&found.cannot_turn_off)
-                        ),
-                        detail(t),
-                        c.text_tertiary,
-                    ));
-                }
-                extras = extras.child(panel);
-            }
-            None => {
-                extras = extras.child(
-                    div()
-                        .p(t.space.lg - t.space.xxs)
-                        .border_t(t.border_width)
-                        .border_color(c.border_subtle)
-                        .child(text(
-                            format!("{} has not reported what this account brings yet. It does after the next session.", worker.name),
-                            detail(t),
-                            c.text_tertiary,
-                        )),
-                );
-            }
-        }
         let body = div()
             .flex()
             .flex_col()
@@ -469,8 +331,7 @@ impl ConsortApp {
                 input_box(&self.inputs.name, focused, t),
                 None,
                 t,
-            ))
-            .child(extras);
+            ));
         let (w, a) = (worker_id.to_owned(), account_id.to_owned());
         let (rw, ra) = (worker_id.to_owned(), account_id.to_owned());
         let (dw, da) = (worker_id.to_owned(), account_id.to_owned());
@@ -528,7 +389,7 @@ impl ConsortApp {
                     }),
                 ),
             )
-            .child(div().flex_1())
+            .child(div().flex_1().min_w_0())
             .child(
                 button("dialog-confirm", "Done", ButtonKind::Primary, t)
                     .on_click(cx.listener(move |this, _, window, cx| done(this, window, cx))),

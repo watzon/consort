@@ -8,7 +8,7 @@
 use std::time::Duration;
 
 use crate::common::*;
-use consort_proto::auth::{OpenSession, PeerId, WORKER_WS_PATH, WorkerHello};
+use consort_proto::auth::{OpenSession, PeerId, SESSION_HOST_WS_PATH, WorkerHello};
 use consort_proto::client_api::{
     ApprovalAnswer, ChannelCreate, ChannelDelete, EntityKind, EntityPayload, FeedChange,
     MemoryWrite, MessageSend, ReadMark, RoutineCreate, SnapshotScope, TaskCreate,
@@ -19,8 +19,8 @@ use consort_proto::model::{
     ExpectedHash, ItemStatus, MemoryScope, MessageKind, PlacementRequest, RoutineAction,
     RoutineSchedule, SessionState, WorkerState,
 };
+use consort_proto::session_host_link::{HubToSessionHost, SessionStartResult, TurnEndReason};
 use consort_proto::status::TaskStatus;
-use consort_proto::worker_link::{HubToWorker, SessionStartResult, TurnEndReason};
 use serde_json::json;
 
 fn channel_named(name: &str) -> ChannelCreate {
@@ -77,11 +77,11 @@ async fn wait_stop(worker: &mut FakeWorker, session_id: SessionId) {
     loop {
         let (request, command) = worker.next_command().await;
         match command {
-            HubToWorker::SessionStop(stop) if stop.session_id == session_id => {
+            HubToSessionHost::SessionStop(stop) if stop.session_id == session_id => {
                 worker.respond_ok(&request, &json!({})).await;
                 return;
             }
-            HubToWorker::SessionStart(_) => {
+            HubToSessionHost::SessionStart(_) => {
                 worker
                     .respond_ok(
                         &request,
@@ -123,7 +123,7 @@ async fn a_worker_with_open_turns_in_two_channels_can_say_hello_after_a_restart(
     } = std::mem::replace(&mut world.worker, placeholder);
     peer.close().await;
     for _ in 0..2 {
-        let mut peer = Peer::connect(&world.hub.ws_url(WORKER_WS_PATH)).await;
+        let mut peer = Peer::connect(&world.hub.ws_url(SESSION_HOST_WS_PATH)).await;
         authenticate(
             &mut peer,
             &world.hub.origin(),
@@ -208,7 +208,7 @@ async fn a_session_that_the_hub_marks_lost_gets_a_stop_command() {
     // The worker says that it does not know the session, so the hub marks it
     // lost. The worker may still run the harness, so it gets session.stop.
     let (request, command) = world.worker.next_command().await;
-    assert!(matches!(command, HubToWorker::SessionTurn(_)));
+    assert!(matches!(command, HubToSessionHost::SessionTurn(_)));
     world
         .worker
         .respond_error(
@@ -253,7 +253,7 @@ async fn a_refused_answer_fails_the_task_so_it_can_be_retried() {
         .await
         .unwrap();
     let (request, command) = world.worker.next_command().await;
-    assert!(matches!(command, HubToWorker::SessionRespond(_)));
+    assert!(matches!(command, HubToSessionHost::SessionRespond(_)));
     world
         .worker
         .respond_error(
@@ -355,7 +355,7 @@ async fn a_thread_message_for_an_offline_worker_waits_for_the_open_turn() {
     // The message is the next turn, after the open one ends.
     back.send_batch(
         sid,
-        vec![consort_proto::worker_link::SequencedEvent {
+        vec![consort_proto::session_host_link::SequencedEvent {
             seq: 3,
             at: consort_proto::time::Timestamp::now(),
             event: turn_ended("t1", TurnEndReason::Completed),
@@ -363,7 +363,7 @@ async fn a_thread_message_for_an_offline_worker_waits_for_the_open_turn() {
     )
     .await;
     let (_, command) = back.next_command().await;
-    let HubToWorker::SessionTurn(turn) = command else {
+    let HubToSessionHost::SessionTurn(turn) = command else {
         panic!("expected session.turn");
     };
     assert_eq!(turn.turn.text, "Also update the docs.");

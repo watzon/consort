@@ -463,6 +463,7 @@ impl Hub {
                     next_run_at: Some(at),
                     last_run_at: None,
                     last_run_status: None,
+                    monid: None,
                     kind: RoutineKind::FollowUp,
                     origin: RoutineOrigin::Assistant,
                     created_at: Some(now),

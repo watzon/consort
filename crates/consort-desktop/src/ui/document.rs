@@ -361,6 +361,7 @@ impl ConsortApp {
                     .flex()
                     .flex_col()
                     .flex_1()
+                    .min_w_0()
                     .min_h_0()
                     .child(panel_scroll(
                         "document-scroll",
@@ -421,6 +422,7 @@ fn message_body(
         .flex()
         .flex_col()
         .flex_1()
+        .min_w_0()
         .items_start()
         .gap(t.space.sm)
         .p(t.space.lg)

@@ -334,8 +334,10 @@ fn notice_post(quiet: bool) -> crate::view::ThreadPost {
         bodies: vec![crate::view::PostBody::Notice {
             kind: "turn_failed".into(),
             text: "The turn failed.".into(),
-            error: Some(card),
+            error: Some(Box::new(card)),
             draft: None,
+            fallback: None,
+            monid: None,
         }],
         pending: false,
         source_message_id: None,

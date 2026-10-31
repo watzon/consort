@@ -200,7 +200,28 @@ pub fn text(content: impl Into<SharedString>, style: Type, color: Hsla) -> Div {
         .child(content.into())
 }
 
+/// The distance from the top of a line box to its baseline, for a type style
+/// in the sans font of the app. It is the distance that GPUI paints with:
+/// the baseline of a line sits at half the free room above the glyphs, plus
+/// the ascent.
+pub fn baseline_in_line(window: &gpui_kit::Window, style: Type, t: &Tokens) -> Pixels {
+    let system = window.text_system();
+    let font = system.resolve_font(&gpui_kit::gpui::font(t.font_sans.clone()));
+    system.baseline_offset(font, style.size, style.line)
+}
+
+/// How far a box in the style `small` moves down so that its first baseline
+/// meets the first baseline of a box in the style `big`, when both boxes
+/// start at the same top. GPUI cannot align the baselines of text boxes
+/// (`items_baseline` aligns their bottoms, which puts a smaller type too
+/// low), so a row of two types sets its items to the top and uses this.
+pub fn baseline_lead(window: &gpui_kit::Window, big: Type, small: Type, t: &Tokens) -> Pixels {
+    (baseline_in_line(window, big, t) - baseline_in_line(window, small, t)).max(Pixels::ZERO)
+}
+
 /// A line of text in one style and color that the user can select and copy.
+/// It holds long content, so it can shrink: it wraps in a row and never pushes
+/// the row.
 /// `id` must be unique and stable, because the selection keeps its state by
 /// it.
 pub fn selectable(
@@ -210,6 +231,7 @@ pub fn selectable(
     color: Hsla,
 ) -> Div {
     div()
+        .min_w_0()
         .type_style(style)
         .text_color(color)
         .child(SelectableText::new(id, content))
@@ -491,6 +513,80 @@ pub fn textarea(
         .w_full()
         .type_style(style)
         .child(gpui_kit::base::input::Textarea::new(state))
+}
+
+/// The rows of the chat composer as it grows: the least and the most. Past
+/// the most, the text scrolls inside the box.
+pub const COMPOSER_ROWS: (usize, usize) = (1, 5);
+/// The rows of the reply box of a task as it grows.
+pub const REPLY_ROWS: (usize, usize) = (1, 5);
+
+/// GPUI Kit draws editor text this far from the left edge, even with no line
+/// numbers (`LINE_NUMBER_RIGHT_MARGIN`). A text area has no such gap.
+const EDITOR_TEXT_INSET: gpui_kit::Pixels = gpui_kit::px(6.);
+
+/// The state of a message box. A message box needs an editor state, because
+/// only an editor can color a range of its text, and dictation grays the words
+/// that it hears. It has no features of a code editor.
+pub fn message_box(
+    placeholder: &str,
+    window: &mut gpui_kit::Window,
+    cx: &mut gpui_kit::Context<gpui_kit::component::input::EditorState>,
+) -> gpui_kit::component::input::EditorState {
+    gpui_kit::component::input::EditorState::new(window, cx)
+        .line_number(false)
+        .folding(false)
+        .indent_guides(false)
+        .searchable(false)
+        .auto_close(false)
+        .smart_indent(false)
+        .soft_wrap(true)
+        // `None` is not "off": it adds half the height, and at least three
+        // rows, of empty space below the last line. A message box adds none.
+        .scroll_beyond_last_line(Some(0))
+        .submit_on_enter(true)
+        .placeholder(placeholder.to_owned())
+}
+
+/// A message box with no frame, in one text style. It grows with its text
+/// between two row counts. An editor has no grow setting, so the height comes
+/// from here. An editor is at least two rows high, so the frame clips it.
+pub fn message_field(
+    state: &gpui_kit::Entity<gpui_kit::component::input::EditorState>,
+    style: Type,
+    rows: (usize, usize),
+    cx: &gpui_kit::App,
+) -> Div {
+    use gpui_kit::{Styled as _, canvas};
+    let shown = state.read(cx).display_map().wrap_row_count();
+    let observed = state.clone();
+    div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .overflow_hidden()
+        .h(style.line * shown.clamp(rows.0, rows.1) as f32)
+        .type_style(style)
+        .child(
+            div()
+                .ml(-EDITOR_TEXT_INSET)
+                .h_full()
+                .child(gpui_kit::base::input::Editor::new(state)),
+        )
+        // The editor wraps its text when it lays out, after this render. A new
+        // row count needs one more frame to reach the height above.
+        .child(
+            canvas(
+                |_, _, _| {},
+                move |_, _, window, cx| {
+                    if observed.read(cx).display_map().wrap_row_count() != shown {
+                        window.refresh();
+                    }
+                },
+            )
+            .absolute()
+            .size_0(),
+        )
 }
 
 /// A one-line text input with no frame, in one text style.

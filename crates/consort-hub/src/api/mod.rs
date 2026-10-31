@@ -73,6 +73,7 @@ pub(crate) async fn dispatch(hub: &Hub, caller: Caller, request: ClientRequest) 
         R::WorkerPairingCode(r) => to_value(&hub.worker_pairing_code(caller, r).await?),
         R::WorkerRename(r) => to_value(&hub.worker_rename(caller, r).await?),
         R::WorkerSetTags(r) => to_value(&hub.worker_set_tags(caller, r).await?),
+        R::WorkerSetPolicy(r) => to_value(&hub.worker_set_policy(caller, r).await?),
         R::WorkerSetPaused(r) => to_value(&hub.worker_set_paused(caller, r).await?),
         R::WorkerRevoke(r) => to_value(&hub.worker_revoke(caller, r).await?),
         R::WorkerRefreshInventory(r) => to_value(&hub.worker_refresh_inventory(caller, r).await?),
@@ -108,15 +109,33 @@ pub(crate) async fn dispatch(hub: &Hub, caller: Caller, request: ClientRequest) 
         R::WorkerToolsCheck(r) => to_value(&hub.worker_tools_check(caller, r).await?),
         R::WorkerToolInstall(r) => to_value(&hub.worker_tool_install(caller, r).await?),
         R::AcpRegistryList(r) => to_value(&hub.acp_registry_list(caller, r).await?),
-        R::PreferencesSetAccountFallback(r) => {
-            to_value(&hub.preferences_set_account_fallback(caller, r).await?)
+        R::PreferencesSetFallbackPath(r) => {
+            to_value(&hub.preferences_set_fallback_path(caller, r).await?)
         }
+        R::ChannelGoBack(r) => to_value(&hub.channel_go_back(caller, r).await?),
         R::PreferencesSetFavoriteModel(r) => {
             to_value(&hub.preferences_set_favorite_model(caller, r).await?)
         }
+        R::PreferencesSetCommandCheck(r) => {
+            to_value(&hub.preferences_set_command_check(caller, r).await?)
+        }
+        R::EndpointSave(r) => to_value(&hub.endpoint_save(caller, r).await?),
+        R::EndpointRemove(r) => to_value(&hub.endpoint_remove(caller, r).await?),
+        R::EndpointTest(r) => to_value(&hub.endpoint_test(caller, r).await?),
+        R::CommandCheckTest(r) => to_value(&hub.command_check_test(caller, r).await?),
         R::ComposioSetKey(r) => to_value(&hub.composio_set_key(caller, r).await?),
         R::ComposioRemoveKey(r) => to_value(&hub.composio_remove_key(caller, r).await?),
         R::ComposioGetStatus(r) => to_value(&hub.composio_get_status(caller, r).await?),
+        R::MonidSetKey(r) => to_value(&hub.monid_set_key(caller, r).await?),
+        R::MonidRemoveKey(r) => to_value(&hub.monid_remove_key(caller, r).await?),
+        R::MonidGetStatus(r) => to_value(&hub.monid_get_status(caller, r).await?),
+        R::MonidUpdateSettings(r) => to_value(&hub.monid_update_settings(caller, r).await?),
+        R::MonidCatalogSearch(r) => to_value(&hub.monid_catalog_search(caller, r).await?),
+        R::MonidCallGet(r) => to_value(&hub.monid_call_get(caller, r).await?),
+        R::MonidCallList(r) => to_value(&hub.monid_call_list(caller, r).await?),
+        R::MonidCallStop(r) => to_value(&hub.monid_call_stop(caller, r).await?),
+        R::ChannelSetMonid(r) => to_value(&hub.channel_set_monid(caller, r).await?),
+        R::ChannelEndAccess(r) => to_value(&hub.channel_end_access(caller, r).await?),
         R::ConnectorCatalogSearch(r) => to_value(&hub.connector_catalog_search(caller, r).await?),
         R::ConnectorCatalogCategories(r) => {
             to_value(&hub.connector_catalog_categories(caller, r).await?)

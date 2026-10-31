@@ -144,6 +144,7 @@ impl Hub {
                     next_run_at,
                     last_run_at: None,
                     last_run_status: None,
+                    monid: None,
                     kind: Default::default(),
                     origin: Default::default(),
                     created_at: Some(now),
@@ -213,6 +214,9 @@ impl Hub {
                 }
                 if let Some(action) = update.action {
                     routine.action = action;
+                }
+                if let Some(monid) = update.monid {
+                    routine.monid = monid;
                 }
                 if let Some(enabled) = update.enabled {
                     routine.enabled = enabled;
@@ -369,6 +373,7 @@ mod tests {
             prompt: None,
             action: None,
             enabled: None,
+            monid: None,
         }
     }
 

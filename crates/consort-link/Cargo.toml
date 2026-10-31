@@ -1,0 +1,27 @@
+[package]
+name = "consort-link"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "What a session host and an execution worker share: the machine key, the WebSocket link to the hub and the signed HTTP calls."
+
+[lints]
+workspace = true
+
+[dependencies]
+consort-proto = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+futures-util = { workspace = true }
+tokio-tungstenite = { workspace = true }
+url = { workspace = true }
+reqwest = { workspace = true }
+ed25519-dalek = { workspace = true }
+rand = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+axum = { workspace = true }
+tempfile = { workspace = true }

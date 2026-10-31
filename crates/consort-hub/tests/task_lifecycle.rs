@@ -16,8 +16,10 @@ use consort_proto::model::{
     ApprovalStatus, DecisionAnswer, DecisionStatus, ItemStatus, MessageKind, SessionRole,
     SessionState,
 };
+use consort_proto::session_host_link::{
+    HubToSessionHost, SessionEvent, SessionStart, TurnEndReason,
+};
 use consort_proto::status::TaskStatus;
-use consort_proto::worker_link::{HubToWorker, SessionEvent, SessionStart, TurnEndReason};
 use serde_json::json;
 
 struct Started {
@@ -154,7 +156,7 @@ async fn a_task_runs_with_an_approval_and_ends_resolved() {
         .approval;
     assert_eq!(answered.status, ApprovalStatus::Allowed);
     let (request, command) = world.worker.next_command().await;
-    let HubToWorker::SessionRespond(respond) = command else {
+    let HubToSessionHost::SessionRespond(respond) = command else {
         panic!("expected session.respond");
     };
     assert_eq!(respond.session_id, sid);
@@ -186,7 +188,7 @@ async fn a_task_runs_with_an_approval_and_ends_resolved() {
             sid,
             vec![SessionEvent::RequestClosed {
                 request_id: "req-1".into(),
-                outcome: consort_proto::worker_link::RequestOutcome::Allowed,
+                outcome: consort_proto::session_host_link::RequestOutcome::Allowed,
             }],
         )
         .await;
@@ -217,7 +219,7 @@ async fn a_task_runs_with_an_approval_and_ends_resolved() {
         )
         .await;
     let (_, command) = world.worker.next_command().await;
-    let HubToWorker::SessionTurn(turn) = command else {
+    let HubToSessionHost::SessionTurn(turn) = command else {
         panic!("expected session.turn for the coordinator");
     };
     assert_eq!(turn.session_id, coordinator.session_id);
@@ -229,6 +231,8 @@ async fn a_task_runs_with_an_approval_and_ends_resolved() {
         turn.turn.text
     );
     assert!(turn.turn.text.contains("status=\"review\""));
+    // The approval woke nothing: the user has its card and its notification.
+    assert!(!turn.turn.text.contains("status=\"needs_input\""));
     assert!(turn.turn.text.contains("Fixed foo.rs. Tests pass."));
 
     // Only the user resolves.
@@ -320,7 +324,7 @@ async fn a_denied_approval_sends_the_deny_option_back() {
         .approval;
     assert_eq!(denied.status, ApprovalStatus::Denied);
     let (_, command) = world.worker.next_command().await;
-    let HubToWorker::SessionRespond(respond) = command else {
+    let HubToSessionHost::SessionRespond(respond) = command else {
         panic!("expected session.respond");
     };
     assert_eq!(respond.answer.option_id.as_deref(), Some("deny"));
@@ -389,7 +393,7 @@ async fn a_harness_question_becomes_a_decision_that_answers_through_respond() {
         .decision;
     assert_eq!(answered.status, DecisionStatus::Answered);
     let (_, command) = world.worker.next_command().await;
-    let HubToWorker::SessionRespond(respond) = command else {
+    let HubToSessionHost::SessionRespond(respond) = command else {
         panic!("expected session.respond, not a new turn");
     };
     assert_eq!(respond.request_id.as_str(), "q-1");
@@ -456,7 +460,7 @@ async fn a_decision_from_a_task_keeps_it_in_needs_input_and_the_answer_is_the_ne
         .await
         .unwrap();
     let (_, command) = world.worker.next_command().await;
-    let HubToWorker::SessionTurn(turn) = command else {
+    let HubToSessionHost::SessionTurn(turn) = command else {
         panic!("expected session.turn with the answer");
     };
     assert_eq!(turn.session_id, sid);
@@ -525,17 +529,17 @@ async fn a_failed_turn_fails_the_task_and_retry_starts_a_new_session() {
     while !stopped || second.is_none() {
         let (request, command) = world.worker.next_command().await;
         match command {
-            HubToWorker::SessionStop(stop) => {
+            HubToSessionHost::SessionStop(stop) => {
                 assert_eq!(stop.session_id, sid);
                 world.worker.respond_ok(&request, &json!({})).await;
                 stopped = true;
             }
-            HubToWorker::SessionStart(start) => {
+            HubToSessionHost::SessionStart(start) => {
                 world
                     .worker
                     .respond_ok(
                         &request,
-                        &consort_proto::worker_link::SessionStartResult {
+                        &consort_proto::session_host_link::SessionStartResult {
                             workspace_path: "/tmp/workspace".to_owned(),
                             native_ref: None,
                         },
@@ -612,7 +616,7 @@ async fn a_message_in_the_task_thread_reaches_the_session() {
         .await
         .unwrap();
     let (_, command) = world.worker.next_command().await;
-    let HubToWorker::SessionTurn(turn) = command else {
+    let HubToSessionHost::SessionTurn(turn) = command else {
         panic!("expected session.turn");
     };
     assert_eq!(turn.session_id, sid);
@@ -644,7 +648,7 @@ async fn the_coordinator_can_message_a_running_task_and_steer_it() {
         .await;
     assert_eq!(result["delivery"], "steer");
     let (_, command) = world.worker.next_command().await;
-    let HubToWorker::SessionSteer(steer) = command else {
+    let HubToSessionHost::SessionSteer(steer) = command else {
         panic!("expected session.steer");
     };
     assert_eq!(steer.session_id, sid);
@@ -683,7 +687,7 @@ async fn interrupting_a_task_asks_the_worker_and_ends_in_review() {
         .await;
     let (result, ()) = tokio::join!(world.client.request(TaskInterrupt { task_id }), async {
         let (request, command) = world.worker.next_command().await;
-        let HubToWorker::SessionInterrupt(interrupt) = command else {
+        let HubToSessionHost::SessionInterrupt(interrupt) = command else {
             panic!("expected session.interrupt");
         };
         assert_eq!(interrupt.session_id, sid);

@@ -142,6 +142,9 @@ const READ_CHANNEL_MESSAGES: usize = 50;
 const SEARCH_LIMIT: usize = 20;
 /// The most bytes that `files_write` accepts.
 const FILE_WRITE_MAX_BYTES: usize = 1024 * 1024;
+/// The most bytes of text that one `files_read` gives. The rest of a larger
+/// file stays out of the context.
+const FILE_READ_MAX_BYTES: usize = 256 * 1024;
 
 fn policy_denied(message: impl Into<String>) -> HubError {
     HubError::new(ErrorCode::PolicyDenied, message)
@@ -570,7 +573,7 @@ impl Hub {
     ) -> Result<Value> {
         let scope = writable_scope(ctx)?;
         if crate::ops::knowledge::is_voice_note(scope, &args.path) {
-            return Err(policy_denied(crate::voice::VOICE_NOTE_REFUSAL));
+            return Err(policy_denied(crate::voice::VOICE_NOTE_DELETE_REFUSAL));
         }
         self.store
             .write(move |tx| tx.delete_memory(scope, &args.path, &args.expected_sha256))
@@ -591,6 +594,55 @@ impl Hub {
             .read(move |conn| knowledge::channel_files(conn, channel_id, args.prefix.as_deref()))
             .await?;
         to_value(&FilesListResult { files })
+    }
+
+    pub(crate) async fn tool_files_read(
+        &self,
+        ctx: &ToolCtx,
+        args: FilesReadArgs,
+    ) -> Result<Value> {
+        let channel_id = ctx.channel.id;
+        let path = args.path.clone();
+        let file = self
+            .store
+            .read(move |conn| knowledge::channel_files(conn, channel_id, None))
+            .await?
+            .into_iter()
+            .find(|f| f.path == path && f.deleted_at.is_none())
+            .ok_or_else(|| {
+                HubError::not_found(format!(
+                    "This channel has no file at {}. Use a path from files_list.",
+                    args.path
+                ))
+            })?;
+        let blob = self.store.blobs_dir().join(file.blob_sha256.as_str());
+        let bytes = tokio::fs::read(&blob).await.map_err(|err| {
+            if err.kind() == std::io::ErrorKind::NotFound {
+                HubError::not_found(format!(
+                    "The content of {} is missing on the hub.",
+                    file.path
+                ))
+            } else {
+                err.into()
+            }
+        })?;
+        let mut text = String::from_utf8(bytes).map_err(|_| {
+            HubError::invalid(format!(
+                "{} is not a text file. Attach it to a task to work with it.",
+                file.path
+            ))
+        })?;
+        let truncated = text.len() > FILE_READ_MAX_BYTES;
+        if truncated {
+            let end = text.floor_char_boundary(FILE_READ_MAX_BYTES);
+            text.truncate(end);
+        }
+        to_value(&FilesReadResult {
+            path: file.path,
+            content: text,
+            size: file.size,
+            truncated,
+        })
     }
 
     pub(crate) async fn tool_files_write(
@@ -844,6 +896,7 @@ mod tests {
     /// session is saved in the store.
     async fn ctx_for(hub: &Hub, channel: &Channel, role: SessionRole) -> ToolCtx {
         let session = Session {
+            execution_worker_id: None,
             id: SessionId::new(),
             role,
             channel_id: channel.id,
@@ -944,6 +997,8 @@ mod tests {
                     review_summary: None,
                     resolved_at: None,
                     session_ended: false,
+                    monid_calls: 0,
+                    monid_cost_micros: 0,
                     archived_at: None,
                     created_at: now,
                     updated_at: now,
@@ -1550,6 +1605,68 @@ mod tests {
     }
 
     // Files -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn files_read_gives_the_text_of_this_channel_only() {
+        let (hub, _dir) = test_hub().await;
+        let channel = new_channel(&hub, "Docs").await;
+        let other = new_channel(&hub, "Other").await;
+        let ctx = ctx_for(&hub, &channel, SessionRole::Coordinator).await;
+        let write = |path: &str, content: String| FilesWriteArgs {
+            path: path.to_owned(),
+            content,
+        };
+        hub.tool_files_write(&ctx, write("notes.md", "- ship it".to_owned()))
+            .await
+            .unwrap();
+        let read: FilesReadResult = parse(
+            hub.tool_files_read(
+                &ctx,
+                FilesReadArgs {
+                    path: "notes.md".to_owned(),
+                },
+            )
+            .await
+            .unwrap(),
+        );
+        assert_eq!(read.content, "- ship it");
+        assert!(!read.truncated);
+
+        // Another channel does not see it.
+        let other_ctx = ctx_for(&hub, &other, SessionRole::Coordinator).await;
+        let missing = hub
+            .tool_files_read(
+                &other_ctx,
+                FilesReadArgs {
+                    path: "notes.md".to_owned(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            missing.to_string().contains("no file at notes.md"),
+            "{missing}"
+        );
+
+        // A large file gives its start, and says so.
+        let large = "é".repeat(FILE_READ_MAX_BYTES);
+        hub.tool_files_write(&ctx, write("large.md", large))
+            .await
+            .unwrap();
+        let read: FilesReadResult = parse(
+            hub.tool_files_read(
+                &ctx,
+                FilesReadArgs {
+                    path: "large.md".to_owned(),
+                },
+            )
+            .await
+            .unwrap(),
+        );
+        assert!(read.truncated);
+        assert!(read.content.len() <= FILE_READ_MAX_BYTES);
+        assert_eq!(read.size, u64::try_from(FILE_READ_MAX_BYTES * 2).unwrap());
+    }
 
     #[tokio::test]
     async fn files_write_then_files_list() {

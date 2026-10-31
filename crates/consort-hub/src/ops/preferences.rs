@@ -1,7 +1,8 @@
 //! The user's preferences, which every client shares.
 
 use consort_proto::client_api::{
-    PreferencesResult, PreferencesSetAccountFallback, PreferencesSetFavoriteModel,
+    PreferencesResult, PreferencesSetCommandCheck, PreferencesSetFallbackPath,
+    PreferencesSetFavoriteModel,
 };
 use consort_proto::model::{FAVORITE_FIELD_MAX_CHARS, FAVORITE_MODELS_MAX};
 
@@ -10,19 +11,60 @@ use crate::hub::{Caller, Hub};
 use crate::store::preferences;
 
 impl Hub {
-    /// Allows the move to another account at a usage limit, or stops it. A
-    /// request that changes nothing writes nothing.
-    pub(crate) async fn preferences_set_account_fallback(
+    /// Sets the source of the command check.
+    pub(crate) async fn preferences_set_command_check(
         &self,
         _caller: &Caller,
-        request: PreferencesSetAccountFallback,
+        request: PreferencesSetCommandCheck,
     ) -> Result<PreferencesResult> {
+        for choice in [&request.setting.decision, &request.setting.chat]
+            .into_iter()
+            .flatten()
+        {
+            if !(1..=100).contains(&choice.confidence_limit) {
+                return Err(HubError::invalid(
+                    "The confidence limit must be from 1 to 100 percent.",
+                ));
+            }
+        }
         let preferences = self
             .store
             .write(move |tx| {
                 let mut preferences = preferences::preferences(tx.db())?;
-                if preferences.account_fallback != request.enabled {
-                    preferences.account_fallback = request.enabled;
+                if preferences.command_check != request.setting {
+                    preferences.command_check = request.setting;
+                    tx.save_preferences(&preferences)?;
+                }
+                Ok(preferences)
+            })
+            .await?;
+        Ok(PreferencesResult { preferences })
+    }
+
+    /// Replaces the fallback path. The hub trims the labels and the models
+    /// and refuses a path that does not pass `FallbackPath::validate`. A
+    /// request that changes nothing writes nothing.
+    pub(crate) async fn preferences_set_fallback_path(
+        &self,
+        _caller: &Caller,
+        request: PreferencesSetFallbackPath,
+    ) -> Result<PreferencesResult> {
+        let mut path = request.path;
+        for step in &mut path.steps {
+            step.account_label = step.account_label.trim().to_owned();
+            step.model = step.model.trim().to_owned();
+        }
+        path.validate().map_err(|e| {
+            HubError::invalid(format!(
+                "The fallback path is not valid: {e}. Check the steps, then try again."
+            ))
+        })?;
+        let preferences = self
+            .store
+            .write(move |tx| {
+                let mut preferences = preferences::preferences(tx.db())?;
+                if preferences.fallback_path != path {
+                    preferences.fallback_path = path;
                     tx.save_preferences(&preferences)?;
                 }
                 Ok(preferences)

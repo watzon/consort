@@ -20,13 +20,13 @@
 //! first check that removed the last candidate.
 
 use std::cmp::Reverse;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use consort_proto::error::{ErrorBody, ErrorCode};
 use consort_proto::ids::{AccountId, RepoId, WorkerId};
 use consort_proto::model::{
-    ApprovalMode, AuthState, HarnessAccount, Inventory, Isolation, ModelOptions, ModelSelection,
-    Os, PlacementRequest, PlacementRequire, Repo, Worker, WorkerState,
+    ApprovalMode, AuthState, HarnessAccount, Inventory, Isolation, MachineKind, ModelOptions,
+    ModelSelection, Os, PlacementRequest, PlacementRequire, Repo, Worker, WorkerState,
 };
 
 use crate::store::conversation::repo_url_key;
@@ -48,8 +48,6 @@ pub(crate) struct PlacementInput<'a> {
     pub workers: &'a [Worker],
     /// Open sessions by worker, counted by the hub.
     pub open_sessions: &'a HashMap<WorkerId, u32>,
-    /// The accounts that reached a usage limit. See [`choose_account`].
-    pub limited: &'a HashSet<AccountId>,
     /// The model selection that the channel or the task chose. `None` means
     /// the default rule: the best harness account and its first model.
     pub selection: Option<&'a ModelSelection>,
@@ -78,8 +76,11 @@ pub(crate) struct RepoCheckout {
 /// The chosen worker, account and model.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Placement {
+    /// Where the work runs. For a coordinator this is the session host.
     pub worker_id: WorkerId,
     pub worker_name: String,
+    /// The session host that holds the account and runs the CLI.
+    pub session_host_id: WorkerId,
     pub account_id: AccountId,
     pub account_label: String,
     pub harness: String,
@@ -112,17 +113,96 @@ impl PlacementError {
 }
 
 /// Picks the worker and the harness account.
+///
+/// What thinks and where the tools run are two choices. A coordinator needs
+/// no worker, so it runs on a session host. A task runs on an execution
+/// worker with an account from a session host: each execution worker is
+/// judged as if it held the accounts of the session hosts.
 pub(crate) fn place(input: &PlacementInput<'_>) -> Result<Placement, PlacementError> {
-    let live: Vec<(usize, &Worker)> = input
-        .workers
+    match input.subject {
+        Subject::Coordinator => {
+            let live = live_machines(input.workers, MachineKind::SessionHost);
+            // The tags of a channel say where its work runs. A coordinator
+            // does no work on a machine, so they do not apply to it.
+            let view = PlacementInput {
+                channel_tags: &[],
+                ..*input
+            };
+            let chosen = match input.request.worker_id {
+                Some(id) => place_on_named_worker(&view, &live, id),
+                None => place_on_best_worker(&view, &live),
+            };
+            chosen.map_err(|err| match (err, live.is_empty()) {
+                (PlacementError::Wait(_), true) => {
+                    PlacementError::Wait(SESSION_HOST_WAIT.to_owned())
+                }
+                (err, _) => err,
+            })
+        }
+        Subject::Task => place_task(input),
+    }
+}
+
+/// The wait reason when no session host is there.
+const SESSION_HOST_WAIT: &str = "Waiting for the session host on the hub machine to come online.";
+
+fn live_machines(workers: &[Worker], kind: MachineKind) -> Vec<(usize, &Worker)> {
+    workers
         .iter()
         .enumerate()
-        .filter(|(_, worker)| worker.revoked_at.is_none())
+        .filter(|(_, worker)| worker.revoked_at.is_none() && worker.kind == kind)
+        .collect()
+}
+
+fn place_task(input: &PlacementInput<'_>) -> Result<Placement, PlacementError> {
+    let hosts: Vec<&Worker> = input
+        .workers
+        .iter()
+        .filter(|w| {
+            w.kind == MachineKind::SessionHost
+                && w.revoked_at.is_none()
+                && !w.paused
+                && w.state == WorkerState::Online
+        })
         .collect();
-    match input.request.worker_id {
-        Some(id) => place_on_named_worker(input, &live, id),
-        None => place_on_best_worker(input, &live),
+    let pool: Vec<(WorkerId, &HarnessAccount)> = hosts
+        .iter()
+        .filter_map(|host| host.inventory.as_ref().map(|i| (host.id, i)))
+        .flat_map(|(id, inventory)| inventory.accounts.iter().map(move |a| (id, a)))
+        .collect();
+    let merged: Vec<Worker> = input
+        .workers
+        .iter()
+        .map(|worker| {
+            let mut worker = worker.clone();
+            if worker.kind == MachineKind::Execution
+                && let Some(inventory) = worker.inventory.as_mut()
+            {
+                inventory
+                    .accounts
+                    .extend(pool.iter().map(|(_, a)| (*a).clone()));
+            }
+            worker
+        })
+        .collect();
+    let live = live_machines(&merged, MachineKind::Execution);
+    let view = PlacementInput {
+        workers: &merged,
+        ..*input
+    };
+    let mut placement = match input.request.worker_id {
+        Some(id) => place_on_named_worker(&view, &live, id),
+        None => place_on_best_worker(&view, &live),
+    }?;
+    // An account that is on the worker itself exists only in the tests of
+    // this module.
+    if let Some((host, _)) = pool
+        .iter()
+        .find(|(_, a)| a.account_id == placement.account_id)
+    {
+        placement.session_host_id = *host;
     }
+    Ok(placement)
 }
 
 // Named worker ---------------------------------------------------------------
@@ -277,6 +357,7 @@ impl Candidate<'_> {
         Placement {
             worker_id: self.worker.id,
             worker_name: self.worker.name.clone(),
+            session_host_id: self.worker.id,
             account_id: self.account.account_id,
             account_label: self.account.label.clone(),
             harness: self.account.harness.clone(),
@@ -314,13 +395,8 @@ fn evaluate<'a>(
     worker: &'a Worker,
     inventory: &'a Inventory,
 ) -> Result<Candidate<'a>, Rejection> {
-    let (account, model, options) = choose_account(
-        inventory,
-        input.selection,
-        input.approval_mode,
-        input.limited,
-    )
-    .map_err(Rejection::Account)?;
+    let (account, model, options) = choose_account(inventory, input.selection, input.approval_mode)
+        .map_err(Rejection::Account)?;
     if let Some(require) = &effective_require(input)
         && !meets_require(require, worker, inventory)
     {
@@ -339,55 +415,39 @@ fn evaluate<'a>(
     })
 }
 
-/// Another account for work that runs the model on `account`: same harness,
-/// signed in, with the same model, able to keep the mode, and not limited.
-fn other_account<'a>(
-    inventory: &'a Inventory,
-    account: &HarnessAccount,
-    model: &str,
+/// The account and model that the default rule gives when a selection is
+/// empty: the best harness, then its first model. It reads every paired
+/// worker, so the fallback path can tell what "the first choice" is. The
+/// result is a first choice for the path, not a placement.
+pub(crate) fn default_selection(
+    workers: &[Worker],
     approval_mode: ApprovalMode,
-    limited: &HashSet<AccountId>,
-) -> Option<&'a HarnessAccount> {
-    inventory.accounts.iter().find(|a| {
-        a.account_id != account.account_id
-            && a.harness == account.harness
-            && a.can_run(model)
-            && enforces_mode(a, approval_mode)
-            && !limited.contains(&a.account_id)
-    })
-}
-
-/// The selection that a session moves to when its account reached a usage
-/// limit, or `None` when no other account can take the work.
-pub(crate) fn fallback_selection(
-    inventory: &Inventory,
-    account_id: AccountId,
-    model: &str,
-    options: &ModelOptions,
-    approval_mode: ApprovalMode,
-    limited: &HashSet<AccountId>,
 ) -> Option<ModelSelection> {
-    if !limited.contains(&account_id) {
-        return None;
-    }
-    let account = inventory.account(account_id)?;
-    let other = other_account(inventory, account, model, approval_mode, limited)?;
-    Some(ModelSelection {
-        account_label: other.label.clone(),
-        model: model.to_owned(),
-        options: options.clone(),
-    })
+    workers
+        .iter()
+        .filter(|w| w.revoked_at.is_none())
+        .filter_map(|w| w.inventory.as_ref())
+        .flat_map(|inventory| inventory.accounts.iter())
+        .filter(|a| a.enabled && a.auth_state == AuthState::SignedIn && !a.models.is_empty())
+        .filter(|a| a.blocked_reason.is_none())
+        .filter(|a| enforces_mode(a, approval_mode))
+        .min_by_key(|a| harness_rank(a))
+        .and_then(|a| {
+            a.models.first().map(|m| ModelSelection {
+                account_label: a.label.clone(),
+                model: m.id.clone(),
+                options: ModelOptions::new(),
+            })
+        })
 }
 
-/// Chooses the account, the model and the model options on one worker. An
-/// account in `limited` gives way to another account of the same harness
-/// with the same model. When no such account exists, it stays, and the turn
-/// shows the limit to the user.
+/// Chooses the account, the model and the model options on one worker.
+/// Usage limits are not a placement matter: the fallback path
+/// (`crate::fallback`) chooses another selection before placement runs.
 fn choose_account<'a>(
     inventory: &'a Inventory,
     selection: Option<&ModelSelection>,
     approval_mode: ApprovalMode,
-    limited: &HashSet<AccountId>,
 ) -> Result<(&'a HarnessAccount, String, ModelOptions), AccountProblem> {
     match selection {
         Some(selection) => {
@@ -397,17 +457,11 @@ fn choose_account<'a>(
             let mut matching = inventory
                 .accounts
                 .iter()
+                .filter(|a| a.blocked_reason.is_none())
                 .filter(|a| a.label == selection.account_label && a.can_run(&selection.model))
                 .peekable();
             let first_label = matching.peek().map(|a| a.label.clone());
-            let chosen = matching.find(|a| enforces_mode(a, approval_mode)).map(|a| {
-                if limited.contains(&a.account_id) {
-                    other_account(inventory, a, &selection.model, approval_mode, limited)
-                        .unwrap_or(a)
-                } else {
-                    a
-                }
-            });
+            let chosen = matching.find(|a| enforces_mode(a, approval_mode));
             match chosen {
                 Some(account) => Ok((account, selection.model.clone(), selection.options.clone())),
                 None => {
@@ -436,7 +490,7 @@ fn choose_account<'a>(
                 .iter()
                 .copied()
                 .filter(|a| enforces_mode(a, approval_mode))
-                .min_by_key(|a| (harness_rank(a), limited.contains(&a.account_id)));
+                .min_by_key(|a| harness_rank(a));
             match best {
                 Some(account) => match account.models.first() {
                     Some(model) => Ok((account, model.id.clone(), ModelOptions::new())),
@@ -457,22 +511,20 @@ pub(crate) fn resolve_selection<'a>(
     selection: &ModelSelection,
     approval_mode: ApprovalMode,
 ) -> Result<(&'a HarnessAccount, String, ModelOptions), String> {
-    choose_account(inventory, Some(selection), approval_mode, &HashSet::new()).map_err(|problem| {
-        match problem {
-            AccountProblem::Missing => format!(
-                "The worker has no signed-in account \"{}\" with the model \"{}\".",
-                selection.account_label, selection.model
-            ),
-            AccountProblem::Mode { label } => format!(
-                "The account \"{label}\" on the worker cannot keep the approval mode of this task."
-            ),
-        }
+    choose_account(inventory, Some(selection), approval_mode).map_err(|problem| match problem {
+        AccountProblem::Missing => format!(
+            "The worker has no signed-in account \"{}\" with the model \"{}\".",
+            selection.account_label, selection.model
+        ),
+        AccountProblem::Mode { label } => format!(
+            "The account \"{label}\" on the worker cannot keep the approval mode of this task."
+        ),
     })
 }
 
 /// Whether the account can enforce a mode that is at most the requested one.
 /// An empty list means the worker did not say, so the account is accepted.
-fn enforces_mode(account: &HarnessAccount, requested: ApprovalMode) -> bool {
+pub(crate) fn enforces_mode(account: &HarnessAccount, requested: ApprovalMode) -> bool {
     account.capabilities.approval_modes.is_empty()
         || account.capabilities.best_mode_up_to(requested).is_some()
 }
@@ -685,7 +737,7 @@ fn wait_reason(input: &PlacementInput<'_>, rejections: &[Rejection]) -> String {
                 )
             } else {
                 "No online worker has a signed-in account. \
-                 Add an account to a worker and sign in to it in Settings > Workers."
+                 Add an account and sign in to it in Settings > Providers."
                     .to_owned()
             }
         }
@@ -712,7 +764,7 @@ fn wait_reason(input: &PlacementInput<'_>, rejections: &[Rejection]) -> String {
         }
         Stage::Policy => "No online worker that fits the rest of the request allows an \
                           in-place run in the folders of these repos. Use a worktree or a \
-                          clone, or add the folder to allowed_roots in the worker policy."
+                          clone, or add the folder to Allowed folders in Settings > Workers."
             .to_owned(),
     }
 }
@@ -751,7 +803,7 @@ impl Rejection {
             Self::Account(AccountProblem::Mode { label }) => ErrorBody::new(
                 ErrorCode::NoMatchingAccount,
                 format!(
-                    "The account {label} on {name} cannot run in {} mode. \
+                    "The account {label} cannot run in {} mode. \
                      Choose a mode with more access, or choose another account.",
                     mode_name(input.approval_mode)
                 ),
@@ -773,8 +825,8 @@ impl Rejection {
                 ErrorCode::PolicyDenied,
                 format!(
                     "{name} does not allow an in-place run in {path}. \
-                     Use a worktree or a clone, or add the folder to allowed_roots \
-                     in the worker policy of {name}."
+                     Use a worktree or a clone, or add the folder to Allowed folders \
+                     of {name} in Settings > Workers."
                 ),
             ),
         }
@@ -790,7 +842,7 @@ fn explain_missing_account(
     let Some(selection) = selection else {
         return format!(
             "{name} has no signed-in account with a model. \
-             Add an account to {name} and sign in to it in Settings > Workers."
+             Add an account and sign in to it in Settings > Providers."
         );
     };
     let label = &selection.account_label;
@@ -806,20 +858,20 @@ fn explain_missing_account(
         )
     } else if !same_label.iter().any(|a| a.enabled) {
         format!(
-            "The account {label} is turned off on {name}. \
-             Turn it on in worker.toml, or choose another account."
+            "The account {label} is turned off. \
+             Choose another account in Settings > Providers."
         )
     } else if !same_label
         .iter()
         .any(|a| a.enabled && a.auth_state == AuthState::SignedIn)
     {
         format!(
-            "The account {label} on {name} is not signed in. \
-             Sign in to it in Settings > Workers, then try again."
+            "The account {label} is not signed in. \
+             Sign in to it in Settings > Providers, then try again."
         )
     } else {
         format!(
-            "The account {label} on {name} does not offer the model {}. \
+            "The account {label} does not offer the model {}. \
              Choose another model.",
             selection.model
         )
@@ -895,6 +947,7 @@ mod tests {
 
     fn account(label: &str, harness: &str, models: &[&str]) -> HarnessAccount {
         HarnessAccount {
+            blocked_reason: None,
             account_id: AccountId::new(),
             harness: harness.to_owned(),
             label: label.to_owned(),
@@ -916,8 +969,6 @@ mod tests {
             plan: None,
             secret_names: Vec::new(),
             sign_in_methods: Vec::new(),
-            extras_enabled: true,
-            extras: None,
         }
     }
 
@@ -928,6 +979,7 @@ mod tests {
     /// An online worker on macOS with one account and an empty policy.
     fn worker(name: &str, accounts: Vec<HarnessAccount>) -> Worker {
         Worker {
+            kind: MachineKind::SessionHost,
             id: WorkerId::new(),
             name: name.to_owned(),
             hostname: format!("{name}.local"),
@@ -941,6 +993,7 @@ mod tests {
             state: WorkerState::Online,
             last_seen_at: None,
             inventory: Some(Inventory {
+                boundary: None,
                 hash: String::new(),
                 hostname: format!("{name}.local"),
                 os: Os::Macos,
@@ -984,7 +1037,6 @@ mod tests {
 
     /// Owns the input of one placement call.
     struct Case {
-        limited: HashSet<AccountId>,
         subject: Subject,
         workers: Vec<Worker>,
         open_sessions: HashMap<WorkerId, u32>,
@@ -998,12 +1050,14 @@ mod tests {
     }
 
     impl Case {
-        fn task(workers: Vec<Worker>) -> Self {
+        fn task(mut workers: Vec<Worker>) -> Self {
+            for worker in &mut workers {
+                worker.kind = MachineKind::Execution;
+            }
             Self {
                 subject: Subject::Task,
                 workers,
                 open_sessions: HashMap::new(),
-                limited: HashSet::new(),
                 selection: None,
                 request: PlacementRequest::default(),
                 approval_mode: ApprovalMode::Ask,
@@ -1031,11 +1085,24 @@ mod tests {
         }
 
         fn run(&self) -> Result<Placement, PlacementError> {
+            // A coordinator goes to a session host, and a task to a worker.
+            let kind = match self.subject {
+                Subject::Coordinator => MachineKind::SessionHost,
+                Subject::Task => MachineKind::Execution,
+            };
+            let workers: Vec<Worker> = self
+                .workers
+                .iter()
+                .cloned()
+                .map(|mut worker| {
+                    worker.kind = kind;
+                    worker
+                })
+                .collect();
             place(&PlacementInput {
                 subject: self.subject,
-                workers: &self.workers,
+                workers: &workers,
                 open_sessions: &self.open_sessions,
-                limited: &self.limited,
                 selection: self.selection.as_ref(),
                 request: &self.request,
                 approval_mode: self.approval_mode,
@@ -1182,7 +1249,8 @@ mod tests {
         let err = case.fail();
         assert_eq!(err.code, ErrorCode::NoMatchingAccount);
         assert!(
-            err.message.contains("sign in to it in Settings > Workers"),
+            err.message
+                .contains("sign in to it in Settings > Providers"),
             "{err}"
         );
     }
@@ -1215,52 +1283,10 @@ mod tests {
         let err = case.fail();
         assert_eq!(err.code, ErrorCode::PolicyDenied);
         assert!(err.message.contains("/tmp/sayso"), "{err}");
-        assert!(err.message.contains("allowed_roots"), "{err}");
+        assert!(err.message.contains("Allowed folders"), "{err}");
     }
 
     // Candidates -------------------------------------------------------------
-
-    #[test]
-    fn a_limited_account_gives_way_to_another_with_the_same_model() {
-        let first = account("Personal 1", "claude", &["opus"]);
-        let second = account("Personal 2", "claude", &["opus"]);
-        let mut case =
-            Case::task(vec![worker("w", vec![first.clone(), second])]).select("Personal 1", "opus");
-        assert_eq!(case.run().unwrap().account_label, "Personal 1");
-        case.limited.insert(first.account_id);
-        let moved = case.run().unwrap();
-        assert_eq!(moved.account_label, "Personal 2");
-        assert_eq!(moved.model, "opus");
-    }
-
-    #[test]
-    fn a_limited_account_stays_when_no_account_of_its_harness_has_the_model() {
-        let first = account("Personal 1", "claude", &["opus"]);
-        let no_model = account("Personal 2", "claude", &["sonnet"]);
-        let other_harness = account("Codex", "codex", &["opus"]);
-        let mut case = Case::task(vec![worker(
-            "w",
-            vec![first.clone(), no_model, other_harness],
-        )])
-        .select("Personal 1", "opus");
-        case.limited.insert(first.account_id);
-        assert_eq!(case.run().unwrap().account_label, "Personal 1");
-    }
-
-    #[test]
-    fn the_default_rule_skips_a_limited_account_of_the_same_rank_only() {
-        let first = account("Claude Code 1", "claude", &["opus"]);
-        let second = account("Claude Code 2", "claude", &["opus"]);
-        let codex = account("Codex", "codex", &["gpt"]);
-        let mut case = Case::task(vec![worker(
-            "w",
-            vec![first.clone(), second.clone(), codex],
-        )]);
-        case.limited.insert(first.account_id);
-        assert_eq!(case.run().unwrap().account_label, "Claude Code 2");
-        case.limited.insert(second.account_id);
-        assert_eq!(case.run().unwrap().account_label, "Claude Code 1");
-    }
 
     #[test]
     fn revoked_workers_are_ignored() {
@@ -1459,7 +1485,7 @@ mod tests {
         assert_eq!(err.code, ErrorCode::NoMatchingAccount);
         assert!(
             err.message
-                .contains("The account Pi on mini cannot run in Ask mode"),
+                .contains("The account Pi cannot run in Ask mode"),
             "{err}"
         );
     }
@@ -1726,7 +1752,7 @@ mod tests {
         only.isolation = Isolation::InPlace;
         let reason = only.wait_reason();
         assert!(reason.contains("in-place run"), "{reason}");
-        assert!(reason.contains("allowed_roots"), "{reason}");
+        assert!(reason.contains("Allowed folders"), "{reason}");
 
         // A worktree or a clone does not need the root.
         let mut worktree = Case::task(vec![outside]);
@@ -1922,7 +1948,7 @@ mod tests {
         assert_eq!(
             case.wait_reason(),
             "No online worker has a signed-in account. \
-             Add an account to a worker and sign in to it in Settings > Workers."
+             Add an account and sign in to it in Settings > Providers."
         );
     }
 
@@ -1942,7 +1968,7 @@ mod tests {
         assert_eq!(
             case.wait_reason(),
             "No online worker has a signed-in account. \
-             Add an account to a worker and sign in to it in Settings > Workers."
+             Add an account and sign in to it in Settings > Providers."
         );
     }
 
@@ -1995,16 +2021,12 @@ mod tests {
     }
 
     #[test]
-    fn channel_tags_apply_to_a_coordinator() {
-        let mut hub = worker("hub", vec![claude()]);
-        hub.tags = vec!["hub".to_owned()];
+    fn channel_tags_do_not_apply_to_a_coordinator() {
         let case = with_channel_tags(
-            Case::coordinator(vec![hub, tagged("work", &["work"])]),
+            Case::coordinator(vec![worker("host", vec![claude()])]),
             &["work"],
         );
-        // The hub tag ranks first for a coordinator, but not without the
-        // channel tag.
-        assert_eq!(case.chosen(), "work");
+        assert_eq!(case.chosen(), "host");
     }
 
     #[test]
@@ -2022,7 +2044,7 @@ mod tests {
              Add the tag to a worker in Settings > Workers."
         );
         let case = with_channel_tags(
-            Case::coordinator(vec![worker("a", vec![claude()])]),
+            Case::task(vec![worker("a", vec![claude()])]),
             &["work", "gpu"],
         );
         assert_eq!(

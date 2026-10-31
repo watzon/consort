@@ -303,7 +303,7 @@ impl ConsortApp {
                         code.clone(),
                     )),
             )
-            .child(div().flex_1())
+            .child(div().flex_1().min_w_0())
             .child(
                 div()
                     .flex()

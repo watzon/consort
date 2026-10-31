@@ -71,6 +71,8 @@ pub struct NewAccount {
 pub enum CommandOutput {
     #[default]
     Done,
+    /// The result of an endpoint test or a command check test.
+    Tested(crate::command_check::TestResultView),
     /// `account.create` made an account with this ID.
     AccountCreated(String),
     /// `sign_in.start` started a sign-in with this ID.
@@ -386,6 +388,14 @@ pub enum Command {
         worker_id: String,
         tags: Vec<String>,
     },
+    /// Changes the limits of a worker. A `None` keeps its value. An empty
+    /// list of folders means no limit.
+    SetWorkerPolicy {
+        worker_id: String,
+        max_approval_mode: Option<crate::view::ApprovalMode>,
+        allowed_roots: Option<Vec<String>>,
+        allow_shell: Option<bool>,
+    },
     /// Stars a model in the model picker, or takes the star away. The hub
     /// keeps the favorites for every client.
     SetFavoriteModel {
@@ -393,9 +403,43 @@ pub enum Command {
         model_id: String,
         favorite: bool,
     },
-    /// Allows work to move to another account at a usage limit, or stops it.
-    SetAccountFallback {
-        enabled: bool,
+    /// Replaces the fallback path: the built-in row "Other accounts with the
+    /// same model" and the steps, in order. The hub keeps the path for
+    /// every client and refuses one that repeats a step.
+    SetFallbackPath {
+        other_accounts: bool,
+        steps: Vec<SelectionView>,
+    },
+    /// Replaces the source of the command check.
+    SetCommandCheck {
+        choice: crate::command_check::CommandCheckChoice,
+    },
+    /// Adds an API endpoint, or changes one. With no key, an endpoint keeps
+    /// its key.
+    SaveEndpoint {
+        id: Option<String>,
+        name: String,
+        base_url: String,
+        api_key: Option<String>,
+    },
+    RemoveEndpoint {
+        id: String,
+    },
+    /// Tries an endpoint. With no key, the hub uses the stored key of `id`.
+    /// The answer is [`CommandOutput::Tested`].
+    TestEndpoint {
+        id: Option<String>,
+        base_url: String,
+        api_key: Option<String>,
+    },
+    /// Runs the saved command check on two sample commands. The answer is
+    /// [`CommandOutput::Tested`].
+    TestCommandCheck,
+    /// Takes the assistant of a channel back to its first choice, before the
+    /// limit resets. The hub refuses it when the first choice cannot answer
+    /// yet or a turn runs.
+    GoBack {
+        channel_id: String,
     },
     SetWorkerPaused {
         worker_id: String,
@@ -454,12 +498,6 @@ pub enum Command {
     /// Loads the ACP registry, and the icons of its agents. It does nothing
     /// while a load runs or after a load that worked.
     LoadAcpRegistry,
-    /// Turns the provider extras of an account on or off.
-    SetAccountExtras {
-        worker_id: String,
-        account_id: String,
-        enabled: bool,
-    },
     // Connectors.
     /// Asks the hub for the state of the Composio key and the plan.
     LoadComposioStatus,
@@ -468,6 +506,58 @@ pub enum Command {
         api_key: SecretText,
     },
     RemoveComposioKey,
+    /// Ends temporary access in a channel.
+    EndAccess {
+        channel_id: String,
+        grant_id: String,
+    },
+    // Monid.
+    /// Asks the hub for the Monid key state, the balance, the settings and
+    /// the spend of this month.
+    LoadMonidStatus,
+    /// Saves the Monid key on the hub, with the settings of the Add Monid
+    /// dialog. The key never comes back.
+    SetMonidKey {
+        api_key: SecretText,
+        settings: Option<crate::monid::MonidSettingsView>,
+    },
+    RemoveMonidKey,
+    /// Saves the whole Monid settings of the hub.
+    UpdateMonidSettings {
+        settings: crate::monid::MonidSettingsView,
+    },
+    /// Saves the whole Monid access of a channel.
+    SetChannelMonid {
+        channel_id: String,
+        access: crate::monid::MonidAccessView,
+    },
+    /// Searches the Monid catalog for a tool to add to a channel's list.
+    SearchMonid {
+        query: String,
+    },
+    /// Loads the recent calls of a channel.
+    LoadMonidCalls {
+        channel_id: String,
+    },
+    /// Loads the input, the output and the cost of one call.
+    LoadMonidCall {
+        call_id: String,
+    },
+    /// Asks Monid to stop a run.
+    StopMonidCall {
+        call_id: String,
+    },
+    /// Answers an approval with one option by its ID, such as "Always allow
+    /// this tool here" on a Monid card.
+    AnswerApprovalOption {
+        approval_id: String,
+        option_id: String,
+    },
+    /// Sets what a routine may do with Monid. `None` uses the hub's setting.
+    SetRoutineMonid {
+        routine_id: String,
+        monid: Option<crate::monid::MonidUnattendedView>,
+    },
     /// Loads the categories of the connector catalog.
     LoadConnectorCategories,
     /// Searches the catalog. The first page replaces the old results.

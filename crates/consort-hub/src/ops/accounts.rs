@@ -1,7 +1,8 @@
 //! Accounts, sign-ins and managed tools. The hub relays these requests to
-//! the worker that owns the account.
+//! the session host, which owns every account. A `worker_id` in these requests
+//! names the row of the session host.
 //!
-//! A request for a worker that is offline fails at once with
+//! A request while the session host is offline fails at once with
 //! `worker_offline`. The hub never queues it: the user is at the screen and
 //! needs the answer now, and a sign-in that waits for days is of no use.
 //!
@@ -16,9 +17,9 @@ use consort_proto::ids::{AccountId, SignInId, WorkerId};
 use consort_proto::model::{
     AcpAccountSpec, SIGN_IN_IDLE_EXPIRY_MS, SecretEnv, SignIn, SignInState,
 };
-use consort_proto::worker_link::{
+use consort_proto::session_host_link::{
     AccountCreateCommand, AccountRemoveCommand, AccountSignOutCommand, AccountUpdateCommand,
-    HubToWorker, SignInCancelCommand, SignInCodeCommand, SignInStartCommand, SignInUpdate,
+    HubToSessionHost, SignInCancelCommand, SignInCodeCommand, SignInStartCommand, SignInUpdate,
     ToolsCheck, ToolsInstall,
 };
 
@@ -77,6 +78,9 @@ fn map_worker_error(error: ErrorBody, relay: Relay) -> ErrorBody {
         | ErrorCode::ConnectorNotAvailable
         | ErrorCode::ComposioNotConfigured
         | ErrorCode::ComposioError
+        | ErrorCode::MonidNotConfigured
+        | ErrorCode::MonidKeyRefused
+        | ErrorCode::MonidError
         | ErrorCode::NeedsUser
         | ErrorCode::SkillBlocked
         | ErrorCode::SkillInvalid
@@ -203,8 +207,16 @@ impl Hub {
                 format!("The worker {} was removed.", worker.name),
             ));
         }
+        if worker.kind != consort_proto::model::MachineKind::SessionHost {
+            return Err(HubError::invalid(
+                "A worker holds no accounts or harness tools. They are on the hub machine.",
+            ));
+        }
         if !self.links.is_online(worker_id) {
-            return Err(HubError::Api(crate::link::worker_offline(&worker.name)));
+            return Err(HubError::Api(ErrorBody::new(
+                ErrorCode::WorkerOffline,
+                "The session host on the hub machine is offline. Check its service, then try again.",
+            )));
         }
         Ok(())
     }
@@ -217,7 +229,7 @@ impl Hub {
     async fn relay(
         &self,
         worker_id: WorkerId,
-        command: HubToWorker,
+        command: HubToSessionHost,
         relay: Relay,
         secrets: &[String],
     ) -> Result<()> {
@@ -250,7 +262,7 @@ impl Hub {
             "the hub asks a worker to create an account"
         );
         let secrets = secret_values(&request.env);
-        let command = HubToWorker::AccountCreate(AccountCreateCommand {
+        let command = HubToSessionHost::AccountCreate(AccountCreateCommand {
             account_id,
             harness,
             label,
@@ -277,11 +289,7 @@ impl Hub {
                 )));
             }
         }
-        if label.is_none()
-            && request.env_set.is_empty()
-            && request.env_remove.is_empty()
-            && request.extras_enabled.is_none()
-        {
+        if label.is_none() && request.env_set.is_empty() && request.env_remove.is_empty() {
             return Err(HubError::invalid(
                 "The update changes nothing. Give a new name or a variable to set or remove.",
             ));
@@ -294,12 +302,11 @@ impl Hub {
             "the hub asks a worker to update an account"
         );
         let secrets = secret_values(&request.env_set);
-        let command = HubToWorker::AccountUpdate(AccountUpdateCommand {
+        let command = HubToSessionHost::AccountUpdate(AccountUpdateCommand {
             account_id: request.account_id,
             label,
             env_set: request.env_set,
             env_remove: request.env_remove,
-            extras_enabled: request.extras_enabled,
         });
         self.relay(request.worker_id, command, Relay::Account, &secrets)
             .await?;
@@ -311,7 +318,7 @@ impl Hub {
         _caller: &Caller,
         request: AccountRemove,
     ) -> Result<Empty> {
-        let command = HubToWorker::AccountRemove(AccountRemoveCommand {
+        let command = HubToSessionHost::AccountRemove(AccountRemoveCommand {
             account_id: request.account_id,
         });
         self.relay(request.worker_id, command, Relay::Account, &[])
@@ -324,7 +331,7 @@ impl Hub {
         _caller: &Caller,
         request: AccountSignOut,
     ) -> Result<Empty> {
-        let command = HubToWorker::AccountSignOut(AccountSignOutCommand {
+        let command = HubToSessionHost::AccountSignOut(AccountSignOutCommand {
             account_id: request.account_id,
         });
         self.relay(request.worker_id, command, Relay::Account, &[])
@@ -339,7 +346,7 @@ impl Hub {
     ) -> Result<Empty> {
         self.relay(
             request.worker_id,
-            HubToWorker::ToolsCheck(ToolsCheck {}),
+            HubToSessionHost::ToolsCheck(ToolsCheck {}),
             Relay::Tool,
             &[],
         )
@@ -358,7 +365,7 @@ impl Hub {
                 request.tool
             )));
         }
-        let command = HubToWorker::ToolsInstall(ToolsInstall { tool: request.tool });
+        let command = HubToSessionHost::ToolsInstall(ToolsInstall { tool: request.tool });
         self.relay(request.worker_id, command, Relay::Tool, &[])
             .await?;
         Ok(Empty {})
@@ -395,7 +402,7 @@ impl Hub {
                 })
                 .await?
         };
-        let command = HubToWorker::SignInStart(SignInStartCommand {
+        let command = HubToSessionHost::SignInStart(SignInStartCommand {
             sign_in_id: sign_in.id,
             account_id: sign_in.account_id,
             method: sign_in.method.clone(),
@@ -450,7 +457,7 @@ impl Hub {
         }
         // The code goes to the worker and nowhere else.
         let secrets = vec![code.clone()];
-        let command = HubToWorker::SignInCode(SignInCodeCommand {
+        let command = HubToSessionHost::SignInCode(SignInCodeCommand {
             sign_in_id: sign_in.id,
             code,
         });
@@ -474,7 +481,7 @@ impl Hub {
         }
         // Best effort. A worker that is gone has no flow left to stop, and
         // the user cancels in any case.
-        let command = HubToWorker::SignInCancel(SignInCancelCommand {
+        let command = HubToSessionHost::SignInCancel(SignInCancelCommand {
             sign_in_id: sign_in.id,
         });
         if let Err(error) = self

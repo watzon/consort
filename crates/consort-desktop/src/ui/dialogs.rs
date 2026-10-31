@@ -287,6 +287,11 @@ impl ConsortApp {
             .cloned()
             .map(|notice| self.render_notice(notice, t, cx))
             .collect();
+        let dictation = self
+            .dictation
+            .notice
+            .as_ref()
+            .map(|notice| self.render_dictation_notice(notice, t, cx));
         div()
             .id("notice-stack")
             .debug_selector(|| "notice-stack".into())
@@ -316,6 +321,7 @@ impl ConsortApp {
                 )))
             })
             .children(cards)
+            .children(dictation)
             .into_any_element()
     }
 
@@ -456,6 +462,7 @@ impl ConsortApp {
         let mut lead: Option<AnyElement> = None;
         let mut ext_parts = match dialog {
             Dialog::ComposioKey => Some(self.composio_key_dialog(t, window, cx)),
+            Dialog::MonidKey => Some(self.monid_key_dialog(t, window, cx)),
             Dialog::AddConnector => Some(self.add_connector_dialog(t, window, cx)),
             Dialog::Connect => Some(self.connect_dialog(t, window, cx)),
             Dialog::ConfirmDisconnect(id) => Some(self.confirm_disconnect_dialog(id, t, cx)),
@@ -473,6 +480,7 @@ impl ConsortApp {
         };
         let (title, description, width, body, actions) = match dialog {
             Dialog::ComposioKey
+            | Dialog::MonidKey
             | Dialog::AddConnector
             | Dialog::Connect
             | Dialog::ConfirmDisconnect(_)
@@ -612,6 +620,19 @@ impl ConsortApp {
                 )
             }
             Dialog::AddWorker => self.add_worker_dialog(t, cx),
+            Dialog::DeepgramKey => self.deepgram_key_dialog(t, window, cx),
+            Dialog::Endpoint(id) => {
+                let id = id.clone();
+                self.endpoint_dialog(id, t, window, cx)
+            }
+            Dialog::ConfirmRemoveEndpoint(id) => {
+                let id = id.clone();
+                self.confirm_remove_endpoint_dialog(id, t, cx)
+            }
+            Dialog::WorkerFolders(id) => {
+                let id = id.clone();
+                self.worker_folders_dialog(id, t, window, cx)
+            }
             Dialog::RenameWorker(id) => {
                 let id = id.clone();
                 let focused = self
@@ -757,6 +778,7 @@ impl ConsortApp {
                     }),
                 )
             }
+            Dialog::ConfirmOtherHarnessStep => self.other_harness_step_dialog(t, cx),
             Dialog::ConfirmOpenLink(url) => {
                 let url = url.clone();
                 let open = url.clone();

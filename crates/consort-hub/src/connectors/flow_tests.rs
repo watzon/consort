@@ -71,6 +71,7 @@ pub(super) async fn coordinator_session(
     harness: &str,
 ) -> SessionId {
     let session = Session {
+        execution_worker_id: None,
         id: SessionId::new(),
         role: SessionRole::Coordinator,
         channel_id,
@@ -506,7 +507,8 @@ async fn connector_tools_show_only_where_a_connection_is_and_skill_tools_only_wi
     assert!(before.contains(&"list_connections".to_owned()));
     assert!(before.contains(&"add_skill".to_owned()));
     assert!(before.contains(&"search_skills".to_owned()));
-    assert!(!names(claude).await.contains(&"read_skill".to_owned()));
+    // Claude Code gets its skills from the hub tools too, and Codex loads them.
+    assert!(names(claude).await.contains(&"read_skill".to_owned()));
     active_gmail(&hub, &fake, ToolApprovals::default()).await;
     assert!(names(acp).await.contains(&"run_connector_tool".to_owned()));
 }
@@ -1046,16 +1048,21 @@ async fn a_channel_assistant_manages_only_its_own_channel() {
     )
     .await;
     assert_eq!(refused["status"], "refused");
-    let asked = call(
-        &hub,
-        session,
-        "request_access",
-        json!({"connection": "private"}),
-    )
-    .await;
-    assert_eq!(asked["status"], "waiting_for_user");
+    let asked = {
+        let hub = hub.clone();
+        tokio::spawn(async move {
+            call(
+                &hub,
+                session,
+                "request_access",
+                json!({"connection": "private", "duration": "permanent"}),
+            )
+            .await
+        })
+    };
     let card = pending_card(&hub).await;
-    answer(&hub, card.id, "allow").await;
+    answer(&hub, card.id, consort_proto::model::ACCESS_CARD_ALWAYS).await;
+    assert_eq!(asked.await.unwrap()["status"], "granted");
     wait_for(async || {
         let c = stored(&hub, private.id).await;
         (c.use_in
@@ -1208,7 +1215,7 @@ async fn skills_reach_the_session_and_the_worker_that_was_told() {
     let err = hub
         .skill_bundle_get(
             worker,
-            consort_proto::worker_link::SkillBundleGet {
+            consort_proto::session_host_link::SkillBundleGet {
                 content_hash: hash.clone(),
             },
         )
@@ -1228,7 +1235,7 @@ async fn skills_reach_the_session_and_the_worker_that_was_told() {
     let bundle = hub
         .skill_bundle_get(
             worker,
-            consort_proto::worker_link::SkillBundleGet { content_hash: hash },
+            consort_proto::session_host_link::SkillBundleGet { content_hash: hash },
         )
         .await
         .unwrap();
@@ -1307,6 +1314,7 @@ async fn worker_and_account_tools_ask_where_the_rule_says() {
     let (hub, _dir) = test_hub().await;
     let account_id = AccountId::new();
     let worker = Worker {
+        kind: Default::default(),
         id: WorkerId::new(),
         name: "Laptop".to_owned(),
         hostname: "laptop".to_owned(),
@@ -1320,12 +1328,14 @@ async fn worker_and_account_tools_ask_where_the_rule_says() {
         state: WorkerState::Online,
         last_seen_at: None,
         inventory: Some(Inventory {
+            boundary: None,
             hash: String::new(),
             hostname: "laptop".to_owned(),
             os: Os::Macos,
             arch: "aarch64".to_owned(),
             tags: Vec::new(),
             accounts: vec![HarnessAccount {
+                blocked_reason: None,
                 account_id,
                 harness: "claude".to_owned(),
                 label: "Claude Work".to_owned(),
@@ -1340,8 +1350,6 @@ async fn worker_and_account_tools_ask_where_the_rule_says() {
                 plan: None,
                 secret_names: Vec::new(),
                 sign_in_methods: vec![consort_proto::model::SignInMethod::ClaudePlan],
-                extras_enabled: false,
-                extras: None,
             }],
             local_mcp_servers: Vec::new(),
             checkouts: Vec::new(),
@@ -1356,9 +1364,17 @@ async fn worker_and_account_tools_ask_where_the_rule_says() {
         paired_at: Timestamp::now(),
         revoked_at: None,
     };
+    // The account is on the session host. The coordinator knows only the ID
+    // of the execution machine, from `list_workers`.
+    let mut host = worker.clone();
+    host.id = WorkerId::new();
+    host.kind = consort_proto::model::MachineKind::SessionHost;
     let worker_id = worker.id;
     hub.store
-        .write(move |tx| tx.save_worker(&worker))
+        .write(move |tx| {
+            tx.save_worker(&worker)?;
+            tx.save_worker(&host)
+        })
         .await
         .unwrap();
     let tutti_id = tutti(&hub).await;
@@ -1371,8 +1387,6 @@ async fn worker_and_account_tools_ask_where_the_rule_says() {
     )
     .await;
     assert_eq!(tags["status"], "waiting_for_user");
-    let extras = call(&hub, session, "set_account_extras", json!({"worker": worker_id.to_string(), "account": account_id.to_string(), "enabled": true})).await;
-    assert_eq!(extras["status"], "waiting_for_user");
     let sign_in = call(&hub, session, "start_sign_in", json!({"worker": worker_id.to_string(), "account": account_id.to_string(), "method": "claude_plan"})).await;
     assert_eq!(sign_in["status"], "waiting_for_user");
     let cards = hub

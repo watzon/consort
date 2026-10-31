@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use crate::common::*;
 use consort_proto::model::{SessionRole, SessionState};
-use consort_proto::worker_link::{HubToWorker, SessionStartResult};
+use consort_proto::session_host_link::{HubToSessionHost, SessionStartResult};
 
 /// Answers commands for `wait` and returns the first turn of each new
 /// coordinator session that starts.
@@ -20,7 +20,7 @@ async fn new_coordinator_turns(
 ) -> Vec<String> {
     let mut turns = Vec::new();
     while let Some((request, command)) = world.worker.try_next_command(wait).await {
-        if let HubToWorker::SessionStart(start) = &command {
+        if let HubToSessionHost::SessionStart(start) = &command {
             if start.session_id != old && start.role == SessionRole::Coordinator {
                 turns.push(
                     start

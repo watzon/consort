@@ -1,4 +1,4 @@
-//! The mock backend for connectors, skills and the provider extras. It
+//! The mock backend for connectors and skills. It
 //! changes the mock view state the way the hub would change the real one.
 
 use std::time::Duration;
@@ -8,7 +8,7 @@ use crate::{
     connectors::*,
     mock_extensions as mx,
     skills::*,
-    view::{ApprovalChoice, HarnessAccountView, RequestState, TimelineItem, ViewState},
+    view::{ApprovalChoice, RequestState, TimelineItem, ViewState},
 };
 
 /// A change that the mock makes a while after a command.
@@ -29,18 +29,6 @@ fn not_found(what: &str) -> ClientError {
         code: "not_found".into(),
         message: format!("This {what} is gone. It may have been removed in another client."),
     }
-}
-
-fn account_mut<'a>(
-    state: &'a mut ViewState,
-    worker_id: &str,
-    account_id: &str,
-) -> Option<&'a mut HarnessAccountView> {
-    state
-        .workers
-        .iter_mut()
-        .find(|w| w.id == worker_id)
-        .and_then(|w| w.accounts.iter_mut().find(|a| a.id == account_id))
 }
 
 /// The page of the mock catalog that starts at `offset`.
@@ -287,15 +275,6 @@ pub(crate) fn apply(
     later: &mut Vec<Later>,
 ) -> Result<CommandOutput, ClientError> {
     match command {
-        Command::SetAccountExtras {
-            worker_id,
-            account_id,
-            enabled,
-        } => {
-            let account =
-                account_mut(state, &worker_id, &account_id).ok_or_else(|| not_found("account"))?;
-            account.extras_enabled = enabled;
-        }
         Command::LoadComposioStatus => state.composio.load = LoadState::Loaded,
         Command::SetComposioKey {
             api_key: SecretText(key),

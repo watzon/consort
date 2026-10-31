@@ -87,8 +87,47 @@ impl VoiceState {
     }
 }
 
-/// The error of a session that writes or deletes `voice.md`.
-pub(crate) const VOICE_NOTE_REFUSAL: &str = "voice.md belongs to the hub. Sessions cannot write or delete it. To change a rule after a voice_edits event, call propose_voice_rule with the edits that agree; the user approves it as an offer. To add a rule that the user asked for, tell the user to add it in Settings > Voice.";
+/// The error of a session that writes `voice.md` in a turn that the user did
+/// not ask for.
+pub(crate) const VOICE_NOTE_REFUSAL: &str = "Only Tutti can write voice.md, and only in a turn with a message from the user or the report of a task that the user asked for. A routine, a proactive turn or a voice event cannot change it. To change a rule after a voice_edits event, call propose_voice_rule with the edits that agree; the user approves it as an offer.";
+
+/// The error of a session that deletes `voice.md`.
+pub(crate) const VOICE_NOTE_DELETE_REFUSAL: &str = "No session can delete voice.md. To change it in Tutti, use memory_write. To remove the whole guide, tell the user to use Reset in Settings > Voice.";
+
+/// Whether this session is the Tutti coordinator, in an open turn that the
+/// user asked for: it holds a message from the user, or the report of a task
+/// that the user asked for. A turn from a routine, a proactive wake or a
+/// voice event does not count.
+fn session_may_write_note(conn: &Db, session_id: consort_proto::ids::SessionId) -> Result<bool> {
+    let tutti = conversation::tutti_channel(conn)?;
+    let row = crate::store::coordinator::coordinator(conn, tutti.id)?;
+    if !row.turn_open || row.session_id != Some(session_id) {
+        return Ok(false);
+    }
+    for event in &row.turn_events {
+        match event {
+            WakeEvent::UserMessage { .. } => return Ok(true),
+            WakeEvent::TaskUpdate {
+                task,
+                proactive: None,
+                ..
+            } if task_is_from_the_user(conn, *task)? => return Ok(true),
+            _ => {}
+        }
+    }
+    Ok(false)
+}
+
+/// Whether the user made a task, or a coordinator started it in a turn with
+/// words from the user. The hub keeps those words for the voice scan.
+fn task_is_from_the_user(conn: &Db, task_id: consort_proto::ids::TaskId) -> Result<bool> {
+    if crate::store::work::task(conn, task_id)?
+        .is_some_and(|t| t.created_by == consort_proto::model::TaskCreator::User)
+    {
+        return Ok(true);
+    }
+    Ok(store::task_request(conn, task_id)?.is_some_and(|text| !text.trim().is_empty()))
+}
 
 /// The style guide, when `voice.md` exists, with the user's rules from the
 /// settings. A `(you)` mark in the note that the settings do not have is
@@ -114,18 +153,31 @@ pub(crate) fn active_guide(conn: &Db) -> Result<Option<VoiceGuide>> {
     Ok(guide(conn)?.filter(|g| !g.is_empty()))
 }
 
-/// Checks and normalizes a write of `voice.md` from outside the hub. Only
-/// the user may write it: a session gets [`VOICE_NOTE_REFUSAL`]. The
-/// user's write marks every new or changed rule as the user's, and the
-/// rules with the mark become the user's rules in the settings. The text
-/// goes through the format and the screening, and must fit in 6 KiB.
+/// Checks and normalizes a write of `voice.md` from outside the hub. The
+/// user may write it, and so may Tutti in a turn that answers the user: see
+/// [`session_may_write_note`]. Such a write counts as the user's, because the
+/// user asked for it: each new or changed rule gets the mark, and the rules
+/// with the mark become the user's rules in the settings. The text goes
+/// through the format and the screening, and must fit in 6 KiB.
 pub(crate) fn screen_note_write(
     tx: &mut Tx<'_>,
     by: MemoryAuthor,
     content: &str,
 ) -> Result<String> {
-    if by != MemoryAuthor::User {
-        return Err(crate::proactivity::turn::denied(VOICE_NOTE_REFUSAL));
+    if let MemoryAuthor::Session(session_id) = by {
+        if !session_may_write_note(tx.db(), session_id)? {
+            return Err(crate::proactivity::turn::denied(VOICE_NOTE_REFUSAL));
+        }
+        // The parser drops a section that it does not know. A session must
+        // hear that, or it tells the user that the text is in the guide.
+        let unknown = VoiceGuide::unknown_sections(content);
+        if !unknown.is_empty() {
+            return Err(HubError::invalid(format!(
+                "voice.md cannot have these sections: {}. Use Core, Hard rules or a context: {}.",
+                unknown.join(", "),
+                consort_proto::model::VOICE_CONTEXTS.join(", ")
+            )));
+        }
     }
     let before = guide(tx.db())?.unwrap_or_else(VoiceGuide::empty);
     let after = mark_user_rules(&before, VoiceGuide::parse(content).screened());

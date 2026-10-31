@@ -40,6 +40,8 @@ pub struct RoutineView {
     pub origin: consort_proto::model::RoutineOrigin,
     /// When it was made, in Unix milliseconds.
     pub created_at: Option<i64>,
+    /// What the routine may do with Monid. `None` uses the hub's setting.
+    pub monid: Option<crate::monid::MonidUnattendedView>,
 }
 
 /// What a routine does when it runs.
@@ -1532,6 +1534,7 @@ mod tests {
             next_run_at: None,
             last_run_at: last,
             last_run_status: status,
+            monid: None,
             runs: Vec::new(),
             runs_loaded: false,
             created_at: None,

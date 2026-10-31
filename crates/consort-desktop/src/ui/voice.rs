@@ -509,7 +509,7 @@ impl ConsortApp {
                             detail(t),
                             c.text_tertiary,
                         )
-                        .flex_1(),
+                        .flex_1().min_w_0(),
                     ),
             )
     }
@@ -708,7 +708,11 @@ impl ConsortApp {
                     t.text.ui_strong,
                     c.text_primary,
                 ))
-                .child(text(section.subtitle.clone(), detail(t), c.text_tertiary).flex_1())
+                .child(
+                    text(section.subtitle.clone(), detail(t), c.text_tertiary)
+                        .flex_1()
+                        .min_w_0(),
+                )
                 .when_some(section.learned.clone(), |d, learned| {
                     d.child(text(learned, detail(t), c.text_tertiary))
                 }),
@@ -860,11 +864,11 @@ impl ConsortApp {
                 .pt(t.space.sm)
                 .pb(t.space.md)
                 .px(t.space.lg)
-                .child(
-                    div()
-                        .flex_1()
-                        .child(input_box(&self.voice_inputs.rule, focused, t)),
-                )
+                .child(div().flex_1().min_w_0().child(input_box(
+                    &self.voice_inputs.rule,
+                    focused,
+                    t,
+                )))
                 .child(
                     button("voice-rule-save", "Add rule", ButtonKind::Primary, t).on_click(
                         cx.listener(|this, _, window, cx| this.add_voice_rule(window, cx)),
@@ -922,7 +926,7 @@ impl ConsortApp {
                         },
                         t,
                     )
-                    .flex_1(),
+                    .flex_1().min_w_0(),
                 )
                 .when(has_note, |d| {
                     d.child(
@@ -962,6 +966,7 @@ impl ConsortApp {
                         .flex()
                         .flex_col()
                         .flex_1()
+                        .min_w_0()
                         .gap(t.space.xs)
                         .child(
                             text("Request", detail(t), c.text_secondary)
@@ -1131,15 +1136,22 @@ impl ConsortApp {
             list = list.child(
                 div()
                     .flex()
-                    .items_center()
+                    .items_start()
                     .gap(t.space.sm + t.space.xxs)
-                    .child(icon("check", t.icon.dense, c.status_done))
-                    .child(selectable(
+                    .child(
+                        div()
+                            .flex()
+                            .flex_none()
+                            .items_center()
+                            .h(t.text.ui.line)
+                            .child(icon("check", t.icon.dense, c.status_done)),
+                    )
+                    .child(div().flex_1().min_w_0().child(selectable(
                         SharedString::from(format!("{key}-step-{i}")),
                         step.clone(),
                         t.text.ui,
                         c.text_primary,
-                    )),
+                    ))),
             );
         }
         list
@@ -1147,9 +1159,29 @@ impl ConsortApp {
 
     /// "Open the full guide" under the offer "Save this style guide?".
     pub fn render_open_guide_link(&mut self, t: &Tokens, cx: &mut Context<Self>) -> Stateful<Div> {
+        Self::guide_link("voice-open-guide", "Open the full guide", t).on_click(cx.listener(
+            |this, _, window, cx| this.open_voice_dialog(VoiceDialog::Proposal, window, cx),
+        ))
+    }
+
+    /// "Open the saved guide" after Do it: the note in global memory.
+    pub fn render_saved_guide_link(&mut self, t: &Tokens, cx: &mut Context<Self>) -> Stateful<Div> {
+        Self::guide_link("voice-saved-guide", "Open the saved guide", t).on_click(cx.listener(
+            |this, _, window, cx| {
+                this.open_note_in_panel(
+                    consort_client::memory::GLOBAL,
+                    consort_client::voice::VOICE_NOTE_PATH,
+                    window,
+                    cx,
+                );
+            },
+        ))
+    }
+
+    fn guide_link(id: &'static str, label: &'static str, t: &Tokens) -> Stateful<Div> {
         let c = &t.colors;
-        focusable(div().id("voice-open-guide"), t)
-            .debug_selector(|| "voice-open-guide".into())
+        focusable(div().id(id), t)
+            .debug_selector(move || id.into())
             .flex()
             .items_center()
             .gap(t.space.xs + t.space.xxs)
@@ -1160,11 +1192,8 @@ impl ConsortApp {
                     .type_style(t.text.ui)
                     .text_color(c.text_primary)
                     .underline()
-                    .child("Open the full guide"),
+                    .child(label),
             )
-            .on_click(cx.listener(|this, _, window, cx| {
-                this.open_voice_dialog(VoiceDialog::Proposal, window, cx)
-            }))
     }
 
     // Dialogs ------------------------------------------------------------------

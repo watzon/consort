@@ -31,7 +31,7 @@ The one-time step that makes the hub trust a new worker or client.
 _Avoid_: registration, linking, enrollment
 
 **Worker policy**:
-The limits that a worker sets on what the hub may ask it to do.
+The limits of a worker: the highest approval mode, the allowed folders and shell access. The user sets them in the app, and the worker keeps them and enforces them.
 _Avoid_: permissions, ACL, sandbox
 
 **Local MCP server**:
@@ -172,12 +172,36 @@ _Avoid_: engine, runtime, CLI
 The UI word for a harness that Consort can install and run: Claude Code, Codex, OpenCode, Gemini CLI, an agent from the ACP registry, or a custom ACP command. The UI shows each provider with its logo.
 _Avoid_: provider for a model company (say model provider), vendor, engine
 
+**Session host**:
+The process on the hub machine that holds the harness CLIs, the accounts and the sign-ins, and runs each session in a boundary. It is not the hub: it has its own credentials and, on Linux, its own user. The UI says "the hub machine".
+_Avoid_: hub worker, local worker
+
+**Execution worker**:
+A machine where work runs: commands, files and checkouts. It has no account and no CLI. The UI and most of the code say **worker**.
+_Avoid_: runner, agent machine
+
+**Boundary**:
+The OS limits around a session: bubblewrap on Linux, `sandbox-exec` on a Mac in development, and a network proxy for each session. With no boundary, no session starts.
+_Avoid_: jail, sandbox (in code; the UI may say "development sandbox" for a Mac)
+
+**Command check**:
+In Auto mode, the model that decides whether a shell command or an unknown tool can run without asking the user. It allows, blocks or asks. The code calls it the classifier or `command_check`. It is not a lock: worker policy and the boundary still hold.
+_Avoid_: classifier (in UI text), guard, safety check
+
+**API endpoint**:
+A base URL and a key that the user adds in Settings > Providers. Only the command check uses it. It cannot run a task.
+_Avoid_: provider, account
+
+**Journal**:
+The worker's record of each tool operation, by session, operation ID and argument hash. A retry with the same key gets the stored result and does not run again.
+_Avoid_: log, history
+
 **Harness account**:
-One login to one harness on one worker, with its own profile folder, such as "Codex Personal" on the MacBook Pro. The UI calls it an **account**. Accounts with the same name on different workers count as one account for a model selection.
+One login to one harness on the hub machine, with its own profile folder, such as "Codex Personal". The UI calls it an **account**. A worker never holds one.
 _Avoid_: provider instance, instance, profile
 
 **Profile folder**:
-The folder of one account on its worker, `<consort home>/profiles/<name>/`, where the name comes from the account name when the account is made (`Claude Work` gives `claude-work`) and does not change on a rename. It holds the harness's own config and login, and `env.json` with the account's secret variables.
+The folder of one account in the session host, `<consort home>/profiles/<name>/`, where the name comes from the account name when the account is made (`Claude Work` gives `claude-work`) and does not change on a rename. It holds the harness's own config and login, and `env.json` with the account's secret variables.
 _Avoid_: home, shadow home (for a new account), config dir
 
 **Sign-in**:
@@ -241,8 +265,12 @@ The user's own way of writing to other people, which the assistant can use for d
 _Avoid_: persona, tone of the assistant, writing style (for the assistant's own replies)
 
 **Style guide**:
-The global memory note `voice.md` that describes the voice: Core rules, one section for each context (Formal email, Close email, Chat, Public posts), short examples with placeholders, and hard rules. A rule that ends with `(you)` is one that the user wrote, and a learned change never replaces it. The hub owns the note: it changes only when the user edits it or says Do it on an offer.
+The global memory note `voice.md` that describes the voice: Core rules, one section for each context (Formal email, Close email, Chat, Public posts), short examples with placeholders, and hard rules. A rule that ends with `(you)` is one that the user wrote, and a learned change never replaces it. The note changes when the user edits it, asks Tutti in a message to edit it, or says Do it on an offer.
 _Avoid_: voice profile, persona file, style model
+
+**Dictation**:
+Speech that becomes text in a message box while the user speaks. It runs on the user's computer (the client), not on the hub or on a worker. The heard words are gray until dictation ends.
+_Avoid_: voice (that is the user's way of writing), transcription, system dictation
 
 **Commitment flag**:
 A phrase in a draft that the user must check before it goes out: a date, a time, a weekday, a price or an agreement whose value the request (the user's own words) did not contain, or text that breaks a hard rule.
@@ -298,6 +326,18 @@ _Avoid_: connected account, link, credential
 What a connector tool does: read, change (create or update) or delete. It picks the approval rule: run without asking, ask once per task, or ask every time.
 _Avoid_: permission level, scope
 
+**Monid**:
+A catalog of paid tools with one wallet. The hub uses it with a key that only the hub holds. Monid has no accounts to connect, so it is not a connector.
+_Avoid_: marketplace, Monad
+
+**Paid tool**:
+A tool from Monid. Each run can cost money.
+_Avoid_: service, endpoint (in the UI), connector tool
+
+**Monid call**:
+One run of a paid tool, with a row in the chat or the task thread that shows the tool, the input, the output and the cost.
+_Avoid_: run (alone), purchase
+
 **Skill**:
 A folder in the Agent Skills format, with a `SKILL.md`, that the hub installs from a source, pins to a commit and a content hash, and gives to sessions.
 _Avoid_: plugin, prompt, recipe, tool
@@ -314,6 +354,10 @@ _Avoid_: override, block list
 The connections and skills that a session gets: the ones whose "Use in" matches the session's channel, minus the channel's exceptions.
 _Avoid_: enabled tools, active connectors
 
-**Provider extras**:
-What a harness account brings from the provider's side, such as claude.ai connectors and synced plugins and skills. Each account has a toggle for them, on by default.
-_Avoid_: built-in connectors, cloud extras, synced stuff
+### Access request
+
+A session asks the user for a connection or for Monid that its channel lacks. The user answers on a card with temporary access, lasting access or no. Access does not change approvals.
+
+### Temporary access
+
+Access that ends by itself: with its task, or after 24 hours in the chat. It changes no "Use in", and the user can end it in the Channel panel.

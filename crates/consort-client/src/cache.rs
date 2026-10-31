@@ -8,10 +8,10 @@ use consort_proto::{
     client_api::{EntityKind, EntityPayload, FeedChange, FeedEntry, Snapshot},
     ids::{ChannelId, TaskId},
     model::{
-        AcpRegistryAgent, Approval, BlobRef, Channel, ChannelFile, Connection, Decision, Group,
-        ItemPayload, MemoryNote, MemoryNoteSummary, Message, MessageKind, PREFERENCES_ENTITY_ID,
-        Preferences, ReadMarker, Repo, Routine, RoutineRun, SessionItem, SignIn, Skill, Task,
-        Worker,
+        AcpRegistryAgent, Approval, BlobRef, Channel, ChannelFile, CommandCheckVerdict, Connection,
+        Decision, Group, ItemPayload, MemoryNote, MemoryNoteSummary, Message, MessageKind,
+        PREFERENCES_ENTITY_ID, Preferences, ReadMarker, Repo, Routine, RoutineRun, SessionItem,
+        SignIn, Skill, Task, Worker,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -59,6 +59,8 @@ pub struct SendFailure {
 pub enum ItemSummary {
     /// The command line.
     Command(String),
+    /// A command that the command check blocked. It never ran.
+    Blocked(String),
     /// The paths of the changed files.
     Files(Vec<String>),
     /// The steps of the plan of the harness, with their status, and when
@@ -73,6 +75,13 @@ pub enum ItemSummary {
 impl ItemSummary {
     fn of(item: &SessionItem) -> Option<ItemSummary> {
         match &item.payload {
+            ItemPayload::Command(c)
+                if c.check
+                    .as_ref()
+                    .is_some_and(|o| o.verdict == CommandCheckVerdict::Blocked) =>
+            {
+                Some(ItemSummary::Blocked(c.command.clone()))
+            }
             ItemPayload::Command(c) => Some(ItemSummary::Command(c.command.clone())),
             ItemPayload::FileChange(f) => Some(ItemSummary::Files(
                 f.changes.iter().map(|c| c.path.clone()).collect(),
@@ -237,6 +246,12 @@ impl CachedNote {
 #[derive(Clone, Debug, Default)]
 pub struct Extensions {
     pub composio: crate::connectors::ComposioView,
+    pub monid: crate::monid::MonidView,
+    /// What `monid.call` loaded, by call ID.
+    pub monid_calls: BTreeMap<String, crate::monid::MonidCallDetailView>,
+    /// Counts the Monid searches, so an old answer does not replace a newer
+    /// one.
+    pub monid_search_serial: u64,
     pub catalog: crate::connectors::CatalogView,
     /// Counts the catalog searches, so an old answer does not replace a
     /// newer one.
@@ -1168,6 +1183,8 @@ mod tests {
             review_summary: None,
             resolved_at: None,
             session_ended: false,
+            monid_calls: 0,
+            monid_cost_micros: 0,
             archived_at: None,
             created_at: Timestamp::from_millis(1),
             updated_at: Timestamp::from_millis(1),
@@ -1384,6 +1401,7 @@ mod tests {
             next_run_at: None,
             last_run_at: None,
             last_run_status: None,
+            monid: None,
             created_at: None,
             kind: Default::default(),
             origin: Default::default(),
@@ -1576,7 +1594,6 @@ mod tests {
     fn the_cache_applies_preferences_from_the_snapshot_and_the_feed() {
         use consort_proto::model::{FavoriteModel, Preferences};
         let prefs = |models: &[&str]| Preferences {
-            account_fallback: true,
             favorite_models: models
                 .iter()
                 .map(|m| FavoriteModel {
@@ -1584,6 +1601,7 @@ mod tests {
                     model: (*m).into(),
                 })
                 .collect(),
+            ..Preferences::default()
         };
         let mut cache = Cache::default();
         let mut snapshot = snapshot_at(5);

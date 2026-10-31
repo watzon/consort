@@ -183,7 +183,13 @@ impl ConsortApp {
                     .border_b(t.border_width)
                     .border_color(c.border_subtle)
                     .drag_area()
-                    .child(div().flex_1().type_style(t.text.title).child("Skills"))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .type_style(t.text.title)
+                            .child("Skills"),
+                    )
                     .child(
                         button("add-skill", "Add skill", ButtonKind::Secondary, t)
                             .child(icon("plus", t.icon.dense, c.text_primary))
@@ -197,6 +203,7 @@ impl ConsortApp {
                 div()
                     .id("skills-list")
                     .flex_1()
+                    .min_w_0()
                     .overflow_y_scroll()
                     .child(rows)
                     .child(self.skill_sources_section(t, cx)),
@@ -205,6 +212,7 @@ impl ConsortApp {
             Some(skill) => self.skill_page(&skill, t, cx),
             None => div()
                 .flex_1()
+                .min_w_0()
                 .p(t.layout.speaker_gutter)
                 .flex()
                 .flex_col()
@@ -352,11 +360,11 @@ impl ConsortApp {
                     .items_center()
                     .gap(t.space.sm)
                     .px(t.space.sm)
-                    .child(
-                        div()
-                            .flex_1()
-                            .child(text("Sources", t.text.ui_strong, c.text_primary)),
-                    )
+                    .child(div().flex_1().min_w_0().child(text(
+                        "Sources",
+                        t.text.ui_strong,
+                        c.text_primary,
+                    )))
                     .child(
                         button("add-skill-source", "Add source", ButtonKind::Secondary, t)
                             .debug_selector(|| "add-skill-source".into())
@@ -870,6 +878,7 @@ impl ConsortApp {
                 let search = div()
                     .flex()
                     .flex_1()
+                    .min_w_0()
                     .items_center()
                     .gap(t.space.sm)
                     .py(t.component.input_pad_y)

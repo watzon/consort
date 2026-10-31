@@ -16,7 +16,7 @@ use consort_proto::client_api::{
 };
 use consort_proto::error::ErrorCode;
 use consort_proto::model::{AuthState, ConnectionStatus, SecretEnv, ToolApprovals, UseIn};
-use consort_proto::worker_link::{HubToWorker, SessionEvent, TurnEndReason};
+use consort_proto::session_host_link::{HubToSessionHost, SessionEvent, TurnEndReason};
 
 async fn world_with_composio() -> (World, FakeComposio) {
     let world = World::start().await;
@@ -215,17 +215,12 @@ async fn a_login_that_a_turn_found_expired_marks_the_account_and_stops_the_coord
         .await;
     // The hub ends the session on the worker, and the notice says where.
     let (request, command) = world.worker.next_command().await;
-    assert!(matches!(command, HubToWorker::SessionStop(_)));
+    assert!(matches!(command, HubToSessionHost::SessionStop(_)));
     world
         .worker
         .respond_ok(&request, &serde_json::json!({}))
         .await;
-    world
-        .wait_notice(
-            None,
-            &["assistant_signed_out", "Claude Code", "Fake worker"],
-        )
-        .await;
+    world.wait_blocked(&["Claude Code"]).await;
     let id = world.worker.worker_id;
     let account_id = world.worker.account_id;
     let workers = world

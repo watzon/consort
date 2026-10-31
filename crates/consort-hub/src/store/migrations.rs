@@ -23,6 +23,8 @@ pub const MIGRATIONS: &[&str] = &[
     include_str!("schema_v13.sql"),
     include_str!("schema_v14.sql"),
     include_str!("schema_v15.sql"),
+    include_str!("schema_v16.sql"),
+    include_str!("schema_v17.sql"),
 ];
 
 pub fn current_version() -> i64 {
@@ -180,6 +182,10 @@ mod tests {
             created_at: now,
             updated_at: now,
             proactive_tasks: Default::default(),
+            coordinator_fallback: None,
+            coordinator_blocked: None,
+            monid: Default::default(),
+            access_grants: Vec::new(),
             proactivity: None,
         };
         let json = serde_json::to_string(&channel).unwrap();

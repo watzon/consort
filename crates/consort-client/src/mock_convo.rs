@@ -74,6 +74,7 @@ fn reply(id: &str, speaker: Speaker, time: &str, body: &str) -> MessageView {
 fn line(text: &str, item_id: &str) -> ActivityLine {
     ActivityLine {
         text: text.into(),
+        blocked: text.starts_with("Blocked "),
         session_id: SESSION.into(),
         item_id: item_id.into(),
     }
@@ -571,6 +572,7 @@ fn item_view(state: &ViewState, task_id: &str, item_id: &str) -> ItemDetailView 
         _ => (1, text("Command on bigboi"), "bigboi"),
     };
     ItemDetailView {
+        check: None,
         task_id: task_id.into(),
         session_id: SESSION.into(),
         item_id: item_id.into(),

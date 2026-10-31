@@ -130,11 +130,7 @@ impl Hub {
     pub(crate) async fn tool_list_workers(&self, _ctx: &ToolCtx, _args: NoArgs) -> Result<Value> {
         let workers = self.store.read(machine::workers).await?;
         to_value(&ListWorkersResult {
-            workers: workers
-                .iter()
-                .filter(|w| w.revoked_at.is_none())
-                .map(WorkerSummary::from_worker)
-                .collect(),
+            workers: machines_for_tasks(&workers),
         })
     }
 
@@ -743,5 +739,95 @@ impl Hub {
             .write(move |tx| tx.save_channel_file(&file))
             .await?;
         to_value(&PublishArtifactResult { path })
+    }
+}
+
+/// The machines that the coordinator can name for a task. A session host runs
+/// no work, and placement refuses its ID. It has the accounts, so each machine
+/// shows them.
+fn machines_for_tasks(workers: &[consort_proto::model::Worker]) -> Vec<WorkerSummary> {
+    use consort_proto::model::MachineKind;
+    let accounts: Vec<_> = workers
+        .iter()
+        .filter(|w| w.kind == MachineKind::SessionHost && w.revoked_at.is_none())
+        .flat_map(|w| WorkerSummary::from_worker(w).accounts)
+        .collect();
+    workers
+        .iter()
+        .filter(|w| w.kind == MachineKind::Execution && w.revoked_at.is_none())
+        .map(|w| {
+            let mut summary = WorkerSummary::from_worker(w);
+            summary.accounts.extend(accounts.iter().cloned());
+            summary
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod machine_tests {
+    use consort_proto::auth::PublicKey;
+    use consort_proto::ids::{AccountId, WorkerId};
+    use consort_proto::model::{
+        Inventory, MachineKind, Os, Worker, WorkerLoad, WorkerPolicy, WorkerState,
+    };
+    use consort_proto::time::Timestamp;
+
+    use super::machines_for_tasks;
+
+    fn machine(kind: MachineKind, account: Option<&str>) -> Worker {
+        let accounts = account
+            .iter()
+            .map(|label| {
+                serde_json::from_value(serde_json::json!({
+                    "account_id": AccountId::new(), "harness": "claude-code", "label": label,
+                    "auth_state": "signed_in", "models": [], "capabilities": {}, "enabled": true,
+                }))
+                .unwrap()
+            })
+            .collect();
+        Worker {
+            kind,
+            id: WorkerId::new(),
+            name: "hub".to_owned(),
+            hostname: "hub.local".to_owned(),
+            os: Os::Macos,
+            arch: "aarch64".to_owned(),
+            public_key: PublicKey::from_bytes([1; 32]),
+            version: "0.1.0".to_owned(),
+            protocol_version: 1,
+            tags: Vec::new(),
+            paused: false,
+            state: WorkerState::Online,
+            last_seen_at: None,
+            inventory: Some(Inventory {
+                boundary: None,
+                hash: String::new(),
+                hostname: "hub.local".to_owned(),
+                os: Os::Macos,
+                arch: "aarch64".to_owned(),
+                tags: Vec::new(),
+                accounts,
+                local_mcp_servers: Vec::new(),
+                checkouts: Vec::new(),
+                policy: WorkerPolicy::default(),
+                load: WorkerLoad::default(),
+                tools: Vec::new(),
+            }),
+            paired_at: Timestamp::from_millis(0),
+            revoked_at: None,
+        }
+    }
+
+    /// Placement refuses a session host, so `list_workers` must not offer it.
+    #[test]
+    fn list_workers_offers_only_machines_that_run_work_with_the_accounts_of_the_hub() {
+        let host = machine(MachineKind::SessionHost, Some("Claude Personal"));
+        let worker = machine(MachineKind::Execution, None);
+        let mut removed = machine(MachineKind::Execution, None);
+        removed.revoked_at = Some(Timestamp::from_millis(1));
+        let listed = machines_for_tasks(&[host, worker.clone(), removed]);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, worker.id);
+        assert_eq!(listed[0].accounts[0].label, "Claude Personal");
     }
 }

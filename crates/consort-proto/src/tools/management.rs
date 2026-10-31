@@ -6,9 +6,8 @@
 //! something new and narrow, or that makes access smaller or approvals
 //! stricter, runs at once. A change that deletes or archives, widens
 //! access, makes approvals looser, turns on a skill with scripts, changes
-//! worker or channel tags, or turns provider extras on, waits for the user
-//! on a management approval card. Every such tool answers with a
-//! [`ManagementResult`], whose `status` says what happened.
+//! worker or channel tags, waits for the user on a management approval
+//! card. Every such tool answers with a [`ManagementResult`], whose `status` says what happened.
 //!
 //! A connection is named by its handle or its ID, and a skill by its name
 //! or its ID.
@@ -18,7 +17,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::ids::{AccountId, ApprovalId, ChannelId, ConnectionId, SkillId, WorkerId};
 use crate::model::{
-    Connection, ConnectorService, ModelSelection, Skill, SkillDirectoryEntry, ToolApprovals, UseIn,
+    AccessDuration, Connection, ConnectorService, ModelSelection, Skill, SkillDirectoryEntry,
+    ToolApprovals, UseIn,
 };
 
 /// `create_channel`.
@@ -133,17 +133,6 @@ pub struct StartSignInArgs {
     /// choose on the card.
     #[serde(default)]
     pub method: Option<String>,
-}
-
-/// `set_account_extras`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct SetAccountExtrasArgs {
-    /// The worker.
-    pub worker: WorkerId,
-    /// The account.
-    pub account: AccountId,
-    /// True turns the provider extras on, which asks the user first.
-    pub enabled: bool,
 }
 
 /// `search_connector_catalog`.
@@ -299,9 +288,61 @@ pub struct RequestAccessArgs {
     /// The connection handle or ID.
     #[serde(default)]
     pub connection: Option<String>,
-    /// The skill name or ID.
+    /// The skill name or ID. A skill is always lasting access.
     #[serde(default)]
     pub skill: Option<String>,
+    /// Ask for Monid. Leave out the provider to ask for all of Monid. Name a
+    /// provider, or a provider and an endpoint, to ask for less.
+    #[serde(default)]
+    pub monid: Option<MonidAccessArgs>,
+    /// `temporary` lasts until your task ends, or 24 hours outside a task.
+    /// `permanent` lasts from now on in this channel. Ask for temporary
+    /// unless this channel will need it again and again.
+    #[serde(default)]
+    pub duration: AccessDuration,
+    /// One short sentence for the user: why you need it.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// The Monid part of `request_access`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct MonidAccessArgs {
+    /// The provider from `search_tools`.
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// The endpoint from `search_tools`.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+}
+
+/// `request_access` result for a connection or Monid. Serialized with a
+/// `status` field.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum RequestAccessResult {
+    /// The user gave access. It works from now on in this session.
+    Granted {
+        /// What the session can do now.
+        message: String,
+    },
+    /// The user has not answered. The answer arrives in a later turn.
+    WaitingForUser {
+        /// The card.
+        approval_id: ApprovalId,
+        /// What to tell the user.
+        message: String,
+    },
+    /// The user said no.
+    Denied {
+        /// What to do next.
+        message: String,
+    },
+    /// The hub posted no card.
+    Refused {
+        /// Why.
+        message: String,
+    },
 }
 
 /// What a management tool did.
@@ -392,6 +433,21 @@ pub struct ListConnectionsResult {
     /// this channel turned off.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub off_in_this_channel: Vec<ConnectionId>,
+    /// The connections that this channel does not have. Only their names:
+    /// `request_access` asks the user for one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub can_request: Vec<RequestableConnection>,
+}
+
+/// A connection that a channel can ask for.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestableConnection {
+    /// The handle.
+    pub handle: String,
+    /// The name.
+    pub name: String,
+    /// The service name.
+    pub service_name: String,
 }
 
 /// `search_skills` result.

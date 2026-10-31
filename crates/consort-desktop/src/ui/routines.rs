@@ -202,7 +202,7 @@ impl ConsortApp {
             }));
         if routines.is_empty() && follow_ups.is_empty() {
             let channel_id = self.channel_id.clone();
-            return div().flex_1().min_h_0().p(t.space.lg).child(
+            return div().flex_1().min_w_0().min_h_0().p(t.space.lg).child(
                 div()
                     .debug_selector(|| "routines-empty".into())
                     .flex()
@@ -262,6 +262,7 @@ impl ConsortApp {
             .flex()
             .flex_col()
             .flex_1()
+            .min_w_0()
             .min_h_0()
             .child(
                 div()
@@ -277,6 +278,7 @@ impl ConsortApp {
                         div()
                             .debug_selector(|| "routines-summary".into())
                             .flex_1()
+                            .min_w_0()
                             .child(text(summary, t.text.ui, c.text_secondary)),
                     )
                     .child(new_button),
@@ -484,7 +486,7 @@ impl ConsortApp {
                                 )),
                             )
                         })
-                        .child(div().flex_1())
+                        .child(div().flex_1().min_w_0())
                         .child(
                             icon_button(
                                 SharedString::from(format!("routine-more-{}", routine.id)),
@@ -825,6 +827,7 @@ impl ConsortApp {
                             })),
                     ),
             );
+        let summary = summary.child(self.routine_monid_row(routine, t, cx));
         let runs = r::recent_runs(routine, now);
         let mut list = div()
             .flex()
@@ -1281,13 +1284,13 @@ impl ConsortApp {
                     })
                     .rounded(t.radius.md)
                     .child(icon("search", t.icon.dense, c.text_tertiary))
-                    .child(div().flex_1().child(crate::ui::parts::input(
+                    .child(div().flex_1().min_w_0().child(crate::ui::parts::input(
                         &self.knowledge_inputs.filter,
                         t.text.ui,
                     ))),
             )
             .child(statuses)
-            .child(div().flex_1())
+            .child(div().flex_1().min_w_0())
             .child(channel_select);
         let mut groups = div().flex().flex_col().gap(t.space.xl);
         // The open channel first, then the others in the order of the
@@ -1382,7 +1385,8 @@ impl ConsortApp {
                     .max_w(t.component.settings_detail_max)
                     .child(header)
                     .child(filters)
-                    .child(groups),
+                    .child(groups)
+                    .children(self.monid_unattended_section(true, t, cx)),
             )
             .into_any_element()
     }
@@ -1517,7 +1521,11 @@ impl ConsortApp {
                 Some(ch) => icon(&ch.icon, t.icon.size, c.text_secondary).into_any_element(),
                 None => div().into_any_element(),
             })
-            .child(line(channel_name.clone(), t.text.ui, c.text_primary).flex_1())
+            .child(
+                line(channel_name.clone(), t.text.ui, c.text_primary)
+                    .flex_1()
+                    .min_w_0(),
+            )
             .child(icon("chevrons-up-down", t.icon.dense, c.text_secondary))
             .on_click(cx.listener(move |this, _, _, cx| {
                 if let Some(bounds) = this.triggers.get("routine-channel") {
@@ -1739,14 +1747,17 @@ impl ConsortApp {
                                 c.text_primary,
                             ))
                         })
-                        .child(text(
-                            selection
-                                .as_ref()
-                                .map(|s| s.model_name.clone())
-                                .unwrap_or_else(|| "The channel's model".to_owned()),
-                            t.text.label,
-                            c.text_secondary,
-                        ))
+                        .child(
+                            text(
+                                selection
+                                    .as_ref()
+                                    .map(|s| s.model_name.clone())
+                                    .unwrap_or_else(|| "The channel's model".to_owned()),
+                                t.text.label,
+                                c.text_secondary,
+                            )
+                            .min_w_0(),
+                        )
                         .when_some(selection.as_ref(), |d, s| {
                             d.child(text(s.account_label.clone(), detail(t), c.text_tertiary))
                         }),
@@ -1858,6 +1869,7 @@ pub fn panel_scroll(id: &'static str, list: Div, t: &Tokens) -> Div {
     div()
         .relative()
         .flex_1()
+        .min_w_0()
         .min_h_0()
         .child(div().id(id).size_full().overflow_y_scroll().child(list))
         .child(

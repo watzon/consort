@@ -30,7 +30,7 @@ One component, `ModelPicker`, with a trigger and a popover.
   - **Search:** typing hides the rail and shows the matching models of every account, as rows of the Favorites kind. It filters by model name, model ID, account name and provider name. Escape clears the search first, then closes only the popover.
   - **Keyboard:** Up and Down move in the list, and Enter chooses. Left, with an empty search, moves to the rail. In the rail, Up and Down change the view, and Right, Enter or typing go back to the list.
   - **Use the Tutti model:** a small text button at the right end of the header line, in every view, for a channel that has its own model. It clears the channel's own choice.
-  - **No signed-in account:** "No account is signed in. Add one in Settings > Workers." with a button that opens it. There is no rail.
+  - **No signed-in account:** "No account is signed in. Add one in Settings > Providers." with a button that opens it. There is no rail.
 - **Effort control:** a second chip next to the model chip (bars icon plus the level), with a small menu titled "Effort for <model>". It lists the choices of the model's `effort` option, marks the provider default with "Default", and ends with the note "<Provider> offers these levels for this model. More effort thinks longer and uses more of your plan." It is hidden when the model has no effort option. In dialogs the effort control is a select next to the model field.
 - Changing the model keeps the effort if the new model offers that level. Otherwise it falls back to the new model's default.
 

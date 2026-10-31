@@ -19,7 +19,7 @@ use consort_harness::{
     AccountConfig, ApprovalMode, HarnessKind, SessionEvent, SessionSpec, TurnInput, adapter_for,
 };
 use consort_proto::ids::SessionId;
-use consort_proto::worker_link::TurnEndReason;
+use consort_proto::session_host_link::TurnEndReason;
 
 fn spec(dir: &std::path::Path, mode: ApprovalMode) -> SessionSpec {
     SessionSpec {
@@ -37,7 +37,6 @@ fn spec(dir: &std::path::Path, mode: ApprovalMode) -> SessionSpec {
         system_prompt_append: "You are a smoke test. Keep answers short.".into(),
         mcp_servers: Vec::new(),
         env: BTreeMap::new(),
-        extras_enabled: true,
         skills: None,
         resume: None,
         process_watcher: None,
@@ -295,4 +294,303 @@ async fn codex_device_code_sign_in_starts_and_cancels() {
     logout(&account).await.unwrap();
     let info = read_account(&account).await.unwrap();
     assert!(info.account.is_none());
+}
+
+/// One HTTP port that plays the model and the `consort` MCP server. The model
+/// asks for `apply_patch`, then finds an MCP tool and calls it, then answers.
+struct LocalModel {
+    port: u16,
+    tools_called: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    requests: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+}
+
+impl LocalModel {
+    /// `first_step` 3 answers at once, with no tool.
+    fn start(first_step: usize) -> Self {
+        use std::io::{Read, Write};
+        use std::sync::atomic::Ordering;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let tools_called = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (called, seen) = (tools_called.clone(), requests.clone());
+        std::thread::spawn(move || {
+            let step = std::sync::atomic::AtomicUsize::new(first_step);
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let mut raw = Vec::new();
+                let mut buffer = [0_u8; 65536];
+                let (path, body) = loop {
+                    let read = stream.read(&mut buffer).unwrap_or(0);
+                    if read == 0 {
+                        break (String::new(), Vec::new());
+                    }
+                    raw.extend_from_slice(&buffer[..read]);
+                    let Some(end) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let head = String::from_utf8_lossy(&raw[..end]).to_ascii_lowercase();
+                    let length: usize = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse().ok())
+                        .unwrap_or(0);
+                    if raw.len() >= end + 4 + length {
+                        let path = head.split_whitespace().nth(1).unwrap_or("").to_owned();
+                        break (path, raw[end + 4..end + 4 + length].to_vec());
+                    }
+                };
+                let value: serde_json::Value =
+                    serde_json::from_slice(&body).unwrap_or(serde_json::Value::Null);
+                let (status, kind, reply) = if path.starts_with("/mcp") {
+                    let result = match value["method"].as_str().unwrap_or("") {
+                        "initialize" => serde_json::json!({
+                            "protocolVersion": value["params"]["protocolVersion"],
+                            "capabilities": {"tools": {}},
+                            "serverInfo": {"name": "consort", "version": "1"},
+                        }),
+                        "tools/list" => serde_json::json!({"tools": [{
+                            "name": "echo",
+                            "description": "Echo",
+                            "inputSchema": {"type": "object", "properties": {}},
+                        }]}),
+                        "tools/call" => {
+                            called.fetch_add(1, Ordering::SeqCst);
+                            serde_json::json!({"content": [{"type": "text", "text": "echoed"}]})
+                        }
+                        _ => serde_json::json!({}),
+                    };
+                    if value.get("id").is_some() {
+                        let reply = serde_json::json!({"jsonrpc": "2.0", "id": value["id"], "result": result});
+                        ("200 OK", "application/json", reply.to_string())
+                    } else {
+                        ("202 Accepted", "application/json", String::new())
+                    }
+                } else if path.ends_with("/responses") {
+                    seen.lock().unwrap().push(value);
+                    let items = match step.fetch_add(1, Ordering::SeqCst) {
+                        0 => {
+                            serde_json::json!({"type": "custom_tool_call", "call_id": "c1", "name": "apply_patch", "input": "*** Begin Patch\n*** Add File: outside.txt\n+x\n*** End Patch\n"})
+                        }
+                        1 => {
+                            serde_json::json!({"type": "tool_search_call", "call_id": "s1", "execution": "client", "status": "completed", "arguments": {"query": "echo", "limit": 5}})
+                        }
+                        2 => {
+                            serde_json::json!({"type": "function_call", "call_id": "c2", "name": "echo", "namespace": "mcp__consort", "arguments": "{}"})
+                        }
+                        _ => {
+                            serde_json::json!({"type": "message", "role": "assistant", "id": "m1", "content": [{"type": "output_text", "text": "done"}]})
+                        }
+                    };
+                    let usage = serde_json::json!({"input_tokens": 1, "output_tokens": 1, "total_tokens": 2, "input_tokens_details": null, "output_tokens_details": null});
+                    let events = [
+                        serde_json::json!({"type": "response.created", "response": {"id": "r"}}),
+                        serde_json::json!({"type": "response.output_item.done", "item": items}),
+                        serde_json::json!({"type": "response.completed", "response": {"id": "r", "usage": usage}}),
+                    ];
+                    let text: String = events
+                        .iter()
+                        .map(|e| format!("event: {}\ndata: {e}\n\n", e["type"].as_str().unwrap()))
+                        .collect();
+                    ("200 OK", "text/event-stream", text)
+                } else {
+                    ("404 Not Found", "text/plain", String::new())
+                };
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\ncontent-type: {kind}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
+                    reply.len()
+                );
+            }
+        });
+        Self {
+            port,
+            tools_called,
+            requests,
+        }
+    }
+}
+
+/// The native binary of the npm package of `codex`, which needs no Node.js.
+/// `CONSORT_CODEX_BINARY` picks another one, such as a managed install.
+fn codex_native() -> std::path::PathBuf {
+    if let Some(binary) = std::env::var_os("CONSORT_CODEX_BINARY") {
+        return binary.into();
+    }
+    let wrapper = consort_harness::process::resolve_program("codex").expect("codex on PATH");
+    let wrapper = std::fs::canonicalize(wrapper).unwrap();
+    let package = wrapper.parent().unwrap().parent().unwrap();
+    let (arch, triple) = if cfg!(target_arch = "aarch64") {
+        ("arm64", format!("aarch64-{}", codex_system()))
+    } else {
+        ("x64", format!("x86_64-{}", codex_system()))
+    };
+    let system = if cfg!(target_os = "macos") {
+        "darwin"
+    } else {
+        "linux"
+    };
+    package
+        .join(format!("node_modules/@openai/codex-{system}-{arch}/vendor"))
+        .join(triple)
+        .join("bin/codex")
+}
+
+fn codex_system() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "apple-darwin"
+    } else {
+        "unknown-linux-musl"
+    }
+}
+
+/// An account of real Codex in the real boundary, with a home folder in
+/// `root` that uses the local model and needs no sign-in.
+fn local_codex(root: &std::path::Path, model: &LocalModel) -> AccountConfig {
+    let home = root.join("profile/codex");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        home.join("config.toml"),
+        format!(
+            "cli_auth_credentials_store = \"file\"\ncheck_for_update_on_startup = false\nmodel_provider = \"local\"\n[model_providers.local]\nname = \"local\"\nbase_url = \"http://127.0.0.1:{}/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = false\n",
+            model.port
+        ),
+    )
+    .unwrap();
+    let native = codex_native();
+    let mut account = AccountConfig::default_for(HarnessKind::Codex);
+    account.binary = Some(native.to_string_lossy().into_owned());
+    account.home = Some(home.to_string_lossy().into_owned());
+    account.runtime.boundary = Some(consort_harness::boundary::BoundaryConfig {
+        kind: consort_harness::boundary::detect().unwrap(),
+        read_only: vec![native.parent().unwrap().parent().unwrap().to_path_buf()],
+        helper: std::env::current_exe().ok(),
+    });
+    account
+}
+
+/// Real `codex app-server` in the real boundary, with a local model and no
+/// account. The model calls `apply_patch` and a Consort tool. Only the Consort
+/// tool runs, and it asks for nothing.
+#[tokio::test]
+#[ignore = "needs codex; no model call"]
+async fn codex_in_the_boundary_runs_only_consort_tools() {
+    let root = tempfile::tempdir().unwrap();
+    let root_path = std::fs::canonicalize(root.path()).unwrap();
+    let (session, runtime) = (root_path.join("session"), root_path.join("runtime"));
+    for dir in [&session, &runtime] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    let model = LocalModel::start(0);
+    let account = local_codex(&root_path, &model);
+    let mut spec = spec(&session, ApprovalMode::Ask);
+    spec.runtime_dir = runtime.clone();
+    spec.model = "gpt-5.5".into();
+    spec.mcp_servers = vec![consort_harness::McpServerSpec {
+        name: "consort".into(),
+        url: format!("http://127.0.0.1:{}/mcp", model.port),
+        bearer_token: Some("token".into()),
+        bridge: None,
+    }];
+    let harness = adapter_for(HarnessKind::Codex).unwrap();
+    let started = std::time::Instant::now();
+    let (mut session_handle, mut events) = harness.open(&account, spec).await.unwrap();
+    let turn = session_handle
+        .turn(TurnInput {
+            text: "Go".into(),
+            attachments: vec![],
+        })
+        .await
+        .unwrap();
+    let mut text = String::new();
+    let mut asked = false;
+    let reason = tokio::time::timeout(Duration::from_secs(90), async {
+        while let Some(event) = events.recv().await {
+            println!(
+                "{:?} {}",
+                started.elapsed(),
+                serde_json::to_string(&event).unwrap()
+            );
+            match event {
+                SessionEvent::RequestOpened(_) => asked = true,
+                SessionEvent::Item(item) => {
+                    if let consort_proto::model::ItemPayload::AssistantMessage(m) = item.payload {
+                        text = m.text;
+                    }
+                }
+                SessionEvent::TurnEnded {
+                    turn_id, reason, ..
+                } if turn_id == turn => return reason,
+                _ => {}
+            }
+        }
+        panic!("events ended before the turn ended");
+    })
+    .await
+    .unwrap();
+    assert_eq!(reason, TurnEndReason::Completed);
+    assert_eq!(text, "done");
+    assert!(!asked, "Codex asks for nothing");
+    let called = model.tools_called.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(called, 1, "the Consort tool ran");
+    assert!(
+        !session.join("outside.txt").exists(),
+        "apply_patch wrote a file"
+    );
+    for request in model.requests.lock().unwrap().iter() {
+        let names: Vec<String> = request["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| {
+                t["name"]
+                    .as_str()
+                    .unwrap_or(t["type"].as_str().unwrap())
+                    .to_owned()
+            })
+            .collect();
+        println!("tools: {names:?}");
+        for off in [
+            "exec_command",
+            "write_stdin",
+            "shell",
+            "view_image",
+            "web_search",
+        ] {
+            assert!(!names.iter().any(|n| n == off), "{off} in {names:?}");
+        }
+    }
+    session_handle.close().await.ok();
+}
+
+/// The boundary gives real Codex no port that it does not list. One question
+/// to the local model, which is not an MCP endpoint here, ends in an error.
+#[tokio::test]
+#[ignore = "needs codex; no model call"]
+async fn codex_in_the_boundary_cannot_reach_a_port_that_is_not_listed() {
+    let root = tempfile::tempdir().unwrap();
+    let root_path = std::fs::canonicalize(root.path()).unwrap();
+    let folder = root_path.join("check");
+    std::fs::create_dir_all(&folder).unwrap();
+    let model = LocalModel::start(3);
+    let account = local_codex(&root_path, &model);
+    let harness = adapter_for(HarnessKind::Codex).unwrap();
+    // Codex keeps trying, so a limit ends the wait. The caller of a check has
+    // its own limit too.
+    let answer = tokio::time::timeout(
+        Duration::from_secs(30),
+        harness.one_shot(
+            &account,
+            &folder,
+            consort_harness::OneShot {
+                model: "gpt-5.5".into(),
+                system: "Answer in one word.".into(),
+                prompt: "Go".into(),
+            },
+        ),
+    )
+    .await;
+    println!("{answer:?}");
+    assert!(!matches!(answer, Ok(Ok(_))));
+    assert!(model.requests.lock().unwrap().is_empty());
 }

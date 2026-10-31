@@ -12,15 +12,15 @@ use consort_proto::error::{ErrorBody, ErrorCode};
 use consort_proto::frame::MessageFamily;
 use consort_proto::ids::{DecisionId, SessionId};
 use consort_proto::model::{DecisionAnswer, ItemStatus, SessionState};
+use consort_proto::session_host_link::{HubToSessionHost, TurnEndReason};
 use consort_proto::status::TaskStatus;
-use consort_proto::worker_link::{HubToWorker, TurnEndReason};
 
 /// Answers commands until a `session.turn` for `session` comes, and
 /// refuses it.
 async fn refuse_next_turn(worker: &mut FakeWorker, session: SessionId, why: &str) {
     loop {
         let (request, command) = worker.next_command().await;
-        if let HubToWorker::SessionTurn(turn) = &command
+        if let HubToSessionHost::SessionTurn(turn) = &command
             && turn.session_id == session
         {
             worker
@@ -88,7 +88,7 @@ async fn a_refused_turn_from_ready_for_review_goes_back_to_ready_for_review() {
     write_in_thread(&mut world, card, "Please try again.").await;
     loop {
         let (request, command) = world.worker.next_command().await;
-        if let HubToWorker::SessionTurn(turn) = &command
+        if let HubToSessionHost::SessionTurn(turn) = &command
             && turn.session_id == s
         {
             assert!(turn.turn.text.contains("Please try again."));
@@ -168,8 +168,9 @@ async fn a_refused_coordinator_turn_runs_when_the_session_ends_its_turn() {
     world.say(world.tutti, "First question").await;
     refuse_next_turn(&mut world.worker, c, "a turn is already running").await;
     world
-        .wait_notice(None, &["did not take your message", "tries again"])
+        .wait_blocked(&["did not take your message", "tries again"])
         .await;
+    assert!(world.notices(None).await.is_empty());
     // The turn that kept the harness busy ends. The hub sends the waiting
     // message at once.
     world
@@ -177,7 +178,7 @@ async fn a_refused_coordinator_turn_runs_when_the_session_ends_its_turn() {
         .send_events(c, vec![turn_ended("t-busy", TurnEndReason::Completed)])
         .await;
     let (request, command) = world.worker.next_command().await;
-    let HubToWorker::SessionTurn(turn) = command else {
+    let HubToSessionHost::SessionTurn(turn) = command else {
         panic!("expected session.turn, got {}", command.type_name());
     };
     assert_eq!(turn.session_id, c);

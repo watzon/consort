@@ -69,7 +69,7 @@ pub enum PairedWith {
 pub fn paired_with(toml: &WorkerToml, key_exists: bool, hub_url: &str) -> PairedWith {
     match (&toml.hub_url, &toml.worker_id) {
         (Some(url), Some(_)) if key_exists => {
-            if consort_worker::http::base_url(url) == consort_worker::http::base_url(hub_url) {
+            if consort_link::http::base_url(url) == consort_link::http::base_url(hub_url) {
                 PairedWith::ThisHub
             } else {
                 PairedWith::OtherHub(url.clone())
@@ -141,7 +141,7 @@ pub async fn install(
         print!("{}", service::describe(&plan, "install"));
         return Ok(());
     }
-    if let Some(warning) = consort_worker::http::cleartext_warning(&args.hub) {
+    if let Some(warning) = consort_link::http::cleartext_warning(&args.hub) {
         eprintln!("Warning: {warning}");
     }
     match state {

@@ -26,11 +26,11 @@ use tokio::time::Instant;
 
 use consort_proto::ids::TaskId;
 use consort_proto::model::Isolation;
-use consort_proto::worker_link::{WorkspaceRepo, WorkspaceSpec};
+use consort_proto::session_host_link::{WorkspaceRepo, WorkspaceSpec};
 
 use crate::WorkerError;
 use crate::config::{PolicyConfig, create_private_dir};
-use crate::store::{WorkspaceEntry, WorkspaceRecord};
+use crate::journal::{WorkspaceEntry, WorkspaceRecord};
 
 /// How long a clone may take.
 const CLONE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
@@ -248,7 +248,7 @@ pub fn check_allowed(path: &Path, policy: &PolicyConfig) -> Result<(), WorkerErr
     let real = std::fs::canonicalize(path)
         .map_err(|e| WorkerError::Workspace(format!("{} cannot be used: {e}", path.display())))?;
     for root in &policy.allowed_roots {
-        let root = consort_harness::account::expand_home(root);
+        let root = crate::config::expand_home(root);
         if let Ok(root) = std::fs::canonicalize(&root)
             && real.starts_with(&root)
         {
@@ -256,9 +256,27 @@ pub fn check_allowed(path: &Path, policy: &PolicyConfig) -> Result<(), WorkerErr
         }
     }
     Err(WorkerError::Policy(format!(
-        "{} is outside the allowed roots of this worker (policy.allowed_roots)",
+        "{} is outside the allowed folders of this worker. Add the folder in Settings > Workers, or use another folder.",
         path.display()
     )))
+}
+
+/// Checks the folders of a workspace that exists against the limits now. A
+/// change of the limits applies to a session that runs.
+pub fn check_record_allowed(
+    record: &WorkspaceRecord,
+    policy: &PolicyConfig,
+) -> Result<(), WorkerError> {
+    for entry in &record.entries {
+        match entry {
+            WorkspaceEntry::InPlace { path } => check_allowed(Path::new(path), policy)?,
+            WorkspaceEntry::Worktree { checkout, .. } => {
+                check_allowed(Path::new(checkout), policy)?;
+            }
+            WorkspaceEntry::Clone { .. } | WorkspaceEntry::Empty { .. } => {}
+        }
+    }
+    Ok(())
 }
 
 /// Refuses a value from the hub that `git` could read as an option.
@@ -1263,5 +1281,31 @@ mod tests {
         );
         assert_eq!(repo_folder_name(&r("https://github.com/a/b/")), "b");
         assert!(repo_folder_name(&r("..")).starts_with("rep_"));
+    }
+
+    #[tokio::test]
+    async fn a_git_workspace_does_not_see_the_worker_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir.path())
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .status()
+                .unwrap();
+            assert!(status.success());
+        };
+        run(&["init", "-q"]);
+        std::fs::create_dir_all(dir.path().join(".channel")).unwrap();
+        std::fs::write(dir.path().join(".channel/a.txt"), "a").unwrap();
+        exclude_worker_folders(dir.path()).await;
+        let output = std::process::Command::new("git")
+            .args(["status", "--porcelain", "--untracked-files=all"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "");
     }
 }

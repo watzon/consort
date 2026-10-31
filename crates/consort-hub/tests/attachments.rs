@@ -20,10 +20,12 @@ use consort_proto::ids::{MessageId, SessionId, TaskId};
 use consort_proto::model::{
     Author, BlobRef, ChannelFile, ItemStatus, Message, SessionState, Sha256Hash,
 };
+use consort_proto::session_host_link::{
+    HubToSessionHost, SessionEvent, SessionStart, TurnEndReason,
+};
 use consort_proto::status::TaskStatus;
 use consort_proto::time::Timestamp;
 use consort_proto::tools::ToolCallResult;
-use consort_proto::worker_link::{HubToWorker, SessionEvent, SessionStart, TurnEndReason};
 use ed25519_dalek::Signer;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -147,16 +149,16 @@ async fn end_turn(world: &mut World, session_id: SessionId) {
 }
 
 /// The next command, which must be `session.turn`.
-async fn next_turn(world: &mut World) -> consort_proto::worker_link::SessionTurn {
+async fn next_turn(world: &mut World) -> consort_proto::session_host_link::SessionTurn {
     let (request, command) = world.worker.next_command().await;
-    let HubToWorker::SessionTurn(turn) = command else {
+    let HubToSessionHost::SessionTurn(turn) = command else {
         panic!("expected session.turn, got {}", command.type_name());
     };
     world
         .worker
         .respond_ok(
             &request,
-            &consort_proto::worker_link::SessionTurnResult {
+            &consort_proto::session_host_link::SessionTurnResult {
                 turn_id: "t2".into(),
             },
         )
@@ -384,18 +386,18 @@ async fn start_task_attaches_channel_files_to_each_session_and_hides_its_own_art
     while second_start.is_none() {
         let (request, command) = world.worker.next_command().await;
         match command {
-            HubToWorker::SessionStop(_) => {
+            HubToSessionHost::SessionStop(_) => {
                 world
                     .worker
                     .respond_ok(&request, &serde_json::json!({}))
                     .await;
             }
-            HubToWorker::SessionStart(s) => {
+            HubToSessionHost::SessionStart(s) => {
                 world
                     .worker
                     .respond_ok(
                         &request,
-                        &consort_proto::worker_link::SessionStartResult {
+                        &consort_proto::session_host_link::SessionStartResult {
                             workspace_path: "/tmp/workspace-2".to_owned(),
                             native_ref: None,
                         },
@@ -442,7 +444,7 @@ async fn message_task_delivers_its_attachments_by_steer_and_by_turn_and_posts_th
         .await;
     assert_eq!(result["delivery"], "steer");
     let (request, command) = world.worker.next_command().await;
-    let HubToWorker::SessionSteer(steer) = command else {
+    let HubToSessionHost::SessionSteer(steer) = command else {
         panic!("expected session.steer, got {}", command.type_name());
     };
     world

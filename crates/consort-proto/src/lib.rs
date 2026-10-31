@@ -24,8 +24,10 @@
 //! - [`auth`] has the pairing bodies, pairing codes, `auth.challenge`,
 //!   `auth.response`, `hello` for both links, `auth.http_token`, the hub
 //!   origin and the exact bytes to sign.
-//! - [`worker_link`] has [`worker_link::WorkerToHub`],
-//!   [`worker_link::HubToWorker`] and [`worker_link::SessionEvent`].
+//! - [`session_host_link`] has [`session_host_link::SessionHostToHub`],
+//!   [`session_host_link::HubToSessionHost`] and [`session_host_link::SessionEvent`].
+//! - [`execution_link`] has [`execution_link::ExecutionToHub`],
+//!   [`execution_link::HubToExecution`] and the tools that run on a worker.
 //! - [`client_api`] has [`client_api::ClientRequest`],
 //!   [`client_api::HubToClient`], [`client_api::FeedEntry`] and
 //!   [`client_api::Snapshot`].
@@ -45,15 +47,17 @@
 // Tests may unwrap (AGENTS.md: "No unwrap or expect outside tests").
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod attachment_names;
 pub mod auth;
 pub mod client_api;
 pub mod error;
+pub mod execution_link;
 pub mod frame;
 mod hex;
 pub mod ids;
 pub mod model;
+pub mod session_host_link;
 pub mod status;
 pub mod time;
 pub mod tools;
 pub mod turn_input;
-pub mod worker_link;

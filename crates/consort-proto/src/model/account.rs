@@ -15,8 +15,8 @@ use crate::time::Timestamp;
 
 /// The step that a worker adds to the reason of a signed-out account that
 /// Consort made. A message outside Settings keeps it. The account row in
-/// Settings > Workers shows the reason without it (the user is there).
-pub const SIGN_IN_IN_SETTINGS: &str = "Sign in to this account in Settings > Workers.";
+/// Settings > Providers shows the reason without it (the user is there).
+pub const SIGN_IN_IN_SETTINGS: &str = "Sign in to this account in Settings > Providers.";
 
 /// A sign-in expires after this many milliseconds without an update (15
 /// minutes).

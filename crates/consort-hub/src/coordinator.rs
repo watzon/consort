@@ -13,14 +13,16 @@ use std::time::{Duration, Instant};
 
 use consort_proto::ids::{ChannelId, SessionId};
 use consort_proto::model::{
-    BlobRef, Channel, Isolation, PlacementRequest, Session, SessionRole, SessionState, Usage,
+    BlobRef, Channel, CoordinatorBlocked, CoordinatorBlockedKind, Isolation, PlacementRequest,
+    Session, SessionRole, SessionState, Usage,
+};
+use consort_proto::session_host_link::{
+    HubToSessionHost, SessionStart, SessionTurn, TurnInput, WorkspaceSpec,
 };
 use consort_proto::turn_input::{WakeEvent, render_events};
-use consort_proto::worker_link::{
-    HubToWorker, SessionStart, SessionTurn, TurnInput, WorkspaceSpec,
-};
 
 use crate::error::Result;
+use crate::fallback;
 use crate::hub::Hub;
 use crate::limits::{TURN_TEXT_MAX_BYTES, TURN_TEXT_MIN_BYTES, json_len, turn_room};
 use crate::link::events::{Effects, queue_stop};
@@ -48,6 +50,20 @@ pub(crate) fn start_backoff(failures: u32) -> Duration {
         .min(START_BACKOFF_MAX)
 }
 
+/// How long placement must fail for a channel before the hub says that the
+/// assistant cannot answer. After a start of the hub, the session host and
+/// the workers need a short time to connect, and a line that shows for that
+/// time is noise.
+pub(crate) const BLOCKED_GRACE: Duration = Duration::from_secs(30);
+
+/// The first failed placement of a channel in a row.
+#[derive(Debug, Clone, Copy)]
+struct CannotStart {
+    since: Instant,
+    /// A run is scheduled for the end of the grace period.
+    run_scheduled: bool,
+}
+
 /// The failed starts of one channel's coordinator.
 #[derive(Debug, Clone, Copy)]
 struct StartFailures {
@@ -57,20 +73,43 @@ struct StartFailures {
     retry_scheduled: bool,
 }
 
-#[derive(Default)]
 pub struct Coordinators {
     /// Unit tests of other modules turn the coordinator off, so a queued wake
     /// event stays queued and no notice appears.
     disabled: std::sync::atomic::AtomicBool,
     locks: Mutex<HashMap<ChannelId, Arc<tokio::sync::Mutex<()>>>>,
-    /// The last notice per channel, so the hub does not post the same one twice.
-    notices: Mutex<HashMap<ChannelId, String>>,
+    /// The channels whose placement fails now, with the time of the first
+    /// failure. The hub says nothing until the grace period has passed.
+    cannot_start: Mutex<HashMap<ChannelId, CannotStart>>,
+    /// The grace period in milliseconds. Tests change it.
+    grace_ms: std::sync::atomic::AtomicU64,
     /// Failed starts per channel, for the backoff. They live in memory, so
     /// a hub restart tries again at once.
     start_failures: Mutex<HashMap<ChannelId, StartFailures>>,
 }
 
+impl Default for Coordinators {
+    fn default() -> Self {
+        Self {
+            disabled: Default::default(),
+            locks: Default::default(),
+            cannot_start: Default::default(),
+            grace_ms: std::sync::atomic::AtomicU64::new(
+                u64::try_from(BLOCKED_GRACE.as_millis()).unwrap_or(u64::MAX),
+            ),
+            start_failures: Default::default(),
+        }
+    }
+}
+
 impl Coordinators {
+    pub(crate) fn set_grace(&self, grace: Duration) {
+        self.grace_ms.store(
+            u64::try_from(grace.as_millis()).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
     /// Starts a background run for a channel. It returns at once.
     pub(crate) fn kick(&self, hub: &Hub, channel_id: ChannelId) {
         if self.disabled.load(std::sync::atomic::Ordering::Relaxed) {
@@ -97,21 +136,41 @@ impl Coordinators {
         locks.entry(channel_id).or_default().clone()
     }
 
-    /// True when `text` differs from the last notice for the channel.
-    fn is_new_notice(&self, channel_id: ChannelId, text: &str) -> bool {
-        let Ok(mut notices) = self.notices.lock() else {
-            return false;
+    /// Notes that placement fails for a channel now. Returns `None` when the
+    /// failure has lasted for the grace period, so the hub says it. Before
+    /// that, it returns how long to wait. The second value is true when the
+    /// caller must schedule a run for the end of the wait.
+    fn grace_left(&self, channel_id: ChannelId, now: Instant) -> Option<(Duration, bool)> {
+        let Ok(mut map) = self.cannot_start.lock() else {
+            return None;
         };
-        if notices.get(&channel_id).is_some_and(|last| last == text) {
-            return false;
+        let entry = map.entry(channel_id).or_insert(CannotStart {
+            since: now,
+            run_scheduled: false,
+        });
+        let grace = Duration::from_millis(self.grace_ms.load(std::sync::atomic::Ordering::Relaxed));
+        let until = entry.since + grace;
+        if now >= until {
+            return None;
         }
-        notices.insert(channel_id, text.to_owned());
-        true
+        let schedule = !entry.run_scheduled;
+        entry.run_scheduled = true;
+        Some((until - now, schedule))
     }
 
-    fn clear_notice(&self, channel_id: ChannelId) {
-        if let Ok(mut notices) = self.notices.lock() {
-            notices.remove(&channel_id);
+    fn grace_run_ran(&self, channel_id: ChannelId) {
+        if let Ok(mut map) = self.cannot_start.lock()
+            && let Some(entry) = map.get_mut(&channel_id)
+        {
+            entry.run_scheduled = false;
+        }
+    }
+
+    /// Placement works again for the channel, so the grace starts again at
+    /// the next failure.
+    fn clear_cannot_start(&self, channel_id: ChannelId) {
+        if let Ok(mut map) = self.cannot_start.lock() {
+            map.remove(&channel_id);
         }
     }
 
@@ -262,7 +321,8 @@ fn main_text(event: &mut WakeEvent) -> Option<&mut String> {
         WakeEvent::UserMessage { text, .. }
         | WakeEvent::TaskUpdate { text, .. }
         | WakeEvent::TuttiMessage { text, .. }
-        | WakeEvent::CardAnswered { text, .. } => Some(text),
+        | WakeEvent::CardAnswered { text, .. }
+        | WakeEvent::MonidResult { text, .. } => Some(text),
         WakeEvent::Routine { prompt, .. } | WakeEvent::Brief { prompt, .. } => Some(prompt),
         WakeEvent::MemorySuggestion { note, .. } => Some(note),
         WakeEvent::DecisionAnswered { text, .. } => text.as_mut(),
@@ -318,13 +378,24 @@ fn cut_event(event: &WakeEvent, room: usize) -> WakeEvent {
     cut
 }
 
-/// A hash of what the system prompt of a coordinator says about its channel.
-/// When it changes, the hub replaces the session, so the new purpose,
-/// instructions or model reach the coordinator.
+/// A hash of what the system prompt of a coordinator says. When it changes,
+/// the hub replaces the session, so the new purpose, instructions or model
+/// reach the coordinator. It holds the base prompt too: a session keeps the
+/// prompt that it started with, also through a restart of the hub, so a new
+/// build would otherwise run with the rules of the old one.
 fn prompt_fingerprint(channel: &Channel, tutti: &Channel, extensions_key: &str) -> String {
+    fingerprint_with_base(prompts::COORDINATOR_BASE, channel, tutti, extensions_key)
+}
+
+fn fingerprint_with_base(
+    base: &str,
+    channel: &Channel,
+    tutti: &Channel,
+    extensions_key: &str,
+) -> String {
     let selection = channel.effective_coordinator_selection(tutti);
     let text = format!(
-        "{}\n{}\n{}\n{}\n{extensions_key}\n{}",
+        "{base}\n{}\n{}\n{}\n{}\n{extensions_key}\n{}",
         channel.name,
         channel.purpose,
         channel.instructions,
@@ -371,7 +442,8 @@ struct Inputs {
     session: Option<Session>,
     workers: Vec<consort_proto::model::Worker>,
     open: HashMap<consort_proto::ids::WorkerId, u32>,
-    limited: std::collections::HashSet<consort_proto::ids::AccountId>,
+    holds: Vec<crate::store::machine::AccountHold>,
+    path: consort_proto::model::FallbackPath,
     global_index: String,
     channel_index: String,
     context: String,
@@ -380,6 +452,39 @@ struct Inputs {
     /// The voice part of the prompt, when the session can draft or send in
     /// the user's voice.
     voice: Option<String>,
+}
+
+/// Ends the open coordinator session of a channel inside a transaction, so
+/// the next turn starts a new one. A session with an open turn stays: the turn
+/// is not cut. Returns true when the session ended.
+pub(crate) fn retire_session_tx(
+    hub: &Hub,
+    tx: &mut crate::store::Tx<'_>,
+    channel_id: ChannelId,
+    session_id: Option<SessionId>,
+    reason: &str,
+    fx: &mut Effects,
+) -> Result<bool> {
+    let mut row = coord_store::coordinator(tx.db(), channel_id)?;
+    let Some(session_id) = session_id.or(row.session_id) else {
+        return Ok(false);
+    };
+    let Some(mut session) = work::session(tx.db(), session_id)? else {
+        return Ok(false);
+    };
+    if row.turn_open || row.session_id != Some(session_id) {
+        return Ok(false);
+    }
+    row.session_id = None;
+    tx.save_coordinator(&row)?;
+    if !session.state.is_final() {
+        session.state = SessionState::Ended;
+        session.ended_at = Some(tx.now());
+        session.end_reason = Some(reason.to_owned());
+        tx.save_session(&session)?;
+        queue_stop(hub, tx, fx, &session, reason)?;
+    }
+    Ok(true)
 }
 
 impl Hub {
@@ -475,6 +580,7 @@ impl Hub {
                     }
                     let attachments = event_attachments(tx.db(), &events)?;
                     let channel_files = tx.channel_files_for_turn(session.id, channel_id, None)?;
+                    tx.set_coordinator_blocked(channel_id, None)?;
                     tx.delete_wakes(&event_ids)?;
                     tx.save_coordinator(&CoordinatorRow {
                         channel_id,
@@ -494,7 +600,7 @@ impl Hub {
                     )?;
                     tx.queue_command(
                         session.worker_id,
-                        &HubToWorker::SessionTurn(SessionTurn {
+                        &HubToSessionHost::SessionTurn(SessionTurn {
                             session_id: session.id,
                             turn: TurnInput {
                                 text: rendered,
@@ -520,17 +626,29 @@ impl Hub {
         if self.retry_coordinator_later(channel_id) {
             return Ok(());
         }
-        let selection = inputs
+        let first = inputs
             .channel
             .effective_coordinator_selection(&inputs.tutti)
             .cloned();
+        // A first choice that is held (a limit or an outage) gives way to
+        // the fallback path before placement runs.
+        let holds = fallback::holds_by_label(&inputs.workers, &inputs.holds);
+        let walk = fallback::Walk {
+            path: &inputs.path,
+            workers: &inputs.workers,
+            holds: &holds,
+            mode: COORDINATOR_APPROVAL_MODE,
+        };
+        let start = fallback::choose_start(&walk, first.as_ref());
+        let default_first = first.clone().or_else(|| {
+            crate::placement::default_selection(&inputs.workers, COORDINATOR_APPROVAL_MODE)
+        });
         let request = PlacementRequest::default();
         let placement = place(&PlacementInput {
             subject: Subject::Coordinator,
             workers: &inputs.workers,
             open_sessions: &inputs.open,
-            limited: &inputs.limited,
-            selection: selection.as_ref(),
+            selection: start.selection.as_ref(),
             request: &request,
             approval_mode: COORDINATOR_APPROVAL_MODE,
             preferred_workers: &inputs.channel.preferred_workers,
@@ -541,12 +659,10 @@ impl Hub {
         let placement = match placement {
             Ok(placement) => placement,
             Err(err) => {
-                return self
-                    .coordinator_cannot_start(&inputs.channel, &err.reason())
-                    .await;
+                return self.coordinator_cannot_start(&inputs, &err.reason()).await;
             }
         };
-        self.coordinators.clear_notice(channel_id);
+        self.coordinators.clear_cannot_start(channel_id);
 
         let mut system_prompt = prompts::coordinator_system_prompt(
             &inputs.channel,
@@ -564,6 +680,7 @@ impl Hub {
         let turn_approval_mode = turn_approval_mode(&events);
         let first_turn = format!("{}\n\n{rendered}", inputs.context);
         let worker_id = placement.worker_id;
+        let fallback_workers = inputs.workers.clone();
         let started = self
             .store
             .write(move |tx| {
@@ -571,12 +688,20 @@ impl Hub {
                 if row.turn_open {
                     return Ok(false);
                 }
+                crate::fallback_flow::note_start(
+                    tx,
+                    channel_id,
+                    &fallback_workers,
+                    default_first.as_ref(),
+                    start.moved.as_ref(),
+                )?;
                 let session = Session {
                     id: SessionId::new(),
                     role: SessionRole::Coordinator,
                     channel_id,
                     task_id: None,
                     worker_id,
+                    execution_worker_id: None,
                     account_id: placement.account_id,
                     harness: placement.harness.clone(),
                     model: placement.model.clone(),
@@ -602,6 +727,7 @@ impl Hub {
                         ..SessionRuntime::default()
                     },
                 )?;
+                tx.set_coordinator_blocked(channel_id, None)?;
                 tx.delete_wakes(&event_ids)?;
                 tx.save_coordinator(&CoordinatorRow {
                     channel_id,
@@ -612,7 +738,7 @@ impl Hub {
                 })?;
                 tx.queue_command(
                     worker_id,
-                    &HubToWorker::SessionStart(SessionStart {
+                    &HubToSessionHost::SessionStart(SessionStart {
                         session_id: session.id,
                         role: SessionRole::Coordinator,
                         channel_id,
@@ -636,6 +762,7 @@ impl Hub {
                             attachments,
                         }),
                         turn_approval_mode,
+                        execution: None,
                     }),
                 )?;
                 Ok(true)
@@ -702,25 +829,7 @@ impl Hub {
             .store
             .write(move |tx| {
                 let mut fx = Effects::default();
-                let mut row = coord_store::coordinator(tx.db(), channel_id)?;
-                let Some(session_id) = session_id.or(row.session_id) else {
-                    return Ok(fx);
-                };
-                let Some(mut session) = work::session(tx.db(), session_id)? else {
-                    return Ok(fx);
-                };
-                if row.turn_open || row.session_id != Some(session_id) {
-                    return Ok(fx);
-                }
-                row.session_id = None;
-                tx.save_coordinator(&row)?;
-                if !session.state.is_final() {
-                    session.state = SessionState::Ended;
-                    session.ended_at = Some(tx.now());
-                    session.end_reason = Some(reason.to_owned());
-                    tx.save_session(&session)?;
-                    queue_stop(&hub, tx, &mut fx, &session, reason)?;
-                }
+                retire_session_tx(&hub, tx, channel_id, session_id, reason, &mut fx)?;
                 Ok(fx)
             })
             .await?;
@@ -792,10 +901,11 @@ impl Hub {
                 };
                 let extensions_key =
                     crate::connectors::extensions::effective_set_key(conn, channel_id)?;
-                let limited = crate::store::machine::limited_accounts(
+                let holds = crate::store::machine::account_holds(
                     conn,
                     consort_proto::time::Timestamp::now(),
                 )?;
+                let path = crate::store::preferences::preferences(conn)?.fallback_path;
                 Ok(Some(Inputs {
                     channel,
                     tutti,
@@ -803,7 +913,8 @@ impl Hub {
                     session,
                     workers,
                     open,
-                    limited,
+                    holds,
+                    path,
                     global_index: String::new(),
                     channel_index: String::new(),
                     context,
@@ -824,19 +935,48 @@ impl Hub {
         Ok(Some(partial))
     }
 
-    /// The coordinator cannot start now. The events stay queued. The hub says
-    /// why in the channel, once for each reason.
-    async fn coordinator_cannot_start(&self, channel: &Channel, reason: &str) -> Result<()> {
-        let text = format!("The assistant cannot answer yet. {reason}");
-        if !self.coordinators.is_new_notice(channel.id, &text) {
+    /// The coordinator cannot start now. The events stay queued. When a
+    /// message of the user waits and placement has failed for the grace
+    /// period, the hub sets the live state on the channel, once for each
+    /// reason. It posts no message: the app shows a status line above the
+    /// composer, and the line goes away when the assistant can answer.
+    async fn coordinator_cannot_start(&self, inputs: &Inputs, reason: &str) -> Result<()> {
+        let channel_id = inputs.channel.id;
+        // Only a message of the user is worth a line. Other events wait.
+        if !inputs
+            .events
+            .iter()
+            .any(|(_, e)| matches!(e, WakeEvent::UserMessage { .. }))
+        {
             return Ok(());
         }
-        let channel_id = channel.id;
+        // "Signed out" says more than a failed placement of that account.
+        if inputs
+            .channel
+            .coordinator_blocked
+            .as_ref()
+            .is_some_and(|b| b.kind == CoordinatorBlockedKind::SignedOut)
+        {
+            return Ok(());
+        }
+        if let Some((wait, schedule)) = self.coordinators.grace_left(channel_id, Instant::now()) {
+            if schedule {
+                let hub = self.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(wait).await;
+                    hub.coordinators.grace_run_ran(channel_id);
+                    hub.kick_coordinator(channel_id);
+                });
+            }
+            return Ok(());
+        }
+        let blocked = CoordinatorBlocked {
+            kind: CoordinatorBlockedKind::NoPlacement,
+            reason: reason.to_owned(),
+            account: None,
+        };
         self.store
-            .write(move |tx| {
-                tx.post_notice(channel_id, None, None, "assistant_unavailable", &text)
-                    .map(|_| ())
-            })
+            .write(move |tx| tx.set_coordinator_blocked(channel_id, Some(blocked)))
             .await
     }
 
@@ -941,6 +1081,70 @@ mod tests {
         let mut same = inherits.clone();
         same.coordinator_selection = Some(sel("new"));
         assert!(moved_selections(&inherits, &same, &after, &all).is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_live_state_of_a_channel_is_one_feed_entry_for_one_cause() {
+        async fn head(hub: &Hub) -> u64 {
+            hub.store.read(crate::store::feed::head_seq).await.unwrap()
+        }
+        async fn set(hub: &Hub, id: ChannelId, reason: Option<&str>) {
+            let value = reason.map(|reason| CoordinatorBlocked {
+                kind: CoordinatorBlockedKind::NoPlacement,
+                reason: reason.to_owned(),
+                account: None,
+            });
+            hub.store
+                .write(move |tx| tx.set_coordinator_blocked(id, value))
+                .await
+                .unwrap();
+        }
+        async fn blocked(hub: &Hub) -> Option<Box<CoordinatorBlocked>> {
+            let channel = hub.store.read(conversation::tutti_channel).await.unwrap();
+            channel.coordinator_blocked
+        }
+        let (hub, _dir) = crate::hub::test_hub().await;
+        let tutti = hub
+            .store
+            .read(conversation::tutti_channel)
+            .await
+            .unwrap()
+            .id;
+        let waiting = "Waiting for a worker to come online.";
+        set(&hub, tutti, Some(waiting)).await;
+        let after_first = head(&hub).await;
+        // The same cause again writes nothing, however often the hub tries.
+        for _ in 0..3 {
+            set(&hub, tutti, Some(waiting)).await;
+        }
+        assert_eq!(head(&hub).await, after_first);
+        // The channel holds it, and no message does.
+        assert!(blocked(&hub).await.is_some());
+        let messages = hub
+            .store
+            .read(move |conn| conversation::messages_page(conn, tutti, None, None, 50, usize::MAX))
+            .await
+            .unwrap()
+            .0;
+        assert!(
+            messages
+                .iter()
+                .all(|m| m.kind != consort_proto::model::MessageKind::Notice)
+        );
+        // A new cause is a new entry. Clearing is one more, and clearing
+        // twice writes once.
+        set(
+            &hub,
+            tutti,
+            Some("No online worker has the account Claude Work."),
+        )
+        .await;
+        assert!(head(&hub).await > after_first);
+        set(&hub, tutti, None).await;
+        let cleared = head(&hub).await;
+        set(&hub, tutti, None).await;
+        assert_eq!(head(&hub).await, cleared);
+        assert!(blocked(&hub).await.is_none());
     }
 
     #[test]
@@ -1120,6 +1324,7 @@ mod tests {
     async fn session_with_old_turn(hub: &Hub) -> Session {
         let tutti = hub.store.read(conversation::tutti_channel).await.unwrap();
         let session = Session {
+            execution_worker_id: None,
             id: SessionId::new(),
             role: SessionRole::Coordinator,
             channel_id: tutti.id,
@@ -1211,6 +1416,7 @@ mod tests {
         let (hub, _dir) = crate::hub::test_hub().await;
         let tutti = hub.store.read(conversation::tutti_channel).await.unwrap();
         let session = Session {
+            execution_worker_id: None,
             id: SessionId::new(),
             role: SessionRole::Coordinator,
             channel_id: tutti.id,
@@ -1261,5 +1467,26 @@ mod tests {
             .unwrap()
             .state;
         assert_eq!(state, SessionState::Lost);
+    }
+
+    /// A session keeps its prompt through a restart of the hub. So a new
+    /// base prompt must replace it, or a new build runs with the old rules.
+    #[tokio::test]
+    async fn a_changed_base_prompt_changes_the_fingerprint() {
+        let (hub, _dir) = crate::hub::test_hub().await;
+        let tutti = hub.store.read(conversation::tutti_channel).await.unwrap();
+        let old = fingerprint_with_base("old rules", &tutti, &tutti, "key");
+        assert_eq!(
+            old,
+            fingerprint_with_base("old rules", &tutti, &tutti, "key")
+        );
+        assert_ne!(
+            old,
+            fingerprint_with_base("new rules", &tutti, &tutti, "key")
+        );
+        assert_eq!(
+            prompt_fingerprint(&tutti, &tutti, "key"),
+            fingerprint_with_base(prompts::COORDINATOR_BASE, &tutti, &tutti, "key")
+        );
     }
 }

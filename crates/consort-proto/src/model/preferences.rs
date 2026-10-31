@@ -3,6 +3,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::fallback::FallbackPath;
+
 /// The feed `entity_id` of the one preferences record.
 pub const PREFERENCES_ENTITY_ID: &str = "preferences";
 
@@ -25,23 +27,80 @@ pub struct FavoriteModel {
 }
 
 /// The user's preferences. Every client reads the same record.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Preferences {
     /// The favorite models, in the order that the user starred them.
     pub favorite_models: Vec<FavoriteModel>,
-    /// When an account reaches a usage limit, work moves to another signed-in
-    /// account of the same harness that has the same model.
-    pub account_fallback: bool,
+    /// The fallback path: where work goes when the model of a channel
+    /// cannot answer.
+    pub fallback_path: FallbackPath,
+    /// The source of the command check.
+    pub command_check: CommandCheckSetting,
+    /// The API endpoints that the user added. Their keys stay on the hub.
+    pub endpoints: Vec<ApiEndpoint>,
 }
 
-impl Default for Preferences {
-    fn default() -> Self {
-        Self {
-            favorite_models: Vec::new(),
-            account_fallback: true,
-        }
-    }
+/// An API endpoint. The key stays on the hub. Clients see its last four
+/// characters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApiEndpoint {
+    /// The ID.
+    pub id: String,
+    /// The name that the user gave.
+    pub name: String,
+    /// The base URL.
+    pub base_url: String,
+    /// The last four characters of the key.
+    pub key_last_four: String,
+}
+
+/// The kind of source of the command check.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandCheckKind {
+    /// A model of an account.
+    #[default]
+    Account,
+    /// A decision model: a `state` and named `questions`.
+    Decision,
+    /// A chat model on an OpenAI-compatible endpoint.
+    Chat,
+}
+
+/// The default confidence limit of a decision model, in percent.
+pub const DEFAULT_CONFIDENCE_LIMIT: u8 = 80;
+
+fn default_confidence_limit() -> u8 {
+    DEFAULT_CONFIDENCE_LIMIT
+}
+
+/// The source of the command check. It keeps the choice of each kind, so a
+/// change of kind loses nothing.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CommandCheckSetting {
+    /// The kind that runs.
+    pub kind: CommandCheckKind,
+    /// The model of an account. `None` means that Consort chooses the
+    /// smallest model.
+    pub account_model: Option<FavoriteModel>,
+    /// The decision model.
+    pub decision: Option<CommandCheckEndpoint>,
+    /// The chat model.
+    pub chat: Option<CommandCheckEndpoint>,
+}
+
+/// A model on an API endpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandCheckEndpoint {
+    /// The endpoint.
+    pub endpoint_id: String,
+    /// The model name.
+    pub model: String,
+    /// The confidence limit, in percent. Only a decision model uses it.
+    #[serde(default = "default_confidence_limit")]
+    pub confidence_limit: u8,
 }
 
 impl Preferences {
@@ -91,5 +150,13 @@ mod tests {
     fn an_old_record_reads_as_empty() {
         let p: Preferences = serde_json::from_value(serde_json::json!({})).unwrap();
         assert!(p.favorite_models.is_empty());
+        assert_eq!(p.fallback_path, FallbackPath::default());
+    }
+
+    #[test]
+    fn the_old_switch_in_a_stored_record_is_ignored() {
+        let p: Preferences =
+            serde_json::from_value(serde_json::json!({"account_fallback": false})).unwrap();
+        assert!(p.fallback_path.other_accounts);
     }
 }

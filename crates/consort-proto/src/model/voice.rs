@@ -604,6 +604,16 @@ impl VoiceGuide {
 
     /// Reads `voice.md`. Sections that the format does not know, and text
     /// outside a rule, an example or a known line, are left out.
+    /// The `##` headings in `text` that the format does not know. The parser
+    /// drops their text.
+    pub fn unknown_sections(text: &str) -> Vec<String> {
+        text.lines()
+            .filter_map(|line| line.trim().strip_prefix("## "))
+            .filter(|heading| matches!(heading_part(heading), Part::Unknown))
+            .map(|heading| heading.trim().to_owned())
+            .collect()
+    }
+
     pub fn parse(text: &str) -> Self {
         let mut guide = Self::empty();
         let mut part = Part::None;
@@ -616,21 +626,7 @@ impl VoiceGuide {
             }
             if let Some(heading) = trimmed.strip_prefix("## ") {
                 in_examples = false;
-                let heading = heading.trim();
-                let key = heading
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or("")
-                    .to_ascii_lowercase();
-                part = if heading.eq_ignore_ascii_case("core") || key == "core" {
-                    Part::Core
-                } else if heading.to_ascii_lowercase().starts_with("hard rules") {
-                    Part::Hard
-                } else if let Some(i) = VOICE_CONTEXTS.iter().position(|c| *c == key) {
-                    Part::Context(i)
-                } else {
-                    Part::Unknown
-                };
+                part = heading_part(heading);
                 continue;
             }
             if trimmed.starts_with("# ") {
@@ -955,6 +951,25 @@ impl VoiceGuide {
             }
         }
         Some(out)
+    }
+}
+
+/// The part of the guide that a `##` heading starts.
+fn heading_part(heading: &str) -> Part {
+    let heading = heading.trim();
+    let key = heading
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if heading.eq_ignore_ascii_case("core") || key == "core" {
+        Part::Core
+    } else if heading.to_ascii_lowercase().starts_with("hard rules") {
+        Part::Hard
+    } else if let Some(i) = VOICE_CONTEXTS.iter().position(|c| *c == key) {
+        Part::Context(i)
+    } else {
+        Part::Unknown
     }
 }
 

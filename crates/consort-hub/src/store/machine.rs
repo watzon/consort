@@ -4,7 +4,7 @@ use consort_proto::auth::PairingCode;
 use consort_proto::client_api::EntityPayload;
 use consort_proto::frame::FrameId;
 use consort_proto::ids::{AccountId, ClientId, SessionId, WorkerId};
-use consort_proto::model::{Client, PairedBy, PushProvider, Worker, WorkerState};
+use consort_proto::model::{Client, FallbackCause, PairedBy, PushProvider, Worker, WorkerState};
 use consort_proto::time::Timestamp;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
@@ -68,24 +68,48 @@ fn origin_column(text: Option<String>) -> Option<Origin> {
 
 // Workers ----------------------------------------------------------------
 
-/// The accounts that placement avoids now because they reached a usage limit.
-/// Empty when the user turned the move to another account off.
-pub fn limited_accounts(
-    conn: &Connection,
-    now: Timestamp,
-) -> Result<std::collections::HashSet<AccountId>> {
-    if !super::preferences::preferences(conn)?.account_fallback {
-        return Ok(std::collections::HashSet::new());
-    }
-    let mut stmt = conn.prepare("SELECT account_id FROM account_limits WHERE until_at > ?1")?;
-    let rows = stmt.query_map([now.as_millis()], |row| row.get::<_, String>(0))?;
-    let mut limited = std::collections::HashSet::new();
+/// Why an account is held, and until when. A held account is skipped by the
+/// fallback path until the time passes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccountHold {
+    pub account_id: AccountId,
+    pub until: Timestamp,
+    pub cause: FallbackCause,
+    /// True when the provider gave `until`.
+    pub exact: bool,
+}
+
+/// The accounts that are held now: they reached a usage limit, or their
+/// provider was down for three turns.
+pub fn account_holds(conn: &Connection, now: Timestamp) -> Result<Vec<AccountHold>> {
+    let mut stmt = conn.prepare(
+        "SELECT account_id, until_at, reason, exact FROM account_limits WHERE until_at > ?1",
+    )?;
+    let rows = stmt.query_map([now.as_millis()], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, bool>(3)?,
+        ))
+    })?;
+    let mut holds = Vec::new();
     for row in rows {
-        if let Ok(id) = row?.parse() {
-            limited.insert(id);
+        let (id, until, reason, exact) = row?;
+        if let Ok(account_id) = id.parse() {
+            holds.push(AccountHold {
+                account_id,
+                until: Timestamp::from_millis(until),
+                cause: if reason == "outage" {
+                    FallbackCause::Outage
+                } else {
+                    FallbackCause::UsageLimit
+                },
+                exact,
+            });
         }
     }
-    Ok(limited)
+    Ok(holds)
 }
 
 pub fn worker(conn: &Connection, id: WorkerId) -> Result<Option<Worker>> {
@@ -160,16 +184,61 @@ pub fn worker_records(conn: &Connection) -> Result<Vec<WorkerRecord>> {
 impl Tx<'_> {
     /// Saves that an account reached a usage limit, until the time when the
     /// limit resets. Old rows go at the same time.
-    pub fn record_account_limit(&mut self, account_id: AccountId, until: Timestamp) -> Result<()> {
+    pub fn record_account_limit(
+        &mut self,
+        account_id: AccountId,
+        until: Timestamp,
+        cause: FallbackCause,
+        exact: bool,
+    ) -> Result<()> {
         let now = self.now();
         self.db().execute(
             "DELETE FROM account_limits WHERE until_at <= ?1",
             [now.as_millis()],
         )?;
+        let reason = match cause {
+            FallbackCause::UsageLimit => "usage_limit",
+            FallbackCause::Outage => "outage",
+        };
         self.db().execute(
-            "INSERT INTO account_limits (account_id, until_at) VALUES (?1, ?2)
-             ON CONFLICT (account_id) DO UPDATE SET until_at = excluded.until_at",
-            params![account_id.to_string(), until.as_millis()],
+            "INSERT INTO account_limits (account_id, until_at, reason, exact) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (account_id) DO UPDATE SET until_at = excluded.until_at,
+                reason = excluded.reason, exact = excluded.exact",
+            params![account_id.to_string(), until.as_millis(), reason, exact],
+        )?;
+        Ok(())
+    }
+
+    /// Ends the hold on an account.
+    pub fn clear_account_limit(&mut self, account_id: AccountId) -> Result<()> {
+        self.db().execute(
+            "DELETE FROM account_limits WHERE account_id = ?1",
+            [account_id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    /// Counts one more failed turn of a session with a provider outage and
+    /// returns the count.
+    pub fn bump_outage_tries(&mut self, session_id: SessionId) -> Result<u32> {
+        self.db().execute(
+            "INSERT INTO session_outage_tries (session_id, tries) VALUES (?1, 1)
+             ON CONFLICT (session_id) DO UPDATE SET tries = tries + 1",
+            [session_id.to_string()],
+        )?;
+        let tries: i64 = self.db().query_row(
+            "SELECT tries FROM session_outage_tries WHERE session_id = ?1",
+            [session_id.to_string()],
+            |row| row.get(0),
+        )?;
+        Ok(u32::try_from(tries).unwrap_or(u32::MAX))
+    }
+
+    /// Forgets the failed turns of a session.
+    pub fn clear_outage_tries(&mut self, session_id: SessionId) -> Result<()> {
+        self.db().execute(
+            "DELETE FROM session_outage_tries WHERE session_id = ?1",
+            [session_id.to_string()],
         )?;
         Ok(())
     }
@@ -404,6 +473,7 @@ impl Tx<'_> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PairingKind {
     Worker,
+    SessionHost,
     Client,
 }
 
@@ -411,6 +481,7 @@ impl PairingKind {
     fn as_str(self) -> &'static str {
         match self {
             Self::Worker => "worker",
+            Self::SessionHost => "session_host",
             Self::Client => "client",
         }
     }
@@ -670,8 +741,10 @@ mod tests {
     use super::*;
     use crate::store::testing::temp_store;
     use consort_proto::auth::PAIRING_CODE_TTL_MS;
+    use consort_proto::session_host_link::{
+        HubToSessionHost, InventoryRefresh, QUEUED_COMMAND_TTL_MS,
+    };
     use consort_proto::time::Timestamp;
-    use consort_proto::worker_link::{HubToWorker, InventoryRefresh, QUEUED_COMMAND_TTL_MS};
 
     #[tokio::test]
     async fn a_pairing_code_works_once_for_its_kind_and_expires_after_ten_minutes() {
@@ -732,11 +805,11 @@ mod tests {
             .write(move |tx| {
                 let first = tx.queue_command(
                     worker_id,
-                    &HubToWorker::InventoryRefresh(InventoryRefresh {}),
+                    &HubToSessionHost::InventoryRefresh(InventoryRefresh {}),
                 )?;
                 let second = tx.queue_command(
                     worker_id,
-                    &HubToWorker::InventoryRefresh(InventoryRefresh {}),
+                    &HubToSessionHost::InventoryRefresh(InventoryRefresh {}),
                 )?;
                 Ok((first, second))
             })

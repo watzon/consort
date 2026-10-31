@@ -1,4 +1,4 @@
-//! Harness accounts: the `[[accounts]]` entries of `worker.toml`, and the
+//! Harness accounts: the `[[accounts]]` entries of `session-host.toml`, and the
 //! per-account home folders that keep two logins of one harness apart.
 //!
 //! The worker never reads a harness's private login files. A shadow home
@@ -64,7 +64,7 @@ pub struct AccountConfig {
     /// The ACP agent of an `acp` account that Consort made.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acp: Option<AcpAccountSpec>,
-    /// What the worker adds at run time. Never written to `worker.toml`.
+    /// What the worker adds at run time. Never written to `session-host.toml`.
     #[serde(skip)]
     pub runtime: AccountRuntime,
 }
@@ -82,6 +82,9 @@ pub struct AccountRuntime {
     /// Variables to remove from the worker's environment, so a profile
     /// account does not pick up a login that the machine already has.
     pub env_remove: Vec<String>,
+    /// The OS boundary that sessions of this account run in. The session
+    /// host sets it. `None` only for a harness that needs none.
+    pub boundary: Option<crate::boundary::BoundaryConfig>,
 }
 
 impl std::fmt::Debug for AccountRuntime {
@@ -90,6 +93,7 @@ impl std::fmt::Debug for AccountRuntime {
             .field("launch", &self.launch.as_ref().map(|l| &l.program))
             .field("env", &self.env.keys().collect::<Vec<_>>())
             .field("env_remove", &self.env_remove)
+            .field("boundary", &self.boundary)
             .finish()
     }
 }

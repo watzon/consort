@@ -22,7 +22,7 @@ use consort_proto::frame::MessageFamily;
 use consort_proto::model::{
     ApprovalDetails, ConnectionStatus, SecretEnv, ToolApprovals, UseIn, skill_content_hash,
 };
-use consort_proto::worker_link::SkillBundleGet;
+use consort_proto::session_host_link::SkillBundleGet;
 use fake::{FakeComposio, GOOD_KEY};
 use serde_json::json;
 
@@ -205,7 +205,7 @@ async fn a_new_skill_replaces_the_idle_coordinator_session_at_its_next_turn() {
             first.session_id,
             vec![turn_ended(
                 "t1",
-                consort_proto::worker_link::TurnEndReason::Completed,
+                consort_proto::session_host_link::TurnEndReason::Completed,
             )],
         )
         .await;
@@ -229,7 +229,7 @@ async fn a_new_skill_replaces_the_idle_coordinator_session_at_its_next_turn() {
     // The set changed, so the hub ends the old session and starts one with
     // the skill.
     let (request, command) = world.worker.next_command().await;
-    let consort_proto::worker_link::HubToWorker::SessionStop(stop) = command else {
+    let consort_proto::session_host_link::HubToSessionHost::SessionStop(stop) = command else {
         panic!("expected session.stop, got {}", command.type_name());
     };
     assert_eq!(stop.session_id, first.session_id);

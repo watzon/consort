@@ -1,0 +1,24 @@
+[package]
+name = "consort-dictation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+# Path dependencies on the Sayso checkout, for now: the changes in Sayso are not
+# committed or published yet (docs/DICTATION-PLAN.md, "Work in Sayso", step 5).
+# Change these to exact versions when the crates are on crates.io.
+sayso-sdk = { path = "../../../sayso/crates/sayso-sdk" }
+crossbeam-channel = "0.5"
+directories.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+toml.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

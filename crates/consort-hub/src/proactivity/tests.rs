@@ -14,10 +14,10 @@ use consort_proto::model::{
     RoutineOrigin, RoutineSchedule, Session, SessionRole, SessionState, SnoozeChoice, TaskCreator,
     Usage,
 };
+use consort_proto::session_host_link::TurnEndReason;
 use consort_proto::status::{Actor, TaskStatus};
 use consort_proto::time::Timestamp;
 use consort_proto::turn_input::WakeEvent;
-use consort_proto::worker_link::TurnEndReason;
 use serde_json::{Value, json};
 
 use super::routines::{pending_wake, sync_channel_routines};
@@ -96,6 +96,10 @@ async fn channel(hub: &Hub, name: &str, level: Option<ProactivityLevel>) -> Chan
         updated_at: now,
         proactivity: level,
         proactive_tasks: Default::default(),
+        coordinator_fallback: None,
+        coordinator_blocked: None,
+        monid: Default::default(),
+        access_grants: Vec::new(),
     };
     let saved = channel.clone();
     hub.store
@@ -147,6 +151,7 @@ async fn log(hub: &Hub, channel_id: Option<ChannelId>) -> Vec<ProactiveWake> {
 /// `events`. Returns the session.
 async fn open_turn(hub: &Hub, channel_id: ChannelId, events: Vec<WakeEvent>) -> SessionId {
     let session = Session {
+        execution_worker_id: None,
         id: SessionId::new(),
         role: SessionRole::Coordinator,
         channel_id,
@@ -411,6 +416,7 @@ async fn the_hub_fixes_the_prompt_of_a_check_in_and_its_shortest_interval() {
         prompt: Some("Do something else.".into()),
         action: None,
         enabled: None,
+        monid: None,
     };
     let err = hub
         .update_routine_in(None, update.clone())

@@ -22,7 +22,7 @@ use consort_proto::model::{
     Approval, ApprovalDetails, ConnectorCard, DecisionAnswer, FlagKind, MemoryScope, SecretEnv,
     ToolApprovals, UseIn, VOICE_NOTE_PATH, VoiceSampleState, VoiceSource, VoiceSourceKind,
 };
-use consort_proto::worker_link::TurnEndReason;
+use consort_proto::session_host_link::TurnEndReason;
 use serde_json::json;
 
 const VOICE_SECTION: &str = "# The user's voice is on";
@@ -454,7 +454,8 @@ async fn a_session_that_can_send_gets_the_voice_and_its_draft_card_has_flags_edi
     assert!(prompt.contains("- Never promise a date or a price."));
     assert!(prompt.contains("- email.formal: clients and new contacts"));
     let session = start.session_id;
-    // The coordinator cannot write voice.md: the hub owns it.
+    // The user asked for this turn, so the coordinator can edit voice.md.
+    // A wrong hash still fails, like a write of any other note.
     let write = world
         .worker
         .tool_call(
@@ -464,11 +465,6 @@ async fn a_session_that_can_send_gets_the_voice_and_its_draft_card_has_flags_edi
         )
         .await;
     assert!(write.is_error);
-    assert!(
-        format!("{:?}", write.content).contains("propose_voice_rule"),
-        "{:?}",
-        write.content
-    );
     let guide = world
         .worker
         .tool_json(session, "voice_guide", json!({"context": "email.formal"}))
@@ -629,13 +625,15 @@ async fn try_it_writes_a_sample_that_is_not_posted_and_reset_turns_the_voice_neu
     // turn goes to the coordinator session, or to a new one when the hub
     // replaces the idle session.
     let session = loop {
-        use consort_proto::worker_link::{HubToWorker, SessionStartResult, SessionTurnResult};
+        use consort_proto::session_host_link::{
+            HubToSessionHost, SessionStartResult, SessionTurnResult,
+        };
         let (request, command) = world.worker.next_command().await;
         match command {
-            HubToWorker::SessionStop(_) => {
+            HubToSessionHost::SessionStop(_) => {
                 world.worker.respond_ok(&request, &json!({})).await;
             }
-            HubToWorker::SessionTurn(turn) => {
+            HubToSessionHost::SessionTurn(turn) => {
                 assert!(
                     turn.turn.text.contains("The voice was reset."),
                     "{}",
@@ -652,7 +650,7 @@ async fn try_it_writes_a_sample_that_is_not_posted_and_reset_turns_the_voice_neu
                     .await;
                 break turn.session_id;
             }
-            HubToWorker::SessionStart(start) => {
+            HubToSessionHost::SessionStart(start) => {
                 assert!(!start.system_prompt_append.contains(VOICE_SECTION));
                 world
                     .worker

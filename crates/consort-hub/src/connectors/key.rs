@@ -23,17 +23,34 @@ const SECRET_FILE: &str = "hub-secret.key";
 const KEY_FILE: &str = "composio.key";
 /// Binds the ciphertext to its use.
 const AAD: &[u8] = b"consort composio.key v1";
+const MONID_KEY_FILE: &str = "monid.key";
+const MONID_AAD: &[u8] = b"consort monid.key v1";
 
 /// Reads and writes the encrypted Composio key.
 #[derive(Debug, Clone)]
 pub(crate) struct KeyStore {
     dir: PathBuf,
+    file: &'static str,
+    aad: &'static [u8],
 }
 
 impl KeyStore {
     pub(crate) fn new(dir: &Path) -> Self {
         Self {
             dir: dir.to_path_buf(),
+            file: KEY_FILE,
+            aad: AAD,
+        }
+    }
+
+    /// The store of the Monid key: `monid.key`, in the same format and under
+    /// the same hub key. It has its own binding, so one file cannot stand in
+    /// for the other.
+    pub(crate) fn for_monid(dir: &Path) -> Self {
+        Self {
+            dir: dir.to_path_buf(),
+            file: MONID_KEY_FILE,
+            aad: MONID_AAD,
         }
     }
 
@@ -42,7 +59,7 @@ impl KeyStore {
     }
 
     fn key_path(&self) -> PathBuf {
-        self.dir.join(KEY_FILE)
+        self.dir.join(self.file)
     }
 
     /// The hub's own key. It makes one when there is none.
@@ -75,10 +92,10 @@ impl KeyStore {
                 Nonce::from_slice(&nonce),
                 Payload {
                     msg: key.expose().as_bytes(),
-                    aad: AAD,
+                    aad: self.aad,
                 },
             )
-            .map_err(|_| HubError::internal("could not encrypt the Composio key"))?;
+            .map_err(|_| HubError::internal("could not encrypt the key"))?;
         let mut out = Vec::with_capacity(MAGIC.len() + NONCE_BYTES + sealed.len());
         out.extend_from_slice(MAGIC);
         out.extend_from_slice(&nonce);
@@ -94,9 +111,10 @@ impl KeyStore {
             Err(err) => return Err(err.into()),
         };
         let damaged = || {
-            HubError::internal(
-                "composio.key cannot be read. Remove the key in Settings > Connectors and add it again.",
-            )
+            HubError::internal(format!(
+                "{} cannot be read. Remove the key in Settings > Connectors and add it again.",
+                self.file
+            ))
         };
         if bytes.len() <= MAGIC.len() + NONCE_BYTES || &bytes[..MAGIC.len()] != MAGIC {
             return Err(damaged());
@@ -108,7 +126,7 @@ impl KeyStore {
                 Nonce::from_slice(nonce),
                 Payload {
                     msg: sealed,
-                    aad: AAD,
+                    aad: self.aad,
                 },
             )
             .map_err(|_| damaged())?;
@@ -178,6 +196,18 @@ mod tests {
         }
         store.remove().unwrap();
         assert!(store.load().unwrap().is_none());
+    }
+
+    #[test]
+    fn the_monid_key_has_its_own_file_and_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let monid = KeyStore::for_monid(dir.path());
+        monid.save(&ApiKey::new("monid_live_1".to_owned())).unwrap();
+        assert_eq!(monid.load().unwrap().unwrap().expose(), "monid_live_1");
+        assert!(KeyStore::new(dir.path()).load().unwrap().is_none());
+        // A copy of one file under the other's name does not open.
+        std::fs::copy(dir.path().join(MONID_KEY_FILE), dir.path().join(KEY_FILE)).unwrap();
+        assert!(KeyStore::new(dir.path()).load().is_err());
     }
 
     #[test]

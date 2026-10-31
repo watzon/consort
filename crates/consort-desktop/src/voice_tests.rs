@@ -199,6 +199,66 @@ fn the_offer_opens_the_full_guide(cx: &mut TestAppContext) {
         == Some(Dialog::Voice(VoiceDialog::Proposal))));
 }
 
+/// The id of the offer in Tutti.
+fn offer_id(app: &Entity<ConsortApp>, cx: &mut VisualTestContext) -> String {
+    app.read_with(cx, |app, _| {
+        app.state
+            .timelines
+            .iter()
+            .flat_map(|t| &t.items)
+            .find_map(|item| match item {
+                consort_client::TimelineItem::Decision(card) => Some(card.decision.id.clone()),
+                _ => None,
+            })
+            .expect("the offer")
+    })
+}
+
+/// After Do it, the guide is a note. The answers go, the card says what
+/// the user chose, and the link opens the saved note.
+#[gpui::test]
+fn do_it_replaces_the_answers_and_opens_the_saved_guide(cx: &mut TestAppContext) {
+    let (handle, app) = open(state("voice-offer"), cx);
+    let cx = &mut VisualTestContext::from_window(handle, cx);
+    screen(&app, "voice-offer", cx);
+    let id = offer_id(&app, cx);
+    assert!(has(cx, &format!("offer-{id}-0")));
+    assert!(!has(cx, "offer-outcome"));
+    click(cx, &format!("offer-{id}-0"));
+    until(cx, &app, "the offer is answered", |app| {
+        app.state.timelines.iter().flat_map(|t| &t.items).any(|i| {
+            matches!(i, consort_client::TimelineItem::Decision(c) if c.decision.chosen == Some(0))
+        })
+    });
+    draw(cx);
+    assert!(has(cx, "offer-outcome"));
+    assert!(!has(cx, "voice-open-guide"));
+    for i in 0..3 {
+        assert!(!has(cx, &format!("offer-{id}-{i}")));
+    }
+    assert!(has(cx, "voice-saved-guide"));
+    click(cx, "voice-saved-guide");
+    assert!(app.read_with(cx, |app, _| app.dialog.is_none()));
+}
+
+/// After another answer, the card has no link: the proposal is gone.
+#[gpui::test]
+fn not_now_leaves_no_link_to_the_guide(cx: &mut TestAppContext) {
+    let (handle, app) = open(state("voice-offer"), cx);
+    let cx = &mut VisualTestContext::from_window(handle, cx);
+    screen(&app, "voice-offer", cx);
+    let id = offer_id(&app, cx);
+    click(cx, &format!("offer-{id}-1"));
+    until(cx, &app, "the offer is answered", |app| {
+        app.state.timelines.iter().flat_map(|t| &t.items).any(|i| {
+            matches!(i, consort_client::TimelineItem::Decision(c) if c.decision.chosen == Some(1))
+        })
+    });
+    draw(cx);
+    assert!(has(cx, "offer-outcome"));
+    assert!(!has(cx, "voice-open-guide") && !has(cx, "voice-saved-guide"));
+}
+
 /// A draft with marked lines: Allow stays off until the tick. Edit and
 /// Save changes check the text again and clear the tick. "Not how I
 /// write" records the feedback.

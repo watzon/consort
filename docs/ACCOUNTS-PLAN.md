@@ -2,6 +2,8 @@
 
 Status: approved by the user on 2026-10-29. The Paper designs are on the Desktop page of "Consort — v0.1 Design": "Settings, Workers with tags and tools", "Add account dialog", "Add account dialog, Name step" and "Sign-in dialog, Claude". This file is the contract between the build agents. If you must change a name or a shape here, change this file in the same commit and say why in `docs/DECISIONS.md`.
 
+Note (2026-10-31): [ADR 0015](adr/0015-the-hub-machine-owns-accounts-and-agents.md) changes this plan. Accounts, profile folders and managed tools are now in the session host on the hub machine, and the user manages them in Settings > Providers. Where this plan says "worker" or "Settings > Workers" about an account, read "session host" and "Settings > Providers". Tags now apply only to tasks.
+
 ## What the user asked for
 
 1. Accounts belong to a worker and are managed in Settings > Workers. There is no central Providers page.

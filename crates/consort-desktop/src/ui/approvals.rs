@@ -99,6 +99,21 @@ impl ConsortApp {
             return self.render_draft_approval(approval, &card, &draft, key, chat, t, cx);
         }
         if let Some(hub_card) = approval.card.clone() {
+            // Monid and access cards have their own waiting card
+            // (`ui/monid_cards.rs`).
+            if is_waiting(approval.state) {
+                match &*hub_card {
+                    HubCardView::Monid(card) => {
+                        return self.render_monid_card(approval, card, key, chat, t, cx);
+                    }
+                    HubCardView::Access(card) => {
+                        return self.render_access_card(approval, card, key, chat, t, cx);
+                    }
+                    _ => {}
+                }
+            } else if let HubCardView::Access(card) = &*hub_card {
+                return self.render_access_answered(card, key, t);
+            }
             // A hub card keeps its own body while it waits. After the answer
             // it shrinks to the same line, unless its outcome is still
             // moving (a sign-in in a browser): then the user needs the
@@ -205,6 +220,31 @@ impl ConsortApp {
     ) -> Div {
         let c = &t.colors;
         let mut block = div().flex().flex_col().gap(t.space.sm).w_full().min_w_0();
+        // Why Consort asks, and what the command check blocked before this.
+        if let Some(note) = &approval.check_note {
+            block = block.child(text(note.clone(), detail(t), c.text_secondary));
+        }
+        for (n, command) in approval.blocked.iter().enumerate() {
+            block = block.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(t.space.sm)
+                    .child(icon("failed", t.icon.dense, c.status_failed))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .font_family(t.font_mono.clone())
+                            .type_style(detail(t))
+                            .text_color(c.text_secondary)
+                            .child(SelectableText::new(
+                                SharedString::from(format!("{key}.blocked.{n}")),
+                                command.clone(),
+                            )),
+                    ),
+            );
+        }
         for part in detail_parts(approval, false) {
             block = match part {
                 DetailPart::Summary(_) => block,
@@ -501,6 +541,7 @@ impl ConsortApp {
             .child(
                 line(headline, t.text.ui, c.text_primary)
                     .flex_1()
+                    .min_w_0()
                     .when(mono, |d| d.font_family(t.font_mono.clone())),
             )
             .child(

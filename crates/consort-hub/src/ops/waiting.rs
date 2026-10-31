@@ -3,10 +3,10 @@
 use consort_proto::client_api::*;
 use consort_proto::ids::TaskId;
 use consort_proto::model::{ApprovalStatus, BlobRef, DecisionAnswer, DecisionStatus};
+use consort_proto::session_host_link::{HubToSessionHost, RequestAnswer, SessionRespond};
 use consort_proto::status::{Actor, TaskStatus};
 use consort_proto::tools::MessageDelivery;
 use consort_proto::turn_input::{WakeEvent, render_events};
-use consort_proto::worker_link::{HubToWorker, RequestAnswer, SessionRespond};
 
 use super::flow::{Delivered, deliver_in_tx, transition};
 use crate::connectors::replace::{DraftScope, replace_waiting_drafts};
@@ -68,7 +68,7 @@ impl Hub {
                 let session = work::session_or_404(tx.db(), approval.session_id)?;
                 tx.queue_command(
                     session.worker_id,
-                    &HubToWorker::SessionRespond(SessionRespond {
+                    &HubToSessionHost::SessionRespond(SessionRespond {
                         session_id: session.id,
                         request_id: approval.request_id.clone(),
                         answer: RequestAnswer {
@@ -140,7 +140,7 @@ impl Hub {
                         .and_then(|o| o.id.clone());
                     tx.queue_command(
                         session.worker_id,
-                        &HubToWorker::SessionRespond(SessionRespond {
+                        &HubToSessionHost::SessionRespond(SessionRespond {
                             session_id: session.id,
                             request_id,
                             answer: RequestAnswer { option_id, text },
@@ -258,7 +258,7 @@ pub(crate) fn deliver_user_text(
         }
         tx.queue_command(
             session.worker_id,
-            &HubToWorker::SessionRespond(SessionRespond {
+            &HubToSessionHost::SessionRespond(SessionRespond {
                 session_id: session.id,
                 request_id,
                 answer: RequestAnswer {

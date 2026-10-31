@@ -20,7 +20,7 @@ use consort_proto::model::{
     ApprovalMode, AuthState, Capabilities, ModelInfo, ModelOptions, OptionChoice, OptionDescriptor,
     OptionValue, SessionState,
 };
-use consort_proto::worker_link::{RequestOutcome, SessionEvent, TurnEndReason, TurnInput};
+use consort_proto::session_host_link::{RequestOutcome, SessionEvent, TurnEndReason, TurnInput};
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 
@@ -170,22 +170,91 @@ pub fn thread_config(
     root
 }
 
-/// The `config` object of a session: [`thread_config`], and with the
-/// provider extras off, the keys that stop what ChatGPT sign-in syncs to the
-/// account (see [`extras_off_config`]).
+/// The `config` object of a session: [`thread_config`], and always the keys
+/// that stop what ChatGPT sign-in syncs to the account (see
+/// [`extras_off_config`]). A new thread and a resumed thread get the same keys.
 pub fn session_config(spec: &SessionSpec) -> serde_json::Map<String, Value> {
     let mut config = thread_config(&spec.mcp_servers, spec.allow_shell);
     if spec.coordinator {
         let (key, value) = crate::approval::CODEX_WEB_SEARCH_OFF;
         config.insert(key.to_owned(), Value::String(value.to_owned()));
     }
-    if !spec.extras_enabled {
-        merge_config(&mut config, extras_off_config());
-    }
+    merge_config(&mut config, extras_off_config());
     config
 }
 
-/// The Codex settings that stop the account-synced extras for one thread.
+/// The Codex tools that a session in the boundary may not have: the shell,
+/// agents, goals, images, hooks and the rest. Tested with codex-cli 0.166.0
+/// against a local model: the request then has only the MCP resource tools,
+/// `request_user_input`, `tool_search` and, on newer models, `apply_patch`.
+/// `apply_patch` comes from the model catalog and has no switch. The fixed
+/// policy ([`BOUNDARY_POLICY`]) rejects each call of it.
+const BOUNDARY_FEATURES_OFF: [&str; 12] = [
+    "shell_tool",
+    "unified_exec",
+    "shell_snapshot",
+    "multi_agent",
+    "goals",
+    "view_image",
+    "image_generation",
+    "hooks",
+    "sleep_tool",
+    "tool_suggest",
+    "browser_use",
+    "computer_use",
+];
+
+/// The approval policy and the sandbox of each session in the boundary, in
+/// all approval modes. Consort asks the user when a Consort tool runs, as it
+/// does for Claude Code. Tested with codex-cli 0.166.0: Codex rejects
+/// `apply_patch` with no prompt and writes no file.
+const BOUNDARY_POLICY: (&str, &str) = ("never", "read-only");
+
+/// What the model reads in a session in the boundary.
+const BOUNDARY_NOTE: &str = "Use only the tools of the consort MCP server. They run on the worker. Find them with tool_search. The tools of Codex itself cannot change files here.";
+
+/// Adds the keys of a session in the boundary to its `config`. With the
+/// policy `never`, Codex refuses an MCP tool that needs its approval, so each
+/// Consort server gets `default_tools_approval_mode`. Tested with codex-cli
+/// 0.166.0: the call then reaches the server with no prompt.
+pub fn boundary_config(config: &mut serde_json::Map<String, Value>) {
+    let features: serde_json::Map<String, Value> = BOUNDARY_FEATURES_OFF
+        .iter()
+        .map(|f| ((*f).to_owned(), Value::Bool(false)))
+        .collect();
+    let mut off = serde_json::Map::new();
+    off.insert("features".to_owned(), Value::Object(features));
+    let (key, value) = crate::approval::CODEX_WEB_SEARCH_OFF;
+    off.insert(key.to_owned(), Value::String(value.to_owned()));
+    merge_config(config, off);
+    if let Some(Value::Object(servers)) = config.get_mut("mcp_servers") {
+        for server in servers.values_mut() {
+            if let Value::Object(server) = server {
+                server.insert(
+                    "default_tools_approval_mode".to_owned(),
+                    Value::String("approve".to_owned()),
+                );
+            }
+        }
+    }
+}
+
+/// Gives the thread of a session in the boundary its fixed policy and the
+/// note for the model.
+pub fn boundary_params(params: &mut ThreadStartParams, has_tools: bool) {
+    let (policy, sandbox) = BOUNDARY_POLICY;
+    params.approval_policy = Some(policy.to_owned());
+    params.sandbox = Some(sandbox.to_owned());
+    if has_tools {
+        params.developer_instructions = Some(match params.developer_instructions.take() {
+            Some(text) => format!("{text}\n\n{BOUNDARY_NOTE}"),
+            None => BOUNDARY_NOTE.to_owned(),
+        });
+    }
+}
+
+/// The Codex settings that stop what the provider syncs to the account, for
+/// one thread. Consort always sends them.
 ///
 /// With ChatGPT sign-in, Codex adds a hosted `codex_apps` MCP server (the
 /// ChatGPT connectors), syncs the plugins that the account has installed
@@ -382,10 +451,20 @@ pub fn app_server_spec(
         program: launch.program,
         args,
         env,
+        env_clear: false,
         env_remove: account.runtime.env_remove.clone(),
         cwd: Some(cwd.to_path_buf()),
         watcher,
     })
+}
+
+/// The folders and the MCP endpoints of one `codex app-server` in the boundary.
+/// An account with no boundary, such as in a sign-in, ignores them.
+pub(crate) struct Place<'a> {
+    /// The session folder.
+    pub session: &'a std::path::Path,
+    /// The MCP endpoints that the CLI may reach.
+    pub mcp_urls: Vec<String>,
 }
 
 /// Whether a failed start of `codex app-server` came from another Codex
@@ -402,11 +481,12 @@ pub(crate) async fn connect(
     cwd: &std::path::Path,
     extra_env: BTreeMap<String, String>,
     watcher: Option<process::WatcherHandle>,
+    place: &Place<'_>,
 ) -> Result<Connection, HarnessError> {
     let mut tries = 0;
     loop {
         tries += 1;
-        match connect_once(account, cwd, extra_env.clone(), watcher.clone()).await {
+        match connect_once(account, cwd, extra_env.clone(), watcher.clone(), place).await {
             Err(err) if tries < 3 && is_state_init_race(&err) => {
                 tracing::debug!("codex app-server could not set up its home; it tries again");
                 tokio::time::sleep(Duration::from_millis(500 * tries)).await;
@@ -421,14 +501,28 @@ async fn connect_once(
     cwd: &std::path::Path,
     extra_env: BTreeMap<String, String>,
     watcher: Option<process::WatcherHandle>,
+    place: &Place<'_>,
 ) -> Result<Connection, HarnessError> {
-    let mut process = process::spawn(&app_server_spec(
-        account,
-        cwd,
-        extra_env,
-        watcher,
-        &resolve_program,
-    )?)?;
+    let spec = app_server_spec(account, cwd, extra_env, watcher, &resolve_program)?;
+    let (spec, guard) = match &account.runtime.boundary {
+        Some(config) => {
+            let (inner, guard) = crate::boundary::enter(
+                config,
+                HarnessKind::Codex,
+                spec,
+                place.session,
+                cwd,
+                &place.mcp_urls,
+            )
+            .await?;
+            (inner, Some(guard))
+        }
+        None => (spec, None),
+    };
+    let mut process = process::spawn(&spec)?;
+    if let Some(guard) = guard {
+        process.hold(Box::new(guard));
+    }
     let stdin = process
         .take_stdin()
         .ok_or_else(|| HarnessError::Spawn("no stdin".to_owned()))?;
@@ -508,9 +602,20 @@ impl Harness for CodexHarness {
         .await
         .ok()
         .and_then(|out| parse_version(&out));
-        let dir = std::env::temp_dir();
+        // A probe in the boundary may write only to its own folder.
+        let dir = std::env::temp_dir().join(format!("consort-probe-{}", uuid::Uuid::now_v7()));
+        if let Err(err) = std::fs::create_dir_all(&dir) {
+            return AccountStatus::unknown(
+                format!("could not make a folder for the probe: {err}"),
+                caps,
+            );
+        }
+        let place = Place {
+            session: &dir,
+            mcp_urls: Vec::new(),
+        };
         let probe = async {
-            let mut conn = connect(account, &dir, BTreeMap::new(), None).await?;
+            let mut conn = connect(account, &dir, BTreeMap::new(), None, &place).await?;
             let account_info: GetAccountResponse = conn
                 .client
                 .request(
@@ -543,7 +648,9 @@ impl Harness for CodexHarness {
             drop(conn.inbound);
             Ok::<_, HarnessError>((account_info, models))
         };
-        match tokio::time::timeout(PROBE_TIMEOUT, probe).await {
+        let probed = tokio::time::timeout(PROBE_TIMEOUT, probe).await;
+        let _ = std::fs::remove_dir_all(&dir);
+        match probed {
             Ok(Ok((info, models))) => {
                 let mut status = account_status(account, info);
                 status.harness_version = version;
@@ -573,17 +680,96 @@ impl Harness for CodexHarness {
         account: &AccountConfig,
         spec: SessionSpec,
     ) -> Result<(Box<dyn HarnessSession>, EventReceiver), HarnessError> {
-        let config = session_config(&spec);
+        let in_boundary = account.runtime.boundary.is_some();
+        let mut config = session_config(&spec);
+        if in_boundary {
+            boundary_config(&mut config);
+        }
+        let place = Place {
+            session: &spec.workspace,
+            mcp_urls: spec.mcp_servers.iter().map(|s| s.url.clone()).collect(),
+        };
         let conn = connect(
             account,
             &spec.runtime_dir,
             spec.env.clone(),
             spec.process_watcher.clone(),
+            &place,
         )
         .await?;
-        let session =
-            start_thread(spec, config, conn.client, conn.inbound, Some(conn.process)).await?;
+        let session = start_thread(
+            spec,
+            config,
+            conn.client,
+            conn.inbound,
+            Some(conn.process),
+            in_boundary,
+        )
+        .await?;
         Ok((Box::new(session.0), session.1))
+    }
+
+    fn boundary_support(&self, _account: &AccountConfig) -> crate::boundary::BoundarySupport {
+        crate::boundary::BoundarySupport::Proven
+    }
+
+    async fn one_shot(
+        &self,
+        account: &AccountConfig,
+        folder: &std::path::Path,
+        request: crate::OneShot,
+    ) -> Result<String, HarnessError> {
+        if account.runtime.boundary.is_none() {
+            return Err(HarnessError::Spawn(
+                "the command check runs only inside the boundary".to_owned(),
+            ));
+        }
+        let mut options = ModelOptions::default();
+        options.insert("effort".to_owned(), OptionValue::Text("low".to_owned()));
+        let spec = SessionSpec {
+            session_id: consort_proto::ids::SessionId::new(),
+            workspace: folder.to_path_buf(),
+            runtime_dir: folder.to_path_buf(),
+            model: request.model,
+            options,
+            approval_mode: ApprovalMode::Ask,
+            allow_shell: false,
+            coordinator: true,
+            system_prompt_append: request.system,
+            mcp_servers: Vec::new(),
+            env: BTreeMap::new(),
+            skills: None,
+            resume: None,
+            process_watcher: None,
+        };
+        let (mut session, mut events) = self.open(account, spec).await?;
+        session
+            .turn(TurnInput {
+                text: request.prompt,
+                attachments: Vec::new(),
+            })
+            .await?;
+        let mut answer = String::new();
+        while let Some(event) = events.recv().await {
+            match event {
+                SessionEvent::Item(item) => {
+                    if let consort_proto::model::ItemPayload::AssistantMessage(m) = item.payload {
+                        answer = m.text;
+                    }
+                }
+                SessionEvent::TurnEnded { reason, error, .. } => {
+                    return match reason {
+                        TurnEndReason::Completed => Ok(answer),
+                        _ => Err(HarnessError::Protocol(format!(
+                            "Codex did not answer: {}",
+                            error.unwrap_or_else(|| "the turn ended early".to_owned())
+                        ))),
+                    };
+                }
+                _ => {}
+            }
+        }
+        Err(HarnessError::Closed)
     }
 }
 
@@ -596,6 +782,7 @@ pub(crate) async fn start_thread(
     client: RpcClient,
     inbound: mpsc::UnboundedReceiver<Inbound>,
     process: Option<HarnessProcess>,
+    in_boundary: bool,
 ) -> Result<(CodexSession, EventReceiver), HarnessError> {
     let mut process = process;
     // The skills of the session are an extra skill root of this app-server,
@@ -616,7 +803,10 @@ pub(crate) async fn start_thread(
         }
         None => None,
     };
-    let params = thread_params(&spec, config);
+    let mut params = thread_params(&spec, config);
+    if in_boundary {
+        boundary_params(&mut params, !spec.mcp_servers.is_empty());
+    }
     let method_name = if spec.resume.is_some() {
         method::THREAD_RESUME
     } else {
@@ -669,6 +859,7 @@ pub(crate) async fn start_thread(
         counter: 0,
         mode: spec.approval_mode,
         applied_mode: spec.approval_mode,
+        fixed_policy: in_boundary,
     };
     let task = tokio::spawn(actor.run(process, inbound, command_rx));
     Ok((
@@ -759,6 +950,8 @@ struct Actor {
     /// them for the next turns too.
     mode: ApprovalMode,
     applied_mode: ApprovalMode,
+    /// In the boundary, the policy of the thread stays for all modes.
+    fixed_policy: bool,
 }
 
 impl Actor {
@@ -968,12 +1161,13 @@ impl Actor {
                 "a turn is already running".to_owned(),
             ));
         }
-        let (approval_policy, sandbox_policy) = if self.mode == self.applied_mode {
-            (None, None)
-        } else {
-            let (policy, sandbox) = turn_policies(self.mode);
-            (Some(policy.to_owned()), Some(sandbox))
-        };
+        let (approval_policy, sandbox_policy) =
+            if self.fixed_policy || self.mode == self.applied_mode {
+                (None, None)
+            } else {
+                let (policy, sandbox) = turn_policies(self.mode);
+                (Some(policy.to_owned()), Some(sandbox))
+            };
         let response: TurnStartResponse = self
             .client
             .request(

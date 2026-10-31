@@ -50,9 +50,10 @@ fn auto_asks_before_commands_and_fetches_in_harnesses_with_no_sandbox() {
         gemini_mode(ApprovalMode::FullAccess)
     );
 
-    // Claude Auto is Claude Code's own `auto` mode, and Codex Auto runs
-    // commands in a `workspace-write` sandbox.
-    assert_eq!(claude_mode(ApprovalMode::Auto), "auto");
+    // Claude Code stays in `default` in every mode, because the approval
+    // engine of the hub decides. Codex Auto runs commands in a
+    // `workspace-write` sandbox.
+    assert_eq!(claude_mode(ApprovalMode::Auto), "default");
     assert_eq!(
         codex_policy(ApprovalMode::Auto),
         ("never", "workspace-write")
@@ -65,7 +66,7 @@ fn only_full_access_runs_with_no_prompt() {
         let full = mode == ApprovalMode::FullAccess;
         assert_eq!(opencode_runs_without_asking(mode), full, "{mode:?}");
         assert_eq!(gemini_mode(mode) == "yolo", full, "{mode:?}");
-        assert_eq!(claude_mode(mode) == "bypassPermissions", full, "{mode:?}");
+        assert_eq!(claude_mode(mode), "default", "{mode:?}");
         assert_eq!(
             codex_policy(mode).1 == "danger-full-access",
             full,
@@ -73,7 +74,7 @@ fn only_full_access_runs_with_no_prompt() {
         );
     }
     // The old behavior of Gemini Auto stays possible, but only when the
-    // user allows Full access in `worker.toml`.
+    // user allows Full access in `session-host.toml`.
     let gemini = static_capabilities(HarnessKind::GeminiCli);
     assert_eq!(
         effective_mode(ApprovalMode::FullAccess, ApprovalMode::FullAccess, &gemini),

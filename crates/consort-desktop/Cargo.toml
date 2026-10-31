@@ -12,6 +12,9 @@ path = "src/main.rs"
 
 [dependencies]
 consort-client.workspace = true
+consort-dictation.workspace = true
+crossbeam-channel = "0.5"
+directories.workspace = true
 consort-theme.workspace = true
 gpui-kit.workspace = true
 # The same Markdown parser that the GPUI text view uses (gpui-base 0.8.1). The

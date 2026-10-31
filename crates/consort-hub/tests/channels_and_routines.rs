@@ -14,7 +14,7 @@ use consort_proto::ids::ItemId;
 use consort_proto::model::{
     RoutineAction, RoutineRunStatus, RoutineSchedule, SessionState, Sha256Hash,
 };
-use consort_proto::worker_link::{HubToWorker, ItemDetailResult, TurnEndReason};
+use consort_proto::session_host_link::{HubToSessionHost, ItemDetailResult, TurnEndReason};
 use serde_json::json;
 
 fn new_channel(name: &str, purpose: &str, instructions: &str) -> ChannelCreate {
@@ -96,20 +96,20 @@ async fn changing_the_instructions_replaces_the_coordinator_session() {
     for _ in 0..2 {
         let (request, command) = world.worker.next_command().await;
         match command {
-            HubToWorker::SessionStop(stop) => {
+            HubToSessionHost::SessionStop(stop) => {
                 stopped = Some(stop.session_id);
                 world
                     .worker
                     .respond_ok(&request, &consort_proto::frame::Empty {})
                     .await;
             }
-            HubToWorker::SessionStart(start) => {
+            HubToSessionHost::SessionStart(start) => {
                 started = Some(start);
                 world
                     .worker
                     .respond_ok(
                         &request,
-                        &consort_proto::worker_link::SessionStartResult {
+                        &consort_proto::session_host_link::SessionStartResult {
                             workspace_path: "/tmp/ws".to_owned(),
                             native_ref: None,
                         },
@@ -331,7 +331,7 @@ async fn item_detail_asks_the_worker_and_fails_clearly_when_it_is_away() {
         }),
         async {
             let (request, command) = world.worker.next_command().await;
-            let HubToWorker::ItemDetail(asked) = command else {
+            let HubToSessionHost::ItemDetail(asked) = command else {
                 panic!("expected item.detail");
             };
             assert_eq!(asked.item_id, item_id);

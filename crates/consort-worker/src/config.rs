@@ -1,16 +1,10 @@
-//! `worker.toml` and the files in the worker's configuration folder.
-//!
-//! The folder holds `worker.toml`, the key file `worker.key`, the database
-//! `worker.db`, the `workspaces/` folder and the `runtime/` folder. The
-//! format of `worker.toml` is in `docs/data-model.md` ("Worker-local
-//! state"). On Unix the worker makes these folders with mode 0700 (see
-//! [`create_private_dir`]).
+//! The files of the worker: `worker.toml`, the key, `worker.db` and
+//! `workspaces/`.
 
 use std::path::{Path, PathBuf};
 
-use consort_harness::AccountConfig;
 use consort_proto::ids::WorkerId;
-use consort_proto::model::{ApprovalMode, CheckoutInfo, WorkerPolicy};
+use consort_proto::model::{ApprovalMode, CheckoutInfo, LocalMcpServerInfo, WorkerPolicy};
 use serde::{Deserialize, Serialize};
 
 use crate::WorkerError;
@@ -23,53 +17,51 @@ pub const KEY_FILE: &str = "worker.key";
 pub const DB_FILE: &str = "worker.db";
 /// The name of the workspaces folder.
 pub const WORKSPACES_DIR: &str = "workspaces";
-/// The name of the folder with one runtime folder per session.
-pub const RUNTIME_DIR: &str = "runtime";
+/// The name of the folder with the output of each process.
+pub const PROCESSES_DIR: &str = "processes";
+/// The name of the folder with the blob and skill caches.
+pub const CACHE_DIR: &str = "cache";
 /// The name of the lock file. A running worker holds an exclusive lock on
 /// it, so a second worker cannot use the same folder.
 pub const LOCK_FILE: &str = "worker.lock";
 
-/// Creates a folder and its parents. On Unix the folder gets mode 0700,
-/// also when it exists already, so only the user can read what the worker
-/// keeps in it. Parents that exist keep their mode.
+/// Creates a folder that only this user can read.
 pub fn create_private_dir(path: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(path)?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(path)?;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
     }
-    #[cfg(not(unix))]
-    {
-        std::fs::create_dir_all(path)
-    }
+    Ok(())
 }
 
-/// Why a local MCP server name cannot be used, or `None` when it can.
-///
-/// The name `hub` (in any case) is kept for the hub tools. A name with `__`
-/// could look like a hub tool: `hub__x` gives the tool `mcp__hub__x__tool`,
-/// which reads as the `hub` server with the tool `x__tool`.
-pub fn local_server_name_problem(name: &str) -> Option<&'static str> {
-    if name.trim().is_empty() {
-        Some("the name is empty")
-    } else if name.eq_ignore_ascii_case("hub") {
-        Some("Consort keeps the name `hub` for the hub tools")
-    } else if name.contains("__") {
-        Some("the name has `__`, which harnesses use between the server and the tool name")
-    } else {
-        None
+/// A path with `~` read as the user's home folder.
+pub fn expand_home(path: &str) -> PathBuf {
+    let home = || directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf());
+    if path == "~" {
+        return home().unwrap_or_else(|| PathBuf::from(path));
     }
+    if let Some(rest) = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\"))
+        && let Some(home) = home()
+    {
+        return home.join(rest);
+    }
+    PathBuf::from(path)
 }
 
 fn default_true() -> bool {
     true
 }
 
-/// The `[policy]` table.
+/// A new worker allows Auto. Full access is a choice that the user makes in
+/// the app.
+fn default_max_mode() -> ApprovalMode {
+    ApprovalMode::Auto
+}
+
+/// The limits of this worker. They are in `worker.db`, and they change only
+/// through the app (see [`crate::limits`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PolicyConfig {
     /// Folders that sessions may use. Empty means any folder.
@@ -81,12 +73,6 @@ pub struct PolicyConfig {
     /// Whether sessions may run shell commands.
     #[serde(default = "default_true")]
     pub allow_shell: bool,
-}
-
-/// A new worker allows Auto. Full access is a choice that the user makes
-/// in `worker.toml`.
-fn default_max_mode() -> ApprovalMode {
-    ApprovalMode::Auto
 }
 
 impl Default for PolicyConfig {
@@ -150,22 +136,9 @@ pub struct WorkerToml {
     /// The display name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    /// Tags for placement, added to the detected tags. Older files call
-    /// this `labels`.
-    #[serde(default, alias = "labels")]
+    /// Tags for placement, added to the detected tags.
+    #[serde(default)]
     pub tags: Vec<String>,
-    /// Deprecated and ignored. Older builds added an account for each
-    /// harness on `PATH`. A worker now has only the accounts that the user
-    /// adds (see docs/DECISIONS.md). The key still reads, so an older file
-    /// loads, and it is not written again.
-    #[serde(default, skip_serializing)]
-    pub auto_discover: Option<bool>,
-    /// The worker policy.
-    #[serde(default)]
-    pub policy: PolicyConfig,
-    /// The harness accounts.
-    #[serde(default)]
-    pub accounts: Vec<AccountConfig>,
     /// Local MCP servers.
     #[serde(default)]
     pub local_mcp_servers: Vec<LocalMcpServerConfig>,
@@ -175,12 +148,12 @@ pub struct WorkerToml {
 }
 
 impl WorkerToml {
-    /// The path of `worker.toml` in a folder.
+    /// The path of the file in a config folder.
     pub fn path(config_dir: &Path) -> PathBuf {
         config_dir.join(CONFIG_FILE)
     }
 
-    /// Reads `worker.toml`, or returns the defaults when it does not exist.
+    /// Reads the file. A missing file gives the defaults.
     pub fn load(config_dir: &Path) -> Result<Self, WorkerError> {
         let path = Self::path(config_dir);
         match std::fs::read_to_string(&path) {
@@ -193,18 +166,11 @@ impl WorkerToml {
         }
     }
 
-    /// Writes `worker.toml` through a temporary file, so a crash never
-    /// leaves half a file.
+    /// Writes the file.
     pub fn save(&self, config_dir: &Path) -> Result<(), WorkerError> {
-        create_private_dir(config_dir).map_err(|e| {
-            WorkerError::io(format!("could not create {}", config_dir.display()), e)
-        })?;
         let text = toml::to_string_pretty(self).map_err(|e| WorkerError::Config(e.to_string()))?;
         let path = Self::path(config_dir);
-        let tmp = path.with_extension("toml.tmp");
-        std::fs::write(&tmp, text)
-            .map_err(|e| WorkerError::io(format!("could not write {}", tmp.display()), e))?;
-        std::fs::rename(&tmp, &path)
+        std::fs::write(&path, text)
             .map_err(|e| WorkerError::io(format!("could not write {}", path.display()), e))
     }
 
@@ -220,121 +186,32 @@ impl WorkerToml {
             .collect()
     }
 
-    /// The account with this ID.
-    pub fn account(&self, id: consort_proto::ids::AccountId) -> Option<&AccountConfig> {
-        self.accounts.iter().find(|a| a.id == id)
+    /// The local MCP servers as the inventory shows them.
+    pub fn local_server_infos(&self) -> Vec<LocalMcpServerInfo> {
+        self.local_mcp_servers
+            .iter()
+            .map(|s| LocalMcpServerInfo {
+                name: s.name.clone(),
+                description: s.description.clone(),
+                tools: Vec::new(),
+            })
+            .collect()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use consort_harness::HarnessKind;
 
     #[test]
-    fn data_model_example_parses() {
-        let text = r#"
-hub_url = "https://hub.example.com"
-name = "bigboi"
-tags = ["windows-test", "gpu"]
-
-[policy]
-allowed_roots = ["C:/Users/chris/Code"]
-max_approval_mode = "auto_edits"
-allow_shell = true
-
-[[accounts]]
-id = "acc_0192f0c4-7a1e-7c3d-9b4a-2f1e0d9c8b7a"
-harness = "codex"
-label = "Codex Personal"
-binary = "codex"
-home = "~/.codex"
-shadow_home = "~/.local/share/app/homes/codex-personal"
-args = []
-env = {}
-enabled = true
-
-[[local_mcp_servers]]
-name = "home-assistant"
-transport = "http"
-url = "http://192.168.1.20:8123/mcp"
-
-[[checkouts]]
-repo_url = "git@github.com:watzon/sayso.git"
-path = "C:/Users/chris/Code/sayso"
-"#;
-        let config: WorkerToml = toml::from_str(text).unwrap();
-        assert_eq!(config.policy.max_approval_mode, ApprovalMode::AutoEdits);
-        assert_eq!(config.accounts[0].harness, HarnessKind::Codex);
-        assert_eq!(config.accounts[0].label, "Codex Personal");
-        assert_eq!(config.tags, ["windows-test", "gpu"]);
-        assert_eq!(config.auto_discover, None);
-        // A file from before the rename still loads its labels as tags.
-        let old: WorkerToml = toml::from_str(r#"labels = ["gpu"]"#).unwrap();
-        assert_eq!(old.tags, ["gpu"]);
-        assert_eq!(config.local_mcp_servers[0].name, "home-assistant");
-        assert_eq!(config.checkout_infos()[0].path, "C:/Users/chris/Code/sayso");
-    }
-
-    #[test]
-    fn local_server_names_that_look_like_hub_tools_are_refused() {
-        assert!(local_server_name_problem("home-assistant").is_none());
-        assert!(local_server_name_problem("github_tools").is_none());
-        for bad in ["hub", "HUB", "Hub", "hub__x", "a__b", " "] {
-            assert!(local_server_name_problem(bad).is_some(), "{bad}");
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn private_folders_have_mode_0700() {
-        use std::os::unix::fs::PermissionsExt;
+    fn a_missing_file_gives_the_defaults_and_a_saved_file_reads_back() {
         let dir = tempfile::tempdir().unwrap();
-        let folder = dir.path().join("a").join("worker");
-        create_private_dir(&folder).unwrap();
-        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode(&folder), 0o700);
-        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
-        WorkerToml::default().save(&folder).unwrap();
-        assert_eq!(mode(&folder), 0o700, "an existing folder becomes private");
-    }
-
-    #[test]
-    fn save_and_load_round_trip() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut config = WorkerToml::load(dir.path()).unwrap();
-        assert!(config.accounts.is_empty(), "a new worker has no accounts");
-        config.hub_url = Some("http://127.0.0.1:7600".into());
-        config.worker_id = Some(WorkerId::new());
-        let mut account = AccountConfig::default_for(HarnessKind::Codex);
-        account.label = "Codex Personal".into();
-        account.profile = true;
-        config.accounts.push(account);
-        let mut agent = AccountConfig::default_for(HarnessKind::Acp);
-        agent.profile = true;
-        agent.acp = Some(consort_proto::model::AcpAccountSpec::Registry { id: "goose".into() });
-        config.accounts.push(agent);
-        config.save(dir.path()).unwrap();
-        let text = std::fs::read_to_string(WorkerToml::path(dir.path())).unwrap();
-        assert!(text.contains("profile = true"), "{text}");
-        let back = WorkerToml::load(dir.path()).unwrap();
-        assert_eq!(back, config);
-        assert_eq!(back.accounts[0].label, "Codex Personal");
-    }
-
-    #[test]
-    fn the_old_auto_discover_key_reads_and_is_not_written() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            WorkerToml::path(dir.path()),
-            "auto_discover = true\nname = \"old\"\n",
-        )
-        .unwrap();
-        let config = WorkerToml::load(dir.path()).unwrap();
-        assert_eq!(config.auto_discover, Some(true));
-        assert!(config.accounts.is_empty());
-        config.save(dir.path()).unwrap();
-        let text = std::fs::read_to_string(WorkerToml::path(dir.path())).unwrap();
-        assert!(!text.contains("auto_discover"), "{text}");
+        let empty = WorkerToml::load(dir.path()).unwrap();
+        assert_eq!(empty, WorkerToml::default());
+        let mut toml = empty;
+        toml.name = Some("bigboi".to_owned());
+        toml.tags.push("gpu".to_owned());
+        toml.save(dir.path()).unwrap();
+        assert_eq!(WorkerToml::load(dir.path()).unwrap(), toml);
     }
 }

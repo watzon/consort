@@ -212,6 +212,14 @@ define_id!(
     /// One record in the audit log of connector tool calls (`ccl_`).
     ConnectorCallId, "ccl_"
 );
+define_id!(
+    /// One call of a paid tool through Monid (`mnc_`).
+    MonidCallId, "mnc_"
+);
+define_id!(
+    /// Temporary access that the user gave (`acg_`).
+    AccessGrantId, "acg_"
+);
 
 macro_rules! define_text_id {
     ($(#[$meta:meta])* $name:ident) => {

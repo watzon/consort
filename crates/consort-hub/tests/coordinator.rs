@@ -6,9 +6,12 @@
 
 use crate::common::*;
 use consort_proto::client_api::{EntityPayload, MessageList, SnapshotScope, WorkerSetPaused};
-use consort_proto::model::{Author, ItemStatus, MessageKind, SessionRole, SessionState};
-use consort_proto::worker_link::{HubToWorker, SessionEvent, TurnEndReason};
+use consort_proto::model::{
+    Author, Channel, CoordinatorBlockedKind, ItemStatus, MessageKind, SessionRole, SessionState,
+};
+use consort_proto::session_host_link::{HubToSessionHost, SessionEvent, TurnEndReason};
 use serde_json::json;
+use std::time::Duration;
 
 #[tokio::test]
 async fn a_user_message_starts_a_coordinator_and_its_post_reaches_the_client() {
@@ -19,7 +22,7 @@ async fn a_user_message_starts_a_coordinator_and_its_post_reaches_the_client() {
 
     // The hub starts a coordinator session on the worker.
     let (request, command) = world.worker.next_command().await;
-    let HubToWorker::SessionStart(start) = command else {
+    let HubToSessionHost::SessionStart(start) = command else {
         panic!("expected session.start");
     };
     assert_eq!(start.role, SessionRole::Coordinator);
@@ -51,7 +54,7 @@ async fn a_user_message_starts_a_coordinator_and_its_post_reaches_the_client() {
         .worker
         .respond_ok(
             &request,
-            &consort_proto::worker_link::SessionStartResult {
+            &consort_proto::session_host_link::SessionStartResult {
                 workspace_path: "/tmp/ws".to_owned(),
                 native_ref: None,
             },
@@ -127,7 +130,7 @@ async fn a_second_message_goes_to_the_same_session_as_a_turn() {
     // The first turn was part of session.start, so the next message is a turn.
     world.say(world.tutti, "Second").await;
     let (request, command) = world.worker.next_command().await;
-    let HubToWorker::SessionTurn(turn) = command else {
+    let HubToSessionHost::SessionTurn(turn) = command else {
         panic!(
             "expected session.turn, got {}",
             consort_proto::frame::MessageFamily::type_name(&command)
@@ -143,7 +146,7 @@ async fn a_second_message_goes_to_the_same_session_as_a_turn() {
         .worker
         .respond_ok(
             &request,
-            &consort_proto::worker_link::SessionTurnResult {
+            &consort_proto::session_host_link::SessionTurnResult {
                 turn_id: "t2".into(),
             },
         )
@@ -176,7 +179,7 @@ async fn messages_during_a_turn_wait_and_go_out_together_after_it() {
         )
         .await;
     let (_, command) = world.worker.next_command().await;
-    let HubToWorker::SessionTurn(turn) = command else {
+    let HubToSessionHost::SessionTurn(turn) = command else {
         panic!("expected session.turn");
     };
     assert!(turn.turn.text.contains("Wait one"));
@@ -297,41 +300,146 @@ async fn a_lost_session_in_the_middle_of_a_turn_puts_the_events_back() {
     world.hub.handle.shutdown().await.unwrap();
 }
 
-#[tokio::test]
-async fn without_a_worker_the_hub_says_why_and_starts_when_one_connects() {
-    let hub = TestHub::start().await;
-    let mut client = FakeClient::pair_and_connect(&hub).await;
-    let tutti = client.tutti().await;
-    let snapshot = client.snapshot(SnapshotScope::All).await;
-    client.subscribe(snapshot.seq).await.unwrap();
+/// The channel in a snapshot of the channel.
+async fn channel_of(client: &mut FakeClient, id: consort_proto::ids::ChannelId) -> Channel {
+    client
+        .snapshot(SnapshotScope::Channel(id))
+        .await
+        .channels
+        .into_iter()
+        .find(|c| c.id == id)
+        .unwrap()
+}
+
+async fn send_to(client: &mut FakeClient, tutti: consort_proto::ids::ChannelId, body: &str) {
     client
         .request(consort_proto::client_api::MessageSend {
             channel_id: tutti,
-            client_message_id: "a".to_owned(),
-            body: "Anyone there?".to_owned(),
+            client_message_id: body.to_owned(),
+            body: body.to_owned(),
             attachments: Vec::new(),
             thread_root_id: None,
             in_timeline: false,
         })
         .await
         .unwrap();
-    let notice = client
-        .wait_feed(|e| matches!(upserted(e), Some(EntityPayload::Message(m)) if m.kind == MessageKind::Notice))
-        .await;
-    let Some(EntityPayload::Message(notice)) = upserted(&notice) else {
-        unreachable!()
-    };
-    assert!(
-        notice.body.contains("assistant_unavailable"),
-        "{}",
-        notice.body
-    );
-    assert!(notice.body.contains("worker"), "{}", notice.body);
+}
 
-    // A worker connects. The queued message starts a session.
+/// With no session host, the hub posts no message. It waits for the grace
+/// period, then it sets the live state on the channel, and the state goes
+/// away when a session host connects and the waiting message goes out.
+#[tokio::test]
+async fn without_a_worker_the_hub_sets_a_live_state_and_starts_when_one_connects() {
+    let hub = TestHub::start().await;
+    hub.handle.set_blocked_grace(Duration::from_millis(300));
+    let mut client = FakeClient::pair_and_connect(&hub).await;
+    let tutti = client.tutti().await;
+    send_to(&mut client, tutti, "Anyone there?").await;
+
+    // In the grace period, the channel says nothing.
+    assert!(
+        channel_of(&mut client, tutti)
+            .await
+            .coordinator_blocked
+            .is_none()
+    );
+    // After it, the live state names the cause.
+    let deadline = tokio::time::Instant::now() + WAIT;
+    let blocked = loop {
+        if let Some(blocked) = channel_of(&mut client, tutti).await.coordinator_blocked {
+            break blocked;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no live state after the grace period"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(blocked.kind, CoordinatorBlockedKind::NoPlacement);
+    assert!(
+        blocked.reason.contains("session host"),
+        "{}",
+        blocked.reason
+    );
+    // No message says it: the timeline holds the message of the user only.
+    let snapshot = client.snapshot(SnapshotScope::Channel(tutti)).await;
+    assert!(
+        snapshot
+            .messages
+            .iter()
+            .all(|m| m.kind != MessageKind::Notice),
+        "{:?}",
+        snapshot.messages
+    );
+
+    // The session host connects. The queued message starts a session, and
+    // the live state goes away.
     let mut worker = FakeWorker::pair_and_connect(&hub).await;
     let start = worker.accept_session_start().await;
     assert!(start.turn.unwrap().text.contains("Anyone there?"));
+    assert!(
+        channel_of(&mut client, tutti)
+            .await
+            .coordinator_blocked
+            .is_none()
+    );
+    hub.handle.shutdown().await.unwrap();
+}
+
+/// A session host that connects within the grace period shows no line at
+/// all: this is the start of the hub.
+#[tokio::test]
+async fn a_worker_that_connects_in_the_grace_period_shows_no_live_state() {
+    let hub = TestHub::start().await;
+    hub.handle.set_blocked_grace(Duration::from_secs(30));
+    let mut client = FakeClient::pair_and_connect(&hub).await;
+    let tutti = client.tutti().await;
+    send_to(&mut client, tutti, "Anyone there?").await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        channel_of(&mut client, tutti)
+            .await
+            .coordinator_blocked
+            .is_none()
+    );
+    let mut worker = FakeWorker::pair_and_connect(&hub).await;
+    worker.accept_session_start().await;
+    assert!(
+        channel_of(&mut client, tutti)
+            .await
+            .coordinator_blocked
+            .is_none()
+    );
+    hub.handle.shutdown().await.unwrap();
+}
+
+/// A stored live state belongs to a hub that has stopped. A new hub clears it.
+#[tokio::test]
+async fn a_new_hub_clears_a_stored_live_state() {
+    let hub = TestHub::start().await;
+    hub.handle.set_blocked_grace(Duration::from_millis(100));
+    let mut client = FakeClient::pair_and_connect(&hub).await;
+    let tutti = client.tutti().await;
+    send_to(&mut client, tutti, "Anyone there?").await;
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while channel_of(&mut client, tutti)
+        .await
+        .coordinator_blocked
+        .is_none()
+    {
+        assert!(tokio::time::Instant::now() < deadline, "no live state");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let (client_id, key) = (client.client_id, client.key.clone());
+    let hub = hub.restart().await;
+    let mut client = FakeClient::connect(&hub, client_id, key).await;
+    let tutti = client.tutti().await;
+    assert!(
+        channel_of(&mut client, tutti)
+            .await
+            .coordinator_blocked
+            .is_none()
+    );
     hub.handle.shutdown().await.unwrap();
 }
 
@@ -374,7 +482,7 @@ async fn session_items_reach_the_client_and_fast_updates_merge() {
     let start = world.start_coordinator("Work").await;
     let item_id = consort_proto::ids::ItemId::new();
     let make = |text: &str, status: ItemStatus| {
-        consort_proto::worker_link::SessionEvent::Item(consort_proto::model::SessionItem {
+        consort_proto::session_host_link::SessionEvent::Item(consort_proto::model::SessionItem {
             id: item_id,
             session_id: start.session_id,
             turn_id: "t1".into(),
@@ -469,7 +577,7 @@ async fn a_reopened_session_drops_its_old_turn_and_requests() {
     };
     assert!(notice.body.contains("worker restarted"), "{}", notice.body);
     let (_, command) = world.worker.next_command().await;
-    let HubToWorker::SessionTurn(turn) = command else {
+    let HubToSessionHost::SessionTurn(turn) = command else {
         panic!("expected session.turn");
     };
     assert_eq!(turn.session_id, start.session_id);

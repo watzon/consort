@@ -62,7 +62,7 @@ fn every_connector_and_skill_page_and_dialog_opens(cx: &mut TestAppContext) {
         Dialog::ConfirmDisconnect(mx::CON_GITHUB.into()),
         Dialog::AddSkill,
         Dialog::ConfirmRemoveSkill(mx::SKL_PDF.into()),
-        Dialog::AccountSettings("wrk_bigboi".into(), "acc_bigboi_claude".into()),
+        Dialog::AccountSettings("wrk_session_host".into(), "acc_hub_claude".into()),
     ];
     for dialog in dialogs {
         cx.update(|window, cx| {
@@ -339,8 +339,14 @@ fn the_connectors_tab_lists_the_items_and_the_switch_turns_one_off(cx: &mut Test
     for id in &on {
         bounds(cx, &format!("channel-item-{id}"));
     }
+    // The Monid row counts when Monid is on in the channel.
     app.read_with(cx, |app, _| {
-        assert_eq!(app.connectors_tab_count(mx::ACME), on.len() + skills_on)
+        let monid =
+            consort_client::monid::channel_row(&app.state, mx::ACME).is_some_and(|row| row.enabled);
+        assert_eq!(
+            app.connectors_tab_count(mx::ACME),
+            on.len() + skills_on + usize::from(monid)
+        )
     });
     bounds(cx, "channel-add-connector");
     // The rows stay inside the panel.
@@ -375,36 +381,6 @@ fn the_connectors_tab_opens_the_add_connector_dialog(cx: &mut TestAppContext) {
     app.read_with(cx, |app, _| {
         assert_eq!(app.dialog.as_ref(), Some(&Dialog::AddConnector));
         assert_eq!(app.page, Page::Main);
-    });
-}
-
-/// The account dialog turns the provider extras off.
-#[gpui::test]
-fn the_account_dialog_turns_the_extras_off(cx: &mut TestAppContext) {
-    let (handle, app) = open_app(cx, consort_client::mock::view_state());
-    let cx = &mut VisualTestContext::from_window(handle, cx);
-    cx.update(|_, cx| {
-        app.update(cx, |app, cx| {
-            let client = app.client.clone();
-            app.spawn_command(cx, async move {
-                client
-                    .run(consort_client::Command::SetAccountExtras {
-                        worker_id: "wrk_bigboi".into(),
-                        account_id: "acc_bigboi_claude".into(),
-                        enabled: false,
-                    })
-                    .await
-            });
-        })
-    });
-    settle(cx);
-    app.read_with(cx, |app, _| {
-        let account = app
-            .state
-            .worker("wrk_bigboi")
-            .and_then(|w| w.account("acc_bigboi_claude"))
-            .expect("the account");
-        assert!(!account.extras_enabled);
     });
 }
 

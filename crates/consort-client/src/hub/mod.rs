@@ -16,6 +16,7 @@ mod extensions;
 mod files;
 mod knowledge;
 mod link;
+mod monid;
 mod outbox;
 mod proactivity;
 mod save;

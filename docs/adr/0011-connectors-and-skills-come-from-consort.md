@@ -29,12 +29,12 @@ Scope:
 
 Management:
 
-- Management tools are hub tools with audiences: the Everything coordinator manages everything, a channel's coordinator manages its own channel. A change that is new and narrow, or that makes access smaller or approvals stricter, runs at once. A change that deletes, widens access, loosens approvals, turns on scripts, changes tags or turns on provider extras waits for the user on a management approval card. Sign-ins and keys always go through a card that the user completes.
+- Management tools are hub tools with audiences: the Everything coordinator manages everything, a channel's coordinator manages its own channel. A change that is new and narrow, or that makes access smaller or approvals stricter, runs at once. A change that deletes, widens access, loosens approvals, turns on scripts or changes tags waits for the user on a management approval card. Sign-ins and keys always go through a card that the user completes.
 - Every card is an approval entity (a hub card), so the existing approval cards, `approval.answer`, push notifications and Needs input work for it.
 
 Provider extras:
 
-- Each harness account has an extras toggle, on by default. Off starts the harness without its account-synced extras, as far as the provider lets the worker turn them off.
+- Each harness account had an extras toggle, on by default. Later decision, 2026-10-30: the toggle is removed. Provider extras are always off, as far as the provider lets the session host turn them off (DECISIONS row 806).
 
 ## Considered options
 

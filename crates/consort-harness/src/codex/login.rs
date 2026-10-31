@@ -57,7 +57,11 @@ impl std::fmt::Debug for ChatgptLogin {
 /// Starts `codex app-server` for an account in a temporary folder.
 async fn open(account: &AccountConfig) -> Result<Connection, HarnessError> {
     let dir = std::env::temp_dir();
-    connect(account, &dir, Default::default(), None).await
+    let place = super::Place {
+        session: &dir,
+        mcp_urls: Vec::new(),
+    };
+    connect(account, &dir, Default::default(), None, &place).await
 }
 
 impl ChatgptLogin {

@@ -9,8 +9,8 @@ use crate::common::*;
 use consort_proto::error::{ErrorBody, ErrorCode};
 use consort_proto::frame::MessageFamily;
 use consort_proto::model::AuthState;
+use consort_proto::session_host_link::{HubToSessionHost, SessionEvent};
 use consort_proto::status::TaskStatus;
-use consort_proto::worker_link::{HubToWorker, SessionEvent};
 
 /// Starts a coordinator, which starts a task, and returns the task ID and
 /// the task's `session.start` request, which the worker has not answered.
@@ -19,7 +19,7 @@ async fn task_start_request(
 ) -> (
     consort_proto::ids::TaskId,
     consort_proto::frame::RequestFrame,
-    consort_proto::worker_link::SessionStart,
+    consort_proto::session_host_link::SessionStart,
 ) {
     let coordinator = world.start_coordinator("Please do this").await;
     let started = world
@@ -32,7 +32,7 @@ async fn task_start_request(
         .await;
     let task_id = started["task_id"].as_str().unwrap().parse().unwrap();
     let (request, command) = world.worker.next_command().await;
-    let HubToWorker::SessionStart(start) = command else {
+    let HubToSessionHost::SessionStart(start) = command else {
         panic!("expected session.start, got {}", command.type_name());
     };
     (task_id, request, start)
@@ -59,7 +59,7 @@ async fn a_start_that_conflicts_stops_the_session_on_the_worker() {
             .worker
             .respond_ok(&request, &serde_json::json!({}))
             .await;
-        if let HubToWorker::SessionStop(stop) = command {
+        if let HubToSessionHost::SessionStop(stop) = command {
             assert_eq!(stop.session_id, start.session_id);
             break;
         }

@@ -240,7 +240,8 @@ impl ConsortApp {
                                 detail(t),
                                 c.text_tertiary,
                             )
-                            .flex_1(),
+                            .flex_1()
+                            .min_w_0(),
                         ),
                     every_error,
                     t,
@@ -531,7 +532,11 @@ impl ConsortApp {
                     .rounded(t.radius.md)
                     .cursor_pointer()
                     .hover(|s| s.bg(c.surface_selected))
-                    .child(line(zone.to_owned(), t.text.ui, c.text_primary).flex_1())
+                    .child(
+                        line(zone.to_owned(), t.text.ui, c.text_primary)
+                            .flex_1()
+                            .min_w_0(),
+                    )
                     .when(zone == local, |d| {
                         d.child(text("Your time zone", detail(t), c.text_tertiary))
                     })
@@ -571,7 +576,7 @@ impl ConsortApp {
                     .border_b(t.border_width)
                     .border_color(c.border_subtle)
                     .child(icon("search", t.icon.dense, c.text_tertiary))
-                    .child(div().flex_1().child(crate::ui::parts::input(
+                    .child(div().flex_1().min_w_0().child(crate::ui::parts::input(
                         &self.knowledge_inputs.zone_search,
                         t.text.ui,
                     ))),
@@ -699,7 +704,7 @@ impl ConsortApp {
                     .items_center()
                     .gap(t.space.xs)
                     .child(nav("calendar-prev", "chevron-left", cal.prev, cx))
-                    .child(div().flex_1().flex().justify_center().child(text(
+                    .child(div().flex_1().min_w_0().flex().justify_center().child(text(
                         cal.title,
                         t.text.ui_strong,
                         c.text_primary,

@@ -44,8 +44,13 @@ impl ConsortApp {
             .child(
                 column(t)
                     .child(header("Hub", line, None, t))
+                    .when_some(self.state.boundary_warning(), |d, warning| {
+                        d.child(
+                            error_box("hub-boundary-warning", warning, t)
+                                .debug_selector(|| "hub-boundary-warning".into()),
+                        )
+                    })
                     .child(self.hub_connection(&hub, t, cx))
-                    .child(self.hub_accounts(t, cx))
                     .child(hub_storage(&hub, t))
                     .child(self.hub_backup(&hub, t, window, cx)),
             )
@@ -75,49 +80,6 @@ impl ConsortApp {
             ),
         };
         header("Hub", div(), None, t).child(div()).child(body)
-    }
-
-    /// Whether work moves to another account at a usage limit.
-    fn hub_accounts(&self, t: &Tokens, cx: &mut Context<Self>) -> Div {
-        let c = &t.colors;
-        let on = self.state.account_fallback;
-        div()
-            .flex()
-            .flex_col()
-            .gap(t.space.md)
-            .child(section_title("Accounts", t))
-            .child(
-                rows(t).child(
-                    row(false, t)
-                        .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .flex_1()
-                                .min_w_0()
-                                .child(text(
-                                    "Move to another account at a usage limit",
-                                    t.text.ui,
-                                    c.text_primary,
-                                ))
-                                .child(hint(
-                                    "A chat or a task goes on with another signed-in account of the same harness that has the same model. It stays there until the session ends.",
-                                    t,
-                                )),
-                        )
-                        .child(
-                            crate::ui::settings::switch("account-fallback", on, t)
-                                .debug_selector(|| "account-fallback".into())
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    let client = this.client.clone();
-                                    this.spawn_command(cx, async move {
-                                        client.set_account_fallback(!on).await
-                                    });
-                                    cx.notify();
-                                })),
-                        ),
-                ),
-            )
     }
 
     fn hub_connection(&self, hub: &HubStatusView, t: &Tokens, cx: &mut Context<Self>) -> Div {
@@ -210,6 +172,7 @@ impl ConsortApp {
                     .flex()
                     .flex_col()
                     .flex_1()
+                    .min_w_0()
                     .gap(t.space.xxs)
                     .child(section_title("Backup", t))
                     .child(text(
@@ -299,7 +262,7 @@ impl ConsortApp {
         let frequency = backup.frequency;
         let schedule = row(false, t)
             .child(row_label("Schedule", t))
-            .child(div().flex_1())
+            .child(div().flex_1().min_w_0())
             .child(
                 segmented(
                     "backup-frequency",
@@ -542,12 +505,8 @@ fn hub_storage(hub: &HubStatusView, t: &Tokens) -> Div {
                 .flex()
                 .items_end()
                 .gap(t.space.md)
-                .child(section_title("Storage", t).flex_1())
-                .child(text(
-                    hub.storage.summary.clone(),
-                    t.text.ui,
-                    c.text_tertiary,
-                )),
+                .child(section_title("Storage", t).flex_1().min_w_0())
+                .child(text(hub.storage.summary.clone(), t.text.ui, c.text_tertiary).min_w_0()),
         )
         .child(bar)
         .child(legend)

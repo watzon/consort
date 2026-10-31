@@ -226,6 +226,8 @@ pub struct Opacity {
     pub offline_mark: f32,
     /// The bubble of a message that waits in the outbox.
     pub queued: f32,
+    pub tint: f32,
+    pub dictation_border: f32,
 }
 
 /// Sizes of single components that no other token covers. Each one comes
@@ -250,6 +252,8 @@ pub struct Components {
     pub account_state: f32,
     /// The action column of an account row: Sign out, Sign in.
     pub account_action: f32,
+    /// The three dots button at the end of a row.
+    pub row_dots: f32,
     /// The version column of a tool row.
     pub tool_version: f32,
     /// The state column of a tool row: Up to date, Update to X.
@@ -270,6 +274,10 @@ pub struct Components {
     pub tag_label: f32,
     /// A select in a settings row.
     pub settings_select: f32,
+    /// The Language and Input device selects of Settings > Dictation.
+    pub dictation_select: f32,
+    /// The Cleanup model select. It has the name and the size of the model.
+    pub dictation_cleanup_select: f32,
     /// The Group select in the New channel dialog.
     pub group_select: f32,
     /// The Workspace control in the New channel dialog.
@@ -341,8 +349,23 @@ pub struct Components {
     pub chat: Chat,
     pub proactivity: Proactivity,
     pub voice: Voice,
+    pub fallback: Fallback,
     pub theme_preview: ThemePreview,
     pub convo: Convo,
+}
+
+/// The sizes of the fallback path in Settings > Models and of its path
+/// lines in a notice and in an error card. From the designs P2, B2 and B4.
+#[derive(Clone, Copy, Debug, Deserialize)]
+pub struct Fallback {
+    /// The drag handle at the left of a step.
+    pub handle: f32,
+    /// The number of a step.
+    pub number: f32,
+    /// The lane of the place ("First choice", "Step 2") in a path line.
+    pub place: f32,
+    /// The height of the empty slot that a lifted step leaves.
+    pub slot: f32,
 }
 
 /// The sizes of Settings > Voice and of the card of a draft in your voice.
@@ -750,6 +773,11 @@ pub struct Chat {
     /// The line of a request after the answer (an approval, a draft): one
     /// box with a glyph, the action, the answer and a chevron.
     pub answered_line: f32,
+    pub mic_stop: f32,
+    pub mic_bar: f32,
+    pub mic_bar_gap: f32,
+    pub mic_bar_max: f32,
+    pub mic_dot: f32,
 }
 
 /// The drawing of a theme in its card: a miniature sidebar, two lines of
@@ -990,6 +1018,15 @@ mod tests {
         assert_eq!(
             (a.dock_tile, a.dock_badge, a.banner_width),
             (40.0, 18.0, 360.0)
+        );
+    }
+
+    #[test]
+    fn fallback_tokens_keep_the_values_of_the_designs() {
+        let f = super::structure().component.fallback;
+        assert_eq!(
+            (f.handle, f.number, f.place, f.slot),
+            (16.0, 24.0, 112.0, 48.0)
         );
     }
 

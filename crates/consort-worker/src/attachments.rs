@@ -2,7 +2,7 @@
 //!
 //! Before a turn starts, the worker downloads each attachment of the turn
 //! with the signed blob GET, checks its SHA-256, and saves it at
-//! [`consort_harness::attachments::attachment_path`] in the workspace. The
+//! [`consort_proto::attachment_names::attachment_path`] in the workspace. The
 //! adapters find the files there and tell the model the paths.
 //!
 //! The channel files go into a read-only copy in
@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use async_trait::async_trait;
-use consort_harness::attachments::{CHANNEL_FILES_DIR, attachment_path, format_size};
+use consort_proto::attachment_names::{CHANNEL_FILES_DIR, attachment_path, format_size};
 use consort_proto::model::{BlobRef, FileRef, Sha256Hash, validate_relative_path};
 use sha2::{Digest, Sha256};
 
@@ -115,7 +115,7 @@ fn temp_next_to(target: &Path) -> PathBuf {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
     let short: String = name.chars().take(40).collect();
-    target.with_file_name(format!(".{short}.{}.tmp", uuid::Uuid::new_v4().simple()))
+    target.with_file_name(format!(".{short}.{}.tmp", uuid::Uuid::now_v7().simple()))
 }
 
 /// Whether a path is a regular file, without following a link.
@@ -546,10 +546,7 @@ mod tests {
                 .unwrap()
                 .get(sha256.as_str())
                 .cloned()
-                .ok_or_else(|| WorkerError::Hub {
-                    code: consort_proto::error::ErrorCode::NotFound,
-                    message: "no such blob".into(),
-                })?;
+                .ok_or_else(|| WorkerError::Network("no such blob".into()))?;
             assert!(bytes.len() as u64 <= max_bytes);
             std::fs::write(dest, bytes).unwrap();
             Ok(())

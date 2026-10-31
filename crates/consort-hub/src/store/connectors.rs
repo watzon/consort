@@ -6,8 +6,9 @@
 //! clients see. No row holds a credential.
 
 use consort_proto::client_api::{EntityKind, EntityPayload};
-use consort_proto::ids::{ConnectionId, ConnectorCallId};
+use consort_proto::ids::{ConnectionId, ConnectorCallId, TaskId};
 use consort_proto::model::{Channel, Connection, ConnectionStatus, ConnectorCall, ToolKind};
+use consort_proto::time::Timestamp;
 use rusqlite::{Connection as Db, OptionalExtension, params};
 
 use super::{Tx, get_doc, list_docs, parse_doc, to_doc};
@@ -142,9 +143,34 @@ pub fn is_usable(connection: &Connection) -> bool {
 /// The connections of a channel's effective set: their `use_in` matches
 /// the channel, the channel did not turn them off, and they can be used.
 pub fn effective_connections(conn: &Db, channel: &Channel) -> Result<Vec<Connection>> {
+    effective_connections_for(conn, channel, None)
+}
+
+/// The connections that a session of this task, or a coordinator with
+/// `None`, can use now: the channel's, plus temporary access.
+pub fn effective_connections_for(
+    conn: &Db,
+    channel: &Channel,
+    task_id: Option<TaskId>,
+) -> Result<Vec<Connection>> {
+    let now = Timestamp::now();
     Ok(connections(conn)?
         .into_iter()
-        .filter(|c| c.is_available_in(channel) && is_usable(c))
+        .filter(|c| c.is_available_for(channel, task_id, now) && is_usable(c))
+        .collect())
+}
+
+/// The connections that work but that this session cannot use. A session
+/// may see their names and ask for them.
+pub fn requestable_connections(
+    conn: &Db,
+    channel: &Channel,
+    task_id: Option<TaskId>,
+) -> Result<Vec<Connection>> {
+    let now = Timestamp::now();
+    Ok(connections(conn)?
+        .into_iter()
+        .filter(|c| !c.is_available_for(channel, task_id, now) && is_usable(c))
         .collect())
 }
 

@@ -68,7 +68,7 @@ One turn at a time per channel is the rule that keeps "one assistant" true. Two 
 ### A harness asks for permission
 
 1. The harness asks to run a command. The adapter emits `request.opened`.
-2. The hub creates an approval, posts an approval card in the task thread, moves the task to `needs_input`, and sends a push notification.
+2. The hub creates an approval, posts an approval card in the task thread, and moves the task to `needs_input`. The client shows a notification. The hub does not wake the coordinator, because the coordinator cannot answer an approval.
 3. The user answers on any client. The hub sends `session.respond` to the worker, and the harness continues.
 
 A decision works the same way from the user's side, but the assistant starts it with `ask_decision`. A decision does not block the turn. The turn ends, and the answer arrives as input to the next turn. So a session never holds a tool call open for hours.
@@ -146,15 +146,35 @@ The client shows Settings > Voice, the offer with "Open the full guide", the voi
 
 A task runs on the first of these that exists: its own selection, the task selection of its channel, the task selection of Tutti, and the coordinator selection that its channel uses. The first two are choices of the user: when no worker can run them, the task waits or fails. The other two are defaults: when the task needs a worker without that account, the default rule of placement decides. When a task starts, the hub saves its account and model on the task, so a later change to the channel does not move it.
 
-### The move to another account at a usage limit
+### The fallback path
 
-A turn that fails with the kind `rate_limit` marks its account as limited in `account_limits`, until the limit resets. While `account_fallback` is on, placement does not choose a limited account when another signed-in account of the same harness has the same model and can keep the approval mode. The move never goes to another harness or another model.
+The user keeps one global path of models. The hub stores it in the preferences and sends it to every client. A step is an account, a model and an effort. The path has four parts, in this order:
 
-- **A task** gets the new account as its selection, and the hub ends its session and starts a new one on the same worker. The new session keeps the workspace and goes on from the brief and the task thread, as after a change of model. The task stays on that account.
-- **The assistant** gets a new session on the new account, and the events of the failed turn go back to the queue. The session stays on that account until it ends. A later session goes back to the chosen account when its limit has reset.
-- **Both accounts at their limit:** the task fails, or the channel shows the error, as with one account. No turn runs in a loop, because the move needs an account that is not limited.
+1. **The first choice.** This is the model of the channel (or of the task). It is not stored in the path.
+2. **Other accounts with the same model.** A built-in row, on by default. It moves the work to another signed-in account of the same harness that has the same model. It replaces the old `account_fallback` switch.
+3. **The steps of the user.** At most 10, in order. No account and model is in the path twice.
+4. **Stop and show the error.** A fixed row. It is not stored.
 
-The thread or the channel gets an `account_fallback` notice that names both accounts.
+Two causes start a move. A turn that fails with the kind `rate_limit` marks its account as limited in `account_limits`. A turn that fails with the kind `provider_outage` (the provider is down or overloaded) starts a move only after 3 failed tries of the same session, counted in `session_outage_tries`. The first failure and two retries run on the first choice. A sign-in problem starts no move, because the user can fix it.
+
+The walk goes through the parts in order and takes the first step that can answer. It skips a step, and records the reason, in these cases:
+
+| Reason | When |
+|---|---|
+| Limited | The account is at a usage limit, or its provider is in an outage hold |
+| Signed out | The account is signed out, or its sign-in expired |
+| Unavailable | No account has this label, or the account does not offer the model |
+| Mode | The account cannot keep the approval mode of the channel or the task. A step never lowers the mode |
+
+A worker is never a reason to skip a step. All accounts are on the hub machine, so the hub does not look at the worker when it walks the path.
+
+A hold lasts until the provider's reset time. When the provider gives no time, a usage limit holds for one hour (DECISIONS 753) and an outage holds for 10 minutes. An outage hold covers every account of the same harness, because the provider is the same.
+
+- **A task** gets the new account and model as its selection. The hub ends its session and starts a new one on the same worker, in the same workspace. The task stays where it moved, and the user can change its model.
+- **The assistant** gets a new session on the step. The hub saves `coordinator_fallback` on the channel (the first choice, the step, the cause and the reset time), and the events of the failed turn go back to the queue. At the reset time the maintenance tick sends the assistant back to its first choice when it is idle, and the hub posts a `fallback_returned` notice. "Go back now" (`channel.go_back`) does the same after the reset, and is refused while a turn runs. When the provider gave no reset time, the hold time is the reset time.
+- **No step can answer:** the task fails, or the channel shows a `turn_failed` notice. The notice has `path`, the lines of the walk, so the client can show what Consort tried and skipped. No turn runs in a loop, because a move needs a step that is not held.
+
+The move adds a notice to the thread or the channel (`account_fallback`). When the walk skips a signed-out account, the hub also adds `fallback_signed_out`. When the step is on another harness than the first choice, the notice names the provider, because the work and its context go to that provider. The first step on another harness needs a confirm in the client. The approval mode stays the same on every step.
 
 ### The model of the assistant
 
@@ -173,30 +193,32 @@ Consort, not the provider of each harness, is the source of the assistant's conn
 ```
 
 - **Connectors.** The user brings a Composio key, which only the hub holds. Each connection is one connected account of one service, with a handle such as `gmail_work`. A session sees the connections of its channel in a "Connectors in this channel" block, and uses them only through `list_connector_tools`, `get_connector_tool` and `run_connector_tool`. Tool schemas stay out of the context until the assistant asks for the tools of one connector. The hub checks the scope, applies the approval rule of the tool kind, runs the call with the exact connected account, and writes an audit record.
+- **Monid.** Monid is a catalog of paid tools with one wallet. The hub holds the key and calls its API. A session uses `search_tools`, `get_monid_tool` and `run_monid_tool`. The hub checks access, limits and approvals on each call, starts a run once, follows it, and writes one row with what ran, what came back and what it cost. See ADR 0016.
+- **Access requests.** A session sees the names of the connections and of Monid that its channel lacks, and asks with `request_access`. The user answers on a card with temporary access, lasting access or no. See ADR 0017.
 - **Skills.** The hub installs a skill from a git repo, a directory entry or an upload, pins it to a commit and a content hash, and stores its files as blobs. The worker gets the skills of a session by hash and writes them where its harness reads skills (a plugin folder for Claude Code, a skills folder for Codex and Gemini CLI, the `skills` paths of OpenCode). A harness with no skill support gets `list_skills` and `read_skill`.
 - **Scope.** Each connection and skill has a "Use in" scope: every channel, the channels with all of some tags, or a list of channels. A channel can turn off an item that its scope gives it (a channel exception). The effective set of a session is fixed when the session starts.
 - **Cards.** A connector approval, a connect card, a sign-in card, an install card and a management approval card are approvals that the hub makes itself (hub cards). They use the approval card, `approval.answer`, push and Needs input. When a card that a coordinator posted closes, the coordinator gets a `card_answered` event.
-- **Management.** The Tutti coordinator manages everything, and a channel's coordinator manages its own channel. The hub enforces the risk rule: a narrow or stricter change runs at once, and a change that deletes, widens access, loosens approvals, turns on scripts, changes tags or turns on provider extras waits for the user. The assistant never handles a secret.
-- **Provider extras.** Each harness account has a toggle for what it syncs from the provider, such as claude.ai connectors. It is on by default. Off starts the harness without them, as far as the provider lets the worker turn them off.
+- **Management.** The Tutti coordinator manages everything, and a channel's coordinator manages its own channel. The hub enforces the risk rule: a narrow or stricter change runs at once, and a change that deletes, widens access, loosens approvals, turns on scripts or changes tags waits for the user. The assistant never handles a secret.
+- **Provider extras.** What a provider syncs to an account, such as claude.ai connectors, is always off, as far as the provider lets the session host turn it off. There is no setting. Connectors and skills come from Consort only (ADR 0011).
 
 ## Placement
 
-Placement turns a task's model selection and placement request into one worker and one harness account. It follows these steps in order:
+Placement makes two separate choices. The model selection chooses one harness account in the session host. The placement request chooses the execution worker where the tools of the task run. The second choice follows these steps in order:
 
 1. If the request names a worker, use it. If that worker is offline, keep the task in `up_next` with the reason. If the worker cannot satisfy the request, fail with the reason.
-2. Collect the online workers that have a signed-in harness account with the selected label and model.
+2. Collect the online execution workers. The session host must have a signed-in harness account with the selected label and model.
 3. Remove the workers that fail the `require` constraints (OS, tags, local MCP servers) or whose policy forbids the requested approval mode or the needed folders. A worker must also have every tag of the channel. Its tags are its user tags and the tags in its inventory.
 4. Prefer workers that already have a checkout of the task's repos.
 5. Prefer the channel's `preferred_workers`, in order.
 6. Prefer the worker with the fewest active sessions.
 
-When no online worker has the channel's tags, the work waits, and the reason names the tags, for example "Waiting for an online worker with the tag work. Add the tag in Settings > Workers." Coordinator turns and routine runs follow the same rule as tasks.
+When no online worker has the channel's tags, a task waits, and the reason names the tags, for example "Waiting for an online worker with the tag work. Add the tag in Settings > Workers." Routine runs that start a task follow the same rule.
 
-When the tags of a channel change, and its coordinator session runs on a worker that does not have every tag now, the hub ends that session as it does when the account of the session signs out. The next turn goes to a worker that has the tags, and the channel gets the notice "The assistant moved off <worker> because the channel now needs the tag <tag>." Tasks that run keep running. Only new work follows the tags.
+Tags apply to tasks, not to coordinators. A change of the tags of a channel does not stop its coordinator. Tasks that run keep running. Only new tasks follow the tags.
 
 The coordinator can see the same inventory through `list_workers`, with each worker's tags, so it can reason about placement before it starts a task. "Test this on Windows" becomes `require: { os: "windows" }`. "Use the Home Assistant server" becomes `require: { local_mcp_servers: ["home-assistant"] }`.
 
-Coordinators use the same steps, with the hub's own worker first in the preferred list. If the coordinator's harness account is signed in only on a laptop, the coordinator runs there, and that channel goes quiet when the laptop sleeps. The fix is to sign in to that harness on the hub machine too.
+A coordinator runs in the session host and needs no worker, so a channel does not go quiet when a laptop sleeps.
 
 ## Workspaces and local changes
 
@@ -260,7 +282,9 @@ One Cargo workspace:
 |---|---|
 | `proto` | Wire types for the client API, the worker link and the hub tools. No I/O |
 | `harness` | The `Harness` and `HarnessSession` traits and the adapters, one feature per adapter |
-| `worker` | The worker daemon: hub link, spool, workspaces, local MCP endpoint, inventory, accounts and their profile folders, sign-in flows |
+| `link` | The dial-out link that the session host and the worker share: pairing, keys, spool, reconnect |
+| `session-host` | The session host: accounts and their profile folders, sign-in flows, managed CLIs, sessions in a boundary, the MCP endpoint and the tool surface |
+| `worker` | The execution worker: journal, processes, files, workspaces, inventory |
 | `tools` | Managed tools: downloads, checks, install layout and launch specs. No hub I/O |
 | `hub` | The hub server: HTTP and WebSocket (axum), SQLite store, feed, scheduler, coordinator queues, placement, hub tools, push |
 | `client-core` | The shared client logic |
@@ -277,7 +301,9 @@ The binary name `app` is a placeholder until the product has a name.
 
 To restore, stop the hub and run `consort hub restore <backup> --data <data folder>` on the hub machine. It refuses to run while a hub uses the folder, refuses a file that is not a Consort backup (or that a newer hub made), and refuses a folder that is not empty unless you add `--force`. With `--force`, the database, the blobs, the keys and the backup settings that were in the folder move to `before-restore-<time>/` in it first, so nothing is lost. The restore checks every blob hash and runs SQLite's integrity check before it changes the folder. Then start the hub as before. The clients and workers that were paired when the backup was made connect again with their keys.
 
-**Worker.** One binary for each OS. The worker must run as the logged-in user, not as a system account, because harness logins live in the profile folders in the user's Consort home (`~/.consort`, or `CONSORT_HOME`), next to the managed tools. The service for each OS:
+**Session host.** It runs on the hub machine, as its own user, with its own unit (`deploy/session-host/consort-session-host.service`) or its own image (`deploy/session-host/Dockerfile`). The hardened hub unit stays as it is, because bubblewrap cannot run under it. Harness logins and managed tools live in its folder. In Docker, bubblewrap needs the narrow seccomp profile in `deploy/session-host/seccomp.json`. `scripts/dev.sh` starts it as a child of `consort dev`, and on a Mac it uses `sandbox-exec`, with a warning in Settings > Hub.
+
+**Worker.** One binary for each OS. The worker runs as the logged-in user, because tasks use that user's checkouts, git credentials and hooks. It has no account and no CLI. The service for each OS:
 
 | OS | Service |
 |---|---|
@@ -289,13 +315,14 @@ To restore, stop the hub and run `consort hub restore <backup> --data <data fold
 
 ## Security model
 
-The hub can tell any worker to run a harness, and a harness can run commands. So the hub is the most valuable target in the system, and the design limits what a stolen hub can do:
+The hub can tell any worker to run a harness, and a harness can run commands. So the hub is the most valuable target in the system. The hub controls the workers, and a stolen hub compromises them. That is accepted, as a stolen laptop with SSH keys is (see the owner's decision below). The design limits what else a stolen hub gives away:
 
-- **Model credentials do not stay on the hub.** Subscription logins stay in each account's profile folder on the worker, in the harness's own files or keychain entry, and Consort never reads them. An API key goes once from the app through the hub to the worker, which writes it to `env.json` in the profile folder. The hub never stores or logs it. The code that the user pastes during a Claude sign-in goes the same way to the stdin of `claude auth login`, and nobody stores it. See ADR 0010.
+- **Model credentials stay in the session host.** Subscription logins stay in each account's profile folder in the session host, in the harness's own files or keychain entry, and Consort never reads them. An API key goes once from the app through the hub to the session host, which writes it to `env.json` in the profile folder. The hub process never stores or logs it. The code that the user pastes during a Claude sign-in goes the same way to the stdin of `claude auth login`, and nobody stores it. See ADR 0015. A key of an API endpoint for the command check is different: the hub keeps it in its database, because the hub calls the endpoint.
+- **A session runs in a boundary.** Bubblewrap on Linux, `sandbox-exec` on a Mac in development, and a network proxy per session that allows only the hosts of that provider. With no boundary, no session starts. Each session has its own MCP token.
 - **Connector keys stay on the hub.** The Composio key is encrypted at rest on the hub and never leaves it. Credentials for a connector with no browser step go from the app through the hub to Composio once, and Consort does not store them. The assistant never handles a key or a sign-in: a card sends the user to the app or the browser. The hub keeps a hash of each connector call's arguments, never the arguments. See ADR 0011.
-- **Workers set the limits.** Worker policy caps the approval mode, the folders and shell access. The hub cannot raise a worker's limits.
+- **The hub controls the workers (owner's decision, 2026-10-31).** The user changes the limits of a worker in the app: the highest approval mode, the folders and shell access. Nobody edits a file on the worker. The hub forwards the change with no signature, so a stolen hub can raise the limits. The worker saves the limits in `worker.db`, applies them at once and refuses a shell command or a folder outside them, because that is where the work runs. The approval engine on the hub applies the highest approval mode.
 - **Keys, not passwords.** Workers and clients prove their identity with Ed25519 keys made during pairing. Pairing codes are single use and expire after 10 minutes. The user can revoke any worker or client.
-- **Local tokens stay local.** The bearer token for a session's MCP endpoint exists only on that worker, and the endpoint listens only on 127.0.0.1.
+- **Local tokens stay local.** The bearer token for a session's MCP endpoint exists only in the session host, and the endpoint listens only on 127.0.0.1.
 - **Push stays small.** Push payloads hold IDs and titles, not message text, unless the user turns on previews.
 
 Anthropic's terms allow a user to sign in to the unmodified Claude Code binary with their own plan. Workers do exactly that, on the user's own machines, and the user starts the sign-in from the app. Before a public release, ask Anthropic to confirm that a hub that starts those sessions remotely is acceptable.

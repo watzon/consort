@@ -182,7 +182,7 @@ pub fn answer(hub: &Shared, req: &RequestFrame) -> (Frame, Vec<Frame>) {
                 let digest: [u8; 32] = sha2::Sha256::digest(&text).into();
                 let sha = consort_proto::model::Sha256Hash::from_bytes(digest);
                 h.blobs.insert(sha.to_string(), text.clone());
-                req.respond_ok(&consort_proto::worker_link::ItemDetailResult {
+                req.respond_ok(&consort_proto::session_host_link::ItemDetailResult {
                     sha256: sha,
                     size: text.len() as u64,
                     mime: "text/plain".into(),

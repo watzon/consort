@@ -71,9 +71,13 @@ impl ConsortApp {
             .clone()
             .filter(|id| state.connection(id).is_some())
             .or_else(|| state.connections.first().map(|c| c.id.clone()));
+        let monid_page = self.monid_ui.page && state.monid.key_present;
         let mut rows = div().flex().flex_col().gap(t.space.xxs).p(t.space.sm);
+        if state.monid.key_present {
+            rows = rows.child(self.monid_list_row(monid_page, t, cx));
+        }
         for connection in &state.connections {
-            let is_selected = selected.as_deref() == Some(connection.id.as_str());
+            let is_selected = !monid_page && selected.as_deref() == Some(connection.id.as_str());
             let id = connection.id.clone();
             let menu_id = connection.id.clone();
             let handle = connection.handle.clone();
@@ -150,7 +154,13 @@ impl ConsortApp {
                     .border_b(t.border_width)
                     .border_color(c.border_subtle)
                     .drag_area()
-                    .child(div().flex_1().type_style(t.text.title).child("Connectors"))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .type_style(t.text.title)
+                            .child("Connectors"),
+                    )
                     .when(key_present, |d| {
                         d.child(
                             button("add-connector", "Add connector", ButtonKind::Secondary, t)
@@ -166,17 +176,22 @@ impl ConsortApp {
                 div()
                     .id("connections-list")
                     .flex_1()
+                    .min_w_0()
                     .overflow_y_scroll()
                     .child(rows),
             )
-            .child(self.composio_footer(t, cx));
-        let page = if !key_present {
+            .child(self.composio_footer(t, cx))
+            .child(self.monid_footer(t, cx));
+        let page = if monid_page {
+            self.render_monid_page(t, window, cx)
+        } else if !key_present {
             self.composio_setup(t, window, cx)
         } else {
             match selected.and_then(|id| state.connection(&id).cloned()) {
                 Some(connection) => self.connection_page(&connection, t, window, cx),
                 None => div()
                     .flex_1()
+                    .min_w_0()
                     .p(t.layout.speaker_gutter)
                     .flex()
                     .flex_col()
@@ -314,7 +329,7 @@ impl ConsortApp {
                     div()
                         .flex()
                         .gap(t.space.sm)
-                        .child(input_box(&self.ext_inputs.composio_key, focused, t).flex_1())
+                        .child(input_box(&self.ext_inputs.composio_key, focused, t).flex_1().min_w_0())
                         .child(
                             button("save-composio-key", "Save key", ButtonKind::Primary, t)
                                 .when(busy, |b| b.opacity(t.opacity.busy))
@@ -406,15 +421,18 @@ impl ConsortApp {
                             .items_center()
                             .gap(t.space.sm)
                             .child(dot(status_color(&connection.status, t), t))
-                            .child(text(
-                                connection_status_line(connection, total),
-                                t.text.ui,
-                                if connection.status.needs_sign_in() {
-                                    c.status_failed
-                                } else {
-                                    c.text_secondary
-                                },
-                            )),
+                            .child(
+                                text(
+                                    connection_status_line(connection, total),
+                                    t.text.ui,
+                                    if connection.status.needs_sign_in() {
+                                        c.status_failed
+                                    } else {
+                                        c.text_secondary
+                                    },
+                                )
+                                .min_w_0(),
+                            ),
                     ),
             )
             .child(
@@ -635,7 +653,7 @@ impl ConsortApp {
                     ),
                 )
             })
-            .child(div().flex_1())
+            .child(div().flex_1().min_w_0())
             .child(
                 button("dialog-cancel", "Cancel", ButtonKind::Quiet, t)
                     .on_click(cx.listener(|this, _, window, cx| this.close_dialog(window, cx))),
@@ -793,7 +811,8 @@ impl ConsortApp {
                                 .child(service_logo(&service.logo, t.component.provider_logo, t))
                                 .child(
                                     line(service.name.clone(), t.text.ui_strong, c.text_primary)
-                                        .flex_1(),
+                                        .flex_1()
+                                        .min_w_0(),
                                 )
                                 .when(connected > 0, |d| {
                                     d.child(text(
@@ -862,12 +881,14 @@ impl ConsortApp {
         .mb(-t.space.xl)
         .border_t(t.border_width)
         .border_color(c.border_subtle);
+        let offer = self.monid_offer(t, cx);
         let body = div()
             .flex()
             .flex_col()
             .gap(t.space.md)
             .child(search)
             .child(chips)
+            .children(offer)
             .child(grid);
         (
             "Add a connector".to_owned(),
@@ -959,7 +980,11 @@ impl ConsortApp {
                         .flex()
                         .items_center()
                         .gap(t.space.md)
-                        .child(text(kind.label(), t.text.ui, c.text_secondary).flex_1())
+                        .child(
+                            text(kind.label(), t.text.ui, c.text_secondary)
+                                .flex_1()
+                                .min_w_0(),
+                        )
                         .child(rule_select(
                             None,
                             kind,
@@ -1030,7 +1055,7 @@ impl ConsortApp {
                         },
                         t.text.ui,
                         c.text_primary,
-                    )),
+                    ).min_w_0().flex_1().min_w_0()),
             );
         }
         let busy = self.in_flight.is_running("connect");
@@ -1061,7 +1086,8 @@ impl ConsortApp {
                     detail(t),
                     c.text_tertiary,
                 )
-                .flex_1(),
+                .flex_1()
+                .min_w_0(),
             )
             .child(
                 button(

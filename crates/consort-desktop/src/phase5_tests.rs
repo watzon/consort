@@ -182,6 +182,38 @@ fn ready(state: UpdateState) -> Updates {
 }
 
 #[gpui::test]
+fn an_expired_account_shows_a_notice_that_opens_its_sign_in(cx: &mut TestAppContext) {
+    let state = consort_client::mock::view_state();
+    let (worker_id, account_id) = state
+        .expired_accounts()
+        .next()
+        .map(|(worker, account)| (worker.id.clone(), account.id.clone()))
+        .expect("the mock has an expired account");
+    let (handle, app) = open(state, cx);
+    let cx = &mut VisualTestContext::from_window(handle, cx);
+    let notice = format!("sign-in-notice-{account_id}");
+    let button = format!("sign-in-again-{account_id}");
+    let notice: &'static str = Box::leak(notice.into_boxed_str());
+    let button: &'static str = Box::leak(button.into_boxed_str());
+    assert!(has(cx, notice));
+    let at = cx
+        .debug_bounds(button)
+        .expect("the button of the notice")
+        .center();
+    cx.simulate_click(at, Modifiers::default());
+    cx.run_until_parked();
+    let form = cx.update(|_, cx| {
+        let app = app.read(cx);
+        (
+            matches!(app.dialog, Some(Dialog::AddAccount(_))),
+            app.add_account.worker_id.clone(),
+            app.add_account.account_id.clone(),
+        )
+    });
+    assert_eq!(form, (true, worker_id, Some(account_id)));
+}
+
+#[gpui::test]
 fn the_update_notice_shows_only_when_an_update_is_ready(cx: &mut TestAppContext) {
     let (handle, app) = open(consort_client::mock::view_state(), cx);
     let cx = &mut VisualTestContext::from_window(handle, cx);

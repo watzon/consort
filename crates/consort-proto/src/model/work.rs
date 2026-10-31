@@ -177,6 +177,12 @@ pub struct Task {
     /// retry. A new session sets it back to false. Older hubs leave it out.
     #[serde(default)]
     pub session_ended: bool,
+    /// How many Monid calls of this task ran.
+    #[serde(default)]
+    pub monid_calls: u32,
+    /// What they cost, in millionths of a dollar.
+    #[serde(default)]
+    pub monid_cost_micros: i64,
     /// When the task was archived. Archive hides a task in any status.
     pub archived_at: Option<Timestamp>,
     /// When the task was created.

@@ -1,345 +1,540 @@
-//! The worker's managed tools: installs on demand, the update check, and
-//! updates that wait until no session uses the tool.
-//!
-//! The [`ToolStore`] of `consort-tools` does the downloads and the checks.
-//! This module adds what the worker needs on top:
-//!
-//! - [`Tools::ensure`] installs a missing tool once, also when several
-//!   sessions ask for it at the same time.
-//! - A [`ToolLease`] marks a tool and the tools that it needs as in use
-//!   while a session, a probe or a sign-in runs it.
-//! - [`Tools::request_install`] runs at once when the tool is idle, and
-//!   waits otherwise. The worker never replaces a tool that a session uses.
+//! The file tools. Each works inside one workspace root, after a check with
+//! [`crate::paths::contain`]. These functions block, so call them from a
+//! blocking task.
 
-use std::collections::{BTreeSet, HashMap};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::{Duration, SystemTime};
+use std::path::{Path, PathBuf};
 
-use consort_proto::model::{ToolState as ProtoToolState, ToolStatus as ProtoToolStatus};
-use consort_tools::{LaunchSpec, ToolError, ToolId, ToolState, ToolStatus, ToolStore};
-use tokio::sync::Notify;
+use consort_proto::execution_link::MAX_READ_BYTES;
+use regex::Regex;
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
-/// How often the worker checks for updates.
-pub const CHECK_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+use crate::paths::{PathRules, contain};
 
-fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(PoisonError::into_inner)
+/// The most entries that `fs_list` returns.
+const MAX_LIST: usize = 5_000;
+/// The most lines that `fs_search` returns by default.
+const DEFAULT_SEARCH_RESULTS: usize = 200;
+/// The largest file that `fs_search` reads.
+const MAX_SEARCH_FILE: u64 = 2 * 1024 * 1024;
+/// A folder that the walks skip.
+const SKIP: [&str; 2] = [".git", "node_modules"];
+
+/// A tool that refused or failed. The model reads the code and the message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolError {
+    /// A code that does not change, such as `sha256_mismatch`.
+    pub code: &'static str,
+    /// What happened and what to do next.
+    pub message: String,
 }
 
-/// The managed tools of one worker.
-pub struct Tools {
-    store: ToolStore,
-    in_use: Mutex<HashMap<ToolId, usize>>,
-    pending: Mutex<BTreeSet<ToolId>>,
-    ensure_locks: Mutex<HashMap<ToolId, Arc<tokio::sync::Mutex<()>>>>,
-    /// Wakes the tools loop: a lease ended, or an install waits.
-    pub wake: Notify,
-    /// Whether the worker checks for updates by itself. Tests turn it off,
-    /// so they make no network request.
-    pub check_updates: bool,
-}
+impl ToolError {
+    /// A new error.
+    pub fn new(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
 
-impl std::fmt::Debug for Tools {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Tools")
-            .field("root", &self.store.root())
-            .finish_non_exhaustive()
+    /// The result that the model sees.
+    pub fn to_value(&self) -> Value {
+        json!({"error_code": self.code, "message": self.message})
     }
 }
 
-/// The tools that `tool` needs to run, with `tool` itself, in no order.
-pub fn with_dependencies(tool: &ToolId) -> Vec<ToolId> {
-    let mut out = vec![tool.clone()];
-    let mut i = 0;
-    while i < out.len() {
-        for dependency in out[i].dependencies() {
-            if !out.contains(dependency) {
-                out.push(dependency.clone());
+/// What a change left: the path and the hash that a replay checks.
+pub type Check = Option<(String, String)>;
+
+/// The result of a tool, and what a replay checks.
+pub type ToolOutcome = Result<(Value, Check), ToolError>;
+
+/// The hex SHA-256 of some bytes.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+fn str_arg<'a>(args: &'a Value, name: &str) -> Result<&'a str, ToolError> {
+    args.get(name)
+        .and_then(Value::as_str)
+        .ok_or_else(|| ToolError::new("invalid_arguments", format!("`{name}` is required.")))
+}
+
+fn resolve(root: &Path, given: &str, rules: PathRules) -> Result<PathBuf, ToolError> {
+    contain(root, given, rules).map_err(|e| ToolError::new("path_refused", e.to_string()))
+}
+
+fn optional_path(root: &Path, args: &Value, rules: PathRules) -> Result<PathBuf, ToolError> {
+    match args.get("path").and_then(Value::as_str) {
+        Some(given) if !given.trim().is_empty() && given.trim() != "." => {
+            resolve(root, given, rules)
+        }
+        _ => std::fs::canonicalize(root).map_err(|e| {
+            ToolError::new(
+                "workspace_missing",
+                format!("The workspace root is not there: {e}"),
+            )
+        }),
+    }
+}
+
+fn io_error(what: &str, path: &str, err: &std::io::Error) -> ToolError {
+    let code = if err.kind() == std::io::ErrorKind::NotFound {
+        "not_found"
+    } else {
+        "io_error"
+    };
+    ToolError::new(code, format!("Could not {what} `{path}`: {err}"))
+}
+
+/// `fs_list`.
+pub fn fs_list(root: &Path, args: &Value, rules: PathRules) -> Result<Value, ToolError> {
+    let dir = optional_path(root, args, rules)?;
+    let recursive = args
+        .get("recursive")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let shown = args.get("path").and_then(Value::as_str).unwrap_or(".");
+    let mut entries = Vec::new();
+    let mut truncated = false;
+    let mut stack = vec![(dir, String::new())];
+    while let Some((folder, prefix)) = stack.pop() {
+        let read = std::fs::read_dir(&folder).map_err(|e| io_error("list", shown, &e))?;
+        let mut names: Vec<_> = read.flatten().collect();
+        names.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in names {
+            if entries.len() >= MAX_LIST {
+                truncated = true;
+                break;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Ok(meta) = entry.path().symlink_metadata() else {
+                continue;
+            };
+            let kind = if meta.file_type().is_symlink() {
+                "link"
+            } else if meta.is_dir() {
+                "folder"
+            } else {
+                "file"
+            };
+            let path = format!("{prefix}{name}");
+            entries.push(json!({"path": path, "kind": kind, "size": meta.len()}));
+            if recursive && meta.is_dir() && !SKIP.contains(&name.as_str()) {
+                stack.push((entry.path(), format!("{path}/")));
             }
         }
-        i += 1;
     }
-    out
+    Ok(json!({"entries": entries, "truncated": truncated}))
 }
 
-/// Marks tools as in use while it lives.
-pub struct ToolLease {
-    tools: Arc<Tools>,
-    held: Vec<ToolId>,
-}
-
-impl std::fmt::Debug for ToolLease {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ToolLease")
-            .field("held", &self.held)
-            .finish()
+/// `fs_stat`.
+pub fn fs_stat(root: &Path, args: &Value, rules: PathRules) -> Result<Value, ToolError> {
+    let given = str_arg(args, "path")?;
+    let path = resolve(root, given, rules)?;
+    let meta = std::fs::metadata(&path).map_err(|e| io_error("read", given, &e))?;
+    let mut out = json!({
+        "path": given,
+        "kind": if meta.is_dir() { "folder" } else { "file" },
+        "size": meta.len(),
+    });
+    if meta.is_file() && meta.len() <= MAX_READ_BYTES * 8 {
+        let bytes = std::fs::read(&path).map_err(|e| io_error("read", given, &e))?;
+        out["sha256"] = json!(sha256_hex(&bytes));
     }
+    Ok(out)
 }
 
-impl Drop for ToolLease {
-    fn drop(&mut self) {
-        let mut freed = false;
-        {
-            let mut in_use = lock(&self.tools.in_use);
-            for tool in &self.held {
-                if let Some(count) = in_use.get_mut(tool) {
-                    *count -= 1;
-                    if *count == 0 {
-                        in_use.remove(tool);
-                        freed = true;
-                    }
+/// `fs_read`.
+pub fn fs_read(root: &Path, args: &Value, rules: PathRules) -> Result<Value, ToolError> {
+    let given = str_arg(args, "path")?;
+    let path = resolve(root, given, rules)?;
+    let bytes = std::fs::read(&path).map_err(|e| io_error("read", given, &e))?;
+    let offset = args
+        .get("offset")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .min(bytes.len() as u64) as usize;
+    let limit = args
+        .get("limit")
+        .and_then(Value::as_u64)
+        .unwrap_or(MAX_READ_BYTES)
+        .min(MAX_READ_BYTES) as usize;
+    let end = offset.saturating_add(limit).min(bytes.len());
+    let part = &bytes[offset..end];
+    if part.contains(&0) {
+        return Err(ToolError::new(
+            "binary_file",
+            format!(
+                "`{given}` is not a text file. Use fs_stat to see its size, or a command to read it."
+            ),
+        ));
+    }
+    Ok(json!({
+        "path": given,
+        "content": String::from_utf8_lossy(part),
+        "size": bytes.len(),
+        "offset": offset,
+        "truncated": end < bytes.len(),
+        "sha256": sha256_hex(&bytes),
+    }))
+}
+
+/// `fs_search`.
+pub fn fs_search(root: &Path, args: &Value, rules: PathRules) -> Result<Value, ToolError> {
+    let pattern = str_arg(args, "pattern")?;
+    let regex = Regex::new(pattern).map_err(|e| {
+        ToolError::new(
+            "invalid_arguments",
+            format!("The pattern is not valid: {e}"),
+        )
+    })?;
+    let start = optional_path(root, args, rules)?;
+    let real_root = std::fs::canonicalize(root)
+        .map_err(|e| ToolError::new("workspace_missing", e.to_string()))?;
+    let max = args
+        .get("max_results")
+        .and_then(Value::as_u64)
+        .map_or(DEFAULT_SEARCH_RESULTS, |n| n as usize)
+        .min(2_000);
+    let mut matches = Vec::new();
+    let mut stack = vec![start];
+    'walk: while let Some(path) = stack.pop() {
+        let Ok(meta) = path.symlink_metadata() else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        if meta.is_dir() {
+            let Ok(read) = std::fs::read_dir(&path) else {
+                continue;
+            };
+            let mut names: Vec<_> = read.flatten().collect();
+            names.sort_by_key(std::fs::DirEntry::file_name);
+            for entry in names.into_iter().rev() {
+                let name = entry.file_name();
+                if !SKIP.iter().any(|s| *s == name) {
+                    stack.push(entry.path());
+                }
+            }
+            continue;
+        }
+        if meta.len() > MAX_SEARCH_FILE {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        if bytes.contains(&0) {
+            continue;
+        }
+        let text = String::from_utf8_lossy(&bytes);
+        let shown = path
+            .strip_prefix(&real_root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        for (index, line) in text.lines().enumerate() {
+            if regex.is_match(line) {
+                if matches.len() >= max {
+                    return Ok(json!({"matches": matches, "truncated": true}));
+                }
+                matches.push(json!({"path": shown, "line": index + 1, "text": line}));
+                if matches.len() >= max {
+                    break 'walk;
                 }
             }
         }
-        if freed {
-            self.tools.wake.notify_one();
-        }
     }
+    Ok(json!({"matches": matches, "truncated": false}))
 }
 
-impl Tools {
-    /// Opens the store at `root`.
-    pub fn new(root: std::path::PathBuf, check_updates: bool) -> Result<Self, ToolError> {
-        Ok(Self::with_store(ToolStore::new(root)?, check_updates))
+/// Writes a whole file, by way of a new file next to it, so a reader never
+/// sees half of it.
+fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
     }
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let temp = path.with_file_name(format!(".{name}.{}.tmp", uuid::Uuid::now_v7().simple()));
+    std::fs::write(&temp, bytes)?;
+    if let Ok(meta) = std::fs::metadata(path) {
+        let _ = std::fs::set_permissions(&temp, meta.permissions());
+    }
+    if let Err(err) = std::fs::rename(&temp, path) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(err);
+    }
+    Ok(())
+}
 
-    /// Uses a store that the caller made. Tests pass one with local
-    /// sources.
-    pub fn with_store(store: ToolStore, check_updates: bool) -> Self {
-        Self {
-            store,
-            in_use: Mutex::new(HashMap::new()),
-            pending: Mutex::new(BTreeSet::new()),
-            ensure_locks: Mutex::new(HashMap::new()),
-            wake: Notify::new(),
-            check_updates,
+/// `fs_apply_patch`. All the edits apply, or none.
+pub fn fs_apply_patch(root: &Path, args: &Value, rules: PathRules) -> ToolOutcome {
+    let given = str_arg(args, "path")?;
+    let expected = str_arg(args, "expected_sha256")?;
+    let path = resolve(root, given, rules)?;
+    let bytes = std::fs::read(&path).map_err(|e| io_error("read", given, &e))?;
+    let actual = sha256_hex(&bytes);
+    if actual != expected {
+        return Err(ToolError::new(
+            "sha256_mismatch",
+            format!(
+                "`{given}` changed since you read it: its sha256 is now {actual}. Read it again with fs_read, then make the patch again with a new operation_id."
+            ),
+        ));
+    }
+    let mut text = String::from_utf8(bytes).map_err(|_| {
+        ToolError::new(
+            "binary_file",
+            format!("`{given}` is not UTF-8 text, so it cannot take a patch."),
+        )
+    })?;
+    let edits = args
+        .get("edits")
+        .and_then(Value::as_array)
+        .filter(|e| !e.is_empty())
+        .ok_or_else(|| ToolError::new("invalid_arguments", "`edits` needs at least one edit."))?;
+    for (index, edit) in edits.iter().enumerate() {
+        let old = str_arg(edit, "old")?;
+        let new = str_arg(edit, "new")?;
+        if old.is_empty() {
+            return Err(ToolError::new(
+                "invalid_arguments",
+                format!("Edit {index} has an empty `old`."),
+            ));
         }
-    }
-
-    /// The store.
-    pub fn store(&self) -> &ToolStore {
-        &self.store
-    }
-
-    /// Marks a tool and the tools that it needs as in use.
-    pub fn lease(self: &Arc<Self>, tool: &ToolId) -> ToolLease {
-        let held = with_dependencies(tool);
-        {
-            let mut in_use = lock(&self.in_use);
-            for tool in &held {
-                *in_use.entry(tool.clone()).or_insert(0) += 1;
+        match text.matches(old).count() {
+            1 => text = text.replacen(old, new, 1),
+            0 => {
+                return Err(ToolError::new(
+                    "edit_not_found",
+                    format!(
+                        "Edit {index}: the text of `old` is not in `{given}`. Read the file again."
+                    ),
+                ));
+            }
+            n => {
+                return Err(ToolError::new(
+                    "edit_not_unique",
+                    format!(
+                        "Edit {index}: the text of `old` is in `{given}` {n} times. Give more of the text around it."
+                    ),
+                ));
             }
         }
-        ToolLease {
-            tools: self.clone(),
-            held,
-        }
     }
-
-    /// Whether a session, a probe or a sign-in uses the tool now.
-    pub fn in_use(&self, tool: &ToolId) -> bool {
-        lock(&self.in_use).contains_key(tool)
-    }
-
-    /// The launch of a tool. A missing tool is installed first. When several
-    /// callers ask for the same missing tool, it installs once.
-    pub async fn ensure(&self, tool: &ToolId) -> Result<LaunchSpec, ToolError> {
-        if self.store.installed(tool).is_some() {
-            return self.store.launch(tool);
-        }
-        let gate = lock(&self.ensure_locks)
-            .entry(tool.clone())
-            .or_default()
-            .clone();
-        let _guard = gate.lock().await;
-        if self.store.installed(tool).is_none() {
-            self.store.install(tool, None).await?;
-        }
-        self.store.launch(tool)
-    }
-
-    /// Whether the tool or a tool that it needs is installing now.
-    pub fn installing(&self, tool: &ToolId) -> bool {
-        let needed = with_dependencies(tool);
-        self.store
-            .status()
-            .iter()
-            .any(|s| s.state == ToolState::Installing && needed.contains(&s.tool))
-    }
-
-    /// The last install error of a tool or a tool that it needs, when it is
-    /// not installed.
-    pub fn install_failure(&self, tool: &ToolId) -> Option<String> {
-        let needed = with_dependencies(tool);
-        self.store
-            .status()
-            .into_iter()
-            .find(|s| s.state == ToolState::Failed && needed.contains(&s.tool))
-            .and_then(|s| s.detail)
-    }
-
-    /// Asks for an install or an update. It waits until no session uses
-    /// the tool. The tools loop runs it.
-    pub fn request_install(&self, tool: ToolId) {
-        lock(&self.pending).insert(tool);
-        self.wake.notify_one();
-    }
-
-    /// The waiting installs whose tools are idle now. They leave the
-    /// waiting list.
-    pub fn take_ready(&self) -> Vec<ToolId> {
-        let mut pending = lock(&self.pending);
-        let ready: Vec<ToolId> = pending
-            .iter()
-            .filter(|tool| !self.in_use(tool))
-            .cloned()
-            .collect();
-        for tool in &ready {
-            pending.remove(tool);
-        }
-        ready
-    }
-
-    /// Whether the update check is due: never done, or done more than a day
-    /// ago.
-    pub fn check_due(&self) -> bool {
-        match self.store.last_check() {
-            None => true,
-            Some(at) => SystemTime::now()
-                .duration_since(at)
-                .map_or(true, |age| age >= CHECK_INTERVAL),
-        }
-    }
-
-    /// The status of every tool for the inventory.
-    pub fn statuses(&self) -> Vec<ProtoToolStatus> {
-        let pending = lock(&self.pending).clone();
-        self.store
-            .status()
-            .into_iter()
-            .map(|status| {
-                let waits = pending.contains(&status.tool) && status.state != ToolState::Installing;
-                to_proto(status, waits)
-            })
-            .collect()
-    }
+    write_atomic(&path, text.as_bytes()).map_err(|e| io_error("write", given, &e))?;
+    let hash = sha256_hex(text.as_bytes());
+    Ok((
+        json!({"path": given, "sha256": hash, "edits": edits.len()}),
+        Some((given.to_owned(), hash)),
+    ))
 }
 
-/// A name for a tool in a status text, such as "Claude Code".
-pub fn tool_name(tool: &ToolId) -> String {
-    match tool {
-        // The ACP adapter is part of Claude Code for the user.
-        ToolId::ClaudeAgentAcp => "Claude Code".to_owned(),
-        other => other.display_name().to_owned(),
+/// `fs_write`.
+pub fn fs_write(root: &Path, args: &Value, rules: PathRules) -> ToolOutcome {
+    let given = str_arg(args, "path")?;
+    let content = str_arg(args, "content")?;
+    let path = resolve(root, given, rules)?;
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            let actual = sha256_hex(&bytes);
+            let expected = args.get("expected_sha256").and_then(Value::as_str);
+            if expected != Some(actual.as_str()) {
+                return Err(ToolError::new(
+                    "sha256_mismatch",
+                    format!(
+                        "`{given}` exists and its sha256 is {actual}. Read it with fs_read, then pass that hash as expected_sha256 with a new operation_id."
+                    ),
+                ));
+            }
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(io_error("read", given, &err)),
     }
+    write_atomic(&path, content.as_bytes()).map_err(|e| io_error("write", given, &e))?;
+    let hash = sha256_hex(content.as_bytes());
+    Ok((
+        json!({"path": given, "sha256": hash, "size": content.len()}),
+        Some((given.to_owned(), hash)),
+    ))
 }
 
-fn to_proto(status: ToolStatus, waits: bool) -> ProtoToolStatus {
-    let state = match status.state {
-        ToolState::Missing => ProtoToolState::Missing,
-        ToolState::Installing => ProtoToolState::Installing,
-        ToolState::Ready => ProtoToolState::Ready,
-        ToolState::UpdateAvailable => ProtoToolState::UpdateAvailable,
-        ToolState::Failed => ProtoToolState::Failed,
-    };
-    let detail = if waits {
-        Some(format!(
-            "The install waits until no session uses {}.",
-            tool_name(&status.tool)
-        ))
+/// `fs_move`.
+pub fn fs_move(root: &Path, args: &Value, rules: PathRules) -> ToolOutcome {
+    let from = str_arg(args, "from")?;
+    let to = str_arg(args, "to")?;
+    let source = resolve(root, from, rules)?;
+    let target = resolve(root, to, rules)?;
+    if target.symlink_metadata().is_ok() {
+        return Err(ToolError::new(
+            "already_exists",
+            format!("`{to}` exists. Choose another path, or remove it first."),
+        ));
+    }
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| io_error("write", to, &e))?;
+    }
+    std::fs::rename(&source, &target).map_err(|e| io_error("move", from, &e))?;
+    Ok((json!({"from": from, "to": to}), None))
+}
+
+/// `fs_remove`.
+pub fn fs_remove(root: &Path, args: &Value, rules: PathRules) -> ToolOutcome {
+    let given = str_arg(args, "path")?;
+    let path = resolve(root, given, rules)?;
+    let real_root = std::fs::canonicalize(root)
+        .map_err(|e| ToolError::new("workspace_missing", e.to_string()))?;
+    if path == real_root {
+        return Err(ToolError::new(
+            "path_refused",
+            "The workspace root cannot be removed.",
+        ));
+    }
+    let meta = path
+        .symlink_metadata()
+        .map_err(|e| io_error("remove", given, &e))?;
+    if meta.is_dir() {
+        if !args
+            .get("recursive")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            std::fs::remove_dir(&path).map_err(|e| {
+                ToolError::new(
+                    "folder_not_empty",
+                    format!(
+                        "Could not remove the folder `{given}`: {e}. Pass recursive to remove what it holds."
+                    ),
+                )
+            })?;
+        } else {
+            std::fs::remove_dir_all(&path).map_err(|e| io_error("remove", given, &e))?;
+        }
     } else {
-        status.detail
-    };
-    ProtoToolStatus {
-        tool: consort_proto::model::ToolId::new(status.tool.to_string()),
-        version: status.version,
-        latest: status.latest,
-        state,
-        detail,
+        std::fs::remove_file(&path).map_err(|e| io_error("remove", given, &e))?;
     }
+    Ok((json!({"path": given, "removed": true}), None))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn tools(dir: &std::path::Path) -> Arc<Tools> {
-        Arc::new(Tools::new(dir.join("tools"), false).unwrap())
-    }
+    const R: PathRules = PathRules::Unix;
 
-    /// Makes `tool` look installed at `version`, as the store lays it out.
-    fn fake_install(dir: &std::path::Path, tool: &ToolId, version: &str) {
-        let tool_dir = dir.join("tools").join(tool.dir_name());
-        std::fs::create_dir_all(tool_dir.join(version)).unwrap();
-        std::fs::write(tool_dir.join("current"), version).unwrap();
+    #[test]
+    fn a_patch_needs_the_hash_from_the_read_and_applies_all_or_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "one two").unwrap();
+        let read = fs_read(dir.path(), &json!({"path": "a.txt"}), R).unwrap();
+        assert_eq!(read["content"], "one two");
+        let hash = read["sha256"].as_str().unwrap();
+        let wrong = fs_apply_patch(
+            dir.path(),
+            &json!({"path": "a.txt", "expected_sha256": "00", "edits": [{"old": "one", "new": "1"}]}),
+            R,
+        )
+        .unwrap_err();
+        assert_eq!(wrong.code, "sha256_mismatch");
+        let partial = fs_apply_patch(
+            dir.path(),
+            &json!({"path": "a.txt", "expected_sha256": hash, "edits": [{"old": "one", "new": "1"}, {"old": "nope", "new": "x"}]}),
+            R,
+        )
+        .unwrap_err();
+        assert_eq!(partial.code, "edit_not_found");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "one two"
+        );
+        let (result, check) = fs_apply_patch(
+            dir.path(),
+            &json!({"path": "a.txt", "expected_sha256": hash, "edits": [{"old": "one", "new": "1"}]}),
+            R,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "1 two"
+        );
+        assert_eq!(check.unwrap().1, result["sha256"].as_str().unwrap());
     }
 
     #[test]
-    fn dependencies_are_in_use_with_the_tool() {
+    fn a_write_to_a_file_that_exists_needs_its_hash() {
         let dir = tempfile::tempdir().unwrap();
-        let tools = tools(dir.path());
-        let lease = tools.lease(&ToolId::ClaudeAgentAcp);
-        assert!(tools.in_use(&ToolId::ClaudeAgentAcp));
-        assert!(tools.in_use(&ToolId::Node));
-        assert!(tools.in_use(&ToolId::ClaudeCode));
-        assert!(!tools.in_use(&ToolId::Codex));
-        let second = tools.lease(&ToolId::GeminiCli);
-        drop(lease);
-        assert!(tools.in_use(&ToolId::Node), "Gemini CLI still runs on Node");
-        assert!(!tools.in_use(&ToolId::ClaudeCode));
-        drop(second);
-        assert!(!tools.in_use(&ToolId::Node));
+        fs_write(dir.path(), &json!({"path": "d/n.txt", "content": "x"}), R).unwrap();
+        let err = fs_write(dir.path(), &json!({"path": "d/n.txt", "content": "y"}), R).unwrap_err();
+        assert_eq!(err.code, "sha256_mismatch");
+        fs_write(
+            dir.path(),
+            &json!({"path": "d/n.txt", "content": "y", "expected_sha256": sha256_hex(b"x")}),
+            R,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("d/n.txt")).unwrap(),
+            "y"
+        );
     }
 
     #[test]
-    fn an_install_waits_until_the_tool_is_idle() {
+    fn list_search_stat_move_and_remove_work_inside_the_root() {
         let dir = tempfile::tempdir().unwrap();
-        let tools = tools(dir.path());
-        let lease = tools.lease(&ToolId::Codex);
-        tools.request_install(ToolId::Codex);
-        tools.request_install(ToolId::OpenCode);
-        assert_eq!(tools.take_ready(), [ToolId::OpenCode]);
-        let codex = tools
-            .statuses()
-            .into_iter()
-            .find(|s| s.tool.as_str() == "codex")
-            .unwrap();
-        assert!(
-            codex
-                .detail
-                .unwrap()
-                .contains("waits until no session uses Codex"),
-            "the inventory says why"
-        );
-        assert!(tools.take_ready().is_empty());
-        drop(lease);
-        assert_eq!(tools.take_ready(), [ToolId::Codex]);
-    }
-
-    #[tokio::test]
-    async fn an_installed_tool_launches_without_a_download() {
-        let dir = tempfile::tempdir().unwrap();
-        let tools = tools(dir.path());
-        fake_install(dir.path(), &ToolId::ClaudeCode, "2.1.308");
-        let launch = tools.ensure(&ToolId::ClaudeCode).await.unwrap();
-        assert!(
-            launch.program.ends_with(
-                std::path::Path::new("claude-code")
-                    .join("2.1.308")
-                    .join(format!("claude{}", std::env::consts::EXE_SUFFIX))
-            )
-        );
-        assert_eq!(launch.env["DISABLE_AUTOUPDATER"], "1");
-        let statuses = tools.statuses();
-        let claude = statuses
+        fs_write(
+            dir.path(),
+            &json!({"path": "a/b.txt", "content": "hello\nworld\n"}),
+            R,
+        )
+        .unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join(".git/x"), "hello").unwrap();
+        let list = fs_list(dir.path(), &json!({"recursive": true}), R).unwrap();
+        let paths: Vec<_> = list["entries"]
+            .as_array()
+            .unwrap()
             .iter()
-            .find(|s| s.tool.as_str() == "claude-code")
-            .unwrap();
-        assert_eq!(claude.state, ProtoToolState::Ready);
-        assert_eq!(claude.version.as_deref(), Some("2.1.308"));
-        let node = statuses.iter().find(|s| s.tool.as_str() == "node").unwrap();
-        assert_eq!(node.state, ProtoToolState::Missing);
-        assert!(tools.check_due());
-        assert_eq!(tool_name(&ToolId::ClaudeAgentAcp), "Claude Code");
+            .map(|e| e["path"].as_str().unwrap().to_owned())
+            .collect();
+        assert!(paths.contains(&"a/b.txt".to_owned()));
+        assert!(!paths.iter().any(|p| p == ".git/x"));
+        let found = fs_search(dir.path(), &json!({"pattern": "wor.d"}), R).unwrap();
+        assert_eq!(found["matches"][0]["path"], "a/b.txt");
+        assert_eq!(found["matches"][0]["line"], 2);
+        assert_eq!(
+            fs_search(dir.path(), &json!({"pattern": "hello"}), R).unwrap()["matches"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            fs_stat(dir.path(), &json!({"path": "a/b.txt"}), R).unwrap()["kind"],
+            "file"
+        );
+        fs_move(dir.path(), &json!({"from": "a/b.txt", "to": "c.txt"}), R).unwrap();
+        assert!(fs_remove(dir.path(), &json!({"path": "."}), R).is_err());
+        assert_eq!(
+            fs_remove(dir.path(), &json!({"path": "a"}), R).unwrap().0["removed"],
+            true
+        );
+        fs_remove(dir.path(), &json!({"path": "c.txt"}), R).unwrap();
+    }
+
+    #[test]
+    fn a_path_that_leaves_the_workspace_is_refused_with_a_clear_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = fs_read(dir.path(), &json!({"path": "/etc/passwd"}), R).unwrap_err();
+        assert_eq!(err.code, "path_refused");
+        assert!(err.message.contains("workspace_inspect"));
     }
 }

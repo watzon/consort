@@ -22,7 +22,7 @@ use std::fmt::{self, Write as _};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::ids::{ApprovalId, ChannelId, DecisionId, MessageId, RoutineId, TaskId};
+use crate::ids::{ApprovalId, ChannelId, DecisionId, MessageId, MonidCallId, RoutineId, TaskId};
 use crate::model::{ApprovalKind, ApprovalStatus, ChannelKind, ProactiveKind, ProactiveRating};
 use crate::status::TaskStatus;
 use crate::time::Timestamp;
@@ -159,6 +159,13 @@ pub enum WakeEvent {
         /// When it was posted.
         at: Timestamp,
         /// The message text.
+        text: String,
+    },
+    /// A Monid run that took long ended after its tool call returned.
+    MonidResult {
+        /// The call.
+        id: MonidCallId,
+        /// What came of it.
         text: String,
     },
     /// The user answered a hub card that a management tool or a connector
@@ -404,6 +411,7 @@ impl WakeEvent {
             Self::MemorySuggestion { .. } => "memory_suggestion",
             Self::TuttiMessage { .. } => "tutti_message",
             Self::CardAnswered { .. } => "card_answered",
+            Self::MonidResult { .. } => "monid_result",
             Self::CheckIn { .. } => "check_in",
             Self::Brief { .. } => "brief",
             Self::FollowUp { .. } => "follow_up",
@@ -586,6 +594,9 @@ impl WakeEvent {
                 &[("id", Some(id.to_string())), ("at", Some(at.to_rfc3339()))],
                 Some(text),
             ),
+            Self::MonidResult { id, text } => {
+                element(out, name, &[("id", Some(id.to_string()))], Some(text))
+            }
             Self::CardAnswered {
                 id,
                 kind,

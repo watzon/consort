@@ -72,7 +72,7 @@ The note has a size limit of 6 KiB. Rules that the user wrote or edited carry `(
 - A tool `voice_guide { context }` returns the full section for one context with its examples. Sessions call it before they write a draft. The hub logs each call.
 - The session picks the context from the recipient and the channel. When it is not sure, it uses Core only.
 - The approval card of a send or draft tool shows "Written in your voice (email.formal)" or "Neutral style".
-- No session can write `voice.md`. The voice task proposes a guide; the Tutti coordinator proposes one learned rule with `propose_voice_rule`.
+- Only Tutti can write `voice.md`, in a turn that holds a message from the user (ADR 0014). The voice task proposes a guide; the Tutti coordinator proposes one learned rule with `propose_voice_rule`.
 
 ## Safety
 
@@ -110,7 +110,7 @@ Paper first (see `docs/notes/design-voice.md` when it exists): Settings > Voice 
 2. Consent: the voice task brief lists only the chosen sources; a fake connector proves no call to an unchosen source.
 3. No raw text in memory: after learning, `voice.md` has no source message verbatim except the approved examples, and the examples have no email address, phone number or URL.
 4. Assistant text filter: pairs marked sent unchanged are not in the learning set.
-5. Ownership: no session can write or delete `voice.md`; the voice task's proposal and `propose_voice_rule` reach the user as offers; a rule needs 3 distinct edited pairs; a forged `(you)` mark is not the user's.
+5. Ownership: a session can write `voice.md` only in Tutti, in a turn from the user, and no session can delete it; the voice task's proposal and `propose_voice_rule` reach the user as offers; a rule needs 3 distinct edited pairs; a forged `(you)` mark is not the user's.
 6. Scope: a coordinator reply to the user gets no voice text; a session with a draft tool does.
 7. Approval cannot be skipped with the voice on: every send asks, also with "Run without asking" and earlier allows; a late answer saves no allow for a card that asked every time.
 8. Commitment flags: a table test for every format; a draft with a date or price whose value is not in the request is flagged; the request is only the user's words; every string of the arguments is scanned; the allow stays off until the tick, and the tick holds only for the hash that the user saw.

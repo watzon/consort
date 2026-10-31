@@ -20,6 +20,8 @@ mod coordinator_acted;
 mod coordinator_model;
 mod coordinator_recovery;
 mod data_perms;
+mod exec_relay;
+mod fallback_path;
 mod frame_size;
 mod heartbeat;
 mod memory_and_blobs;

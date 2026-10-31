@@ -217,6 +217,9 @@ pub struct Routine {
     /// When it was made. Empty for a routine from an older hub.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_at: Option<Timestamp>,
+    /// What this routine may do with Monid. `None` uses the hub's setting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub monid: Option<super::monid::MonidUnattended>,
 }
 
 /// One run of a routine. It is a feed entity, so a client sees a run start

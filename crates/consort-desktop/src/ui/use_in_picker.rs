@@ -147,6 +147,7 @@ impl ConsortApp {
                 .debug_selector(move || id.to_owned())
                 .flex()
                 .flex_1()
+                .min_w_0()
                 .justify_center()
                 .py(t.space.xs)
                 .rounded(t.radius.sm)
@@ -225,7 +226,7 @@ impl ConsortApp {
                     .flex()
                     .flex_none()
                     .items_center()
-                    .child(div().flex_1().child(text(
+                    .child(div().flex_1().min_w_0().child(text(
                         "Choose where to use it",
                         t.text.heading,
                         c.text_primary,

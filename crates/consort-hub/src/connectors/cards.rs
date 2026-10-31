@@ -12,7 +12,7 @@ use consort_proto::model::{
     Approval, ApprovalDetails, ApprovalStatus, Author, Connection, MessageKind, Session,
     SessionRole, SignInMethod, Task, hub_card_request_id,
 };
-use consort_proto::status::{Actor, TaskStatus};
+use consort_proto::status::Actor;
 use consort_proto::tools::ToolAudience;
 use consort_proto::turn_input::{WakeEvent, render_events};
 
@@ -20,7 +20,7 @@ use super::connections::ConnectSpec;
 use crate::error::{HubError, Result};
 use crate::hub::{Hub, ToolCtx};
 use crate::limits::{MESSAGE_BODY_MAX_BYTES, cut_text};
-use crate::ops::flow::{deliver_in_tx, transition};
+use crate::ops::flow::{deliver_in_tx, wait_for_approval};
 use crate::ops::waiting::resume_if_nothing_waits;
 use crate::store::conversation::NewMessage;
 use crate::store::{Tx, conversation, work};
@@ -39,7 +39,7 @@ pub(crate) fn post_card_in_tx(
     task: Option<&Task>,
     summary: &str,
     details: ApprovalDetails,
-) -> Result<(Approval, bool)> {
+) -> Result<Approval> {
     let body = cut_text(summary, MESSAGE_BODY_MAX_BYTES);
     let message = match task {
         Some(task) => tx.post_in_task_thread(
@@ -76,21 +76,12 @@ pub(crate) fn post_card_in_tx(
         created_at: tx.now(),
     };
     tx.save_approval(&approval)?;
-    let mut kick = false;
     if let Some(task) = task {
         let mut task = work::task_or_404(tx.db(), task.id)?;
-        match transition(
-            tx,
-            &mut task,
-            TaskStatus::NeedsInput,
-            Actor::System,
-            Some(summary.to_owned()),
-            Some(format!("Waiting for the user: {summary}")),
-        ) {
+        match wait_for_approval(tx, &mut task, Actor::System, Some(summary.to_owned())) {
             Ok(changed) => {
                 if changed {
                     tx.save_task(&task)?;
-                    kick = TaskStatus::NeedsInput.wakes_coordinator();
                 }
             }
             Err(err) => {
@@ -98,7 +89,7 @@ pub(crate) fn post_card_in_tx(
             }
         }
     }
-    Ok((approval, kick))
+    Ok(approval)
 }
 
 impl Hub {
@@ -113,8 +104,7 @@ impl Hub {
         let session = ctx.session.clone();
         let channel_id = ctx.channel.id;
         let task = ctx.task.clone();
-        let (approval, kick) = self
-            .store
+        self.store
             .write(move |tx| {
                 post_card_in_tx(
                     tx,
@@ -126,11 +116,7 @@ impl Hub {
                     details,
                 )
             })
-            .await?;
-        if kick {
-            self.kick_coordinator(approval.channel_id);
-        }
-        Ok(approval)
+            .await
     }
 
     /// The tool context of the session that posted a card. The session may
@@ -201,8 +187,12 @@ impl Hub {
 
     /// Runs after the user answered a hub card with `approval.answer`.
     pub(crate) fn hub_card_answered(&self, approval: Approval) {
-        if let ApprovalDetails::Connector(_) = &approval.details
-            && let Some(waiter) = self.connectors.take_waiter(approval.id)
+        if matches!(
+            approval.details,
+            ApprovalDetails::Connector(_)
+                | ApprovalDetails::Monid(_)
+                | ApprovalDetails::AccessRequest(_)
+        ) && let Some(waiter) = self.connectors.take_waiter(approval.id)
         {
             // A run_connector_tool call waits for it and runs the call.
             let _ = waiter.send(approval.status);
@@ -231,6 +221,8 @@ impl Hub {
         let allowed = approval.status == ApprovalStatus::Allowed;
         match &approval.details {
             ApprovalDetails::Connector(_) => self.late_connector_answer(approval).await.map(Some),
+            ApprovalDetails::Monid(_) => self.late_monid_answer(approval).await.map(Some),
+            ApprovalDetails::AccessRequest(_) => self.late_access_answer(approval).await.map(Some),
             ApprovalDetails::Management(card) => {
                 if !allowed {
                     return Ok(Some(format!(

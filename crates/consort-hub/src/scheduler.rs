@@ -605,6 +605,10 @@ pub(crate) mod testing {
             updated_at: now,
             tags: Vec::new(),
             proactive_tasks: Default::default(),
+            coordinator_fallback: None,
+            coordinator_blocked: None,
+            monid: Default::default(),
+            access_grants: Vec::new(),
             proactivity: None,
         };
         let saved = channel.clone();
@@ -632,6 +636,7 @@ pub(crate) mod testing {
             next_run_at: None,
             last_run_at: None,
             last_run_status: None,
+            monid: None,
             kind: Default::default(),
             origin: Default::default(),
             created_at: None,

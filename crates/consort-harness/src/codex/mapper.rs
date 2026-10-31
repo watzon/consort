@@ -10,7 +10,7 @@ use consort_proto::model::{
     PlanStepStatus, ReasoningPayload, RequestOption, RequestOptionKind, SessionState,
     ToolCallPayload, Usage, WebSearchPayload, tail_of,
 };
-use consort_proto::worker_link::{
+use consort_proto::session_host_link::{
     QuestionDetails, RequestBody, RequestOpened, SessionEvent, TurnEndReason,
 };
 use serde::de::DeserializeOwned;
@@ -471,6 +471,8 @@ impl CodexMapper {
         let details = ApprovalDetails::Command {
             command,
             cwd: command_cwd(params.cwd.as_deref(), self.workspace.as_deref()),
+            check_note: None,
+            blocked: Vec::new(),
         };
         RequestOpened {
             request_id,

@@ -12,8 +12,8 @@ use std::time::Duration;
 use consort_proto::auth::{
     AuthChallenge, AuthResponse, CLIENT_WS_PATH, ClientHello, ClientHelloResult, OpenSession,
     PAIR_CLIENT_PATH, PAIR_WORKER_PATH, PairClientRequest, PairClientResponse, PairWorkerRequest,
-    PairWorkerResponse, PairingCode, PeerId, PublicKey, Signature, WORKER_WS_PATH, WorkerHello,
-    WorkerHelloResult, auth_signing_payload, normalize_origin,
+    PairWorkerResponse, PairingCode, PeerId, PublicKey, Signature, WorkerHello, WorkerHelloResult,
+    auth_signing_payload, normalize_origin,
 };
 use consort_proto::client_api::{
     EntityPayload, FeedChange, FeedEntry, HubToClient, Snapshot, SnapshotScope, SyncSnapshot,
@@ -26,12 +26,12 @@ use consort_proto::model::{
     ApprovalMode, AuthState, Capabilities, ClientKind, HarnessAccount, Inventory, ModelInfo, Os,
     Worker, WorkerLoad, WorkerPolicy,
 };
+use consort_proto::session_host_link::{
+    HubToSessionHost, SequencedEvent, SessionEvent, SessionEvents, SessionEventsAck,
+    SessionStartResult, ToolCall,
+};
 use consort_proto::time::Timestamp;
 use consort_proto::tools::ToolCallResult;
-use consort_proto::worker_link::{
-    HubToWorker, SequencedEvent, SessionEvent, SessionEvents, SessionEventsAck, SessionStartResult,
-    ToolCall,
-};
 use ed25519_dalek::{Signer, SigningKey};
 use futures_util::{SinkExt, StreamExt};
 use rand::rngs::OsRng;
@@ -58,6 +58,29 @@ impl TestHub {
     pub async fn start() -> Self {
         let dir = tempfile::tempdir().unwrap();
         Self::start_in(dir).await
+    }
+
+    /// A hub that other machines on the network can reach at `host`.
+    pub async fn start_on_network(host: &str) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let port = std::net::TcpListener::bind("0.0.0.0:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let handle = serve(HubConfig {
+            data_dir: dir.path().to_path_buf(),
+            listen: format!("0.0.0.0:{port}").parse().unwrap(),
+            public_url: Some(format!("http://{host}:{port}")),
+        })
+        .await
+        .unwrap();
+        Self {
+            url: handle.public_url(),
+            addr: format!("127.0.0.1:{port}").parse().unwrap(),
+            handle,
+            dir,
+        }
     }
 
     pub async fn start_in(dir: tempfile::TempDir) -> Self {
@@ -126,6 +149,23 @@ pub async fn pair_client_http(hub: &TestHub, code: &str, key: &SigningKey) -> (u
             name: "Test client".to_owned(),
             kind: ClientKind::Desktop,
             os: Some(consort_proto::model::Os::Macos),
+        },
+    )
+    .await
+}
+
+/// Pairs with a session host code, on the route of the session host.
+pub async fn pair_session_host_http(hub: &TestHub, code: &str, key: &SigningKey) -> (u16, Value) {
+    http_post(
+        hub,
+        consort_proto::auth::PAIR_SESSION_HOST_PATH,
+        &PairWorkerRequest {
+            code: parse_code(code),
+            public_key: public_key(key),
+            hostname: "fake-host".to_owned(),
+            os: Os::Macos,
+            arch: "aarch64".to_owned(),
+            name: Some("Fake worker".to_owned()),
         },
     )
     .await
@@ -378,16 +418,102 @@ pub struct FakeWorker {
     pub account_id: AccountId,
     pub hello_result: WorkerHelloResult,
     seqs: std::collections::HashMap<SessionId, u64>,
+    /// The execution worker that goes with this session host. A task runs on
+    /// it. `worker_id` and `peer` are the session host.
+    pub exec_id: WorkerId,
+    exec: Option<ExecSide>,
+}
+
+/// An execution worker with no session host. Tags and placement tests use it.
+pub struct FakeExec {
+    pub worker_id: WorkerId,
+    peer: Peer,
+    key: SigningKey,
+}
+
+impl FakeExec {
+    /// Pairs, connects and sends an inventory with no accounts.
+    pub async fn pair(hub: &TestHub) -> Self {
+        let code = hub.handle.new_worker_pairing_code().await.unwrap();
+        let key = new_key();
+        let (status, body) = pair_worker_http(hub, &code, &key).await;
+        assert_eq!(status, 200, "{body}");
+        let paired: PairWorkerResponse = serde_json::from_value(body).unwrap();
+        let mut peer = connect_exec(hub, paired.worker_id, &key).await;
+        send_exec_inventory(&mut peer, inventory(AccountId::new())).await;
+        Self {
+            worker_id: paired.worker_id,
+            peer,
+            key,
+        }
+    }
+
+    /// Closes the connection. The hub keeps the worker.
+    pub async fn go_away(self) -> (WorkerId, SigningKey) {
+        self.peer.close().await;
+        (self.worker_id, self.key)
+    }
+
+    /// Connects again with the same identity.
+    pub async fn come_back(hub: &TestHub, away: (WorkerId, SigningKey)) -> Self {
+        let (worker_id, key) = away;
+        let mut peer = connect_exec(hub, worker_id, &key).await;
+        send_exec_inventory(&mut peer, inventory(AccountId::new())).await;
+        Self {
+            worker_id,
+            peer,
+            key,
+        }
+    }
+}
+
+/// The execution worker of a [`FakeWorker`].
+struct ExecSide {
+    peer: Peer,
+    key: SigningKey,
+}
+
+async fn connect_exec(hub: &TestHub, worker_id: WorkerId, key: &SigningKey) -> Peer {
+    let mut peer = Peer::connect(&hub.ws_url(consort_proto::auth::WORKER_WS_PATH)).await;
+    authenticate(&mut peer, &hub.origin(), PeerId::Worker(worker_id), key)
+        .await
+        .unwrap();
+    peer.call_raw(
+        "hello",
+        serde_json::to_value(WorkerHello {
+            worker_id,
+            version: "test".to_owned(),
+            protocol_versions: vec![1],
+            sessions: Vec::new(),
+        })
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    peer
+}
+
+async fn send_exec_inventory(peer: &mut Peer, mut inventory: Inventory) {
+    inventory.accounts.clear();
+    inventory.tools.clear();
+    let inventory = serde_json::to_value(inventory.with_hash()).unwrap();
+    peer.send(&Frame::Event(consort_proto::frame::EventFrame {
+        kind: "inventory".to_owned(),
+        body: inventory,
+    }))
+    .await;
 }
 
 pub fn inventory(account_id: AccountId) -> Inventory {
     Inventory {
+        boundary: None,
         hash: String::new(),
         hostname: "fake-host".to_owned(),
         os: Os::Macos,
         arch: "aarch64".to_owned(),
         tags: vec!["hub".to_owned()],
         accounts: vec![HarnessAccount {
+            blocked_reason: None,
             account_id,
             harness: "claude".to_owned(),
             label: "Claude Code".to_owned(),
@@ -432,8 +558,6 @@ pub fn inventory(account_id: AccountId) -> Inventory {
             plan: None,
             secret_names: Vec::new(),
             sign_in_methods: Vec::new(),
-            extras_enabled: true,
-            extras: None,
         }],
         local_mcp_servers: Vec::new(),
         checkouts: Vec::new(),
@@ -451,13 +575,26 @@ pub fn inventory(account_id: AccountId) -> Inventory {
 impl FakeWorker {
     /// Pairs with a worker code, connects and sends an inventory.
     pub async fn pair_and_connect(hub: &TestHub) -> Self {
-        let code = hub.handle.new_worker_pairing_code().await.unwrap();
+        let code = hub.handle.new_session_host_pairing_code().await.unwrap();
         let key = new_key();
-        let (status, body) = pair_worker_http(hub, &code, &key).await;
+        let (status, body) = pair_session_host_http(hub, &code, &key).await;
         assert_eq!(status, 200, "{body}");
         let paired: PairWorkerResponse = serde_json::from_value(body).unwrap();
         let account_id = AccountId::new();
         let mut worker = Self::connect(hub, paired.worker_id, key, account_id, Vec::new()).await;
+
+        // The execution worker, on its own route with its own key.
+        let code = hub.handle.new_worker_pairing_code().await.unwrap();
+        let exec_key = new_key();
+        let (status, body) = pair_worker_http(hub, &code, &exec_key).await;
+        assert_eq!(status, 200, "{body}");
+        let exec_paired: PairWorkerResponse = serde_json::from_value(body).unwrap();
+        let exec_peer = connect_exec(hub, exec_paired.worker_id, &exec_key).await;
+        worker.exec_id = exec_paired.worker_id;
+        worker.exec = Some(ExecSide {
+            peer: exec_peer,
+            key: exec_key,
+        });
         worker.send_inventory().await;
         worker
     }
@@ -469,7 +606,7 @@ impl FakeWorker {
         account_id: AccountId,
         sessions: Vec<OpenSession>,
     ) -> Self {
-        let mut peer = Peer::connect(&hub.ws_url(WORKER_WS_PATH)).await;
+        let mut peer = Peer::connect(&hub.ws_url(consort_proto::auth::SESSION_HOST_WS_PATH)).await;
         authenticate(&mut peer, &hub.origin(), PeerId::Worker(worker_id), &key)
             .await
             .unwrap();
@@ -493,6 +630,8 @@ impl FakeWorker {
             account_id,
             hello_result: serde_json::from_value(result).unwrap(),
             seqs: std::collections::HashMap::new(),
+            exec_id: WorkerId::new(),
+            exec: None,
         }
     }
 
@@ -504,16 +643,95 @@ impl FakeWorker {
             account_id,
             seqs,
             peer,
+            exec_id,
+            exec,
             ..
         } = self;
         peer.close().await;
         let mut again = Self::connect(hub, worker_id, key, account_id, sessions).await;
         again.seqs = seqs;
+        again.exec_id = exec_id;
+        if let Some(ExecSide { peer, key }) = exec {
+            peer.close().await;
+            let mut peer = connect_exec(hub, exec_id, &key).await;
+            send_exec_inventory(&mut peer, inventory(account_id)).await;
+            again.exec = Some(ExecSide { peer, key });
+        }
         again
+    }
+
+    /// Closes the connection of the execution worker. The session host stays.
+    pub async fn exec_goes_away(&mut self) {
+        if let Some(side) = self.exec.take() {
+            side.peer.close().await;
+        }
+    }
+
+    /// Sends a request as the session host. The execution worker takes the
+    /// command that the hub sends for it and answers it with `answer`.
+    pub async fn relay_exec(
+        &mut self,
+        kind: &str,
+        body: Value,
+        answer: impl FnOnce(&consort_proto::execution_link::HubToExecution) -> Value,
+    ) -> (
+        Result<Value, ErrorBody>,
+        consort_proto::execution_link::HubToExecution,
+    ) {
+        let side = self
+            .exec
+            .as_mut()
+            .expect("this fake has an execution worker");
+        let peer = &mut self.peer;
+        let exec = &mut side.peer;
+        let worker = async move {
+            loop {
+                if let Frame::Request(request) = exec.next_frame(WAIT).await.expect("a hub command")
+                {
+                    let command: consort_proto::execution_link::HubToExecution =
+                        request.decode().unwrap();
+                    let value = answer(&command);
+                    exec.send(&request.respond_ok(&value).unwrap()).await;
+                    return command;
+                }
+            }
+        };
+        tokio::join!(peer.call_raw(kind, body), worker)
+    }
+
+    /// The next command to the execution worker.
+    pub async fn next_exec_command(
+        &mut self,
+    ) -> (RequestFrame, consort_proto::execution_link::HubToExecution) {
+        let side = self
+            .exec
+            .as_mut()
+            .expect("this fake has an execution worker");
+        loop {
+            match side.peer.next_frame(WAIT).await.expect("a hub command") {
+                Frame::Request(request) => {
+                    let command = request.decode().unwrap();
+                    return (request, command);
+                }
+                _ => continue,
+            }
+        }
+    }
+
+    /// Answers a command of the execution worker.
+    pub async fn exec_respond_ok<T: Serialize>(&mut self, request: &RequestFrame, body: &T) {
+        let side = self
+            .exec
+            .as_mut()
+            .expect("this fake has an execution worker");
+        side.peer.send(&request.respond_ok(body).unwrap()).await;
     }
 
     /// Sends this inventory instead of the default one.
     pub async fn send_custom_inventory(&mut self, inventory: Inventory) {
+        if let Some(side) = self.exec.as_mut() {
+            send_exec_inventory(&mut side.peer, inventory.clone()).await;
+        }
         let inventory = serde_json::to_value(inventory.with_hash()).unwrap();
         self.peer
             .send(&Frame::Event(consort_proto::frame::EventFrame {
@@ -524,6 +742,9 @@ impl FakeWorker {
     }
 
     pub async fn send_inventory(&mut self) {
+        if let Some(side) = self.exec.as_mut() {
+            send_exec_inventory(&mut side.peer, inventory(self.account_id)).await;
+        }
         let inventory = serde_json::to_value(inventory(self.account_id)).unwrap();
         self.peer
             .send(&Frame::Event(consort_proto::frame::EventFrame {
@@ -534,18 +755,18 @@ impl FakeWorker {
     }
 
     /// The next hub command. Panics when none arrives in time.
-    pub async fn next_command(&mut self) -> (RequestFrame, HubToWorker) {
+    pub async fn next_command(&mut self) -> (RequestFrame, HubToSessionHost) {
         self.try_next_command(WAIT).await.expect("a hub command")
     }
 
     pub async fn try_next_command(
         &mut self,
         wait: Duration,
-    ) -> Option<(RequestFrame, HubToWorker)> {
+    ) -> Option<(RequestFrame, HubToSessionHost)> {
         loop {
             match self.peer.next_frame(wait).await? {
                 Frame::Request(request) => {
-                    let command: HubToWorker = request.decode().unwrap();
+                    let command: HubToSessionHost = request.decode().unwrap();
                     return Some((request, command));
                 }
                 _ => continue,
@@ -562,9 +783,9 @@ impl FakeWorker {
     }
 
     /// Takes the next command, which must be `session.start`, and answers it.
-    pub async fn accept_session_start(&mut self) -> consort_proto::worker_link::SessionStart {
+    pub async fn accept_session_start(&mut self) -> consort_proto::session_host_link::SessionStart {
         let (request, command) = self.next_command().await;
-        let HubToWorker::SessionStart(start) = command else {
+        let HubToSessionHost::SessionStart(start) = command else {
             panic!("expected session.start, got {}", command.type_name());
         };
         self.respond_ok(
@@ -657,6 +878,8 @@ pub struct AwayWorker {
     pub worker_id: WorkerId,
     key: SigningKey,
     account_id: AccountId,
+    pub exec_id: WorkerId,
+    exec: Option<ExecSide>,
 }
 
 impl FakeWorker {
@@ -667,6 +890,8 @@ impl FakeWorker {
             worker_id,
             key,
             account_id,
+            exec_id,
+            exec,
             ..
         } = self;
         peer.close().await;
@@ -674,6 +899,8 @@ impl FakeWorker {
             worker_id,
             key,
             account_id,
+            exec_id,
+            exec,
         }
     }
 }
@@ -681,7 +908,11 @@ impl FakeWorker {
 impl AwayWorker {
     /// Connects again with the same identity.
     pub async fn come_back(self, hub: &TestHub) -> FakeWorker {
-        FakeWorker::connect(hub, self.worker_id, self.key, self.account_id, Vec::new()).await
+        let mut back =
+            FakeWorker::connect(hub, self.worker_id, self.key, self.account_id, Vec::new()).await;
+        back.exec_id = self.exec_id;
+        back.exec = self.exec;
+        back
     }
 }
 
@@ -771,7 +1002,9 @@ use consort_proto::model::{ApprovalDetails, RequestOption, RequestOptionKind};
 use consort_proto::model::{
     AssistantMessagePayload, ItemPayload, ItemStatus, SessionItem, SessionState,
 };
-use consort_proto::worker_link::{QuestionDetails, RequestBody, RequestOpened, TurnEndReason};
+use consort_proto::session_host_link::{
+    QuestionDetails, RequestBody, RequestOpened, TurnEndReason,
+};
 
 pub fn state(state: SessionState) -> SessionEvent {
     SessionEvent::State { state }
@@ -810,6 +1043,8 @@ pub fn approval_request(request_id: &str, command: &str) -> SessionEvent {
         request_id: request_id.into(),
         summary: format!("Run {command}"),
         body: RequestBody::Approval(ApprovalDetails::Command {
+            blocked: Vec::new(),
+            check_note: None,
             command: command.to_owned(),
             cwd: Some("/tmp/workspace".to_owned()),
         }),
@@ -952,7 +1187,7 @@ impl World {
     pub async fn start_coordinator(
         &mut self,
         text: &str,
-    ) -> consort_proto::worker_link::SessionStart {
+    ) -> consort_proto::session_host_link::SessionStart {
         self.say(self.tutti, text).await;
         let start = self.worker.accept_session_start().await;
         self.worker
@@ -978,9 +1213,9 @@ impl World {
 /// while the real one is closed.
 pub async fn placeholder_worker(hub: &TestHub) -> FakeWorker {
     // Another paired worker that stays connected. It has no inventory.
-    let code = hub.handle.new_worker_pairing_code().await.unwrap();
+    let code = hub.handle.new_session_host_pairing_code().await.unwrap();
     let key = new_key();
-    let (status, body) = pair_worker_http(hub, &code, &key).await;
+    let (status, body) = pair_session_host_http(hub, &code, &key).await;
     assert_eq!(status, 200, "{body}");
     let paired: PairWorkerResponse = serde_json::from_value(body).unwrap();
     FakeWorker::connect(hub, paired.worker_id, key, AccountId::new(), Vec::new()).await
@@ -996,7 +1231,7 @@ impl World {
         brief: &str,
     ) -> (
         consort_proto::ids::TaskId,
-        consort_proto::worker_link::SessionStart,
+        consort_proto::session_host_link::SessionStart,
     ) {
         let coordinator = self.start_coordinator("Please do this").await;
         let started = self
@@ -1060,14 +1295,14 @@ impl World {
         while !stopped || new.is_none() {
             let (request, command) = self.worker.next_command().await;
             match command {
-                HubToWorker::SessionStop(stop) => {
+                HubToSessionHost::SessionStop(stop) => {
                     assert_eq!(stop.session_id, old);
                     self.worker
                         .respond_ok(&request, &serde_json::json!({}))
                         .await;
                     stopped = true;
                 }
-                HubToWorker::SessionStart(start) => {
+                HubToSessionHost::SessionStart(start) => {
                     self.worker
                         .respond_ok(
                             &request,
@@ -1121,6 +1356,40 @@ impl World {
             assert!(
                 tokio::time::Instant::now() < deadline,
                 "no notice with {parts:?} in {notices:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// The live state "the assistant cannot answer" of the Tutti channel.
+    pub async fn blocked(&mut self) -> Option<consort_proto::model::CoordinatorBlocked> {
+        self.client
+            .snapshot(SnapshotScope::Channel(self.tutti))
+            .await
+            .channels
+            .into_iter()
+            .find(|c| c.id == self.tutti)
+            .and_then(|c| c.coordinator_blocked)
+            .map(|b| *b)
+    }
+
+    /// Waits until the live state of the Tutti channel has a reason with all
+    /// of `parts`, and returns it.
+    pub async fn wait_blocked(
+        &mut self,
+        parts: &[&str],
+    ) -> consort_proto::model::CoordinatorBlocked {
+        let deadline = tokio::time::Instant::now() + WAIT;
+        loop {
+            let blocked = self.blocked().await;
+            if let Some(b) = blocked.clone()
+                && parts.iter().all(|p| b.reason.contains(p))
+            {
+                return b;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no live state with {parts:?}, it is {blocked:?}"
             );
             tokio::time::sleep(Duration::from_millis(25)).await;
         }

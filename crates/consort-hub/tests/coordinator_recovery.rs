@@ -10,8 +10,8 @@ use crate::common::*;
 use consort_proto::error::{ErrorBody, ErrorCode};
 use consort_proto::frame::{EventFrame, Frame, MessageFamily};
 use consort_proto::ids::AccountId;
-use consort_proto::model::{AuthState, SessionState};
-use consort_proto::worker_link::{HubToWorker, SessionEvent, TurnEndReason};
+use consort_proto::model::{AuthState, CoordinatorBlockedKind, SessionState};
+use consort_proto::session_host_link::{HubToSessionHost, SessionEvent, TurnEndReason};
 
 fn signed_out_events() -> Vec<SessionEvent> {
     vec![
@@ -51,7 +51,7 @@ async fn a_signed_out_coordinator_waits_for_a_sign_in_and_says_where() {
     world.worker.send_events(s1, signed_out_events()).await;
     // The hub ends the session on the worker.
     let (request, command) = world.worker.next_command().await;
-    let HubToWorker::SessionStop(stop) = command else {
+    let HubToSessionHost::SessionStop(stop) = command else {
         panic!("expected session.stop, got {}", command.type_name());
     };
     assert_eq!(stop.session_id, s1);
@@ -59,12 +59,17 @@ async fn a_signed_out_coordinator_waits_for_a_sign_in_and_says_where() {
         .worker
         .respond_ok(&request, &serde_json::json!({}))
         .await;
-    world
-        .wait_notice(
-            None,
-            &["assistant_signed_out", "Claude Code", "Fake worker"],
-        )
-        .await;
+    let blocked = world.wait_blocked(&["signed out"]).await;
+    assert_eq!(blocked.kind, CoordinatorBlockedKind::SignedOut);
+    assert!(
+        blocked
+            .account
+            .as_deref()
+            .is_some_and(|a| a.starts_with("Claude Code")),
+        "{blocked:?}"
+    );
+    // The hub posts no message for it.
+    assert!(world.notices(None).await.is_empty());
 
     world.say(world.tutti, "are you there?").await;
     if let Some((_, command)) = world.worker.try_next_command(Duration::from_secs(1)).await {
@@ -78,13 +83,54 @@ async fn a_signed_out_coordinator_waits_for_a_sign_in_and_says_where() {
     let inventory = inventory(world.worker.account_id);
     send_inventory(&mut world.worker, inventory).await;
     let (_, command) = world.worker.next_command().await;
-    let HubToWorker::SessionStart(again) = command else {
+    let HubToSessionHost::SessionStart(again) = command else {
         panic!("expected session.start, got {}", command.type_name());
     };
     assert_ne!(again.session_id, s1);
     let text = again.turn.unwrap().text;
     assert!(text.contains("hello"), "{text}");
     assert!(text.contains("are you there?"), "{text}");
+    // The sign-in works, so the state goes away by itself when the turn
+    // goes out.
+    assert!(world.blocked().await.is_none());
+    world.hub.handle.shutdown().await.unwrap();
+}
+
+/// A probe can say "signed in" while the login does not work, so the hub tries
+/// again and fails again. The channel gets the live state again for each
+/// failure, and the hub posts no message at all.
+#[tokio::test]
+async fn a_login_that_keeps_failing_posts_no_message() {
+    let mut world = World::start().await;
+    let mut session = world.start_coordinator("hello").await.session_id;
+    for round in 0..3 {
+        world.worker.send_events(session, signed_out_events()).await;
+        let (request, command) = world.worker.next_command().await;
+        let HubToSessionHost::SessionStop(stop) = command else {
+            panic!("expected session.stop, got {}", command.type_name());
+        };
+        assert_eq!(stop.session_id, session);
+        world
+            .worker
+            .respond_ok(&request, &serde_json::json!({}))
+            .await;
+        world.wait_blocked(&["Claude Code"]).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let notices = world.notices(None).await;
+        assert!(notices.is_empty(), "round {round}: {notices:?}");
+
+        // The next probe says "signed in" again.
+        let inventory = inventory(world.worker.account_id);
+        send_inventory(&mut world.worker, inventory).await;
+        session = world.worker.accept_session_start().await.session_id;
+        world
+            .worker
+            .send_events(
+                session,
+                vec![state(SessionState::Active), turn_started("t1")],
+            )
+            .await;
+    }
     world.hub.handle.shutdown().await.unwrap();
 }
 
@@ -128,7 +174,7 @@ async fn a_signed_out_coordinator_moves_to_another_signed_in_account() {
     while !stopped || moved.is_none() {
         let (request, command) = world.worker.next_command().await;
         match command {
-            HubToWorker::SessionStop(stop) => {
+            HubToSessionHost::SessionStop(stop) => {
                 assert_eq!(stop.session_id, s1);
                 world
                     .worker
@@ -136,12 +182,12 @@ async fn a_signed_out_coordinator_moves_to_another_signed_in_account() {
                     .await;
                 stopped = true;
             }
-            HubToWorker::SessionStart(start) => {
+            HubToSessionHost::SessionStart(start) => {
                 world
                     .worker
                     .respond_ok(
                         &request,
-                        &consort_proto::worker_link::SessionStartResult {
+                        &consort_proto::session_host_link::SessionStartResult {
                             workspace_path: "/tmp/w".to_owned(),
                             native_ref: None,
                         },
@@ -155,9 +201,9 @@ async fn a_signed_out_coordinator_moves_to_another_signed_in_account() {
     let moved = moved.unwrap();
     assert_ne!(moved.account_id, first_account);
     assert!(moved.turn.unwrap().text.contains("hello"));
-    world
-        .wait_notice(None, &["assistant_signed_out", "moves to another account"])
-        .await;
+    // The assistant moved, so nothing is blocked and nothing is posted.
+    assert!(world.blocked().await.is_none());
+    assert!(world.notices(None).await.is_empty());
     world.hub.handle.shutdown().await.unwrap();
 }
 
@@ -169,7 +215,7 @@ async fn a_coordinator_start_that_fails_is_not_tried_again_at_once() {
     let mut world = World::start().await;
     world.say(world.tutti, "hello").await;
     let (request, command) = world.worker.next_command().await;
-    let HubToWorker::SessionStart(start) = command else {
+    let HubToSessionHost::SessionStart(start) = command else {
         panic!("expected session.start, got {}", command.type_name());
     };
     world
@@ -193,9 +239,8 @@ async fn a_coordinator_start_that_fails_is_not_tried_again_at_once() {
             ErrorBody::new(ErrorCode::Internal, "could not start the harness"),
         )
         .await;
-    world
-        .wait_notice(None, &["assistant_unavailable", "could not start"])
-        .await;
+    let blocked = world.wait_blocked(&["could not start"]).await;
+    assert_eq!(blocked.kind, CoordinatorBlockedKind::StartFailed);
     if let Some((_, command)) = world.worker.try_next_command(Duration::from_secs(2)).await {
         panic!("the hub sent {} after a failed start", command.type_name());
     }
@@ -205,13 +250,6 @@ async fn a_coordinator_start_that_fails_is_not_tried_again_at_once() {
         panic!("the hub sent {} in the backoff", command.type_name());
     }
     let notices = world.notices(None).await;
-    assert_eq!(
-        notices
-            .iter()
-            .filter(|n| n.contains("could not start"))
-            .count(),
-        1,
-        "{notices:?}"
-    );
+    assert!(notices.is_empty(), "{notices:?}");
     world.hub.handle.shutdown().await.unwrap();
 }

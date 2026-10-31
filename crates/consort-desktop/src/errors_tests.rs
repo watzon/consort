@@ -21,6 +21,7 @@ fn failed(kind: TurnErrorKindView, account: &str) -> TurnFailed {
         kind,
         resets_at: None,
         account: Some(account.into()),
+        path: Vec::new(),
         raw: "Internal error: You've hit your weekly limit, resets 4am (America/Denver): {\n  \"errorKind\": \"rate_limit\"\n}".into(),
     }
 }
@@ -247,11 +248,9 @@ fn sign_in_again_opens_the_sign_in_of_the_account(cx: &mut TestAppContext) {
         assert_eq!(
             app.add_account.account_id.as_deref().and_then(|id| {
                 app.state
-                    .workers
-                    .iter()
-                    .flat_map(|w| &w.accounts)
-                    .find(|a| a.id == id)
-                    .map(|a| a.label.clone())
+                    .accounts()
+                    .find(|(_, a)| a.id == id)
+                    .map(|(_, a)| a.label.clone())
             }),
             Some("Claude Personal".to_owned())
         );
@@ -259,7 +258,7 @@ fn sign_in_again_opens_the_sign_in_of_the_account(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn sign_in_again_with_an_unknown_account_opens_the_workers_page(cx: &mut TestAppContext) {
+fn sign_in_again_with_an_unknown_account_opens_the_providers_page(cx: &mut TestAppContext) {
     let mut c = card(TurnErrorKindView::ExpiredSignIn, false);
     c.account = Some("An account that no worker has".into());
     let (handle, app) = open(with_card(c), cx);
@@ -268,7 +267,7 @@ fn sign_in_again_with_an_unknown_account_opens_the_workers_page(cx: &mut TestApp
     click(cx, "error-action-err-m_failed-SignInAgain");
     app.read_with(cx, |app, _| {
         assert_eq!(app.page, crate::app::Page::Settings);
-        assert_eq!(app.settings_section, crate::app::SettingsSection::Workers);
+        assert_eq!(app.settings_section, crate::app::SettingsSection::Providers);
     });
 }
 
@@ -322,8 +321,10 @@ fn error_post(card: ErrorCardView) -> ThreadPost {
         bodies: vec![PostBody::Notice {
             kind: "turn_failed".into(),
             text: "The turn failed.".into(),
-            error: Some(card),
+            error: Some(Box::new(card)),
             draft: None,
+            fallback: None,
+            monid: None,
         }],
         pending: false,
         source_message_id: None,
@@ -519,5 +520,23 @@ fn a_refused_reply_in_a_task_thread_stays_in_the_lane_of_the_user(cx: &mut TestA
             app.inputs.reply.read(cx).value().to_string(),
             "OK, go ahead and start the build."
         );
+    });
+}
+
+#[gpui::test]
+fn a_card_of_a_failed_path_lists_the_steps_and_edit_path_opens_the_models_page(
+    cx: &mut TestAppContext,
+) {
+    let body = r#"{"kind":"turn_failed","text":"x","error_kind":"rate_limit","account":"Claude Lab","path":[{"place":"first","account_label":"Claude Lab","model":"opus","model_name":"Opus 5.5","outcome":"failed","cause":"usage_limit"}]}"#;
+    let path_failed = consort_client::turn_errors::parse_turn_failed(body).expect("a notice");
+    let card = error_card(&path_failed, resend(), false, NOW);
+    assert_eq!(card.title, "No model in the path could answer");
+    let (handle, app) = open(with_card(card), cx);
+    let cx = &mut VisualTestContext::from_window(handle, cx);
+    settle(cx, 100);
+    assert!(crate::test_support::has(cx, "error-path-err-m_failed"));
+    crate::test_support::click(cx, "error-action-err-m_failed-EditPath");
+    app.read_with(cx, |app, _| {
+        assert_eq!(app.settings_section, crate::app::SettingsSection::Models)
     });
 }

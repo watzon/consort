@@ -73,6 +73,7 @@ fn new_routine(
         next_run_at: None,
         last_run_at: None,
         last_run_status: None,
+        monid: None,
         kind,
         origin: RoutineOrigin::Hub,
         created_at: Some(now),

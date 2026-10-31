@@ -9,9 +9,9 @@ use consort_proto::ids::{MessageId, TaskId};
 use consort_proto::model::{
     ApprovalStatus, Author, DecisionStatus, Message, MessageKind, SessionState,
 };
+use consort_proto::session_host_link::{HubToSessionHost, TurnEndReason};
 use consort_proto::status::TaskStatus;
 use consort_proto::tools::ToolCallResult;
-use consort_proto::worker_link::{HubToWorker, TurnEndReason};
 use serde_json::json;
 
 /// The messages of the thread of a task card.
@@ -69,7 +69,7 @@ async fn the_coordinator_passes_a_user_message_to_a_task_with_its_stored_words()
         .await;
     assert_eq!(result["delivery"], "steer");
     let (_, command) = world.worker.next_command().await;
-    let HubToWorker::SessionSteer(steer) = command else {
+    let HubToSessionHost::SessionSteer(steer) = command else {
         panic!("expected session.steer");
     };
     assert_eq!(steer.session_id, sid);
@@ -382,7 +382,7 @@ async fn text_from_the_chat_closes_the_open_decision_of_the_task() {
     assert_eq!(answer.text.as_deref(), Some("SQLite is fine."));
     assert_eq!(answer.option_index, None);
     let (_, command) = world.worker.next_command().await;
-    let HubToWorker::SessionTurn(turn) = command else {
+    let HubToSessionHost::SessionTurn(turn) = command else {
         panic!("expected session.turn");
     };
     assert_eq!(turn.session_id, sid);
@@ -410,7 +410,7 @@ async fn a_reply_typed_in_the_task_thread_closes_the_open_decision_too() {
     let decision = wait_decision_answered(&mut world, decision_id).await;
     assert_eq!(decision.answer.unwrap().text.as_deref(), Some("Postgres."));
     let (_, command) = world.worker.next_command().await;
-    let HubToWorker::SessionTurn(turn) = command else {
+    let HubToSessionHost::SessionTurn(turn) = command else {
         panic!("expected session.turn");
     };
     assert_eq!(turn.turn.text, "Postgres.");
@@ -481,7 +481,7 @@ async fn text_answers_a_harness_question_through_the_session() {
     // The harness waits for the answer to its question, so the text goes
     // back as the answer, not as a steer.
     let (_, command) = world.worker.next_command().await;
-    let HubToWorker::SessionRespond(respond) = command else {
+    let HubToSessionHost::SessionRespond(respond) = command else {
         panic!("expected session.respond, got {command:?}");
     };
     assert_eq!(respond.request_id.as_str(), "req-q");
@@ -509,7 +509,7 @@ async fn user_turn(world: &mut World, ended: &str, next: &str, text: &str) -> (M
         .await;
     loop {
         let (request, command) = world.worker.next_command().await;
-        if let HubToWorker::SessionTurn(turn) = &command
+        if let HubToSessionHost::SessionTurn(turn) = &command
             && turn.session_id == coordinator
             && turn.turn.text.contains(text)
         {

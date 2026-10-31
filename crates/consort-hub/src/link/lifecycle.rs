@@ -5,10 +5,11 @@ use consort_proto::auth::{SessionSeq, WorkerHello, WorkerHelloResult};
 use consort_proto::error::{ErrorBody, ErrorCode};
 use consort_proto::ids::{RequestId, SessionId, WorkerId};
 use consort_proto::model::{
-    ApprovalStatus, DecisionStatus, Inventory, SessionRole, SessionState, WorkerState,
+    ApprovalStatus, CoordinatorBlocked, CoordinatorBlockedKind, DecisionStatus, Inventory,
+    SessionRole, SessionState, WorkerState,
 };
+use consort_proto::session_host_link::{SessionRespond, SessionStartResult, SessionSteer};
 use consort_proto::status::{Actor, TaskStatus};
-use consort_proto::worker_link::{SessionRespond, SessionStartResult, SessionSteer};
 
 use super::events::{Ctx, Effects, finish_session, mark_lost_in_tx, queue_stop};
 use crate::error::{HubError, Result};
@@ -355,12 +356,13 @@ pub(crate) fn session_start_failed_tx(
         // channel waits longer before each new try.
         ctx.fx.kick.clear();
         ctx.fx.start_failed.push(session.channel_id);
-        tx.post_notice(
+        tx.set_coordinator_blocked(
             session.channel_id,
-            None,
-            None,
-            "assistant_unavailable",
-            &format!("The assistant could not start: {}", error.message),
+            Some(CoordinatorBlocked {
+                kind: CoordinatorBlockedKind::StartFailed,
+                reason: format!("The assistant could not start: {}", error.message),
+                account: None,
+            }),
         )?;
     } else {
         // The task failed in finish_session. Give the reason in the
@@ -380,7 +382,7 @@ pub(crate) fn session_start_failed_tx(
 pub(crate) fn model_change_refused_tx(
     hub: &Hub,
     tx: &mut Tx<'_>,
-    turn: &consort_proto::worker_link::SessionTurn,
+    turn: &consort_proto::session_host_link::SessionTurn,
     error: ErrorBody,
 ) -> Result<Effects> {
     let session_id = turn.session_id;
@@ -455,15 +457,16 @@ pub(crate) fn turn_command_failed_tx(
                 row.turn_started_at = None;
                 row.turn_events.clear();
                 tx.save_coordinator(&row)?;
-                tx.post_notice(
+                tx.set_coordinator_blocked(
                     session.channel_id,
-                    None,
-                    None,
-                    "assistant_unavailable",
-                    &format!(
-                        "The assistant did not take your message: {} The hub tries again soon.",
-                        error.message
-                    ),
+                    Some(CoordinatorBlocked {
+                        kind: CoordinatorBlockedKind::StartFailed,
+                        reason: format!(
+                            "The assistant did not take your message: {} The hub tries again soon.",
+                            error.message
+                        ),
+                        account: None,
+                    }),
                 )?;
                 fx.turn_refused.push(session.channel_id);
             }
@@ -675,6 +678,7 @@ mod tests {
 
     async fn online_worker(hub: &Hub) -> WorkerId {
         let worker = Worker {
+            kind: Default::default(),
             id: WorkerId::new(),
             name: "Laptop".to_owned(),
             hostname: "laptop".to_owned(),

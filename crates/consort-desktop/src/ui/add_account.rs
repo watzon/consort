@@ -19,8 +19,8 @@ use crate::{
     ui::{
         dialogs::input_box,
         parts::{
-            ButtonKind, button, detail, focusable, icon, provider_logo, selectable, status_glyph,
-            text,
+            ButtonKind, button, detail, error_box, focusable, icon, provider_logo, selectable,
+            status_glyph, text,
         },
         settings::segmented,
     },
@@ -283,13 +283,8 @@ impl ConsortApp {
                     .worker(&worker_id)
                     .is_some_and(|w| w.accounts.iter().any(|a| a.label == label));
                 if taken {
-                    let worker = self
-                        .state
-                        .worker(&worker_id)
-                        .map(|w| w.name.clone())
-                        .unwrap_or_default();
                     self.dialog_error = Some(format!(
-                        "{worker} has an account named {label} already. Choose another name."
+                        "An account named {label} is there already. Choose another name."
                     ));
                     cx.notify();
                     return;
@@ -360,7 +355,7 @@ impl ConsortApp {
         cx.notify();
     }
 
-    fn field_text(&self, input: &Entity<InputState>, cx: &gpui_kit::App) -> String {
+    pub(crate) fn field_text(&self, input: &Entity<InputState>, cx: &gpui_kit::App) -> String {
         input.read(cx).value().trim().to_owned()
     }
 
@@ -375,20 +370,15 @@ impl ConsortApp {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AccountDialogParts {
-        let worker = self
-            .state
-            .worker(&self.add_account.worker_id)
-            .map(|w| w.name.clone())
-            .unwrap_or_else(|| "the worker".to_owned());
+        // Every account is on the hub machine. The dialog names no worker.
+        let worker = "the hub machine".to_owned();
         match self.add_account.step {
             AccountStep::Provider => {
-                let (body, note) = self.provider_step(&worker, t, window, cx);
+                let (body, note) = self.provider_step(t, window, cx);
                 let actions = self.account_footer(note, "Cancel", "Next", true, t, cx);
                 (
-                    format!("Add an account to {worker}"),
-                    format!(
-                        "An account is one login to a provider. {worker} keeps each one in its own profile folder, so one provider can have several accounts."
-                    ),
+                    "Add an account".to_owned(),
+                    "An account is one login to a provider. The hub machine keeps each one in its own profile folder, so one provider can have several accounts.".to_owned(),
                     t.layout.dialog_account,
                     body,
                     actions,
@@ -396,7 +386,7 @@ impl ConsortApp {
                 )
             }
             AccountStep::Name => {
-                let body = self.name_step(&worker, t, window, cx);
+                let body = self.name_step(t, window, cx);
                 let actions = self.account_footer(
                     "You can change the name later.".into(),
                     "Back",
@@ -406,10 +396,8 @@ impl ConsortApp {
                     cx,
                 );
                 (
-                    format!("Add an account to {worker}"),
-                    format!(
-                        "An account is one login to a provider. {worker} keeps each one in its own profile folder, so one provider can have several accounts."
-                    ),
+                    "Add an account".to_owned(),
+                    "An account is one login to a provider. The hub machine keeps each one in its own profile folder, so one provider can have several accounts.".to_owned(),
                     t.layout.dialog_account,
                     body,
                     actions,
@@ -433,7 +421,22 @@ impl ConsortApp {
         let steps = [
             (AccountStep::Provider, "1", "Provider", provider),
             (AccountStep::Name, "2", "Name", label),
-            (AccountStep::SignIn, "3", "Sign in", String::new()),
+            (
+                AccountStep::SignIn,
+                "3",
+                if self.sign_in_tool().is_some_and(|tool| {
+                    !matches!(
+                        tool.state,
+                        consort_client::ToolState::Ready
+                            | consort_client::ToolState::UpdateAvailable
+                    )
+                }) {
+                    "Install and sign in"
+                } else {
+                    "Sign in"
+                },
+                String::new(),
+            ),
         ];
         let order = |s: AccountStep| match s {
             AccountStep::Provider => 0,
@@ -545,7 +548,6 @@ impl ConsortApp {
     /// Step 1: the provider grid, the ACP registry and the custom command.
     fn provider_step(
         &mut self,
-        worker: &str,
         t: &Tokens,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -566,6 +568,7 @@ impl ConsortApp {
                     .flex()
                     .flex_col()
                     .flex_1()
+                    .min_w_0()
                     .flex_basis(gpui_kit::relative(0.))
                     .gap(t.space.xxs)
                     .py(t.space.sm + t.space.xxs)
@@ -614,6 +617,7 @@ impl ConsortApp {
         let search = div()
             .flex()
             .flex_1()
+            .min_w_0()
             .items_center()
             .gap(t.space.sm)
             .py(t.space.xs + t.space.xxs)
@@ -627,7 +631,11 @@ impl ConsortApp {
             })
             .rounded(t.radius.md)
             .child(icon("search", t.icon.dense, c.text_tertiary))
-            .child(crate::ui::parts::input(&self.inputs.agent_search, t.text.ui).flex_1());
+            .child(
+                crate::ui::parts::input(&self.inputs.agent_search, t.text.ui)
+                    .flex_1()
+                    .min_w_0(),
+            );
         let custom_button = button("custom-command", "Custom command", ButtonKind::Secondary, t)
             .when(custom, |b| b.border_color(c.accent_text))
             .on_click(cx.listener(|this, _, window, cx| {
@@ -648,10 +656,11 @@ impl ConsortApp {
                     crate::ui::dialogs::field_block(
                         "Program",
                         input_box(&self.inputs.program, program_focused, t),
-                        Some("The worker runs it as an ACP agent."),
+                        Some("The hub machine runs it as an ACP agent."),
                         t,
                     )
-                    .flex_1(),
+                    .flex_1()
+                    .min_w_0(),
                 )
                 .child(
                     crate::ui::dialogs::field_block(
@@ -660,7 +669,8 @@ impl ConsortApp {
                         Some("Separate them with spaces."),
                         t,
                     )
-                    .flex_1(),
+                    .flex_1()
+                    .min_w_0(),
                 )
                 .into_any_element()
         } else {
@@ -682,13 +692,25 @@ impl ConsortApp {
                             .flex()
                             .items_center()
                             .gap(t.space.md)
-                            .child(div().flex_1().h(t.border_width).bg(c.border_strong))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .h(t.border_width)
+                                    .bg(c.border_strong),
+                            )
                             .child(text(
                                 "Or add an agent from the ACP registry",
                                 detail(t),
                                 c.text_tertiary,
                             ))
-                            .child(div().flex_1().h(t.border_width).bg(c.border_strong)),
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .h(t.border_width)
+                                    .bg(c.border_strong),
+                            ),
                     )
                     .child(
                         div()
@@ -702,13 +724,16 @@ impl ConsortApp {
         let (name, _) = self.chosen_provider();
         let note = match &chosen {
             Some(ProviderPick::Builtin(_)) => {
-                format!("{worker} downloads {name} itself and keeps it up to date.")
+                format!("Consort installs {name} on the hub machine and signs in.")
             }
             Some(ProviderPick::Registry { .. }) => {
-                format!("{worker} installs {name} from the ACP registry and keeps it up to date.")
+                format!(
+                    "Consort installs {name} from the ACP registry on the hub machine and signs in."
+                )
             }
             Some(ProviderPick::Command) => {
-                format!("{worker} runs this command as it is. Consort does not install it.")
+                "The hub machine runs this command as it is. Consort does not install it."
+                    .to_owned()
             }
             None => "Choose a provider.".to_owned(),
         };
@@ -810,7 +835,7 @@ impl ConsortApp {
             let description = if supported {
                 agent.description.clone()
             } else {
-                "Consort cannot install this agent yet. It needs a download that no worker can check.".to_owned()
+                "Consort cannot install this agent yet. It needs a download that the hub machine cannot check.".to_owned()
             };
             list = list.child(
                 div()
@@ -864,15 +889,8 @@ impl ConsortApp {
         list.into_any_element()
     }
 
-    /// Step 2: the account name, the names already used on other workers,
-    /// and the profile folder.
-    fn name_step(
-        &mut self,
-        worker: &str,
-        t: &Tokens,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Div {
+    /// Step 2: the account name and the profile folder.
+    fn name_step(&mut self, t: &Tokens, window: &mut Window, cx: &mut Context<Self>) -> Div {
         let c = &t.colors;
         let (_, logo) = self.chosen_provider();
         let focused = self.is_focused(&self.inputs.account_name, window, cx);
@@ -892,19 +910,12 @@ impl ConsortApp {
             })
             .rounded(t.radius.md)
             .child(provider_logo(&logo, t.icon.size, c.text_primary))
-            .child(crate::ui::parts::input(&self.inputs.account_name, t.text.body).flex_1());
-        let harness = match &self.add_account.provider {
-            Some(ProviderPick::Builtin(harness)) => (*harness).to_owned(),
-            Some(ProviderPick::Registry { id, .. }) => format!("acp:{id}"),
-            _ => String::new(),
-        };
-        let names = if harness.is_empty() {
-            Vec::new()
-        } else {
-            self.state
-                .account_names(&harness, &self.add_account.worker_id)
-        };
-        let mut body = div()
+            .child(
+                crate::ui::parts::input(&self.inputs.account_name, t.text.body)
+                    .flex_1()
+                    .min_w_0(),
+            );
+        let body = div()
             .flex()
             .flex_col()
             .gap(t.space.lg + t.space.xxs)
@@ -915,81 +926,6 @@ impl ConsortApp {
                 Some("Shown in the model picker and on task cards. Say whose login it is, such as Personal or Work."),
                 t,
             ));
-        if !names.is_empty() {
-            let mut chips = div().flex().flex_wrap().gap(t.space.xs + t.space.xxs);
-            for suggestion in names {
-                let selected = suggestion.label == name;
-                let label = suggestion.label.clone();
-                chips = chips.child(
-                    div()
-                        .id(SharedString::from(format!("name-{}", suggestion.label)))
-                        .flex()
-                        .items_center()
-                        .gap(t.space.xs + t.space.xxs)
-                        .py(t.component.button_pad_y - t.space.xxs)
-                        .px(t.space.sm + t.space.xxs)
-                        .rounded(t.radius.full)
-                        .border(t.border_width)
-                        .cursor_pointer()
-                        .when(selected, |d| {
-                            d.bg(c.tint_accent).border_color(c.accent_text)
-                        })
-                        .when(!selected, |d| {
-                            d.border_color(c.border_strong)
-                                .hover(|s| s.bg(c.hover_card))
-                        })
-                        .child(text(
-                            suggestion.label.clone(),
-                            if selected { t.text.label } else { detail(t) },
-                            if selected {
-                                c.accent_text
-                            } else {
-                                c.text_secondary
-                            },
-                        ))
-                        .child(text(
-                            suggestion.workers.join(", "),
-                            t.text.caption,
-                            c.text_tertiary,
-                        ))
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            let label = label.clone();
-                            this.inputs
-                                .account_name
-                                .update(cx, |input, cx| input.set_value(label, window, cx));
-                            cx.notify();
-                        })),
-                );
-            }
-            body = body.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(t.space.sm)
-                    .p(t.space.md)
-                    .bg(c.surface_card)
-                    .border(t.border_width)
-                    .border_color(c.border_subtle)
-                    .rounded(t.radius.lg)
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap(t.space.xxs)
-                            .child(text(
-                                "Same account on other workers",
-                                t.text.ui_strong,
-                                c.text_primary,
-                            ))
-                            .child(text(
-                                "Choose a name you already use, and the hub treats them as one account when it picks a worker.",
-                                detail(t),
-                                c.text_tertiary,
-                            )),
-                    )
-                    .child(chips),
-            );
-        }
         let windows = self
             .state
             .worker(&self.add_account.worker_id)
@@ -1007,7 +943,7 @@ impl ConsortApp {
                 .gap(t.space.sm + t.space.xxs)
                 .child(icon("folder", t.icon.dense, c.text_tertiary))
                 .child(text(
-                    format!("Profile folder on {worker}:"),
+                    "Profile folder on the hub machine:".to_owned(),
                     detail(t),
                     c.text_tertiary,
                 ))
@@ -1019,6 +955,84 @@ impl ConsortApp {
     }
 
     /// Step 3: the method tabs, then the flow of the sign-in.
+    /// The command line tool of the provider that the dialog signs in to.
+    fn sign_in_tool(&self) -> Option<consort_client::ToolView> {
+        let (provider, _) = self.chosen_provider();
+        let host = self.state.session_host.as_ref()?;
+        consort_client::provider_sections(host)
+            .into_iter()
+            .find(|section| section.name == provider)
+            .and_then(|section| section.tool)
+    }
+
+    /// The install in step 3, while the tool of the provider is not ready.
+    /// The user can close the dialog, and the install goes on.
+    fn install_block(&self, provider: &str, t: &Tokens, cx: &mut Context<Self>) -> Option<Div> {
+        let c = &t.colors;
+        let tool = self.sign_in_tool()?;
+        let host = self.state.session_host.as_ref()?.id.clone();
+        match tool.state {
+            consort_client::ToolState::Failed => {
+                let tool_id = tool.id.clone();
+                Some(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_start()
+                        .gap(t.space.sm)
+                        .debug_selector(|| "install-failed".into())
+                        .child(error_box(
+                            "install-error",
+                            format!("{provider} did not install. Check that the hub machine can reach the network, then try again."),
+                            t,
+                        ))
+                        .when_some(tool.detail.clone(), |d, details| {
+                            d.child(selectable(
+                                "install-details",
+                                details,
+                                detail(t),
+                                c.text_secondary,
+                            ))
+                        })
+                        .child(
+                            button("install-again", "Try again", ButtonKind::Secondary, t)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    let client = this.client.clone();
+                                    let (w, id) = (host.clone(), tool_id.clone());
+                                    this.spawn_command(cx, async move {
+                                        client.install_tool(w, id).await
+                                    });
+                                })),
+                        ),
+                )
+            }
+            consort_client::ToolState::Installing | consort_client::ToolState::Missing => Some(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(t.space.sm)
+                    .debug_selector(|| "install-running".into())
+                    .child(status_glyph(
+                        "install-running",
+                        consort_client::TaskStatus::Working,
+                        t.icon.dense,
+                        t,
+                        cx,
+                    ))
+                    .child(
+                        text(
+                            format!("Installing {provider} on the hub machine. You can close this dialog. The install goes on."),
+                            t.text.ui,
+                            c.text_secondary,
+                        )
+                        .flex_1()
+                        .min_w_0(),
+                    ),
+            ),
+            consort_client::ToolState::Ready | consort_client::ToolState::UpdateAvailable => None,
+        }
+    }
+
     fn sign_in_step(
         &mut self,
         worker: &str,
@@ -1073,6 +1087,9 @@ impl ConsortApp {
             .flex_col()
             .gap(t.space.lg + t.space.xxs)
             .child(self.steps_bar(t));
+        if let Some(block) = self.install_block(&provider, t, cx) {
+            body = body.child(block);
+        }
         if methods.len() > 1 {
             let options: Vec<(usize, String)> = methods
                 .iter()
@@ -1172,7 +1189,7 @@ impl ConsortApp {
         (
             format!("Sign in to {label}"),
             format!(
-                "{worker} runs {provider}'s own sign-in. The login stays in this account's profile folder on {worker}."
+                "The hub machine runs {provider}'s own sign-in. The login stays in this account's profile folder on {worker}."
             ),
             t.layout.dialog_account,
             body,
@@ -1215,7 +1232,7 @@ impl ConsortApp {
         }
         let Some(method) = method else {
             return card.child(text(
-                format!("{worker} offers no way to sign in to this account from the app. Check the setup of {provider} on {worker}."),
+                format!("The hub machine offers no way to sign in to this account from the app. Check the setup of {provider} on {worker}."),
                 t.text.ui,
                 c.text_secondary,
             ));
@@ -1245,7 +1262,11 @@ impl ConsortApp {
                 let row = div()
                     .flex()
                     .gap(t.space.sm)
-                    .child(code_field(&self.inputs.api_key, focused, t).flex_1())
+                    .child(
+                        code_field(&self.inputs.api_key, focused, t)
+                            .flex_1()
+                            .min_w_0(),
+                    )
                     .child(
                         button("save-key", "Save", ButtonKind::Primary, t)
                             .px(t.space.md + t.space.xxs)
@@ -1259,7 +1280,7 @@ impl ConsortApp {
                 card.child(flow_step(
                     Marker::Number("1"),
                     "Paste the API key".to_owned(),
-                    Some(format!("{worker} saves it as {variable} in this account's profile folder. The hub does not keep it.")),
+                    Some(format!("The hub machine saves it as {variable} in this account's profile folder. The hub does not keep it.")),
                     Some(row.into_any_element()),
                     t,
                 ))
@@ -1386,7 +1407,7 @@ impl ConsortApp {
                 let row = div()
                     .flex()
                     .gap(t.space.sm)
-                    .child(code_field(&self.inputs.sign_in_code, focused, t).flex_1())
+                    .child(code_field(&self.inputs.sign_in_code, focused, t).flex_1().min_w_0())
                     .child(
                         button("send-code", "Send code", ButtonKind::Primary, t)
                             .px(t.space.md + t.space.xxs)
@@ -1397,7 +1418,7 @@ impl ConsortApp {
                 card.child(flow_step(
                     Marker::Done,
                     format!("Open {page}'s sign-in page"),
-                    Some(format!("{worker} started the sign-in of {provider} for this account. Sign in with the login that {label} stands for.")),
+                    Some(format!("The hub machine started the sign-in of {provider} for this account. Sign in with the login that {label} stands for.")),
                     Some(open_buttons(url, "Copy link", url.clone(), cx).into_any_element()),
                     t,
                 ))

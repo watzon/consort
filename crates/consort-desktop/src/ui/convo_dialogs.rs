@@ -79,6 +79,7 @@ fn choice(
     focusable(div().id(gpui_kit::ElementId::Name(id.into())), t)
         .flex()
         .flex_1()
+        .min_w_0()
         .items_center()
         .justify_center()
         .gap(t.space.sm)
@@ -139,6 +140,7 @@ fn icon_choices(current: &str, t: &Tokens, cx: &mut Context<ConsortApp>) -> Div 
             .debug_selector(|| "icon-choice-more".into())
             .flex()
             .flex_1()
+            .min_w_0()
             .items_center()
             .justify_center()
             .h(v.icon_choice)
@@ -657,6 +659,7 @@ impl ConsortApp {
             );
         let repo_select = select_field("task-repo", repo_value, self, t)
             .flex_1()
+            .min_w_0()
             .on_click(cx.listener(|this, _, _, cx| {
                 if let Some(bounds) = this.triggers.get("task-repo") {
                     let current = this.convo.new_task.repo_id.clone();
@@ -775,6 +778,7 @@ impl ConsortApp {
                         t,
                     )
                     .flex_1()
+                    .min_w_0()
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if let Some(bounds) = this.triggers.get("start-day") {
                             let current = this.convo.new_task.day;
@@ -850,6 +854,7 @@ impl ConsortApp {
                 Some(approval_caption(form.approval_mode)),
                 t,
             ))
+            .children(self.monid_full_access_note(&form.channel_id, form.approval_mode, t))
             .child(field_block("Start", start_row, None, t));
         let start = if form.later {
             consort_client::convo::StartWhen::At(consort_client::convo::start_time(
@@ -966,7 +971,8 @@ impl ConsortApp {
                             None,
                             t,
                         )
-                        .flex_1(),
+                        .flex_1()
+                        .min_w_0(),
                     ),
             )
             .child(field_block(
@@ -1051,6 +1057,34 @@ impl ConsortApp {
                 None,
                 t,
             ))
+            .child(
+                // One line, so the dialog still fits a window of 900 px with
+                // its buttons in view. The path is global: Settings > Models.
+                div()
+                    .id("settings-fallback-path")
+                    .debug_selector(|| "settings-fallback-path".into())
+                    .flex()
+                    .items_baseline()
+                    .justify_between()
+                    .gap(t.space.md)
+                    .child(text("Fallback path", t.text.label, c.text_secondary))
+                    .child(
+                        div()
+                            .flex()
+                            .items_baseline()
+                            .gap(t.space.sm)
+                            .child(text(
+                                format!("Same as {}", crate::ui::TUTTI),
+                                t.text.ui,
+                                c.text_primary,
+                            ))
+                            .child(text(
+                                self.state.fallback_path.summary(),
+                                detail(t),
+                                c.text_tertiary,
+                            )),
+                    ),
+            )
             .child(proactivity)
             .child(
                 div()
@@ -1319,17 +1353,21 @@ impl ConsortApp {
                     .child(
                         line(server.clone(), t.text.mono, c.text_primary)
                             .font_family(t.font_mono.clone())
-                            .flex_1(),
+                            .flex_1()
+                            .min_w_0(),
                     )
-                    .child(text(
-                        if names.is_empty() {
-                            "No worker has it now".to_owned()
-                        } else {
-                            format!("On {}", consort_client::convo::join_names(&names))
-                        },
-                        detail(t),
-                        c.text_tertiary,
-                    ))
+                    .child(
+                        text(
+                            if names.is_empty() {
+                                "No worker has it now".to_owned()
+                            } else {
+                                format!("On {}", consort_client::convo::join_names(&names))
+                            },
+                            detail(t),
+                            c.text_tertiary,
+                        )
+                        .min_w_0(),
+                    )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         let list = &mut this.convo.settings.servers;
                         if let Some(at) = list.iter().position(|s| *s == toggle) {
@@ -1382,9 +1420,18 @@ impl ConsortApp {
                 div()
                     .flex()
                     .gap(t.space.sm)
-                    .child(field_block("Default isolation", isolation, None, t).flex_1())
-                    .child(field_block("Default approval mode", mode_select, None, t).flex_1()),
+                    .child(
+                        field_block("Default isolation", isolation, None, t)
+                            .flex_1()
+                            .min_w_0(),
+                    )
+                    .child(
+                        field_block("Default approval mode", mode_select, None, t)
+                            .flex_1()
+                            .min_w_0(),
+                    ),
             )
+            .children(self.monid_full_access_note(&form.channel_id, form.approval_mode, t))
             .child(field_block(
                 "Allowed local MCP servers",
                 server_list,
@@ -1455,7 +1502,7 @@ impl ConsortApp {
                             })),
                     )
                 })
-                .child(div().flex_1())
+                .child(div().flex_1().min_w_0())
                 .child(
                     button("dialog-cancel", "Cancel", ButtonKind::Secondary, t)
                         .on_click(cx.listener(|this, _, window, cx| this.close_dialog(window, cx))),
@@ -1841,6 +1888,13 @@ impl ConsortApp {
                                 "about-licenses",
                                 "Licenses",
                                 format!("https://github.com/{repo}/blob/main/LICENSE"),
+                            ))
+                            .child(link(
+                                "about-dictation-licenses",
+                                "Dictation credits",
+                                format!(
+                                    "https://github.com/{repo}/blob/main/docs/dictation-licenses.md"
+                                ),
                             )),
                     )
                     .child(text(

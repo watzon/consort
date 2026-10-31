@@ -93,6 +93,7 @@ impl ConsortApp {
         let mut segmented = div()
             .flex()
             .flex_1()
+            .min_w_0()
             .gap(t.space.xxs)
             .p(t.space.xxs)
             .bg(c.surface_card)
@@ -103,6 +104,7 @@ impl ConsortApp {
                 focusable(div().id(SharedString::from(format!("tab-{label}"))), t)
                     .flex()
                     .flex_1()
+                    .whitespace_nowrap()
                     .justify_center()
                     .gap(t.space.xs + t.space.xxs)
                     .py(t.space.xs)
@@ -216,13 +218,19 @@ impl ConsortApp {
                     // How many tasks need you. The header of the column
                     // said it before the redesign; the Tasks button has only
                     // a dot now.
-                    .child(div().flex_1().pl(t.space.xs).when(need_you > 0, |d| {
-                        d.child(text(
-                            format!("{need_you} need you"),
-                            t.text.ui,
-                            c.accent_text,
-                        ))
-                    }))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .pl(t.space.xs)
+                            .when(need_you > 0, |d| {
+                                d.child(text(
+                                    format!("{need_you} need you"),
+                                    t.text.ui,
+                                    c.accent_text,
+                                ))
+                            }),
+                    )
                     .child(
                         icon_button(
                             "tasks-new",
@@ -257,6 +265,7 @@ impl ConsortApp {
                 div()
                     .id("tasks-scroll")
                     .flex_1()
+                    .min_w_0()
                     .min_h_0()
                     .overflow_y_scroll()
                     .pb(t.space.lg)
@@ -685,6 +694,7 @@ impl ConsortApp {
                 div()
                     .relative()
                     .flex_1()
+                    .min_w_0()
                     .min_h_0()
                     .child(posts)
                     .child(fade(true))
@@ -734,7 +744,11 @@ impl ConsortApp {
             // A closed section shows the first line, so the reader knows
             // what is in it.
             .when(!section.open, |d| {
-                d.child(line(first_line, detail(t), c.text_tertiary).flex_1())
+                d.child(
+                    line(first_line, detail(t), c.text_tertiary)
+                        .flex_1()
+                        .min_w_0(),
+                )
             })
             .on_click(cx.listener(move |this, _, _, cx| {
                 toggle(this);
@@ -995,6 +1009,34 @@ impl ConsortApp {
                         cx,
                     ))
                     .into_any_element(),
+                // A paid call, as it is in the timeline.
+                PostBody::Notice {
+                    monid: Some(row), ..
+                } => div()
+                    .flex()
+                    .w_full()
+                    .child(self.render_monid_call(row, "thread", t, cx))
+                    .into_any_element(),
+                // A move of the task: the notice says that the task stays.
+                PostBody::Notice {
+                    fallback: Some(fallback),
+                    ..
+                } => {
+                    let channel_id = self
+                        .state
+                        .task(&task_id)
+                        .map(|t| t.channel_id.clone())
+                        .unwrap_or_default();
+                    self.render_fallback_notice(
+                        fallback,
+                        &format!("{key}-fallback"),
+                        &post.time_label,
+                        &channel_id,
+                        true,
+                        t,
+                        cx,
+                    )
+                }
                 PostBody::Notice { text: notice, .. } => div()
                     .w_full()
                     .flex()

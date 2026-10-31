@@ -15,6 +15,9 @@ path = "src/main.rs"
 
 [dependencies]
 consort-proto = { workspace = true }
+consort-session-host = { workspace = true }
+consort-harness = { workspace = true }
+consort-link = { workspace = true }
 consort-worker = { workspace = true }
 consort-hub = { workspace = true }
 tokio = { workspace = true }

@@ -33,6 +33,7 @@ const SECTIONS: [(&str, &[SectionEntry]); 3] = [
         &[
             (SettingsSection::Appearance, "Appearance", "contrast"),
             (SettingsSection::Notifications, "Notifications", "bell"),
+            (SettingsSection::Dictation, "Dictation", "voice"),
         ],
     ),
     (
@@ -46,6 +47,8 @@ const SECTIONS: [(&str, &[SectionEntry]); 3] = [
     (
         "Assistant",
         &[
+            (SettingsSection::Providers, "Providers", "connector"),
+            (SettingsSection::Models, "Models", "chip"),
             (SettingsSection::Connectors, "Connectors", "link"),
             (SettingsSection::Skills, "Skills", "box"),
             (SettingsSection::Memory, "Memory", "book-open"),
@@ -234,7 +237,7 @@ impl ConsortApp {
                         cx.notify();
                     })),
             )
-            .child(nav.flex_1())
+            .child(nav.flex_1().min_w_0())
             .child(self.about_row(t, cx));
         let content = match self.settings_section {
             SettingsSection::Appearance => self.render_appearance(t, window, cx),
@@ -242,12 +245,15 @@ impl ConsortApp {
             SettingsSection::Connectors => self.render_connectors(t, window, cx),
             SettingsSection::Skills => self.render_skills(t, window, cx),
             SettingsSection::Hub => self.render_hub(t, window, cx),
+            SettingsSection::Providers => self.render_providers(t, window, cx),
+            SettingsSection::Models => self.render_models(t, window, cx),
             SettingsSection::Clients => self.render_clients(t, window, cx),
             SettingsSection::Notifications => self.render_notifications(t, window, cx),
             SettingsSection::Routines => self.render_routines_settings(t, window, cx),
             SettingsSection::Memory => self.render_memory_settings(t, window, cx),
             SettingsSection::Proactivity => self.render_proactivity(t, window, cx),
             SettingsSection::Voice => self.render_voice(t, window, cx),
+            SettingsSection::Dictation => self.render_dictation_settings(t, window, cx),
         };
         if !compact {
             return div()
@@ -300,7 +306,7 @@ impl ConsortApp {
                             })),
                     ),
             )
-            .child(div().flex_1().min_h_0().w_full().child(content))
+            .child(div().flex_1().min_w_0().min_h_0().w_full().child(content))
             .into_any_element()
     }
 
@@ -403,6 +409,7 @@ impl ConsortApp {
                                     .flex()
                                     .flex_col()
                                     .flex_1()
+                                    .min_w_0()
                                     .child(text(name.clone(), t.text.ui_strong, c.text_primary))
                                     .child(text(description, detail(t), c.text_tertiary)),
                             )
@@ -446,6 +453,7 @@ impl ConsortApp {
                     .flex()
                     .flex_col()
                     .flex_1()
+                    .min_w_0()
                     .child(text("Add a theme", t.text.ui_strong, c.text_primary))
                     .child(text(
                         "Put a theme file in this folder. Consort checks its contrast before it loads it.",
@@ -492,6 +500,7 @@ impl ConsortApp {
                             .flex()
                             .flex_col()
                             .flex_1()
+                            .min_w_0()
                             .child(text(
                                 format!("{} did not load", bad.file_name),
                                 t.text.ui_strong,
@@ -653,7 +662,13 @@ impl ConsortApp {
                     .border_b(t.border_width)
                     .border_color(c.border_subtle)
                     .drag_area()
-                    .child(div().flex_1().type_style(t.text.title).child("Workers"))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .type_style(t.text.title)
+                            .child("Workers"),
+                    )
                     .child(
                         button("add-worker", "Add worker", ButtonKind::Secondary, t)
                             .child(icon("plus", t.icon.dense, c.text_primary))
@@ -667,6 +682,7 @@ impl ConsortApp {
                 div()
                     .id("workers-list")
                     .flex_1()
+                    .min_w_0()
                     .overflow_y_scroll()
                     .child(rows),
             );
@@ -676,6 +692,7 @@ impl ConsortApp {
             .unwrap_or_else(|| {
                 div()
                     .flex_1()
+                    .min_w_0()
                     .p(t.layout.speaker_gutter)
                     .child(text(
                         "No workers yet. Add one to run tasks.",
@@ -714,8 +731,6 @@ impl ConsortApp {
                 .bg(t.colors.surface_card)
         };
         let tags = self.worker_tags(w, t, window, cx);
-        let accounts = self.accounts_section(w, t, cx);
-        let tools = self.tools_section(w, t, cx);
         let policy = &w.policy;
         let mode_trigger = self.triggers.clone();
         let current_mode = policy.max_approval_mode;
@@ -755,11 +770,13 @@ impl ConsortApp {
             }));
         let roots: Vec<String> = policy.allowed_roots.clone();
         let roots_line = match roots.len() {
-            0 => "No folders yet. Tasks cannot open files on this worker.".to_owned(),
+            0 => "No limit. Tasks can use any folder on this worker.".to_owned(),
             _ => String::new(),
         };
         let shell = policy.allow_shell;
         let name = w.name.clone();
+        let folders_worker = w.id.clone();
+        let shell_worker = w.id.clone();
         let mut limits = card(t);
         limits = limits
             .child(limit_row(
@@ -783,6 +800,7 @@ impl ConsortApp {
                             .flex()
                             .flex_col()
                             .flex_1()
+                            .min_w_0()
                             .child(text("Allowed folders", t.text.ui_strong, c.text_primary))
                             .child(if roots.is_empty() {
                                 text(roots_line, detail(t), c.text_tertiary).into_any_element()
@@ -791,25 +809,25 @@ impl ConsortApp {
                             }),
                     )
                     .child(
-                        button("edit-folders", "Edit folders", ButtonKind::Quiet, t).on_click(
-                            cx.listener(|this, _, _, cx| {
-                                this.show_notice(
-                                    "Allowed folders are set on the worker in worker.toml.".into(),
+                        button("edit-folders", "Edit folders", ButtonKind::Quiet, t)
+                            .debug_selector(|| "edit-folders".into())
+                            .flex_none()
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.open_dialog(
+                                    Dialog::WorkerFolders(folders_worker.clone()),
+                                    window,
                                     cx,
-                                )
-                            }),
-                        ),
+                                );
+                            })),
                     ),
             )
             .child(limit_row(
                 "Shell access",
                 &format!("Tasks can run commands in {}.", policy.shell_name),
                 switch("shell-access", shell, t)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.show_notice(
-                            "Shell access is set on the worker in worker.toml.".into(),
-                            cx,
-                        )
+                    .debug_selector(|| "shell-access".into())
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.set_worker_limit(shell_worker.clone(), None, Some(!shell), window, cx);
                     }))
                     .into_any_element(),
                 false,
@@ -845,7 +863,8 @@ impl ConsortApp {
                                     .gap(t.space.md)
                                     .child(
                                         text(w.name.clone(), t.text.heading, c.text_primary)
-                                            .flex_1(),
+                                            .flex_1()
+                                            .min_w_0(),
                                     )
                                     .child(
                                         button(
@@ -909,16 +928,13 @@ impl ConsortApp {
                                         t.space.sm,
                                         t,
                                     ))
-                                    .child(text(
-                                        w.status_line.clone(),
-                                        t.text.ui,
-                                        c.text_secondary,
-                                    )),
+                                    .child(
+                                        text(w.status_line.clone(), t.text.ui, c.text_secondary)
+                                            .min_w_0(),
+                                    ),
                             )
                             .child(tags),
                     )
-                    .child(accounts)
-                    .child(tools)
                     .child(section_block(
                         "Limits",
                         &format!(
@@ -944,10 +960,16 @@ impl ConsortApp {
         &mut self,
         select: &'static str,
         option: &str,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self.pick_admin_select(select, option, cx) {
+            return;
+        }
+        if self.pick_check_select(select, option, cx) {
+            return;
+        }
+        if self.pick_dictation_select(select, option, cx) {
             return;
         }
         // The channel settings dialog keeps the pick in its form. Save
@@ -964,11 +986,15 @@ impl ConsortApp {
         if self.pick_proactivity_select(select, option, cx) {
             return;
         }
+        if self.pick_monid_select(select, option, cx) {
+            return;
+        }
         match resolve_pick(&self.state, select, option) {
-            Some(Pick::ApprovalMode(mode)) => self.show_notice(
-                format!("The approval mode is set on the worker. Set max_approval_mode to {} in worker.toml.", mode_key(mode)),
-                cx,
-            ),
+            Some(Pick::ApprovalMode(mode)) => {
+                if let Some(worker) = self.settings_worker.clone() {
+                    self.set_worker_limit(worker, Some(mode), None, window, cx);
+                }
+            }
             Some(Pick::Tag(tag)) => {
                 let tags = &mut self.convo.settings.tags;
                 if !tags.contains(&tag) {
@@ -1059,6 +1085,7 @@ fn section_block(
                         .flex()
                         .flex_col()
                         .flex_1()
+                        .min_w_0()
                         .gap(t.space.xxs)
                         .child(
                             div()
@@ -1100,10 +1127,13 @@ fn limit_row(title: &str, hint: &str, control: AnyElement, border: bool, t: &Tok
                 .flex()
                 .flex_col()
                 .flex_1()
+                .min_w_0()
+                // The text wraps, so the control keeps its place.
+                .min_w_0()
                 .child(text(title.to_owned(), t.text.ui_strong, c.text_primary))
                 .child(text(hint.to_owned(), detail(t), c.text_tertiary)),
         )
-        .child(control)
+        .child(div().flex_none().child(control))
 }
 
 /// An account detail as Markdown: the code words in backticks, which the text
@@ -1235,6 +1265,7 @@ fn theme_preview(theme: &consort_theme::ThemeFile, mode: Mode, t: &Tokens) -> Di
     div()
         .flex()
         .flex_1()
+        .min_w_0()
         .h(t.component.theme_preview_height)
         .rounded(t.radius.md)
         .overflow_hidden()
@@ -1260,6 +1291,7 @@ fn theme_preview(theme: &consort_theme::ThemeFile, mode: Mode, t: &Tokens) -> Di
                 .flex()
                 .flex_col()
                 .flex_1()
+                .min_w_0()
                 .gap(t.space.xs + t.space.xxs)
                 .pt(t.space.sm)
                 .px(t.space.sm)

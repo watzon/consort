@@ -26,6 +26,11 @@ use crate::time::Timestamp;
 
 /// The WebSocket path for workers.
 pub const WORKER_WS_PATH: &str = "/v1/worker";
+/// The WebSocket path for the session host. A session host has its own key
+/// and its own row, and it cannot use the worker path.
+pub const SESSION_HOST_WS_PATH: &str = "/v1/session-host";
+/// The HTTP path to pair the session host.
+pub const PAIR_SESSION_HOST_PATH: &str = "/v1/pair/session-host";
 /// The WebSocket path for clients.
 pub const CLIENT_WS_PATH: &str = "/v1/client";
 /// The HTTP path to pair a worker.

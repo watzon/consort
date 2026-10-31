@@ -30,12 +30,15 @@ use crate::error::{HubError, Result};
 use crate::hub::{Caller, Hub};
 use crate::store::{connectors as con_store, meta_get};
 
+pub(crate) mod access;
 pub(crate) mod cards;
 pub(crate) mod composio;
 pub(crate) mod connections;
 pub(crate) mod extensions;
 pub(crate) mod key;
 pub(crate) mod logos;
+pub(crate) mod monid;
+pub(crate) mod monid_run;
 pub(crate) mod replace;
 pub(crate) mod run;
 
@@ -132,6 +135,12 @@ pub struct Connectors {
     /// Connections whose connect attempt a task follows.
     polling: Mutex<HashSet<ConnectionId>>,
     timings: Mutex<Timings>,
+    /// The encrypted Monid key.
+    monid_keys: key::KeyStore,
+    monid_key: Mutex<Option<ApiKey>>,
+    monid_base_url: Mutex<String>,
+    /// Tests fetch files from a local fake server.
+    monid_allow_private: std::sync::atomic::AtomicBool,
 }
 
 impl Connectors {
@@ -161,7 +170,23 @@ impl Connectors {
             .ok()
             .filter(|u| !u.trim().is_empty())
             .unwrap_or_else(|| composio::DEFAULT_BASE_URL.to_owned());
+        let monid_keys = key::KeyStore::for_monid(data_dir);
+        let monid_key = match monid_keys.load() {
+            Ok(key) => key,
+            Err(err) => {
+                tracing::warn!(error = %err, "could not read the Monid key, so Monid is off");
+                None
+            }
+        };
+        let monid_base_url = std::env::var("CONSORT_MONID_URL")
+            .ok()
+            .filter(|u| !u.trim().is_empty())
+            .unwrap_or_else(|| monid::DEFAULT_BASE_URL.to_owned());
         Self {
+            monid_keys,
+            monid_key: Mutex::new(monid_key),
+            monid_base_url: Mutex::new(monid_base_url),
+            monid_allow_private: std::sync::atomic::AtomicBool::new(false),
             keys,
             base_url: Mutex::new(base_url),
             key: Mutex::new(key),
@@ -223,6 +248,70 @@ impl Connectors {
             Some(limit) => Client::with_timeout(&self.base_url(), key, health, limit),
             None => Client::with_health(&self.base_url(), key, health),
         }
+    }
+
+    /// The stored Monid key.
+    pub(crate) fn monid_key(&self) -> Option<ApiKey> {
+        self.monid_key.lock().ok().and_then(|k| k.clone())
+    }
+
+    fn monid_base_url(&self) -> String {
+        self.monid_base_url
+            .lock()
+            .map(|u| u.clone())
+            .unwrap_or_else(|_| monid::DEFAULT_BASE_URL.to_owned())
+    }
+
+    /// A Monid client for a key that is not stored yet.
+    pub(crate) fn monid_client_for(&self, key: ApiKey) -> Result<monid::Client> {
+        monid::Client::new(&self.monid_base_url(), key)
+    }
+
+    /// Encrypts and stores the Monid key.
+    pub(crate) async fn save_monid_key(&self, key: ApiKey) -> Result<()> {
+        let keys = self.monid_keys.clone();
+        let stored = key.clone();
+        tokio::task::spawn_blocking(move || keys.save(&stored)).await??;
+        if let Ok(mut slot) = self.monid_key.lock() {
+            *slot = Some(key);
+        }
+        Ok(())
+    }
+
+    /// Deletes the Monid key.
+    pub(crate) async fn remove_monid_key(&self) -> Result<()> {
+        let keys = self.monid_keys.clone();
+        tokio::task::spawn_blocking(move || keys.remove()).await??;
+        if let Ok(mut slot) = self.monid_key.lock() {
+            *slot = None;
+        }
+        Ok(())
+    }
+
+    /// A Monid client for the stored key, or `monid_not_configured`.
+    pub(crate) fn monid_client(&self) -> Result<monid::Client> {
+        let key = self.monid_key().ok_or_else(|| {
+            HubError::new(
+                ErrorCode::MonidNotConfigured,
+                "Monid needs a key. Ask the user to add one in Settings > Connectors.",
+            )
+        })?;
+        monid::Client::new(&self.monid_base_url(), key)
+    }
+
+    pub(crate) fn monid_allow_private(&self) -> bool {
+        self.monid_allow_private
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Uses a local fake server for Monid, also for its files.
+    #[cfg(test)]
+    pub(crate) fn set_monid_test_server(&self, url: &str) {
+        if let Ok(mut slot) = self.monid_base_url.lock() {
+            *slot = url.trim_end_matches('/').to_owned();
+        }
+        self.monid_allow_private
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Registers a call that waits for a card. The receiver gets the
@@ -849,7 +938,7 @@ impl Hub {
 pub(crate) mod fake;
 
 #[cfg(test)]
-mod flow_tests;
+pub(crate) mod flow_tests;
 
 #[cfg(test)]
 mod replace_tests;

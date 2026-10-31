@@ -22,17 +22,17 @@ use consort_proto::model::{
     ItemStatus, ModelInfo, ModelOptions, RequestOption, RequestOptionKind, SessionItem,
     SessionState,
 };
-use consort_proto::time::Timestamp;
-use consort_proto::worker_link::{
+use consort_proto::session_host_link::{
     RequestBody, RequestOpened, RequestOutcome, SessionEvent, TurnEndReason, TurnInput,
 };
+use consort_proto::time::Timestamp;
 use tokio::sync::{mpsc, oneshot, watch};
 
 /// One step of a fake turn.
 #[derive(Debug, Clone)]
 pub enum FakeStep {
     /// Send this event as it is.
-    Event(SessionEvent),
+    Event(Box<SessionEvent>),
     /// A completed assistant message.
     Text(String),
     /// A completed command with its output.
@@ -236,6 +236,13 @@ impl Harness for FakeHarness {
         self.kind
     }
 
+    fn boundary_support(
+        &self,
+        _account: &AccountConfig,
+    ) -> consort_harness::boundary::BoundarySupport {
+        consort_harness::boundary::BoundarySupport::NotNeeded
+    }
+
     fn capabilities(&self, _account: &AccountConfig) -> Capabilities {
         self.capabilities.clone()
     }
@@ -378,7 +385,7 @@ async fn play(
             break;
         }
         match step {
-            FakeStep::Event(event) => send(event).await,
+            FakeStep::Event(event) => send(*event).await,
             FakeStep::Text(text) => {
                 send(now_item(
                     &spec,
@@ -422,6 +429,8 @@ async fn play(
                             // Like the real adapters, the fake names the
                             // folder of every command approval.
                             cwd: Some(spec.workspace.to_string_lossy().into_owned()),
+                            check_note: None,
+                            blocked: Vec::new(),
                         },
                     ),
                     _ => unreachable!("the outer pattern allows only approvals"),
@@ -708,7 +717,6 @@ mod tests {
             system_prompt_append: String::new(),
             mcp_servers: vec![],
             env: BTreeMap::new(),
-            extras_enabled: true,
             skills: None,
             resume: None,
             process_watcher: None,

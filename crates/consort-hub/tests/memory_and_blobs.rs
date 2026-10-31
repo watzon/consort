@@ -194,7 +194,7 @@ async fn each_kind_of_session_gets_its_own_tool_list() {
             .collect()
     };
     async fn list(worker: &mut FakeWorker, session: SessionId) -> serde_json::Value {
-        let call = serde_json::to_value(consort_proto::worker_link::ToolList {
+        let call = serde_json::to_value(consort_proto::session_host_link::ToolList {
             session_id: session,
         })
         .unwrap();
@@ -262,7 +262,7 @@ async fn suggestions_travel_one_level_up() {
             coordinator.session_id,
             vec![turn_ended(
                 "t1",
-                consort_proto::worker_link::TurnEndReason::Completed,
+                consort_proto::session_host_link::TurnEndReason::Completed,
             )],
         )
         .await;
@@ -286,7 +286,7 @@ async fn suggestions_travel_one_level_up() {
         .await;
     // The coordinator of the channel gets it in its next turn.
     let (_, command) = world.worker.next_command().await;
-    let consort_proto::worker_link::HubToWorker::SessionTurn(turn) = command else {
+    let consort_proto::session_host_link::HubToSessionHost::SessionTurn(turn) = command else {
         panic!("expected session.turn");
     };
     assert!(

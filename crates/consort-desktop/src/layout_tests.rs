@@ -295,3 +295,54 @@ fn the_tasks_and_channel_panels_have_the_same_header_and_tabs(cx: &mut TestAppCo
     assert_eq!(bounds(cx, "panel-header"), header);
     assert_eq!(bounds(cx, "panel-tabs"), tabs);
 }
+
+/// GPUI gives a flex item the full width of its text as its minimum, so a long
+/// line pushes its neighbors out of the row. `min_w_0` lets the text wrap.
+#[test]
+fn every_flex_1_can_shrink_so_its_text_wraps() {
+    fn in_chain<'a>(lines: impl Iterator<Item = &'a str>, indent: usize) -> bool {
+        for line in lines {
+            let own = line.len() - line.trim_start().len();
+            if own != indent || !line.trim_start().starts_with('.') {
+                if own <= indent && !line.trim_start().starts_with('.') {
+                    return false;
+                }
+                continue;
+            }
+            // A label that never wraps keeps its width, as a tab does.
+            if line.contains("min_w_0") || line.contains("whitespace_nowrap") {
+                return true;
+            }
+        }
+        false
+    }
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui");
+    let mut bad = Vec::new();
+    let mut folders = vec![root];
+    while let Some(folder) = folders.pop() {
+        for entry in std::fs::read_dir(folder).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                folders.push(path);
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).unwrap();
+            let lines: Vec<&str> = source.lines().collect();
+            for (at, line) in lines.iter().enumerate() {
+                if !line.contains(".flex_1()")
+                    || line.contains("min_w_0")
+                    || line.contains("whitespace_nowrap")
+                {
+                    continue;
+                }
+                let indent = line.len() - line.trim_start().len();
+                if !in_chain(lines[..at].iter().rev().copied(), indent)
+                    && !in_chain(lines[at + 1..].iter().copied(), indent)
+                {
+                    bad.push(format!("{}:{}", path.display(), at + 1));
+                }
+            }
+        }
+    }
+    assert!(bad.is_empty(), "flex_1 with no min_w_0: {bad:#?}");
+}

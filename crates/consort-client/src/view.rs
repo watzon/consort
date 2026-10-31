@@ -28,7 +28,10 @@ pub struct ViewState {
     pub tasks: Vec<TaskView>,
     pub threads: Vec<TaskThreadView>,
     pub tasks_panel: TasksPanelView,
+    /// The machines where work runs.
     pub workers: Vec<WorkerView>,
+    /// The session host on the hub machine: the accounts and the harness tools.
+    pub session_host: Option<WorkerView>,
     /// Every worker tag: the user tags of all workers first, then the
     /// detected tags, each once and sorted. Tag fields offer these.
     pub tags: Vec<String>,
@@ -41,9 +44,13 @@ pub struct ViewState {
     /// whose account or model is gone stays here, and the picker hides it
     /// (see [`crate::picker::favorite_rows`]).
     pub favorite_models: Vec<FavoriteModelView>,
-    /// Work moves to another account of the same harness when its account
-    /// reaches a usage limit. From the hub's preferences.
-    pub account_fallback: bool,
+    /// The fallback path of the hub's preferences, with the first choice
+    /// of Tutti. Settings > Models shows it.
+    pub fallback_path: crate::fallback::FallbackPathView,
+    /// The API endpoints of Settings > Providers.
+    pub endpoints: Vec<crate::command_check::EndpointView>,
+    /// The command check of Settings > Models.
+    pub command_check: crate::command_check::CommandCheckView,
     /// The sign-ins that this client started, newest last. A sign-in that
     /// another client started does not show (see DECISIONS row 269).
     pub sign_ins: Vec<SignInView>,
@@ -65,6 +72,9 @@ pub struct ViewState {
     /// The Composio key and plan. The client loads it with
     /// [`crate::Command::LoadComposioStatus`].
     pub composio: crate::connectors::ComposioView,
+    /// The Monid key, balance, settings and spend. The client loads them
+    /// with [`crate::Command::LoadMonidStatus`].
+    pub monid: crate::monid::MonidView,
     /// The connector catalog of the Add connector dialog.
     pub connector_catalog: crate::connectors::CatalogView,
     /// The tools of the services that the client loaded.
@@ -128,6 +138,11 @@ pub struct SendFailureView {
 }
 
 impl ViewState {
+    /// The warning of Settings > Hub, when the session host has one.
+    pub fn boundary_warning(&self) -> Option<String> {
+        crate::command_check::boundary_warning(self.session_host.as_ref())
+    }
+
     pub fn channel(&self, id: &str) -> Option<&ChannelView> {
         self.channels.iter().find(|c| c.id == id)
     }
@@ -173,8 +188,27 @@ impl ViewState {
         self.threads.iter().find(|t| t.task_id == task_id)
     }
 
+    /// A worker, or the session host, by its ID.
     pub fn worker(&self, id: &str) -> Option<&WorkerView> {
-        self.workers.iter().find(|w| w.id == id)
+        self.workers
+            .iter()
+            .chain(self.session_host.iter())
+            .find(|w| w.id == id)
+    }
+
+    /// The accounts of the hub. A worker has none, but an older inventory or a
+    /// test can list them there.
+    pub fn accounts(&self) -> impl Iterator<Item = (&WorkerView, &HarnessAccountView)> {
+        self.session_host
+            .iter()
+            .chain(self.workers.iter())
+            .flat_map(|w| w.accounts.iter().map(move |a| (w, a)))
+    }
+
+    /// The accounts whose login expired. Each one waits for a new sign-in.
+    pub fn expired_accounts(&self) -> impl Iterator<Item = (&WorkerView, &HarnessAccountView)> {
+        self.accounts()
+            .filter(|(_, account)| account.status == AccountStatus::Expired)
     }
 
     pub fn connection(&self, id: &str) -> Option<&crate::connectors::ConnectionView> {
@@ -198,30 +232,6 @@ impl ViewState {
     /// tags, every worker matches.
     pub fn workers_with_tags(&self, tags: &[String]) -> Vec<&WorkerView> {
         self.workers.iter().filter(|w| w.has_tags(tags)).collect()
-    }
-
-    /// The account names already used for a provider on workers other than
-    /// `worker_id`, each with the workers that use it. The Add account
-    /// dialog offers them, so the same account on several workers gets one
-    /// name.
-    pub fn account_names(&self, harness: &str, worker_id: &str) -> Vec<AccountNameView> {
-        let mut names: Vec<AccountNameView> = Vec::new();
-        for worker in self.workers.iter().filter(|w| w.id != worker_id) {
-            for account in worker.accounts.iter().filter(|a| a.harness == harness) {
-                match names.iter_mut().find(|n| n.label == account.label) {
-                    Some(name) => {
-                        if !name.workers.contains(&worker.name) {
-                            name.workers.push(worker.name.clone());
-                        }
-                    }
-                    None => names.push(AccountNameView {
-                        label: account.label.clone(),
-                        workers: vec![worker.name.clone()],
-                    }),
-                }
-            }
-        }
-        names
     }
 
     /// The group and the model of the picker with this account label and
@@ -257,11 +267,9 @@ impl ViewState {
     /// The provider logo of the account with this label. Accounts with one
     /// label on several workers are one account, so the first one counts.
     pub fn account_logo(&self, label: &str) -> Option<&ProviderLogo> {
-        self.workers
-            .iter()
-            .flat_map(|w| w.accounts.iter())
-            .find(|a| a.label == label)
-            .map(|a| &a.logo)
+        self.accounts()
+            .find(|(_, a)| a.label == label)
+            .map(|(_, a)| &a.logo)
     }
 }
 
@@ -286,14 +294,6 @@ pub fn profile_slug(label: &str) -> String {
     } else {
         slug.to_owned()
     }
-}
-
-/// A name that an account of one provider already has on other workers.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct AccountNameView {
-    pub label: String,
-    /// The names of the workers that have an account with this name.
-    pub workers: Vec<String>,
 }
 
 /// The value of a model option.
@@ -581,6 +581,13 @@ pub struct ChannelView {
     /// The model of the coordinator, with the fallback to Tutti's.
     /// `None` when neither channel has one: placement then chooses.
     pub coordinator_selection: Option<EffectiveSelection>,
+    /// Set while the assistant runs on a fallback of the path. The model
+    /// chip shows a marker and the menu offers "Go back".
+    pub fallback: Option<crate::fallback::ChannelFallbackView>,
+    /// Set while the assistant cannot answer and a message of the user
+    /// waits (or a turn cannot start). The app shows a status line above
+    /// the composer. It is live state: no message holds it.
+    pub assistant_status: Option<crate::assistant_status::AssistantStatusView>,
     pub repos: Vec<RepoView>,
     pub preferred_workers: Vec<String>,
     pub task_selection: Option<SelectionView>,
@@ -597,6 +604,10 @@ pub struct ChannelView {
     pub default_approval_mode: ApprovalMode,
     /// The local MCP servers that a task from the assistant may use.
     pub allowed_local_mcp_servers: Vec<String>,
+    /// What the channel may do with Monid.
+    pub monid: crate::monid::MonidAccessView,
+    /// Temporary access that the user gave, newest last.
+    pub access_grants: Vec<crate::access::AccessGrantView>,
     /// The channel has its own memory.
     pub memory_enabled: bool,
 }
@@ -675,6 +686,11 @@ pub struct NoticeView {
     /// For a `draft` notice: the text that the assistant showed with
     /// `show_draft`.
     pub draft: Option<crate::drafts::ShownDraftView>,
+    /// For an `account_fallback`, `fallback_returned` or
+    /// `fallback_signed_out` notice: the move and the lines of the path.
+    pub fallback: Option<crate::fallback::FallbackNoticeView>,
+    /// For a `monid_call` notice: the row of the call.
+    pub monid: Option<Box<crate::monid::MonidCallRowView>>,
 }
 
 /// The memory saved line: the assistant saved a memory note. The timeline
@@ -838,6 +854,11 @@ pub struct TaskCardView {
     pub steps: Vec<String>,
     /// A last line of the card, such as "Raw text stays in this task.".
     pub note: Option<String>,
+    /// How many Monid calls the task made. The card shows the total while
+    /// it is more than zero.
+    pub monid_calls: u32,
+    /// What they cost, in millionths of a dollar.
+    pub monid_cost_micros: i64,
 }
 
 impl TaskCardView {
@@ -855,7 +876,8 @@ impl TaskCardView {
         !(waits
             || self.status == TaskStatus::Failed
             || !self.steps.is_empty()
-            || self.note.is_some())
+            || self.note.is_some()
+            || self.monid_calls > 0)
     }
 }
 
@@ -893,6 +915,10 @@ pub enum RequestState {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ApprovalView {
     pub id: String,
+    /// Why Consort asks, when the command check is the reason.
+    pub check_note: Option<String>,
+    /// The commands that the command check blocked before this one.
+    pub blocked: Vec<String>,
     /// The task that asks. `None` for the channel coordinator.
     pub task_id: Option<String>,
     /// One line, such as "Codex wants to run a command".
@@ -992,6 +1018,10 @@ pub struct TaskView {
     /// The current session of the task has ended. A task in Ready for
     /// review or Resolved can then only retry.
     pub session_ended: bool,
+    /// How many Monid calls the task made.
+    pub monid_calls: u32,
+    /// What they cost, in millionths of a dollar.
+    pub monid_cost_micros: i64,
 }
 
 impl TaskView {
@@ -1073,9 +1103,14 @@ pub enum PostBody {
         kind: String,
         text: String,
         /// For a `turn_failed` notice.
-        error: Option<crate::turn_errors::ErrorCardView>,
+        error: Option<Box<crate::turn_errors::ErrorCardView>>,
         /// For a `draft` notice.
         draft: Option<crate::drafts::ShownDraftView>,
+        /// For a fallback notice. The thread of a task shows the move of the
+        /// task and the details of its path.
+        fallback: Option<Box<crate::fallback::FallbackNoticeView>>,
+        /// For a `monid_call` notice.
+        monid: Option<Box<crate::monid::MonidCallRowView>>,
     },
     /// The files attached to the post.
     Attachments(Vec<crate::files::AttachmentView>),
@@ -1086,6 +1121,8 @@ pub enum PostBody {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ActivityLine {
     pub text: String,
+    /// The command check blocked this command, so it never ran.
+    pub blocked: bool,
     pub session_id: String,
     pub item_id: String,
 }
@@ -1409,11 +1446,6 @@ pub struct HarnessAccountView {
     pub secret_names: Vec<String>,
     /// Who is signed in, when the harness tells.
     pub email: Option<String>,
-    /// The worker starts the harness with the account's provider extras.
-    pub extras_enabled: bool,
-    /// What the account brings from the provider's side, when the worker
-    /// can tell.
-    pub extras: Option<crate::connectors::ProviderExtrasView>,
 }
 
 /// Where a managed tool is on a worker.
@@ -1625,6 +1657,11 @@ pub struct PolicyView {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct WorkerView {
+    /// This is the session host on the hub machine, not a worker. It is never
+    /// in `ViewState::workers`.
+    pub is_session_host: bool,
+    /// The boundary that a session host puts around a session.
+    pub boundary: Option<crate::command_check::BoundaryView>,
     pub id: String,
     pub name: String,
     pub os: Os,
@@ -1672,6 +1709,49 @@ impl WorkerView {
     }
 }
 
+/// One harness on Settings > Providers: its tool and its accounts.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProviderSection {
+    /// The provider name, such as "Claude Code".
+    pub name: String,
+    pub logo: ProviderLogo,
+    /// The command line tool, when Consort manages it.
+    pub tool: Option<ToolView>,
+    pub accounts: Vec<HarnessAccountView>,
+}
+
+/// The sections of Settings > Providers, in the order of the tools. A harness
+/// has a section only when it has an account or an installed tool.
+pub fn provider_sections(host: &WorkerView) -> Vec<ProviderSection> {
+    let mut sections: Vec<ProviderSection> = Vec::new();
+    for tool in &host.tools {
+        sections.push(ProviderSection {
+            name: tool.name.clone(),
+            logo: tool.logo.clone(),
+            tool: Some(tool.clone()),
+            accounts: Vec::new(),
+        });
+    }
+    for account in &host.accounts {
+        match sections.iter_mut().find(|s| s.name == account.provider) {
+            Some(section) => section.accounts.push(account.clone()),
+            None => sections.push(ProviderSection {
+                name: account.provider.clone(),
+                logo: account.logo.clone(),
+                tool: None,
+                accounts: vec![account.clone()],
+            }),
+        }
+    }
+    sections.retain(|s| {
+        !s.accounts.is_empty()
+            || s.tool
+                .as_ref()
+                .is_some_and(|tool| tool.state != ToolState::Missing)
+    });
+    sections
+}
+
 /// A pairing code for a new worker.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PairingCodeView {
@@ -1694,5 +1774,49 @@ mod profile_slug_tests {
         let long = "a".repeat(47) + " b";
         assert_eq!(profile_slug(&long), "a".repeat(47));
         assert_eq!(profile_slug(&"x".repeat(60)).len(), 48);
+    }
+}
+
+#[cfg(test)]
+mod provider_section_tests {
+    use super::*;
+
+    fn tool(name: &str, state: ToolState) -> ToolView {
+        ToolView {
+            id: name.to_lowercase(),
+            name: name.into(),
+            state,
+            ..ToolView::default()
+        }
+    }
+
+    fn account(label: &str, provider: &str) -> HarnessAccountView {
+        HarnessAccountView {
+            label: label.into(),
+            provider: provider.into(),
+            ..HarnessAccountView::default()
+        }
+    }
+
+    #[test]
+    fn a_harness_has_a_section_only_with_an_account_or_an_installed_tool() {
+        let host = WorkerView {
+            tools: vec![
+                tool("Claude Code", ToolState::Ready),
+                tool("Codex", ToolState::Missing),
+                tool("OpenCode", ToolState::Missing),
+            ],
+            accounts: vec![
+                account("Claude Work", "Claude Code"),
+                account("Codex Work", "Codex"),
+                account("Amp", "Amp"),
+            ],
+            ..WorkerView::default()
+        };
+        let sections = provider_sections(&host);
+        let names: Vec<&str> = sections.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["Claude Code", "Codex", "Amp"]);
+        assert_eq!(sections[0].accounts.len(), 1);
+        assert!(sections[2].tool.is_none());
     }
 }

@@ -4,8 +4,8 @@ use std::collections::HashMap;
 
 use consort_proto::ids::{ItemId, SessionId, TurnId};
 use consort_proto::model::{ItemPayload, ItemStatus, SessionItem};
+use consort_proto::session_host_link::SessionEvent;
 use consort_proto::time::Timestamp;
-use consort_proto::worker_link::SessionEvent;
 
 #[derive(Debug, Clone)]
 struct Tracked {

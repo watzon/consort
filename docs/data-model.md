@@ -17,11 +17,13 @@ This page lists the entities that the hub, the workers and the clients store, wi
 | Hub | `hub.lock` | A lock that a running hub holds, so a second hub and `consort hub restore` cannot use the folder at the same time |
 | Hub | `backups/` (default) | The backup archives, `consort-<date>-<time>.tar`. The folder is a setting and can be anywhere on the hub machine |
 | Client | `notifications.json` | The notification switches of this client (Settings > Notifications). They do not go to the hub |
-| Worker | `worker.toml` | Hub URL, tags, worker policy, harness accounts, local MCP servers, checkouts |
-| Worker | `worker.db` (SQLite) | Event spool, processed command IDs, local session registry |
+| Session host | `session-host.toml` | Hub URL, harness accounts |
+| Session host | `sessions/<task or session ID>/` | The folder where the CLI of a session runs. A task keeps its folder, so a new session can resume its transcript |
+| Worker | `worker.toml` | Hub URL and worker ID from pairing, local MCP servers, checkouts |
+| Worker | `worker.db` (SQLite) | The journal, processes, workspaces and the worker policy |
 | Worker | `workspaces/` | Worktrees and clones that the worker made for tasks |
-| Worker | `<consort home>/profiles/<name>/` | The profile folder of each account, named after the account name when the worker made it (`profile_dir` in `worker.toml`): the harness's own config and login, and `env.json` with the secret variables (mode 0600 on Unix) |
-| Worker | `<consort home>/tools/<tool>/<version>/` | The managed tools that the worker installed |
+| Session host | `<consort home>/profiles/<name>/` | The profile folder of each account, named after the account name when the session host made it (`profile_dir` in `session-host.toml`): the harness's own config and login, and `env.json` with the secret variables (mode 0600 on Unix) |
+| Session host | `<consort home>/tools/<tool>/<version>/` | The managed tools that the session host installed |
 | Worker | `<consort home>/cache/skills/<content hash>/` | The skill bundles of sessions: `bundle.json` (the file list), `files/`, and `used`, an empty file that each use touches. The worker removes a bundle that no open session names and that nobody used for 30 days, when it starts and then once a day. A bundle that it needs again comes from the hub. See [Skill](#skill) |
 | Worker | `<consort home>/cache/blobs/<sha256>` | Attachments and channel files that the worker downloaded, checked by hash (mode 0600 on Unix). Sessions get copies in their workspace |
 | Worker | `<workspace>/.consort/attachments/` and `<workspace>/.channel/files/` | The attachments of a session's turns, and the read-only copy of the channel files (see [protocol.md](protocol.md#attachments-and-channel-files-on-the-worker)) |
@@ -71,7 +73,7 @@ Every ID is a UUIDv7 string with a type prefix, for example `tsk_0192f0c4-...`. 
 | `cko_` | Checkout |
 | `rtn_` | Routine |
 | `wrk_` | Worker |
-| `acc_` | Harness account (unique per worker) |
+| `acc_` | Harness account (unique on the hub machine) |
 | `cli_` | Client |
 | `sgn_` | Sign-in |
 | `con_` | Connection |
@@ -106,6 +108,8 @@ Turn IDs, harness request IDs and native references are opaque strings that the 
 | `purpose` | text, one line | |
 | `instructions` | markdown | |
 | `coordinator_selection` | model selection | Falls back to the Tutti channel's value |
+| `coordinator_blocked` | object, optional | Live state, set while the assistant cannot answer: `kind` (`no_placement`, `signed_out` or `start_failed`), `reason` and `account` (only for `signed_out`). It is not a message. The hub clears it when a turn goes out and at every start of the hub (see [protocol.md](protocol.md)) |
+| `coordinator_fallback` | object, optional | Set while the assistant runs on a step of the fallback path: `from`, `to`, `cause`, `returns_at`, `moved_at`. The hub clears it when the assistant goes back. `coordinator_selection` keeps the first choice |
 | `task_selection` | model selection | Default for new tasks in this channel. With none, a new task uses Tutti's `task_selection`, then the coordinator selection that the channel uses |
 | `preferred_workers` | list of worker IDs | Ordered. Placement tries these first |
 | `repo_ids` | list of repo IDs | The `channel_repos` join, in order. Part of the client view |
@@ -115,6 +119,8 @@ Turn IDs, harness request IDs and native references are opaque strings that the 
 | `memory_enabled` | bool | |
 | `tags` | list of text | Requirements. A coordinator turn, a task or a routine run of the channel runs only on a worker that has every tag. Empty by default |
 | `disabled_connections` | list of connection IDs | Channel exceptions: connections that the channel turned off. Empty by default |
+| `monid` | object | What this channel may do with Monid: `disabled`, its own `approval`, `only_allowed`, `allowed` and `blocked`. The default changes nothing (ADR 0016) |
+| `access_grants` | list of objects | Temporary access that the user gave: `id`, `target`, `task_id`, `expires_at`, `granted_at` (ADR 0017) |
 | `disabled_skills` | list of skill IDs | Channel exceptions: skills that the channel turned off. Empty by default |
 | `proactivity` | `off`, `quiet`, `normal` or `eager`, optional | The proactivity level. Empty means the default: `normal` for Tutti, `quiet` for other channels |
 | `proactive_tasks` | `drafts` or `channel_default` | What a task that a proactive turn starts may do. `drafts` (the default) runs it in Ask |
@@ -440,7 +446,7 @@ An artifact is a channel file with a `task_id`. Tasks publish artifacts under `a
 
 ### Harness account
 
-The worker owns the account configuration and the login. The hub stores only what the worker reports in its inventory. The user makes, renames and removes accounts from a client (`account.create`, `account.update`, `account.remove`). An account that Consort made has its own profile folder, so two accounts of one provider on one worker never share a login. A new worker has no accounts. Accounts that a user wrote in `worker.toml` by hand still load.
+The session host owns the account configuration and the login. The hub stores only what the session host reports in its inventory. The user makes, renames and removes accounts from a client (`account.create`, `account.update`, `account.remove`). An account that Consort made has its own profile folder, so two accounts of one provider never share a login. A worker has no accounts.
 
 | Field | Type | Notes |
 |---|---|---|
@@ -457,8 +463,6 @@ The worker owns the account configuration and the login. The hub stores only wha
 | `email`, `plan` | text, optional | Who is signed in and on which plan, when the harness tells |
 | `secret_names` | list of text | The names of the variables in `env.json`. Never the values |
 | `sign_in_methods` | list | The methods that a client may offer. See [protocol.md](protocol.md#sign-in) |
-| `extras_enabled` | bool | Whether the harness starts with its provider extras. True by default, and for an inventory from an older worker |
-| `extras` | object, optional | What the account syncs from the provider: `mcp_servers`, `plugins` and `skills`, each with a `count` and at most 20 short `names`, and `cannot_turn_off`, the extras that the worker cannot turn off, in words. Never a secret |
 
 ### Sign-in
 
@@ -481,7 +485,7 @@ A value in the inventory, not a row: `tool`, `version`, `latest`, `state` and `d
 
 ### Model selection
 
-A model selection is a value, not a row: `account_label`, `model` and `options`. Placement turns it into a worker and an account ID on that worker.
+A model selection is a value, not a row: `account_label`, `model` and `options`. Placement turns it into an account ID in the session host. The execution worker is a separate choice.
 
 ### Checkout
 
@@ -554,6 +558,25 @@ One row of the audit log, kept on the hub. Not a feed entity. A client reads it 
 | `error`, `composio_log_id` | text, optional | |
 | `result_bytes`, `duration_ms` | integer | |
 | `at` | timestamp | |
+
+### Monid call
+
+One row in `monid_calls` per call, with the whole call in `data`. Unlike a connector call, it keeps the full input and output, because the user asked to see them (ADR 0016). Money is in whole millionths of a dollar.
+
+| Field | Type | Notes |
+|---|---|---|
+| `id` | `mnc_` | |
+| `channel_id`, `session_id`, `task_id` | IDs | Where it came from |
+| `message_id`, `approval_id` | IDs | Its row, and its card when it asked |
+| `provider`, `endpoint`, `name`, `rate` | text | The tool |
+| `state` | enum | `running`, `completed`, `provider_error`, `failed`, `denied`, `blocked`, `stopped_by_monid`, `stopped`, `timed_out` |
+| `cost_micros` | integer | What Monid charged |
+| `run_id`, `stoppable` | text, bool | Monid's run |
+| `input`, `output`, `output_blob` | JSON, JSON, blob | A large output is cut, and the whole goes to a blob |
+| `files` | list of blobs | Saved under `monid/` in the channel files |
+| `error`, `duration_ms`, `at` | | |
+
+A task has `monid_calls` and `monid_cost_micros`. A routine has `monid`, its own unattended setting. `monid_grants` holds "Allow for this task". `access_denials` holds a Deny of an access request for 24 hours. The settings and the mark that a key exists are in `meta`. The key is in `monid.key`, encrypted like `composio.key`.
 
 ### Skill
 
@@ -670,13 +693,15 @@ Not enough text yet. Add documents to learn this context.
 - Never promise a date or a price. (you)
 ```
 
-Only the hub and the user write `voice.md`. Every write goes through the parser: sections that the format does not know and loose text are dropped, addresses (also `mailto:` and written out as `name [at] domain [dot] com`), phone numbers and links (any scheme, `www.`, and bare domains such as `evil.com/pay`) become `{email}`, `{phone}` and `{link}`, also in the `sources:`, `learned:` and `learned from:` lines, each section keeps at most 12 rules and 6 examples, and the note must fit in 6 KiB. A write by the user marks every new or changed rule `(you)`, and the marked rules become `user_rules`. A session cannot write or delete the note. The hub writes it on Do it, with the user's rules of then.
+The hub, the user and the Tutti coordinator in a turn from the user write `voice.md`. Every write goes through the parser: sections that the format does not know and loose text are dropped, addresses (also `mailto:` and written out as `name [at] domain [dot] com`), phone numbers and links (any scheme, `www.`, and bare domains such as `evil.com/pay`) become `{email}`, `{phone}` and `{link}`, also in the `sources:`, `learned:` and `learned from:` lines, each section keeps at most 12 rules and 6 examples, and the note must fit in 6 KiB. A write by the user marks every new or changed rule `(you)`, and the marked rules become `user_rules`. A session cannot write or delete the note. The hub writes it on Do it, with the user's rules of then.
 
 `draft_pairs` keeps one row per allowed draft card, and per draft or send that ran with no card, for 90 days: `approval_id` (a new ID for a call with no card), `connection_id`, `tool`, `context` (none for a neutral draft), `draft`, `final` (the subject line and the text fields), `final_bodies` (each text field alone, without the subject; the filter of the assistant's text matches these), `recipients`, `unchanged` (sent with no edit, or with no card: the assistant's text, never used for learning), `not_my_voice`, `at`, and `used` (taken by a `voice_edits` wake).
 
 `voice_uses` keeps each `voice_guide` call: `session_id`, `context`, `at`, for 90 days.
 
-`account_limits` (schema 15) keeps the accounts that reached a usage limit: `account_id` and `until_at`, the time when the limit resets, or one hour later when the harness does not say. A row has no use after that time.
+`account_limits` (schema 15, extended in schema 16) keeps the accounts that are on hold: `account_id`, `until_at`, `reason` (`usage_limit` or `outage`) and `exact`. `until_at` is the time when the limit resets, or one hour later (an outage: 10 minutes later) when the provider does not say. `exact` is false in that case, and the notices then leave out "It returns at". A row has no use after `until_at`.
+
+`session_outage_tries` (schema 16) counts the failed turns of one session with the kind `provider_outage`: `session_id` and `tries`. The fallback path moves the work at the third failure (`OUTAGE_TRIES`). A turn that works, or a move, clears the row.
 
 `voice_tasks` (schema 12) keeps every task that learned the voice: `task_id` and `at`. The mark stays after Learn again, so an old voice task keeps its limits. Learn again, Turn off and Reset end the session of every voice task that still runs, and the task fails.
 
@@ -686,7 +711,11 @@ A connector card ([Hub cards](#hub-cards)) of a draft or send tool has `outgoing
 
 A card from `show_draft` is not an approval. It is a message of the kind `notice` with the JSON body `{"kind": "draft", "text", "title", "to"?, "body", "original_body"?}`. `original_body` is the first text of the assistant, kept after the user edits the card (see [protocol.md](protocol.md#drafts-that-the-user-sends)).
 
-A notice with `kind` `turn_failed` can also have `error_kind` (`rate_limit`, `expired_sign_in`, `worker_restarted` or `unknown`), `resets_at` (Unix milliseconds), `account` and `raw`. Notices from before these fields exist read as `unknown`.
+A notice with `kind` `turn_failed` can also have `error_kind` (`rate_limit`, `provider_outage`, `expired_sign_in`, `worker_restarted` or `unknown`), `resets_at` (Unix milliseconds), `account`, `raw` and `path`. `path` lists what the fallback path tried and skipped (the same lines as a move notice) and is set when no step could answer. Notices from before these fields exist read as `unknown`.
+
+The notice kinds `assistant_unavailable` and `assistant_signed_out` are not posted any more: that state is live, in `coordinator_blocked` on the channel. A database from an older hub can still hold rows of these two kinds. A client does not show them.
+
+A notice with `kind` `account_fallback`, `fallback_returned` or `fallback_signed_out` records a move of the fallback path. Its body has `text` and the fields `scope`, `cause`, `from`, `to`, `provider`, `returns_at`, `lines` and `account_label` (see [protocol.md](protocol.md)). A channel has the field `coordinator_fallback` while its assistant runs on a fallback step: `from`, `to`, `cause`, `returns_at` and `moved_at`. The hub clears it when the assistant goes back.
 
 Every copy of a draft goes after 90 days. The maintenance purge deletes old `draft_pairs` and `voice_uses`, clears `arguments`, `draft_arguments`, `fields` and `flags` of old cards of draft and send tools, clears the arguments and the output of old `run_connector_tool` calls to such tools in session items, and replaces the brief of an old voice task with a short note. The connector call log keeps only a hash of the arguments, so it holds no copy.
 
@@ -697,9 +726,9 @@ The user's preferences are one record that every client shares. The hub stores i
 | Field | Type | Notes |
 |---|---|---|
 | `favorite_models` | list of `{account_label, model}` | The favorite models of the model picker, in the order that the user starred them. At most 200. Each field has at most 200 characters |
-| `account_fallback` | boolean | Work moves to another account at a usage limit. True by default |
+| `fallback_path` | object | The one global fallback path: `other_accounts` (boolean, true by default) and `steps` (a list of model selections: account label, model and options, at most 10, no account and model twice). The first choice is the model of the channel and is not stored. See "The fallback path" in architecture.md |
 
-A favorite whose account is not signed in on any worker, or whose account no longer offers the model, stays in the list. The clients do not show it until the account or the model comes back. The feed `entity_id` of the record is `preferences`, and its entries have no channel.
+A favorite whose account is not signed in, or whose account no longer offers the model, stays in the list. The clients do not show it until the account or the model comes back. The feed `entity_id` of the record is `preferences`, and its entries have no channel.
 
 ## Backups
 
@@ -734,37 +763,12 @@ The hub merges updates to the same session item that arrive within 250 ms into o
 
 ## Worker-local state
 
-`worker.toml` holds the configuration that the user owns on that machine:
+`worker.toml` holds what pairing writes, and two lists that have no control in the app yet. Nobody needs to edit the file for anything else. A `[policy]` table in an old file is ignored.
 
 ```toml
 hub_url = "https://hub.example.com"
+worker_id = "wrk_0192f0c4-..."
 name = "bigboi"
-tags = ["windows-test", "gpu"]
-
-[policy]
-allowed_roots = ["C:/Users/chris/Code"]
-max_approval_mode = "auto_edits"
-allow_shell = true
-
-[[accounts]]
-id = "acc_0192f0c4-..."
-harness = "codex"
-label = "Codex Personal"
-binary = "codex"
-home = "~/.codex"
-shadow_home = "~/.local/share/app/homes/codex-personal"
-args = []
-env = {}
-enabled = true
-
-# An account that Consort made. Its home folders are in the profile folder
-# <consort home>/profiles/claude-personal/.
-[[accounts]]
-id = "acc_0192f0c5-..."
-harness = "claude"
-label = "Claude Personal"
-profile = true
-profile_dir = "claude-personal"
 
 [[local_mcp_servers]]
 name = "home-assistant"
@@ -776,12 +780,25 @@ repo_url = "git@github.com:watzon/sayso.git"
 path = "C:/Users/chris/Code/sayso"
 ```
 
+The worker policy is in `worker.db`, in the table `policy`. The request `worker.set_policy` changes it. See [protocol.md](protocol.md).
+
+`session-host.toml` is the same kind of file on the session host. It has the accounts that Consort makes:
+
+```toml
+[[accounts]]
+id = "acc_0192f0c5-..."
+harness = "claude"
+label = "Claude Personal"
+profile = true
+profile_dir = "claude-personal"
+```
+
 `worker.db` holds:
 
 - `spool`: session ID, sequence number, event and an acknowledged flag. The worker keeps events until the hub acknowledges them.
 - `processed_commands`: command ID, result and time, kept for 8 days (the 7 days that the hub keeps a queued command, and one more day) so that a repeated command runs once.
 - `sessions`: the local registry of sessions with their native references and workspace paths.
 - `harness_processes`: the process group of each harness that the worker started on Unix, with the start time of its leader. At the next start, the worker stops only the recorded groups whose start time still matches.
-- `account_settings`: one row per account with `extras_enabled`. A missing row means on. The worker deletes the row when it removes the account.
+- An older database may still have the `account_settings` table. Nothing reads or writes it, and it is safe to leave.
 
 On Unix the worker folder, `workspaces/` and `runtime/` have mode 0700, and `worker.db` has mode 0600.

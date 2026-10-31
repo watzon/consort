@@ -564,40 +564,6 @@ pub fn directory_sources() -> Vec<DirectorySourceView> {
     ]
 }
 
-/// What the Claude Personal account on bigboi brings from claude.ai.
-pub fn claude_extras() -> ProviderExtrasView {
-    ProviderExtrasView {
-        mcp_servers: ExtrasGroupView {
-            count: 19,
-            names: [
-                "Gmail",
-                "Gmail",
-                "Gmail",
-                "Google Calendar",
-                "Google Calendar",
-                "Google Drive",
-                "Google Drive",
-                "Google Drive",
-                "Linear",
-                "Slack",
-                "Miss Lucy",
-            ]
-            .iter()
-            .map(|n| (*n).to_owned())
-            .collect(),
-        },
-        plugins: ExtrasGroupView {
-            count: 2,
-            names: Vec::new(),
-        },
-        skills: ExtrasGroupView {
-            count: 6,
-            names: Vec::new(),
-        },
-        cannot_turn_off: vec!["Plugins that you installed by hand in this profile".into()],
-    }
-}
-
 fn card(
     id: &str,
     task: Option<&str>,
@@ -606,6 +572,8 @@ fn card(
     labels: (&str, &str),
 ) -> ApprovalView {
     ApprovalView {
+        check_note: None,
+        blocked: Vec::new(),
         id: id.into(),
         task_id: task.map(Into::into),
         summary: summary.into(),

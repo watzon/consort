@@ -6,10 +6,10 @@ use consort_proto::model::{
     CHECK_IN_BACKOFF_MAX_SECONDS, Channel, Message, ProactiveKind, ProactiveMark, ProactiveOutcome,
     RoutineKind, RoutineSchedule, SILENT_CHECK_INS_BEFORE_BACKOFF,
 };
+use consort_proto::session_host_link::TurnEndReason;
 use consort_proto::time::Timestamp;
 use consort_proto::tools::HubTool;
 use consort_proto::turn_input::WakeEvent;
-use consort_proto::worker_link::TurnEndReason;
 use rusqlite::{Connection, params};
 
 use crate::error::{HubError, Result};
@@ -176,7 +176,6 @@ fn widens_access(tool: HubTool) -> bool {
             | T::SetChannelConnector
             | T::SetChannelSkill
             | T::SetWorkerTags
-            | T::SetAccountExtras
             | T::UpdateConnection
             | T::UpdateSkill
             | T::Disconnect
@@ -205,11 +204,15 @@ fn research_allows(tool: HubTool) -> bool {
         T::MemoryList
             | T::MemoryRead
             | T::FilesList
+            | T::FilesRead
             | T::ListWorkers
             | T::Search
             | T::ListConnectorTools
             | T::GetConnectorTool
             | T::RunConnectorTool
+            | T::SearchTools
+            | T::GetMonidTool
+            | T::RunMonidTool
             | T::ListSkills
             | T::ReadSkill
             | T::FetchTimeline

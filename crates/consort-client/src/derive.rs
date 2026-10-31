@@ -219,6 +219,8 @@ fn sync_cards(state: &mut ViewState) {
                 card.title = task.title.clone();
                 card.status = task.status;
                 card.approval_mode = task.approval_mode;
+                card.monid_calls = task.monid_calls;
+                card.monid_cost_micros = task.monid_cost_micros;
             }
         }
     }

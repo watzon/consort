@@ -9,9 +9,9 @@ use crate::common::*;
 use consort_proto::client_api::*;
 use consort_proto::ids::{ChannelId, SessionId, TaskId};
 use consort_proto::model::{ItemStatus, PlacementRequest, SessionState};
+use consort_proto::session_host_link::{HubToSessionHost, SessionStartResult, TurnEndReason};
 use consort_proto::status::TaskStatus;
 use consort_proto::time::Timestamp;
-use consort_proto::worker_link::{HubToWorker, SessionStartResult, TurnEndReason};
 
 async fn task_in_review(world: &mut World, channel_id: ChannelId) -> (TaskId, SessionId) {
     let task = world
@@ -49,7 +49,7 @@ async fn task_in_review(world: &mut World, channel_id: ChannelId) -> (TaskId, Se
 async fn next_start(world: &mut World, task_id: TaskId) -> SessionId {
     loop {
         let (request, command) = world.worker.next_command().await;
-        if let HubToWorker::SessionStart(start) = &command
+        if let HubToSessionHost::SessionStart(start) = &command
             && start.task_id == Some(task_id)
         {
             world

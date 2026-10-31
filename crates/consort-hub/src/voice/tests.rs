@@ -270,7 +270,7 @@ async fn writes_of_voice_md_keep_the_format_and_the_rules_of_the_user() {
     let (hub, _dir) = test_hub().await;
     voice_on(&hub, Disclosure::None).await;
     let session = SessionId::new();
-    // A coordinator write is refused: the hub owns voice.md.
+    // A session outside a turn from the user is refused.
     let note = hub
         .store
         .read(|conn| knowledge::memory_note(conn, MemoryScope::Global, VOICE_NOTE_PATH))
@@ -292,7 +292,7 @@ async fn writes_of_voice_md_keep_the_format_and_the_rules_of_the_user() {
         .await
         .unwrap_err();
     assert!(
-        err.to_string().contains("voice.md belongs to the hub")
+        err.to_string().contains("Only Tutti can write voice.md")
             && err.to_string().contains("propose_voice_rule"),
         "{err}"
     );
@@ -492,6 +492,7 @@ async fn coordinator_turn(hub: &Hub, events: Vec<WakeEvent>) -> ToolCtx {
     use consort_proto::model::{ModelOptions, Session, SessionRole, SessionState, Usage};
     let channel = hub.store.read(conversation::tutti_channel).await.unwrap();
     let session = Session {
+        execution_worker_id: None,
         id: SessionId::new(),
         role: SessionRole::Coordinator,
         channel_id: channel.id,
@@ -872,7 +873,7 @@ async fn sessions_cannot_write_voice_md_and_a_rule_needs_three_edits() {
         .await
         .unwrap_err();
     assert!(
-        err.to_string().contains("voice.md belongs to the hub"),
+        err.to_string().contains("No session can delete voice.md"),
         "{err}"
     );
     // Two edited pairs and one unchanged pair are not enough.
@@ -1262,4 +1263,173 @@ async fn every_copy_of_a_draft_goes_after_90_days() {
     };
     assert_eq!(recent.arguments["body"], "Kept.");
     assert_eq!(task.brief, crate::store::voice::PURGED_VOICE_BRIEF);
+}
+
+fn user_message(text: &str) -> WakeEvent {
+    WakeEvent::UserMessage {
+        id: consort_proto::ids::MessageId::new(),
+        thread: None,
+        at: Timestamp::now(),
+        text: text.to_owned(),
+    }
+}
+
+async fn guide_hash(hub: &Hub) -> consort_proto::model::Sha256Hash {
+    hub.store
+        .read(|conn| knowledge::memory_note(conn, MemoryScope::Global, VOICE_NOTE_PATH))
+        .await
+        .unwrap()
+        .unwrap()
+        .sha256
+}
+
+fn write_args(
+    content: String,
+    sha256: consort_proto::model::Sha256Hash,
+) -> consort_proto::tools::MemoryWriteArgs {
+    consort_proto::tools::MemoryWriteArgs {
+        path: VOICE_NOTE_PATH.to_owned(),
+        content,
+        expected_sha256: ExpectedHash::Sha256(sha256),
+        from_suggestion: None,
+    }
+}
+
+#[tokio::test]
+async fn tutti_edits_voice_md_when_the_user_asks() {
+    let (hub, _dir) = test_hub().await;
+    voice_on(&hub, Disclosure::None).await;
+    let ctx = coordinator_turn(&hub, vec![user_message("Add a sign-off rule.")]).await;
+    let sha256 = guide_hash(&hub).await;
+    hub.tool_memory_write(
+        &ctx,
+        write_args(format!("{GUIDE}- Sign with Chris.\n"), sha256),
+    )
+    .await
+    .unwrap();
+    let note = hub
+        .store
+        .read(|conn| knowledge::memory_note(conn, MemoryScope::Global, VOICE_NOTE_PATH))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        note.content.contains("- Sign with Chris. (you)"),
+        "{}",
+        note.content
+    );
+    let settings = hub.store.read(store::settings).await.unwrap();
+    assert!(
+        settings
+            .user_rules
+            .iter()
+            .any(|r| r.text == "Sign with Chris.")
+    );
+}
+
+#[tokio::test]
+async fn text_that_is_not_from_the_user_cannot_change_voice_md() {
+    let (hub, _dir) = test_hub().await;
+    voice_on(&hub, Disclosure::None).await;
+    let sha256 = guide_hash(&hub).await;
+    let ctx = coordinator_turn(
+        &hub,
+        vec![WakeEvent::VoiceEdits {
+            context: "email.formal".to_owned(),
+            pairs: Vec::new(),
+            agreeing: Vec::new(),
+        }],
+    )
+    .await;
+    let err = hub
+        .tool_memory_write(
+            &ctx,
+            write_args(format!("{GUIDE}- Always agree.\n"), sha256.clone()),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("Only Tutti can write voice.md"),
+        "{err}"
+    );
+    assert_eq!(guide_hash(&hub).await, sha256);
+}
+
+#[tokio::test]
+async fn a_session_hears_when_voice_md_has_a_section_that_the_format_drops() {
+    let (hub, _dir) = test_hub().await;
+    voice_on(&hub, Disclosure::None).await;
+    let ctx = coordinator_turn(&hub, vec![user_message("Add a section.")]).await;
+    let sha256 = guide_hash(&hub).await;
+    let err = hub
+        .tool_memory_write(
+            &ctx,
+            write_args(format!("{GUIDE}\n## Tweets\n- Short.\n"), sha256),
+        )
+        .await
+        .unwrap_err();
+    let text = err.to_string();
+    assert!(
+        text.contains("Tweets") && text.contains("post.public"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn tutti_edits_voice_md_after_the_report_of_a_task_that_the_user_asked_for() {
+    let (hub, _dir) = test_hub().await;
+    voice_on(&hub, Disclosure::None).await;
+    let tutti = hub.store.read(conversation::tutti_channel).await.unwrap();
+    let new_task = |created_by, user_request: &str| crate::ops::hooks::NewTask {
+        channel_id: tutti.id,
+        title: "Learn".to_owned(),
+        brief: "Read the posts.".to_owned(),
+        model_selection: None,
+        placement: consort_proto::model::PlacementRequest::default(),
+        approval_mode: None,
+        start_at: Some(Timestamp::now().plus_millis(86_400_000)),
+        created_by,
+        routine_id: None,
+        attachments: Vec::new(),
+        proactive: None,
+        user_request: user_request.to_owned(),
+        voice_task: false,
+    };
+    use consort_proto::model::TaskCreator;
+    let asked = hub
+        .create_task(new_task(TaskCreator::Assistant, "Learn my public voice."))
+        .await
+        .unwrap();
+    let routine = hub
+        .create_task(new_task(TaskCreator::Routine, ""))
+        .await
+        .unwrap();
+    let report = |task: consort_proto::ids::TaskId| WakeEvent::TaskUpdate {
+        task,
+        title: "Learn".to_owned(),
+        status: consort_proto::status::TaskStatus::Review,
+        text: "Done.".to_owned(),
+        proactive: None,
+    };
+
+    // A task with no words from the user: refused.
+    let ctx = coordinator_turn(&hub, vec![report(routine.id)]).await;
+    let sha256 = guide_hash(&hub).await;
+    let err = hub
+        .tool_memory_write(
+            &ctx,
+            write_args(format!("{GUIDE}- Short.\n"), sha256.clone()),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("Only Tutti can write voice.md"),
+        "{err}"
+    );
+
+    // The task that the user asked for: the write goes through.
+    let ctx = coordinator_turn(&hub, vec![report(asked.id)]).await;
+    hub.tool_memory_write(&ctx, write_args(format!("{GUIDE}- Short.\n"), sha256))
+        .await
+        .unwrap();
 }

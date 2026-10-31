@@ -323,6 +323,8 @@ pub struct Opacity {
     pub offline_mark: f32,
     /// The bubble of a message that waits in the outbox.
     pub queued: f32,
+    pub tint: f32,
+    pub dictation_border: f32,
 }
 
 /// Sizes of single components, from `structure.json`.
@@ -337,6 +339,7 @@ pub struct Components {
     pub settings_detail_max: Pixels,
     pub account_state: Pixels,
     pub account_action: Pixels,
+    pub row_dots: Pixels,
     pub tool_version: Pixels,
     pub tool_state: Pixels,
     pub provider_logo: Pixels,
@@ -347,6 +350,8 @@ pub struct Components {
     pub step_marker: Pixels,
     pub tag_label: Pixels,
     pub settings_select: Pixels,
+    pub dictation_select: Pixels,
+    pub dictation_cleanup_select: Pixels,
     pub group_select: Pixels,
     pub workspace_control: Pixels,
     pub model_picker: Pixels,
@@ -385,8 +390,18 @@ pub struct Components {
     pub chat: Chat,
     pub proactivity: Proactivity,
     pub voice: Voice,
+    pub fallback: Fallback,
     pub theme_preview: ThemePreview,
     pub convo: Convo,
+}
+
+/// The sizes of the fallback path. See `structure::Fallback`.
+#[derive(Clone, Copy, Debug)]
+pub struct Fallback {
+    pub handle: Pixels,
+    pub number: Pixels,
+    pub place: Pixels,
+    pub slot: Pixels,
 }
 
 /// The sizes of phase 4. See `structure::Convo`.
@@ -636,6 +651,11 @@ pub struct Chat {
     pub footer_button: Pixels,
     pub feedback_pair: Pixels,
     pub answered_line: Pixels,
+    pub mic_stop: Pixels,
+    pub mic_bar: Pixels,
+    pub mic_bar_gap: Pixels,
+    pub mic_bar_max: Pixels,
+    pub mic_dot: Pixels,
 }
 
 /// The drawing of a theme in its card.
@@ -668,6 +688,7 @@ impl Components {
             settings_detail_max: px(c.settings_detail_max),
             account_state: px(c.account_state),
             account_action: px(c.account_action),
+            row_dots: px(c.row_dots),
             tool_version: px(c.tool_version),
             tool_state: px(c.tool_state),
             provider_logo: px(c.provider_logo),
@@ -678,6 +699,8 @@ impl Components {
             step_marker: px(c.step_marker),
             tag_label: px(c.tag_label),
             settings_select: px(c.settings_select),
+            dictation_select: px(c.dictation_select),
+            dictation_cleanup_select: px(c.dictation_cleanup_select),
             group_select: px(c.group_select),
             workspace_control: px(c.workspace_control),
             model_picker: px(c.model_picker),
@@ -886,6 +909,11 @@ impl Components {
                 footer_button: px(c.chat.footer_button),
                 feedback_pair: px(c.chat.feedback_pair),
                 answered_line: px(c.chat.answered_line),
+                mic_stop: px(c.chat.mic_stop),
+                mic_bar: px(c.chat.mic_bar),
+                mic_bar_gap: px(c.chat.mic_bar_gap),
+                mic_bar_max: px(c.chat.mic_bar_max),
+                mic_dot: px(c.chat.mic_dot),
             },
             proactivity: {
                 let p = &c.proactivity;
@@ -937,6 +965,15 @@ impl Components {
                     line_icon: px(v.line_icon),
                     rule_pad_y: px(v.rule_pad_y),
                     example_pad_y: px(v.example_pad_y),
+                }
+            },
+            fallback: {
+                let f = &c.fallback;
+                Fallback {
+                    handle: px(f.handle),
+                    number: px(f.number),
+                    place: px(f.place),
+                    slot: px(f.slot),
                 }
             },
             theme_preview: ThemePreview {
@@ -1103,6 +1140,8 @@ impl Tokens {
                 offline_dim: s.opacity.offline_dim,
                 offline_mark: s.opacity.offline_mark,
                 queued: s.opacity.queued,
+                tint: s.opacity.tint,
+                dictation_border: s.opacity.dictation_border,
             },
             component: Components::new(&s.component, scale),
             icon: Icons {

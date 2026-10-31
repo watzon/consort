@@ -16,11 +16,13 @@
 //! is in Working with no current session and with the worker it ran on.
 
 use consort_proto::ids::{SessionId, TaskId};
-use consort_proto::model::{Message, ModelSelection, Session, SessionRole, SessionState, Task};
-use consort_proto::status::{Actor, TaskStatus};
-use consort_proto::worker_link::{
-    HubToWorker, SessionModelChange, SessionStart, TurnInput, WorkspaceSpec,
+use consort_proto::model::{
+    MachineKind, Message, ModelSelection, Session, SessionRole, SessionState, Task, Worker,
 };
+use consort_proto::session_host_link::{
+    HubToSessionHost, SessionExecution, SessionModelChange, SessionStart, TurnInput, WorkspaceSpec,
+};
+use consort_proto::status::{Actor, TaskStatus};
 use rusqlite::Connection;
 
 use crate::error::{HubError, Result};
@@ -215,10 +217,14 @@ impl Hub {
                     Some(id) => machine::worker(conn, id)?,
                     None => None,
                 };
-                Ok(Some((task, channel, thread, worker)))
+                let hosts: Vec<Worker> = machine::workers(conn)?
+                    .into_iter()
+                    .filter(|w| w.kind == MachineKind::SessionHost && w.revoked_at.is_none())
+                    .collect();
+                Ok(Some((task, channel, thread, worker, hosts)))
             })
             .await?;
-        let Some((task, channel, thread, worker)) = inputs else {
+        let Some((task, channel, thread, worker, hosts)) = inputs else {
             return Ok(());
         };
         let Some(worker) = worker else {
@@ -226,20 +232,34 @@ impl Hub {
                 .fail_switch(task_id, "The worker of this task is gone.")
                 .await;
         };
+        // The account is on a session host. The tools stay on the worker of
+        // the task.
         let resolved = task.model_selection.as_ref().map(|selection| {
-            worker
-                .inventory
-                .as_ref()
-                .ok_or_else(|| format!("{} has not sent its accounts yet.", worker.name))
-                .and_then(|inventory| {
-                    resolve_selection(inventory, selection, task.approval_mode)
-                        .map(|(account, model, options)| {
-                            (account.account_id, account.harness.clone(), model, options)
-                        })
-                        .map_err(|reason| format!("{} {reason}", worker.name))
-                })
+            let mut last = Err(
+                "The session host on the hub machine has not sent its accounts yet.".to_owned(),
+            );
+            for host in &hosts {
+                let Some(inventory) = &host.inventory else {
+                    continue;
+                };
+                last = resolve_selection(inventory, selection, task.approval_mode)
+                    .map(|(account, model, options)| {
+                        (
+                            host.id,
+                            account.account_id,
+                            account.harness.clone(),
+                            model,
+                            options,
+                        )
+                    })
+                    .map_err(|reason| format!("{} {reason}", host.name));
+                if last.is_ok() {
+                    break;
+                }
+            }
+            last
         });
-        let Some(Ok((account_id, harness, model, options))) = resolved else {
+        let Some(Ok((session_host_id, account_id, harness, model, options))) = resolved else {
             let reason = match resolved {
                 Some(Err(reason)) => reason,
                 _ => "The task has no model choice.".to_owned(),
@@ -264,7 +284,12 @@ impl Hub {
             .as_ref()
             .map(|r| r.local_mcp_servers.clone())
             .unwrap_or_default();
-        let worker_id = worker.id;
+        let worker_id = session_host_id;
+        let execution_worker_id = worker.id;
+        let execution = Some(SessionExecution {
+            worker_id: worker.id,
+            worker_name: worker.name.clone(),
+        });
         let isolation = task
             .placement
             .isolation
@@ -290,6 +315,7 @@ impl Hub {
                     channel_id: task.channel_id,
                     task_id: Some(task_id),
                     worker_id,
+                    execution_worker_id: Some(execution_worker_id),
                     account_id,
                     harness,
                     model: model.clone(),
@@ -317,7 +343,7 @@ impl Hub {
                 )?;
                 tx.queue_command(
                     worker_id,
-                    &HubToWorker::SessionStart(SessionStart {
+                    &HubToSessionHost::SessionStart(SessionStart {
                         session_id: session.id,
                         role: SessionRole::Task,
                         channel_id: task.channel_id,
@@ -343,6 +369,7 @@ impl Hub {
                             attachments: batch.attachments,
                         }),
                         turn_approval_mode: None,
+                        execution: execution.clone(),
                     }),
                 )?;
                 task.current_session_id = Some(session.id);
@@ -449,13 +476,16 @@ mod tests {
         hub.store
             .write(move |tx| {
                 let mut worker = machine::worker(tx.db(), worker_id)?.unwrap();
+                worker.kind = consort_proto::model::MachineKind::SessionHost;
                 worker.inventory = Some(Inventory {
+                    boundary: None,
                     hash: String::new(),
                     hostname: "laptop".to_owned(),
                     os: worker.os,
                     arch: "aarch64".to_owned(),
                     tags: Vec::new(),
                     accounts: vec![HarnessAccount {
+                        blocked_reason: None,
                         account_id,
                         harness: "claude".to_owned(),
                         label: "Claude Work".to_owned(),
@@ -474,8 +504,6 @@ mod tests {
                         plan: None,
                         secret_names: Vec::new(),
                         sign_in_methods: Vec::new(),
-                        extras_enabled: false,
-                        extras: None,
                     }],
                     local_mcp_servers: Vec::new(),
                     checkouts: Vec::new(),

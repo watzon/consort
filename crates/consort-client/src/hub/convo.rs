@@ -338,6 +338,7 @@ fn describe(item: &SessionItem, worker: &str, view: &mut ItemDetailView) {
         ItemPayload::Command(c) => {
             view.kind = ItemKind::Output;
             view.title = c.command.clone();
+            view.check = c.check.as_ref().map(crate::command_check::check_detail);
             let ran = match c.duration_ms {
                 Some(ms) => format!("ran {} on {worker}, {time}", duration_label(ms)),
                 None => format!("ran on {worker}, {time}"),
@@ -398,7 +399,8 @@ async fn open_item(
                 .get(&session_id)
                 .and_then(|items| items.get(&item_id))
                 .map(|s| match s {
-                    crate::cache::ItemSummary::Command(command) => {
+                    crate::cache::ItemSummary::Command(command)
+                    | crate::cache::ItemSummary::Blocked(command) => {
                         (ItemKind::Output, command.clone())
                     }
                     crate::cache::ItemSummary::Files(paths) => {

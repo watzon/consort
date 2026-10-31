@@ -1,0 +1,18 @@
+# The session host next to a hub. See docs/deploy.md.
+services:
+  session-host:
+    build:
+      context: ../..
+      dockerfile: deploy/session-host/Dockerfile
+      # The Sayso checkout beside this repo. The workspace needs its manifests.
+      additional_contexts:
+        sayso: ../../../sayso
+    restart: unless-stopped
+    security_opt:
+      - seccomp=./seccomp.json
+      - apparmor=unconfined
+      - systempaths=unconfined
+    volumes:
+      - session-host:/data
+volumes:
+  session-host:

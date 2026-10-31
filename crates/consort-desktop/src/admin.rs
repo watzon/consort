@@ -188,6 +188,7 @@ impl ConsortApp {
                 self.spawn_command(cx, async move { client.run(Command::LoadClients).await });
             }
             SettingsSection::Notifications => self.check_permission(cx),
+            SettingsSection::Dictation => self.open_dictation_page(cx),
             _ => {}
         }
     }
@@ -285,6 +286,10 @@ impl ConsortApp {
                     self.open_channel(channel_id, window, cx);
                 }
             }
+            Some(NotificationTarget::SignIn {
+                worker_id,
+                account_id,
+            }) => self.open_sign_in(worker_id, account_id, window, cx),
             Some(NotificationTarget::App) | None => {}
         }
         cx.notify();
@@ -496,6 +501,7 @@ impl ConsortApp {
     ) -> bool {
         match screen {
             "hub" => self.open_settings(SettingsSection::Hub, cx),
+            "models" => self.open_settings(SettingsSection::Models, cx),
             "clients" => self.open_settings(SettingsSection::Clients, cx),
             "clients-revoke" => {
                 self.open_settings(SettingsSection::Clients, cx);

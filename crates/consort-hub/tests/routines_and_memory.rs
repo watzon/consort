@@ -312,6 +312,7 @@ async fn a_client_moves_a_routine_to_another_channel() {
             prompt: None,
             action: None,
             enabled: None,
+            monid: None,
         })
         .await
         .unwrap()

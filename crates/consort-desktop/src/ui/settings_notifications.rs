@@ -248,7 +248,11 @@ impl ConsortApp {
                                     .gap(t.space.lg + t.space.xs)
                                     .pt(t.space.md)
                                     .child(banner)
-                                    .child(text(caption, detail(t), c.text_tertiary).flex_1()),
+                                    .child(
+                                        text(caption, detail(t), c.text_tertiary)
+                                            .flex_1()
+                                            .min_w_0(),
+                                    ),
                             ),
                     ),
             )

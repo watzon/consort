@@ -439,6 +439,7 @@ async fn the_brief_and_the_research_pass_run_at_most_once_in_twelve_hours() {
         prompt: None,
         action: None,
         enabled: None,
+        monid: None,
     };
     let hourly = RoutineSchedule::Interval { seconds: 3600 };
     let err = hub

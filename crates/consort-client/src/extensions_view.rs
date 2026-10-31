@@ -491,6 +491,12 @@ pub fn hub_card(
             blocked_reason: card.blocked_reason.clone(),
             skill_id: card.skill_id.map(|s| s.to_string()),
         }),
+        ApprovalDetails::Monid(card) => {
+            HubCardView::Monid(Box::new(crate::monid::card_view(card, options)))
+        }
+        ApprovalDetails::AccessRequest(card) => {
+            HubCardView::Access(Box::new(crate::access::card_view(card, options)))
+        }
         _ => return None,
     };
     // The labels come from the options the hub sent, so the buttons say

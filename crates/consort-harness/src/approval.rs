@@ -20,17 +20,11 @@ pub fn effective_mode(
 }
 
 /// The Claude Code permission mode (an ACP session mode in
-/// `claude-agent-acp`).
-pub fn claude_mode(mode: ApprovalMode) -> &'static str {
-    match mode {
-        ApprovalMode::Ask => "default",
-        ApprovalMode::AutoEdits => "acceptEdits",
-        // Claude Code's own `auto` mode: it asks only for destructive actions
-        // and for actions outside the workspace. The adapter may not offer
-        // it (see [`claude_mode_fallback`]).
-        ApprovalMode::Auto => "auto",
-        ApprovalMode::FullAccess => "bypassPermissions",
-    }
+/// `claude-agent-acp`). It is `default` for every approval mode, and never
+/// `bypassPermissions`. The CLI has only Consort tools, and the approval
+/// engine of the hub decides at the MCP endpoint.
+pub fn claude_mode(_mode: ApprovalMode) -> &'static str {
+    "default"
 }
 
 /// The permission mode to use when the adapter does not offer `mode`, or
@@ -131,7 +125,7 @@ pub const GEMINI_COORDINATOR_DENIED: [&str; 3] =
 pub const GEMINI_SHELL_TOOL: &str = "run_shell_command";
 
 /// The name of the MCP server that carries the hub tools.
-const HUB_SERVER_NAME: &str = "hub";
+const HUB_SERVER_NAME: &str = "consort";
 
 /// The Gemini CLI policy file of a session, or `None` when the session
 /// needs none. The adapter passes it with `--admin-policy`, the highest
@@ -231,9 +225,9 @@ mod tests {
     #[test]
     fn modes_follow_the_table() {
         assert_eq!(claude_mode(ApprovalMode::Ask), "default");
-        assert_eq!(claude_mode(ApprovalMode::AutoEdits), "acceptEdits");
-        assert_eq!(claude_mode(ApprovalMode::Auto), "auto");
-        assert_eq!(claude_mode(ApprovalMode::FullAccess), "bypassPermissions");
+        assert_eq!(claude_mode(ApprovalMode::AutoEdits), "default");
+        assert_eq!(claude_mode(ApprovalMode::Auto), "default");
+        assert_eq!(claude_mode(ApprovalMode::FullAccess), "default");
         assert_eq!(codex_policy(ApprovalMode::Ask), ("untrusted", "read-only"));
         assert_eq!(
             codex_policy(ApprovalMode::FullAccess),
@@ -261,27 +255,19 @@ mod tests {
 
     #[test]
     fn claude_modes_have_a_rank() {
-        assert!(claude_mode_allowed("default", ApprovalMode::Ask));
-        assert!(claude_mode_allowed("plan", ApprovalMode::Ask));
-        assert!(!claude_mode_allowed("acceptEdits", ApprovalMode::Ask));
-        assert!(!claude_mode_allowed("auto", ApprovalMode::AutoEdits));
-        // `auto` is allowed from the Auto approval mode up, and never below.
-        assert!(!claude_mode_allowed("auto", ApprovalMode::Ask));
-        assert!(claude_mode_allowed("auto", ApprovalMode::Auto));
-        assert!(claude_mode_allowed("auto", ApprovalMode::FullAccess));
-        assert!(claude_mode_allowed("acceptEdits", ApprovalMode::Auto));
+        // The limit is `default` in every approval mode, so the CLI cannot
+        // raise its own mode.
+        for limit in ApprovalMode::ALL {
+            assert!(claude_mode_allowed("default", limit));
+            assert!(claude_mode_allowed("plan", limit));
+            assert!(!claude_mode_allowed("acceptEdits", limit));
+            assert!(!claude_mode_allowed("auto", limit));
+            assert!(!claude_mode_allowed("bypassPermissions", limit));
+            assert!(!claude_mode_allowed("somethingNew", limit));
+        }
         assert_eq!(claude_mode_fallback("auto"), Some("acceptEdits"));
         assert_eq!(claude_mode_fallback("acceptEdits"), None);
         assert_eq!(claude_mode_fallback("bypassPermissions"), None);
-        assert!(!claude_mode_allowed(
-            "bypassPermissions",
-            ApprovalMode::Auto
-        ));
-        assert!(!claude_mode_allowed("somethingNew", ApprovalMode::Auto));
-        assert!(claude_mode_allowed(
-            "bypassPermissions",
-            ApprovalMode::FullAccess
-        ));
         assert_eq!(claude_option_mode("exit-plan-auto", false), Some("auto"));
         assert_eq!(
             claude_option_mode("allow-with-updates", true),

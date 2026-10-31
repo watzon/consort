@@ -68,7 +68,7 @@ Each side sends the protocol versions that it supports in `hello`. The hub picks
 | `worker_offline` | The worker that this action needs is offline |
 | `worker_unknown` | No worker has this ID |
 | `no_matching_account` | No online worker has a harness account with this label and model |
-| `policy_denied` | The worker policy does not allow this action. `message` names the rule |
+| `policy_denied` | The worker policy does not allow this action. `message` names the rule. The user changes the policy in Settings > Workers |
 | `resync_required` | The client's feed position is older than the oldest kept feed entry |
 | `conflict` | The action does not apply to the entity's current state, for example resolving a task that is `up_next` |
 | `internal` | An unexpected error on the hub. The hub logs the details |
@@ -96,7 +96,7 @@ Workers and clients pair the same way, and both prove their identity with an Ed2
 3. The worker makes an Ed25519 key pair. The private key stays in the OS keychain, or in a file with mode 0600 when no keychain is available.
 4. The worker sends `POST /v1/pair/worker` with `code`, `public_key`, `hostname`, `os`, `arch` and an optional `name`. Public keys, signatures and nonces are lowercase hex on the wire.
 5. The hub checks the code, stores the worker, and returns the `worker_id`. An HTTP error has the body `{"error": {"code", "message"}}`. The hub allows 10 pairing requests per minute from one IPv4 address or one IPv6 /64 network, and 60 per minute from all addresses together. After that, it answers HTTP 429 with the code `policy_denied`.
-6. The worker writes `hub_url` and its ID to `worker.toml`.
+6. The worker writes `hub_url` and its ID to `worker.toml` (`session-host.toml` on a session host).
 
 ### Pair a client
 
@@ -160,8 +160,8 @@ Every hub command is a request. The envelope `id` of a hub command is its comman
 | `workspace.release` | `task_id`, `delete` (bool) | None. The hub sends it with `delete` true when a task is deleted, when a resolved task is archived, and when its channel is deleted, to each worker that ran the task, after the `session.stop` of the task's session. It does not send it when a task is resolved, because Not done needs the workspace. After a release, the hub refuses Not done and offers Retry, which starts a new session in a new workspace. The hub refuses Retry while a release of the task still waits in a queue |
 | `item.detail` | `session_id`, `item_id` | `sha256`, `size` and `mime` of a blob with the full command output or diff |
 | `inventory.refresh` | Empty | None |
-| `account.create` | `account_id` (the hub chooses it), `harness`, `label`, optional `acp`, `env` | None. The worker makes the profile folder, writes `env` to `env.json` in it, adds the account to `worker.toml`, and sends a new inventory |
-| `account.update` | `account_id`, optional `label`, `env_set`, `env_remove`, `extras_enabled` | None. `extras_enabled` turns the provider extras of the account on or off from the next session or resume. The worker keeps the setting for the account. A running session keeps what it started with |
+| `account.create` | `account_id` (the hub chooses it), `harness`, `label`, optional `acp`, `env` | None. The worker makes the profile folder, writes `env` to `env.json` in it, adds the account to `session-host.toml`, and sends a new inventory |
+| `account.update` | `account_id`, optional `label`, `env_set`, `env_remove` | None. An old client may still send `extras_enabled`. The session host ignores it |
 | `account.remove` | `account_id` | None. The worker signs out where it can and deletes the profile folder |
 | `account.sign_out` | `account_id` | None |
 | `sign_in.start` | `sign_in_id`, `account_id`, `method` | None. The worker sends each state as `sign_in.update` |
@@ -255,7 +255,7 @@ The `code` of an `error` event is one of these:
 | `approval_too_long` | Worker | An approval was too long to show in full, so the worker denied it. The model gets the same reason as a steer when the harness can steer |
 | `approval_mode_lowered` | Worker | The session asked for Full access, but the agent offers no bypass mode, so the session runs in Auto |
 
-The hub stores each `error` event as a failed item of the session. `login_expired` does what `signed_out` does, except that the account becomes `error` with the detail "The login expired. Sign in again." (the app reads "expired" in the detail as Expired). After `signed_out`, the hub also marks the account `signed_out` in the stored inventory of the worker, so placement does not choose it until the next inventory from the worker. A coordinator session on that account ends as `lost`: its turn's events go back to the queue, and placement starts a new session on another signed-in account. When no account fits, the channel gets a notice that names the account and the worker to sign in on, and the events wait for the next inventory. A failed coordinator turn on an account that the inventory shows as signed out has the same result.
+The hub stores each `error` event as a failed item of the session. `login_expired` does what `signed_out` does, except that the account becomes `error` with the detail "The login expired. Sign in again." (the app reads "expired" in the detail as Expired). After `signed_out`, the hub also marks the account `signed_out` in the stored inventory of the worker, so placement does not choose it until the next inventory from the worker. A coordinator session on that account ends as `lost`: its turn's events go back to the queue, and placement starts a new session on another signed-in account. When no account fits, the channel gets `coordinator_blocked` with the kind `signed_out` and the name of the account (see below), and the events wait for the next inventory. A failed coordinator turn on an account that the inventory shows as signed out has the same result.
 
 The `details` of an approval request has a `kind` and the fields for that kind: `command` (`command`, `cwd`), `file_change` (`paths`), `tool` (`server`, `tool`, `arguments`), `network` (`target`) or `other` (`text`). The hub card kinds (`connector`, `management`, `connect_service`, `sign_in` and `skill_install`) are for approvals that the hub makes itself. The hub reads one of them from a worker as `other`, with the summary as the text. Every `command` approval has its `cwd`. A Codex network approval comes as `command` details, with the command and its folder, and its summary names the host, for example "Run `git fetch` with network access to github.com". The `details` of a question has `question`, `context` and `allow_free_text`. Each option has `id`, `label`, `kind` (`allow_once`, `allow_always`, `deny_once`, `deny_always` or `choice`) and an optional `description`.
 
@@ -292,8 +292,8 @@ The worker sends a full inventory after `hello` and again when any part changes.
 |---|---|
 | `hash` | Hash of the rest of the inventory: `fnv1a64:` and 16 hex characters over the JSON of the inventory with an empty `hash`. It detects changes. It is not a security hash |
 | `hostname`, `os`, `arch` | |
-| `tags` | The detected tags (`macos`, `windows`, `linux`, `arm64`, `x64`, `ram-<n>gb`, `cpu-<n>`, `gpu-nvidia`, `gpu-amd`, `gpu-apple`) and the `tags` in `worker.toml`. An older worker sends `labels`, which reads as `tags` |
-| `accounts` | Each harness account: `account_id`, `harness`, `label`, `harness_version`, `auth_state`, `auth_detail`, `models`, `capabilities`, `enabled`, `profile` (true for an account that Consort made, with a profile folder), `email`, `plan`, `secret_names` (the names in `env.json`, never the values), `sign_in_methods`, `extras_enabled` (true when the field is missing) and optional `extras` (what the account syncs from the provider, see [data-model.md](data-model.md#harness-account)). Never a credential |
+| `tags` | The detected tags (`macos`, `windows`, `linux`, `arm64`, `x64`, `ram-<n>gb`, `cpu-<n>`, `gpu-nvidia`, `gpu-amd`, `gpu-apple`) and the `tags` in the configuration file of the machine. An older worker sends `labels`, which reads as `tags` |
+| `accounts` | Each harness account: `account_id`, `harness`, `label`, `harness_version`, `auth_state`, `auth_detail`, `models`, `capabilities`, `enabled`, `profile` (true for an account that Consort made, with a profile folder), `email`, `plan`, `secret_names` (the names in `env.json`, never the values), `sign_in_methods`. Never a credential |
 | `tools` | Each managed tool: `tool`, `version`, `latest`, `state` (`missing`, `installing`, `ready`, `update_available` or `failed`) and `detail`. `tool` is `node`, `claude-code`, `claude-agent-acp`, `codex`, `opencode`, `gemini-cli` or `acp:<registry id>` |
 | `local_mcp_servers` | Each server's `name`, `description` and tool names. Never a URL with a secret, and never a credential |
 | `checkouts` | Each checkout's `repo_url`, `path` and `managed` flag |
@@ -356,6 +356,28 @@ The worker gets every file of a session with the signed `GET /v1/blobs/{sha256}`
 - **Channel files.** At `session.start`, the worker makes a read-only copy of `channel_files` in `<workspace>/.channel/files/`. A task session's list has no files under `artifacts/<its own task id>/`. When a `session.turn` has `channel_files`, the worker makes the copy match the new list before the turn starts: it writes new and changed files, and removes files that are gone and files that the session added or changed. The worker never sends the copy back to the hub. A session publishes a file with `publish_artifact`, and a coordinator writes one with `files_write`.
 - In a workspace that is a git checkout, the worker adds `/.channel/` and `/.consort/` to the repo's `info/exclude`, so git does not see them.
 
+## Session host and execution links
+
+The session host and each worker dial the hub on separate routes with separate keys: `/v1/session-host` and `/v1/pair/session-host` for the session host, `/v1/worker` and `/v1/pair/worker` for a worker. The hub refuses a peer on the wrong route. The tables above are the session host link. A worker has no sessions, accounts or tools to install. The types are in `consort_proto::execution_link`.
+
+The hub sends these requests to a worker:
+
+| Request | Body | Result |
+|---|---|---|
+| `workspace.prepare` | `capability`, `task_id`, `key`, `spec`, `channel_files` | The inspection of the workspace. The same key finds the same workspace, and the worker checks it against the policy again |
+| `workspace.inspect` | `capability` | The inspection |
+| `workspace.release` | `key`, `delete` | None |
+| `workspace.sync` | `capability`, `attachments`, optional `channel_files` | `failures` |
+| `exec.op` | `session_id`, `capability`, `operation_id`, `tool`, `arguments`, `deadline`, `policy_version` | `result`, `replayed_from_journal`, `is_error` |
+| `inventory.refresh` | Empty | None |
+| `policy.set` | Optional `max_approval_mode`, `allowed_roots`, `allow_shell` | The policy that the worker uses now. The worker saves it in `worker.db`, applies it at once and sends a new inventory. It refuses a folder that is not a full path on the machine, and then nothing changes |
+
+The tools of `exec.op` are the file, process, blob, skill and local MCP tools in `ExecTool`. `process_list` returns the commands of the session and the operations that began and have no result.
+
+The session host asks the hub on its own link with `workspace.open`, `workspace.files`, `tool.authorize` and `tool.exec`. A restart of the session host sends `reopened` for each session. For a task that works, the hub then sends a new `session.turn`. The session host first asks the worker with `process_list`, and it puts the result before the text of the turn. A command with no known result does not run again by itself.
+
+An account tool of the hub (`install_tool`, `add_account`, `start_sign_in`) takes the ID of any worker and finds the account on the session host.
+
 ## Hub tools
 
 The worker runs one MCP endpoint per session at `http://127.0.0.1:<port>/mcp/<session_id>`, with streamable HTTP transport. The worker makes a random 32-byte bearer token for each session and gives it only to that session's harness.
@@ -373,6 +395,7 @@ The hub gives each session the tools for its role. Each tool's `input_schema` is
 | `memory_list` | optional `scope` | Paths, hashes and update times |
 | `memory_read` | optional `scope`, `path` | `content` and `sha256` |
 | `files_list` | optional `prefix` | Channel file paths, sizes and hashes |
+| `files_read` | `path` | Coordinators only. The text of a channel file or an artifact, at most 256 KiB, with `truncated` when the file is larger. A file that is not text fails with `invalid`. |
 | `list_workers` | None | Each worker's ID, name, OS, state, tags, account labels with their models, local MCP server names and repo checkouts |
 | `ask_decision` | `question`, `options` (2 to 4, each with `label` and `consequence`), optional `recommended_index`, `context` and `allow_free_text` | `decision_id`. The answer arrives as input to a later turn |
 | `search` | `query`, optional `channel_id` | Matching messages, memory notes and tasks. A memory note and a task hit have `updated_at` |
@@ -432,7 +455,7 @@ The Tutti coordinator also has the management tools in [Management tools](#manag
 - `voice_sample { sample, draft, context? }`, for the Tutti coordinator: the answer to a `voice_sample` event. The hub keeps the sample only in memory.
 - `propose_voice_rule { rule, context, pair_ids, replaces? }`, for the Tutti coordinator, listed only while the voice is on: one learned rule for the section of `context` (`core` or a context key), after a `voice_edits` event. The hub checks that `pair_ids` name at least 3 distinct edited draft pairs of that context, that the voice and "Your edits to drafts" are on, and that Tutti's proactivity level is not Off (`policy_denied` or `invalid` otherwise). `replaces` names a learned rule of that section; a rule of the user cannot be replaced. The hub stores the change and posts the offer "Change your style guide?" in Tutti with Do it, Not now and Never about this. Do it adds the rule to the guide as it is then, with the user's rules of then; Never about this turns off "Your edits to drafts".
 
-No session can write or delete `voice.md`: `memory_write` and `memory_delete` on it fail with `policy_denied` and a message that names `propose_voice_rule` and Settings > Voice. The note changes only through an offer that the user answers with Do it, or through the user's own `memory.write`.
+The Tutti coordinator can write `voice.md` with `memory_write` in a turn that holds a `user_message` event, or a `task_update` of a task that the user asked for: the user made it, or a coordinator started it in a turn with the user's words. The write counts as the user's: a new or changed rule gets `(you)`. A section that the format does not know fails with `invalid`, so that no text goes missing. In any other turn, `memory_write` fails with `policy_denied` and a message that names `propose_voice_rule`. `memory_delete` on the note always fails. The note also changes through an offer that the user answers with Do it, and through the user's own `memory.write`.
 
 A voice task (every task that "Learn" or "Learn again" started, also after a newer one replaced it) has only these hub tools: `memory_list`, `memory_read`, `files_list`, `list_workers`, `search`, `list_connector_tools`, `get_connector_tool`, `run_connector_tool`, `list_skills`, `read_skill`, `suggest_memory` and `submit_for_review`. Other tools fail with `policy_denied`.
 
@@ -481,7 +504,7 @@ A draft or send tool gets more on its card ([VOICE-PLAN.md](VOICE-PLAN.md)). Nei
 
 ### Management tools
 
-The hub enforces the scope and the risk rule. A change runs at once and posts a short activity line when it adds something new and narrow, or makes access smaller or approvals stricter. It waits for the user on a management approval card when it deletes or archives, widens access (more channels or workers, or every channel), makes approvals looser, turns on a skill with scripts, changes worker or channel tags, or turns provider extras on. A sign-in or a key always goes through a card that the user completes in the app or the browser. The assistant never handles a secret.
+The hub enforces the scope and the risk rule. A change runs at once and posts a short activity line when it adds something new and narrow, or makes access smaller or approvals stricter. It waits for the user on a management approval card when it deletes or archives, widens access (more channels or workers, or every channel), makes approvals looser, turns on a skill with scripts, or changes worker or channel tags. A sign-in or a key always goes through a card that the user completes in the app or the browser. The assistant never handles a secret.
 
 A change that ran at once posts a notice in the channel of the session that made it (the Tutti channel for a Tutti tool). The notice is a message of the kind `notice` with the author `system`. Its `body` is a JSON object `{"kind": "assistant_change", "text": "<one line that names the change>"}`, for example "Created the channel Taxes." This is the activity line of the risk rule. A change that waited for a card has no activity line, because the card shows what changed. A client shows it in the timeline like any other notice.
 
@@ -508,7 +531,6 @@ For the Tutti coordinator only:
 | `install_tool` | `worker`, `tool` | As `worker.tool_install` |
 | `add_account` | `worker`, `provider`, `name` | Makes the account, then posts a sign-in card |
 | `start_sign_in` | `worker`, `account`, optional `method` (a method kind) | Posts a sign-in card |
-| `set_account_extras` | `worker`, `account`, `enabled` | Turning them on asks first |
 | `search_connector_catalog` | `search`, optional `category` | `services` |
 | `update_connection` | `connection`, optional `name`, `use_in`, `approvals` | Follows the risk rule |
 | `disconnect` | `connection` | Asks first |
@@ -524,13 +546,16 @@ For a channel's coordinator, only for its own channel:
 | `set_channel_tags` | `tags` | Asks first |
 | `set_channel_connector` | `connection`, `enabled` | Only for a connection whose `use_in` gives it to the channel. Otherwise `refused` |
 | `set_channel_skill` | `skill`, `enabled` | The same rule |
-| `request_access` | `connection` or `skill` | Posts a management approval card that asks the user to widen the item's `use_in` to this channel |
+| `request_access` | `connection`, `monid` or `skill`, with `duration` and `reason` | Every session. Posts an access card and waits: temporary access, lasting access or Deny (ADR 0017). A skill takes a management card with lasting access only |
+| `search_tools` | `query` | Connector tools first, then Monid. Each row has `access`: `available` or `request` (ADR 0016, 0017) |
+| `get_monid_tool` | `provider`, `endpoint` | One Monid schema and its price |
+| `run_monid_tool` | `provider`, `endpoint`, `body`, `query_params`, `path_params` | Runs one Monid tool after the steps of ADR 0016. Result status: `ran`, `waiting_for_user`, `still_running`, `denied` |
 
 Task sessions have no management tools.
 
 ## Coordinator turn input
 
-The hub wakes a coordinator when one of these events happens in its channel: a user message, a task status change to `review`, `needs_input` or `failed`, a decision answer, a routine run, a message from Tutti, a memory suggestion, or the answer to a hub card that the coordinator posted. A memory suggestion comes from a task to its channel coordinator, or from a channel coordinator to the Tutti coordinator. The hub runs one turn at a time for each channel. Events that arrive during a turn go into the next turn.
+The hub wakes a coordinator when one of these events happens in its channel: a user message, a task status change to `review`, `needs_input` (a decision, not an approval) or `failed`, a decision answer, a routine run, a message from Tutti, a memory suggestion, or the answer to a hub card that the coordinator posted. A memory suggestion comes from a task to its channel coordinator, or from a channel coordinator to the Tutti coordinator. The hub runs one turn at a time for each channel. Events that arrive during a turn go into the next turn.
 
 The hub writes the events into the turn text in this form:
 
@@ -583,7 +608,7 @@ In a proactive turn:
 - Messages and decision cards get a `proactive` mark with the kind of the turn, and for a follow-up its reason.
 - `post_message` with `notify` notifies only outside quiet hours, snooze and Pause all, once per turn, and while the hub-wide count of notifying messages today is under the limit (3 by default). Otherwise the message posts without it, and the log entry gets `notify_held`.
 - `start_task` runs in Ask (draft mode), unless the channel's `proactive_tasks` is `channel_default`.
-- The tools that widen access or change settings are `policy_denied`: `connect_service`, `add_skill`, `request_access`, `set_channel_tags`, `set_channel_connector`, `set_channel_skill`, `set_worker_tags`, `set_account_extras`, `update_connection`, `update_skill`, `disconnect`, `remove_skill`, `install_tool`, `add_account`, `start_sign_in`, `create_channel`, `update_channel`, `archive_channel`, `set_default_model`, `update_this_channel` and the routine tools.
+- The tools that widen access or change settings are `policy_denied`: `connect_service`, `add_skill`, `request_access`, `set_channel_tags`, `set_channel_connector`, `set_channel_skill`, `set_worker_tags`, `update_connection`, `update_skill`, `disconnect`, `remove_skill`, `install_tool`, `add_account`, `start_sign_in`, `create_channel`, `update_channel`, `archive_channel`, `set_default_model`, `update_this_channel` and the routine tools.
 - A turn whose only events are `research` may use only the read tools, `memory_write` under `research/`, `ask_decision` with `offer` (at most 3 offers a day), `run_connector_tool` for read tools, and `no_reply_needed`. Every other tool fails with "The research pass is read-only. Make an offer with ask_decision instead."
 
 A stale task is a task in Needs input for 24 hours or in Ready for review for 72 hours. It gets one `stale_task` event per status entry.
@@ -651,10 +676,10 @@ A client that does not know these fields shows the preview, which ends with a no
 | Memory | `memory.list` (with optional `scope`, and `deleted: true` for the notes in Recently deleted, newest deletion first), `memory.read`, `memory.write`, `memory.delete` (the note goes to Recently deleted), `memory.history`, `memory.restore` (with `scope` and `path`: brings a note back from Recently deleted, as it was), `memory.move` (with `scope`, `from_path`, `to_path` and `expected_sha256`: renames a note with its versions; `conflict` when a note that is not deleted has the new path) |
 | Channel files | `files.list`, `files.put` (after a blob upload), `files.move`, `files.delete` |
 | Routines | `routine.create`, `routine.update` (a client may also send `channel_id` to move the routine; a session may not), `routine.delete`, `routine.run_now` (`conflict` while the last run of the routine still runs), `routine.runs` |
-| Workers | `worker.list`, `worker.pairing_code`, `worker.rename`, `worker.set_tags` (with `worker_id` and `tags`), `worker.set_paused`, `worker.revoke`, `worker.refresh_inventory`, `worker.tools_check` (with `worker_id`), `worker.tool_install` (with `worker_id` and `tool`) |
-| Accounts | `account.create` (with `worker_id`, `harness`, `label`, optional `acp`, `env`; the result has `account_id`), `account.update` (with `worker_id`, `account_id`, optional `label`, `env_set`, `env_remove`, `extras_enabled`), `account.remove` and `account.sign_out` (with `worker_id` and `account_id`), `acp_registry.list` (the result has `agents`, each with `id`, `name`, `description`, `version`, `icon_url` and `supported`) |
+| Workers | `worker.list`, `worker.pairing_code`, `worker.rename`, `worker.set_tags` (with `worker_id` and `tags`), `worker.set_policy` (with `worker_id` and optional `max_approval_mode`, `allowed_roots` and `allow_shell`; a missing field keeps its value, and an empty `allowed_roots` means no limit; `worker_offline` when the worker is offline, and the user tries again when it is online), `worker.set_paused`, `worker.revoke`, `worker.refresh_inventory`, `worker.tools_check` (with `worker_id`), `worker.tool_install` (with `worker_id` and `tool`) |
+| Accounts | `account.create` (with `worker_id`, `harness`, `label`, optional `acp`, `env`; the result has `account_id`), `account.update` (with `worker_id`, `account_id`, optional `label`, `env_set`, `env_remove`), `account.remove` and `account.sign_out` (with `worker_id` and `account_id`), `acp_registry.list` (the result has `agents`, each with `id`, `name`, `description`, `version`, `icon_url` and `supported`) |
 | Sign-in | `sign_in.start` (with `worker_id`, `account_id` and `method`; the result has `sign_in`), `sign_in.submit_code` (with `sign_in_id` and `code`), `sign_in.cancel` (with `sign_in_id`) |
-| Preferences | `preferences.set_favorite_model` (with `account_label`, `model` and `favorite`; the result has `preferences`), `preferences.set_account_fallback` (with `enabled`; the result has `preferences`) |
+| Preferences | `preferences.set_favorite_model` (with `account_label`, `model` and `favorite`; the result has `preferences`), `preferences.set_fallback_path` (with `path`: `other_accounts` and `steps`; the result has `preferences`) |
 | Proactivity | `proactivity.get`, `proactivity.set` (with optional `paused`, `quiet_hours` (`start` and `end`, `HH:MM`), `time_zone` (IANA), `time_zone_if_unset` (true: set the zone only when the hub has none; a client sends this at start), `notify_cap_per_day` (0 to 20)), `proactivity.snooze` (with `choice`: `off`, `two_hours`, `until_tomorrow` or `week`). Each result has `settings`. `proactivity.log` (with optional `channel_id`, `kind`, `before` (an entry number) and `limit` (default 100, at most 500); the result has `wakes`, newest first, and `has_more`). `proactivity.cancel_follow_ups` (with optional `channel_id`; the result has `canceled`). `message.rate` (with `message_id` and `rating`: `useful`, `too_noisy` or `null`; only a message with a `proactive` mark; Too noisy wakes the coordinator with a `proactive_feedback` event) |
 | Composio | `composio.set_key` (with `api_key`), `composio.remove_key`, `composio.status`. Each result has `status`: `key_present`, `key_hint` (the last 4 characters), `plan`, `usage` (`used`, `limit`, `resets_at`), `error` and `checked_at`. Never the key. `usage.used` is the number of tool calls that this hub sent to Composio in the current calendar month (UTC), counted from the audit log, and `resets_at` is the start of the next month. `limit` and `plan` stay empty, because Composio gives them only to a dashboard login, not to a project key. `error` is set when Composio refuses the key (a call met `401` or `403`, or the hourly check did), and it says what to do: copy the project key again and add it in Settings > Connectors. `composio.status` checks the key again when the last check is older than 10 minutes |
 | Connector catalog | `connector_catalog.search` (with optional `search`, `category`, `cursor`, `limit`; the result has `services` and `next_cursor`), `connector_catalog.categories`, `connector_catalog.service` (with `service`; the result has `service` and its `tools`) |
@@ -677,7 +702,15 @@ In `channel.update` and `task.update`, a field that is left out does not change.
 
 `channel.create` and `channel.update` take `tags`. `worker.set_tags` replaces the user tags of a worker. The hub trims each tag, drops repeats, and refuses a tag that is not 1 to 32 lowercase letters, digits or `-` with `invalid_tag`. A channel's tags are requirements: a coordinator turn, a task or a routine run of the channel runs only on a worker that has every tag, from its user tags or its inventory tags. This is added to any `require.tags` of a task. `worker.set_labels` and the `labels` fields are gone; a `labels` field in an old body still reads as `tags`.
 
-`preferences.set_account_fallback` allows or stops the move to another account at a usage limit. See "The account of a task" in architecture.md.
+`preferences.set_fallback_path` replaces the whole fallback path, so a reorder, an add and a remove are one request and a retry is safe. `path` has `other_accounts` (the built-in row "Other accounts with the same model") and `steps` (a list of `{account_label, model, options}`). The hub refuses with `invalid` a path with more than 10 steps, a step with an empty or a long (over 200 characters) account label or model, and a step that repeats an account and model. The account and model do not have to exist now. See "The fallback path" in architecture.md.
+
+`channel.go_back` (with `channel_id`; the result has `channel`) sends the assistant of a channel back to its first choice. The hub refuses it with `conflict` while the assistant is not on a fallback, before the reset time of the first choice, and while a turn runs. A turn that runs is never cut. The assistant then goes back by itself when it is idle.
+
+The assistant of a channel that runs on a fallback has `coordinator_fallback` on the channel: `from` and `to` (selections), `cause` (`usage_limit` or `outage`), `returns_at` (left out when the provider gave no time) and `moved_at`. The channel feed entries carry it, so every client shows the marker on the model chip.
+
+When the assistant of a channel cannot answer, the hub posts no message. It sets `coordinator_blocked` on the channel, and the channel feed entry carries it, so every client shows the same status line above the composer. The field is live state: `kind` (`no_placement`, `signed_out` or `start_failed`), `reason` (a full sentence for the user) and `account` (the name of the account, only for `signed_out`, when the assistant waits for a sign-in). The hub sets it only while a message of the user waits for an answer, except for `start_failed`, which also covers a turn that the hub could not start. For `no_placement`, placement must fail for 30 seconds first (`BLOCKED_GRACE`), so the short time after a start of the hub, while the session host connects, shows nothing. The hub clears the field when a turn goes out, and at every start of the hub, because a stored value then belongs to a hub that has stopped. A client shows the line while the field is set and a message of the user has no answer after it (a `start_failed` line needs no waiting message), and it shows Sign in again when `account` is set. The notice kinds `assistant_unavailable` and `assistant_signed_out` of older hubs are no longer posted, and a client does not show old rows of these kinds. The waiting messages are not changed: the hub still sends them as one turn when the assistant can answer.
+
+A move adds a message of the kind `notice` with the JSON body `{"kind", "text", ...}`. The `kind` is `account_fallback` (the work moved), `fallback_returned` (the assistant went back) or `fallback_signed_out` (a move skipped an account that is signed out). `text` is a full sentence for a client that reads no other field. The other fields are optional: `scope` (`assistant` or `task`), `cause`, `from` and `to` (`{account_label, model, model_name?}`), `provider` (set when the work goes to another harness, such as `OpenAI`), `returns_at`, `lines` and, for `fallback_signed_out`, `account_label`. A line is `{place, step?, account_label, model, model_name?, effort?, outcome, cause?, reason?, until?, provider?}`. `place` is `first`, `other_account` or `step`. `outcome` is `failed`, `skipped` or `chosen`. `reason` is `limited`, `signed_out`, `unavailable` or `mode`. A client that does not know a field ignores it.
 
 `preferences.set_favorite_model` adds a star to a model when `favorite` is true, and takes it away when it is false. The hub trims the account label and the model. It refuses an empty account label, a field of more than 200 characters, and a new favorite when the list has 200, with `invalid`. The account and the model do not have to exist now. A request that changes nothing writes nothing. A change sends a feed upsert of the `preferences` entity with the whole record, so every client updates. A client sets one favorite for each request, not the whole list, so two clients that star at the same time do not undo each other.
 

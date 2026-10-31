@@ -492,6 +492,8 @@ pub struct ItemDetailView {
     /// from 1, and how many there are. 0 until the items load.
     pub index: usize,
     pub total: usize,
+    /// What the command check said, for a command that it looked at.
+    pub check: Option<crate::command_check::CheckDetailView>,
     pub state: ItemDetailState,
 }
 

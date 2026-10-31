@@ -21,7 +21,7 @@ use consort_proto::ids::{AccountId, SignInId, WorkerId};
 use consort_proto::model::{
     AcpAccountSpec, SecretEnv, SignIn, SignInMethod, SignInState, ToolId, WorkerState,
 };
-use consort_proto::worker_link::{HubToWorker, SignInUpdate};
+use consort_proto::session_host_link::{HubToSessionHost, SignInUpdate};
 use serde_json::json;
 
 // Capturing the logs --------------------------------------------------------
@@ -79,7 +79,7 @@ async fn ask<R: Request>(
     world: &mut World,
     body: R,
     answer: Result<(), ErrorBody>,
-) -> (Result<R::Response, ErrorBody>, HubToWorker) {
+) -> (Result<R::Response, ErrorBody>, HubToSessionHost) {
     let World { client, worker, .. } = world;
     tokio::join!(client.request(body), async {
         let (request, command) = worker.next_command().await;
@@ -148,7 +148,7 @@ async fn account_create_sends_the_command_with_an_id_that_the_hub_chose() {
         env: env(&[("GOOSE_KEY", "value-1")]),
     };
     let (result, command) = ask(&mut world, request, Ok(())).await;
-    let HubToWorker::AccountCreate(command) = command else {
+    let HubToSessionHost::AccountCreate(command) = command else {
         panic!("expected account.create, got {command:?}");
     };
     assert_eq!(result.unwrap().account_id, command.account_id);
@@ -206,11 +206,10 @@ async fn account_update_remove_and_sign_out_reach_the_worker() {
         label: Some("Renamed".to_owned()),
         env_set: env(&[("KEY", "new-value")]),
         env_remove: vec!["OLD".to_owned()],
-        extras_enabled: None,
     };
     let (result, command) = ask(&mut world, update, Ok(())).await;
     result.unwrap();
-    let HubToWorker::AccountUpdate(command) = command else {
+    let HubToSessionHost::AccountUpdate(command) = command else {
         panic!("expected account.update, got {command:?}");
     };
     assert_eq!(command.account_id, account_id);
@@ -229,7 +228,7 @@ async fn account_update_remove_and_sign_out_reach_the_worker() {
     .await;
     result.unwrap();
     assert!(
-        matches!(command, HubToWorker::AccountSignOut(c) if c.account_id == account_id),
+        matches!(command, HubToSessionHost::AccountSignOut(c) if c.account_id == account_id),
         "wrong command"
     );
 
@@ -244,7 +243,7 @@ async fn account_update_remove_and_sign_out_reach_the_worker() {
     .await;
     result.unwrap();
     assert!(
-        matches!(command, HubToWorker::AccountRemove(c) if c.account_id == account_id),
+        matches!(command, HubToSessionHost::AccountRemove(c) if c.account_id == account_id),
         "wrong command"
     );
 
@@ -255,7 +254,6 @@ async fn account_update_remove_and_sign_out_reach_the_worker() {
         label: None,
         env_set: SecretEnv::new(),
         env_remove: Vec::new(),
-        extras_enabled: None,
     };
     let error = world.client.request(nothing).await.unwrap_err();
     assert_eq!(error.code, ErrorCode::Invalid);
@@ -268,7 +266,7 @@ async fn tool_requests_reach_the_worker() {
     let worker_id = world.worker.worker_id;
     let (result, command) = ask(&mut world, WorkerToolsCheck { worker_id }, Ok(())).await;
     result.unwrap();
-    assert!(matches!(command, HubToWorker::ToolsCheck(_)));
+    assert!(matches!(command, HubToSessionHost::ToolsCheck(_)));
 
     let install = WorkerToolInstall {
         worker_id,
@@ -276,7 +274,9 @@ async fn tool_requests_reach_the_worker() {
     };
     let (result, command) = ask(&mut world, install, Ok(())).await;
     result.unwrap();
-    assert!(matches!(command, HubToWorker::ToolsInstall(c) if c.tool == ToolId::claude_code()));
+    assert!(
+        matches!(command, HubToSessionHost::ToolsInstall(c) if c.tool == ToolId::claude_code())
+    );
 
     let unknown = WorkerToolInstall {
         worker_id,
@@ -426,7 +426,7 @@ async fn secret_values_stay_out_of_the_database_the_feed_the_logs_and_errors() {
     .await;
     let created = result.unwrap().account_id;
     // The value reaches the worker. That is the point of the request.
-    let HubToWorker::AccountCreate(command) = command else {
+    let HubToSessionHost::AccountCreate(command) = command else {
         panic!("expected account.create");
     };
     assert_eq!(command.env.get("ANTHROPIC_API_KEY"), Some(created_secret));
@@ -437,11 +437,10 @@ async fn secret_values_stay_out_of_the_database_the_feed_the_logs_and_errors() {
         label: None,
         env_set: env(&[("ANTHROPIC_API_KEY", updated_secret)]),
         env_remove: Vec::new(),
-        extras_enabled: None,
     };
     let (result, command) = ask(&mut world, update, Ok(())).await;
     result.unwrap();
-    let HubToWorker::AccountUpdate(command) = command else {
+    let HubToSessionHost::AccountUpdate(command) = command else {
         panic!("expected account.update");
     };
     assert_eq!(
@@ -505,7 +504,7 @@ async fn start_sign_in(world: &mut World, method: SignInMethod) -> SignIn {
     };
     let (result, command) = ask(world, request, Ok(())).await;
     let sign_in = result.unwrap().sign_in;
-    let HubToWorker::SignInStart(command) = command else {
+    let HubToSessionHost::SignInStart(command) = command else {
         panic!("expected sign_in.start, got {command:?}");
     };
     assert_eq!(command.sign_in_id, sign_in.id);
@@ -675,7 +674,7 @@ async fn submit_code_forwards_the_code_and_never_stores_or_logs_it() {
     };
     let (result, command) = ask(&mut world, request, Ok(())).await;
     result.unwrap();
-    let HubToWorker::SignInCode(command) = command else {
+    let HubToSessionHost::SignInCode(command) = command else {
         panic!("expected sign_in.code, got {command:?}");
     };
     assert_eq!(command.sign_in_id, sign_in.id);
@@ -712,7 +711,7 @@ async fn cancel_forwards_to_the_worker_and_sets_cancelled() {
     )
     .await;
     result.unwrap();
-    assert!(matches!(command, HubToWorker::SignInCancel(c) if c.sign_in_id == sign_in.id));
+    assert!(matches!(command, HubToSessionHost::SignInCancel(c) if c.sign_in_id == sign_in.id));
     world
         .client
         .wait_feed(sign_in_entry(sign_in.id, |s| *s == SignInState::Cancelled))
@@ -812,6 +811,7 @@ async fn a_client_that_lists_workers_still_works_after_account_requests() {
     let (result, _) = ask(&mut world, WorkerToolsCheck { worker_id }, Ok(())).await;
     result.unwrap();
     let list = world.client.request(WorkerList {}).await.unwrap();
-    assert_eq!(list.workers.len(), 1);
+    // The session host and the execution worker of the fake.
+    assert_eq!(list.workers.len(), 2);
     world.hub.handle.shutdown().await.unwrap();
 }

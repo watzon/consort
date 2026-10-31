@@ -8,12 +8,15 @@
 //! empty. Unknown fields are ignored, so an older peer can read a newer
 //! entity.
 
+mod access;
 mod account;
 mod common;
 mod connector;
 mod conversation;
+mod fallback;
 mod knowledge;
 mod machine;
+mod monid;
 mod preferences;
 mod proactivity;
 mod routine;
@@ -25,6 +28,10 @@ mod voice;
 mod waiting;
 mod work;
 
+pub use access::{
+    ACCESS_CARD_ALWAYS, ACCESS_CARD_TEMPORARY, AccessDuration, AccessGrant, AccessRequestCard,
+    AccessTarget, TEMPORARY_ACCESS_MS,
+};
 pub(crate) use account::Redacted;
 pub use account::{
     AcpAccountSpec, AcpRegistryAgent, SIGN_IN_IDLE_EXPIRY_MS, SIGN_IN_IN_SETTINGS,
@@ -43,8 +50,13 @@ pub use connector::{
     unique_connection_handle, validate_connection_name,
 };
 pub use conversation::{
-    Author, Channel, ChannelKind, ChannelRepo, Group, Message, MessageKind, Reaction, ReadMarker,
-    Repo, TurnErrorKind,
+    Author, Channel, ChannelKind, ChannelRepo, CoordinatorBlocked, CoordinatorBlockedKind, Group,
+    Message, MessageKind, Reaction, ReadMarker, Repo, TurnErrorKind,
+};
+pub use fallback::{
+    CoordinatorFallback, FALLBACK_FIELD_MAX_CHARS, FALLBACK_STEPS_MAX, FallbackCause,
+    FallbackModel, FallbackNotice, FallbackPath, FallbackScope, OUTAGE_TRIES, PathLine,
+    PathOutcome, PathPlace, SkipReason, harness_company,
 };
 pub use knowledge::{
     ARTIFACTS_DIR, ChannelFile, ExpectedHash, FileRef, MEMORY_DELETED_KEEP_DAYS,
@@ -52,14 +64,21 @@ pub use knowledge::{
     ScopeParseError, artifact_path, memory_note_entity_id, validate_memory_path,
 };
 pub use machine::{
-    AuthState, Capabilities, Checkout, CheckoutInfo, Client, ClientKind, ExtrasGroup,
-    HarnessAccount, Inventory, LocalMcpServerInfo, ModelInfo, OptionChoice, OptionDescriptor,
-    PROVIDER_EXTRAS_NAMES_MAX, PairedBy, ProviderExtras, PushProvider, PushRegistration, Worker,
-    WorkerLoad, WorkerPolicy, WorkerState,
+    AuthState, BoundaryInfo, Capabilities, Checkout, CheckoutInfo, Client, ClientKind,
+    HarnessAccount, Inventory, LocalMcpServerInfo, MachineKind, ModelInfo, OptionChoice,
+    OptionDescriptor, PairedBy, PushProvider, PushRegistration, Worker, WorkerLoad, WorkerPolicy,
+    WorkerState,
+};
+pub use monid::{
+    MONID_CALL_NOTICE, MONID_CARD_ALLOW_TASK, MONID_CARD_ALWAYS, MONID_CARD_NEVER,
+    MonidAllowedTool, MonidCall, MonidCallNotice, MonidCallState, MonidCard, MonidChannelAccess,
+    MonidChannelSpend, MonidLimitNote, MonidLimits, MonidSettings, MonidStatus, MonidToolRef,
+    MonidUnattended,
 };
 pub use preferences::{
-    FAVORITE_FIELD_MAX_CHARS, FAVORITE_MODELS_MAX, FavoriteModel, PREFERENCES_ENTITY_ID,
-    Preferences,
+    ApiEndpoint, CommandCheckEndpoint, CommandCheckKind, CommandCheckSetting,
+    DEFAULT_CONFIDENCE_LIMIT, FAVORITE_FIELD_MAX_CHARS, FAVORITE_MODELS_MAX, FavoriteModel,
+    PREFERENCES_ENTITY_ID, Preferences,
 };
 pub use proactivity::{
     BRIEF_RESEARCH_MIN_GAP_SECONDS, CHECK_IN_BACKOFF_MAX_SECONDS, CHECK_IN_CHANNEL_SECONDS,
@@ -79,10 +98,11 @@ pub use routine::{
     RoutineRunStatus, RoutineSchedule,
 };
 pub use session::{
-    AssistantMessagePayload, COMMAND_OUTPUT_TAIL_BYTES, CommandPayload, ErrorPayload, FileChange,
-    FileChangeKind, FileChangePayload, ItemKind, ItemPayload, ItemStatus, PlanPayload, PlanStep,
-    PlanStepStatus, ReasoningPayload, Session, SessionItem, SessionRole, SessionState,
-    SubagentPayload, ToolCallPayload, Usage, WebSearchPayload, tail_of,
+    AssistantMessagePayload, COMMAND_OUTPUT_TAIL_BYTES, CommandCheckOutcome, CommandCheckRule,
+    CommandCheckVerdict, CommandPayload, ErrorPayload, FileChange, FileChangeKind,
+    FileChangePayload, ItemKind, ItemPayload, ItemStatus, PlanPayload, PlanStep, PlanStepStatus,
+    ReasoningPayload, Session, SessionItem, SessionRole, SessionState, SubagentPayload,
+    ToolCallPayload, Usage, WebSearchPayload, tail_of,
 };
 pub use skill::{
     AuditStatus, SKILL_DESCRIPTION_MAX_CHARS, SKILL_MANIFEST_FILE, SKILL_MAX_FILE_BYTES,

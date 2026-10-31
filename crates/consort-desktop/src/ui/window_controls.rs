@@ -141,6 +141,7 @@ pub fn title_bar(t: &Tokens, window: &Window) -> Option<AnyElement> {
                 div()
                     .flex()
                     .flex_1()
+                    .min_w_0()
                     .h_full()
                     .items_center()
                     .gap(t.space.sm)

@@ -30,19 +30,21 @@ use crate::ids::{
 };
 use crate::model::{
     AcpAccountSpec, AcpRegistryAgent, Approval, ApprovalMode, BlobRef, Channel, ChannelFile,
-    Client, Connection, Decision, DecisionAnswer, ExpectedHash, FavoriteModel, Group, Isolation,
-    MemoryNote, MemoryScope, Message, ModelSelection, PREFERENCES_ENTITY_ID, PROACTIVITY_ENTITY_ID,
-    PlacementRequest, Preferences, ProactiveTasks, ProactiveWake, ProactivityLevel,
-    ProactivitySettings, PushProvider, ReadMarker, Repo, Routine, RoutineAction, RoutineRun,
-    RoutineSchedule, SecretEnv, SessionItem, Sha256Hash, SignIn, SignInMethod, Skill, Task, ToolId,
-    VOICE_ENTITY_ID, VoiceSettings, Worker, memory_note_entity_id,
+    Client, CommandCheckSetting, Connection, Decision, DecisionAnswer, ExpectedHash, FallbackPath,
+    FavoriteModel, Group, Isolation, MemoryNote, MemoryScope, Message, ModelSelection,
+    PREFERENCES_ENTITY_ID, PROACTIVITY_ENTITY_ID, PlacementRequest, Preferences, ProactiveTasks,
+    ProactiveWake, ProactivityLevel, ProactivitySettings, PushProvider, ReadMarker, Repo, Routine,
+    RoutineAction, RoutineRun, RoutineSchedule, SecretEnv, SessionItem, Sha256Hash, SignIn,
+    SignInMethod, Skill, Task, ToolId, VOICE_ENTITY_ID, VoiceSettings, Worker,
+    memory_note_entity_id,
 };
+use crate::session_host_link::ItemDetailResult;
 use crate::time::Timestamp;
 use crate::tools::{FilesListResult, MemoryListResult, RoutineResult, SearchResult};
-use crate::worker_link::ItemDetailResult;
 
 mod connectors;
 mod hub_admin;
+mod monid;
 mod proactivity;
 mod skills;
 mod voice;
@@ -61,6 +63,12 @@ pub use hub_admin::{
     BackupInfo, BackupProgress, BackupRecord, BackupSchedule, BackupSettings, BackupTrigger,
     HubBackup, HubBackupResult, HubBackupSettings, HubBackupSettingsResult, HubInfo, HubStatus,
     HubStatusResult, HubStorage, Weekday, parse_time,
+};
+pub use monid::{
+    ChannelEndAccess, ChannelSetMonid, MONID_CALLS_PAGE_MAX, MonidCallGet, MonidCallList,
+    MonidCallListResult, MonidCallResult, MonidCallStop, MonidCatalogSearch,
+    MonidCatalogSearchResult, MonidCatalogTool, MonidGetStatus, MonidRemoveKey, MonidSetKey,
+    MonidStatusResult, MonidUpdateSettings,
 };
 pub use proactivity::{
     MessageRate, PROACTIVITY_LOG_PAGE_MAX, ProactivityCancelFollowUps,
@@ -777,6 +785,17 @@ fn default_true() -> bool {
     true
 }
 
+/// `channel.go_back`: "Go back to <model>" in the model chip. The assistant
+/// of the channel goes back to its first choice. The hub refuses it while the
+/// assistant is not on a fallback, or before the limit of the first choice
+/// has reset. A turn that runs is not cut: the assistant goes back when the
+/// turn ends. The result is the channel.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelGoBack {
+    /// The channel.
+    pub channel_id: ChannelId,
+}
+
 /// `channel.delete`. The Tutti channel cannot be deleted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChannelDelete {
@@ -1389,6 +1408,14 @@ pub struct RoutineUpdate {
     /// Turn it on or off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
+    /// What this routine may do with Monid. Absent leaves it. Null uses the
+    /// hub's setting. Only a user sets this: the routine tools do not.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "patch::deserialize"
+    )]
+    pub monid: Option<Option<crate::model::MonidUnattended>>,
 }
 
 /// `routine.delete`.
@@ -1467,6 +1494,24 @@ pub struct WorkerSetTags {
     /// The user tags.
     #[serde(alias = "labels")]
     pub tags: Vec<String>,
+}
+
+/// `worker.set_policy`: change the limits of a worker from the app. A missing
+/// field keeps its value. An empty `allowed_roots` means no limit. The worker
+/// must be online, and it applies the change at once.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerSetPolicy {
+    /// The worker.
+    pub worker_id: WorkerId,
+    /// The highest approval mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_approval_mode: Option<ApprovalMode>,
+    /// The folders that tasks may use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_roots: Option<Vec<String>>,
+    /// Whether tasks may run shell commands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_shell: Option<bool>,
 }
 
 /// `worker.set_paused`: **Pause** or resume a worker. Placement skips a
@@ -1566,9 +1611,6 @@ pub struct AccountUpdate {
     /// Secret variables to remove, by name.
     #[serde(default)]
     pub env_remove: Vec<String>,
-    /// Turn the provider extras of the account on or off.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub extras_enabled: Option<bool>,
 }
 
 /// `account.remove`: the worker signs out where it can and deletes the
@@ -1698,6 +1740,63 @@ pub struct ClientPushRegister {
     pub token: String,
 }
 
+/// `preferences.set_command_check`: the source of the command check.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreferencesSetCommandCheck {
+    /// The new setting.
+    pub setting: CommandCheckSetting,
+}
+
+/// `endpoint.save`: adds an API endpoint, or changes one. With no key, an
+/// existing endpoint keeps its key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EndpointSave {
+    /// The endpoint to change, or `None` for a new one.
+    pub id: Option<String>,
+    /// The name.
+    pub name: String,
+    /// The base URL.
+    pub base_url: String,
+    /// The API key.
+    pub api_key: Option<String>,
+}
+
+/// `endpoint.remove`: removes an API endpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EndpointRemove {
+    /// The endpoint.
+    pub id: String,
+}
+
+/// `endpoint.test`: tries an endpoint. With no key, the hub uses the stored
+/// key of `id`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EndpointTest {
+    /// The stored endpoint, when there is one.
+    pub id: Option<String>,
+    /// The base URL.
+    pub base_url: String,
+    /// The API key.
+    pub api_key: Option<String>,
+}
+
+/// `command_check.test`: runs the check with the saved source on one command
+/// that it must allow and one that it must block.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommandCheckTest {}
+
+/// The result of a test.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TestResult {
+    /// Whether the test passed.
+    pub ok: bool,
+    /// One line for the user.
+    pub message: String,
+    /// More text to copy, when it failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<String>,
+}
+
 /// `preferences.set_favorite_model`: star a model in the model picker, or
 /// take the star away. Adding a favorite that is there already, or removing
 /// one that is not, changes nothing, so a retry is safe.
@@ -1710,13 +1809,15 @@ pub struct PreferencesSetFavoriteModel {
     pub favorite: bool,
 }
 
-/// `preferences.set_account_fallback`: allow work to move to another account
-/// when its account reaches a usage limit, or stop it.
+/// `preferences.set_fallback_path`: replace the fallback path. The request
+/// holds the whole path, so a reorder, an add and a remove are one request
+/// and a retry is safe. The hub refuses a path that does not pass
+/// [`FallbackPath::validate`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct PreferencesSetAccountFallback {
-    /// True to allow the move.
-    pub enabled: bool,
+pub struct PreferencesSetFallbackPath {
+    /// The new path.
+    pub path: FallbackPath,
 }
 
 /// The preferences after a change.
@@ -1741,6 +1842,8 @@ message_family! {
         ChannelUpdate("channel.update", ChannelUpdate => ChannelResult),
         /// Archive or unarchive a channel.
         ChannelArchive("channel.archive", ChannelArchive => ChannelResult),
+        /// Send the assistant back to its first choice after a fallback.
+        ChannelGoBack("channel.go_back", ChannelGoBack => ChannelResult),
         /// Delete a channel.
         ChannelDelete("channel.delete", ChannelDelete => Empty),
         /// Move a channel.
@@ -1837,6 +1940,7 @@ message_family! {
         WorkerRename("worker.rename", WorkerRename => WorkerResult),
         /// Set a worker's user tags.
         WorkerSetTags("worker.set_tags", WorkerSetTags => WorkerResult),
+        WorkerSetPolicy("worker.set_policy", WorkerSetPolicy => WorkerResult),
         /// Pause or resume a worker.
         WorkerSetPaused("worker.set_paused", WorkerSetPaused => WorkerResult),
         /// Remove a worker.
@@ -1907,8 +2011,18 @@ message_family! {
         DraftEdit("draft.edit", DraftEdit => MessageResult),
         /// Star a model, or take the star away.
         PreferencesSetFavoriteModel("preferences.set_favorite_model", PreferencesSetFavoriteModel => PreferencesResult),
-        /// Allow the move to another account at a usage limit, or stop it.
-        PreferencesSetAccountFallback("preferences.set_account_fallback", PreferencesSetAccountFallback => PreferencesResult),
+        /// Set the source of the command check.
+        PreferencesSetCommandCheck("preferences.set_command_check", PreferencesSetCommandCheck => PreferencesResult),
+        /// Add or change an API endpoint.
+        EndpointSave("endpoint.save", EndpointSave => PreferencesResult),
+        /// Remove an API endpoint.
+        EndpointRemove("endpoint.remove", EndpointRemove => PreferencesResult),
+        /// Try an API endpoint.
+        EndpointTest("endpoint.test", EndpointTest => TestResult),
+        /// Try the command check.
+        CommandCheckTest("command_check.test", CommandCheckTest => TestResult),
+        /// Replace the fallback path.
+        PreferencesSetFallbackPath("preferences.set_fallback_path", PreferencesSetFallbackPath => PreferencesResult),
         /// Get a bearer token for the blob endpoints.
         AuthHttpToken("auth.http_token", AuthHttpToken => HttpToken),
         /// Store the Composio key on the hub.
@@ -1917,6 +2031,26 @@ message_family! {
         ComposioRemoveKey("composio.remove_key", ComposioRemoveKey => ComposioStatusResult),
         /// The Composio settings, without the key.
         ComposioGetStatus("composio.status", ComposioGetStatus => ComposioStatusResult),
+        /// Store the Monid key on the hub.
+        MonidSetKey("monid.set_key", MonidSetKey => MonidStatusResult),
+        /// Delete the Monid key.
+        MonidRemoveKey("monid.remove_key", MonidRemoveKey => MonidStatusResult),
+        /// The Monid settings, balance and spend, without the key.
+        MonidGetStatus("monid.status", MonidGetStatus => MonidStatusResult),
+        /// Change the Monid settings.
+        MonidUpdateSettings("monid.update_settings", MonidUpdateSettings => MonidStatusResult),
+        /// Search Monid's tools, to add one to a channel's list.
+        MonidCatalogSearch("monid.search", MonidCatalogSearch => MonidCatalogSearchResult),
+        /// One Monid call with its full input and output.
+        MonidCallGet("monid.call", MonidCallGet => MonidCallResult),
+        /// The recent Monid calls of a channel.
+        MonidCallList("monid.calls", MonidCallList => MonidCallListResult),
+        /// Ask Monid to stop a run.
+        MonidCallStop("monid.stop", MonidCallStop => MonidCallResult),
+        /// Change what a channel may do with Monid.
+        ChannelSetMonid("channel.set_monid", ChannelSetMonid => ChannelResult),
+        /// End temporary access in a channel.
+        ChannelEndAccess("channel.end_access", ChannelEndAccess => ChannelResult),
         /// Search the connector catalog.
         ConnectorCatalogSearch("connector_catalog.search", ConnectorCatalogSearch => ConnectorCatalogSearchResult),
         /// The categories of the connector catalog.
@@ -2220,6 +2354,8 @@ mod tests {
             review_summary: Some("PR #62 is up.".into()),
             resolved_at: None,
             session_ended: false,
+            monid_calls: 0,
+            monid_cost_micros: 0,
             archived_at: None,
             created_at: Timestamp::from_millis(1),
             updated_at: Timestamp::from_millis(2),
@@ -2458,6 +2594,25 @@ mod tests {
         let sgn: SignInId = "sgn_00000000-0000-0000-0000-00000000000a".parse().unwrap();
         let hash: Sha256Hash = "a".repeat(64).parse().unwrap();
         vec![
+            PreferencesSetCommandCheck {
+                setting: CommandCheckSetting::default(),
+            }
+            .into(),
+            EndpointSave {
+                id: None,
+                name: "OpenRouter".into(),
+                base_url: "https://openrouter.ai/api".into(),
+                api_key: Some("key".into()),
+            }
+            .into(),
+            EndpointRemove { id: "end_1".into() }.into(),
+            EndpointTest {
+                id: Some("end_1".into()),
+                base_url: "https://openrouter.ai/api".into(),
+                api_key: None,
+            }
+            .into(),
+            CommandCheckTest {}.into(),
             ClientHello {
                 client_id: "cli_00000000-0000-0000-0000-000000000008".parse().unwrap(),
                 version: "0.1.0".into(),
@@ -2716,6 +2871,7 @@ mod tests {
                 prompt: None,
                 action: None,
                 enabled: Some(false),
+                monid: None,
             }
             .into(),
             RoutineDelete { routine_id: rtn }.into(),
@@ -2735,6 +2891,13 @@ mod tests {
             WorkerSetTags {
                 worker_id: wrk,
                 tags: vec!["gpu".into()],
+            }
+            .into(),
+            WorkerSetPolicy {
+                worker_id: wrk,
+                max_approval_mode: Some(ApprovalMode::Auto),
+                allowed_roots: Some(vec!["/code".into()]),
+                allow_shell: Some(false),
             }
             .into(),
             WorkerSetPaused {
@@ -2764,7 +2927,6 @@ mod tests {
                 label: Some("Claude Work".into()),
                 env_set: [("ANTHROPIC_API_KEY", "sk")].into_iter().collect(),
                 env_remove: vec!["OLD".into()],
-                extras_enabled: Some(false),
             }
             .into(),
             AccountRemove {
@@ -2874,7 +3036,18 @@ mod tests {
                 rating: Some(crate::model::ProactiveRating::TooNoisy),
             }
             .into(),
-            PreferencesSetAccountFallback { enabled: false }.into(),
+            PreferencesSetFallbackPath {
+                path: FallbackPath {
+                    other_accounts: false,
+                    steps: vec![ModelSelection {
+                        account_label: "Codex Work".into(),
+                        model: "gpt-5.5".into(),
+                        options: Default::default(),
+                    }],
+                },
+            }
+            .into(),
+            ChannelGoBack { channel_id: chn() }.into(),
             PreferencesSetFavoriteModel {
                 model: FavoriteModel {
                     account_label: "Claude Personal".into(),
@@ -2934,6 +3107,44 @@ mod tests {
                 connection_id: con(),
                 before: Some(ConnectorCallId::new()),
                 limit: Some(20),
+            }
+            .into(),
+            MonidSetKey {
+                api_key: "monid_live_secret".to_owned(),
+                settings: Some(crate::model::MonidSettings::default()),
+            }
+            .into(),
+            MonidRemoveKey {}.into(),
+            MonidGetStatus {}.into(),
+            MonidUpdateSettings {
+                settings: crate::model::MonidSettings::default(),
+            }
+            .into(),
+            MonidCatalogSearch {
+                query: "images".to_owned(),
+            }
+            .into(),
+            MonidCallGet {
+                id: crate::ids::MonidCallId::new(),
+            }
+            .into(),
+            MonidCallList {
+                channel_id: chn(),
+                limit: Some(10),
+            }
+            .into(),
+            MonidCallStop {
+                id: crate::ids::MonidCallId::new(),
+            }
+            .into(),
+            ChannelSetMonid {
+                channel_id: chn(),
+                access: crate::model::MonidChannelAccess::default(),
+            }
+            .into(),
+            ChannelEndAccess {
+                channel_id: chn(),
+                grant_id: crate::ids::AccessGrantId::new(),
             }
             .into(),
             ChannelSetConnectionEnabled {
@@ -3225,13 +3436,15 @@ mod tests {
         .unwrap();
         assert_eq!(git["ref"], "v1");
         assert_eq!(git["kind"], "git");
-        // `account.update` from an older client leaves the extras alone.
+        // `account.update` from an older client still has `extras_enabled`.
+        // The field is gone, and the request still loads.
         let old: AccountUpdate = serde_json::from_value(json!({
             "worker_id": "wrk_00000000-0000-0000-0000-000000000006",
-            "account_id": "acc_00000000-0000-0000-0000-000000000009"
+            "account_id": "acc_00000000-0000-0000-0000-000000000009",
+            "extras_enabled": true
         }))
         .unwrap();
-        assert_eq!(old.extras_enabled, None);
+        assert_eq!(old.label, None);
         assert!(
             serde_json::to_value(&old)
                 .unwrap()
@@ -3356,6 +3569,7 @@ mod tests {
             "worker.pairing_code",
             "worker.rename",
             "worker.set_tags",
+            "worker.set_policy",
             "worker.revoke",
             "worker.refresh_inventory",
             "worker.tools_check",
@@ -3391,7 +3605,8 @@ mod tests {
             "draft.edit",
             "auth.http_token",
             "preferences.set_favorite_model",
-            "preferences.set_account_fallback",
+            "preferences.set_fallback_path",
+            "channel.go_back",
             "composio.set_key",
             "composio.remove_key",
             "composio.status",
@@ -3404,6 +3619,16 @@ mod tests {
             "connection.reconnect",
             "connection.calls",
             "channel.set_connection_enabled",
+            "monid.set_key",
+            "monid.remove_key",
+            "monid.status",
+            "monid.update_settings",
+            "monid.search",
+            "monid.call",
+            "monid.calls",
+            "monid.stop",
+            "channel.set_monid",
+            "channel.end_access",
             "channel.set_skill_enabled",
             "skill_directory.search",
             "skill_directory.sources",
@@ -3471,6 +3696,10 @@ mod tests {
             created_at: Timestamp::from_millis(0),
             updated_at: Timestamp::from_millis(0),
             proactive_tasks: Default::default(),
+            coordinator_fallback: None,
+            coordinator_blocked: None,
+            monid: Default::default(),
+            access_grants: Vec::new(),
             proactivity: None,
         };
         let entry = FeedEntry::upsert(
@@ -3512,6 +3741,10 @@ mod tests {
             created_at: Timestamp::from_millis(0),
             updated_at: Timestamp::from_millis(0),
             proactive_tasks: Default::default(),
+            coordinator_fallback: None,
+            coordinator_blocked: None,
+            monid: Default::default(),
+            access_grants: Vec::new(),
             proactivity: None,
         })
         .unwrap();
@@ -3569,7 +3802,6 @@ mod tests {
                 .into_iter()
                 .collect(),
             env_remove: vec![],
-            extras_enabled: None,
         };
         let code = SignInSubmitCode {
             sign_in_id: SignInId::new(),
@@ -3722,7 +3954,9 @@ mod tests {
             request
         );
         let preferences = Preferences {
-            account_fallback: true,
+            command_check: Default::default(),
+            endpoints: Vec::new(),
+            fallback_path: FallbackPath::default(),
             favorite_models: vec![favorite],
         };
         let result = PreferencesResult {

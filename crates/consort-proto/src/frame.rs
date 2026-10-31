@@ -10,7 +10,7 @@
 //! [`Frame`] is the untyped envelope. Typed bodies implement [`Message`], and
 //! the ones that expect a response implement [`Request`]. Each link has
 //! enums of its messages ([`crate::client_api::ClientRequest`],
-//! [`crate::worker_link::WorkerToHub`], [`crate::worker_link::HubToWorker`])
+//! [`crate::session_host_link::SessionHostToHub`], [`crate::session_host_link::HubToSessionHost`])
 //! that implement [`MessageFamily`], so a receiver can decode any frame of
 //! that link with [`RequestFrame::decode`] or [`EventFrame::decode`].
 //!

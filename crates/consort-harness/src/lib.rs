@@ -20,8 +20,9 @@ pub mod account;
 pub mod acp;
 pub mod approval;
 pub mod attachments;
+pub mod boundary;
 pub mod codex;
-pub mod extras;
+pub mod egress;
 mod items;
 pub mod process;
 pub mod record;
@@ -42,7 +43,7 @@ pub use consort_proto::model::SignInMethod;
 pub use consort_proto::model::{
     ApprovalMode, AuthState, Capabilities, ModelInfo, ModelOptions, TurnErrorKind,
 };
-pub use consort_proto::worker_link::{RequestAnswer as Answer, SessionEvent, TurnInput};
+pub use consort_proto::session_host_link::{RequestAnswer as Answer, SessionEvent, TurnInput};
 pub use consort_tools::ToolId;
 pub use items::ItemTracker;
 
@@ -50,7 +51,7 @@ pub use items::ItemTracker;
 pub const EVENT_CHANNEL_CAPACITY: usize = 1024;
 
 /// The kind of harness behind an account. The `harness` field of an account
-/// in `worker.toml` and in the inventory uses the serialized names.
+/// in `session-host.toml` and in the inventory uses the serialized names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum HarnessKind {
     /// Claude Code through `claude-agent-acp`.
@@ -241,10 +242,6 @@ pub struct SessionSpec {
     pub mcp_servers: Vec<McpServerSpec>,
     /// Extra environment variables for the harness process.
     pub env: BTreeMap<String, String>,
-    /// Whether the account's provider extras are on (see [`extras`]). Off
-    /// means that the adapter starts the harness without the extras that
-    /// the provider syncs to the account, where the harness allows that.
-    pub extras_enabled: bool,
     /// The skills that the worker wrote for this session, laid out for this
     /// harness (see [`skills::write_session_skills`]). `None` when the
     /// session has none, or when the harness has no native skills.
@@ -309,6 +306,17 @@ pub fn steer_ready(result: Result<(), HarnessError>) -> SteerFuture {
     Box::pin(std::future::ready(result))
 }
 
+/// One question to a model, with no tools and no session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OneShot {
+    /// The model ID.
+    pub model: String,
+    /// The system text.
+    pub system: String,
+    /// The user text.
+    pub prompt: String,
+}
+
 /// One kind of harness.
 #[async_trait]
 pub trait Harness: Send + Sync {
@@ -318,6 +326,13 @@ pub trait Harness: Send + Sync {
     /// The capabilities of sessions for this account, without starting the
     /// harness.
     fn capabilities(&self, account: &AccountConfig) -> Capabilities;
+
+    /// How sessions of this account stay inside the hub boundary. A harness
+    /// is off until tests prove its generated configuration.
+    fn boundary_support(&self, account: &AccountConfig) -> boundary::BoundarySupport {
+        let _ = account;
+        boundary::BoundarySupport::Off(boundary::turned_off_reason(self.kind().display_name()))
+    }
 
     /// The managed tool that runs this account, or `None` when the adapter
     /// needs none. The worker installs it and puts its launch in
@@ -330,6 +345,20 @@ pub trait Harness: Send + Sync {
     /// Installed version, sign-in state, models with option descriptors,
     /// capabilities. A probe never reads credential files.
     async fn probe(&self, account: &AccountConfig) -> AccountStatus;
+
+    /// Runs the model once with no tools, inside the boundary. The command
+    /// check uses it. `folder` is an empty folder for this run.
+    async fn one_shot(
+        &self,
+        account: &AccountConfig,
+        folder: &std::path::Path,
+        request: OneShot,
+    ) -> Result<String, HarnessError> {
+        let _ = (account, folder, request);
+        Err(HarnessError::Unsupported(
+            "run one question with this harness",
+        ))
+    }
 
     /// Starts a new session, or resumes one when `spec.resume` is set.
     async fn open(
@@ -503,12 +532,51 @@ pub fn classify_failure(message: &str) -> FailureInfo {
             .replace(['\\', ' '], "")
             .contains("\"errorkind\":\"rate_limit\"");
     if !limited {
-        return FailureInfo::default();
+        return FailureInfo {
+            kind: if outage_text(&lower) {
+                TurnErrorKind::ProviderOutage
+            } else {
+                TurnErrorKind::Unknown
+            },
+            resets_at: None,
+        };
     }
     FailureInfo {
         kind: TurnErrorKind::RateLimit,
         resets_at: reset_time(message),
     }
+}
+
+/// Whether the error text (in lowercase) says that the provider is down or
+/// overloaded: the words of the Anthropic and OpenAI API errors for a 5xx
+/// status, an overload, or a closed connection. A bare "Internal error" is
+/// not one, because the adapters send it for many causes.
+fn outage_text(lower: &str) -> bool {
+    let compact = lower.replace(['\\', ' '], "");
+    [
+        "overloaded_error",
+        "api error: 500",
+        "api error: 502",
+        "api error: 503",
+        "api error: 504",
+        "api error: 529",
+        "service unavailable",
+        "service_unavailable",
+        "bad gateway",
+        "gateway timeout",
+        "internal server error",
+        "server is overloaded",
+        "server_overloaded",
+        "serveroverloaded",
+        "internalservererror",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+        // The JSON that the Claude adapter puts after its text, and the
+        // `type` of an Anthropic API error.
+        || ["\"errorkind\":\"overloaded\"", "\"errorkind\":\"server_error\"", "\"type\":\"api_error\""]
+            .iter()
+            .any(|marker| compact.contains(marker))
 }
 
 /// The reset time in a rate limit text. See [`classify_failure`].
@@ -569,7 +637,7 @@ pub fn sign_in_hint(kind: HarnessKind, message: &str) -> String {
 }
 
 /// What to tell the user when an account is not signed in. An account that
-/// Consort made signs in from the app. An account from `worker.toml` signs
+/// Consort made signs in from the app. An account from `session-host.toml` signs
 /// in with the harness's own command (see [`sign_in_hint`]).
 pub fn sign_in_hint_for(account: &AccountConfig, message: &str) -> String {
     if !account.profile {
@@ -656,6 +724,29 @@ mod tests {
     }
 
     #[test]
+    fn an_overload_or_a_server_error_is_an_outage_and_a_bare_error_is_not() {
+        for outage in [
+            "API Error: 529 {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}",
+            "API Error: 503 Service Unavailable",
+            "API Error: 500 {\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"Internal server error\"}}",
+            "Internal error: {\"errorKind\":\"server_error\"}",
+        ] {
+            let info = classify_failure(outage);
+            assert_eq!(info.kind, TurnErrorKind::ProviderOutage, "{outage}");
+            assert_eq!(info.resets_at, None);
+        }
+        // A 429 is still a limit, whatever else the text says.
+        assert_eq!(
+            classify_failure("API Error: 429 rate_limit_error: overloaded").kind,
+            TurnErrorKind::RateLimit
+        );
+        assert_eq!(
+            classify_failure("Internal error").kind,
+            TurnErrorKind::Unknown
+        );
+    }
+
+    #[test]
     fn failure_kinds_come_from_known_texts_and_never_from_a_guess() {
         let limit = classify_failure("Claude AI usage limit reached|1760000000");
         assert_eq!(limit.kind, TurnErrorKind::RateLimit);
@@ -698,7 +789,6 @@ mod tests {
         for other in [
             "",
             "Internal error",
-            "overloaded_error",
             "The file rate_limit.rs was not found",
             "Request 4290 failed",
             "codex app-server exited",

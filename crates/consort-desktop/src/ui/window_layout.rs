@@ -452,7 +452,7 @@ impl ConsortApp {
                             .on_click(cx.listener(|this, _, _, cx| this.close_panel(cx))),
                     ),
             )
-            .child(div().flex_1().min_h_0().w_full().child(panel))
+            .child(div().flex_1().min_w_0().min_h_0().w_full().child(panel))
             .into_any_element()
     }
 }

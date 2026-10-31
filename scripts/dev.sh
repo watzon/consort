@@ -1,19 +1,21 @@
 #!/usr/bin/env bash
-# Development run: build the debug binaries, start a dev hub with its worker
-# (`consort dev`), start the desktop app, and show the hub's log. Quitting the
-# app stops the hub.
+# Development run: build the debug binaries, start a dev hub with its session
+# host and its worker (`consort dev`), start the desktop app, and show the hub's
+# log. Quitting the app stops the hub. On a Mac the session host runs the agents
+# in `sandbox-exec`, and Settings > Hub shows a warning. On Linux it needs
+# bubblewrap. With no boundary, no session starts.
 #
 #   scripts/dev.sh [app flags]      for example: scripts/dev.sh --dark --theme velvet
 #
-# The hub, its worker and the app's pairing live in CONSORT_DEV_DIR (default
+# The hub, its session host, its worker and the app's pairing live in CONSORT_DEV_DIR (default
 # ~/.consort-dev), apart from the normal Consort folders. A dev run never
 # changes the pairing of an app that you use with a real hub. The folder is
 # outside the repo because task workspaces go in it, and a harness that works
 # there must not find this repo's AGENTS.md or git history. Delete the folder
 # to start again with a new hub.
 #
-# The worker's Consort home (its account profile folders and managed tools)
-# is CONSORT_DEV_DIR/hub/home (`consort dev` uses <data>/home), so a dev run
+# The session host's Consort home (its account profile folders and managed
+# tools) is CONSORT_DEV_DIR/hub/home (`consort dev` uses <data>/home), so a dev run
 # never uses the logins and tools in ~/.consort. Set CONSORT_HOME to use
 # another folder.
 #
@@ -24,6 +26,10 @@
 # this machine's LAN address to pair a worker on another machine. RUST_LOG
 # passes through. With --mock, only the app starts, with no hub. Press Ctrl+C
 # to stop the app and the hub.
+#
+# Dictation needs Sayso's engine and cleanup runtime. A checkout of Sayso beside
+# this repo is used when they are built there. CONSORT_SPEECH_ENGINE and
+# SAYSO_CLEANUP_PATH name other programs.
 #
 # On macOS the app runs from a small bundle in the build folder, because macOS
 # takes the Dock icon, the menu name and notifications from a bundle. It has
@@ -43,6 +49,11 @@ listen="${CONSORT_DEV_LISTEN:-127.0.0.1:7600}"
 
 echo "==> building"
 cargo build -p consort-cli -p consort-desktop
+if [ -z "${CONSORT_SPEECH_ENGINE:-}" ] && [ "$(uname -s)" = "Darwin" ] \
+  && [ -x ../sayso/native/macos/SaysoEngine/.build/release/SaysoEngine ]; then
+  CONSORT_SPEECH_ENGINE="$PWD/../sayso/native/macos/SaysoEngine/.build/release/SaysoEngine"
+  export CONSORT_SPEECH_ENGINE
+fi
 bin="$(cd "${CARGO_TARGET_DIR:-target}" && pwd)/debug"
 
 app_bin="$bin/consort-desktop"

@@ -3,7 +3,7 @@
 
 use consort_proto::ids::{ChannelId, WorkerId};
 use consort_proto::model::{ConnectorContextEntry, Skill, SkillContextEntry};
-use consort_proto::worker_link::SessionExtensions;
+use consort_proto::session_host_link::SessionExtensions;
 use rusqlite::Connection as Db;
 
 use crate::error::Result;
@@ -21,6 +21,13 @@ pub(crate) fn extensions_for(conn: &Db, channel_id: ChannelId) -> Result<Session
             .collect(),
         skills: skills.iter().map(Skill::bundle_ref).collect(),
         skill_context: skills.iter().map(SkillContextEntry::from).collect(),
+        monid: crate::store::monid::available_in(conn, &channel)?,
+        other_connections: con_store::requestable_connections(conn, &channel, None)?
+            .iter()
+            .map(|c| format!("{} ({})", c.name, c.handle))
+            .collect(),
+        monid_requestable: crate::store::monid::key_present(conn)?
+            && !crate::store::monid::available_in(conn, &channel)?,
     })
 }
 

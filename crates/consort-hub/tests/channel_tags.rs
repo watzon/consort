@@ -1,6 +1,7 @@
-//! Channel tags: all work from a channel with tags (coordinator turns and
-//! tasks) runs only on workers that have every tag. Work waits, and does
-//! not fail, while no online worker qualifies.
+//! Channel tags: the tasks of a channel with tags run only on workers that
+//! have every tag. A task waits, and does not fail, while no online worker
+//! qualifies. A coordinator runs no work on a worker, so tags do not apply to
+//! it.
 
 // Test code may unwrap (AGENTS.md: "No unwrap or expect outside tests").
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -12,13 +13,13 @@ use consort_proto::client_api::{
     ChannelCreate, ChannelUpdate, MessageSend, RoutineCreate, RoutineRunNow, TaskCreate,
     WorkerList, WorkerSetTags,
 };
-use consort_proto::frame::{EventFrame, Frame, MessageFamily};
+use consort_proto::frame::MessageFamily;
 use consort_proto::ids::{ChannelId, TaskId, WorkerId};
 use consort_proto::model::{
-    AuthState, PlacementRequest, RoutineAction, RoutineSchedule, SessionRole, Task, WorkerState,
+    PlacementRequest, RoutineAction, RoutineSchedule, SessionRole, Task, WorkerState,
 };
+use consort_proto::session_host_link::{HubToSessionHost, SessionStart};
 use consort_proto::status::TaskStatus;
-use consort_proto::worker_link::{HubToWorker, SessionEvent, SessionStart, TurnEndReason};
 
 const QUIET: Duration = Duration::from_millis(400);
 
@@ -26,9 +27,9 @@ fn tags(names: &[&str]) -> Vec<String> {
     names.iter().map(|t| (*t).to_owned()).collect()
 }
 
-/// Pairs a second worker and waits until the hub has its inventory.
-async fn add_worker(world: &mut World) -> FakeWorker {
-    let worker = FakeWorker::pair_and_connect(&world.hub).await;
+/// Pairs a second execution worker and waits until the hub has its inventory.
+async fn add_worker(world: &mut World) -> FakeExec {
+    let worker = FakeExec::pair(&world.hub).await;
     let id = worker.worker_id;
     let deadline = tokio::time::Instant::now() + WAIT;
     loop {
@@ -118,13 +119,13 @@ async fn task_in(world: &mut World, channel_id: ChannelId, id: TaskId) -> Task {
 async fn accept_task_start(worker: &mut FakeWorker) -> SessionStart {
     loop {
         let (request, command) = worker.next_command().await;
-        let HubToWorker::SessionStart(start) = command else {
+        let HubToSessionHost::SessionStart(start) = command else {
             panic!("expected session.start, got {}", command.type_name());
         };
         worker
             .respond_ok(
                 &request,
-                &consort_proto::worker_link::SessionStartResult {
+                &consort_proto::session_host_link::SessionStartResult {
                     workspace_path: "/tmp/workspace".to_owned(),
                     native_ref: None,
                 },
@@ -146,14 +147,17 @@ async fn assert_silent(worker: &mut FakeWorker, who: &str) {
 async fn a_task_in_a_tagged_channel_runs_only_on_the_tagged_worker() {
     let mut world = World::start().await;
     // The first worker is the better pick without a tag: it comes first.
-    let mut tagged = add_worker(&mut world).await;
+    let tagged = add_worker(&mut world).await;
     set_tags(&mut world, tagged.worker_id, &["work"]).await;
     let channel = tagged_channel(&mut world, &["work"]).await;
 
     let task = create_task(&mut world, channel).await;
-    let start = accept_task_start(&mut tagged).await;
+    let start = accept_task_start(&mut world.worker).await;
     assert_eq!(start.task_id, Some(task.id));
-    assert_silent(&mut world.worker, "the untagged worker").await;
+    assert_eq!(
+        start.execution.as_ref().map(|e| e.worker_id),
+        Some(tagged.worker_id)
+    );
     let task = task_in(&mut world, channel, task.id).await;
     assert_eq!(task.worker_id, Some(tagged.worker_id));
     world.hub.handle.shutdown().await.unwrap();
@@ -162,13 +166,16 @@ async fn a_task_in_a_tagged_channel_runs_only_on_the_tagged_worker() {
 #[tokio::test]
 async fn an_untagged_channel_still_uses_the_first_worker() {
     let mut world = World::start().await;
-    let mut tagged = add_worker(&mut world).await;
+    let tagged = add_worker(&mut world).await;
     set_tags(&mut world, tagged.worker_id, &["work"]).await;
     let channel = tagged_channel(&mut world, &[]).await;
 
     create_task(&mut world, channel).await;
-    accept_task_start(&mut world.worker).await;
-    assert_silent(&mut tagged, "the tagged worker").await;
+    let start = accept_task_start(&mut world.worker).await;
+    assert_eq!(
+        start.execution.as_ref().map(|e| e.worker_id),
+        Some(world.worker.exec_id)
+    );
     world.hub.handle.shutdown().await.unwrap();
 }
 
@@ -185,7 +192,7 @@ async fn a_task_waits_for_the_tagged_worker_and_starts_when_it_connects() {
     let task = create_task(&mut world, channel).await;
     // The first worker is online and could run the task, but it lacks the
     // tag. The task waits, and it does not fail.
-    assert_silent(&mut world.worker, "the untagged worker").await;
+    assert_silent(&mut world.worker, "the session host").await;
     let waiting = task_in(&mut world, channel, task.id).await;
     assert_eq!(waiting.status, TaskStatus::UpNext);
     assert_eq!(
@@ -193,17 +200,20 @@ async fn a_task_waits_for_the_tagged_worker_and_starts_when_it_connects() {
         Some("Waiting for an online worker with the tag work.")
     );
 
-    let mut tagged = away.come_back(&world.hub).await;
-    let start = accept_task_start(&mut tagged).await;
+    let _tagged = FakeExec::come_back(&world.hub, away).await;
+    let start = accept_task_start(&mut world.worker).await;
     assert_eq!(start.task_id, Some(task.id));
-    assert_silent(&mut world.worker, "the untagged worker").await;
+    assert_eq!(
+        start.execution.as_ref().map(|e| e.worker_id),
+        Some(tagged_id)
+    );
     world.hub.handle.shutdown().await.unwrap();
 }
 
 #[tokio::test]
 async fn a_task_waits_with_a_hint_when_no_worker_has_the_tag() {
     let mut world = World::start().await;
-    let mut other = add_worker(&mut world).await;
+    let other = add_worker(&mut world).await;
     let channel = tagged_channel(&mut world, &["work"]).await;
 
     let task = create_task(&mut world, channel).await;
@@ -216,13 +226,16 @@ async fn a_task_waits_with_a_hint_when_no_worker_has_the_tag() {
              Add the tag to a worker in Settings > Workers."
         )
     );
-    assert_silent(&mut world.worker, "the first worker").await;
-    assert_silent(&mut other, "the second worker").await;
+    assert_silent(&mut world.worker, "the session host").await;
 
     // The user adds the tag to a worker, and the task starts there.
     set_tags(&mut world, other.worker_id, &["work"]).await;
-    let start = accept_task_start(&mut other).await;
+    let start = accept_task_start(&mut world.worker).await;
     assert_eq!(start.task_id, Some(task.id));
+    assert_eq!(
+        start.execution.as_ref().map(|e| e.worker_id),
+        Some(other.worker_id)
+    );
     world.hub.handle.shutdown().await.unwrap();
 }
 
@@ -261,10 +274,8 @@ fn channel_update(channel_id: ChannelId) -> ChannelUpdate {
 }
 
 #[tokio::test]
-async fn the_coordinator_of_a_tagged_channel_runs_on_the_tagged_worker() {
+async fn the_coordinator_of_a_tagged_channel_needs_no_tagged_worker() {
     let mut world = World::start().await;
-    let mut tagged = add_worker(&mut world).await;
-    set_tags(&mut world, tagged.worker_id, &["work"]).await;
     let channel = tagged_channel(&mut world, &["work"]).await;
 
     world
@@ -279,148 +290,19 @@ async fn the_coordinator_of_a_tagged_channel_runs_on_the_tagged_worker() {
         })
         .await
         .unwrap();
-    let (_, command) = tagged.next_command().await;
-    let HubToWorker::SessionStart(start) = command else {
+    let (_, command) = world.worker.next_command().await;
+    let HubToSessionHost::SessionStart(start) = command else {
         panic!("expected session.start, got {}", command.type_name());
     };
     assert_eq!(start.role, SessionRole::Coordinator);
     assert_eq!(start.channel_id, channel);
-    assert_silent(&mut world.worker, "the untagged worker").await;
+    assert_eq!(start.execution, None);
     world.hub.handle.shutdown().await.unwrap();
 }
 
 #[tokio::test]
-async fn a_replacement_coordinator_respects_the_tags_after_a_sign_out() {
+async fn a_new_channel_tag_does_not_stop_the_coordinator() {
     let mut world = World::start().await;
-    // Tutti is the channel that the World helpers use. Give it a tag
-    // and put the tag on the first worker only.
-    let first = world.worker.worker_id;
-    set_tags(&mut world, first, &["work"]).await;
-    world
-        .client
-        .request(ChannelUpdate {
-            tags: Some(tags(&["work"])),
-            ..channel_update(world.tutti)
-        })
-        .await
-        .unwrap();
-    let mut other = add_worker(&mut world).await;
-
-    let start = world.start_coordinator("hello").await;
-    let session = start.session_id;
-    assert_silent(&mut other, "the untagged worker").await;
-
-    // The account of the first worker signs out.
-    let mut signed_out = inventory(world.worker.account_id);
-    for account in &mut signed_out.accounts {
-        account.auth_state = AuthState::SignedOut;
-    }
-    world
-        .worker
-        .peer
-        .send(&Frame::Event(EventFrame {
-            kind: "inventory".to_owned(),
-            body: serde_json::to_value(signed_out.with_hash()).unwrap(),
-        }))
-        .await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    world
-        .worker
-        .send_events(
-            session,
-            vec![SessionEvent::TurnEnded {
-                turn_id: "t1".into(),
-                reason: TurnEndReason::Failed,
-                error: Some("Authentication required.".to_owned()),
-                error_kind: None,
-                resets_at: None,
-            }],
-        )
-        .await;
-    let (request, command) = world.worker.next_command().await;
-    assert!(matches!(command, HubToWorker::SessionStop(_)));
-    world
-        .worker
-        .respond_ok(&request, &serde_json::json!({}))
-        .await;
-
-    // The other worker is signed in, but it lacks the tag. The assistant
-    // waits for the sign-in on the tagged worker.
-    world
-        .wait_notice(None, &["assistant_signed_out", "cannot answer"])
-        .await;
-    world.say(world.tutti, "are you there?").await;
-    assert_silent(&mut other, "the untagged worker").await;
-    assert_silent(&mut world.worker, "the signed-out worker").await;
-    world.hub.handle.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn a_new_channel_tag_moves_the_coordinator_off_a_worker_without_it() {
-    let mut world = World::start().await;
-    // A task and the coordinator run on the first worker. It has no tag.
-    let (task_id, task_start) = world.start_task("Fix it.").await;
-    let coordinator = world.coordinator_session.unwrap();
-    let mut other = add_worker(&mut world).await;
-    set_tags(&mut world, other.worker_id, &["work"]).await;
-    let first = world.worker.worker_id;
-    let name = world
-        .client
-        .request(WorkerList {})
-        .await
-        .unwrap()
-        .workers
-        .into_iter()
-        .find(|w| w.id == first)
-        .unwrap()
-        .name;
-
-    world
-        .client
-        .request(ChannelUpdate {
-            tags: Some(tags(&["work"])),
-            ..channel_update(world.tutti)
-        })
-        .await
-        .unwrap();
-
-    // The coordinator session ends, and the channel says why.
-    let (request, command) = world.worker.next_command().await;
-    let HubToWorker::SessionStop(stop) = command else {
-        panic!("expected session.stop, got {}", command.type_name());
-    };
-    assert_eq!(stop.session_id, coordinator);
-    world
-        .worker
-        .respond_ok(&request, &serde_json::json!({}))
-        .await;
-    world
-        .wait_notice(
-            None,
-            &[&format!(
-                "The assistant moved off {name} because the channel now needs the tag work."
-            )],
-        )
-        .await;
-    // The task keeps running: it gets no stop, and it stays Working.
-    assert_silent(&mut world.worker, "the worker of the running task").await;
-    let task = world.task(task_id).await;
-    assert_eq!(task.status, TaskStatus::Working, "{task:?}");
-    assert_ne!(task_start.session_id, coordinator);
-
-    // The next message starts a coordinator on the worker with the tag.
-    world.say(world.tutti, "hello again").await;
-    let start = other.accept_session_start().await;
-    assert_eq!(start.role, SessionRole::Coordinator);
-    assert!(start.turn.unwrap().text.contains("hello again"));
-    world.hub.handle.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn a_new_channel_tag_that_the_coordinator_worker_has_changes_nothing() {
-    let mut world = World::start().await;
-    let first = world.worker.worker_id;
-    set_tags(&mut world, first, &["work"]).await;
     world.start_coordinator("hello").await;
     world
         .client
@@ -430,7 +312,7 @@ async fn a_new_channel_tag_that_the_coordinator_worker_has_changes_nothing() {
         })
         .await
         .unwrap();
-    assert_silent(&mut world.worker, "the tagged worker").await;
+    assert_silent(&mut world.worker, "the session host").await;
     let notices = world.notices(None).await;
     assert!(
         !notices.iter().any(|n| n.contains("moved off")),
@@ -442,7 +324,7 @@ async fn a_new_channel_tag_that_the_coordinator_worker_has_changes_nothing() {
 #[tokio::test]
 async fn list_workers_shows_the_tags_of_each_worker() {
     let mut world = World::start().await;
-    let id = world.worker.worker_id;
+    let id = world.worker.exec_id;
     set_tags(&mut world, id, &["work", "gpu"]).await;
     let coordinator = world.start_coordinator("Which machines?").await;
     let listed = world
@@ -468,7 +350,7 @@ async fn list_workers_shows_the_tags_of_each_worker() {
 #[tokio::test]
 async fn a_routine_run_in_a_tagged_channel_runs_only_on_the_tagged_worker() {
     let mut world = World::start().await;
-    let mut tagged = add_worker(&mut world).await;
+    let tagged = add_worker(&mut world).await;
     set_tags(&mut world, tagged.worker_id, &["work"]).await;
     let channel = tagged_channel(&mut world, &["work"]).await;
     let routine = world
@@ -495,8 +377,11 @@ async fn a_routine_run_in_a_tagged_channel_runs_only_on_the_tagged_worker() {
         })
         .await
         .unwrap();
-    let start = accept_task_start(&mut tagged).await;
+    let start = accept_task_start(&mut world.worker).await;
     assert_eq!(start.channel_id, channel);
-    assert_silent(&mut world.worker, "the untagged worker").await;
+    assert_eq!(
+        start.execution.as_ref().map(|e| e.worker_id),
+        Some(tagged.worker_id)
+    );
     world.hub.handle.shutdown().await.unwrap();
 }

@@ -140,6 +140,20 @@ impl Hub {
             .await
     }
 
+    /// The kind of a worker row, when it is not removed.
+    pub(crate) async fn machine_kind(
+        &self,
+        id: consort_proto::ids::WorkerId,
+    ) -> Result<Option<consort_proto::model::MachineKind>> {
+        self.store
+            .read(move |conn| {
+                Ok(machine::worker(conn, id)?
+                    .filter(|w| w.revoked_at.is_none())
+                    .map(|w| w.kind))
+            })
+            .await
+    }
+
     pub(crate) async fn client_is_active(&self, id: ClientId) -> Result<bool> {
         self.store
             .read(
@@ -234,6 +248,8 @@ mod tests {
             review_summary: Some("s".repeat(8 * 1024)),
             resolved_at: (status == TaskStatus::Resolved).then_some(time),
             session_ended: false,
+            monid_calls: 0,
+            monid_cost_micros: 0,
             archived_at: None,
             created_at: time,
             updated_at: time,

@@ -5,16 +5,18 @@ use std::sync::Arc;
 use consort_proto::{
     client_api::{
         AccountCreate, AccountRemove, AccountSignOut, AccountUpdate, AcpRegistryList,
-        ChannelArchive, ChannelCreate, ChannelDelete, ChannelMove, ChannelUpdate,
-        DecisionAnswerRequest, GroupCreate, GroupUpdate, MessageDelete, MessageEdit, MessageList,
-        PreferencesSetAccountFallback, PreferencesSetFavoriteModel, ReadMark, SignInCancel,
-        SignInStart, SignInSubmitCode, TaskArchive, TaskInterrupt, TaskReopen, TaskResolve,
-        TaskRetry, WorkerPairingCode, WorkerRename, WorkerRevoke, WorkerSetPaused, WorkerSetTags,
-        WorkerToolInstall, WorkerToolsCheck,
+        ChannelArchive, ChannelCreate, ChannelDelete, ChannelGoBack, ChannelMove, ChannelUpdate,
+        CommandCheckTest, DecisionAnswerRequest, EndpointRemove, EndpointSave, EndpointTest,
+        GroupCreate, GroupUpdate, MessageDelete, MessageEdit, MessageList,
+        PreferencesSetCommandCheck, PreferencesSetFallbackPath, PreferencesSetFavoriteModel,
+        ReadMark, SignInCancel, SignInStart, SignInSubmitCode, TaskArchive, TaskInterrupt,
+        TaskReopen, TaskResolve, TaskRetry, TestResult, WorkerPairingCode, WorkerRename,
+        WorkerRevoke, WorkerSetPaused, WorkerSetPolicy, WorkerSetTags, WorkerToolInstall,
+        WorkerToolsCheck,
     },
     ids::{ChannelId, GroupId},
     model::{
-        AcpAccountSpec, DecisionAnswer, FavoriteModel, ModelSelection, OptionValue,
+        AcpAccountSpec, DecisionAnswer, FallbackPath, FavoriteModel, ModelSelection, OptionValue,
         RequestOptionKind, SignInMethod, ToolId,
     },
 };
@@ -688,6 +690,36 @@ async fn run(shared: Arc<Shared>, command: Command) -> Result<CommandOutput, Cli
                 return Err(err);
             }
         }
+        Command::AnswerApprovalOption {
+            approval_id,
+            option_id,
+        } => {
+            let known = shared
+                .cache
+                .lock()
+                .ok()
+                .and_then(|c| c.approvals.get(&approval_id).cloned())
+                .is_some_and(|a| a.options.iter().any(|o| o.id == option_id));
+            if !known {
+                return Err(invalid(
+                    "This approval has no such answer. It may have closed.",
+                ));
+            }
+            let answered = shared
+                .call(consort_proto::client_api::ApprovalAnswer {
+                    approval_id: parse(&approval_id, "approval")?,
+                    option_id,
+                    checked: false,
+                    checked_hash: None,
+                })
+                .await;
+            if let Err(err) = answered {
+                if is_closed_reply(&err) {
+                    close_approval(&shared, &approval_id);
+                }
+                return Err(err);
+            }
+        }
         Command::AnswerDecision {
             decision_id,
             option,
@@ -752,6 +784,21 @@ async fn run(shared: Arc<Shared>, command: Command) -> Result<CommandOutput, Cli
                 })
                 .await?;
         }
+        Command::SetWorkerPolicy {
+            worker_id,
+            max_approval_mode,
+            allowed_roots,
+            allow_shell,
+        } => {
+            shared
+                .call(WorkerSetPolicy {
+                    worker_id: parse(&worker_id, "worker")?,
+                    max_approval_mode: max_approval_mode.map(proto_approval_mode),
+                    allowed_roots,
+                    allow_shell,
+                })
+                .await?;
+        }
         Command::SetFavoriteModel {
             account_label,
             model_id,
@@ -769,9 +816,71 @@ async fn run(shared: Arc<Shared>, command: Command) -> Result<CommandOutput, Cli
                 })
                 .await?;
         }
-        Command::SetAccountFallback { enabled } => {
+        Command::SetFallbackPath {
+            other_accounts,
+            steps,
+        } => {
+            let steps = steps
+                .into_iter()
+                .filter_map(|s| selection(&Some(s)))
+                .collect();
             shared
-                .call(PreferencesSetAccountFallback { enabled })
+                .call(PreferencesSetFallbackPath {
+                    path: FallbackPath {
+                        other_accounts,
+                        steps,
+                    },
+                })
+                .await?;
+        }
+        Command::SetCommandCheck { choice } => {
+            shared
+                .call(PreferencesSetCommandCheck {
+                    setting: crate::command_check::setting_of(&choice),
+                })
+                .await?;
+        }
+        Command::SaveEndpoint {
+            id,
+            name,
+            base_url,
+            api_key,
+        } => {
+            shared
+                .call(EndpointSave {
+                    id,
+                    name,
+                    base_url,
+                    api_key,
+                })
+                .await?;
+        }
+        Command::RemoveEndpoint { id } => {
+            shared.call(EndpointRemove { id }).await?;
+        }
+        Command::TestEndpoint {
+            id,
+            base_url,
+            api_key,
+        } => {
+            let result = shared
+                .call(EndpointTest {
+                    id,
+                    base_url,
+                    api_key,
+                })
+                .await?;
+            return Ok(CommandOutput::Tested(tested(result)));
+        }
+        Command::TestCommandCheck => {
+            let result = shared.call(CommandCheckTest {}).await?;
+            return Ok(CommandOutput::Tested(tested(result)));
+        }
+        Command::GoBack { channel_id } => {
+            shared
+                .call(ChannelGoBack {
+                    channel_id: parse(&channel_id, "channel")?,
+                })
                 .await?;
         }
         Command::SetWorkerPaused { worker_id, paused } => {
@@ -830,7 +939,6 @@ async fn run(shared: Arc<Shared>, command: Command) -> Result<CommandOutput, Cli
                     label,
                     env_set,
                     env_remove,
-                    extras_enabled: None,
                 })
                 .await?;
         }
@@ -916,12 +1024,25 @@ async fn run(shared: Arc<Shared>, command: Command) -> Result<CommandOutput, Cli
                 .await?;
         }
         Command::InstallTool { worker_id, tool } => {
-            shared
-                .call(WorkerToolInstall {
-                    worker_id: parse(&worker_id, "worker")?,
-                    tool: ToolId::new(tool),
+            // The app lists no helper tool, so an install of a provider acts
+            // on its helpers that failed or have an update too.
+            let helpers = shared
+                .cache
+                .lock()
+                .ok()
+                .and_then(|cache| {
+                    let inventory = cache.workers.get(&worker_id)?.inventory.as_ref()?;
+                    Some(crate::reduce::helpers_to_install(&inventory.tools, &tool))
                 })
-                .await?;
+                .unwrap_or_default();
+            for tool in std::iter::once(tool).chain(helpers) {
+                shared
+                    .call(WorkerToolInstall {
+                        worker_id: parse(&worker_id, "worker")?,
+                        tool: ToolId::new(tool),
+                    })
+                    .await?;
+            }
         }
         Command::LoadAcpRegistry => load_registry(&shared).await?,
         // Settings > Hub and Settings > Clients.
@@ -955,6 +1076,7 @@ async fn run(shared: Arc<Shared>, command: Command) -> Result<CommandOutput, Cli
         // Routines and memory.
         command @ (Command::SaveRoutine { .. }
         | Command::SetRoutineEnabled { .. }
+        | Command::SetRoutineMonid { .. }
         | Command::DeleteRoutine { .. }
         | Command::RunRoutineNow { .. }
         | Command::LoadRoutineRuns { .. }
@@ -983,7 +1105,18 @@ async fn run(shared: Arc<Shared>, command: Command) -> Result<CommandOutput, Cli
         | Command::DeleteGroup { .. }
         | Command::RenameGroup { .. }
         | Command::ReorderGroups { .. }) => return super::convo::run(&shared, command).await,
-        // Connectors, skills and the provider extras.
+        // Monid.
+        command @ (Command::LoadMonidStatus
+        | Command::SetMonidKey { .. }
+        | Command::RemoveMonidKey
+        | Command::UpdateMonidSettings { .. }
+        | Command::SetChannelMonid { .. }
+        | Command::SearchMonid { .. }
+        | Command::LoadMonidCalls { .. }
+        | Command::LoadMonidCall { .. }
+        | Command::StopMonidCall { .. }
+        | Command::EndAccess { .. }) => return super::monid::run(&shared, command).await,
+        // Connectors and skills.
         other => return super::extensions::run(&shared, other).await,
     }
     Ok(CommandOutput::Done)
@@ -1269,6 +1402,14 @@ pub(crate) fn option_for(
             .find(|o| o.kind == *kind)
             .map(|o| o.id.clone())
     })
+}
+
+fn tested(result: TestResult) -> crate::command_check::TestResultView {
+    crate::command_check::TestResultView {
+        ok: result.ok,
+        message: result.message,
+        details: result.details,
+    }
 }
 
 #[cfg(test)]

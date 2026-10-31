@@ -10,9 +10,9 @@
 //! through a card that the user finishes in the app or the browser.
 
 use consort_proto::client_api::{
-    AccountCreate, AccountUpdate, ChannelArchive, ChannelCreate, ChannelMove,
-    ChannelSetConnectionEnabled, ChannelSetSkillEnabled, ChannelUpdate, GroupCreate, RepoCreate,
-    WorkerSetTags, WorkerToolInstall,
+    AccountCreate, ChannelArchive, ChannelCreate, ChannelMove, ChannelSetConnectionEnabled,
+    ChannelSetSkillEnabled, ChannelUpdate, GroupCreate, RepoCreate, WorkerSetTags,
+    WorkerToolInstall,
 };
 use consort_proto::ids::{ApprovalId, ChannelId, GroupId, RepoId};
 use consort_proto::model::{
@@ -23,8 +23,8 @@ use consort_proto::model::{
 use consort_proto::tools::{
     AddAccountArgs, ArchiveChannelArgs, ConnectServiceArgs, CreateChannelArgs, DisconnectArgs,
     HubTool, HubToolCall, InstallToolArgs, ListConnectionsResult, ListInstalledSkillsResult,
-    ManagementResult, RemoveSkillArgs, RequestAccessArgs, SearchConnectorCatalogArgs,
-    SearchConnectorCatalogResult, SetAccountExtrasArgs, SetChannelConnectorArgs,
+    ManagementResult, RemoveSkillArgs, RequestAccessArgs, RequestableConnection,
+    SearchConnectorCatalogArgs, SearchConnectorCatalogResult, SetChannelConnectorArgs,
     SetChannelSkillArgs, SetChannelTagsArgs, SetDefaultModelArgs, SetWorkerTagsArgs,
     StartSignInArgs, ToolAudience, UpdateChannelArgs, UpdateConnectionArgs, UpdateSkillArgs,
     UpdateThisChannelArgs,
@@ -51,7 +51,7 @@ fn more_channels(n: usize) -> String {
 }
 
 /// How a "Use in" scope reads in a card.
-fn describe_use_in(use_in: &UseIn, channels: &[Channel]) -> String {
+pub(crate) fn describe_use_in(use_in: &UseIn, channels: &[Channel]) -> String {
     match use_in {
         UseIn::EveryChannel => "every channel".to_owned(),
         UseIn::Tags { tags } => format!("channels with the tags {}", tags.join(", ")),
@@ -73,7 +73,7 @@ fn describe_use_in(use_in: &UseIn, channels: &[Channel]) -> String {
 /// The wider scope that gives an item to one more channel. A tag scope
 /// becomes the list of the channels that it gives the item to now, plus
 /// this channel.
-fn widen_to(use_in: &UseIn, channel: &Channel, channels: &[Channel]) -> UseIn {
+pub(crate) fn widen_to(use_in: &UseIn, channel: &Channel, channels: &[Channel]) -> UseIn {
     match use_in {
         UseIn::EveryChannel => UseIn::EveryChannel,
         UseIn::Channels { channel_ids } => {
@@ -153,11 +153,11 @@ impl Hub {
         Ok(ManagementResult::applied(summary))
     }
 
-    async fn all_channels(&self) -> Result<Vec<Channel>> {
+    pub(crate) async fn all_channels(&self) -> Result<Vec<Channel>> {
         self.store.read(conversation::channels).await
     }
 
-    async fn find_connection(&self, key: &str) -> Result<Connection> {
+    pub(crate) async fn find_connection(&self, key: &str) -> Result<Connection> {
         let wanted = key.to_owned();
         self.store
             .read(move |conn| con_store::find_connection(conn, &wanted))
@@ -320,7 +320,6 @@ impl Hub {
             C::InstallTool(a) => self.m_install_tool(ctx, a, approved).await,
             C::AddAccount(a) => self.m_add_account(ctx, a).await,
             C::StartSignIn(a) => self.m_start_sign_in(ctx, a).await,
-            C::SetAccountExtras(a) => self.m_set_account_extras(ctx, a, approved).await,
             C::ConnectService(a) => self.m_connect_service(ctx, a).await,
             C::UpdateConnection(a) => self.m_update_connection(ctx, a, approved).await,
             C::Disconnect(a) => self.m_disconnect(ctx, a, approved).await,
@@ -363,6 +362,14 @@ impl Hub {
                 Ok(ListConnectionsResult {
                     connections,
                     off_in_this_channel: off,
+                    can_request: con_store::requestable_connections(conn, &channel, None)?
+                        .iter()
+                        .map(|c| RequestableConnection {
+                            handle: c.handle.clone(),
+                            name: c.name.clone(),
+                            service_name: c.service_name.clone(),
+                        })
+                        .collect(),
                 })
             })
             .await?;
@@ -656,6 +663,35 @@ impl Hub {
 
     // Workers and accounts ---------------------------------------------------------
 
+    /// The machine that holds accounts and tools: the session host. A
+    /// coordinator knows the IDs of `list_workers`, which lists execution
+    /// machines, so an ID of one of those also finds the session host.
+    pub(crate) async fn account_host(
+        &self,
+        worker: consort_proto::ids::WorkerId,
+    ) -> Result<consort_proto::ids::WorkerId> {
+        self.store
+            .read(move |conn| {
+                let named = machine::worker_or_404(conn, worker)?;
+                if named.kind == consort_proto::model::MachineKind::SessionHost {
+                    return Ok(named.id);
+                }
+                machine::workers(conn)?
+                    .into_iter()
+                    .find(|w| {
+                        w.kind == consort_proto::model::MachineKind::SessionHost
+                            && w.revoked_at.is_none()
+                    })
+                    .map(|w| w.id)
+                    .ok_or_else(|| {
+                        HubError::not_found(
+                            "The session host is not paired, so no account can change. Start it on the hub machine.",
+                        )
+                    })
+            })
+            .await
+    }
+
     async fn worker_name(&self, worker: consort_proto::ids::WorkerId) -> Result<String> {
         let w = self
             .store
@@ -709,11 +745,12 @@ impl Hub {
         a: InstallToolArgs,
         approved: bool,
     ) -> Result<ManagementResult> {
-        let name = self.worker_name(a.worker).await?;
+        let host = self.account_host(a.worker).await?;
+        let name = self.worker_name(host).await?;
         self.worker_tool_install(
             &Caller::Hub,
             WorkerToolInstall {
-                worker_id: a.worker,
+                worker_id: host,
                 tool: ToolId::from(a.tool.trim()),
             },
         )
@@ -738,11 +775,12 @@ impl Hub {
     }
 
     async fn m_add_account(&self, ctx: &ToolCtx, a: AddAccountArgs) -> Result<ManagementResult> {
+        let host = self.account_host(a.worker).await?;
         let account_id = self
             .account_create(
                 &Caller::Hub,
                 AccountCreate {
-                    worker_id: a.worker,
+                    worker_id: host,
                     harness: a.provider.trim().to_owned(),
                     label: a.name.clone(),
                     acp: None,
@@ -755,7 +793,7 @@ impl Hub {
             .post_sign_in_card(
                 ctx,
                 SignInCard {
-                    worker_id: a.worker,
+                    worker_id: host,
                     account_id,
                     account_label: a.name.trim().to_owned(),
                     harness: a.provider.trim().to_owned(),
@@ -776,7 +814,8 @@ impl Hub {
     }
 
     async fn m_start_sign_in(&self, ctx: &ToolCtx, a: StartSignInArgs) -> Result<ManagementResult> {
-        let (worker, account) = (a.worker, a.account);
+        let host = self.account_host(a.worker).await?;
+        let (worker, account) = (host, a.account);
         let found = self
             .store
             .read(move |conn| {
@@ -788,7 +827,7 @@ impl Hub {
             .await?
             .ok_or_else(|| {
                 HubError::not_found(
-                    "The worker has no such account. Call list_workers to see the accounts.",
+                    "The hub machine has no such account. Call list_workers to see the accounts.",
                 )
             })?;
         let method = match a.method.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
@@ -804,7 +843,7 @@ impl Hub {
             .post_sign_in_card(
                 ctx,
                 SignInCard {
-                    worker_id: a.worker,
+                    worker_id: host,
                     account_id: a.account,
                     account_label: found.label.clone(),
                     harness: found.harness.clone(),
@@ -817,50 +856,6 @@ impl Hub {
             approval_id,
             format!("The user signs in to {} on the card.", found.label),
         );
-        result.account_id = Some(a.account);
-        Ok(result)
-    }
-
-    async fn m_set_account_extras(
-        &self,
-        ctx: &ToolCtx,
-        a: SetAccountExtrasArgs,
-        approved: bool,
-    ) -> Result<ManagementResult> {
-        let name = self.worker_name(a.worker).await?;
-        if a.enabled && !approved {
-            return self
-                .ask_first(
-                    ctx,
-                    HubTool::SetAccountExtras,
-                    &a,
-                    format!("Turn on the provider extras of an account on {name}."),
-                    "New sessions of this account get the MCP servers, plugins and skills that the provider syncs, next to the ones from Consort.".to_owned(),
-                )
-                .await;
-        }
-        self.account_update(
-            &Caller::Hub,
-            AccountUpdate {
-                worker_id: a.worker,
-                account_id: a.account,
-                label: None,
-                env_set: Default::default(),
-                env_remove: Vec::new(),
-                extras_enabled: Some(a.enabled),
-            },
-        )
-        .await?;
-        let mut result = self
-            .applied(
-                ctx,
-                approved,
-                format!(
-                    "The provider extras of an account on {name} are {}.",
-                    if a.enabled { "on" } else { "off" }
-                ),
-            )
-            .await?;
         result.account_id = Some(a.account);
         Ok(result)
     }

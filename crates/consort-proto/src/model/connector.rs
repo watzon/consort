@@ -15,6 +15,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::access::AccessTarget;
 use super::common::{Sha256Hash, ValidationError};
 use super::conversation::Channel;
 use super::tag::normalize_tags;
@@ -297,6 +298,22 @@ impl Connection {
     /// matches and the channel did not turn it off.
     pub fn is_available_in(&self, channel: &Channel) -> bool {
         self.use_in.matches_channel(channel) && !channel.disabled_connections.contains(&self.id)
+    }
+
+    /// Whether a session of this task, or a coordinator with `None`, can use
+    /// this connection: its channel has it, or the user gave temporary
+    /// access.
+    pub fn is_available_for(
+        &self,
+        channel: &Channel,
+        task_id: Option<TaskId>,
+        now: Timestamp,
+    ) -> bool {
+        self.is_available_in(channel)
+            || channel.access_grants.iter().any(|grant| {
+                grant.applies(task_id, now)
+                    && matches!(&grant.target, AccessTarget::Connection { connection_id, .. } if *connection_id == self.id)
+            })
     }
 }
 
@@ -748,6 +765,10 @@ mod tests {
             created_at: Timestamp::from_millis(0),
             updated_at: Timestamp::from_millis(0),
             proactive_tasks: Default::default(),
+            coordinator_fallback: None,
+            coordinator_blocked: None,
+            monid: Default::default(),
+            access_grants: Vec::new(),
             proactivity: None,
         }
     }

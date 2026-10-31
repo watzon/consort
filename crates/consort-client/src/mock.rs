@@ -63,6 +63,8 @@ fn channel(id: &str, name: &str, purpose: &str, icon: &str, group: Option<&str>)
                 SelectionSource::Tutti
             },
         }),
+        fallback: None,
+        assistant_status: None,
         repos: Vec::new(),
         preferred_workers: Vec::new(),
         task_selection: Some(selection("Claude Personal", "claude-opus-5-5", "Opus 5.5")),
@@ -73,6 +75,8 @@ fn channel(id: &str, name: &str, purpose: &str, icon: &str, group: Option<&str>)
         default_approval_mode: ApprovalMode::AutoEdits,
         allowed_local_mcp_servers: Vec::new(),
         memory_enabled: true,
+        monid: Default::default(),
+        access_grants: Vec::new(),
     }
 }
 
@@ -107,6 +111,8 @@ fn task(
             _ => ApprovalMode::AutoEdits,
         },
         session_ended: false,
+        monid_calls: 0,
+        monid_cost_micros: 0,
     }
 }
 
@@ -130,6 +136,8 @@ fn message(id: &str, channel_id: &str, speaker: Speaker, time: &str, body: &str)
 
 fn sayso_approval() -> ApprovalView {
     ApprovalView {
+        check_note: None,
+        blocked: Vec::new(),
         id: text("apr_0192f0c4-windows-build"),
         task_id: Some(T_SAYSO.into()),
         summary: text("Codex wants to run a command"),
@@ -218,6 +226,8 @@ fn card(
         approval_mode: ApprovalMode::default(),
         steps: Vec::new(),
         note: None,
+        monid_calls: 0,
+        monid_cost_micros: 0,
     })
 }
 
@@ -230,6 +240,48 @@ fn assistant_model() -> SelectionView {
         SelectionOption::Text(text("high")),
     )];
     chosen
+}
+
+/// The fallback path of the mock data, as in the designs: the built-in row,
+/// a step on the same harness, a step on another harness and a step whose
+/// account is signed out.
+pub fn mock_fallback_path() -> crate::fallback::FallbackPathView {
+    use crate::fallback::{FallbackPathView, StepSkip, step_from_groups};
+    let groups = model_groups();
+    let first = assistant_model();
+    let with_effort = |mut s: SelectionView, effort: &str| {
+        s.options = vec![(
+            crate::picker::EFFORT.to_owned(),
+            SelectionOption::Text(text(effort)),
+        )];
+        s
+    };
+    let step = |s: SelectionView| step_from_groups(&groups, s, Some(&first));
+    let mut signed_out = step(with_effort(
+        selection("Codex Work", "gpt-5.5-mini", "GPT-5.5 mini"),
+        "low",
+    ));
+    signed_out.skipped = Some(StepSkip::SignedOut);
+    signed_out.provider = text("Codex");
+    signed_out.logo = ProviderLogo::Codex;
+    signed_out.company = text("OpenAI");
+    signed_out.other_harness = true;
+    FallbackPathView {
+        other_accounts: true,
+        first: Some(step(first.clone())),
+        other_account_labels: vec![text("Claude Work")],
+        steps: vec![
+            step(with_effort(
+                selection("Claude Work", "claude-sonnet-5-5", "Sonnet 5.5"),
+                "high",
+            )),
+            step(with_effort(
+                selection("Codex Personal", "gpt-5.5", "GPT-5.5"),
+                "medium",
+            )),
+            signed_out,
+        ],
+    }
 }
 
 /// Effort levels, with the provider's default.
@@ -494,8 +546,6 @@ fn account(
         sign_in_methods: methods,
         secret_names,
         email: None,
-        extras_enabled: true,
-        extras: None,
     }
 }
 
@@ -550,6 +600,8 @@ fn worker(
     policy: PolicyView,
 ) -> WorkerView {
     WorkerView {
+        is_session_host: false,
+        boundary: None,
         id: id.into(),
         name: name.into(),
         os,
@@ -583,6 +635,38 @@ fn policy(mode: ApprovalMode, roots: &[&str], shell: &str) -> PolicyView {
         allow_shell: true,
         shell_name: shell.into(),
     }
+}
+
+/// The accounts and the tools are on the session host, as in the design.
+fn session_host() -> WorkerView {
+    let mut host = workers()
+        .into_iter()
+        .find(|w| w.name == "bigboi")
+        .unwrap_or_default();
+    host.is_session_host = true;
+    host.boundary = Some(crate::command_check::BoundaryView::Bubblewrap);
+    host.id = text("wrk_session_host");
+    host.name = text("the hub machine");
+    host.os = Os::Linux;
+    host.online = true;
+    let mut labels = std::collections::HashSet::new();
+    host.accounts = workers()
+        .into_iter()
+        .flat_map(|w| w.accounts)
+        .filter(|a| labels.insert(a.label.clone()))
+        .collect();
+    host
+}
+
+fn workers_without_accounts() -> Vec<WorkerView> {
+    workers()
+        .into_iter()
+        .map(|mut w| {
+            w.accounts.clear();
+            w.tools.clear();
+            w
+        })
+        .collect()
 }
 
 fn workers() -> Vec<WorkerView> {
@@ -1384,6 +1468,22 @@ pub fn view_state() -> ViewState {
             Some("grp_home"),
         ),
     ];
+    // Two channels whose assistant cannot answer: the status line above the
+    // composer, with and without Sign in again.
+    if let Some(homelab) = channels.iter_mut().find(|c| c.id == HOMELAB) {
+        homelab.assistant_status = Some(crate::assistant_status::AssistantStatusView {
+            text: text(
+                "Claude Work is signed out, so the assistant cannot answer. Sign in to Claude Work, and the assistant answers your waiting messages.",
+            ),
+            account: Some(text("Claude Work")),
+        });
+    }
+    if let Some(lights) = channels.iter_mut().find(|c| c.id == LIGHTS) {
+        lights.assistant_status = Some(crate::assistant_status::AssistantStatusView {
+            text: text("Waiting for a worker to come online."),
+            account: None,
+        });
+    }
     if let Some(sayso) = channels.iter_mut().find(|c| c.id == SAYSO) {
         sayso.instructions = text(
             "Never push to main. Open a PR.\n\nRun the engine tests on bigboi before a Windows release.",
@@ -1415,6 +1515,31 @@ pub fn view_state() -> ViewState {
         }
     }
     let mut state = ViewState {
+        endpoints: vec![
+            crate::command_check::EndpointView {
+                id: "end_1".into(),
+                name: "OpenRouter".into(),
+                base_url: "https://openrouter.ai/api".into(),
+                key_last_four: "4f2a".into(),
+                in_use: false,
+            },
+            crate::command_check::EndpointView {
+                id: "end_2".into(),
+                name: "Cloudflare AI Gateway".into(),
+                base_url: "https://gateway.ai.cloudflare.com/v1".into(),
+                key_last_four: "b07d".into(),
+                in_use: false,
+            },
+        ],
+        command_check: crate::command_check::CommandCheckView {
+            chosen_for_you: Some(crate::view::SelectionView {
+                account_label: "Claude Work".into(),
+                model_id: "claude-haiku-5-5".into(),
+                model_name: "Haiku 5.5".into(),
+                options: Vec::new(),
+            }),
+            ..Default::default()
+        },
         connection: Connection::Demo,
         saved_data: None,
         user: UserView {
@@ -1442,10 +1567,11 @@ pub fn view_state() -> ViewState {
         tasks: tasks(),
         threads: with_task_models(threads()),
         tasks_panel: TasksPanelView::default(),
-        workers: workers(),
+        workers: workers_without_accounts(),
+        session_host: Some(session_host()),
         tags: Vec::new(),
         model_groups: model_groups(),
-        account_fallback: true,
+        fallback_path: mock_fallback_path(),
         favorite_models: favorite_models(),
         sign_ins: Vec::new(),
         acp_registry: AcpRegistryView::default(),
@@ -1454,6 +1580,7 @@ pub fn view_state() -> ViewState {
         connections: crate::mock_extensions::connections(),
         skills: crate::mock_extensions::skills(),
         composio: crate::mock_extensions::composio(),
+        monid: crate::mock_monid::monid(),
         connector_catalog: CatalogView {
             categories: crate::mock_extensions::categories(),
             ..CatalogView::default()
@@ -1476,6 +1603,7 @@ pub fn view_state() -> ViewState {
         proactivity: Default::default(),
         voice: crate::mock_voice::off_view(),
     };
+    crate::mock_monid::decorate(&mut state);
     stamp_times(&mut state.timelines);
     crate::mock_convo::decorate(&mut state);
     if let Some(account) = state
@@ -1485,7 +1613,6 @@ pub fn view_state() -> ViewState {
         .find(|a| a.id == "acc_bigboi_claude")
     {
         account.email = Some(text("chris@example.com"));
-        account.extras = Some(crate::mock_extensions::claude_extras());
     }
     stamp_times(&mut state.timelines);
     refresh(&mut state);
@@ -1524,6 +1651,8 @@ pub fn view_state_with_requests() -> ViewState {
         for item in &mut timeline.items {
             if let TimelineItem::TaskCard(card) = item {
                 card.approval = Some(ApprovalView {
+                    check_note: None,
+                    blocked: Vec::new(),
                     id: text("apr_lights_write"),
                     task_id: Some(T_ROOF.into()),
                     summary: text("Write roofline-quotes.md"),
@@ -1553,6 +1682,8 @@ pub fn view_state_with_requests() -> ViewState {
             time_label: text("9:02 AM"),
             created_at: 0,
             approval: ApprovalView {
+                check_note: None,
+                blocked: Vec::new(),
                 id: text("apr_lights_post"),
                 task_id: None,
                 summary: text("Consort wants to use post_message from hub"),

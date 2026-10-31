@@ -15,7 +15,13 @@ mod app;
 mod approvals_tests;
 mod assets;
 #[cfg(test)]
+mod assistant_status_tests;
+#[cfg(test)]
 mod chat_tests;
+#[cfg(test)]
+mod command_check_tests;
+#[cfg(test)]
+mod composer_gate_tests;
 #[cfg(test)]
 mod composer_tests;
 mod convo;
@@ -23,6 +29,8 @@ mod convo;
 mod convo_tests;
 mod countdown;
 mod dictation;
+#[cfg(test)]
+mod dictation_tests;
 #[cfg(test)]
 mod document_tests;
 mod drafts;
@@ -34,6 +42,9 @@ mod errors_tests;
 #[cfg(test)]
 mod ext_tests;
 mod extensions;
+mod fallback;
+#[cfg(test)]
+mod fallback_tests;
 #[cfg(test)]
 mod files_tests;
 mod fonts;
@@ -47,7 +58,12 @@ mod knowledge_tests;
 mod layout;
 #[cfg(test)]
 mod layout_tests;
+mod monid;
+#[cfg(test)]
+mod monid_tests;
 mod notice;
+#[cfg(test)]
+mod notice_row_tests;
 #[cfg(test)]
 mod notices_tests;
 mod notify_platform;
@@ -68,6 +84,8 @@ mod voice;
 #[cfg(test)]
 mod voice_tests;
 mod waiting;
+#[cfg(test)]
+mod worker_limits_tests;
 
 use consort_client::Client;
 use gpui_kit::{
@@ -84,7 +102,11 @@ actions!(consort, [Quit]);
 /// onboarding, connectors, add-connector, connect, connectors-in-channel,
 /// channel-connectors, skills, add-skill, add-skill-unsupported,
 /// account-settings, hub-cards, tutti-manages, instructions, mark-idle,
-/// mark-working, mark-needs-you, mark-done. Phase 1: top-tint,
+/// mark-working, mark-needs-you, mark-done. Monid: monid-cards,
+/// monid-calls, monid-panel, monid-view, monid-settings, monid-add,
+/// monid-offer, monid-routine, monid-full-access, monid-access and
+/// monid-task. The composer: composer-grown and
+/// composer-full. Phase 1: top-tint,
 /// attachments, drop, bubbles, lightbox, files, files-menu, files-drop,
 /// files-empty, thread-attach and add-skill-upload. Phase 3: hub, clients,
 /// clients-revoke, pair-client and notifications. The icon picker: icon-picker,
@@ -177,6 +199,14 @@ fn main() {
             .and_then(consort_client::mock_routines::screen_state)
     {
         // The phase 2 screens: routines and memory.
+        Client::mock_with(state)
+    } else if mock
+        && let Some(state) = args
+            .screen
+            .as_deref()
+            .and_then(consort_client::mock_monid::screen_state)
+    {
+        // The Monid screens that start with no key on the hub.
         Client::mock_with(state)
     } else if mock
         && let Some(state) = args

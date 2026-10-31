@@ -12,58 +12,15 @@ use gpui_kit::{
 };
 
 use crate::{
-    app::{ConsortApp, Dialog},
+    app::ConsortApp,
     ui::{
-        menu::{OpenMenu, account_menu},
-        parts::{
-            ButtonKind, button, detail, focusable, icon, provider_logo, status_glyph, tag_chip,
-            text,
-        },
+        menu::{OpenMenu, account_menu, tool_menu},
+        parts::{detail, focusable, icon, provider_logo, status_glyph, tag_chip, text},
     },
 };
 
 /// How many completions the Add tag field offers at most.
 const TAG_COMPLETIONS: usize = 6;
-
-/// A section of the worker page: a title, a line under it and an action at
-/// the right, over a body.
-pub fn worker_section(
-    title: &str,
-    description: AnyElement,
-    action: Option<AnyElement>,
-    body: impl IntoElement,
-    t: &Tokens,
-) -> Div {
-    let c = &t.colors;
-    div()
-        .flex()
-        .flex_col()
-        .gap(t.space.md)
-        .child(
-            div()
-                .flex()
-                .items_end()
-                .gap(t.space.lg)
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .flex_1()
-                        .min_w_0()
-                        .gap(t.space.xxs)
-                        .child(
-                            div()
-                                .type_style(t.text.body)
-                                .font_weight(t.text.title.weight)
-                                .text_color(c.text_primary)
-                                .child(title.to_owned()),
-                        )
-                        .child(description),
-                )
-                .children(action),
-        )
-        .child(body)
-}
 
 /// A list with a border and rows inside it, as in the designs: no fill of
 /// its own.
@@ -77,7 +34,7 @@ pub fn row_list(t: &Tokens) -> Div {
 }
 
 /// One row of a row list.
-fn list_row(last: bool, t: &Tokens) -> Div {
+pub(crate) fn list_row(last: bool, t: &Tokens) -> Div {
     div()
         .flex()
         .items_center()
@@ -91,7 +48,11 @@ fn list_row(last: bool, t: &Tokens) -> Div {
 }
 
 /// A small bordered button inside a row: Sign in again, Update to X.
-fn row_button(id: impl Into<SharedString>, label: String, t: &Tokens) -> gpui_kit::Stateful<Div> {
+pub(crate) fn row_button(
+    id: impl Into<SharedString>,
+    label: String,
+    t: &Tokens,
+) -> gpui_kit::Stateful<Div> {
     let c = &t.colors;
     focusable(div().id(gpui_kit::ElementId::Name(id.into())), t)
         .flex_none()
@@ -224,7 +185,11 @@ impl ConsortApp {
                         c.border_strong
                     })
                     .bg(c.surface_card)
-                    .child(crate::ui::parts::input(&self.inputs.tag, detail(t)).flex_1())
+                    .child(
+                        crate::ui::parts::input(&self.inputs.tag, detail(t))
+                            .flex_1()
+                            .min_w_0(),
+                    )
                     .child(
                         div()
                             .id("tag-entry-close")
@@ -321,7 +286,8 @@ impl ConsortApp {
                             detail(t),
                             c.status_failed,
                         )
-                        .flex_1(),
+                        .flex_1()
+                        .min_w_0(),
                     ),
             );
         }
@@ -410,72 +376,22 @@ impl ConsortApp {
         .detach();
     }
 
-    /// The Accounts section: one row per account, with its logo, name, plan
-    /// or problem, status and one action. A right click opens the row menu.
-    pub fn accounts_section(&mut self, w: &WorkerView, t: &Tokens, cx: &mut Context<Self>) -> Div {
-        let c = &t.colors;
-        let online = w.online;
-        let mut list = row_list(t);
-        let last = w.accounts.len().saturating_sub(1);
-        for (i, account) in w.accounts.iter().enumerate() {
-            list = list.child(self.account_row(w, account, i == last, t, cx));
-        }
-        if w.accounts.is_empty() {
-            list = list.child(div().py(t.space.md).px(t.space.lg).child(text(
-                format!("{} has no accounts yet. Add one to run tasks here.", w.name),
-                t.text.ui,
-                c.text_secondary,
-            )));
-        }
-        let worker_id = w.id.clone();
-        let label_color = if online {
-            c.text_primary
-        } else {
-            c.text_tertiary
-        };
-        let add = button("add-account", "Add account", ButtonKind::Secondary, t)
-            .child(icon("plus", t.icon.dense, label_color))
-            .flex_row_reverse()
-            .when(!online, |b| b.text_color(label_color).cursor_default())
-            .when(online, |b| {
-                b.on_click(cx.listener(move |this, _, window, cx| {
-                    this.open_dialog(Dialog::AddAccount(worker_id.clone()), window, cx)
-                }))
-            });
-        let description = if online {
-            format!(
-                "Each account has its own sign-in and profile folder on {}.",
-                w.name
-            )
-        } else {
-            format!(
-                "{} is offline. You can change its accounts when it is online again.",
-                w.name
-            )
-        };
-        worker_section(
-            "Accounts",
-            text(description, t.text.ui, c.text_tertiary).into_any_element(),
-            Some(add.into_any_element()),
-            list,
-            t,
-        )
-    }
-
-    fn account_row(
+    pub(crate) fn account_row(
         &mut self,
         w: &WorkerView,
         account: &HarnessAccountView,
         last: bool,
+        tool_missing: bool,
         t: &Tokens,
         cx: &mut Context<Self>,
     ) -> gpui_kit::Stateful<Div> {
         let c = &t.colors;
         let online = w.online;
-        let quiet = matches!(
-            account.status,
-            AccountStatus::NotSignedIn | AccountStatus::Unknown
-        );
+        let quiet = tool_missing
+            || matches!(
+                account.status,
+                AccountStatus::NotSignedIn | AccountStatus::Unknown
+            );
         // The detail is Markdown with the code words in backticks, so the
         // reader can select and copy them.
         let detail_source =
@@ -513,6 +429,9 @@ impl ConsortApp {
         let (worker_id, account_id) = (w.id.clone(), account.id.clone());
         let action_id = format!("account-action-{}", account.id);
         let action: AnyElement = match account.action {
+            // A sign-in needs the tool. The Install button of the tool row is
+            // the way out.
+            _ if tool_missing => div().into_any_element(),
             AccountAction::None => div().into_any_element(),
             _ if !online => {
                 text(account.action.label(), t.text.ui, c.text_tertiary).into_any_element()
@@ -538,6 +457,14 @@ impl ConsortApp {
         let (menu_worker, menu_account) = (w.id.clone(), account.id.clone());
         let (settings_worker, settings_account) = (w.id.clone(), account.id.clone());
         let can_sign_out = matches!(status, AccountStatus::SignedIn | AccountStatus::Ready);
+        let dots = online.then(|| {
+            crate::ui::settings_providers::dots_button(
+                format!("account-dots-{}", account.id),
+                account_menu(&w.id, &account.id, can_sign_out),
+                t,
+                cx,
+            )
+        });
         list_row(last, t)
             .id(SharedString::from(format!("account-row-{}", account.id)))
             .child(
@@ -557,8 +484,7 @@ impl ConsortApp {
                     .flex_1()
                     .min_w_0()
                     .child(
-                        // The name opens the account's settings: its name
-                        // and its provider extras.
+                        // The name opens the account's settings.
                         focusable(
                             div().id(SharedString::from(format!(
                                 "account-settings-{}",
@@ -600,8 +526,16 @@ impl ConsortApp {
                     .items_center()
                     .gap(t.space.xs + t.space.xxs)
                     .w(t.component.account_state)
-                    .child(status_dot(status, t))
-                    .child(text(status.label(), detail(t), status_color)),
+                    .when(!tool_missing, |d| d.child(status_dot(status, t)))
+                    .child(text(
+                        if tool_missing {
+                            "Cannot run"
+                        } else {
+                            status.label()
+                        },
+                        detail(t),
+                        status_color,
+                    )),
             )
             .child(
                 div()
@@ -611,6 +545,7 @@ impl ConsortApp {
                     .w(t.component.account_action)
                     .child(action),
             )
+            .child(div().flex_none().w(t.component.row_dots).children(dots))
             .when(online, |row| {
                 row.on_mouse_down(
                     MouseButton::Right,
@@ -623,72 +558,14 @@ impl ConsortApp {
             })
     }
 
-    /// The Installed tools section: each tool's logo, version and state,
-    /// with Check now.
-    pub fn tools_section(&mut self, w: &WorkerView, t: &Tokens, cx: &mut Context<Self>) -> Div {
-        let c = &t.colors;
-        let online = w.online;
-        let mut list = row_list(t);
-        let last = w.tools.len().saturating_sub(1);
-        for (i, tool) in w.tools.iter().enumerate() {
-            list = list.child(self.tool_row(w, tool, i == last, t, cx));
-        }
-        if w.tools.is_empty() {
-            list = list.child(div().py(t.space.md).px(t.space.lg).child(text(
-                format!(
-                    "No tools yet. {} installs a provider when an account needs it.",
-                    w.name
-                ),
-                t.text.ui,
-                c.text_secondary,
-            )));
-        }
-        let worker_id = w.id.clone();
-        let check = div().py(t.space.xs).child(
-            row_link("check-tools", "Check now".into(), t.text.ui_strong, t)
-                .when(!online, |b| b.opacity(t.opacity.answered_dim))
-                .when(online, |b| {
-                    b.on_click(cx.listener(move |this, _, _, cx| {
-                        let client = this.client.clone();
-                        let id = worker_id.clone();
-                        this.spawn_command(cx, async move { client.check_tools(id).await });
-                        this.show_notice("Checking for updates.".into(), cx);
-                    }))
-                }),
-        );
-        let description = div()
-            .flex()
-            .flex_wrap()
-            .type_style(t.text.ui)
-            .text_color(c.text_tertiary)
-            .child(format!("{} keeps its own copies in\u{a0}", w.name))
-            .child(
-                crate::ui::parts::selectable(
-                    SharedString::from(format!("tools-folder-{}", w.id)),
-                    w.tools_folder.clone(),
-                    t.text.ui,
-                    c.text_tertiary,
-                )
-                .font_family(t.font_mono.clone()),
-            )
-            .child("\u{a0}and checks for updates every day.");
-        worker_section(
-            "Installed tools",
-            description.into_any_element(),
-            Some(check.into_any_element()),
-            list,
-            t,
-        )
-    }
-
-    fn tool_row(
+    pub(crate) fn tool_row(
         &mut self,
         w: &WorkerView,
         tool: &ToolView,
         last: bool,
         t: &Tokens,
         cx: &mut Context<Self>,
-    ) -> Div {
+    ) -> gpui_kit::Stateful<Div> {
         let c = &t.colors;
         let missing = tool.state == ToolState::Missing;
         let label = tool.action_label();
@@ -733,7 +610,18 @@ impl ConsortApp {
                 c.text_primary
             },
         );
+        let (menu_worker, menu_tool, menu_folder) =
+            (w.id.clone(), tool.id.clone(), w.tools_folder.clone());
         list_row(last, t)
+            .id(SharedString::from(format!("tool-row-{}", tool.id)))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    let items = tool_menu(&menu_worker, &menu_tool, &menu_folder, missing);
+                    this.open_menu(OpenMenu::at(event.position, items), cx);
+                    cx.stop_propagation();
+                }),
+            )
             .child(
                 div()
                     .flex_none()
@@ -782,5 +670,11 @@ impl ConsortApp {
                     .w(t.component.tool_state)
                     .child(state),
             )
+            .child(crate::ui::settings_providers::dots_button(
+                format!("tool-dots-{}", tool.id),
+                tool_menu(&w.id, &tool.id, &w.tools_folder, missing),
+                t,
+                cx,
+            ))
     }
 }

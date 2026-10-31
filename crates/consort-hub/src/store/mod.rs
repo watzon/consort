@@ -41,6 +41,7 @@ pub mod feed;
 pub mod knowledge;
 pub mod machine;
 pub mod migrations;
+pub mod monid;
 pub mod preferences;
 pub mod proactivity;
 pub mod routines;
@@ -462,6 +463,11 @@ pub fn meta_get(conn: &Connection, key: &str) -> Result<Option<String>> {
 }
 
 impl Tx<'_> {
+    pub fn meta_delete(&mut self, key: &str) -> Result<()> {
+        self.tx.execute("DELETE FROM meta WHERE key = ?1", [key])?;
+        Ok(())
+    }
+
     pub fn meta_set(&mut self, key: &str, value: &str) -> Result<()> {
         self.tx.execute(
             "INSERT INTO meta (key, value) VALUES (?1, ?2)

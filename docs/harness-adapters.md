@@ -96,29 +96,56 @@ The probe of an account reports its models, each with its options. The `effort` 
 
 The worker writes the model and the options of each session that it opens to its log (`opening a harness session`).
 
+## Failed turns
+
+The adapter sorts a failed turn into a kind, so the hub can decide what to do (see "The fallback path" in [architecture.md](architecture.md)). `rate_limit` is a usage limit, with the reset time when the harness gives it. `provider_outage` is a provider that is down or overloaded. `expired_sign_in`, `worker_restarted` and `unknown` start no move.
+
+- **Claude Code and the other ACP agents** give the error as text. The adapter reads the words of the Anthropic and OpenAI API errors for an outage: `overloaded_error`, status 500, 502, 503, 504 and 529, "service unavailable", "bad gateway", "gateway timeout" and "internal server error", and the `errorKind` values `overloaded` and `server_error`. A 429 is always a limit, even when the text also says "overloaded". A bare "Internal error" is `unknown`, because the adapters send it for many causes.
+- **Codex** gives `codexErrorInfo`. `serverOverloaded`, `internalServerError`, `httpConnectionFailed`, `responseStreamConnectionFailed` and `responseStreamDisconnected` are outages.
+
+These words come from the known API errors. They were not tested against a real outage of a provider.
+
 ## Harness accounts
 
-In the UI a harness is a **provider**, and a harness account is an **account**. Accounts belong to a worker. The user makes them in Settings > Workers, with `account.create` (see [protocol.md](protocol.md#requests)). One provider can have several accounts on one worker. A new worker has no accounts, and the worker does not pick up a login that already exists on the machine.
+In the UI a harness is a **provider**, and a harness account is an **account**. Accounts belong to the session host on the hub machine. The user makes them in Settings > Providers, with `account.create` (see [protocol.md](protocol.md#requests)). One provider can have several accounts. The session host starts with no accounts, and it does not pick up a login that already exists on the machine.
+
+In the sections below, "the worker" as the owner of an account, a profile folder or a managed tool means the session host. The code moved at the cutover ([ADR 0015](adr/0015-the-hub-machine-owns-accounts-and-agents.md)).
+
+### Harnesses in the boundary
+
+A task session runs its CLI in the boundary, with tools from Consort. `Harness::boundary_support` says whether a harness may run there: proven, not needed or off with a reason. A harness turns on only after its tests in the boundary pass.
+
+| Harness | State |
+|---|---|
+| Claude Code | On. Real Haiku tasks ran in `sandbox-exec` on a Mac (see [E2E.md](E2E.md)). On Linux, only the boundary and the proxy ran, with no real model. A token refresh in the boundary ran on a Mac (see [E2E.md](E2E.md)), and did not run on Linux |
+| Codex | On. Real Codex 0.166.0 ran in `sandbox-exec` on a Mac with a local model, and called a Consort tool (see [E2E.md](E2E.md)). No real ChatGPT turn in the boundary has run yet, and none on Linux |
+| Gemini CLI | Off. No test proves it in the boundary |
+| OpenCode | Off. No test proves it in the boundary |
+| ACP registry agents and custom commands | Off. No test proves them in the boundary |
+
+The config of Claude Code is one function, for a new session and for a load: mode `default`, `settingSources: []`, `allowedTools: ["mcp__consort"]`, no native tools, no plugins and never `bypassPermissions`. `CLAUDE_CODE_EXECUTABLE` pins the version. The allow list of the proxy is `api.anthropic.com` and `platform.claude.com` on port 443. Because `settingSources` is empty, the CLI does not read `AGENTS.md` or `CLAUDE.md` by itself. The system prompt tells the model to read them in the workspace root.
+
+The config of Codex is also one set of keys for a new session and a resume, in all approval modes. The policy is `never` and the sandbox is `read-only`. The `features` of the shell, agents, goals, images, hooks and the browser are false, `web_search` is `disabled`, and each Consort server has `default_tools_approval_mode = "approve"`. Consort asks the user when a Consort tool runs, as it does for Claude Code. `apply_patch` comes from the model catalog and has no switch, so some models still see it. The fixed policy rejects each call, with no prompt and no file. Codex shows MCP tools through `tool_search`, so the developer instructions tell the model to look there. The login is a file in the profile, so a Codex boundary has no keychain rules. The allow list of the proxy is `chatgpt.com`, `api.openai.com` and `auth.openai.com`. A sign-in runs outside the boundary, because it needs a browser.
 
 ### Profile folders
 
-Each account that Consort makes has its own profile folder, `<consort home>/profiles/<name>/`. The name comes from the account name when the worker makes the account: lowercase, each run of characters other than `a` to `z` and `0` to `9` as one `-`, no `-` at either end, at most 48 characters, `account` when nothing is left, and `-2`, `-3` and so on when the name is taken. The worker writes the account to `worker.toml` as `{ id, harness, label, profile = true, profile_dir = "<name>" }`, plus `acp` for an ACP agent, so a rename does not move the folder. The Consort home is `~/.consort` (`%USERPROFILE%\.consort` on Windows), or `CONSORT_HOME`. `consort dev` uses `<data>/home` unless `CONSORT_HOME` is set. The profile folder holds the harness's own config and login, and `env.json` with the account's secret variables. The worker derives each harness's home settings from the profile folder:
+Each account that Consort makes has its own profile folder, `<consort home>/profiles/<name>/`. The name comes from the account name when the worker makes the account: lowercase, each run of characters other than `a` to `z` and `0` to `9` as one `-`, no `-` at either end, at most 48 characters, `account` when nothing is left, and `-2`, `-3` and so on when the name is taken. The worker writes the account to `session-host.toml` as `{ id, harness, label, profile = true, profile_dir = "<name>" }`, plus `acp` for an ACP agent, so a rename does not move the folder. The Consort home is `~/.consort` (`%USERPROFILE%\.consort` on Windows), or `CONSORT_HOME`. `consort dev` uses `<data>/home` unless `CONSORT_HOME` is set. The profile folder holds the harness's own config and login, and `env.json` with the account's secret variables. The worker derives each harness's home settings from the profile folder:
 
 | Harness | Settings |
 |---|---|
 | Claude Code | `CLAUDE_CONFIG_DIR=<profile>/claude` |
 | Codex | `CODEX_HOME=<profile>/codex`. Its `config.toml` gets `cli_auth_credentials_store = "file"` and `check_for_update_on_startup = false` |
 | Gemini CLI | `GEMINI_CLI_HOME=<profile>/gemini`. Gemini CLI reads `$GEMINI_CLI_HOME/.gemini/settings.json`, which gets `general.enableAutoUpdate: false` |
-| OpenCode | `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME` and `XDG_CACHE_HOME` under `<profile>/xdg/`, and `HOME` (`USERPROFILE` too on Windows) set to `<profile>/home/`. OpenCode reads `~/.claude/skills`, `~/.agents/skills` and `~/.claude/CLAUDE.md` from the home folder, so an own `HOME` keeps the skills of the real home out. The worker pins the tools of the user to their real places, for each that exists and that the worker's own environment does not set already: `GIT_CONFIG_GLOBAL` (`~/.gitconfig`), `GNUPGHOME`, `CARGO_HOME`, `RUSTUP_HOME`, `BUN_INSTALL` and `npm_config_cache`. `env.json` can override them. **OpenSSH needs no pin.** `ssh` finds `~/.ssh` (keys, `config`, `known_hosts`) through the password database, not through `HOME`, so the own `HOME` hides `~/.claude` and `~/.agents` but not the ssh files of the user. Tested on macOS with OpenSSH 10.3 and by `openssh_ignores_the_own_home_of_an_opencode_account` in `consort-worker` (`ssh -G` with a `HOME` that has its own `.ssh/config`). `SSH_AUTH_SOCK` stays in the environment, so the ssh agent works. Win32-OpenSSH reads the profile folder of the user token, not `USERPROFILE`; this is not tested. An OpenCode account from `worker.toml` (not made by Consort) keeps the real `HOME`, so it also loads `~/.claude/skills`; make the account in the app to get the own `HOME` |
+| OpenCode | `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME` and `XDG_CACHE_HOME` under `<profile>/xdg/`, and `HOME` (`USERPROFILE` too on Windows) set to `<profile>/home/`. OpenCode reads `~/.claude/skills`, `~/.agents/skills` and `~/.claude/CLAUDE.md` from the home folder, so an own `HOME` keeps the skills of the real home out. The worker pins the tools of the user to their real places, for each that exists and that the worker's own environment does not set already: `GIT_CONFIG_GLOBAL` (`~/.gitconfig`), `GNUPGHOME`, `CARGO_HOME`, `RUSTUP_HOME`, `BUN_INSTALL` and `npm_config_cache`. `env.json` can override them. **OpenSSH needs no pin.** `ssh` finds `~/.ssh` (keys, `config`, `known_hosts`) through the password database, not through `HOME`, so the own `HOME` hides `~/.claude` and `~/.agents` but not the ssh files of the user. Tested on macOS with OpenSSH 10.3 and by `openssh_ignores_the_own_home_of_an_opencode_account` in `consort-worker` (`ssh -G` with a `HOME` that has its own `.ssh/config`). `SSH_AUTH_SOCK` stays in the environment, so the ssh agent works. Win32-OpenSSH reads the profile folder of the user token, not `USERPROFILE`; this is not tested. An OpenCode account from `session-host.toml` (not made by Consort) keeps the real `HOME`, so it also loads `~/.claude/skills`; make the account in the app to get the own `HOME` |
 | ACP agents | `HOME` stays as it is. Only the env is set |
 
 The worker merges `env.json` into the session env after the profile variables. It writes `env.json` with mode 0600 on Unix. The inventory reports the variable names (`secret_names`), never the values. The process of a profile account does not get the login variables of the worker's own environment (such as `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `CLAUDE_CONFIG_DIR` and `CODEX_HOME`), so it never uses a login that the machine already has.
 
-In the inventory, an ACP registry agent has the harness `acp:<registry id>`, so a client can show the registry icon. A custom ACP command has `acp:custom`. An `acp` account from `worker.toml` stays `acp`. A new worker has no accounts. The `auto_discover` key of older `worker.toml` files still reads, and the worker ignores it.
+In the inventory, an ACP registry agent has the harness `acp:<registry id>`, so a client can show the registry icon. A custom ACP command has `acp:custom`. An `acp` account from `session-host.toml` stays `acp`. A new worker has no accounts. The `auto_discover` key of older `session-host.toml` files still reads, and the worker ignores it.
 
-### Accounts in worker.toml
+### Accounts that Consort did not make
 
-A user can still write an account in `worker.toml` by hand (see [data-model.md](data-model.md#worker-local-state)). Such an account has a `home` and an optional `shadow_home`. A shadow home is a folder that links to the shared home for everything except the login files. So two accounts of one harness share settings, skills and history, and each keeps its own login. T3 Code does this for Codex with symlinks. Each harness keeps its login in a different place, so each adapter knows which files to keep private:
+An older `session-host.toml` can hold an account that Consort did not make. No user needs one, and the app has no way to sign in to it. Such an account has a `home` and an optional `shadow_home`. A shadow home is a folder that links to the shared home for everything except the login files. So two accounts of one harness share settings, skills and history, and each keeps its own login. T3 Code does this for Codex with symlinks. Each harness keeps its login in a different place, so each adapter knows which files to keep private:
 
 | Harness | Home setting | Private files |
 |---|---|---|
@@ -130,7 +157,7 @@ A user can still write an account in `worker.toml` by hand (see [data-model.md](
 
 The worker never reads the private files. It only reports `auth_state`, which each adapter gets from the harness itself, for example `account/read` in Codex.
 
-**A login that expired.** `claude auth status` reports no expiry, so an expired Claude Code login passes the probe (`signed in`), and the first turn finds out. `claude-agent-acp` then ends the turn with an internal error that carries the API error: `Failed to authenticate. API Error: 401`, `authentication_error` or "OAuth token has expired". When the text of a failed turn of a Claude Code account has one of these words (`login_expired_text` in `consort-harness`), the adapter sends the error event `login_expired` with the message "The login expired. Sign in again." and ends the turn with the same text. The worker marks the account `error` with that detail in its inventory (the app reads "expired" as Expired and shows Sign in again), and it keeps the mark across probes, because the probe cannot see the expiry. A completed turn on the account, or a sign-in that succeeds, clears the mark. `login_expired` is not `signed_out`: the login is not gone, it needs a new sign-in. Other harnesses do not use it, because their probes see an expiry or the text is not known.
+**A login that expired.** `claude auth status` reports no expiry, so an expired Claude Code login passes the probe (`signed in`), and the first turn finds out. `claude-agent-acp` then ends the turn with `auth_required`, or with an internal error that carries the API error: `Failed to authenticate. API Error: 401`, `authentication_error` or "OAuth token has expired". When a failed turn of a Claude Code account has `auth_required` or one of these words (`login_expired_text` in `consort-harness`), the adapter sends the error event `login_expired` with the message "The login expired. Sign in again." and ends the turn with the same text. The worker marks the account `error` with that detail in its inventory (the app reads "expired" as Expired and shows Sign in again), and it keeps the mark across probes, because the probe cannot see the expiry. A completed turn on the account, or a sign-in that succeeds, clears the mark. `login_expired` is not `signed_out`: the login is not gone, it needs a new sign-in. Other harnesses do not use it, because their probes see an expiry or the text is not known.
 
 A session can find out that the login is gone before the next probe. When a turn fails for that reason, the adapter sends a `signed_out` error event. When the open of a session fails for that reason (`auth_required` in ACP), the adapter returns `HarnessError::SignedOut`, and the worker sends the same event. In both cases the event has the step to sign in, and the worker marks the account signed out in its inventory at once, so placement stops choosing it.
 
@@ -166,19 +193,19 @@ The worker also adds the local MCP servers that the channel may use, with the sa
 
 ## Provider extras and skills
 
-Two things reach a session from outside the account's own folders: the account's **provider extras**, and the **skills** that the hub gives to the session's channel. The reasons, the tests and the results of the live checks are in [notes/step2-worker.md](notes/step2-worker.md).
+Two things could reach a session from outside the account's own folders: what the provider syncs to the account, and the **skills** that the hub gives to the session's channel. Consort turns off the first one, always. The user has no setting for it. The reasons, the tests and the results of the live checks are in [notes/step2-worker.md](notes/step2-worker.md).
 
-### Provider extras
+### What the provider syncs
 
-Each account has a switch, on by default, which the worker keeps in `worker.db` (`account_settings`). `account.update` with `extras_enabled` sets it. A change reaches the next session or resume of the account. A running session keeps what it started with. The inventory reports `extras_enabled`, and `extras` where the worker can list them.
+The harness starts without the connectors, plugins, skills and hooks that the provider adds to the account, where the harness allows that. The session host sets this at each `session/new`, `session/load` or `thread/start` or `thread/resume`. The app and the hub tools have no switch for it. The session host reports nothing about it in the inventory.
 
-| Harness | Account-synced extras | When the switch is off | Reported in `extras` |
-|---|---|---|---|
-| Claude Code | claude.ai connectors, synced plugins, synced skills | `_meta.claudeCode.options` of `session/new` and `session/load` gets `settings` `{"disableClaudeAiConnectors": true, "syncClaudeAiSkills": false, "syncClaudeAiPlugins": false}` and `env` `{"ENABLE_CLAUDEAI_MCP_SERVERS": "false"}`. Inline settings apply to the run only and move no file. The worker never writes the `syncClaudeAi*` keys to a settings file, because there Claude Code moves the synced folders to `.trash` | Counts and up to 20 names of the folders in `plugins/synced/*/` and `skills/synced/*/` of `CLAUDE_CONFIG_DIR`. The connectors need the network, so `mcp_servers` stays empty |
-| Codex | With ChatGPT sign-in: ChatGPT apps, plugins of the account, cloud skills | The `config` of `thread/start` and `thread/resume` gets `features.apps` and `features.plugins` false and `cloud.skills.enabled` false. `features.plugins` is one switch for all plugins, so it also stops plugins that the user installed by hand | Nothing (`None`) |
-| Gemini CLI | None for a personal Google account. The admin controls of an organization | No switch | `cannot_turn_off` says that organization settings apply |
-| OpenCode | Servers and providers of a connected OpenCode Console | No switch that spares the hub tools | `cannot_turn_off` says so |
-| ACP registry agents | Differs by agent, mostly enterprise settings | No switch | `cannot_turn_off` says so |
+| Harness | Synced by the provider | How it is off |
+|---|---|---|
+| Claude Code | claude.ai connectors, synced plugins, synced skills | `_meta.claudeCode.options` of `session/new` and `session/load` gets `settings` `{"disableClaudeAiConnectors": true, "syncClaudeAiSkills": false, "syncClaudeAiPlugins": false}` and `env` `{"ENABLE_CLAUDEAI_MCP_SERVERS": "false"}`. Inline settings apply to the run only and move no file. Consort never writes the `syncClaudeAi*` keys to a settings file, because there Claude Code moves the synced folders to `.trash`. `settingSources` is empty, so no hook of a profile or a repo runs |
+| Codex | With ChatGPT sign-in: ChatGPT apps, plugins of the account, cloud skills | The `config` of `thread/start` and `thread/resume` gets `features.apps` and `features.plugins` false and `cloud.skills.enabled` false. `features.plugins` is one switch for all plugins, so it also stops plugins that the user installed by hand |
+| Gemini CLI | None for a personal Google account. The admin controls of an organization | No switch. Organization settings apply |
+| OpenCode | Servers and providers of a connected OpenCode Console | No switch that spares the hub tools |
+| ACP registry agents | Differs by agent, mostly enterprise settings | No switch |
 
 ### Skills
 
@@ -216,7 +243,7 @@ The effective approval mode of a session is the lower of the requested mode and 
 
 The adapter tests check these values, and `tests/harness_modes.rs` in `consort-harness` checks the next rule for every adapter. OpenCode gets its mode in `OPENCODE_CONFIG_CONTENT` as a `permission` setting. Gemini CLI gets `--approval-mode`. Other ACP agents report Ask only.
 
-Full access is the only mode in which a harness runs commands with no prompt and no sandbox. Codex Auto runs commands with no prompt, but in its `workspace-write` sandbox. OpenCode, Gemini CLI and Pi have no sandbox, so a mode with no prompt is Full access for them. So in Auto, OpenCode and Gemini CLI ask before each command and each fetch, and Pi runs only in Full access. Claude Code has a middle mode of its own (`auto`), so in Auto it asks only for destructive actions and for actions outside the workspace. A new worker caps sessions at Auto, so a Full access session needs `max_approval_mode = "full_access"` in `worker.toml`.
+Full access is the only mode in which a harness runs commands with no prompt and no sandbox. Codex Auto runs commands with no prompt, but in its `workspace-write` sandbox. OpenCode, Gemini CLI and Pi have no sandbox, so a mode with no prompt is Full access for them. So in Auto, OpenCode and Gemini CLI ask before each command and each fetch, and Pi runs only in Full access. Claude Code has a middle mode of its own (`auto`), so in Auto it asks only for destructive actions and for actions outside the workspace. A new worker caps sessions at Auto, so a Full access session needs `max_approval_mode = "full_access"` in `session-host.toml`.
 
 A repo's own configuration can raise these limits, so below Full access the adapter keeps it out where the harness allows that:
 
@@ -343,7 +370,7 @@ So that a stop signal reaches only the worker:
 
 ## Install harnesses
 
-Each worker downloads and updates its own copy of each harness CLI, as a managed tool in `<consort home>/tools/<tool>/<version>/`. It does not use a global install. The `consort-tools` crate owns the downloads, the checks, the install layout and the launch specs. The worker launches every harness through it, and installs a missing tool first. While a tool installs, the account status says so, for example "Installing Claude Code".
+The session host downloads and updates its own copy of each harness CLI, as a managed tool in `<consort home>/tools/<tool>/<version>/`. It does not use a global install. The `consort-tools` crate owns the downloads, the checks, the install layout and the launch specs. The worker launches every harness through it, and installs a missing tool first. While a tool installs, the account status says so, for example "Installing Claude Code".
 
 | Tool | Source | Check | Launch |
 |---|---|---|---|
@@ -355,7 +382,9 @@ Each worker downloads and updates its own copy of each harness CLI, as a managed
 | `gemini-cli` | npm, with the managed Node | npm | `node .../bundle/gemini.js --acp` |
 | `acp:<id>` | An ACP registry agent: `binary` with a SHA-256, or `npx` | SHA-256. A `binary` without one is refused. `uvx` is not supported | From the registry |
 
-An install goes to a temporary folder next to the target, is checked, and is then renamed, so a failed install leaves nothing. The previous version stays until the new one is ready. The worker checks for updates once a day and on `tools.check`, and reports them in the inventory. It installs an update only on `tools.install`. It never updates a tool while a session, a probe or a sign-in uses it, or uses a tool that needs it (Node for the npm tools, Claude Code for its ACP adapter): the install waits until the tool is idle, and the tool's `detail` says so. A missing tool installs when a session, a sign-in or a probe needs it. A session waits for the install, and a probe reports "Installing <tool>." and probes again when the install ends. An account with a `binary` in `worker.toml` runs that program and no managed tool. Self-updates are off: `DISABLE_AUTOUPDATER=1` for Claude Code, `check_for_update_on_startup = false` for Codex, `OPENCODE_DISABLE_AUTOUPDATE=true` for OpenCode, and `general.enableAutoUpdate: false` for Gemini CLI. OpenCode version 2 is the supported line.
+An install goes to a temporary folder next to the target, is checked, and is then renamed, so a failed install leaves nothing. The previous version stays until the new one is ready. The worker checks for updates once a day and on `tools.check`, and reports them in the inventory. It installs an update only on `tools.install`. It never updates a tool while a session, a probe or a sign-in uses it, or uses a tool that needs it (Node for the npm tools, Claude Code for its ACP adapter): the install waits until the tool is idle, and the tool's `detail` says so. A missing tool installs when a session, a sign-in or a probe needs it. A session waits for the install, and a probe reports "Installing <tool>." and probes again when the install ends. An account with a `binary` in `session-host.toml` runs that program and no managed tool. Self-updates are off: `DISABLE_AUTOUPDATER=1` for Claude Code, `check_for_update_on_startup = false` for Codex, `OPENCODE_DISABLE_AUTOUPDATE=true` for OpenCode, and `general.enableAutoUpdate: false` for Gemini CLI. OpenCode version 2 is the supported line.
+
+**Helper tools.** Node.js and the Claude Code ACP adapter (`node` and `claude-agent-acp`) only support a provider. They install and update as before, but the app lists no row or section for them in Settings > Providers. The client hides them from the view, and the inventory still reports them. A helper that installs, fails to install or has an update shows on the row of the provider that needs it: Claude Code for both, and Gemini CLI for Node.js. That row then says "Installing Node.js.", "Node.js did not install." with the cause, or "An update for Node.js is available.", and its Try again or Update button runs the install of the provider and of the helpers that failed or have an update. Check for updates already checks every tool, helpers included.
 
 ## Tests
 

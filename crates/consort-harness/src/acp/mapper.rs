@@ -16,7 +16,7 @@ use consort_proto::model::{
     PlanStepStatus, ReasoningPayload, RequestOption, RequestOptionKind, ToolCallPayload, Usage,
     WebSearchPayload, tail_of,
 };
-use consort_proto::worker_link::{RequestBody, RequestOpened, SessionEvent, TurnEndReason};
+use consort_proto::session_host_link::{RequestBody, RequestOpened, SessionEvent, TurnEndReason};
 use serde_json::Value;
 
 use crate::{ItemTracker, command_cwd};
@@ -55,7 +55,7 @@ fn block_text(block: &Value) -> Option<&str> {
     }
 }
 
-/// Splits an MCP tool name such as `mcp__hub__post_update` into the server
+/// Splits an MCP tool name such as `mcp__consort__post_update` into the server
 /// and the tool.
 pub fn split_mcp_name(name: &str) -> Option<(String, String)> {
     let rest = name.strip_prefix("mcp__")?;
@@ -590,6 +590,8 @@ impl AcpMapper {
                     merged.get("rawInput").and_then(raw_command_folder),
                     self.workspace.as_deref(),
                 ),
+                check_note: None,
+                blocked: Vec::new(),
             },
             "edit" | "delete" | "move" => {
                 let mut paths: Vec<String> = file_changes(&merged, &kind)
@@ -608,7 +610,7 @@ impl AcpMapper {
             },
             _ => {
                 // The server comes only from the tool name in `_meta`. A
-                // title such as `mcp__hub__post_message` can come from any
+                // title such as `mcp__consort__post_message` can come from any
                 // agent, and the worker allows a hub tool without a card by
                 // this name, so a title must not pass for one.
                 let (server, tool) = match claude_tool_name(&merged) {

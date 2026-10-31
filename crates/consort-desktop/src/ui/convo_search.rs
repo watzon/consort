@@ -397,6 +397,7 @@ pub fn render_search(app: &mut ConsortApp, t: &Tokens, cx: &mut Context<ConsortA
                 .child(
                     div()
                         .flex_1()
+                        .min_w_0()
                         .text_color(c.text_primary)
                         .child(crate::ui::parts::input(&app.inputs.search, t.text.body)),
                 )
@@ -527,7 +528,7 @@ fn hub_row(
                         .when_some(hit.title_note.clone(), |d, note| {
                             d.child(text(note, t.text.ui, quiet))
                         })
-                        .child(div().flex_1())
+                        .child(div().flex_1().min_w_0())
                         .child(text(hit.detail.clone(), detail(t), quiet)),
                 )
                 .when(!hit.snippet.is_empty(), |d| {

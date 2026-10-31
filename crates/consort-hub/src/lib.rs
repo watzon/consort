@@ -16,10 +16,14 @@
 
 pub mod admin;
 mod api;
+mod approval_engine;
 mod backup;
+mod command_check;
 mod connectors;
 mod coordinator;
 mod error;
+mod fallback;
+mod fallback_flow;
 mod hub;
 mod limits;
 mod link;
@@ -85,6 +89,22 @@ pub fn create_setup_code(data_dir: &Path) -> Result<String> {
     machine::insert_pairing_code(
         &conn,
         PairingKind::Client,
+        &code,
+        Timestamp::now(),
+        PAIRING_CODE_TTL_MS,
+        Origin::HubMachine,
+    )?;
+    Ok(code.to_string())
+}
+
+/// Makes a single-use pairing code for the session host, valid for 10 minutes.
+/// It opens the database directly, so it works while a hub runs.
+pub fn create_session_host_code(data_dir: &Path) -> Result<String> {
+    let conn = store::open_and_migrate(data_dir)?;
+    let code = util::random_pairing_code();
+    machine::insert_pairing_code(
+        &conn,
+        PairingKind::SessionHost,
         &code,
         Timestamp::now(),
         PAIRING_CODE_TTL_MS,
@@ -160,6 +180,7 @@ pub async fn serve(config: HubConfig) -> Result<HubHandle> {
         scheduler::spawn(&hub),
         maintenance::spawn(&hub),
         spawn_connector_sweep(&hub),
+        spawn_monid_resume(&hub),
         spawn_skill_update_check(&hub),
         backup::spawn_scheduler(&hub),
         proactivity::spawn(&hub),
@@ -195,6 +216,16 @@ pub async fn serve(config: HubConfig) -> Result<HubHandle> {
     })
 }
 
+/// Follows the Monid runs that were going when the hub stopped.
+fn spawn_monid_resume(hub: &Hub) -> JoinHandle<()> {
+    let hub = hub.clone();
+    tokio::spawn(async move {
+        if let Err(err) = hub.resume_monid().await {
+            tracing::warn!(error = %err, "could not resume the Monid runs");
+        }
+    })
+}
+
 /// Checks every hour that the active connections still work. A connection
 /// that Composio reports as expired becomes "needs a new sign-in".
 fn spawn_connector_sweep(hub: &Hub) -> JoinHandle<()> {
@@ -204,6 +235,9 @@ fn spawn_connector_sweep(hub: &Hub) -> JoinHandle<()> {
             tokio::select! {
                 () = hub.shutdown.cancelled() => return,
                 () = tokio::time::sleep(connectors::STATUS_SWEEP_INTERVAL) => {}
+            }
+            if let Err(err) = hub.sweep_access_grants().await {
+                tracing::warn!(error = %err, "could not end the temporary access");
             }
             if let Err(err) = hub.sweep_connection_status().await {
                 tracing::warn!(error = %err, "could not check the connections");
@@ -248,6 +282,13 @@ impl HubHandle {
     /// `CONSORT_COMPOSIO_URL` variable sets it at start too.
     pub fn set_composio_url(&self, url: &str) {
         self.hub.connectors.set_base_url(url);
+    }
+
+    /// Sets how long placement must fail before the hub says that the
+    /// assistant cannot answer (see `coordinator::BLOCKED_GRACE`, 30
+    /// seconds). Tests make it short.
+    pub fn set_blocked_grace(&self, grace: std::time::Duration) {
+        self.hub.coordinators.set_grace(grace);
     }
 
     /// Uses other addresses for the built-in skill directories: the
@@ -363,6 +404,16 @@ impl HubHandle {
         let (code, _) = self
             .hub
             .new_pairing_code(PairingKind::Worker, Origin::HubMachine)
+            .await?;
+        Ok(code.to_string())
+    }
+
+    /// Makes a single-use pairing code for the session host, valid for 10
+    /// minutes. It works only on the route of the session host.
+    pub async fn new_session_host_pairing_code(&self) -> Result<String> {
+        let (code, _) = self
+            .hub
+            .new_pairing_code(PairingKind::SessionHost, Origin::HubMachine)
             .await?;
         Ok(code.to_string())
     }

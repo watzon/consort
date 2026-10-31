@@ -449,6 +449,11 @@ impl ConsortApp {
     pub fn open_channel_tab(&mut self, tab: ChannelTab, cx: &mut Context<Self>) {
         self.panel = Panel::Channel;
         self.channel_tab = tab;
+        if tab == ChannelTab::Connectors {
+            self.load_monid_status(cx);
+        } else {
+            self.monid_ui.panel = false;
+        }
         self.knowledge.routine_open = None;
         self.knowledge.panel_note = None;
         cx.notify();

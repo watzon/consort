@@ -82,7 +82,9 @@ pub fn page_section(title: &str, description: &str, body: impl IntoElement, t: &
                         .text_color(c.text_primary)
                         .child(title.to_owned()),
                 )
-                .child(text(description.to_owned(), t.text.ui, c.text_tertiary)),
+                .when(!description.is_empty(), |d| {
+                    d.child(text(description.to_owned(), t.text.ui, c.text_tertiary))
+                }),
         )
         .child(body)
 }
@@ -154,6 +156,8 @@ fn use_in_key(target: &UseInTarget) -> &'static str {
         UseInTarget::Skill(_) => "use-in-skill",
         UseInTarget::ConnectDialog => "use-in-connect",
         UseInTarget::AddSkillDialog => "use-in-add-skill",
+        UseInTarget::Monid => "use-in-monid",
+        UseInTarget::MonidDialog => "use-in-add-monid",
     }
 }
 
@@ -191,7 +195,7 @@ pub fn use_in_control(
             .rounded(t.radius.sm)
             .cursor_pointer()
             .whitespace_nowrap()
-            .when(wide, |d| d.flex_1())
+            .when(wide, |d| d.flex_1().min_w_0())
             .when(active, |d| d.bg(c.surface_selected))
             .when(!active, |d| d.hover(|s| s.bg(c.hover_card)))
     };

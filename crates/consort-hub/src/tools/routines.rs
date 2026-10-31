@@ -87,6 +87,7 @@ impl Hub {
             prompt: args.prompt,
             action,
             enabled: args.enabled,
+            monid: None,
         };
         let routine = self.update_routine_in(Some(ctx.channel.id), update).await?;
         Ok(serde_json::to_value(RoutineResult { routine, notes })?)
@@ -120,6 +121,7 @@ mod tests {
     fn ctx_for(channel: &Channel) -> ToolCtx {
         ToolCtx {
             session: Session {
+                execution_worker_id: None,
                 id: SessionId::new(),
                 role: SessionRole::Coordinator,
                 channel_id: channel.id,

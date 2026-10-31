@@ -16,7 +16,7 @@ use consort_theme::{Tokens, Type, TypeExt as _};
 use gpui_kit::{
     AnyElement, App, Context, Entity, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
     ParentElement, Pixels, SharedString, StatefulInteractiveElement as _, Styled, TextRun, Window,
-    component::input::TextareaState, div, font, prelude::FluentBuilder as _, px,
+    component::input::EditorState, div, font, prelude::FluentBuilder as _, px,
 };
 
 use crate::{
@@ -82,7 +82,7 @@ const TASK_IDS: Ids = Ids {
 /// What differs between the two composers.
 struct Spec {
     ids: Ids,
-    input: Entity<TextareaState>,
+    input: Entity<EditorState>,
     upload: UploadTarget,
     picker: PickerTarget,
     text_target: TextTarget,
@@ -165,24 +165,6 @@ fn text_width(window: &Window, t: &Tokens, content: &str, style: Type) -> Pixels
 }
 
 impl ConsortApp {
-    /// A click on the mic button. The box takes the focus, so dictation types
-    /// into it. `started` is the answer of the platform call. When the system
-    /// did not start dictation, the hint shows as an information notice.
-    pub fn click_mic(
-        &mut self,
-        input: Entity<TextareaState>,
-        started: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        input.update(cx, |input, cx| input.focus(window, cx));
-        if let crate::dictation::MicOutcome::Hint(hint) =
-            crate::dictation::outcome(started, crate::convo::dictation_hint())
-        {
-            self.show_notice(hint, cx);
-        }
-    }
-
     /// The width of the column that the chat has now: the window less the
     /// sidebar and the panel beside it.
     pub fn chat_column_width(&self, t: &Tokens) -> Pixels {
@@ -343,6 +325,16 @@ impl ConsortApp {
         } else {
             spec.runs_on.clone().map(|s| (s, ids.side))
         };
+        let dictating = self.dictating_in(spec.text_target);
+        let starting = dictating && self.dictation.phase == consort_dictation::Phase::Starting;
+        // The state of a dictation takes the slot.
+        let side = crate::ui::dictation_view::side_line(if dictating {
+            self.dictation.phase
+        } else {
+            consort_dictation::Phase::Idle
+        })
+        .map(|line| (line.to_owned(), ids.side))
+        .or(side);
         let fit = self.tool_fit(
             &spec,
             side.as_ref().map(|(s, _)| s.as_str()),
@@ -370,7 +362,12 @@ impl ConsortApp {
                 )
             })
             .flatten();
-        let input = crate::ui::parts::textarea(&spec.input, t.text.body);
+        let rows = if is_channel {
+            crate::ui::parts::COMPOSER_ROWS
+        } else {
+            crate::ui::parts::REPLY_ROWS
+        };
+        let input = crate::ui::parts::message_field(&spec.input, t.text.body, rows, cx);
         let chips = self.render_upload_chips(&spec.upload, t, cx);
         let waiting = is_channel && self.waiting().is_some();
         let dropping = self
@@ -382,7 +379,6 @@ impl ConsortApp {
         let paste_target = spec.upload.clone();
         let add_target = spec.upload.clone();
         let focus_input = spec.input.clone();
-        let mic_input = spec.input.clone();
         let send_target = target.clone();
         let send = icon_button(
             ids.send,
@@ -395,6 +391,11 @@ impl ConsortApp {
             cx,
         )
         .rounded(t.radius.lg)
+        // A send that waits for the dictation shows the pressed color.
+        .when(
+            self.dictation.notice == Some(crate::dictation::DictationNotice::SendHeld) && dictating,
+            |d| d.bg(c.hover_card),
+        )
         .debug_selector(|| ids.send.into())
         .on_click(cx.listener(move |this, _, window, cx| {
             match &send_target {
@@ -432,7 +433,11 @@ impl ConsortApp {
             .p(t.space.sm)
             .bg(c.surface_card)
             .border(t.border_width)
-            .border_color(c.border_strong)
+            .border_color(if dictating {
+                c.accent_text.opacity(t.opacity.dictation_border)
+            } else {
+                c.border_strong
+            })
             .rounded(chat.composer_radius)
             // Files dragged over it: the field is the drop zone, with a
             // dashed accent border and a soft fill.
@@ -480,82 +485,75 @@ impl ConsortApp {
                     cx.stop_propagation();
                 }),
             );
-        let tools = div()
-            .id(ids.tools)
-            .debug_selector(|| ids.tools.into())
-            .flex()
-            .items_center()
-            .gap(t.space.xxs)
-            .w_full()
-            .max_w(t.layout.timeline_max_width)
-            .px(t.space.xs)
-            // The row never wraps and never runs past its column.
-            .overflow_hidden()
-            .child(
-                tool(ids.attach, "plus", cx)
-                    .debug_selector(|| ids.attach.into())
-                    .relative()
-                    .child(self.triggers.track(ids.attach))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.open_add_menu(ids.attach, add_target.clone(), cx)
-                    })),
-            )
-            // Voice: focus the box and ask the system to start dictation.
-            // When the system does not, the hint shows (DECISIONS 738).
-            .child(
-                tool(ids.mic, "voice", cx)
-                    .debug_selector(|| ids.mic.into())
-                    .tooltip(|_, cx| {
-                        gpui_kit::AppContext::new(cx, |_| {
-                            crate::ui::convo_sidebar::Tip("Dictate".into())
-                        })
-                        .into()
-                    })
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.click_mic(
-                            mic_input.clone(),
-                            crate::dictation::start_system_dictation(),
-                            window,
-                            cx,
-                        )
-                    })),
-            )
-            // The divider has nothing to divide without the model chips.
-            .when(spec.chips || inherited, |d| {
-                d.child(
-                    div()
-                        .debug_selector(|| ids.divider.into())
-                        .flex_none()
-                        .w(t.border_width)
-                        .h(t.icon.size)
-                        .mx(t.space.xs + t.space.xxs)
-                        .bg(c.border_strong),
+        let tools =
+            div()
+                .id(ids.tools)
+                .debug_selector(|| ids.tools.into())
+                .flex()
+                .items_center()
+                .gap(t.space.xxs)
+                .w_full()
+                .max_w(t.layout.timeline_max_width)
+                .px(t.space.xs)
+                // The row never wraps and never runs past its column.
+                .overflow_hidden()
+                .child(
+                    tool(ids.attach, "plus", cx)
+                        .debug_selector(|| ids.attach.into())
+                        .relative()
+                        .child(self.triggers.track(ids.attach))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.open_add_menu(ids.attach, add_target.clone(), cx)
+                        })),
                 )
-            })
-            .when(inherited, |d| {
-                d.child(
-                    text(
-                        format!("Same as {}", crate::ui::TUTTI),
-                        detail(t),
-                        c.text_tertiary,
+                .child(self.render_mic(ids.mic, spec.text_target, t, cx))
+                // The divider has nothing to divide without the model chips.
+                .when(spec.chips || inherited, |d| {
+                    d.child(
+                        div()
+                            .debug_selector(|| ids.divider.into())
+                            .flex_none()
+                            .w(t.border_width)
+                            .h(t.icon.size)
+                            .mx(t.space.xs + t.space.xxs)
+                            .bg(c.border_strong),
                     )
-                    .flex_none()
-                    .whitespace_nowrap()
-                    .pr(t.space.xs),
-                )
-            })
-            .children(model_chip)
-            .children(effort_chip)
-            .child(div().flex_1())
-            .when(fit.side, |d| {
-                d.children(side.map(|(label, id)| {
-                    text(label, detail(t), c.text_tertiary)
+                })
+                .when(inherited, |d| {
+                    d.child(
+                        text(
+                            format!("Same as {}", crate::ui::TUTTI),
+                            detail(t),
+                            c.text_tertiary,
+                        )
                         .flex_none()
                         .whitespace_nowrap()
-                        .id(id)
-                        .debug_selector(move || id.into())
-                }))
-            });
+                        .pr(t.space.xs),
+                    )
+                })
+                .children(model_chip)
+                .children(effort_chip)
+                .child(div().flex_1().min_w_0())
+                .when(fit.side, |d| {
+                    d.when(starting, |d| {
+                        d.child(div().flex_none().pr(t.space.xs).child(
+                            crate::ui::parts::status_glyph(
+                                "dictation-starting",
+                                consort_client::TaskStatus::Working,
+                                t.icon.dense,
+                                t,
+                                cx,
+                            ),
+                        ))
+                    })
+                    .children(side.map(|(label, id)| {
+                        text(label, detail(t), c.text_tertiary)
+                            .flex_none()
+                            .whitespace_nowrap()
+                            .id(id)
+                            .debug_selector(move || id.into())
+                    }))
+                });
         div()
             .flex()
             .flex_col()

@@ -15,7 +15,7 @@ use consort_proto::client_api::{
 use consort_proto::error::ErrorCode;
 use consort_proto::frame::{Frame, MAX_FRAME_BYTES};
 use consort_proto::ids::{ChannelId, MessageId};
-use consort_proto::worker_link::{HubToWorker, SessionTurnResult, TurnEndReason};
+use consort_proto::session_host_link::{HubToSessionHost, SessionTurnResult, TurnEndReason};
 
 /// The most a message body can have in this build (256 KiB as JSON). These
 /// tests use bodies just under it.
@@ -61,7 +61,7 @@ async fn large_messages_that_arrive_during_a_turn_go_out_over_several_turns() {
             .try_next_command(Duration::from_secs(5))
             .await
             .expect("the hub sent no turn with the queued messages");
-        let HubToWorker::SessionTurn(turn) = command else {
+        let HubToSessionHost::SessionTurn(turn) = command else {
             panic!("expected session.turn");
         };
         let size = Frame::Request(request.clone()).to_text().unwrap().len();

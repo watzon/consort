@@ -21,11 +21,27 @@ pub enum WorkerState {
     Offline,
 }
 
+/// What a machine does for the hub.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MachineKind {
+    /// A machine where work runs. It has no accounts.
+    #[default]
+    Execution,
+    /// The session host on the hub machine: profiles, sign-ins, managed tools
+    /// and harness processes. The UI never lists it as a worker.
+    SessionHost,
+}
+
 /// A machine that runs sessions for the hub.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Worker {
     /// The ID.
     pub id: WorkerId,
+    /// What the machine does. A session host holds the accounts and runs the
+    /// harnesses. An execution worker runs the work.
+    #[serde(default)]
+    pub kind: MachineKind,
     /// The name that the user set.
     pub name: String,
     /// The hostname.
@@ -196,6 +212,10 @@ impl Capabilities {
 pub struct HarnessAccount {
     /// The ID, unique per worker.
     pub account_id: AccountId,
+    /// Why Consort does not start this account, in words for the user. Set
+    /// for a harness that no test proves inside the boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_reason: Option<String>,
     /// `claude`, `codex`, `pi`, `opencode` or `acp:<agent-id>`.
     pub harness: String,
     /// The label, for example "Claude Personal". Two workers with the same
@@ -214,10 +234,10 @@ pub struct HarnessAccount {
     /// What sessions of this account can do.
     #[serde(default)]
     pub capabilities: Capabilities,
-    /// Whether the user enabled the account in `worker.toml`.
+    /// Whether the user enabled the account in `session-host.toml`.
     pub enabled: bool,
     /// True for an account that Consort created, with its own profile
-    /// folder. False for an account that a user wrote in `worker.toml` by
+    /// folder. False for an account that a user wrote in `session-host.toml` by
     /// hand.
     #[serde(default)]
     pub profile: bool,
@@ -234,59 +254,23 @@ pub struct HarnessAccount {
     /// The sign-in methods that a client may offer for this account.
     #[serde(default)]
     pub sign_in_methods: Vec<SignInMethod>,
-    /// Whether the worker starts this account's harness with its
-    /// account-synced extras, such as claude.ai connectors and synced
-    /// plugins and skills. On by default. An inventory from an older worker
-    /// has no field, which reads as on.
-    #[serde(default = "default_true")]
-    pub extras_enabled: bool,
-    /// What the account brings from the provider's side, when the worker
-    /// can tell. Never a secret value.
-    #[serde(default)]
-    pub extras: Option<ProviderExtras>,
-}
-
-fn default_true() -> bool {
-    true
-}
-
-/// The most names in one group of [`ProviderExtras`]. The count can be
-/// higher.
-pub const PROVIDER_EXTRAS_NAMES_MAX: usize = 20;
-
-/// One kind of provider extra: how many the account has, and some names.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct ExtrasGroup {
-    /// How many there are.
-    #[serde(default)]
-    pub count: u32,
-    /// Short names, at most [`PROVIDER_EXTRAS_NAMES_MAX`].
-    #[serde(default)]
-    pub names: Vec<String>,
-}
-
-/// What a harness account syncs from the provider's side, as the worker
-/// reports it in the inventory. For Claude Code: the claude.ai MCP servers
-/// (connectors), the synced plugins and the synced skills.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct ProviderExtras {
-    /// MCP servers that the provider adds, such as claude.ai connectors.
-    #[serde(default)]
-    pub mcp_servers: ExtrasGroup,
-    /// Plugins that the provider syncs.
-    #[serde(default)]
-    pub plugins: ExtrasGroup,
-    /// Skills that the provider syncs.
-    #[serde(default)]
-    pub skills: ExtrasGroup,
-    /// Extras that the worker cannot turn off for this provider, in words
-    /// for the account dialog, for example "Plugins that you installed by
-    /// hand in this profile".
-    #[serde(default)]
-    pub cannot_turn_off: Vec<String>,
 }
 
 impl HarnessAccount {
+    /// The smallest model of the account: a name with `haiku`, `luna`, `mini`
+    /// or `flash`, else its last model. The command check uses it when the
+    /// user chose no model.
+    pub fn smallest_model(&self) -> Option<&ModelInfo> {
+        let small = ["haiku", "luna", "mini", "flash"];
+        self.models
+            .iter()
+            .find(|m| {
+                let id = m.id.to_ascii_lowercase();
+                small.iter().any(|s| id.contains(s))
+            })
+            .or_else(|| self.models.last())
+    }
+
     /// Whether placement can use this account for `model`.
     pub fn can_run(&self, model: &str) -> bool {
         self.enabled
@@ -320,12 +304,13 @@ pub struct CheckoutInfo {
     pub managed: bool,
 }
 
-/// The limits that a worker sets on what the hub may ask it to do.
+/// The limits of a worker. The user sets them in the app, and the worker
+/// keeps and enforces them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerPolicy {
     /// The highest approval mode that sessions on this worker may use.
     pub max_approval_mode: ApprovalMode,
-    /// Folders where sessions may run. Empty means only `workspaces/`.
+    /// Folders where sessions may run. Empty means any folder.
     #[serde(default)]
     pub allowed_roots: Vec<String>,
     /// Whether sessions may run shell commands.
@@ -349,6 +334,16 @@ pub struct WorkerLoad {
     pub active_sessions: u32,
 }
 
+/// The boundary around a session on the session host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BoundaryInfo {
+    /// `sandbox-exec` on a Mac, for development.
+    MacSandbox,
+    /// Bubblewrap on Linux.
+    Bubblewrap,
+}
+
 /// What a worker has: its tags, harness accounts, managed tools, local MCP
 /// servers, checkouts, policy and load. The worker sends a full inventory after `hello` and again
 /// when any part changes.
@@ -363,10 +358,14 @@ pub struct Inventory {
     pub os: Os,
     /// The CPU architecture.
     pub arch: String,
-    /// Detected tags (such as `macos`, `arm64` or `ram-32gb`) and the tags in
-    /// `worker.toml`. Old inventories have this as `labels`.
+    /// Detected tags (such as `macos`, `arm64` or `ram-32gb`) and the tags in the
+    /// configuration file. Old inventories have this as `labels`.
     #[serde(default, alias = "labels")]
     pub tags: Vec<String>,
+    /// The boundary that this machine puts around a session. `None` on an
+    /// execution worker, or when a session host finds no boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boundary: Option<BoundaryInfo>,
     /// The harness accounts.
     #[serde(default)]
     pub accounts: Vec<HarnessAccount>,
@@ -547,6 +546,7 @@ mod tests {
 
     fn account(label: &str, auth_state: AuthState) -> HarnessAccount {
         HarnessAccount {
+            blocked_reason: None,
             account_id: AccountId::new(),
             harness: "claude".into(),
             label: label.into(),
@@ -582,13 +582,12 @@ mod tests {
                     variable: "ANTHROPIC_API_KEY".into(),
                 },
             ],
-            extras_enabled: true,
-            extras: None,
         }
     }
 
     fn inventory() -> Inventory {
         Inventory {
+            boundary: None,
             hash: String::new(),
             hostname: "bigboi".into(),
             os: Os::Windows,
@@ -631,6 +630,7 @@ mod tests {
 
     fn worker(tags: &[&str], inventory_tags: Option<&[&str]>) -> Worker {
         Worker {
+            kind: Default::default(),
             id: WorkerId::new(),
             name: "bigboi".into(),
             hostname: "bigboi".into(),
@@ -644,6 +644,7 @@ mod tests {
             state: WorkerState::Online,
             last_seen_at: None,
             inventory: inventory_tags.map(|t| Inventory {
+                boundary: None,
                 tags: t.iter().map(|t| (*t).to_owned()).collect(),
                 ..inventory()
             }),
@@ -683,8 +684,6 @@ mod tests {
                 "plan",
                 "secret_names",
                 "sign_in_methods",
-                "extras_enabled",
-                "extras",
             ] {
                 account.remove(key);
             }
@@ -698,9 +697,6 @@ mod tests {
         assert!(!account.profile);
         assert_eq!(account.email, None);
         assert!(account.sign_in_methods.is_empty());
-        // An older worker reports no extras toggle, which reads as on.
-        assert!(account.extras_enabled);
-        assert_eq!(account.extras, None);
         // The new name is what goes out.
         let out = serde_json::to_value(worker(&["work"], None)).unwrap();
         assert!(out.get("labels").is_none());
@@ -729,28 +725,19 @@ mod tests {
         assert_eq!(serde_json::from_value::<Inventory>(value).unwrap(), inv);
     }
 
+    /// An inventory from an older worker still has the provider extras
+    /// fields. They are gone from the model, and the account still loads.
     #[test]
-    fn provider_extras_round_trip() {
-        let mut a = account("Claude Personal", AuthState::SignedIn);
-        a.extras_enabled = false;
-        a.extras = Some(ProviderExtras {
-            mcp_servers: ExtrasGroup {
-                count: 3,
-                names: vec!["Gmail".into(), "Google Drive".into(), "Linear".into()],
-            },
-            plugins: ExtrasGroup::default(),
-            skills: ExtrasGroup {
-                count: 25,
-                names: vec!["pdf".into()],
-            },
-            cannot_turn_off: vec!["Plugins that you installed by hand in this profile".into()],
-        });
-        let value = serde_json::to_value(&a).unwrap();
-        assert_eq!(value["extras_enabled"], false);
-        assert_eq!(value["extras"]["mcp_servers"]["count"], 3);
+    fn old_provider_extras_fields_are_ignored() {
+        let a = account("Claude Personal", AuthState::SignedIn);
+        let mut value = serde_json::to_value(&a).unwrap();
+        let obj = value.as_object_mut().unwrap();
+        obj.insert("extras_enabled".into(), serde_json::json!(false));
+        obj.insert(
+            "extras".into(),
+            serde_json::json!({"skills": {"count": 25, "names": ["pdf"]}}),
+        );
         assert_eq!(serde_json::from_value::<HarnessAccount>(value).unwrap(), a);
-        let empty: ProviderExtras = serde_json::from_str("{}").unwrap();
-        assert_eq!(empty, ProviderExtras::default());
     }
 
     #[test]

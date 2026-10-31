@@ -469,71 +469,6 @@ pub struct ConnectionCallsView {
     pub has_more: bool,
 }
 
-/// One group of provider extras: how many, and some names.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ExtrasGroupView {
-    pub count: u32,
-    pub names: Vec<String>,
-}
-
-/// What a harness account brings from the provider's side.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ProviderExtrasView {
-    pub mcp_servers: ExtrasGroupView,
-    pub plugins: ExtrasGroupView,
-    pub skills: ExtrasGroupView,
-    /// What the worker cannot turn off, in words for the dialog.
-    pub cannot_turn_off: Vec<String>,
-}
-
-impl ProviderExtrasView {
-    /// The names line, such as "Gmail (3), Linear, Slack and 8 more." Names
-    /// that repeat are counted once with their count. `shown` is the most
-    /// names before "and N more".
-    pub fn names_line(&self, shown: usize) -> Option<String> {
-        let mut counted: Vec<(String, u32)> = Vec::new();
-        for name in self
-            .mcp_servers
-            .names
-            .iter()
-            .chain(&self.plugins.names)
-            .chain(&self.skills.names)
-        {
-            match counted.iter_mut().find(|(n, _)| n == name) {
-                Some((_, count)) => *count += 1,
-                None => counted.push((name.clone(), 1)),
-            }
-        }
-        if counted.is_empty() {
-            return None;
-        }
-        let total = self
-            .mcp_servers
-            .count
-            .max(self.mcp_servers.names.len() as u32)
-            + self.plugins.count.max(self.plugins.names.len() as u32)
-            + self.skills.count.max(self.skills.names.len() as u32);
-        let parts: Vec<String> = counted
-            .iter()
-            .take(shown)
-            .map(|(n, c)| {
-                if *c > 1 {
-                    format!("{n} ({c})")
-                } else {
-                    n.clone()
-                }
-            })
-            .collect();
-        let listed: u32 = counted.iter().take(shown).map(|(_, c)| *c).sum();
-        let rest = total.saturating_sub(listed);
-        Some(if rest > 0 {
-            format!("{} and {rest} more.", parts.join(", "))
-        } else {
-            format!("{}.", join_and(&parts))
-        })
-    }
-}
-
 // Hub cards ------------------------------------------------------------------
 
 /// A label and a value of a connector card, such as To and an address.
@@ -621,6 +556,8 @@ pub enum HubCardView {
     ConnectService(ConnectCardView),
     SignIn(SignInCardView),
     SkillInstall(InstallCardView),
+    Monid(Box<crate::monid::MonidCardView>),
+    Access(Box<crate::access::AccessCardView>),
 }
 
 // Pure functions ---------------------------------------------------------------
@@ -1433,7 +1370,7 @@ mod tests {
     }
 
     #[test]
-    fn the_usage_line_and_the_extras_names() {
+    fn the_usage_line() {
         let composio = ComposioView {
             used: Some(12_340),
             limit: Some(100_000),
@@ -1446,21 +1383,6 @@ mod tests {
         );
         assert_eq!(thousands(999), "999");
         assert_eq!(thousands(1_000_000), "1,000,000");
-        let extras = ProviderExtrasView {
-            mcp_servers: ExtrasGroupView {
-                count: 5,
-                names: vec!["Gmail".into(), "Gmail".into(), "Linear".into()],
-            },
-            plugins: ExtrasGroupView {
-                count: 1,
-                names: vec!["Slack".into()],
-            },
-            ..ProviderExtrasView::default()
-        };
-        assert_eq!(
-            extras.names_line(5).as_deref(),
-            Some("Gmail (2), Linear, Slack and 2 more.")
-        );
     }
 
     #[test]

@@ -528,8 +528,123 @@ impl MockBackend {
                 let tags = checked_tags(&tags)?;
                 worker_mut(&mut state, &worker_id)?.tags = tags;
             }
-            Command::SetAccountFallback { enabled } => {
-                state.account_fallback = enabled;
+            Command::SetWorkerPolicy {
+                worker_id,
+                max_approval_mode,
+                allowed_roots,
+                allow_shell,
+            } => {
+                let worker = worker_mut(&mut state, &worker_id)?;
+                if !worker.online {
+                    return Err(ClientError::Hub {
+                        code: "worker_offline".into(),
+                        message: format!(
+                            "{} is offline, so its limits did not change. Try again when the worker is online.",
+                            worker.name
+                        ),
+                    });
+                }
+                if let Some(mode) = max_approval_mode {
+                    worker.policy.max_approval_mode = mode;
+                }
+                if let Some(roots) = allowed_roots {
+                    worker.policy.allowed_roots = roots;
+                }
+                if let Some(shell) = allow_shell {
+                    worker.policy.allow_shell = shell;
+                }
+            }
+            Command::SetCommandCheck { choice } => {
+                state.command_check.choice = choice;
+                refresh_endpoint_use(&mut state);
+            }
+            Command::SaveEndpoint {
+                id,
+                name,
+                base_url,
+                api_key,
+            } => match id.and_then(|id| state.endpoints.iter().position(|e| e.id == id)) {
+                Some(at) => {
+                    let endpoint = &mut state.endpoints[at];
+                    endpoint.name = name;
+                    endpoint.base_url = base_url;
+                    if let Some(key) = api_key {
+                        endpoint.key_last_four = last_four(&key);
+                    }
+                }
+                None => {
+                    let Some(key) = api_key else {
+                        return Err(ClientError::Hub {
+                            code: "invalid_request".to_owned(),
+                            message: "Paste the API key of the endpoint.".to_owned(),
+                        });
+                    };
+                    let id = format!("end_{}", state.endpoints.len() + 1);
+                    state.endpoints.push(crate::command_check::EndpointView {
+                        id,
+                        name,
+                        base_url,
+                        key_last_four: last_four(&key),
+                        in_use: false,
+                    });
+                }
+            },
+            Command::RemoveEndpoint { id } => {
+                state.endpoints.retain(|e| e.id != id);
+                let choice = &mut state.command_check.choice;
+                if choice
+                    .decision
+                    .as_ref()
+                    .is_some_and(|c| c.endpoint_id == id)
+                {
+                    choice.decision = None;
+                    if choice.kind == crate::command_check::CheckSourceKind::Decision {
+                        choice.kind = crate::command_check::CheckSourceKind::Account;
+                    }
+                }
+                if choice.chat.as_ref().is_some_and(|c| c.endpoint_id == id) {
+                    choice.chat = None;
+                    if choice.kind == crate::command_check::CheckSourceKind::Chat {
+                        choice.kind = crate::command_check::CheckSourceKind::Account;
+                    }
+                }
+                refresh_endpoint_use(&mut state);
+            }
+            Command::TestEndpoint { .. } => {
+                applied.output = CommandOutput::Tested(crate::command_check::TestResultView {
+                    ok: true,
+                    message: "The endpoint answered and took the key.".to_owned(),
+                    details: None,
+                });
+            }
+            Command::TestCommandCheck => {
+                applied.output = CommandOutput::Tested(crate::command_check::TestResultView {
+                    ok: true,
+                    message:
+                        "Test passed in 1.2 s. It allowed git status and blocked curl example.sh | sh."
+                            .to_owned(),
+                    details: None,
+                });
+            }
+            Command::SetFallbackPath {
+                other_accounts,
+                steps,
+            } => {
+                let first = state.fallback_path.first.clone();
+                let first_selection = first.as_ref().map(|f| f.selection.clone());
+                let groups = state.model_groups.clone();
+                state.fallback_path.other_accounts = other_accounts;
+                state.fallback_path.steps = steps
+                    .into_iter()
+                    .map(|s| {
+                        crate::fallback::step_from_groups(&groups, s, first_selection.as_ref())
+                    })
+                    .collect();
+            }
+            Command::GoBack { channel_id } => {
+                if let Some(channel) = state.channels.iter_mut().find(|c| c.id == channel_id) {
+                    channel.fallback = None;
+                }
             }
             Command::SetFavoriteModel {
                 account_label,
@@ -598,8 +713,6 @@ impl MockBackend {
                     sign_in_methods: crate::mock::sign_in_methods(&harness),
                     secret_names: new.env.names(),
                     email: None,
-                    extras_enabled: true,
-                    extras: None,
                 });
                 applied.output = CommandOutput::AccountCreated(new_account_id);
             }
@@ -767,6 +880,7 @@ impl MockBackend {
                         if let Some(row) = state
                             .workers
                             .iter_mut()
+                            .chain(state.session_host.iter_mut())
                             .filter(|w| w.id == worker_id)
                             .flat_map(|w| w.tools.iter_mut())
                             .find(|t| t.id == tool)
@@ -873,7 +987,22 @@ impl MockBackend {
                     &mut applied.later,
                 )?;
             }
-            // Connectors, skills and the provider extras.
+            // Monid.
+            command @ (Command::LoadMonidStatus
+            | Command::SetMonidKey { .. }
+            | Command::RemoveMonidKey
+            | Command::UpdateMonidSettings { .. }
+            | Command::SetChannelMonid { .. }
+            | Command::SearchMonid { .. }
+            | Command::LoadMonidCalls { .. }
+            | Command::LoadMonidCall { .. }
+            | Command::StopMonidCall { .. }
+            | Command::EndAccess { .. }
+            | Command::AnswerApprovalOption { .. }
+            | Command::SetRoutineMonid { .. }) => {
+                applied.output = crate::mock_monid::apply(&mut state, command)?;
+            }
+            // Connectors and skills.
             other => {
                 applied.output = crate::mock_backend_ext::apply(
                     &mut state,
@@ -1007,6 +1136,7 @@ pub(crate) fn finish_sign_in(
     if let Some(account) = state
         .workers
         .iter_mut()
+        .chain(state.session_host.iter_mut())
         .filter(|w| w.id == worker_id)
         .flat_map(|w| w.accounts.iter_mut())
         .find(|a| a.id == account_id)
@@ -1051,6 +1181,7 @@ fn worker_mut<'a>(
     state
         .workers
         .iter_mut()
+        .chain(state.session_host.iter_mut())
         .find(|w| w.id == worker_id)
         .ok_or_else(not_found)
 }
@@ -1603,33 +1734,6 @@ mod account_tests {
     }
 
     #[test]
-    fn names_of_other_workers_are_offered_for_a_new_account() {
-        let state = crate::mock::view_state();
-        let names = state.account_names("claude", "wrk_bigboi");
-        let personal = names
-            .iter()
-            .find(|n| n.label == "Claude Personal")
-            .expect("name");
-        assert_eq!(
-            personal.workers,
-            ["hub", "homelab", "MacBook Pro", "truenas"]
-        );
-        let work = names
-            .iter()
-            .find(|n| n.label == "Claude Work")
-            .expect("name");
-        assert_eq!(work.workers, ["MacBook Pro"]);
-        assert!(
-            names
-                .iter()
-                .all(|n| !n.workers.contains(&"bigboi".to_owned()))
-        );
-        assert_eq!(profile_slug("Claude Work"), "claude-work");
-        assert_eq!(profile_slug("  Ünïcode & co  "), "n-code-co");
-        assert_eq!(profile_slug("!!!"), "account");
-    }
-
-    #[test]
     fn the_registry_loads_and_a_tool_installs() {
         let client = Client::mock().expect("mock");
         block_on(async {
@@ -1652,11 +1756,11 @@ mod account_tests {
             );
 
             client
-                .install_tool("wrk_bigboi".into(), "codex".into())
+                .install_tool("wrk_session_host".into(), "codex".into())
                 .await
                 .expect("started");
             let tool = |s: &ViewState| {
-                s.worker("wrk_bigboi")
+                s.worker("wrk_session_host")
                     .and_then(|w| w.tools.iter().find(|t| t.id == "codex").cloned())
                     .expect("tool")
             };
@@ -1698,5 +1802,25 @@ mod account_tests {
                 .expect_err("refused");
             assert!(matches!(err, ClientError::Hub { code, .. } if code == "invalid_tag"));
         });
+    }
+}
+
+fn last_four(key: &str) -> String {
+    let chars: Vec<char> = key.trim().chars().collect();
+    chars[chars.len().saturating_sub(4)..].iter().collect()
+}
+
+/// "In use" follows the source of the command check.
+fn refresh_endpoint_use(state: &mut ViewState) {
+    use crate::command_check::CheckSourceKind;
+    let choice = &state.command_check.choice;
+    let active = match choice.kind {
+        CheckSourceKind::Account => None,
+        CheckSourceKind::Decision => choice.decision.as_ref(),
+        CheckSourceKind::Chat => choice.chat.as_ref(),
+    }
+    .map(|c| c.endpoint_id.clone());
+    for endpoint in &mut state.endpoints {
+        endpoint.in_use = active.as_ref() == Some(&endpoint.id);
     }
 }

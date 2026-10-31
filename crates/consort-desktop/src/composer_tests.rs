@@ -287,3 +287,131 @@ fn chips_of_a_task_that_cannot_change_show_but_do_not_open(cx: &mut TestAppConte
         assert!(app.effort_menu.is_none(), "the effort chip does not open");
     });
 }
+
+/// The message box grows with its text from one row up to its limit, and the
+/// frame around it keeps the height of a text area.
+#[gpui::test]
+fn the_message_box_grows_from_one_row_to_its_limit(cx: &mut TestAppContext) {
+    let (handle, app) = open(state(), cx);
+    let cx = &mut VisualTestContext::from_window(handle, cx);
+    draw(cx);
+    let one_row = bounds(cx, "composer").size.height;
+    let set = |text: String, cx: &mut VisualTestContext| {
+        cx.update(|window, cx| {
+            app.update(cx, |app, cx| {
+                app.inputs
+                    .composer
+                    .update(cx, |input, cx| input.set_value(text, window, cx))
+            })
+        });
+        settle(cx, 50);
+    };
+    set("line\nline\nline".into(), cx);
+    let line = app.read_with(cx, |_, cx| ConsortApp::tokens(cx).text.body.line);
+    assert_eq!(bounds(cx, "composer").size.height, one_row + line * 2.);
+    set("line\n".repeat(30), cx);
+    assert_eq!(bounds(cx, "composer").size.height, one_row + line * 4.);
+    // A long line wraps, and the wrapped rows count.
+    set("word ".repeat(400), cx);
+    assert!(bounds(cx, "composer").size.height > one_row + line);
+    set(String::new(), cx);
+    assert_eq!(bounds(cx, "composer").size.height, one_row);
+}
+
+/// The box grows upward: its bottom edge and the tool row stay still, and
+/// Send stays in the bottom right corner of the box at every height.
+#[gpui::test]
+fn the_message_box_grows_upward_with_send_in_its_corner(cx: &mut TestAppContext) {
+    let (handle, app) = open(state(), cx);
+    let cx = &mut VisualTestContext::from_window(handle, cx);
+    draw(cx);
+    let corner = |cx: &mut VisualTestContext| {
+        let field = bounds(cx, "composer");
+        let send = bounds(cx, "send");
+        (field.right() - send.right(), field.bottom() - send.bottom())
+    };
+    let rest = bounds(cx, "composer");
+    let tools = bounds(cx, "composer-tools");
+    let rest_corner = corner(cx);
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            app.inputs.composer.update(cx, |input, cx| {
+                input.set_value("line\n".repeat(30), window, cx)
+            })
+        })
+    });
+    settle(cx, 50);
+    let grown = bounds(cx, "composer");
+    assert!(grown.size.height > rest.size.height);
+    assert!(grown.origin.y < rest.origin.y, "the top edge moves up");
+    assert_eq!(grown.bottom(), rest.bottom(), "the bottom edge stays");
+    assert_eq!(bounds(cx, "composer-tools").origin.y, tools.origin.y);
+    assert_eq!(corner(cx), rest_corner, "Send stays in the corner");
+}
+
+/// Past its limit the text scrolls inside the box: a wheel moves it, and a new
+/// word at the end stays in view.
+#[gpui::test]
+fn the_message_box_scrolls_its_text_past_the_limit(cx: &mut TestAppContext) {
+    let (handle, app) = open(state(), cx);
+    let cx = &mut VisualTestContext::from_window(handle, cx);
+    draw(cx);
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            app.inputs.composer.update(cx, |input, cx| {
+                input.set_value("line\n".repeat(30), window, cx)
+            })
+        })
+    });
+    settle(cx, 50);
+    let field = bounds(cx, "composer");
+    let offset = |cx: &mut VisualTestContext| {
+        app.read_with(cx, |app, cx| app.inputs.composer.read(cx).scroll_offset().y)
+    };
+    let top = offset(cx);
+    cx.simulate_event(gpui_kit::ScrollEvent {
+        position: field.center(),
+        delta: gpui_kit::ScrollDelta::Pixels(gpui_kit::point(px(0.), px(-60.))),
+        ..Default::default()
+    });
+    settle(cx, 50);
+    assert!(offset(cx) < top, "the wheel moves the text");
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            app.inputs.composer.update(cx, |input, cx| {
+                input.set_scroll_offset(gpui_kit::point(px(0.), top), cx);
+                input.set_cursor_position(
+                    gpui_kit::component::input::Position::new(30, 0),
+                    window,
+                    cx,
+                );
+                input.insert("last word", window, cx);
+            })
+        })
+    });
+    settle(cx, 50);
+    let row = app.read_with(cx, |_, cx| ConsortApp::tokens(cx).text.body.line);
+    assert!(offset(cx) <= top - row * 25., "the new word stays in view");
+}
+
+/// A right click on the text of a message box opens the menu of the box, not
+/// a menu of the editor.
+#[gpui::test]
+fn a_right_click_in_the_message_box_opens_its_menu(cx: &mut TestAppContext) {
+    use gpui_kit::{Modifiers, MouseButton};
+    let (handle, app) = open(state(), cx);
+    let cx = &mut VisualTestContext::from_window(handle, cx);
+    draw(cx);
+    let field = bounds(cx, "composer");
+    cx.simulate_mouse_down(field.center(), MouseButton::Right, Modifiers::default());
+    cx.simulate_mouse_up(field.center(), MouseButton::Right, Modifiers::default());
+    settle(cx, 50);
+    let labels = app.read_with(cx, |app, _| {
+        let menu = app.menu.as_ref().expect("the menu opens");
+        menu.items
+            .iter()
+            .map(|i| i.label.to_string())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(labels, ["Cut", "Copy", "Paste", "Select all"]);
+}

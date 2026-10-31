@@ -77,14 +77,14 @@ fn screen(app: &Entity<ConsortApp>, name: &str, cx: &mut VisualTestContext) {
 }
 
 #[gpui::test]
-fn the_hub_page_turns_the_move_to_another_account_off(cx: &mut TestAppContext) {
+fn the_models_page_turns_the_other_accounts_row_off(cx: &mut TestAppContext) {
     let (handle, app) = open(cx);
     let cx = &mut VisualTestContext::from_window(handle, cx);
-    screen(&app, "hub", cx);
-    app.read_with(cx, |app, _| assert!(app.state.account_fallback));
-    crate::test_support::click(cx, "account-fallback");
+    screen(&app, "models", cx);
+    app.read_with(cx, |app, _| assert!(app.state.fallback_path.other_accounts));
+    crate::test_support::click(cx, "fallback-other-accounts");
     until(cx, &app, "the switch to turn off", |app| {
-        !app.state.account_fallback
+        !app.state.fallback_path.other_accounts
     });
 }
 

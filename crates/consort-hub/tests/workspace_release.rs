@@ -12,8 +12,8 @@ use consort_proto::error::ErrorCode;
 use consort_proto::frame::MessageFamily;
 use consort_proto::ids::{ChannelId, SessionId, TaskId};
 use consort_proto::model::{ItemStatus, PlacementRequest, SessionState};
+use consort_proto::session_host_link::{HubToSessionHost, SessionStartResult, TurnEndReason};
 use consort_proto::status::TaskStatus;
-use consort_proto::worker_link::{HubToWorker, SessionStartResult, TurnEndReason};
 
 async fn task_in_review(world: &mut World, channel_id: ChannelId) -> (TaskId, SessionId) {
     let task = world
@@ -49,10 +49,10 @@ async fn task_in_review(world: &mut World, channel_id: ChannelId) -> (TaskId, Se
 
 /// Answers every command that comes within `wait` of the one before, and
 /// returns them. A `session.start` gets a start result.
-async fn drain(world: &mut World, wait: Duration) -> Vec<HubToWorker> {
+async fn drain(world: &mut World, wait: Duration) -> Vec<HubToSessionHost> {
     let mut commands = Vec::new();
     while let Some((request, command)) = world.worker.try_next_command(wait).await {
-        if matches!(command, HubToWorker::SessionStart(_)) {
+        if matches!(command, HubToSessionHost::SessionStart(_)) {
             world
                 .worker
                 .respond_ok(
@@ -125,9 +125,9 @@ async fn deleting_a_channel_releases_the_workspaces_of_its_tasks() {
     let commands = drain(&mut world, Duration::from_secs(2)).await;
     let stop = commands
         .iter()
-        .position(|c| matches!(c, HubToWorker::SessionStop(stop) if stop.session_id == s));
+        .position(|c| matches!(c, HubToSessionHost::SessionStop(stop) if stop.session_id == s));
     let release = commands.iter().position(
-        |c| matches!(c, HubToWorker::WorkspaceRelease(r) if r.task_id == task_id && r.delete),
+        |c| matches!(c, HubToSessionHost::WorkspaceRelease(r) if r.task_id == task_id && r.delete),
     );
     let names: Vec<&str> = commands.iter().map(|c| c.type_name()).collect();
     assert!(stop.is_some(), "no session.stop: {names:?}");
@@ -157,7 +157,7 @@ async fn not_done_after_archive_is_refused_and_retry_starts_again() {
     assert!(
         commands
             .iter()
-            .any(|c| matches!(c, HubToWorker::WorkspaceRelease(r) if r.task_id == task_id)),
+            .any(|c| matches!(c, HubToSessionHost::WorkspaceRelease(r) if r.task_id == task_id)),
         "the archive released nothing"
     );
     world
@@ -267,7 +267,7 @@ async fn a_task_in_review_whose_session_ended_can_retry() {
 async fn drain_until_start(world: &mut World, task_id: TaskId) -> SessionId {
     loop {
         let (request, command) = world.worker.next_command().await;
-        if let HubToWorker::SessionStart(start) = &command
+        if let HubToSessionHost::SessionStart(start) = &command
             && start.task_id == Some(task_id)
         {
             world

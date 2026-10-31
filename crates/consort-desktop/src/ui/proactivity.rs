@@ -383,6 +383,7 @@ impl ConsortApp {
                     .flex()
                     .flex_col()
                     .flex_1()
+                    .min_w_0()
                     .gap(t.space.xxs)
                     .py(t.space.md)
                     .px(t.space.lg)
@@ -397,6 +398,7 @@ impl ConsortApp {
                     .flex()
                     .flex_col()
                     .flex_1()
+                    .min_w_0()
                     .gap(t.space.xxs)
                     .py(t.space.md)
                     .px(t.space.lg)
@@ -483,6 +485,7 @@ impl ConsortApp {
                     .child(when)
                     .child(each)
                     .child(today)
+                    .children(self.monid_unattended_section(false, t, cx))
                     .child(self.render_proactivity_log(t, cx)),
             )
             .into_any_element()
@@ -985,27 +988,42 @@ impl ConsortApp {
         let c = &t.colors;
         let p = t.component.proactivity;
         let chat = t.component.chat;
-        let guide_link = (decision.question == consort_client::voice::VOICE_PROPOSAL_QUESTION)
-            .then(|| self.render_open_guide_link(t, cx));
         let pending = matches!(
             decision.state,
             consort_client::RequestState::Pending | consort_client::RequestState::Sending
         );
+        // While the offer waits, the guide is a proposal. After Do it, it is
+        // a memory note. After another answer, it is gone.
+        let guide_link = (decision.question == consort_client::voice::VOICE_PROPOSAL_QUESTION)
+            .then(|| {
+                if pending {
+                    Some(self.render_open_guide_link(t, cx))
+                } else if decision.chosen == Some(0) {
+                    Some(self.render_saved_guide_link(t, cx))
+                } else {
+                    None
+                }
+            })
+            .flatten();
+        let outcome = decision
+            .chosen
+            .and_then(|i| decision.options.get(i as usize))
+            .map_or("Closed, no answer.".to_owned(), |o| {
+                format!("You chose {}.", o.label)
+            });
         let answer = |i: u32, label: &str, kind: ButtonKind| {
             let id = decision.id.clone();
-            let chosen = decision.chosen == Some(i);
+            let selector = format!("offer-{}-{i}", decision.id);
             button(
-                SharedString::from(format!("offer-{}-{i}", decision.id)),
+                SharedString::from(selector.clone()),
                 label.to_owned(),
                 kind,
                 t,
             )
-            .when(!pending && !chosen, |d| d.opacity(t.opacity.answered_dim))
-            .when(pending, |d| {
-                d.on_click(cx.listener(move |this, _, window, cx| {
-                    this.answer_decision(id.clone(), Some(i), None, window, cx)
-                }))
-            })
+            .debug_selector(move || selector.clone())
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.answer_decision(id.clone(), Some(i), None, window, cx)
+            }))
         };
         let label = |i: usize, fallback: &str| {
             decision
@@ -1057,15 +1075,24 @@ impl ConsortApp {
             )
             // The offer of a learned style guide links to its full text.
             .when_some(guide_link, |d, link| d.child(link))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(t.space.sm)
-                    .child(answer(0, &label(0, "Do it"), ButtonKind::Primary))
-                    .child(answer(1, &label(1, "Not now"), ButtonKind::Secondary))
-                    .child(answer(2, &label(2, "Never about this"), ButtonKind::Quiet)),
-            )
+            .when(pending, |d| {
+                d.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(t.space.sm)
+                        .child(answer(0, &label(0, "Do it"), ButtonKind::Primary))
+                        .child(answer(1, &label(1, "Not now"), ButtonKind::Secondary))
+                        .child(answer(2, &label(2, "Never about this"), ButtonKind::Quiet)),
+                )
+            })
+            .when(!pending, |d| {
+                d.child(div().debug_selector(|| "offer-outcome".into()).child(text(
+                    outcome,
+                    t.text.ui,
+                    c.text_tertiary,
+                )))
+            })
             .into_any_element()
     }
 
@@ -1267,7 +1294,8 @@ impl ConsortApp {
                             detail(t),
                             c.text_tertiary,
                         )
-                        .flex_1(),
+                        .flex_1()
+                        .min_w_0(),
                     )
                     .child(
                         button("follow-ups-cancel-all", "Cancel all", ButtonKind::Quiet, t)

@@ -7,9 +7,9 @@
 
 use crate::common::*;
 use consort_proto::model::{SessionState, TurnErrorKind};
+use consort_proto::session_host_link::{SessionEvent, TurnEndReason};
 use consort_proto::status::TaskStatus;
 use consort_proto::time::Timestamp;
-use consort_proto::worker_link::{SessionEvent, TurnEndReason};
 use serde_json::Value;
 
 fn failed(kind: Option<TurnErrorKind>, resets_at: Option<Timestamp>, error: &str) -> SessionEvent {

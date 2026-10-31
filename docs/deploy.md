@@ -57,6 +57,27 @@ The unit sets `CONSORT_HUB_DATA`, `CONSORT_HUB_LISTEN` and `CONSORT_PUBLIC_URL`.
 
 The hub logs go to the journal: `journalctl -u consort-hub -f`.
 
+## Run the session host
+
+The session host holds the accounts and runs the agent CLIs. It is a separate service with its own user, because the hardened hub unit does not let a CLI or bubblewrap run. It cannot read `hub.db`, and the hub cannot read the profiles of the accounts. A session does not start when bubblewrap cannot run.
+
+```
+sudo apt install bubblewrap git
+sudo useradd --system --home-dir /var/lib/consort-session-host --shell /usr/sbin/nologin consort-session
+sudo install -m 0644 deploy/session-host/consort-session-host.service /etc/systemd/system/
+sudo -u consort consort hub session-host-code --data /var/lib/consort
+sudo -u consort-session consort session-host pair --hub http://127.0.0.1:7600 --code <code> \
+  --config-dir /var/lib/consort-session-host/config --consort-home /var/lib/consort-session-host/home
+sudo systemctl daemon-reload
+sudo systemctl enable --now consort-session-host
+```
+
+On Ubuntu 24.04 and later, AppArmor can stop bubblewrap from making a user namespace. Add a profile for `/usr/bin/bwrap` with the `userns` rule, or set `kernel.apparmor_restrict_unprivileged_userns=0`.
+
+With Docker, use `deploy/session-host/docker-compose.yml`. It uses `deploy/session-host/seccomp.json`, which allows only the calls that bubblewrap needs beyond the default list. Both images need a Sayso checkout beside this repo, because the workspace has a path dependency on it.
+
+Settings > Hub shows the state of the boundary. Sign in to accounts in Settings > Providers.
+
 ## HTTPS with Caddy
 
 The hub does not make certificates itself. A reverse proxy does it, and this is the supported way.
@@ -88,7 +109,7 @@ The data is in the volume `hub-data`. Caddy keeps its certificates in `caddy-dat
 To run the hub alone, without Compose:
 
 ```
-docker build -t consort-hub .
+docker build --build-context sayso=../sayso -t consort-hub .
 docker run -d --name consort-hub --restart unless-stopped \
   -p 127.0.0.1:7600:7600 -v consort-hub-data:/data \
   -e CONSORT_PUBLIC_URL=https://hub.example.com consort-hub
@@ -108,7 +129,7 @@ With Docker: `docker exec <container> consort hub setup-code`.
 
 Open the Consort app, enter the hub URL (`https://hub.example.com`) and the setup code. A code works once and expires after 10 minutes.
 
-To add a worker, open Settings > Workers > Add worker in the app. The dialog gives one command for the system of the worker. See [install.md](install.md).
+To add a worker, open Settings > Workers > Add worker in the app. The limits of a worker change in the same page, and no file on the worker needs an edit. The dialog gives one command for the system of the worker. See [install.md](install.md).
 
 A hub and a worker can run on the same server. Install the worker as a user service (`consort worker install`, see install.md) for the user that should own its files, and pair it with `https://hub.example.com`. Run the worker as a normal user, not as the `consort` user of the hub.
 

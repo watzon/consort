@@ -21,6 +21,15 @@
 #   APPLE_TEAM_ID            the team ID
 #   APPLE_APP_PASSWORD       an app-specific password for that Apple ID
 #
+# Dictation needs two GPL programs that ship beside the app (see
+# docs/dictation-licenses.md). Build them in Sayso and name them here. The app
+# works without them, but dictation then says that it could not run.
+#
+#   CONSORT_SPEECH_ENGINE    the macOS speech engine (SaysoEngine). Its resource
+#                            bundle beside it comes too.
+#   CONSORT_CLEANUP_RUNTIME  the sayso-cleanup program
+#   CONSORT_SAYSO_LICENSE    the GPL text of Sayso (its LICENSE file)
+#
 # The bundle ID is the constant below, unless --bundle-id changes it. The
 # version comes from [workspace.package] in Cargo.toml.
 set -euo pipefail
@@ -116,6 +125,8 @@ cat >"${app}/Contents/Info.plist" <<PLIST
   <true/>
   <key>NSSupportsAutomaticGraphicsSwitching</key>
   <true/>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Consort listens when you dictate into a message box. Your voice stays on this computer unless you choose Deepgram.</string>
   <key>NSHumanReadableCopyright</key>
   <string>MIT License</string>
 </dict>
@@ -123,13 +134,64 @@ cat >"${app}/Contents/Info.plist" <<PLIST
 PLIST
 plutil -lint "${app}/Contents/Info.plist" >/dev/null
 
+# The credits always ship. The programs ship when the build names them. The
+# engine has its own folder under Helpers, because its resource bundle must lie
+# beside it and a bundle in Contents/MacOS would break the signature of the app.
+licenses="${app}/Contents/Resources/licenses"
+mkdir -p "$licenses"
+cp docs/dictation-licenses.md "$licenses/dictation-licenses.md"
+helpers=()
+if [ -n "${CONSORT_SPEECH_ENGINE:-}" ]; then
+  engine_dir="${app}/Contents/Helpers/sayso-engine"
+  mkdir -p "$engine_dir"
+  cp "$CONSORT_SPEECH_ENGINE" "$engine_dir/sayso-engine"
+  for resource in "$(dirname "$CONSORT_SPEECH_ENGINE")"/*.bundle; do
+    if [ -e "$resource" ]; then
+      cp -R "$resource" "$engine_dir/"
+      helpers+=("$engine_dir/$(basename "$resource")")
+    fi
+  done
+  helpers+=("$engine_dir/sayso-engine")
+fi
+if [ -n "${CONSORT_CLEANUP_RUNTIME:-}" ]; then
+  cp "$CONSORT_CLEANUP_RUNTIME" "${app}/Contents/MacOS/sayso-cleanup"
+  helpers+=("${app}/Contents/MacOS/sayso-cleanup")
+fi
+if [ -n "${CONSORT_SAYSO_LICENSE:-}" ]; then
+  cp "$CONSORT_SAYSO_LICENSE" "$licenses/sayso-GPL-3.0.txt"
+fi
+
+# The app captures the microphone in its own process, so only the app has the
+# audio entitlement. A hardened runtime needs the entitlement for the capture.
+entitlements="$(mktemp -t consort-entitlements)"
+cat >"$entitlements" <<ENTITLEMENTS
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>com.apple.security.device.audio-input</key>
+  <true/>
+</dict>
+</plist>
+ENTITLEMENTS
+plutil -lint "$entitlements" >/dev/null
+
 if [ -n "${APPLE_SIGNING_IDENTITY:-}" ]; then
   echo "Signing with ${APPLE_SIGNING_IDENTITY}"
-  codesign --force --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$app"
+  # Inner code first, then the app.
+  for helper in ${helpers[@]+"${helpers[@]}"}; do
+    codesign --force --options runtime --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$helper"
+  done
+  codesign --force --options runtime --timestamp --entitlements "$entitlements" \
+    --sign "$APPLE_SIGNING_IDENTITY" "$app"
 else
   echo "No APPLE_SIGNING_IDENTITY. Signing ad hoc."
-  codesign --force --sign - "$app"
+  for helper in ${helpers[@]+"${helpers[@]}"}; do
+    codesign --force --sign - "$helper"
+  done
+  codesign --force --entitlements "$entitlements" --sign - "$app"
 fi
+rm -f "$entitlements"
 codesign --verify --strict "$app"
 
 notarize=0

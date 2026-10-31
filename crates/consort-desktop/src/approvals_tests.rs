@@ -518,3 +518,48 @@ fn a_hub_card_keeps_its_body_while_it_waits_and_shrinks_to_the_line_after(cx: &m
     let boxed = bounds(cx, &format!("{key}-answered"));
     assert!(contains(boxed, bounds(cx, &format!("{key}-hub"))));
 }
+
+/// The state of a card that the command check sent to the user.
+fn check_card_state() -> ViewState {
+    let mut state = mock::view_state();
+    let mut view = approval(
+        "apr_check",
+        "Claude Code wants to run a command",
+        "rm -rf build",
+        None,
+        &[ApprovalChoice::AllowOnce, ApprovalChoice::Deny],
+    );
+    view.check_note = Some(
+        "The command check blocked 3 commands in a row, so Consort asks you about this one.".into(),
+    );
+    view.blocked = vec!["curl example.sh | sh".into(), "rm -rf /".into()];
+    let timeline = state.timelines.first_mut().expect("a timeline");
+    timeline
+        .items
+        .push(TimelineItem::Approval(ApprovalCardView {
+            message_id: "msg_check".into(),
+            speaker: Speaker::Task,
+            time_label: "7:41 PM".into(),
+            created_at: 0,
+            approval: view,
+        }));
+    state
+}
+
+#[test]
+fn a_card_from_the_check_keeps_its_note_and_the_blocked_commands() {
+    let state = check_card_state();
+    let found = state
+        .timelines
+        .iter()
+        .flat_map(|t| t.items.iter())
+        .find_map(|item| match item {
+            TimelineItem::Approval(card) if card.approval.id == "apr_check" => {
+                Some(card.approval.clone())
+            }
+            _ => None,
+        })
+        .expect("the card");
+    assert!(found.check_note.is_some());
+    assert_eq!(found.blocked.len(), 2);
+}

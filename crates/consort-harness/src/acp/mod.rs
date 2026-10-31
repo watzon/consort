@@ -23,7 +23,7 @@ use consort_proto::model::{
     ApprovalDetails, ApprovalMode, AuthState, Capabilities, ModelInfo, ModelOptions, OptionChoice,
     OptionDescriptor, OptionValue, RequestOption, SessionState,
 };
-use consort_proto::worker_link::{
+use consort_proto::session_host_link::{
     RequestBody, RequestOutcome, SessionEvent, TurnEndReason, TurnInput,
 };
 use serde_json::{Value, json};
@@ -32,18 +32,18 @@ use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::account::prepare_home;
 use crate::approval::{
-    CLAUDE_SHELL_TOOLS, CLAUDE_WEB_TOOLS, OPENCODE_NO_PROJECT_CONFIG, claude_mode,
-    claude_mode_allowed, claude_mode_fallback, claude_option_mode, gemini_mode, gemini_policy,
-    opencode_coordinator_permission, opencode_permission,
+    OPENCODE_NO_PROJECT_CONFIG, claude_mode, claude_mode_allowed, claude_mode_fallback,
+    claude_option_mode, gemini_mode, gemini_policy, opencode_coordinator_permission,
+    opencode_permission,
 };
 use crate::attachments::{ACP_IMAGE_MAX_BYTES, ImageDelivery, ImageLimits, base64, prepare_turn};
 use crate::process::{self, ProcessSpec, StderrTail, resolve_program};
+use crate::skills;
 use crate::{
     AccountConfig, AccountStatus, Answer, EVENT_CHANNEL_CAPACITY, EventReceiver, Harness,
     HarnessError, HarnessKind, HarnessSession, McpServerSpec, SIGNED_OUT_ERROR_CODE, SessionSpec,
     SignInMethod, SteerFuture, sign_in_hint, sign_in_hint_for, steer_ready,
 };
-use crate::{extras, skills};
 use mapper::{AcpMapper, stop_reason};
 
 /// The pinned `claude-agent-acp` package.
@@ -200,7 +200,7 @@ pub fn launch_recipe_with(
             } else {
                 let Some(binary) = account.binary.as_deref() else {
                     return Err(HarnessError::Spawn(
-                        "an ACP agent account needs `binary` in worker.toml".to_owned(),
+                        "this ACP agent account has no command. Remove it, and add it again in Settings > Providers".to_owned(),
                     ));
                 };
                 (explicit(binary)?, Vec::new())
@@ -499,67 +499,55 @@ pub fn project_instructions(workspace: &Path) -> Option<String> {
 
 /// The `_meta` object of `session/new` and `session/load` for Claude Code.
 ///
-/// - `systemPrompt.append` holds the text from the hub, and below Full
-///   access the repo instructions (see [`project_instructions`]).
-/// - Below Full access, `settingSources` is `["user"]`. The repo's
-///   `.claude/settings.json` and `.claude/settings.local.json` then cannot
-///   allow tools, set a permission mode, add hooks or start MCP servers. And
-///   `allowDangerouslySkipPermissions` is false, so nothing can turn on
-///   `bypassPermissions`.
-/// - With `allow_shell` off, `disallowedTools` removes the shell tools.
+/// This is the one function that builds the configuration of a CLI on the
+/// hub machine. It is the same for all four approval modes, because the
+/// approval engine of the hub decides at the MCP endpoint. A session that
+/// loads without it would get all native tools back. The contract test in
+/// `acp/tests.rs` runs for each version bump of the adapter.
+///
+/// - `tools` is empty, and only the Consort MCP server is allowed.
+/// - `settingSources` is empty, so no settings file, hook or `apiKeyHelper`
+///   of a profile or a repo runs.
+/// - No plugins, no agents, no connectors and no memory of the provider.
+///   The provider extras are always off. The `settings` keys and the
+///   `ENABLE_CLAUDEAI_MCP_SERVERS` variable stop the claude.ai connectors,
+///   the synced plugins and the synced skills. They apply to one run only.
+///   Never put the `syncClaudeAi*` keys in a settings file of the profile:
+///   there, Claude Code moves the synced folders to `.trash` at the next start.
 pub fn claude_meta(spec: &SessionSpec) -> Value {
-    claude_meta_for(spec, false)
-}
-
-/// [`claude_meta`], or for a probe the same without
-/// `allowDangerouslySkipPermissions`. A probe session then shows whether
-/// Claude Code offers `bypassPermissions` on this machine. The probe sets
-/// the `default` mode and runs no turn.
-fn claude_meta_for(spec: &SessionSpec, probe: bool) -> Value {
-    let restricted = spec.approval_mode < ApprovalMode::FullAccess;
-    let mut append = spec.system_prompt_append.clone();
-    if restricted && let Some(text) = project_instructions(&spec.workspace) {
-        if !append.is_empty() {
-            append.push_str("\n\n");
-        }
-        append.push_str(&text);
-    }
-    let mut options = serde_json::Map::new();
-    if restricted {
-        options.insert("settingSources".to_owned(), json!(["user"]));
-        if !probe {
-            options.insert("allowDangerouslySkipPermissions".to_owned(), json!(false));
-        }
-    }
-    let mut disallowed: Vec<&str> = Vec::new();
-    if !spec.allow_shell {
-        disallowed.extend(CLAUDE_SHELL_TOOLS);
-    }
-    if spec.coordinator {
-        disallowed.extend(CLAUDE_WEB_TOOLS);
-    }
-    if !disallowed.is_empty() {
-        options.insert("disallowedTools".to_owned(), json!(disallowed));
-    }
-    // Provider extras off: inline settings and one env variable, for this
-    // session only. The profile's own settings file stays as it is (see
-    // `crate::extras`).
-    if !spec.extras_enabled {
-        options.insert("settings".to_owned(), extras::claude_extras_off_settings());
-        let (name, value) = extras::CLAUDE_CONNECTORS_ENV;
-        options.insert("env".to_owned(), json!({ name: value }));
-    }
-    // The skills of the session are a plugin that holds only skills.
-    if let Some(skills) = &spec.skills {
-        options.insert("plugins".to_owned(), skills::claude_plugins_option(skills));
-    }
     let mut meta = serde_json::Map::new();
-    if !append.is_empty() {
-        meta.insert("systemPrompt".to_owned(), json!({ "append": append }));
+    if !spec.system_prompt_append.is_empty() {
+        meta.insert(
+            "systemPrompt".to_owned(),
+            json!({ "append": spec.system_prompt_append }),
+        );
     }
-    if !options.is_empty() {
-        meta.insert("claudeCode".to_owned(), json!({ "options": options }));
-    }
+    meta.insert(
+        "claudeCode".to_owned(),
+        json!({
+            "options": {
+                "tools": [],
+                "settingSources": [],
+                "strictMcpConfig": true,
+                "allowedTools": ["mcp__consort"],
+                "plugins": [],
+                "agents": {},
+                "promptSuggestions": false,
+                "allowDangerouslySkipPermissions": false,
+                "settings": {
+                    "disableAllHooks": true,
+                    "disableClaudeAiConnectors": true,
+                    "syncClaudeAiSkills": false,
+                    "syncClaudeAiPlugins": false,
+                    "autoMemoryEnabled": false,
+                },
+                "env": {
+                    "ENABLE_CLAUDEAI_MCP_SERVERS": "false",
+                    "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
+                },
+            }
+        }),
+    );
     Value::Object(meta)
 }
 
@@ -729,8 +717,6 @@ struct Ready {
     /// by model ID.
     model_options: BTreeMap<String, Vec<Value>>,
     auth_label: Option<String>,
-    /// For Claude Code: whether the agent offers `bypassPermissions`.
-    bypass: Option<bool>,
     mode_setter: ModeSetter,
 }
 
@@ -953,9 +939,7 @@ impl Actor {
         // Claude Code gets the same `_meta` on `session/load` as on
         // `session/new`, so a resumed session keeps its system prompt and its
         // limits.
-        let meta = (self.kind == HarnessKind::ClaudeCode)
-            .then(|| claude_meta_for(&self.spec, self.probe))
-            .filter(|m| m.as_object().is_some_and(|o| !o.is_empty()));
+        let meta = (self.kind == HarnessKind::ClaudeCode).then(|| claude_meta(&self.spec));
         let (native_ref, response) = if let Some(resume) = &self.spec.resume {
             if !load {
                 return Err(HarnessError::ResumeFailed(
@@ -1014,7 +998,6 @@ impl Actor {
             config_options,
             model_options,
             auth_label: None,
-            bypass: mode.as_ref().map(|(bypass, _)| *bypass),
             mode_setter: mode.map(|(_, setter)| setter).unwrap_or(ModeSetter::None),
         })
     }
@@ -1652,7 +1635,10 @@ impl Actor {
                             let (reason, error) = stop_reason(response.get("stopReason").and_then(Value::as_str));
                             mapper.end_turn(reason, error)
                         }
-                        Err(err) if err.code == ErrorCode::AuthRequired => {
+                        Err(err)
+                            if err.code == ErrorCode::AuthRequired
+                                && self.kind != HarnessKind::ClaudeCode =>
+                        {
                             // The login is gone or expired. Tell the worker
                             // first, then end the turn with the next step.
                             let hint = sign_in_hint(self.kind, &err.message);
@@ -1674,12 +1660,16 @@ impl Actor {
                         // so an expired login passes the probe and fails here
                         // with an API error. Tell the worker, so the account
                         // shows "Sign in again" and placement stops choosing it.
+                        // `auth_required` is the same for this harness: the probe
+                        // says "signed in", so a sign-out mark would last only
+                        // until the next probe, and the hub would try again.
                         Err(err)
                             if self.kind == HarnessKind::ClaudeCode
-                                && crate::login_expired_text(&format!(
-                                    "{err} {}",
-                                    err.data.as_ref().map(ToString::to_string).unwrap_or_default()
-                                )) =>
+                                && (err.code == ErrorCode::AuthRequired
+                                    || crate::login_expired_text(&format!(
+                                        "{err} {}",
+                                        err.data.as_ref().map(ToString::to_string).unwrap_or_default()
+                                    ))) =>
                         {
                             self.emit(SessionEvent::Error {
                                 code: crate::LOGIN_EXPIRED_ERROR_CODE.to_owned(),
@@ -1943,6 +1933,7 @@ pub fn agent_process_spec(
         args: launch.args,
         env,
         env_remove: account.runtime.env_remove.clone(),
+        env_clear: false,
         cwd: Some(spec.runtime_dir.clone()),
         watcher: spec.process_watcher.clone(),
     })
@@ -1957,7 +1948,27 @@ async fn start(
     probe: bool,
     init: InitSlot,
 ) -> Result<(AcpSession, EventReceiver, Ready), HarnessError> {
-    let mut child = process::spawn(&agent_process_spec(kind, account, &spec, &resolve_program)?)?;
+    let process_spec = agent_process_spec(kind, account, &spec, &resolve_program)?;
+    let (process_spec, guard) = match &account.runtime.boundary {
+        Some(config) => {
+            let urls: Vec<String> = spec.mcp_servers.iter().map(|s| s.url.clone()).collect();
+            let (inner, guard) = crate::boundary::enter(
+                config,
+                kind,
+                process_spec,
+                &spec.workspace,
+                &spec.runtime_dir,
+                &urls,
+            )
+            .await?;
+            (inner, Some(guard))
+        }
+        None => (process_spec, None),
+    };
+    let mut child = process::spawn(&process_spec)?;
+    if let Some(guard) = guard {
+        child.hold(Box::new(guard));
+    }
     let stdin = child
         .take_stdin()
         .ok_or_else(|| HarnessError::Spawn("no stdin".to_owned()))?;
@@ -2127,6 +2138,30 @@ impl Harness for AcpHarness {
         self.kind
     }
 
+    async fn one_shot(
+        &self,
+        account: &AccountConfig,
+        folder: &Path,
+        request: crate::OneShot,
+    ) -> Result<String, HarnessError> {
+        if self.kind != HarnessKind::ClaudeCode {
+            return Err(HarnessError::Unsupported(
+                "run one question with this harness",
+            ));
+        }
+        claude_one_shot(account, folder, &request).await
+    }
+
+    fn boundary_support(&self, _account: &AccountConfig) -> crate::boundary::BoundarySupport {
+        if self.kind == HarnessKind::ClaudeCode {
+            crate::boundary::BoundarySupport::Proven
+        } else {
+            crate::boundary::BoundarySupport::Off(crate::boundary::turned_off_reason(
+                self.kind.display_name(),
+            ))
+        }
+    }
+
     fn capabilities(&self, _account: &AccountConfig) -> Capabilities {
         static_capabilities(self.kind)
     }
@@ -2180,7 +2215,6 @@ impl Harness for AcpHarness {
             system_prompt_append: String::new(),
             mcp_servers: Vec::new(),
             env: BTreeMap::new(),
-            extras_enabled: true,
             skills: None,
             resume: None,
             process_watcher: None,
@@ -2201,14 +2235,6 @@ impl Harness for AcpHarness {
                 capabilities.steer = ready.capabilities.steer;
                 capabilities.mcp_http = ready.capabilities.mcp_http;
                 capabilities.images = ready.capabilities.images;
-                if ready.bypass == Some(false) {
-                    // Claude Code turned `bypassPermissions` off, so Full
-                    // access would fail. The worker lowers a Full access
-                    // request to Auto.
-                    capabilities
-                        .approval_modes
-                        .retain(|m| *m != ApprovalMode::FullAccess);
-                }
                 AccountStatus {
                     harness_version: ready.agent_version,
                     auth_state: AuthState::SignedIn,
@@ -2260,12 +2286,116 @@ impl Harness for AcpHarness {
         account: &AccountConfig,
         spec: SessionSpec,
     ) -> Result<(Box<dyn HarnessSession>, EventReceiver), HarnessError> {
-        let (session, events) = open_with_fallback(self.kind, spec, |spec| {
+        let opening = open_with_fallback(self.kind, spec, |spec| {
             start(self.kind, account, spec, false, InitSlot::default())
-        })
-        .await?;
+        });
+        let (session, events) = start_watchdog(START_WATCHDOG, opening).await?;
         Ok((Box::new(session), events))
     }
+}
+
+/// The arguments of one question to Claude Code: no tools, no settings, no
+/// MCP servers and no saved session.
+fn claude_one_shot_args(request: &crate::OneShot) -> Vec<String> {
+    [
+        "-p",
+        "--model",
+        request.model.as_str(),
+        "--effort",
+        "low",
+        "--tools",
+        "",
+        "--setting-sources",
+        "",
+        "--strict-mcp-config",
+        "--no-session-persistence",
+        "--system-prompt",
+        request.system.as_str(),
+        "--output-format",
+        "json",
+        "--max-turns",
+        "1",
+    ]
+    .iter()
+    .map(|arg| (*arg).to_owned())
+    .collect()
+}
+
+/// The answer text in the JSON that `claude -p` prints.
+fn claude_one_shot_text(stdout: &str) -> Result<String, HarnessError> {
+    let value: Value = serde_json::from_str(stdout.trim())
+        .map_err(|_| HarnessError::Protocol("Claude Code gave no JSON answer".to_owned()))?;
+    let text = value.get("result").and_then(Value::as_str).unwrap_or("");
+    if value.get("is_error").and_then(Value::as_bool) == Some(true) {
+        return Err(HarnessError::Protocol(format!(
+            "Claude Code reported an error: {}",
+            head_of(text, 200)
+        )));
+    }
+    Ok(text.to_owned())
+}
+
+/// Runs one question through `claude -p` inside the boundary. With no
+/// boundary it does not run. The caller sets the deadline, and the process
+/// group ends when this future drops.
+async fn claude_one_shot(
+    account: &AccountConfig,
+    folder: &Path,
+    request: &crate::OneShot,
+) -> Result<String, HarnessError> {
+    let Some(config) = &account.runtime.boundary else {
+        return Err(HarnessError::Spawn(
+            "the command check runs only inside the boundary".to_owned(),
+        ));
+    };
+    let command = crate::signin::claude::ClaudeCommand::for_account(account)?;
+    let spec = ProcessSpec {
+        program: command.program.clone(),
+        args: claude_one_shot_args(request),
+        env: command.env.clone(),
+        ..ProcessSpec::default()
+    };
+    let (spec, guard) =
+        crate::boundary::enter(config, HarnessKind::ClaudeCode, spec, folder, folder, &[]).await?;
+    let mut child = process::spawn(&spec)?;
+    child.hold(Box::new(guard));
+    let mut stdout = child
+        .take_stdout()
+        .ok_or_else(|| HarnessError::Spawn("no stdout".to_owned()))?;
+    let mut stdin = child
+        .take_stdin()
+        .ok_or_else(|| HarnessError::Spawn("no stdin".to_owned()))?;
+    let stderr = child.stderr_handle();
+    tokio::io::AsyncWriteExt::write_all(&mut stdin, request.prompt.as_bytes())
+        .await
+        .map_err(|err| HarnessError::Spawn(format!("could not send the question: {err}")))?;
+    drop(stdin);
+    let mut out = String::new();
+    tokio::io::AsyncReadExt::read_to_string(&mut stdout, &mut out)
+        .await
+        .map_err(|err| HarnessError::Spawn(format!("could not read the answer: {err}")))?;
+    let _ = child.wait().await;
+    claude_one_shot_text(&out).inspect_err(|_| {
+        tracing::debug!(stderr = %stderr.get(), "a one-shot question failed");
+    })
+}
+
+/// How long a CLI may take to start a session. A hung CLI ignored the loss
+/// of its parent for 28 minutes in the experiment, so the session host stops
+/// it. The process group ends when the future drops.
+const START_WATCHDOG: Duration = Duration::from_secs(120);
+
+/// Runs the start of a session under `limit`.
+async fn start_watchdog<T>(
+    limit: Duration,
+    opening: impl std::future::Future<Output = Result<T, HarnessError>>,
+) -> Result<T, HarnessError> {
+    tokio::time::timeout(limit, opening).await.map_err(|_| {
+        HarnessError::Timeout(format!(
+            "the CLI did not start the session in {} seconds, so Consort stopped it. Try again.",
+            limit.as_secs()
+        ))
+    })?
 }
 
 /// Opens a session with `start`. When Full access fails because Claude
@@ -2533,7 +2663,6 @@ async fn auth_op(
         system_prompt_append: String::new(),
         mcp_servers: Vec::new(),
         env: BTreeMap::new(),
-        extras_enabled: true,
         skills: None,
         resume: None,
         process_watcher: None,

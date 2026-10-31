@@ -5,14 +5,14 @@ use std::sync::Arc;
 
 use consort_proto::{
     client_api::{
-        AccountUpdate, ChannelSetConnectionEnabled, ChannelSetSkillEnabled, ComposioGetStatus,
-        ComposioRemoveKey, ComposioSetKey, ConnectionCalls, ConnectionConnect,
-        ConnectionDisconnect, ConnectionReconnect, ConnectionUpdate, ConnectorCatalogCategories,
-        ConnectorCatalogSearch, ConnectorCatalogService, SkillDirectoryAddSource,
-        SkillDirectoryRemoveSource, SkillDirectorySearch, SkillDirectorySources, SkillFiles,
-        SkillInstall, SkillPreview, SkillReadFile, SkillRemove, SkillUpdate, SkillVersion,
+        ChannelSetConnectionEnabled, ChannelSetSkillEnabled, ComposioGetStatus, ComposioRemoveKey,
+        ComposioSetKey, ConnectionCalls, ConnectionConnect, ConnectionDisconnect,
+        ConnectionReconnect, ConnectionUpdate, ConnectorCatalogCategories, ConnectorCatalogSearch,
+        ConnectorCatalogService, SkillDirectoryAddSource, SkillDirectoryRemoveSource,
+        SkillDirectorySearch, SkillDirectorySources, SkillFiles, SkillInstall, SkillPreview,
+        SkillReadFile, SkillRemove, SkillUpdate, SkillVersion,
     },
-    model::{CallDecision, CallOutcome, ComposioStatus, SecretEnv, SkillDirectorySource},
+    model::{CallDecision, CallOutcome, ComposioStatus, SkillDirectorySource},
 };
 use futures_util::StreamExt as _;
 
@@ -106,22 +106,6 @@ pub(super) async fn run(
     command: Command,
 ) -> Result<CommandOutput, ClientError> {
     match command {
-        Command::SetAccountExtras {
-            worker_id,
-            account_id,
-            enabled,
-        } => {
-            shared
-                .call(AccountUpdate {
-                    worker_id: parse(&worker_id, "worker")?,
-                    account_id: parse(&account_id, "account")?,
-                    label: None,
-                    env_set: SecretEnv::new(),
-                    env_remove: Vec::new(),
-                    extras_enabled: Some(enabled),
-                })
-                .await?;
-        }
         Command::LoadComposioStatus => {
             if let Ok(mut cache) = shared.cache.lock() {
                 cache.extensions.composio.load = LoadState::Loading;
@@ -702,7 +686,7 @@ pub(super) async fn run(
 
 /// Puts the channel from a `channel.*` answer in the cache, unless the feed
 /// already brought a newer one.
-fn merge_channel(shared: &Shared, channel: consort_proto::model::Channel) {
+pub(super) fn merge_channel(shared: &Shared, channel: consort_proto::model::Channel) {
     if let Ok(mut cache) = shared.cache.lock() {
         let id = channel.id.to_string();
         let newer = cache

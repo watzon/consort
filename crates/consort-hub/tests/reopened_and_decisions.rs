@@ -8,12 +8,16 @@ use std::time::Duration;
 
 use crate::common::*;
 use consort_proto::auth::OpenSession;
-use consort_proto::client_api::{DecisionAnswerRequest, MessageSend};
+use consort_proto::client_api::{DecisionAnswerRequest, MessageSend, TaskItems};
 use consort_proto::ids::{AccountId, DecisionId, WorkerId};
-use consort_proto::model::{DecisionAnswer, ItemStatus, SessionState, WorkerState};
+use consort_proto::model::{
+    CommandPayload, DecisionAnswer, ItemPayload, ItemStatus, SessionItem, SessionState, WorkerState,
+};
+use consort_proto::session_host_link::{
+    HubToSessionHost, SequencedEvent, SessionEvent, TurnEndReason,
+};
 use consort_proto::status::TaskStatus;
 use consort_proto::time::Timestamp;
-use consort_proto::worker_link::{HubToWorker, SequencedEvent, SessionEvent, TurnEndReason};
 use ed25519_dalek::SigningKey;
 
 /// Closes the worker's connection and waits until the hub shows it offline.
@@ -39,7 +43,7 @@ fn at(seq: u64, event: SessionEvent) -> SequencedEvent {
 async fn next_turn(worker: &mut FakeWorker, session: consort_proto::ids::SessionId) -> String {
     loop {
         let (request, command) = worker.next_command().await;
-        if let HubToWorker::SessionTurn(turn) = &command
+        if let HubToSessionHost::SessionTurn(turn) = &command
             && turn.session_id == session
         {
             worker
@@ -130,6 +134,96 @@ async fn reopened_keeps_a_task_turn_that_still_waits_in_the_queue() {
     .await;
     let end = world.wait_task(task_id, TaskStatus::Review).await;
     assert_eq!(end.review_summary.as_deref(), Some("Tests fixed."));
+}
+
+#[tokio::test]
+async fn a_task_goes_on_after_a_restart_cuts_its_turn_and_a_host_that_keeps_stopping_fails_it() {
+    let mut world = World::start().await;
+    let (task_id, start) = world.start_task("Fix it.").await;
+    let s = start.session_id;
+    let command_id = consort_proto::ids::ItemId::new();
+    world
+        .worker
+        .send_events(
+            s,
+            vec![
+                state(SessionState::Active),
+                turn_started("t1"),
+                SessionEvent::Item(SessionItem {
+                    id: command_id,
+                    session_id: s,
+                    turn_id: "t1".into(),
+                    payload: ItemPayload::Command(CommandPayload {
+                        command: "sleep 40".to_owned(),
+                        ..CommandPayload::default()
+                    }),
+                    status: ItemStatus::InProgress,
+                    created_at: Timestamp::now(),
+                    updated_at: Timestamp::now(),
+                }),
+            ],
+        )
+        .await;
+    world.wait_task(task_id, TaskStatus::Working).await;
+    let mut seq = 3;
+    let (wid, key, acc) = worker_offline(&mut world).await;
+    let mut key_now = key;
+
+    // Three restarts: each one closes the old turn and sends a new one.
+    for round in 0..3 {
+        let mut back = FakeWorker::connect(
+            &world.hub,
+            wid,
+            key_now.clone(),
+            acc,
+            vec![OpenSession {
+                session_id: s,
+                last_seq: seq,
+                state: SessionState::Idle,
+            }],
+        )
+        .await;
+        seq += 1;
+        back.send_batch(s, vec![at(seq, SessionEvent::Reopened)])
+            .await;
+        let text = next_turn(&mut back, s).await;
+        assert_eq!(text, "Go on with the task.", "round {round}");
+        assert_eq!(world.task(task_id).await.status, TaskStatus::Working);
+        key_now = back.key.clone();
+        back.peer.close().await;
+        world.wait_worker(wid, WorkerState::Offline).await;
+    }
+    let items = world
+        .client
+        .request(TaskItems {
+            task_id,
+            session_id: None,
+            after_item_id: None,
+            limit: None,
+        })
+        .await
+        .unwrap()
+        .items;
+    let item = items.iter().find(|i| i.id == command_id).unwrap();
+    assert_eq!(item.status, ItemStatus::Failed);
+
+    // The fourth restart in this hub run fails the task, with no new turn.
+    let mut back = FakeWorker::connect(
+        &world.hub,
+        wid,
+        key_now,
+        acc,
+        vec![OpenSession {
+            session_id: s,
+            last_seq: seq,
+            state: SessionState::Idle,
+        }],
+    )
+    .await;
+    back.send_batch(s, vec![at(seq + 1, SessionEvent::Reopened)])
+        .await;
+    world.wait_task(task_id, TaskStatus::Failed).await;
+    back.peer.close().await;
 }
 
 #[tokio::test]
@@ -418,7 +512,7 @@ async fn a_lost_coordinator_session_keeps_its_channel_decision() {
         .unwrap();
     loop {
         let (request, command) = world.worker.next_command().await;
-        if let HubToWorker::SessionStart(next) = &command
+        if let HubToSessionHost::SessionStart(next) = &command
             && next.session_id != c
         {
             let text = next

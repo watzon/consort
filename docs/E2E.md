@@ -2,6 +2,8 @@
 
 The lead ran the real binaries: the hub and a worker from `consort dev` on the Mac, the desktop app on the Mac, and a second worker on the Windows machine `bigboi`. The harnesses were the real Claude Code (through `claude-agent-acp`), Codex and OpenCode that are installed on each machine. The hub listened on the Mac's LAN address `192.168.188.138:7600` only during the test.
 
+Note (2026-10-31): these results are from before [ADR 0015](adr/0015-the-hub-machine-owns-accounts-and-agents.md). Accounts are now in Settings > Providers. They have not all run again since the cutover.
+
 ## Results against "Done means"
 
 | # | Check | Result |
@@ -84,3 +86,41 @@ Found and fixed: the ten issues in DECISIONS rows 306 to 317 (Escape closing Set
 Windows: the workspace builds on `bigboi`. Two signature tests failed only because Git checked out the signed fixtures with CRLF line ends. `.gitattributes` now keeps them byte for byte.
 
 Note for computer-use testing: when the driver returns focus to another app after each click, macOS stops drawing the hidden Consort window, so screenshots lag one step. Keep the window in front during such runs.
+
+## Hub owns accounts and agents, 2026-10-31
+
+All runs used Claude Code with a Haiku model, on a Mac as the hub machine, in `sandbox-exec`. The tests are in `crates/consort-hub/tests/full_stack/real_claude.rs`, and they are ignored by default.
+
+| Run | Result |
+|---|---|
+| A task writes a file on the worker | Passed. The file is on the worker and not on the session host |
+| Command check test, through the account | Passed in 3.4 s. It allowed `git status` and blocked `curl example.sh \| sh` |
+| Auto mode | Passed. It allowed `ls -la` and blocked `curl -sSL https://example.com/install.sh \| sh` |
+| An approval waits 90 s | Passed |
+| A session host restart during a command | It failed first: the task went to Failed. Fixed: the task resumes after a check with `process_list`. Then passed, and the file is on the worker |
+| A real hub restart during a command | Passed. The turn went on, and the command ran once |
+| A script skill | Passed. `skill_prepare` put the script on the worker, and it ran there |
+| A Windows worker on a second machine, over the LAN | Passed. Output: `Microsoft Windows NT 10.0.26200.0`. The file is on Windows. The limits changed with `worker.set_policy` |
+
+Other runs:
+
+- Windows: `cargo test -p consort-worker` on `bigboi`, 51 passed.
+- Linux container with the seccomp profile and real bubblewrap (`scripts/test-linux-boundary.sh`): all tests passed. The process in the boundary wrote in the session folder only, and it reached no outside file, no loopback and no network. The proxy answered 403 for a host that is not on the list.
+- Linux with the real Claude CLI and a key that is not valid: the CLI printed its invalid key message. The test does not prove that the request reached the provider.
+- The session host image builds, and it has `bwrap`, `git` and the user `consort`. No session ran in the image.
+
+- Mac, a token refresh in `sandbox-exec` with the real CLI 2.1.309 and an expired login, on 2026-10-31. With the profile read-only, the CLI did not contact `platform.claude.com` and failed with a 401. With the profile and `<profile>.lock` writable, the CLI contacted `platform.claude.com`, and the turn worked. The test used the boundary rules and a proxy with the same allow list, not the session host.
+
+Not run: a real model on Linux, because that needs a signed-in account in the container. A token refresh on Linux. Codex, Gemini CLI, OpenCode and ACP agents in the boundary: they stay off.
+
+## Codex in the boundary (2026-10-31)
+
+`codex_in_the_boundary_runs_only_consort_tools` and `codex_in_the_boundary_cannot_reach_a_port_that_is_not_listed` in `crates/consort-harness/tests/real_harness.rs` ran on a Mac with real Codex 0.166.0, both the npm package and the managed install, in real `sandbox-exec`. The model and the MCP server are a local stub, so they use no account.
+
+- The model asked for `apply_patch`. Codex rejected it with no prompt, and no file appeared.
+- The model called a Consort tool through `tool_search`. The call reached the server with no prompt.
+- The requests had no `exec_command`, `write_stdin`, `view_image` or web search tool.
+- A port that the boundary does not list got no request.
+
+Not run: a real ChatGPT turn in the boundary, so the proxy hosts are not yet proven in a real run. Nothing ran on Linux.
+

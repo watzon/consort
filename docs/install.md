@@ -19,7 +19,7 @@ The comments and the examples in the scripts and in these docs also show the nam
 
 ## Install a worker
 
-A worker is a machine that runs sessions for the hub. The Add worker dialog (Settings > Workers > Add worker) shows one command for each system. It has the pairing code in it.
+A worker is a machine where work runs. It has no account and no agent CLI. The limits of a worker (the highest approval mode, the folders and shell access) change in Settings > Workers, with the worker online. The Add worker dialog (Settings > Workers > Add worker) shows one command for each system. It has the pairing code in it.
 
 macOS and Linux:
 
@@ -90,6 +90,8 @@ Download the file for your system from the latest release:
 
 Until the app is signed with a Developer ID and notarized, macOS blocks the first start: go to System Settings > Privacy & Security and select Open Anyway. A release that has the signing secrets (below) is signed and notarized, and starts with no question. The Windows and Linux files are not signed.
 
+The app has the `com.apple.security.device.audio-input` entitlement and `NSMicrophoneUsageDescription`, because it captures the microphone in its own process.
+
 The Windows and Linux desktop builds are best effort. The release workflow builds them, but a failed build does not stop the release.
 
 ## Updates
@@ -124,6 +126,14 @@ The staging folder is `consort/updates` in the cache folder of the system. The a
 A tag with a `-` in it, such as `v0.3.0-rc.1`, is a pre-release. The app and the scripts use the latest release that is not a pre-release.
 
 A manual run of the workflow (Actions > Release > Run workflow) builds the files and keeps them as a workflow artifact, with no release.
+
+### The programs of dictation
+
+Dictation needs `sayso-engine` and `sayso-cleanup` from Sayso. They have the GPL, so they ship as separate programs ([dictation-licenses.md](dictation-licenses.md)).
+
+- **macOS.** `scripts/bundle-macos.sh` adds them when `CONSORT_SPEECH_ENGINE`, `CONSORT_CLEANUP_RUNTIME` and `CONSORT_SAYSO_LICENSE` name them. It signs them before the app.
+- **Windows and Linux.** Put `sayso-engine` and `sayso-cleanup` in the `Consort` folder of the release file, beside the app, with the GPL text.
+- **Not done yet.** `release.yml` does not build them, and Consort uses a path dependency on Sayso until Sayso is committed and published. So the workflow cannot build the desktop app today. Do step 5 of "Work in Sayso" in [DICTATION-PLAN.md](DICTATION-PLAN.md) first.
 
 ### Signing and notarization of the macOS app
 

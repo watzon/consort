@@ -669,6 +669,7 @@ impl ConsortApp {
         div()
             .relative()
             .flex_1()
+            .min_w_0()
             .min_h_0()
             .w_full()
             .child(body)
@@ -888,7 +889,7 @@ impl ConsortApp {
                 (
                     spacing(*s),
                     match notice {
-                        Some(n) => self.render_notice_line(&n, t, cx),
+                        Some(n) => self.render_notice_line(&n, t, window, cx),
                         None => div().into_any_element(),
                     },
                 )
@@ -903,6 +904,7 @@ impl ConsortApp {
         &mut self,
         notice: &consort_client::NoticeView,
         t: &Tokens,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         // The text that `show_draft` shows is a card, left, at the bubble
@@ -949,16 +951,37 @@ impl ConsortApp {
                 })
                 .into_any_element();
         }
+        if let Some(row) = &notice.monid {
+            return self.render_monid_call(row, "chat", t, cx);
+        }
         if let Some(memory) = &notice.memory {
             return self.render_memory_saved_line(notice, memory, t, cx);
         }
+        if let Some(fallback) = &notice.fallback {
+            let channel_id = self.channel_id.clone();
+            return self.render_fallback_notice(
+                fallback,
+                &notice.message_id,
+                &notice.time_label,
+                &channel_id,
+                false,
+                t,
+                cx,
+            );
+        }
         let c = &t.colors;
         let copy = notice.text.clone();
+        // The time shares the baseline of the first line of the text. The
+        // two boxes start at the same top, and the time moves down by the
+        // difference of the two baselines (see `baseline_lead`).
+        let lead = crate::ui::parts::baseline_lead(window, t.text.ui, t.text.caption, t);
+        let time_id = format!("notice-time-{}", notice.message_id);
+        let text_id = format!("notice-text-{}", notice.message_id);
         div()
             .id(SharedString::from(format!("notice-{}", notice.message_id)))
             .flex()
             .justify_center()
-            .items_baseline()
+            .items_start()
             .gap(t.space.sm)
             .child(
                 selectable(
@@ -967,15 +990,18 @@ impl ConsortApp {
                     t.text.ui,
                     c.text_tertiary,
                 )
-                .min_w_0(),
+                .min_w_0()
+                .debug_selector(move || text_id),
             )
             // The line that starts a channel sits under its time separator.
             .when(notice.kind != "channel_created", |d| {
-                d.child(text(
-                    notice.time_label.clone(),
-                    t.text.caption,
-                    c.text_tertiary,
-                ))
+                d.child(
+                    div().flex_none().pt(lead).child(
+                        text(notice.time_label.clone(), t.text.caption, c.text_tertiary)
+                            .whitespace_nowrap()
+                            .debug_selector(move || time_id),
+                    ),
+                )
             })
             .on_mouse_down(
                 MouseButton::Right,
@@ -1521,7 +1547,9 @@ impl ConsortApp {
                     .items_center()
                     .gap(t.space.sm)
                     .child(
-                        text("Enter saves. Escape cancels.", detail(t), c.text_tertiary).flex_1(),
+                        text("Enter saves. Escape cancels.", detail(t), c.text_tertiary)
+                            .flex_1()
+                            .min_w_0(),
                     )
                     .child(
                         button("edit-cancel", "Cancel", ButtonKind::Quiet, t).on_click(
@@ -1662,13 +1690,13 @@ impl ConsortApp {
                         .flex()
                         .items_center()
                         .gap(t.space.sm)
-                        .child(div().flex_1()),
+                        .child(div().flex_1().min_w_0()),
                 ))
                 .child(self.render_approval_card(&approval, &key, false, t, cx))
                 .child(
                     div()
                         .flex()
-                        .child(div().flex_1())
+                        .child(div().flex_1().min_w_0())
                         .child(self.open_thread_link(&card.task_id, open, t, cx)),
                 );
         } else if let Some(approval) = pending {
@@ -1693,7 +1721,7 @@ impl ConsortApp {
                 .child(
                     div()
                         .flex()
-                        .child(div().flex_1())
+                        .child(div().flex_1().min_w_0())
                         .child(self.open_thread_link(&card.task_id, open, t, cx)),
                 );
         } else {
@@ -1732,6 +1760,34 @@ impl ConsortApp {
                     .text_ellipsis(),
                 ),
             ));
+            // The Monid total of the task, while it makes calls: the user
+            // sees runaway calls and can stop them.
+            if let Some(total) = consort_client::monid::task_line(card.monid_calls) {
+                body = body.child(
+                    div()
+                        .flex()
+                        .items_baseline()
+                        .gap(t.space.sm)
+                        .child(
+                            selectable(
+                                SharedString::from(format!("card-monid-{}", card.message_id)),
+                                total,
+                                t.text.ui,
+                                c.text_secondary,
+                            )
+                            .flex_1()
+                            .min_w_0(),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .font_family(t.font_mono.clone())
+                                .type_style(t.text.mono)
+                                .text_color(c.text_primary)
+                                .child(consort_client::money_text(card.monid_cost_micros)),
+                        ),
+                );
+            }
             // The voice task: its finished steps, and what stays in it.
             if !card.steps.is_empty() {
                 body = body.child(self.render_task_steps(&card.message_id, &card.steps, t));
@@ -1742,7 +1798,7 @@ impl ConsortApp {
                         .flex()
                         .items_center()
                         .gap(t.space.sm)
-                        .child(text(note, detail(t), c.text_tertiary).flex_1())
+                        .child(text(note, detail(t), c.text_tertiary).flex_1().min_w_0())
                         .child(self.open_thread_link(&card.task_id, open, t, cx)),
                 );
                 return div()
@@ -1758,7 +1814,7 @@ impl ConsortApp {
                     .flex()
                     .items_center()
                     .gap(t.space.sm)
-                    .child(div().flex_1())
+                    .child(div().flex_1().min_w_0())
                     .child(self.open_thread_link(&card.task_id, open, t, cx)),
             );
         }
@@ -1883,6 +1939,9 @@ impl ConsortApp {
                 })
                 .into_any_element()
         });
+        // The hub state is unknown while the link is down, so the line of
+        // the assistant shows only when the link line does not.
+        let above = above.or_else(|| self.render_assistant_status(t, cx));
         let column = self.chat_column_width(t);
         self.render_composer_box(
             crate::ui::composer::ComposerTarget::Channel,

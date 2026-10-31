@@ -13,7 +13,9 @@ use consort_proto::client_api::{ChannelCreate, ChannelUpdate};
 use consort_proto::frame::MessageFamily as _;
 use consort_proto::ids::{ChannelId, SessionId};
 use consort_proto::model::{ModelSelection, OptionValue, SessionState};
-use consort_proto::worker_link::{HubToWorker, SessionStart, SessionStartResult, TurnEndReason};
+use consort_proto::session_host_link::{
+    HubToSessionHost, SessionStart, SessionStartResult, TurnEndReason,
+};
 use serde_json::json;
 
 const QUIET: Duration = Duration::from_millis(400);
@@ -68,7 +70,7 @@ async fn channel(world: &mut World, name: &str, own: Option<ModelSelection>) -> 
 /// Answers the next command, which must be `session.stop` for `session_id`.
 async fn expect_stop(worker: &mut FakeWorker, session_id: SessionId) {
     let (request, command) = worker.next_command().await;
-    let HubToWorker::SessionStop(stop) = command else {
+    let HubToSessionHost::SessionStop(stop) = command else {
         panic!("expected session.stop, got {}", command.type_name());
     };
     assert_eq!(stop.session_id, session_id);
@@ -80,7 +82,7 @@ async fn starts_for(worker: &mut FakeWorker, channels: &[ChannelId]) -> Vec<Sess
     let mut out: Vec<SessionStart> = Vec::new();
     while out.len() < channels.len() {
         let (request, command) = worker.next_command().await;
-        let HubToWorker::SessionStart(start) = command else {
+        let HubToSessionHost::SessionStart(start) = command else {
             panic!("expected session.start, got {}", command.type_name());
         };
         worker

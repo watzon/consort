@@ -11,7 +11,7 @@ use consort_client::convo::{
 };
 use consort_theme::{Tokens, TypeExt as _};
 use gpui_kit::{
-    AnyElement, ClipboardItem, Context, InteractiveElement, IntoElement, ParentElement,
+    AnyElement, ClipboardItem, Context, Div, InteractiveElement, IntoElement, ParentElement,
     ScrollStrategy, SharedString, StatefulInteractiveElement as _, Styled, UniformListScrollHandle,
     Window, div, prelude::FluentBuilder as _, uniform_list,
 };
@@ -390,9 +390,13 @@ impl ConsortApp {
             .border_l(t.border_width)
             .border_color(c.border_subtle)
             .child(head)
+            .when_some(item.check.as_ref().map(|c| check_rows(c, t)), |d, rows| {
+                d.child(rows)
+            })
             .child(
                 div()
                     .flex_1()
+                    .min_w_0()
                     .min_h_0()
                     .m(t.space.lg)
                     .rounded(t.radius.lg)
@@ -410,7 +414,7 @@ impl ConsortApp {
                     .gap(t.space.md)
                     .px(t.space.lg)
                     .pb(t.space.md)
-                    .child(line(caption, detail(t), c.text_tertiary).flex_1())
+                    .child(line(caption, detail(t), c.text_tertiary).flex_1().min_w_0())
                     .children(
                         item.position_label()
                             .map(|p| text(p, detail(t), c.text_tertiary)),
@@ -418,4 +422,58 @@ impl ConsortApp {
             )
             .into_any_element()
     }
+}
+
+/// The rows that say what the command check did with this command. The words
+/// are selectable, and the labels are not.
+fn check_rows(check: &consort_client::CheckDetailView, t: &Tokens) -> Div {
+    let c = &t.colors;
+    let row = |key: &'static str, label: &'static str, value: String| {
+        div()
+            .flex()
+            .items_start()
+            .gap(t.space.md)
+            .child(
+                text(label, detail(t), c.text_tertiary)
+                    .flex_none()
+                    .w(t.component.settings_label),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .type_style(detail(t))
+                    .text_color(c.text_secondary)
+                    .child(gpui_kit::base::SelectableText::new(
+                        SharedString::from(format!("item-check.{key}")),
+                        value,
+                    )),
+            )
+    };
+    let mut rows = div()
+        .flex()
+        .flex_col()
+        .flex_none()
+        .gap(t.space.xs)
+        .px(t.space.lg)
+        .pt(t.space.md)
+        .debug_selector(|| "item-check".into())
+        .child(row("check", "Check", check.check.clone()));
+    if let Some(reason) = &check.reason {
+        rows = rows.child(row("reason", "Reason", reason.clone()));
+    }
+    if let Some(rule) = &check.rule {
+        rows = rows.child(row("rule", "Rule tested", rule.clone()));
+    }
+    if let Some(error) = &check.error {
+        rows = rows.child(row("error", "Error", error.clone()));
+    }
+    if check.blocked {
+        rows = rows.child(text(
+            "To allow this command, tell the assistant in the chat.",
+            detail(t),
+            c.text_tertiary,
+        ));
+    }
+    rows
 }

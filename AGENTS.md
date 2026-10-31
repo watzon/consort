@@ -16,14 +16,17 @@ If the code and a doc disagree, fix the one that is wrong in the same change, an
 | `consort-proto` | Wire types for the client API, the worker link and the hub tools. No I/O |
 | `consort-theme` | Theme files, contrast checks, and the GPUI Kit theme that the app uses |
 | `consort-harness` | The `Harness` and `HarnessSession` traits and the adapters (ACP first) |
-| `consort-worker` | The worker daemon: hub link, spool, local MCP endpoint, workspaces, inventory |
+| `consort-link` | The dial-out link that the session host and the worker share: pairing, keys, spool, reconnect |
+| `consort-session-host` | The session host on the hub machine: accounts, sign-ins, managed CLIs, sessions in a boundary, the MCP endpoint, the tool surface |
+| `consort-worker` | The execution worker: journal, processes, files, workspaces, inventory. It has no account and no CLI |
 | `consort-hub` | The hub server: SQLite store, feed, pairing, coordinator queue, placement, hub tools, routines |
+| `consort-dictation` | One live dictation on the Sayso SDK: states, the three parts of the text, models, settings of this computer. No GPUI and no hub I/O |
 | `consort-client` | Client logic shared by the desktop app and, later, mobile: connection, cache, view state |
 | `consort-desktop` | The GPUI desktop app |
 | `consort-cli` | The `consort` binary: `hub`, `worker`, `dev` and `mcp-bridge` subcommands |
 | `consort-testkit` | A fake harness, a fake worker and helpers for integration tests |
 
-Dependency direction: `proto` and `theme` depend on no other Consort crate. `client` never depends on GPUI. `desktop` never talks to the network; it calls `client`. `hub` never runs a model; it asks a worker.
+Dependency direction: `proto` and `theme` depend on no other Consort crate. `client` never depends on GPUI. `desktop` never talks to the network; it calls `client` and `dictation`. `hub` never runs a model; it asks the session host, a separate process on the hub machine. `worker` never holds an account or a CLI. A session host and a worker have separate routes and credentials.
 
 ## Run the app
 
@@ -38,7 +41,7 @@ Installs, releases and app updates are in [docs/install.md](docs/install.md). Ru
 - Library crates return typed errors (`thiserror`). Only binaries and tests use `anyhow`.
 - No `unwrap` or `expect` outside tests, except for an invariant that a comment proves.
 - Pin GPUI Kit and other fast-moving crates to exact versions (`=x.y.z`) in the workspace `Cargo.toml`.
-- Never read or log harness credential files (`auth.json`, keychain entries, `.credentials.json`). The worker only asks each harness whether it is signed in.
+- Never read or log harness credential files (`auth.json`, keychain entries, `.credentials.json`). The session host only asks each harness whether it is signed in.
 - Every new behavior gets a test at the lowest level that can prove it. Integration tests use `consort-testkit`.
 
 ## GPUI rules
@@ -57,8 +60,12 @@ These come from the user's experience with GPUI. Follow them in every view.
    - A connection row (Settings > Connectors): Reconnect, Activity, Copy handle, Disconnect.
    - A skill row (Settings > Skills): Turn off (Turn on when it is off), View files, Remove.
    - A skill source row (Settings > Skills): Remove. Only a source that the user added has it.
-   - An account row (Settings > Workers): Account settings, Rename, Sign out, Remove.
+   - An account row (Settings > Providers): Account settings, Rename, Sign out, Remove.
+   - A tool row (Settings > Providers): Check for updates, Copy install path, Reinstall. A tool that is not installed has only Install.
+   - An endpoint row (Settings > Providers): Edit, Copy base URL, Test connection, Remove.
    - A worker row: Rename, Edit tags, Pause, Remove.
+   - A step row (Settings > Models): Move up, Move down, Remove. The first row, the built-in row and the end row have no menu.
+   - The model chip of an assistant on a fallback (a left click): Go back to the first choice (off until the reset), Choose another model, Edit path.
    - The composer: Cut, Copy, Paste, Select all.
    - An attachment in a message or a thread post: Open, Save, Save to channel files. An artifact is in the channel files already, so it has no Save to channel files.
    - An attachment chip in the composer or the reply box: Try again (failed only), Remove.
@@ -66,10 +73,13 @@ These come from the user's experience with GPUI. Follow them in every view.
    - The add button of the composer and the reply box (a left click): Upload from this computer, Choose from channel files.
    - A routine row and a routine opened in the panel or in Settings: Run now, Run history, Edit, Turn off (Turn on when it is off), Delete. A check-in has no Edit: the hub sets its prompt.
    - A memory note (in a tree, on its page and in Settings > Memory): Version history, Copy path, Rename, Delete.
+   - A Monid call row (in the chat and in a task thread): Copy input, Copy output, Copy run ID. A call that Monid can stop also has Stop.
+   - A Monid tool row (Channel panel > Connectors > Monid): Remove.
 3. **The chat never has a hard edge.** The top and bottom of the timeline fade into the canvas, so text never stops at a sharp line. GPUI has no blur filter for elements, so use layered gradients. At the top, a progressive tint `layout.top_tint` (the canvas at 97 percent at the top, 94 percent at the bottom of the mark, 80 percent at the bottom of the pill, and clear at 108 px, drawn as three gradient layers) lies under the Three voices mark, the activity pill and the top actions; content under it stays faintly visible. At rest the first item starts at `layout.content_top` (98 px). Above the composer, `layout.fade_bottom` (32 px). Lists that scroll inside a panel or a dialog fade at their edges too.
 4. **Dropdowns flip.** Any menu, popover or select that can run past the window edge opens downward when there is room and upward when there is not. Use GPUI's anchored positioning with anchor switching, not a fixed offset.
 5. **Colors and sizes come from tokens.** Read colors from the active `consort-theme` theme, and sizes from `design/structure.json` through `consort-theme`. No hex values or ad hoc pixel sizes in view code.
 6. **Copy follows the design system.** Sentence case, verbs on buttons, no all-caps labels, no middle dots between details, no arrows in button text. Errors say what happened and what to do next.
+7. **Text wraps, and never pushes its row.** GPUI gives a flex item the full width of its text as its minimum. So every `flex_1` also has `min_w_0`, unless its label has `whitespace_nowrap`, and a fixed control beside text has `flex_none`. Long text beside anything else goes in a `flex_1` part, so that it wraps. A test in `layout_tests.rs` checks the `flex_1` rule.
 
 ## Writing
 
