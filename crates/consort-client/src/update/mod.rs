@@ -503,17 +503,16 @@ mod tests {
 
     #[test]
     fn a_desktop_file_name_differs_from_the_cli_file_names_without_case() {
-        for (os, arch) in [
-            ("macos", "aarch64"),
-            ("macos", "x86_64"),
-            ("windows", "x86_64"),
-            ("linux", "x86_64"),
+        // The release workflow packs the CLI as a zip only for Windows.
+        for (os, arch, extension) in [
+            ("macos", "aarch64", "tar.gz"),
+            ("macos", "x86_64", "tar.gz"),
+            ("windows", "x86_64", "zip"),
+            ("linux", "x86_64", "tar.gz"),
         ] {
             let platform = Platform::from_std(os, arch).unwrap();
             let desktop = platform.desktop_asset().unwrap().to_lowercase();
-            for extension in ["tar.gz", "zip"] {
-                assert_ne!(desktop, format!("consort-{}.{extension}", platform.key()));
-            }
+            assert_ne!(desktop, format!("consort-{}.{extension}", platform.key()));
         }
     }
 
