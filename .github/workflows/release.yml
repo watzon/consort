@@ -173,7 +173,7 @@ jobs:
           mkdir -p out stage/Consort
           cp target/release/consort-desktop.exe stage/Consort/
           cp design/logo/icons/app-icon-256.png stage/Consort/consort.png
-          (cd stage && 7z a "../out/Consort-windows-x86_64.zip" Consort)
+          (cd stage && 7z a "../out/Consort-desktop-windows-x86_64.zip" Consort)
       - uses: actions/upload-artifact@v4
         with:
           name: desktop-windows-x86_64
@@ -202,7 +202,7 @@ jobs:
           cp target/release/consort-desktop stage/Consort/
           cp packaging/linux/consort.desktop stage/Consort/
           cp design/logo/icons/app-icon-256.png stage/Consort/consort.png
-          tar -czf out/Consort-linux-x86_64.tar.gz -C stage Consort
+          tar -czf out/Consort-desktop-linux-x86_64.tar.gz -C stage Consort
       - uses: actions/upload-artifact@v4
         with:
           name: desktop-linux-x86_64
@@ -226,6 +226,12 @@ jobs:
         working-directory: artifacts
         run: |
           ls -l
+          # GitHub compares file names without case.
+          duplicates="$(ls | tr '[:upper:]' '[:lower:]' | sort | uniq -d)"
+          if [ -n "$duplicates" ]; then
+            echo "::error::These file names differ only by case: $duplicates"
+            exit 1
+          fi
           sha256sum -- * > SHA256SUMS
           cat SHA256SUMS
       - name: Attach the files to the release

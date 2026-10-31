@@ -398,7 +398,7 @@ mod tests {
         let script = windows_script(
             4242,
             Path::new(
-                "C:\\Users\\Ann\\AppData\\Local\\consort\\updates\\0.2.0\\Consort-windows-x86_64.zip",
+                "C:\\Users\\Ann\\AppData\\Local\\consort\\updates\\0.2.0\\Consort-desktop-windows-x86_64.zip",
             ),
             &install(
                 Os::Windows,
@@ -408,7 +408,7 @@ mod tests {
             Path::new("C:\\Users\\Ann\\AppData\\Local\\consort\\updates\\0.2.0\\update.log"),
         );
         assert!(script.contains("Wait-Process -Id 4242"));
-        assert!(script.contains("Expand-Archive -Force -Path 'C:\\Users\\Ann\\AppData\\Local\\consort\\updates\\0.2.0\\Consort-windows-x86_64.zip'"));
+        assert!(script.contains("Expand-Archive -Force -Path 'C:\\Users\\Ann\\AppData\\Local\\consort\\updates\\0.2.0\\Consort-desktop-windows-x86_64.zip'"));
         assert!(script.contains("Copy-Item -Recurse -Force (Join-Path "));
         assert!(script.contains("'Consort\\*') 'C:\\Users\\O''Neil\\Consort'"));
         assert!(script.contains("Add-Content -Path $log"));
@@ -421,14 +421,14 @@ mod tests {
     fn the_linux_script_waits_unpacks_replaces_and_starts_the_app() {
         let script = unix_script(
             77,
-            Path::new("/home/ann/.cache/consort/updates/0.2.0/Consort-linux-x86_64.tar.gz"),
+            Path::new("/home/ann/.cache/consort/updates/0.2.0/Consort-desktop-linux-x86_64.tar.gz"),
             &install(Os::Linux, "/home/ann/it's here/Consort", "consort-desktop"),
             Path::new("/home/ann/.cache/consort/updates/0.2.0/update.log"),
         );
         assert!(script.starts_with("#!/bin/sh\n"));
         assert!(script.contains("kill -0 77"));
         assert!(script.contains(
-            "tar -xzf '/home/ann/.cache/consort/updates/0.2.0/Consort-linux-x86_64.tar.gz' -C "
+            "tar -xzf '/home/ann/.cache/consort/updates/0.2.0/Consort-desktop-linux-x86_64.tar.gz' -C "
         ));
         assert!(script.contains("mv -f '/home/ann/it'\\''s here/Consort/consort-desktop.new' '/home/ann/it'\\''s here/Consort/consort-desktop'"));
         assert!(script.trim_end().ends_with(

@@ -73,8 +73,8 @@ The `consort` program contains the hub and the worker. Download it for your serv
 |---|---|
 | macOS, Apple Silicon | [Consort-macos-arm64.dmg](https://github.com/watzon/consort/releases/latest/download/Consort-macos-arm64.dmg) |
 | macOS, Intel | [Consort-macos-x86_64.dmg](https://github.com/watzon/consort/releases/latest/download/Consort-macos-x86_64.dmg) |
-| Windows, x86_64 | [Consort-windows-x86_64.zip](https://github.com/watzon/consort/releases/latest/download/Consort-windows-x86_64.zip) |
-| Linux, x86_64 | [Consort-linux-x86_64.tar.gz](https://github.com/watzon/consort/releases/latest/download/Consort-linux-x86_64.tar.gz) |
+| Windows, x86_64 | [Consort-desktop-windows-x86_64.zip](https://github.com/watzon/consort/releases/latest/download/Consort-desktop-windows-x86_64.zip) |
+| Linux, x86_64 | [Consort-desktop-linux-x86_64.tar.gz](https://github.com/watzon/consort/releases/latest/download/Consort-desktop-linux-x86_64.tar.gz) |
 
 The macOS app of this release is not notarized, so macOS blocks it the first time. To open it, go to System Settings > Privacy & Security and select **Open Anyway**.
 

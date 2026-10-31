@@ -214,8 +214,10 @@ impl Platform {
     pub fn desktop_asset(self) -> Option<String> {
         match (self.os, self.arch) {
             (Os::MacOs, _) => Some(format!("Consort-{}.zip", self.key())),
-            (Os::Windows, Arch::X86_64) => Some(format!("Consort-{}.zip", self.key())),
-            (Os::Linux, Arch::X86_64) => Some(format!("Consort-{}.tar.gz", self.key())),
+            // GitHub compares file names without case, so these names must
+            // differ from the `consort-<key>` files of the CLI by more than case.
+            (Os::Windows, Arch::X86_64) => Some(format!("Consort-desktop-{}.zip", self.key())),
+            (Os::Linux, Arch::X86_64) => Some(format!("Consort-desktop-{}.tar.gz", self.key())),
             _ => None,
         }
     }
@@ -500,6 +502,22 @@ mod tests {
     }
 
     #[test]
+    fn a_desktop_file_name_differs_from_the_cli_file_names_without_case() {
+        for (os, arch) in [
+            ("macos", "aarch64"),
+            ("macos", "x86_64"),
+            ("windows", "x86_64"),
+            ("linux", "x86_64"),
+        ] {
+            let platform = Platform::from_std(os, arch).unwrap();
+            let desktop = platform.desktop_asset().unwrap().to_lowercase();
+            for extension in ["tar.gz", "zip"] {
+                assert_ne!(desktop, format!("consort-{}.{extension}", platform.key()));
+            }
+        }
+    }
+
+    #[test]
     fn each_platform_has_one_desktop_file_name() {
         let p = |os, arch| Platform::from_std(os, arch).unwrap();
         assert_eq!(
@@ -512,11 +530,11 @@ mod tests {
         );
         assert_eq!(
             p("windows", "x86_64").desktop_asset().as_deref(),
-            Some("Consort-windows-x86_64.zip")
+            Some("Consort-desktop-windows-x86_64.zip")
         );
         assert_eq!(
             p("linux", "x86_64").desktop_asset().as_deref(),
-            Some("Consort-linux-x86_64.tar.gz")
+            Some("Consort-desktop-linux-x86_64.tar.gz")
         );
         assert_eq!(p("linux", "aarch64").desktop_asset(), None);
         assert_eq!(p("windows", "aarch64").desktop_asset(), None);

@@ -85,8 +85,8 @@ Download the file for your system from the latest release:
 | System | File | How |
 |---|---|---|
 | macOS | `Consort-macos-arm64.dmg` or `Consort-macos-x86_64.dmg` (the zip has the same app) | Open the dmg and drag Consort to Applications |
-| Windows | `Consort-windows-x86_64.zip` | Unpack it and keep the `Consort` folder where you like. Run `consort-desktop.exe` |
-| Linux | `Consort-linux-x86_64.tar.gz` | Unpack it. Run `consort-desktop`. `consort.desktop` and `consort.png` are for your menu |
+| Windows | `Consort-desktop-windows-x86_64.zip` | Unpack it and keep the `Consort` folder where you like. Run `consort-desktop.exe` |
+| Linux | `Consort-desktop-linux-x86_64.tar.gz` | Unpack it. Run `consort-desktop`. `consort.desktop` and `consort.png` are for your menu |
 
 Until the app is signed with a Developer ID and notarized, macOS blocks the first start: go to System Settings > Privacy & Security and select Open Anyway. A release that has the signing secrets (below) is signed and notarized, and starts with no question. The Windows and Linux files are not signed.
 
@@ -118,7 +118,7 @@ The staging folder is `consort/updates` in the cache folder of the system. The a
 |---|---|
 | `consort-macos-arm64.tar.gz`, `consort-macos-x86_64.tar.gz`, `consort-linux-x86_64.tar.gz`, `consort-linux-arm64.tar.gz`, `consort-windows-x86_64.zip` | The `consort` program (CLI, hub and worker) |
 | `Consort-macos-arm64.zip`, `Consort-macos-arm64.dmg`, `Consort-macos-x86_64.zip`, `Consort-macos-x86_64.dmg` | The macOS app |
-| `Consort-windows-x86_64.zip`, `Consort-linux-x86_64.tar.gz` | The desktop app for Windows and Linux |
+| `Consort-desktop-windows-x86_64.zip`, `Consort-desktop-linux-x86_64.tar.gz` | The desktop app for Windows and Linux |
 | `SHA256SUMS` | The SHA-256 of every file above |
 
 A tag with a `-` in it, such as `v0.3.0-rc.1`, is a pre-release. The app and the scripts use the latest release that is not a pre-release.
