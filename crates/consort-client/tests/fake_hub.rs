@@ -2373,16 +2373,17 @@ async fn a_channel_snapshot_that_fails_is_tried_again() {
     let dir = tempfile::tempdir().unwrap();
     let client = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
     let tutti = tutti_id(&client);
-    assert!(
-        !bodies_of(&client.state(), &tutti)
-            .iter()
-            .any(|(b, _)| b == "history"),
-        "the first snapshot failed"
-    );
     wait_for(&client, "the second try", |s| {
         bodies_of(s, &tutti).iter().any(|(b, _)| b == "history")
     })
     .await;
+    // The retry can arrive before the state is read, so the hub is the proof
+    // that the first try failed.
+    assert_eq!(
+        hub.lock().unwrap().fail_channel_snapshots,
+        0,
+        "it failed once"
+    );
     assert_eq!(hub.lock().unwrap().sessions.len(), 1, "no reconnect");
 }
 
