@@ -835,12 +835,14 @@ fn base64_of(bytes: &[u8]) -> String {
 }
 
 /// A home folder whose git config has a credential helper that gives
-/// `alice` and `s3cret`.
+/// `alice` and `s3cret`. The empty `helper` clears the helpers of the system
+/// config: Git for Windows sets a credential manager there, which waits for a
+/// person.
 fn home_with_credential_helper() -> tempfile::TempDir {
     let home = tempfile::tempdir().unwrap();
     std::fs::write(
         home.path().join(".gitconfig"),
-        "[credential]\n\thelper = \"!f() { echo username=alice; echo password=s3cret; }; f\"\n",
+        "[credential]\n\thelper =\n\thelper = \"!f() { echo username=alice; echo password=s3cret; }; f\"\n",
     )
     .unwrap();
     home
