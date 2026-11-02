@@ -560,35 +560,6 @@ fn level_words_name_what_each_level_does() {
 }
 
 #[test]
-fn a_brief_reads_as_groups_with_numbered_linked_items() {
-    let brief = parse_brief(crate::mock_proactivity::BRIEF_BODY).unwrap();
-    assert_eq!(brief.intro, "Five things for today. Two need you.");
-    let labels: Vec<_> = brief
-        .groups
-        .iter()
-        .map(|g| (g.label.as_str(), g.your_turn))
-        .collect();
-    assert_eq!(
-        labels,
-        [
-            ("Needs you", true),
-            ("Ready for review", true),
-            ("Done since yesterday", false)
-        ]
-    );
-    let first = &brief.groups[0].lines[0];
-    assert_eq!(first.number, 1);
-    assert_eq!(first.name, "Go through open Sayso issues.");
-    assert_eq!(first.target, "task:tsk_0192f0c4-sayso-issues");
-    assert_eq!(first.rest, "Codex needs your OK to build on bigboi.");
-    assert_eq!(brief.groups[2].lines[0].number, 5);
-    assert!(parse_brief("Just a message.\n\n1. One").is_none());
-    // Bold or heading group names read too.
-    let bold = parse_brief("Hi.\n\n**Needs you**\n- [A](task:t) b").unwrap();
-    assert_eq!(bold.groups[0].lines[0].name, "A");
-}
-
-#[test]
 fn a_change_of_quiet_hours_sends_both_times() {
     let current = ProactivitySettings::default();
     let request = set_request(

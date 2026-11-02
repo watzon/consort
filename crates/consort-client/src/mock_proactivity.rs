@@ -85,9 +85,9 @@ fn you(id: &str, channel: &str, at: i64, body: &str) -> MessageView {
     }
 }
 
-/// The morning brief of the design, in the shape that the coordinator
-/// writes: a first line, then the three groups with numbered items.
-pub const BRIEF_BODY: &str = "Five things for today. Two need you.\n\nNeeds you\n1. [Go through open Sayso issues.](task:tsk_0192f0c4-sayso-issues) Codex needs your OK to build on bigboi.\n2. [Dana, about the venue.](message:msg_offer_dana) The offer to draft a reply waits.\n\nReady for review\n3. [Tighten the spam rules.](task:tsk_0192f0c4-spam-rules) The new rules for miss-lucy-tg are ready.\n4. [Price out roofline lighting.](task:tsk_0192f0c4-roofline) Three quotes are compared.\n\nDone since yesterday\n5. [Move backups to homelab.](task:tsk_0192f0c4-nightly-backups) The copy from truenas ended at 4:10 AM.";
+/// A morning brief in Markdown. The coordinator chooses the format, so this
+/// one uses bold, links to tasks, strikethrough, a table and a task list.
+pub const BRIEF_BODY: &str = "Five things for today. **Two need you.**\n\n1. **[Go through open Sayso issues](task:tsk_0192f0c4-sayso-issues).** Codex needs your OK to build on bigboi.\n2. **Dana, about the venue.** The offer to draft a reply waits.\n3. **[Tighten the spam rules](task:tsk_0192f0c4-spam-rules)** is ready for review. The new rules for miss-lucy-tg ~~block links~~ hold links for review.\n4. **[Price out roofline lighting](task:tsk_0192f0c4-roofline)** is ready for review:\n\n| Quote | Price | Install |\n|---|---:|---|\n| Bright Eaves | $1,850 | Nov 14 |\n| Peak Lights | $2,100 | Nov 9 |\n| HomeGlow | $1,640 | Nov 21 |\n\n5. *Done:* [Move backups to homelab](task:tsk_0192f0c4-nightly-backups). The copy from truenas ended at 4:10 AM.\n\n- [ ] Answer Dana\n- [x] Check the backup";
 
 /// Tutti's timeline in G2C-0: an offer, the morning brief, a check-in and a
 /// follow-up.

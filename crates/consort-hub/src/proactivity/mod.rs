@@ -128,12 +128,15 @@ pub(crate) fn channel_created(tx: &mut Tx<'_>, channel: &Channel) -> Result<bool
 }
 
 impl Hub {
-    /// Gives every channel its proactive routines, once per hub. The hub
-    /// calls it at start.
+    /// Gives every channel its proactive routines, once per hub, and the
+    /// brief routine its current prompt. The hub calls it at start.
     pub(crate) async fn make_proactive_defaults(&self) -> Result<()> {
         let made = self.store.write(routines::make_defaults_once).await?;
         if made {
             tracing::info!("made the check-in and the morning brief");
+        }
+        if self.store.write(routines::update_brief_prompt).await? {
+            tracing::info!("gave the morning brief its new prompt");
         }
         Ok(())
     }

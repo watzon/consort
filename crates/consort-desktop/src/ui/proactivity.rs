@@ -6,8 +6,8 @@
 //! tab (`G8V-0`).
 
 use consort_client::proactivity::{
-    BriefView, ChannelLevelView, LogRowView, ProactiveMarkView, ResultTone, SnoozeOption,
-    SuggestionView, level_helper,
+    ChannelLevelView, LogRowView, ProactiveMarkView, ResultTone, SnoozeOption, SuggestionView,
+    level_helper,
 };
 use consort_client::proactivity::{LevelKind as ChannelKind, ProactiveRating, ProactivityLevel};
 use consort_client::routines::RoutineView;
@@ -1094,100 +1094,6 @@ impl ConsortApp {
                 )))
             })
             .into_any_element()
-    }
-
-    /// The morning brief in its bubble: the first line, then the three
-    /// groups with their numbered items. The name of an item opens its task
-    /// or its message.
-    pub fn render_brief(
-        &mut self,
-        key: &str,
-        brief: &BriefView,
-        t: &Tokens,
-        cx: &mut Context<Self>,
-    ) -> Div {
-        let c = &t.colors;
-        let p = t.component.proactivity;
-        let mut body = div()
-            .flex()
-            .flex_col()
-            .gap(t.space.sm)
-            .child(crate::ui::parts::selectable(
-                SharedString::from(format!("{key}-brief-intro")),
-                brief.intro.clone(),
-                t.text.body,
-                c.text_primary,
-            ));
-        for (g, group) in brief.groups.iter().enumerate() {
-            let mut list = div().flex().flex_col().gap(p.brief_group_gap).child(text(
-                group.label.clone(),
-                t.text.label,
-                if group.your_turn {
-                    c.accent_text
-                } else {
-                    c.text_tertiary
-                },
-            ));
-            for (i, line) in group.lines.iter().enumerate() {
-                let target = line.target.clone();
-                list = list.child(
-                    div()
-                        .flex()
-                        .items_start()
-                        .gap(t.space.sm)
-                        .child(
-                            text(format!("{}.", line.number), t.text.body, c.text_tertiary)
-                                .w(t.component.chat.brief_number)
-                                .flex_none(),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .flex_wrap()
-                                .flex_1()
-                                .min_w_0()
-                                .gap_x(t.space.xs)
-                                .when(!line.name.is_empty(), |d| {
-                                    d.child(
-                                        div()
-                                            .id(SharedString::from(format!("{key}-brief-{g}-{i}")))
-                                            .cursor_pointer()
-                                            .type_style(t.text.body)
-                                            .font_weight(t.text.ui_strong.weight)
-                                            .text_color(c.text_primary)
-                                            .underline()
-                                            .child(line.name.clone())
-                                            .on_click(cx.listener(move |this, _, window, cx| {
-                                                this.open_brief_target(&target, window, cx)
-                                            })),
-                                    )
-                                })
-                                .child(
-                                    text(line.rest.clone(), t.text.body, c.text_secondary)
-                                        .max_w_full(),
-                                ),
-                        ),
-                );
-            }
-            body = body.child(list);
-        }
-        body
-    }
-
-    /// Opens the target of a brief item: a task thread, the message's
-    /// channel, or a web address after the link check.
-    pub fn open_brief_target(&mut self, target: &str, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(task) = target.strip_prefix("task:") {
-            if let Some(channel) = self.state.task(task).map(|t| t.channel_id.clone()) {
-                self.open_channel(channel, window, cx);
-            }
-            self.open_thread(task.to_owned(), window, cx);
-        } else if target.strip_prefix("message:").is_some() {
-            // The message is in the open channel or in Tutti.
-            cx.notify();
-        } else if !target.is_empty() {
-            cx.open_url(target);
-        }
     }
 
     // The Routines tab -----------------------------------------------------

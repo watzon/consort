@@ -1138,11 +1138,6 @@ impl ConsortApp {
                         }),
                     ),
             );
-        } else if let Some(brief) = (!you && consort_client::proactivity::is_brief(&message))
-            .then(|| consort_client::proactivity::parse_brief(&message.body))
-            .flatten()
-        {
-            content = content.child(self.render_brief(&key, &brief, t, cx));
         } else if !row.markdown.is_empty() {
             let code = if you {
                 c.surface_card
@@ -1510,6 +1505,13 @@ impl ConsortApp {
                     let view =
                         TextView::new(&state).on_link_click(move |url, event, window, cx| {
                             if !is_open_click(event) {
+                                return;
+                            }
+                            // A link to a task (`task:<id>`) opens its thread.
+                            if let Some(task) = url.strip_prefix("task:") {
+                                let task = task.to_owned();
+                                let _ = weak
+                                    .update(cx, |this, cx| this.open_task_link(task, window, cx));
                                 return;
                             }
                             let action = click_action(&source, url);

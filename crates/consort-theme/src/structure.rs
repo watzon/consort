@@ -477,8 +477,6 @@ pub struct Proactivity {
     pub offer_pad_top: f32,
     /// The padding at the sides and under the offer card content.
     pub offer_pad: f32,
-    /// The gap between a brief group label and its items.
-    pub brief_group_gap: f32,
 }
 
 /// The sizes of Settings > Hub, Settings > Clients, the Pair a new app

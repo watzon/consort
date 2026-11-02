@@ -168,6 +168,12 @@ impl TextCache {
             .insert(key.to_owned(), (text.to_owned(), state.clone()));
         state
     }
+
+    /// Whether a state for `key` is in the cache.
+    #[cfg(test)]
+    pub fn contains(&self, key: &str) -> bool {
+        self.states.contains(key)
+    }
 }
 
 /// The text of a selection, exactly as the reader selected it. The text

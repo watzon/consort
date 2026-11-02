@@ -6,7 +6,8 @@ use std::time::Duration;
 
 use crate::app::{ChannelTab, ConsortApp, Page, SettingsSection};
 use consort_client::mock_proactivity::{
-    CHECK_IN, CHECK_IN_MESSAGE, FOLLOW_UP_QUOTE, FOLLOW_UP_SWITCH, HOMELAB, LIGHTS, READING, TUTTI,
+    BRIEF_MESSAGE, CHECK_IN, CHECK_IN_MESSAGE, FOLLOW_UP_QUOTE, FOLLOW_UP_SWITCH, HOMELAB, LIGHTS,
+    READING, TUTTI,
 };
 use consort_client::proactivity::{ProactiveRating, ProactivityLevel, SnoozeOption};
 use consort_client::{Client, TimelineItem, ViewState};
@@ -317,6 +318,38 @@ fn proactive_messages_show_their_marks_feedback_and_the_offer(cx: &mut TestAppCo
             })
         })
     });
+}
+
+/// The morning brief is ordinary message text: its bubble draws the
+/// Markdown in a text view, with no groups of its own.
+#[gpui::test]
+fn the_morning_brief_draws_as_markdown(cx: &mut TestAppContext) {
+    let (handle, app) = open(state("proactive-messages"), cx);
+    let cx = &mut VisualTestContext::from_window(handle, cx);
+    cx.update(|_, cx| {
+        app.update(cx, |app, _| {
+            let items = app
+                .state
+                .timeline(TUTTI)
+                .map(|t| t.items.clone())
+                .unwrap_or_default();
+            let row = app
+                .chat_rows
+                .iter()
+                .position(|r| {
+                    matches!(r, consort_client::chat::ChatRow::Bubble(b)
+                        if matches!(items.get(b.item), Some(TimelineItem::Message(m)) if m.id == BRIEF_MESSAGE))
+                })
+                .expect("the brief row");
+            app.timeline.scroll_to_reveal_item(row)
+        })
+    });
+    draw(cx);
+    let prose = format!("{BRIEF_MESSAGE}.p0.0");
+    assert!(
+        app.read_with(cx, |app, _| app.texts.contains(&prose)),
+        "the brief is one Markdown text view"
+    );
 }
 
 /// The Routines tab shows the check-in row with Open note, and the

@@ -365,6 +365,40 @@ async fn the_defaults_come_once_and_the_brief_never_comes_back_after_a_delete() 
 }
 
 #[tokio::test]
+async fn a_start_gives_an_old_brief_prompt_the_new_one_and_keeps_an_edited_one() {
+    let (hub, _dir) = test_hub().await;
+    let tutti = tutti(&hub).await;
+    hub.make_proactive_defaults().await.unwrap();
+    let brief = routine_of_kind(&hub, tutti.id, RoutineKind::Brief)
+        .await
+        .unwrap();
+    assert_eq!(brief.prompt, super::routines::BRIEF_PROMPT);
+    assert!(!brief.prompt.contains("Needs you"));
+
+    let save = |prompt: &'static str| {
+        let mut routine = brief.clone();
+        routine.prompt = prompt.to_owned();
+        move |tx: &mut crate::store::Tx<'_>| tx.save_routine(&routine)
+    };
+    hub.store
+        .write(save("Write the morning brief. Read every channel (list_channels, read_channel), the tasks, and the connected mail and calendar. Post one ranked list of at most 5 items in three groups: Needs you, Ready for review, Done since yesterday. Number the items through all groups. Link each item to its task, message or source. Prepare drafts as tasks where they help: they run in draft mode. If nothing needs the user, post nothing: call no_reply_needed with a finding. The brief may notify once."))
+        .await
+        .unwrap();
+    hub.make_proactive_defaults().await.unwrap();
+    let updated = routine_of_kind(&hub, tutti.id, RoutineKind::Brief)
+        .await
+        .unwrap();
+    assert_eq!(updated.prompt, super::routines::BRIEF_PROMPT);
+
+    hub.store.write(save("Only my calendar.")).await.unwrap();
+    hub.make_proactive_defaults().await.unwrap();
+    let kept = routine_of_kind(&hub, tutti.id, RoutineKind::Brief)
+        .await
+        .unwrap();
+    assert_eq!(kept.prompt, "Only my calendar.");
+}
+
+#[tokio::test]
 async fn a_new_time_zone_moves_the_brief_and_the_research_pass() {
     let (hub, _dir) = test_hub().await;
     let tutti = tutti(&hub).await;

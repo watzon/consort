@@ -89,7 +89,7 @@ During quiet hours and snooze, nothing notifies.
 ### M6. The morning brief (from Duet, with the empty-day rule)
 
 - A cron routine in Tutti with `kind: brief`, weekdays at 07:30 in the user's time zone. The hub creates it once, when Tutti first has the level Normal or Eager. If the user deletes it, the hub does not create it again.
-- The prompt: read every channel (`list_channels`, `read_channel`), the tasks, and the connected mail and calendar; post one ranked list of at most 5 items in three groups (Needs you, Ready for review, Done since yesterday); link each item to its task, message or source; prepare drafts as tasks in draft mode (M10) where they help. If nothing needs the user, post nothing (`no_reply_needed` with a finding).
+- The prompt: read every channel (`list_channels`, `read_channel`), the tasks, and the connected mail and calendar; post one message with at most 5 items, the most important first, in a Markdown format that the coordinator chooses; link each item to its source when it has one; prepare drafts as tasks in draft mode (M10) where they help. If nothing needs the user, post nothing (`no_reply_needed` with a finding). A hub start gives a brief routine with the prompt of an earlier hub the current prompt. A prompt that the user edited stays.
 - The brief may notify once (it is the one message the user expects).
 
 ### M7. Stale-task nudges (from Duet "follows up on threads that have gone quiet" and Grok "nudge a stalled handoff once")

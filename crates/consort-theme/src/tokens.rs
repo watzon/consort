@@ -509,7 +509,6 @@ pub struct Proactivity {
     pub writing_pad_y: Pixels,
     pub offer_pad_top: Pixels,
     pub offer_pad: Pixels,
-    pub brief_group_gap: Pixels,
 }
 
 /// The sizes of the Hub, Clients and Notifications pages. See
@@ -965,7 +964,6 @@ impl Components {
                     writing_pad_y: px(p.writing_pad_y),
                     offer_pad_top: px(p.offer_pad_top),
                     offer_pad: px(p.offer_pad),
-                    brief_group_gap: px(p.brief_group_gap),
                 }
             },
             voice: {

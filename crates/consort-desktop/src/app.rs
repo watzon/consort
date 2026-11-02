@@ -3012,6 +3012,15 @@ impl ConsortApp {
     }
 
     /// Acts on a link that the reader clicked.
+    /// Opens the thread of a task that a message links to with
+    /// `task:<id>`, in the channel of the task.
+    pub fn open_task_link(&mut self, task_id: String, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(channel) = self.state.task(&task_id).map(|t| t.channel_id.clone()) {
+            self.open_channel(channel, window, cx);
+        }
+        self.open_thread(task_id, window, cx);
+    }
+
     pub fn follow_link(&mut self, action: LinkAction, window: &mut Window, cx: &mut Context<Self>) {
         match action {
             LinkAction::Open(url) => cx.open_url(&url),

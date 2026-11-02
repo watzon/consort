@@ -30,8 +30,16 @@ const DEFAULTS_KEY: &str = "proactivity.defaults_v1";
 /// check-in note, not here.
 pub(crate) const CHECK_IN_PROMPT: &str = "Look for things that need the user. The event has what changed in the hub since the last check-in and the check-in note. Read the note first: it says what to watch and what to skip. Post only what needs the user, with a link to its source. When nothing needs the user, call no_reply_needed with a finding.";
 
-/// The prompt of the morning brief.
-pub(crate) const BRIEF_PROMPT: &str = "Write the morning brief. Read every channel (list_channels, read_channel), the tasks, and the connected mail and calendar. Post one ranked list of at most 5 items in three groups: Needs you, Ready for review, Done since yesterday. Number the items through all groups. Link each item to its task, message or source. Prepare drafts as tasks where they help: they run in draft mode. If nothing needs the user, post nothing: call no_reply_needed with a finding. The brief may notify once.";
+/// The prompt of the morning brief. The coordinator posts it as one
+/// message and chooses its format.
+pub(crate) const BRIEF_PROMPT: &str = "Write the morning brief. Read every channel (list_channels, read_channel), the tasks, and the connected mail and calendar. Post it as one message with at most 5 items, the most important first. Format it in Markdown as you see fit. Link each item to its source when it has one. Prepare drafts as tasks where they help: they run in draft mode. If nothing needs the user, post nothing: call no_reply_needed with a finding. The brief may notify once.";
+
+/// The brief prompts of earlier hubs. A brief routine that still has one of
+/// them gets [`BRIEF_PROMPT`] at the next start. A prompt that the user
+/// edited stays.
+const OLD_BRIEF_PROMPTS: [&str; 1] = [
+    "Write the morning brief. Read every channel (list_channels, read_channel), the tasks, and the connected mail and calendar. Post one ranked list of at most 5 items in three groups: Needs you, Ready for review, Done since yesterday. Number the items through all groups. Link each item to its task, message or source. Prepare drafts as tasks where they help: they run in draft mode. If nothing needs the user, post nothing: call no_reply_needed with a finding. The brief may notify once.",
+];
 
 /// The prompt of the research pass, for the routine row. The wake event
 /// itself carries no prompt; the system prompt has the rules.
@@ -225,6 +233,23 @@ pub(crate) fn make_defaults_once(tx: &mut Tx<'_>) -> Result<bool> {
     }
     tx.meta_set(DEFAULTS_KEY, "1")?;
     Ok(true)
+}
+
+/// Gives the brief routine the current prompt when it still has the prompt
+/// of an earlier hub. Returns true when it changed the routine.
+pub(crate) fn update_brief_prompt(tx: &mut Tx<'_>) -> Result<bool> {
+    let mut changed = false;
+    for mut routine in routines::routines(tx.db())? {
+        if routine.kind != RoutineKind::Brief
+            || !OLD_BRIEF_PROMPTS.contains(&routine.prompt.as_str())
+        {
+            continue;
+        }
+        routine.prompt = BRIEF_PROMPT.to_owned();
+        tx.save_routine(&routine)?;
+        changed = true;
+    }
+    Ok(changed)
 }
 
 /// Moves the cron routines that the hub made (the brief and the research
