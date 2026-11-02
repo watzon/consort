@@ -147,3 +147,14 @@ async fn real_gemini_cli() {
     // The help text must list the flag that the launch uses.
     assert!(output.contains("--acp"), "{output}");
 }
+
+#[tokio::test]
+#[ignore = "downloads the preview browser (about 100 MB) from storage.googleapis.com"]
+async fn real_chrome_headless_shell() {
+    let (spec, output) = smoke(ToolId::ChromeHeadlessShell, &["--version"]).await;
+    assert!(spec.args.is_empty());
+    assert!(spec.env.is_empty());
+    // The version in the output is the pinned version.
+    let pinned = consort_tools::ChromePin::pinned().version;
+    assert!(output.contains(&pinned), "{output} is not {pinned}");
+}

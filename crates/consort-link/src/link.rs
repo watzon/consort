@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use consort_proto::auth::{
     AuthChallenge, AuthResponse, PeerId, WorkerHello, WorkerHelloResult, auth_signing_payload,
 };
-use consort_proto::error::{ErrorBody, ErrorCode};
+use consort_proto::error::{ErrorBody, ErrorCode, HubVersions};
 use consort_proto::frame::{
     Frame, FrameError, FrameId, Message as ProtoMessage, Request, ResponseError, ResponseFrame,
     SUPPORTED_PROTOCOL_VERSIONS,
@@ -201,6 +201,10 @@ pub trait LinkHandler: Send + Sync + 'static {
     fn worker_id(&self) -> consort_proto::ids::WorkerId;
     /// The hub URL.
     fn hub_url(&self) -> &str;
+    /// The pin of the certificate, for a hub on This network.
+    fn tls_sha256(&self) -> Option<&consort_proto::model::Sha256Hash> {
+        None
+    }
     /// The route of this kind of machine.
     fn ws_path(&self) -> &str;
     /// Signs the challenge payload.
@@ -211,6 +215,12 @@ pub trait LinkHandler: Send + Sync + 'static {
     fn connected(self: Arc<Self>, result: WorkerHelloResult);
     /// Handles a hub command.
     fn command(self: Arc<Self>, request: consort_proto::frame::RequestFrame);
+    /// Runs when the hub refuses this machine because they speak no common
+    /// protocol version. `hub` holds the versions from the error. A worker
+    /// uses it to follow the hub. The link goes on and tries again slowly.
+    fn protocol_mismatch(self: Arc<Self>, hub: Option<&HubVersions>) {
+        let _ = hub;
+    }
 }
 
 fn jitter(base: Duration) -> Duration {
@@ -250,6 +260,10 @@ pub async fn maintain<H: LinkHandler>(
                 ..
             })
         ) {
+            backoff = BACKOFF_MAX;
+        }
+        if let Err(LinkError::ProtocolMismatch { hub_versions, .. }) = &result {
+            handler.clone().protocol_mismatch(hub_versions.as_ref());
             backoff = BACKOFF_MAX;
         }
         let delay = jitter(backoff);
@@ -327,6 +341,7 @@ type WsStream = futures_util::stream::SplitStream<
 /// socket and the time of its last read.
 async fn open_socket(
     url: &str,
+    pin: Option<&consort_proto::model::Sha256Hash>,
 ) -> Result<
     (
         tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<Progress>>,
@@ -358,9 +373,23 @@ async fn open_socket(
         inner: tcp,
         last: last.clone(),
     };
-    let (ws, _) = tokio_tungstenite::client_async_tls(request, stream)
+    // Two crates can turn on two crypto providers in `rustls`. Then a TLS
+    // connection with no pin needs a provider that this process chose.
+    consort_tls::use_default_provider();
+    let connector = pin
+        .map(|pin| {
+            consort_tls::pinned_client_config(pin)
+                .map(|config| tokio_tungstenite::Connector::Rustls(Arc::new(config)))
+                .map_err(|e| LinkError::Network(e.to_string()))
+        })
+        .transpose()?;
+    let (ws, _) = tokio_tungstenite::client_async_tls_with_config(request, stream, None, connector)
         .await
-        .map_err(|e| LinkError::Network(format!("{url}: {e}")))?;
+        .map_err(|e| {
+            LinkError::Network(
+                crate::http::certificate_message(&e, url).unwrap_or_else(|| format!("{url}: {e}")),
+            )
+        })?;
     Ok((ws, last))
 }
 
@@ -394,10 +423,7 @@ async fn await_response(stream: &mut WsStream, id: &FrameId) -> Result<Value, Li
         if let Frame::Response(r) = next_frame(stream).await?
             && &r.re == id
         {
-            return r.result.map_err(|e: ErrorBody| LinkError::Hub {
-                code: e.code,
-                message: e.message,
-            });
+            return r.result.map_err(|e: ErrorBody| e.into());
         }
     }
 }
@@ -410,9 +436,10 @@ async fn connect_once<H: LinkHandler>(
     let url = crate::http::ws_url(handler.hub_url(), handler.ws_path())?;
     let origin = consort_proto::auth::normalize_origin(handler.hub_url())
         .map_err(|e| LinkError::Config(e.to_string()))?;
-    let (ws, last_read) = tokio::time::timeout(HANDSHAKE_TIMEOUT, open_socket(&url))
-        .await
-        .map_err(|_| LinkError::Network(format!("{url} did not answer")))??;
+    let (ws, last_read) =
+        tokio::time::timeout(HANDSHAKE_TIMEOUT, open_socket(&url, handler.tls_sha256()))
+            .await
+            .map_err(|_| LinkError::Network(format!("{url} did not answer")))??;
     let (mut sink, mut stream) = ws.split();
 
     let handshake = async {
@@ -453,9 +480,9 @@ async fn connect_once<H: LinkHandler>(
         .await
         .map_err(|_| LinkError::Network("the hub did not finish the handshake".to_owned()))??;
     if !SUPPORTED_PROTOCOL_VERSIONS.contains(&hello.protocol_version) {
-        return Err(LinkError::Hub {
-            code: ErrorCode::ProtocolMismatch,
+        return Err(LinkError::ProtocolMismatch {
             message: format!("the hub picked protocol version {}", hello.protocol_version),
+            hub_versions: None,
         });
     }
     tracing::info!(hub = handler.hub_url(), "connected to the hub");
@@ -560,6 +587,8 @@ mod tests {
         worker_id: consort_proto::ids::WorkerId,
         /// Gets the ID of each hub command.
         commands: Option<mpsc::UnboundedSender<String>>,
+        /// Gets the hub version of each `protocol_mismatch`.
+        mismatches: Option<mpsc::UnboundedSender<Option<String>>>,
     }
 
     impl LinkHandler for TestHandler {
@@ -588,6 +617,11 @@ mod tests {
         fn command(self: Arc<Self>, request: consort_proto::frame::RequestFrame) {
             if let Some(tx) = &self.commands {
                 let _ = tx.send(request.id.as_str().to_owned());
+            }
+        }
+        fn protocol_mismatch(self: Arc<Self>, hub: Option<&HubVersions>) {
+            if let Some(tx) = &self.mismatches {
+                let _ = tx.send(hub.map(|h| h.hub_version.clone()));
             }
         }
     }
@@ -640,7 +674,75 @@ mod tests {
             identity: crate::identity::Identity::generate(),
             worker_id: consort_proto::ids::WorkerId::new(),
             commands: None,
+            mismatches: None,
         })
+    }
+
+    /// A hub that answers `hello` with `protocol_mismatch` and the versions.
+    async fn refusing_hub() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let (mut sink, mut source) = ws.split();
+            let challenge = Frame::event(&AuthChallenge {
+                nonce: consort_proto::auth::Nonce::from_bytes([7; 32]),
+            })
+            .unwrap()
+            .to_text()
+            .unwrap();
+            sink.send(Message::Text(challenge.into())).await.unwrap();
+            let Some(Ok(Message::Text(text))) = source.next().await else {
+                return;
+            };
+            let Frame::Request(request) = Frame::parse(text.as_str()).unwrap() else {
+                panic!("expected a request")
+            };
+            let reply = request
+                .respond_ok(&serde_json::json!({}))
+                .unwrap()
+                .to_text()
+                .unwrap();
+            sink.send(Message::Text(reply.into())).await.unwrap();
+            let Some(Ok(Message::Text(text))) = source.next().await else {
+                return;
+            };
+            let Frame::Request(hello) = Frame::parse(text.as_str()).unwrap() else {
+                panic!("expected a request")
+            };
+            let error = ErrorBody::new(ErrorCode::ProtocolMismatch, "No common version.")
+                .with_hub_versions(HubVersions {
+                    hub_version: "9.1.0".into(),
+                    protocol_versions: vec![9],
+                    install: None,
+                });
+            let reply = hello.respond_error(error).to_text().unwrap();
+            sink.send(Message::Text(reply.into())).await.unwrap();
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn a_mismatch_error_reaches_the_handler_with_the_hub_version() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let handler = Arc::new(TestHandler {
+            url: refusing_hub().await,
+            identity: crate::identity::Identity::generate(),
+            worker_id: consort_proto::ids::WorkerId::new(),
+            commands: None,
+            mismatches: Some(tx),
+        });
+        let (stop, stopped) = watch::channel(false);
+        let link = Link::new();
+        let task = tokio::spawn(maintain(link, handler, stopped));
+        let seen = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(seen.as_deref(), Some("9.1.0"));
+        stop.send(true).unwrap();
+        let _ = task.await;
     }
 
     /// A server stream that, once `slow` is on, writes at most `chunk`
@@ -753,6 +855,7 @@ mod tests {
             identity: crate::identity::Identity::generate(),
             worker_id: consort_proto::ids::WorkerId::new(),
             commands: Some(tx),
+            mismatches: None,
         });
         let link = Link::new();
         let timing = LinkTiming {

@@ -42,8 +42,50 @@ pub const FRAME_VERSION: u32 = 1;
 pub const PROTOCOL_VERSION: u32 = 1;
 
 /// The protocol versions that this crate can speak, oldest first. Send this
-/// in `hello`.
+/// in `hello` and in a pairing request.
+///
+/// The rule: each release speaks the current version and the one before it.
+/// So a hub, a worker and an app that are one protocol version apart still
+/// work, and an update can reach them one at a time. A change that adds an
+/// optional field or a new method needs no new version. When you raise
+/// [`PROTOCOL_VERSION`], put the old version in this list, remove the version
+/// before it, and add a row to [`PROTOCOL_INTRODUCED_IN`]. A test checks the
+/// rule. See "Versions" in `docs/protocol.md`.
 pub const SUPPORTED_PROTOCOL_VERSIONS: &[u32] = &[PROTOCOL_VERSION];
+
+/// The first software version that speaks each protocol version. A client
+/// that a hub is too old for says which hub version it needs.
+pub const PROTOCOL_INTRODUCED_IN: &[(u32, &str)] = &[(1, "0.1.0")];
+
+/// The oldest hub version that can talk to this build, or `None` when the
+/// table has no row for it.
+pub fn oldest_compatible_software() -> Option<&'static str> {
+    let oldest = SUPPORTED_PROTOCOL_VERSIONS.iter().min()?;
+    PROTOCOL_INTRODUCED_IN
+        .iter()
+        .find(|(version, _)| version == oldest)
+        .map(|(_, software)| *software)
+}
+
+/// Which side of a `protocol_mismatch` must update.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TooOld {
+    /// The hub speaks only older versions than this side.
+    Hub,
+    /// The hub speaks only newer versions than this side.
+    ThisSide,
+}
+
+/// Says which side is too old, from the protocol versions of both. No list
+/// of the hub means an older hub: only a hub from before the field leaves it
+/// out, and this side has the field.
+pub fn who_is_too_old(ours: &[u32], hub: Option<&[u32]>) -> TooOld {
+    let newest = |list: &[u32]| list.iter().max().copied().unwrap_or(0);
+    match hub {
+        Some(hub) if newest(hub) > newest(ours) => TooOld::ThisSide,
+        _ => TooOld::Hub,
+    }
+}
 
 /// The largest frame that a peer may send, in bytes (1 MiB). A larger frame
 /// is a protocol error. Large data goes through the blob endpoints.
@@ -514,6 +556,37 @@ pub(crate) use message_family;
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The rule on [`SUPPORTED_PROTOCOL_VERSIONS`]: the current version and
+    /// at most the one before it, oldest first.
+    #[test]
+    fn this_build_speaks_the_current_protocol_and_at_most_the_one_before() {
+        let list = SUPPORTED_PROTOCOL_VERSIONS;
+        assert_eq!(list.last(), Some(&PROTOCOL_VERSION));
+        assert!(list.len() <= 2, "{list:?}");
+        if let [older, newer] = list {
+            assert_eq!(older + 1, *newer);
+        }
+    }
+
+    #[test]
+    fn each_protocol_version_of_this_build_has_a_row_in_the_table() {
+        for version in SUPPORTED_PROTOCOL_VERSIONS {
+            assert!(
+                PROTOCOL_INTRODUCED_IN.iter().any(|(v, _)| v == version),
+                "add {version} to PROTOCOL_INTRODUCED_IN"
+            );
+        }
+        assert!(oldest_compatible_software().is_some());
+    }
+
+    #[test]
+    fn a_mismatch_says_which_side_is_too_old() {
+        assert_eq!(who_is_too_old(&[3, 4], Some(&[1, 2])), TooOld::Hub);
+        assert_eq!(who_is_too_old(&[1, 2], Some(&[3, 4])), TooOld::ThisSide);
+        // A hub from before the field is older than a client that has it.
+        assert_eq!(who_is_too_old(&[1, 2], None), TooOld::Hub);
+    }
 
     #[test]
     fn json_len_counts_the_bytes_of_a_json_string() {

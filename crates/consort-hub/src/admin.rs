@@ -16,6 +16,8 @@ use consort_proto::ids::{ClientId, WorkerId};
 use crate::error::Result;
 use crate::store::{self, machine};
 
+pub use crate::backup::back_up_now;
+
 pub use crate::backup::{LOCK_FILE, RestoreError, RestoreReport, restore};
 pub use crate::store::machine::{ClientRecord, Origin, WorkerRecord};
 
@@ -26,6 +28,12 @@ pub struct Removed {
     pub name: String,
     /// True when it was removed before this command.
     pub already: bool,
+}
+
+/// How many tasks work now. It works while a hub runs.
+pub fn working_tasks(data_dir: &Path) -> Result<usize> {
+    let conn = store::open_and_migrate(data_dir)?;
+    Ok(store::work::tasks_with_status(&conn, consort_proto::status::TaskStatus::Working)?.len())
 }
 
 /// Every client of the hub, removed ones included, in pairing order.

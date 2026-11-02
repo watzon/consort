@@ -101,6 +101,17 @@ impl Backups {
     }
 }
 
+/// Writes a backup of a data folder into `folder` now, and keeps the newest
+/// `keep` archives there. It uses SQLite's online backup, so it works while a
+/// hub runs and needs no running hub. A local update uses it.
+pub fn back_up_now(data_dir: &Path, folder: &Path, keep: u32) -> Result<PathBuf> {
+    let stem = archive_stem(Timestamp::now());
+    let done = AtomicU64::new(0);
+    let written = archive::write(data_dir, folder, &stem, &done)?;
+    archive::prune(folder, keep);
+    Ok(written.path)
+}
+
 /// The archive name for a backup that starts at `at`: the time in UTC, for
 /// example `consort-2026-10-29-0800`. A name in local time can go back
 /// (a change of the time zone, or the hour that daylight saving time
@@ -135,6 +146,7 @@ impl Hub {
                     last: file.last,
                     running: self.backups.progress(),
                 },
+                install: Some(self.settings.install_kind),
             },
         })
     }

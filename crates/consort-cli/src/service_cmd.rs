@@ -20,6 +20,11 @@ pub struct InstallArgs {
     /// that is paired with this hub already needs no code.
     #[arg(long, env = "CONSORT_PAIRING_CODE", hide_env_values = true)]
     pub code: Option<String>,
+    /// The SHA-256 of the certificate of a hub on This network. The app puts
+    /// it in the install command. The worker accepts this certificate and no
+    /// other for this hub.
+    #[arg(long = "tls-sha256")]
+    pub tls_sha256: Option<consort_proto::model::Sha256Hash>,
     /// The worker name. The default is the host name.
     #[arg(long)]
     pub name: Option<String>,
@@ -154,7 +159,15 @@ pub async fn install(
         ),
         _ => {
             let code = crate::pairing_code(args.code, input)?;
-            let id = consort_worker::pair(&args.hub, &code, &dir, args.name, args.tags).await?;
+            let id = consort_worker::pair_pinned(
+                &args.hub,
+                args.tls_sha256,
+                &code,
+                &dir,
+                args.name,
+                args.tags,
+            )
+            .await?;
             println!(
                 "Paired as worker {id}. The configuration is in {}.",
                 dir.display()

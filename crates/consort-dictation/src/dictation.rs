@@ -12,11 +12,11 @@ use crate::text::LiveWords;
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, unbounded};
 use sayso_sdk::cleanup::{self, Cleaner, CleanupRequest, RuntimeCleaner};
 use sayso_sdk::deepgram::Deepgram;
-use sayso_sdk::permission::{self, Permission};
-use sayso_sdk::{
+use sayso_sdk::embedded::{
     App, CaptureMicrophone, EngineSource, Event, Microphone, Mode, ModelId, ModelInfo, Options,
     SessionOptions, Source, Speech, SpeechEngine,
 };
+use sayso_sdk::permission::{self, Permission};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -135,7 +135,7 @@ impl Preflight for SystemPreflight {
                 }
             }
         }
-        let devices = sayso_sdk::devices();
+        let devices = sayso_sdk::embedded::devices();
         if devices.is_empty() {
             return Err(Failure::NoMicrophone);
         }
@@ -382,7 +382,7 @@ impl Dictation {
 }
 
 impl Shared {
-    fn speech(self: &Arc<Self>) -> Result<Arc<Speech>, sayso_sdk::Error> {
+    fn speech(self: &Arc<Self>) -> Result<Arc<Speech>, sayso_sdk::embedded::Error> {
         let mut slot = lock(&self.speech);
         if let Some(speech) = slot.as_ref() {
             return Ok(speech.clone());
@@ -792,7 +792,7 @@ fn apply_event(event: Event, session: u64, words: &mut LiveWords, silence: &mut 
     }
 }
 
-fn engine_failure(error: sayso_sdk::Error) -> Failure {
+fn engine_failure(error: sayso_sdk::embedded::Error) -> Failure {
     tracing::warn!("dictation failed: {error}");
     Failure::Engine(error.to_string())
 }

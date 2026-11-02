@@ -57,6 +57,18 @@ fn qr_element(data: &str, side: Pixels, light: Hsla, dark: Hsla, radius: Pixels)
     .into_any_element()
 }
 
+/// A QR code in the size of these pages. It needs dark modules on a light
+/// ground in both modes.
+pub fn qr_code(data: &str, t: &Tokens) -> AnyElement {
+    let c = &t.colors;
+    let (ground, ink) = if c.text_primary.l > c.surface_canvas.l {
+        (c.text_primary, c.surface_canvas)
+    } else {
+        (c.surface_canvas, c.text_primary)
+    };
+    qr_element(data, t.component.admin.qr, ground, ink, t.radius.md)
+}
+
 impl ConsortApp {
     pub fn render_clients(
         &mut self,
@@ -366,14 +378,7 @@ impl ConsortApp {
                     .bg(c.surface_selected)
                     .into_any_element()
             } else {
-                // A QR code needs dark modules on a light ground in both
-                // modes.
-                let (ground, ink) = if c.text_primary.l > c.surface_canvas.l {
-                    (c.text_primary, c.surface_canvas)
-                } else {
-                    (c.surface_canvas, c.text_primary)
-                };
-                qr_element(&qr_text, a.qr, ground, ink, t.radius.md)
+                qr_code(&qr_text, t)
             });
         let address = pairing
             .as_ref()
@@ -428,10 +433,15 @@ impl ConsortApp {
                 detail(t),
                 c.text_tertiary,
             ));
+        let loopback = pairing
+            .as_ref()
+            .is_some_and(|p| p.loopback_only)
+            .then(|| self.loopback_notice(consort_client::reach::LOOPBACK_DEVICE_NOTICE, t, cx));
         let body = div()
             .flex()
             .flex_col()
             .gap(t.space.xl - t.space.xs)
+            .children(loopback)
             .child(div().flex().gap(t.space.lg).child(code_panel).child(qr))
             .child(address_block);
         let paired = pairing.as_ref().and_then(|p| p.paired.clone());

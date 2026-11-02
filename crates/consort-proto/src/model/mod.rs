@@ -10,6 +10,7 @@
 
 mod access;
 mod account;
+mod command_rule;
 mod common;
 mod connector;
 mod conversation;
@@ -24,6 +25,7 @@ mod session;
 mod skill;
 mod tag;
 mod tool;
+mod visual;
 mod voice;
 mod waiting;
 mod work;
@@ -37,6 +39,11 @@ pub use account::{
     AcpAccountSpec, AcpRegistryAgent, SIGN_IN_IDLE_EXPIRY_MS, SIGN_IN_IN_SETTINGS,
     SIGN_IN_RETENTION_MS, SecretEnv, SignIn, SignInMethod, SignInState,
 };
+pub use command_rule::{
+    COMMAND_RULE_DESCRIPTION_MAX_CHARS, COMMAND_RULE_EXCEPT_MAX, COMMAND_RULE_PATTERN_MAX_CHARS,
+    COMMAND_RULES_MAX, CommandRule, CommandRuleInput, CommandRuleResult, CommandRuleSource,
+    InvalidCommandRule, validate_command_rules,
+};
 pub use common::{
     BlobRef, HashParseError, ModelOptions, ModelSelection, OptionValue, Os, Sha256Hash,
     ValidationError, validate_relative_path,
@@ -46,8 +53,9 @@ pub use connector::{
     CONNECTION_HANDLE_MAX_CHARS, CONNECTION_NAME_MAX_CHARS, CallDecision, CallOutcome,
     ComposioStatus, ComposioUsage, Connection, ConnectionStatus, ConnectorCall, ConnectorCategory,
     ConnectorContextEntry, ConnectorService, ConnectorToolSummary, CredentialField, DisplayField,
-    ToolApprovals, ToolKind, UseIn, canonical_json, connection_handle, render_connectors_block,
-    unique_connection_handle, validate_connection_name,
+    TOOL_EXCEPTIONS_MAX, ToolApprovals, ToolException, ToolKind, UseIn, canonical_json,
+    connection_handle, render_connectors_block, tool_display_name, unique_connection_handle,
+    validate_connection_name, validate_tool_exceptions,
 };
 pub use conversation::{
     Author, Channel, ChannelKind, ChannelRepo, CoordinatorBlocked, CoordinatorBlockedKind, Group,
@@ -67,7 +75,7 @@ pub use machine::{
     AuthState, BoundaryInfo, Capabilities, Checkout, CheckoutInfo, Client, ClientKind,
     HarnessAccount, Inventory, LocalMcpServerInfo, MachineKind, ModelInfo, OptionChoice,
     OptionDescriptor, PairedBy, PushProvider, PushRegistration, Worker, WorkerLoad, WorkerPolicy,
-    WorkerState,
+    WorkerState, WorkerUpdateStatus,
 };
 pub use monid::{
     MONID_CALL_NOTICE, MONID_CARD_ALLOW_TASK, MONID_CARD_ALWAYS, MONID_CARD_NEVER,
@@ -78,7 +86,7 @@ pub use monid::{
 pub use preferences::{
     ApiEndpoint, CommandCheckEndpoint, CommandCheckKind, CommandCheckSetting,
     DEFAULT_CONFIDENCE_LIMIT, FAVORITE_FIELD_MAX_CHARS, FAVORITE_MODELS_MAX, FavoriteModel,
-    PREFERENCES_ENTITY_ID, Preferences,
+    GuideState, PREFERENCES_ENTITY_ID, Preferences, USER_NAME_MAX_CHARS,
 };
 pub use proactivity::{
     BRIEF_RESEARCH_MIN_GAP_SECONDS, CHECK_IN_BACKOFF_MAX_SECONDS, CHECK_IN_CHANNEL_SECONDS,
@@ -115,6 +123,16 @@ pub use skill::{
 };
 pub use tag::{InvalidTag, TAG_MAX_CHARS, is_valid_tag, normalize_tags, validate_tag};
 pub use tool::{ToolId, ToolState, ToolStatus};
+pub use visual::{
+    CssVariable, VISUAL_BOOTSTRAP_VERSION, VISUAL_CONSOLE_MAX_CHARS, VISUAL_CONSOLE_MAX_MESSAGES,
+    VISUAL_FIT_MAX, VISUAL_HEIGHT_DEFAULT, VISUAL_HEIGHT_MAX, VISUAL_HEIGHT_MIN,
+    VISUAL_HTML_MAX_CHARS, VISUAL_IMAGE_MAX_BYTES, VISUAL_NOTICE, VISUAL_PAGE_MAX_BYTES,
+    VISUAL_PAGE_MIME, VISUAL_PREVIEW_WIDTH_DEFAULT, VISUAL_PREVIEW_WIDTH_MAX,
+    VISUAL_PREVIEW_WIDTH_MIN, VISUAL_RENDER_WIDTH_MAX, VISUAL_RENDER_WIDTH_MIN, VISUAL_SCALE_MAX,
+    VISUAL_STYLE_MAX_VARIABLES, VISUAL_STYLE_VALUE_MAX_CHARS, VISUAL_TITLE_MAX_CHARS,
+    VISUAL_WIDTHS, VisualHeight, VisualImage, VisualMode, VisualNotice, VisualStyle,
+    VisualStyleError, clamp_height,
+};
 pub use voice::{
     CORE_CONTEXT, CommitmentFlag, DISCLOSURE_LINE, DRAFT_PAIR_KEEP_DAYS, Disclosure, DraftPair,
     EDITABLE_ARGUMENTS, FlagKind, HARD_RULES_SECTION, NEUTRAL_STYLE_LINE, OutgoingKind,
@@ -127,11 +145,11 @@ pub use voice::{
     mark_user_rules, outgoing_kind, placeholders,
 };
 pub use waiting::{
-    Approval, ApprovalDetails, ApprovalKind, ApprovalStatus, ConnectServiceCard, ConnectorCard,
-    DECISION_CONSEQUENCE_MAX_CHARS, DECISION_LABEL_MAX_CHARS, DECISION_MAX_OPTIONS,
+    AddWorkerCard, Approval, ApprovalDetails, ApprovalKind, ApprovalStatus, ConnectServiceCard,
+    ConnectorCard, DECISION_CONSEQUENCE_MAX_CHARS, DECISION_LABEL_MAX_CHARS, DECISION_MAX_OPTIONS,
     DECISION_MIN_OPTIONS, DECISION_QUESTION_MAX_CHARS, Decision, DecisionAnswer, DecisionOption,
     DecisionStatus, HUB_CARD_ALLOW, HUB_CARD_DENY, HUB_CARD_REQUEST_PREFIX, ManagementCard,
-    RequestOption, RequestOptionKind, SignInCard, SkillInstallCard, hub_card_request_id,
-    validate_decision,
+    PermissionGroup, PermissionRow, PermissionsCard, RequestOption, RequestOptionKind, SignInCard,
+    SkillInstallCard, hub_card_request_id, validate_decision,
 };
 pub use work::{ApprovalMode, Isolation, PlacementRequest, PlacementRequire, Task, TaskCreator};

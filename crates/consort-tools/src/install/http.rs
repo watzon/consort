@@ -89,16 +89,51 @@ impl Http {
 
     /// Streams `url` into a new file at `dest` and hashes it on the way.
     pub(crate) async fn download(&self, url: &str, dest: &Path) -> Result<Downloaded, ToolError> {
+        self.download_checked(url, dest, None).await
+    }
+
+    /// Like [`Http::download`], and checks the size while it streams. The
+    /// download stops as soon as more than `bytes` arrive, so a wrong server
+    /// cannot fill the disk. A shorter file fails at the end. `name` is the
+    /// file name for the error message.
+    pub(crate) async fn download_sized(
+        &self,
+        url: &str,
+        dest: &Path,
+        name: &str,
+        bytes: u64,
+    ) -> Result<Downloaded, ToolError> {
+        self.download_checked(url, dest, Some((name, bytes))).await
+    }
+
+    async fn download_checked(
+        &self,
+        url: &str,
+        dest: &Path,
+        size: Option<(&str, u64)>,
+    ) -> Result<Downloaded, ToolError> {
+        let mismatch = |(name, expected): (&str, u64), actual: u64| ToolError::SizeMismatch {
+            name: name.to_owned(),
+            expected,
+            actual,
+        };
         let mut response = self.send(url, None).await?;
         let mut file = tokio::fs::File::create(dest)
             .await
             .map_err(ToolError::io(format!("cannot create {}", dest.display())))?;
         let mut hasher = Sha256::new();
+        let mut received: u64 = 0;
         while let Some(chunk) = response
             .chunk()
             .await
             .map_err(|err| network_error(url, err))?
         {
+            received += chunk.len() as u64;
+            if let Some(size) = size
+                && received > size.1
+            {
+                return Err(mismatch(size, received));
+            }
             hasher.update(&chunk);
             file.write_all(&chunk)
                 .await
@@ -107,6 +142,11 @@ impl Http {
         file.flush()
             .await
             .map_err(ToolError::io(format!("cannot write {}", dest.display())))?;
+        if let Some(size) = size
+            && received != size.1
+        {
+            return Err(mismatch(size, received));
+        }
         Ok(Downloaded {
             sha256: format!("{:x}", hasher.finalize()),
         })

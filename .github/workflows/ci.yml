@@ -39,6 +39,8 @@ jobs:
         run: cargo fmt --all --check
       - name: Test the worker install script
         run: scripts/install/test-worker.sh
+      - name: Test the hub install script
+        run: scripts/install/test-hub.sh
 
   test:
     name: Tests and clippy, macOS (manual)

@@ -16,6 +16,8 @@
 #
 # Options:
 #   --hub <url>        The hub URL. Required, unless --no-service is set.
+#   --tls-sha256 <h>   The SHA-256 of the certificate of a hub on This network.
+#                      The worker accepts this certificate and no other.
 #   --code <code>      The pairing code from a client. Without it, the
 #                      CONSORT_PAIRING_CODE variable or a prompt gives it.
 #   --name <name>      The worker name. The default is the host name.
@@ -37,6 +39,7 @@ REPO="watzon/consort"
 
 hub=""
 code=""
+tls_sha256=""
 name=""
 tags=()
 version=""
@@ -57,6 +60,7 @@ Usage: worker.sh --hub <url> --code <code> [options]
 
   --hub <url>      The hub URL. Required, unless --no-service is set.
   --code <code>    The pairing code from a client.
+  --tls-sha256 <h> The SHA-256 of the certificate of a hub on This network.
   --name <name>    The worker name. The default is the host name.
   --tag <tag>      A tag for placement. Repeat it for more tags.
   --version <tag>  A release tag such as v0.2.0. The default is the latest.
@@ -70,6 +74,7 @@ while [ "$#" -gt 0 ]; do
   case "$1" in
     --hub) [ "$#" -ge 2 ] || fail "--hub needs a URL"; hub="$2"; shift 2 ;;
     --code) [ "$#" -ge 2 ] || fail "--code needs a code"; code="$2"; shift 2 ;;
+    --tls-sha256) [ "$#" -ge 2 ] || fail "--tls-sha256 needs a hash"; tls_sha256="$2"; shift 2 ;;
     --name) [ "$#" -ge 2 ] || fail "--name needs a name"; name="$2"; shift 2 ;;
     --tag) [ "$#" -ge 2 ] || fail "--tag needs a tag"; tags+=("$2"); shift 2 ;;
     --version) [ "$#" -ge 2 ] || fail "--version needs a release tag"; version="$2"; shift 2 ;;
@@ -188,6 +193,7 @@ if [ "$no_service" -eq 1 ]; then
 fi
 
 args=(worker install --hub "$hub")
+[ -n "$tls_sha256" ] && args+=(--tls-sha256 "$tls_sha256")
 [ -n "$name" ] && args+=(--name "$name")
 for tag in "${tags[@]+"${tags[@]}"}"; do
   args+=(--tag "$tag")

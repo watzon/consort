@@ -123,7 +123,13 @@ impl Hub {
         let (code, expires_at) = self
             .new_pairing_code(PairingKind::Worker, caller.origin())
             .await?;
-        Ok(PairingCodeResult { code, expires_at })
+        let address = self.pairing_address().await?;
+        Ok(PairingCodeResult {
+            code,
+            expires_at,
+            hub_url: Some(address.hub_url),
+            tls_sha256: address.tls_sha256,
+        })
     }
 
     pub(crate) async fn worker_rename(
@@ -364,10 +370,12 @@ impl Hub {
         let (code, expires_at) = self
             .new_pairing_code(PairingKind::Client, caller.origin())
             .await?;
+        let address = self.pairing_address().await?;
         Ok(ClientPairingCodeResult {
-            hub_url: self.settings.public_url.clone(),
+            hub_url: address.hub_url,
             code,
             expires_at,
+            tls_sha256: address.tls_sha256,
         })
     }
 

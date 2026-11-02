@@ -42,6 +42,15 @@ impl SavedData {
             self.from_label
         )
     }
+
+    /// The text of the status pill while the hub and this app do not fit
+    /// together. The hub can be reached, so the usual text would be wrong.
+    pub fn incompatible_pill_text(&self) -> String {
+        format!(
+            "The hub and this app need the same version. You see saved data from {}.",
+            self.from_label
+        )
+    }
 }
 
 /// "9:41 AM" for today, else the day before it: "yesterday at 9:41 AM",
@@ -69,8 +78,7 @@ pub fn saved_data(
     fresh_at: i64,
     now_ms: i64,
 ) -> Option<SavedData> {
-    (matches!(connection, Connection::Offline { .. }) && has_data && fresh_at > 0)
-        .then(|| SavedData::new(fresh_at, now_ms))
+    (connection.is_hub_down() && has_data && fresh_at > 0).then(|| SavedData::new(fresh_at, now_ms))
 }
 
 /// Changes the view state for saved data: no worker is online, and nothing
@@ -152,6 +160,14 @@ mod tests {
         // No known time.
         assert!(saved_data(&offline(), true, 0, now).is_none());
         // The link is up, or the app connects now.
+        // A hub that does not fit this app keeps the saved data on screen.
+        let incompatible = Connection::Incompatible {
+            too_old: consort_proto::frame::TooOld::Hub,
+            hub: None,
+            app_version: "0.8.0".into(),
+            retry_in_ms: 60_000,
+        };
+        assert!(saved_data(&incompatible, true, now, now).is_some());
         assert!(saved_data(&Connection::Online, true, now, now).is_none());
         assert!(saved_data(&Connection::Connecting, true, now, now).is_none());
         assert!(saved_data(&Connection::NotPaired, true, now, now).is_none());

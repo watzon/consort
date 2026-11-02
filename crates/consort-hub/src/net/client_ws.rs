@@ -70,7 +70,7 @@ async fn run_client(hub: Hub, mut socket: WebSocket, peer_ip: IpAddr) {
     }
     let Some(version) = negotiate_version(SUPPORTED_PROTOCOL_VERSIONS, &hello.protocol_versions)
     else {
-        fail_protocol(&mut socket, &auth.hello).await;
+        fail_protocol(&hub, &mut socket, &auth.hello).await;
         return;
     };
     let head = hub
@@ -124,6 +124,7 @@ async fn run_client(hub: Hub, mut socket: WebSocket, peer_ip: IpAddr) {
         hub_version: HUB_VERSION.to_owned(),
         feed_seq,
         hub_epoch,
+        protocol_versions: SUPPORTED_PROTOCOL_VERSIONS.to_vec(),
     };
     let sent = match auth.hello.respond_ok(&result) {
         Ok(reply) => send_frame(&mut socket, &reply).await,
@@ -223,8 +224,9 @@ async fn handle_request(
                 }
             }
         }
-        ClientRequest::TaskItemDetail(_) => {
-            // This request waits for a worker, so it must not block the others.
+        ClientRequest::TaskItemDetail(_) | ClientRequest::VisualRender(_) => {
+            // These requests wait for a worker or a session host (up to 60
+            // seconds for an image), so they must not block the others.
             let hub = hub.clone();
             let outbox = outbox.clone();
             tokio::spawn(async move {

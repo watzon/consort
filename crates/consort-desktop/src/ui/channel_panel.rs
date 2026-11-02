@@ -755,7 +755,7 @@ impl ConsortApp {
                     },
                 )),
             )
-            .on_click(cx.listener(move |this, _, _, cx| {
+            .on_click(cx.listener(move |this, _, window, cx| {
                 if open.image {
                     let caption = format!(
                         "In the channel files since {}.",
@@ -774,7 +774,7 @@ impl ConsortApp {
                         local_path: open.local_path.clone(),
                         artifact: None,
                     };
-                    this.open_lightbox(vec![image], 0, caption, cx);
+                    this.open_lightbox(vec![image], 0, caption, window, cx);
                 } else {
                     this.click_channel_file(&open, cx);
                 }

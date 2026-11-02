@@ -252,6 +252,15 @@ impl MockBackend {
                 if let Some(memory) = changes.memory_enabled {
                     channel.memory_enabled = memory;
                 }
+                if let Some(rules) = changes.command_rules {
+                    consort_proto::model::validate_command_rules(&rules).map_err(|e| {
+                        ClientError::Hub {
+                            code: "invalid_command_rule".into(),
+                            message: e.to_string(),
+                        }
+                    })?;
+                    channel.command_rules = rules;
+                }
                 if let Some(repos) = new_repos {
                     for repo in &repos {
                         if !state.convo.repos.iter().any(|r| r.id == repo.id) {
@@ -504,16 +513,25 @@ impl MockBackend {
                     settle(&mut state, &task_id);
                 }
             }
+            // The loopback screen stays on the loopback address.
+            Command::WorkerPairingCode
+                if state
+                    .worker_pairing
+                    .as_ref()
+                    .is_some_and(|p| p.loopback_only) => {}
             Command::WorkerPairingCode => {
                 state.worker_pairing = Some(PairingCodeView {
                     code: "KQ7M-4XPD".into(),
                     hub_url: "https://hub.example.com".into(),
+                    tls_sha256: None,
                     expires_at: now + 10 * 60_000,
+                    loopback_only: false,
                 });
             }
             Command::CancelWorkerPairing => state.worker_pairing = None,
             Command::Pair { .. } => state.connection = Connection::Demo,
             Command::Unpair => state.connection = Connection::NotPaired,
+            Command::MoveHub { to, .. } => state.hub_url = to,
             Command::RenameWorker { worker_id, name } => {
                 let name = name.trim().to_owned();
                 if name.is_empty() {
@@ -554,6 +572,13 @@ impl MockBackend {
                     worker.policy.allow_shell = shell;
                 }
             }
+            Command::SetSetupLater { later } => {
+                state.hub_setup.later = later;
+            }
+            Command::SetUserName { name } => {
+                state.user = UserView::from_name(&name);
+            }
+            Command::GuideTryAgain => {}
             Command::SetCommandCheck { choice } => {
                 state.command_check.choice = choice;
                 refresh_endpoint_use(&mut state);
@@ -918,6 +943,10 @@ impl MockBackend {
                     &mut applied.later,
                 )?;
             }
+            // The image of a visual.
+            Command::RenderVisual { message_id, .. } => {
+                applied.output = crate::mock_visual::render(&message_id)?;
+            }
             // Settings > Hub and Settings > Clients.
             command @ (Command::LoadHubStatus
             | Command::BackUpNow
@@ -925,6 +954,8 @@ impl MockBackend {
             | Command::LoadClients
             | Command::RevokeClient { .. }
             | Command::ClientPairingCode
+            | Command::LoadReach
+            | Command::SetReach { .. }
             | Command::CancelClientPairing) => {
                 applied.output = crate::mock_admin::apply(&mut state, command, &mut applied.later)?;
             }

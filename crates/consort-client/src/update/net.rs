@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use consort_proto::error::HubVersions;
 use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
@@ -52,6 +53,13 @@ pub enum UpdateError {
     Storage { path: String, message: String },
     #[error("There is no update ready to install")]
     NotReady,
+    #[error(
+        "Version {version} cannot talk to hub {hub_version}, so Consort did not install it. Update the hub first, then restart"
+    )]
+    Held {
+        version: Version,
+        hub_version: String,
+    },
     #[error("{0}")]
     Install(String),
 }
@@ -200,6 +208,29 @@ pub async fn check_release(
     Ok(choose_update(&cfg.current, &release, platform))
 }
 
+/// The protocol versions of a release, from its `release.json`. A release
+/// with no such file, or with a file that says something else, gives `None`:
+/// the update then runs as it did before that file existed.
+pub async fn fetch_release_protocols(
+    http: &reqwest::Client,
+    candidate: &Candidate,
+) -> Option<Vec<u32>> {
+    let asset = candidate.manifest.as_ref()?;
+    let response = http
+        .get(&asset.url)
+        .timeout(API_TIMEOUT)
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?;
+    let body = read_limited(response, MAX_TEXT_BYTES).await.ok()?;
+    let manifest: super::ReleaseManifest = serde_json::from_slice(&body).ok()?;
+    (Version::parse(&manifest.version).as_ref() == Some(&candidate.version)
+        && !manifest.protocol_versions.is_empty())
+    .then_some(manifest.protocol_versions)
+}
+
 #[cfg(test)]
 fn sha256_hex(bytes: &[u8]) -> String {
     hex(&Sha256::digest(bytes))
@@ -346,6 +377,9 @@ pub struct Updates {
     commands: Option<mpsc::UnboundedSender<Command>>,
     /// Keeps the sender of a fixed view alive.
     fixed: Option<Arc<watch::Sender<UpdateView>>>,
+    /// Tells the view about the hub. A service in a long download still takes
+    /// this at once.
+    hub_tx: watch::Sender<UpdateView>,
     _runtime: Option<Arc<crate::RuntimeThread>>,
 }
 
@@ -359,8 +393,11 @@ impl Updates {
             auto: settings.auto,
             current: cfg.current.clone(),
             installable: cfg.installable,
+            release_protocols: None,
+            hub: None,
         };
         let (view_tx, view) = watch::channel(initial);
+        let hub_tx = view_tx.clone();
         let (commands, rx) = mpsc::unbounded_channel();
         let runtime = crate::spawn_runtime("consort-updates", move |_stop| async move {
             run_service(cfg, settings, rx, view_tx).await;
@@ -369,6 +406,7 @@ impl Updates {
             view,
             commands: Some(commands),
             fixed: None,
+            hub_tx,
             _runtime: Some(Arc::new(runtime)),
         })
     }
@@ -380,6 +418,7 @@ impl Updates {
         Updates {
             view: rx,
             commands: None,
+            hub_tx: tx.clone(),
             fixed: Some(Arc::new(tx)),
             _runtime: None,
         }
@@ -393,6 +432,18 @@ impl Updates {
     /// A receiver for changes of the view.
     pub fn subscribe(&self) -> watch::Receiver<UpdateView> {
         self.view.clone()
+    }
+
+    /// Says which hub this app talks to. An update that cannot talk to it
+    /// then waits. A hub that the view knows already changes nothing.
+    pub fn set_hub(&self, hub: Option<HubVersions>) {
+        self.hub_tx.send_if_modified(|view| {
+            if view.hub == hub {
+                return false;
+            }
+            view.hub = hub;
+            true
+        });
     }
 
     /// Checks now, without waiting for the next time.
@@ -424,6 +475,12 @@ impl Updates {
     /// returns `Ok`.
     pub fn install_and_relaunch(&self) -> Result<(), UpdateError> {
         let view = self.view();
+        if let Some(hold) = view.hold() {
+            return Err(UpdateError::Held {
+                version: hold.version,
+                hub_version: hold.hub_version,
+            });
+        }
         let UpdateState::Ready { archive, .. } = view.state else {
             return Err(UpdateError::NotReady);
         };
@@ -529,6 +586,8 @@ impl Service {
                 });
             }
             Ok(Some(candidate)) => {
+                let protocols = fetch_release_protocols(&self.http, &candidate).await;
+                publish(&self.view_tx, |view| view.release_protocols = protocols);
                 self.apply(UpdateEvent::Found {
                     version: candidate.version.clone(),
                     auto,
@@ -913,6 +972,8 @@ mod tests {
             auto: true,
             current: Version::parse("0.1.0").unwrap(),
             installable: true,
+            release_protocols: None,
+            hub: None,
         });
         updates.check_now();
         updates.set_auto(false);
@@ -927,7 +988,90 @@ mod tests {
             auto: true,
             current: Version::parse("0.1.0").unwrap(),
             installable: true,
+            release_protocols: None,
+            hub: None,
         });
         assert_eq!(updates.install_and_relaunch(), Err(UpdateError::NotReady));
+    }
+
+    #[test]
+    fn an_update_on_hold_is_not_installed_and_a_new_hub_ends_the_hold() {
+        let updates = Updates::fixed(UpdateView {
+            state: UpdateState::Ready {
+                version: Version::parse("0.8.0").unwrap(),
+                archive: PathBuf::new(),
+            },
+            auto: true,
+            current: Version::parse("0.7.0").unwrap(),
+            installable: true,
+            release_protocols: Some(vec![2]),
+            hub: None,
+        });
+        let hub = |version: &str, protocols: Vec<u32>| HubVersions {
+            hub_version: version.to_owned(),
+            protocol_versions: protocols,
+            install: None,
+        };
+        updates.set_hub(Some(hub("0.6.2", vec![1])));
+        assert_eq!(
+            updates.install_and_relaunch(),
+            Err(UpdateError::Held {
+                version: Version::parse("0.8.0").unwrap(),
+                hub_version: "0.6.2".to_owned(),
+            })
+        );
+        updates.set_hub(Some(hub("0.8.0", vec![2])));
+        assert_eq!(updates.view().hold(), None);
+    }
+
+    async fn serve_manifest(body: &'static str) -> String {
+        let app = Router::new().route("/release.json", get(move || async move { body }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        format!("http://{address}/release.json")
+    }
+
+    fn candidate(manifest: Option<String>) -> Candidate {
+        let asset = |name: &str, url: String| super::super::Asset {
+            name: name.to_owned(),
+            url,
+            size: 1,
+        };
+        Candidate {
+            version: Version::parse("0.8.0").unwrap(),
+            asset: asset(ASSET, String::new()),
+            checksums: asset("SHA256SUMS", String::new()),
+            manifest: manifest.map(|url| asset("release.json", url)),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_updater_reads_the_protocol_versions_of_a_release() {
+        let http = reqwest::Client::new();
+        let url = serve_manifest(r#"{"version":"0.8.0","protocol_versions":[2,3]}"#).await;
+        assert_eq!(
+            fetch_release_protocols(&http, &candidate(Some(url))).await,
+            Some(vec![2, 3])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_manifest_that_is_missing_or_wrong_holds_nothing() {
+        let http = reqwest::Client::new();
+        assert_eq!(fetch_release_protocols(&http, &candidate(None)).await, None);
+        for body in [
+            "not json",
+            // The file of another release.
+            r#"{"version":"0.7.0","protocol_versions":[2]}"#,
+            r#"{"version":"0.8.0","protocol_versions":[]}"#,
+        ] {
+            let url = serve_manifest(body).await;
+            assert_eq!(
+                fetch_release_protocols(&http, &candidate(Some(url))).await,
+                None,
+                "{body}"
+            );
+        }
     }
 }

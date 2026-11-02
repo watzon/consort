@@ -8,5 +8,6 @@ mod error;
 pub mod http;
 pub mod identity;
 pub mod link;
+pub mod update;
 
 pub use crate::error::LinkError;

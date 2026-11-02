@@ -25,6 +25,9 @@ pub const MIGRATIONS: &[&str] = &[
     include_str!("schema_v15.sql"),
     include_str!("schema_v16.sql"),
     include_str!("schema_v17.sql"),
+    include_str!("schema_v18.sql"),
+    include_str!("schema_v19.sql"),
+    include_str!("schema_v20.sql"),
 ];
 
 pub fn current_version() -> i64 {
@@ -178,6 +181,7 @@ mod tests {
             tags: Vec::new(),
             disabled_connections: Vec::new(),
             disabled_skills: Vec::new(),
+            command_rules: Vec::new(),
             archived_at: None,
             created_at: now,
             updated_at: now,
@@ -472,5 +476,47 @@ mod tests {
             ("channel", "chn_tutti", "upsert")
         );
         assert!(payload.contains("\"default_approval_mode\":\"auto\""));
+    }
+
+    fn upgrade_to_19(history: &str) -> Option<String> {
+        const BEFORE_V19: usize = 18;
+        let mut conn = Connection::open_in_memory().unwrap();
+        let tx = conn.transaction().unwrap();
+        for sql in &MIGRATIONS[..BEFORE_V19] {
+            tx.execute_batch(sql).unwrap();
+        }
+        tx.execute_batch(history).unwrap();
+        tx.execute_batch(MIGRATIONS[BEFORE_V19]).unwrap();
+        let flag = tx
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'first_greeting'",
+                [],
+                |r| r.get(0),
+            )
+            .ok();
+        tx.commit().unwrap();
+        flag
+    }
+
+    #[test]
+    fn a_new_hub_can_still_greet_after_the_migration() {
+        assert_eq!(upgrade_to_19(""), None);
+        assert_eq!(
+            upgrade_to_19(
+                "INSERT INTO channels (id, kind, position, data) VALUES ('c', 'tutti', 0, '{}')"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_hub_with_a_channel_of_its_own_never_greets() {
+        assert_eq!(
+            upgrade_to_19(
+                "INSERT INTO channels (id, kind, position, data) VALUES ('c', 'standard', 0, '{}')"
+            )
+            .as_deref(),
+            Some("skipped")
+        );
     }
 }

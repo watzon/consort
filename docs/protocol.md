@@ -54,7 +54,17 @@ A response that does not fit in one frame becomes an error response with the cod
 
 ### Versions
 
-Each side sends the protocol versions that it supports in `hello`. The hub picks the highest common version. If no common version exists, the hub closes the connection with `protocol_mismatch`.
+Each side sends the protocol versions that it supports in `hello`. The hub picks the highest common version. If no common version exists, the hub answers with `protocol_mismatch` and closes the connection.
+
+A build supports the current protocol version and the one before it (`SUPPORTED_PROTOCOL_VERSIONS`). A build that adds a version removes the one before the previous, and adds a row to `PROTOCOL_INTRODUCED_IN`. A test checks this rule.
+
+The `error` object of `protocol_mismatch` has `hub_versions`: `hub_version`, `protocol_versions` and `install`. The peer uses them to say which side is too old. The peer has signed in at this point, so `install` is there. `install` is `local`, `service`, `docker` or `manual`. An unknown value reads as `manual`.
+
+A pairing request has `protocol_versions` too. If the list has no common version, the hub answers `protocol_mismatch` before it looks at the code, so the code still works. An empty list comes from an older peer, and the hub does not check it. Every failed pairing has `hub_versions`, without `install`: the peer has not signed in.
+
+`hello` answers also carry `protocol_versions` of the hub. `hub.status` has `install`.
+
+A client with a `protocol_mismatch` keeps its pairing, its saved data and its outbox, and tries again every 60 seconds. A worker with a `protocol_mismatch` follows the version in the error if it is newer than its own.
 
 ### Error codes
 
@@ -82,6 +92,7 @@ Each side sends the protocol versions that it supports in `hello`. The hub picks
 | `needs_user` | The action needs the user first, for example a connection that needs a new sign-in. `message` says what the user must do |
 | `skill_blocked` | The skill is blocked, for example because its audit failed. `message` says why |
 | `skill_invalid` | The skill does not follow the Agent Skills format or breaks a limit. `message` names the file or the limit |
+| `unavailable` | A service that the action needs is not ready yet, for example the preview browser while it installs. Try again later. `message` says when |
 
 A reader that gets a code it does not know treats it as `internal` and shows the message.
 
@@ -101,6 +112,19 @@ Workers and clients pair the same way, and both prove their identity with an Ed2
 ### Pair a client
 
 The first client uses the setup code that the hub prints on its first start. To pair a later client, a paired client shows a QR code that holds the hub URL and a new pairing code. The new client then follows the worker steps with `POST /v1/pair/client`, with `code`, `public_key`, `name`, `kind` (`desktop`, `ios` or `android`) and optional `os` (`macos`, `windows` or `linux`). The QR code holds `{"hub_url", "code"}`. The hub returns the `client_id`.
+
+### Reach from other devices, the pin and the pairing link
+
+A hub has a pairing address: the address of Tailscale when it is on, else the address of This network when it is on, else the public URL. A pairing code uses this address, so `client.pairing_code` answers with it in `hub_url`. `worker.pairing_code` adds it as an optional `hub_url`. `hub.status` still reports the public URL. A client that is paired keeps its own `hub_url` when a way turns on, because its saved data belongs to that URL.
+
+This network uses a self-signed certificate. The peer accepts that certificate by its SHA-256 and nothing else, for the URL that came with it. The pin has the name `tls_sha256` (64 lowercase hex characters) and goes in:
+
+- `PairingInvite`, the JSON in the QR code: `{"hub_url", "code", "tls_sha256"?}`,
+- the pairing link: `consort://pair?hub=<percent-encoded URL>&code=<code>&tls_sha256=<hex>`. A reader ignores a field that it does not know,
+- the answers of `client.pairing_code` and `worker.pairing_code`, as an optional field,
+- the install command of a worker: `--tls-sha256` (`-TlsSha256` in PowerShell), and `worker.toml`.
+
+The client refuses an invite that has a pin and a URL with plain `http`. A client that has only the address of such a hub gets the error that says to scan the code or paste the link, and the code stays good, because the request did not leave the TLS handshake. Plain `http` stays for development and private addresses, as before.
 
 ### Who made a code, and removing a client or a worker
 
@@ -125,7 +149,7 @@ At most 64 connections can be between steps 1 and 5 at the same time, and at mos
 
 Steps 2 to 5 must end in 15 seconds in total. Pings and pongs do not make this time longer. When the time runs out, the hub closes the connection with the close code 1008.
 
-The origin is `scheme://host[:port]` of the hub URL, in lowercase, with `ws` read as `http` and `wss` as `https`, and without a default port, a path or a query. The peer takes it from the hub URL in its own configuration. The hub takes it from its configured public URL. So a peer cannot pass a challenge from one hub to another.
+The origin is `scheme://host[:port]` of the hub URL, in lowercase, with `ws` read as `http` and `wss` as `https`, and without a default port, a path or a query. The peer takes it from the hub URL in its own configuration. The hub accepts its configured public URL and the address of each way to reach it that is on (see [data-model.md](data-model.md#reach)). The same list applies to the HTTP signatures of blobs. The hub reads the list from its store at each check, so a change by `consort hub reach` counts with no restart. So a peer cannot pass a challenge from one hub to another.
 
 A client sends `hello` with `client_id`, `version` and `protocol_versions`. The hub answers with `protocol_version`, `hub_version`, the current feed `seq` and `hub_epoch`. The hub epoch is a random ID of the hub's database. The hub makes a new one when it creates its database and when `consort hub restore` puts a backup back. A restored hub has an older feed, so its sequence numbers name other changes. A client keeps the epoch with its saved feed position. When the epoch in `hello` differs from the saved one, the client does not resume from its position: it loads a snapshot. An older hub sends no epoch.
 
@@ -169,6 +193,7 @@ Every hub command is a request. The envelope `id` of a hub command is its comman
 | `sign_in.cancel` | `sign_in_id` | None |
 | `tools.check` | Empty | None. The result comes in the next inventory |
 | `tools.install` | `tool` | None. The progress comes in the inventory |
+| `visual.render` | `page` (a blob reference), `width` (160 to 2400), `scale` (1 to 3), `style` (`mode` and `variables`) | `image` (a blob reference to the PNG) and `height` (CSS pixels). The session host downloads the page, adds the bootstrap with the style, draws it in its browser, uploads the PNG with `PUT /v1/blobs`, and answers. The hub sends it as a direct request, not a queued command, to one session host that is online, and waits up to 60 seconds. An error of the session host, such as "the preview browser is installing", goes to the client as it is, with its code and message. See [Visuals](#visuals) |
 
 The hub never queues the account, sign-in and tool commands for an offline worker. The client request fails with `worker_offline` instead.
 
@@ -257,7 +282,7 @@ The `code` of an `error` event is one of these:
 
 The hub stores each `error` event as a failed item of the session. `login_expired` does what `signed_out` does, except that the account becomes `error` with the detail "The login expired. Sign in again." (the app reads "expired" in the detail as Expired). After `signed_out`, the hub also marks the account `signed_out` in the stored inventory of the worker, so placement does not choose it until the next inventory from the worker. A coordinator session on that account ends as `lost`: its turn's events go back to the queue, and placement starts a new session on another signed-in account. When no account fits, the channel gets `coordinator_blocked` with the kind `signed_out` and the name of the account (see below), and the events wait for the next inventory. A failed coordinator turn on an account that the inventory shows as signed out has the same result.
 
-The `details` of an approval request has a `kind` and the fields for that kind: `command` (`command`, `cwd`), `file_change` (`paths`), `tool` (`server`, `tool`, `arguments`), `network` (`target`) or `other` (`text`). The hub card kinds (`connector`, `management`, `connect_service`, `sign_in` and `skill_install`) are for approvals that the hub makes itself. The hub reads one of them from a worker as `other`, with the summary as the text. Every `command` approval has its `cwd`. A Codex network approval comes as `command` details, with the command and its folder, and its summary names the host, for example "Run `git fetch` with network access to github.com". The `details` of a question has `question`, `context` and `allow_free_text`. Each option has `id`, `label`, `kind` (`allow_once`, `allow_always`, `deny_once`, `deny_always` or `choice`) and an optional `description`.
+The `details` of an approval request has a `kind` and the fields for that kind: `command` (`command`, `cwd`), `file_change` (`paths`), `tool` (`server`, `tool`, `arguments`), `network` (`target`) or `other` (`text`). The hub card kinds (`connector`, `management`, `connect_service`, `sign_in`, `skill_install` and `add_worker`) are for approvals that the hub makes itself. The hub reads one of them from a worker as `other`, with the summary as the text. Every `command` approval has its `cwd`. A Codex network approval comes as `command` details, with the command and its folder, and its summary names the host, for example "Run `git fetch` with network access to github.com". The `details` of a question has `question`, `context` and `allow_free_text`. Each option has `id`, `label`, `kind` (`allow_once`, `allow_always`, `deny_once`, `deny_always` or `choice`) and an optional `description`.
 
 The hub makes an approval for an approval request. It makes a decision with a `request_id` for a question, and it sends the answer back with `session.respond`, not as a new turn.
 
@@ -294,7 +319,7 @@ The worker sends a full inventory after `hello` and again when any part changes.
 | `hostname`, `os`, `arch` | |
 | `tags` | The detected tags (`macos`, `windows`, `linux`, `arm64`, `x64`, `ram-<n>gb`, `cpu-<n>`, `gpu-nvidia`, `gpu-amd`, `gpu-apple`) and the `tags` in the configuration file of the machine. An older worker sends `labels`, which reads as `tags` |
 | `accounts` | Each harness account: `account_id`, `harness`, `label`, `harness_version`, `auth_state`, `auth_detail`, `models`, `capabilities`, `enabled`, `profile` (true for an account that Consort made, with a profile folder), `email`, `plan`, `secret_names` (the names in `env.json`, never the values), `sign_in_methods`. Never a credential |
-| `tools` | Each managed tool: `tool`, `version`, `latest`, `state` (`missing`, `installing`, `ready`, `update_available` or `failed`) and `detail`. `tool` is `node`, `claude-code`, `claude-agent-acp`, `codex`, `opencode`, `gemini-cli` or `acp:<registry id>` |
+| `tools` | Each managed tool: `tool`, `version`, `latest`, `state` (`missing`, `installing`, `ready`, `update_available` or `failed`) and `detail`. `tool` is `node`, `claude-code`, `claude-agent-acp`, `codex`, `opencode`, `gemini-cli`, `chrome-headless-shell` (the preview browser) or `acp:<registry id>` |
 | `local_mcp_servers` | Each server's `name`, `description` and tool names. Never a URL with a secret, and never a credential |
 | `checkouts` | Each checkout's `repo_url`, `path` and `managed` flag |
 | `policy` | `max_approval_mode`, `allowed_roots` and `allow_shell` |
@@ -370,6 +395,7 @@ The hub sends these requests to a worker:
 | `workspace.sync` | `capability`, `attachments`, optional `channel_files` | `failures` |
 | `exec.op` | `session_id`, `capability`, `operation_id`, `tool`, `arguments`, `deadline`, `policy_version` | `result`, `replayed_from_journal`, `is_error` |
 | `inventory.refresh` | Empty | None |
+| `worker.update` | `{version}` | `{status?}`. The hub sends this to an execution worker that is older than the hub, after `hello`. It names only a version. The worker downloads that release from its fixed repository, checks the SHA-256, restarts when no work runs, and never moves to an older version |
 | `policy.set` | Optional `max_approval_mode`, `allowed_roots`, `allow_shell` | The policy that the worker uses now. The worker saves it in `worker.db`, applies it at once and sends a new inventory. It refuses a folder that is not a full path on the machine, and then nothing changes |
 
 The tools of `exec.op` are the file, process, blob, skill and local MCP tools in `ExecTool`. `process_list` returns the commands of the session and the operations that began and have no result.
@@ -386,6 +412,8 @@ The worker is the MCP server. It gets the tool list from the hub with `tool.list
 
 The worker answers part of `publish_artifact` itself: it uploads the file from the workspace, then sends the call to the hub with the blob hash added.
 
+The session host answers `preview_visual` itself and never sends it to the hub. It prepares the page of `show_visual` (checks it, inlines local images, measures the height table), uploads it, and sends the call to the hub with `page` and `heights` added and `html` empty. A `preview_visual` call that reaches the hub, and a `show_visual` call with no `page`, come from a session host that is too old. The hub fails both with `unsupported` and a message that says to update the session host.
+
 The hub gives each session the tools for its role. Each tool's `input_schema` is an inline JSON Schema object with no `$ref`. Times in tool arguments are RFC 3339 strings. Results are JSON objects. A tool that only confirms returns `{"ok": true}`, and a failed call returns `is_error` with `{"error": {"code", "message"}}`.
 
 ### Tools for every session
@@ -399,6 +427,8 @@ The hub gives each session the tools for its role. Each tool's `input_schema` is
 | `list_workers` | None | Each worker's ID, name, OS, state, tags, account labels with their models, local MCP server names and repo checkouts |
 | `ask_decision` | `question`, `options` (2 to 4, each with `label` and `consequence`), optional `recommended_index`, `context` and `allow_free_text` | `decision_id`. The answer arrives as input to a later turn |
 | `search` | `query`, optional `channel_id` | Matching messages, memory notes and tasks. A memory note and a task hit have `updated_at` |
+| `preview_visual` | `html`, optional `width` (320 to 1144, default 720) and `appearance` (`dark` or `light`) | The session host answers it. A PNG, and `width`, `height`, `console` and `omitted`. Nothing is posted. See [Visuals](#visuals) |
+| `show_visual` | `html`, `title` (1 to 200 characters), optional `height` (80 to 2000) | The session host prepares the page, and the hub posts it. `message_id` and a `message` that says the visual is in the conversation. See [Visuals](#visuals) |
 
 ### Tools for coordinators
 
@@ -423,6 +453,7 @@ The hub gives each session the tools for its role. Each tool's `input_schema` is
 | `read_task` | `task_id`, optional `since_item_id`, `before_item_id` and `limit` | The full task, a page of its session items (oldest first) and `has_more`. The task and the items take at most 320 KiB. Without `since_item_id`, the page has the newest items, or the newest ones older than `before_item_id`, and `has_more` says that older items exist. With `since_item_id`, the page has the oldest items after it, and `has_more` says that newer items exist. The default `limit` is 50, and the limit is 200 |
 | `interrupt_task`, `retry_task` | `task_id` | |
 | `routine_list`, `routine_create`, `routine_update`, `routine_delete` | Routine fields | `routine_create` and `routine_update` give `routine`, and `notes` when the hub lowered the placement of a `start_task` action |
+| `set_user_name` | `name` | Coordinators. Stores the name of the user on the hub (see `preferences.set_user_name`). The clients show it in place of their guess |
 | `suggest_memory` | `note`, `reason` | Channel coordinators only. Sends the note to the Tutti coordinator as a global memory suggestion |
 
 `ask_decision` from a coordinator also takes `offer`. An offer is for a proactive turn in a channel at the level Eager: the hub sets the options "Do it", "Not now" and "Never about this", and marks the card as an offer.
@@ -464,6 +495,25 @@ When the voice is on and a session's channel can reach a connector that drafts o
 #### Drafts that the user sends
 
 `show_draft` (for task and coordinator sessions) takes `title` (1 to 200 characters), optional `to` (at most 1000 bytes) and `body` (at most 64 KiB). It posts a card for text that no connection can send: a form, a phone call, a letter. The card does not wait and the turn goes on. The result has `message_id` and a `message` that says nothing was sent. The card is a message of the kind `notice` by the assistant, in the task thread (or the channel for a coordinator), with the JSON body `{\"kind\": \"draft\", \"text\", \"title\", \"to\"?, \"body\", \"original_body\"?}`. `draft.edit` changes the title or body on the hub and keeps the first text in `original_body`. Copy needs no request.
+
+#### Visuals
+
+A visual is an HTML page that the assistant shows in the timeline as an item of its own ([VISUALS-PLAN.md](VISUALS-PLAN.md)). `preview_visual` and `show_visual` are for task and coordinator sessions.
+
+- `preview_visual` is answered by the session host. It draws the page in its browser and returns the PNG, the height and the console output. The hub never sees the call.
+- `show_visual` has two steps. The session host prepares the page, uploads it as a blob, and adds `page` (a blob reference with the media type `text/html`) and `heights` (the height table, at most 32 rows of `width` and `height`) to the call. It sends `html` as an empty string. The hub posts the visual. The model does not see `page` and `heights`.
+- The hub fails `show_visual` with `invalid` for a title that is empty after trimming or has more than 200 characters, a `page` with another media type, a page of more than 25 MiB, a page that is not in the blob store, more than 32 rows, or a width outside 160 to 2400. It fails with `unsupported` when `page` is missing: the session host is too old.
+- A coordinator posts in its channel, under the rules of its turn (the same as `post_message`: a proactive turn marks the visual, and the research pass may not post). A task session posts in the thread of its task. The result has `message_id` and a `message` that tells the assistant not to describe the visual.
+- A visual is a message of the kind `notice` by the assistant, with the JSON body `{"kind": "visual", "text", "title", "height", "heights"}` and one attachment, the page. See [data-model.md](data-model.md#message). The page is a part of the message. It is not a channel file.
+- Both tools fail with `policy_denied` in the research pass, in a turn of memory suggestions only, in a turn of voice events, and in a voice task. These turns read text that other people or other sessions wrote, and a page can use the network, so a page built from that text could send it out. A normal turn and a proactive turn may use them.
+
+The client request `visual.render` asks for an image of a visual:
+
+- The body is `{message_id, width, scale, style}`: `width` is 160 to 2400 CSS pixels, `scale` is 1 to 3, and `style` is `{mode, variables}` (`mode` is `dark` or `light`, and `variables` is a list of `{name, value}` of CSS custom properties, at most 64; a name is `--` and lowercase letters, digits and dashes, and a value has at most 200 characters and none of `;{}<>\` or a control character). The answer is `{image, height}`: a blob reference to the PNG, and the height of the page in CSS pixels. The client downloads the PNG with its HTTP token.
+- The request fails with `invalid` for a width, a scale or a style outside these limits. It fails with `not_found` when the message does not exist, was deleted, is not a visual, or has lost its page.
+- The hub keeps an image cache. The key is the SHA-256 of a text that names the page hash, the width, the scale, the mode and the variables in the order that the client gave. A hit whose PNG is still in the blob store is the answer. On a miss, the hub sends `visual.render` to a session host that is online and waits up to 60 seconds. It checks that the PNG is in the store, saves the row, and answers. Requests for one key that come together share one render. The hub tries the session host that paired first. When its connection drops while the hub waits, the hub tries the next one.
+- With no session host online, the request fails with `worker_offline` and the message "No session host is online to draw this visual. Try again when the hub is online." A session host that does not answer in 60 seconds gives `worker_offline` too. An error of the session host passes through with its code and message.
+- A visual keeps at most 32 images in the cache. The oldest goes first. The rows of a visual go when its message goes (a task or a channel is deleted). The blobs stay: the hub has no clean-up of blobs.
 
 ### Tools for task sessions
 
@@ -516,14 +566,17 @@ For the coordinators of every channel:
 |---|---|---|
 | `list_connections` | None | `connections`. A channel's coordinator sees the ones that its channel can use, and `off_in_this_channel` |
 | `list_installed_skills` | None | `skills`, with the same rule, and `off_in_this_channel` |
-| `connect_service` | `service`, `name`, optional `use_in`, `approvals` | Posts a connect card. In a channel, the default `use_in` is the channels with this channel's tags, or this channel alone when it has no tags. In Tutti, every channel |
+| `connect_service` | `service`, `name`, optional `use_in`, `approvals` | Posts a connect card. In a channel, the default `use_in` is the channels with this channel's tags, or this channel alone when it has no tags. In Tutti, every channel. With no Composio key on the hub, the card uses the name and has no logo. The hub checks the slug when the user continues, and the card asks the client for the key |
 | `add_skill` | `source` (a git URL, `owner/repo` or a `search_skills` entry ID), optional `path`, `use_in` | Posts an install card with the license, the scripts and the audits. Same defaults for `use_in` |
 
 For the Tutti coordinator only:
 
 | Tool | Arguments | Notes |
 |---|---|---|
-| `create_channel` | `name`, `purpose`, optional `group` (a group name, made when missing), `tags`, `model`, `task_model` | Runs at once |
+| `create_channel` | `name`, `purpose`, optional `group` (a group name, made when missing), `tags`, `model`, `task_model` | Runs at once. Posts a notice of kind `channel_made` in the channel that called it |
+| `add_worker` | optional `this_computer` (default false) | Posts a worker card. The result has the status `waiting_for_user` and no code. The client makes the pairing code and shows the command, so the session never sees it. The card closes when an execution worker comes online, and the `card_answered` event names the worker |
+| `start_guide` | none | The user asked for the guided start. Sets the guide state to `running` and returns the rules |
+| `finish_guide` | `outcome`: `closed`, `later` or `declined` | Ends the guide. `later` makes one follow-up for the next day. A second `later`, and `declined`, make none |
 | `update_channel` | `channel`, optional `name`, `purpose`, `instructions`, `group`, `tags`, `model`, `task_model`, `repos` (git remote URLs) | A change to `tags` asks first |
 | `archive_channel` | `channel` | Asks first |
 | `set_default_model` | `model` (a model selection) | Tutti's selection |
@@ -542,6 +595,7 @@ For a channel's coordinator, only for its own channel:
 
 | Tool | Arguments | Notes |
 |---|---|---|
+| `set_permissions` | optional `channel` (Tutti only), `add` (each with `pattern`, optional `except`, `result`, `description`), `remove` (patterns), `connections` (each with `connection`, optional `approvals`, `add_exceptions`, `remove_exceptions`, `assistant_owned`) | Command rules that only make a channel stricter run at once. Any other change, and every connection change, asks first. A channel's assistant reaches only the connections of its channel. The management card has `permissions` with groups of rows and an optional `warning`. Not for a task session or a proactive turn. See ADR 0019 and ADR 0020 |
 | `update_this_channel` | optional `purpose`, `instructions`, `model`, `task_model`, `repos` | Runs at once |
 | `set_channel_tags` | `tags` | Asks first |
 | `set_channel_connector` | `connection`, `enabled` | Only for a connection whose `use_in` gives it to the channel. Otherwise `refused` |
@@ -596,8 +650,11 @@ What you saw and did not report in recent check-ins:
   <research routine="rtn_..."/>
   <proactive_feedback message="msg_..." rating="too_noisy"/>
   <channel_created name="reading" kind="standard"/>
+  <first_sign_in account="Claude"/>
 </events>
 ```
+
+`first_sign_in` is for the first conversation. The hub queues it in Tutti one time: when the first account of a hub signs in, and the hub has no message in Tutti, no other channel and no task. The hub keeps the result in `meta` under `first_greeting` (`fired` or `skipped`), in the same write as the event. So a restart, a second client and a new inventory do not queue it again. A gate that holds the turn (the level of Tutti, or Pause all) leaves the key open, so the next inventory tries again. The event uses the proactive kind `channel_created` in the log and on the marks, so an older client can read them. While the guide state is `running`, the prompt of Tutti also holds `prompts/guide.md`.
 
 The stored events also hold the number of their proactivity log entry (`log`). The hub never writes it into the turn text.
 
@@ -608,7 +665,7 @@ In a proactive turn:
 - Messages and decision cards get a `proactive` mark with the kind of the turn, and for a follow-up its reason.
 - `post_message` with `notify` notifies only outside quiet hours, snooze and Pause all, once per turn, and while the hub-wide count of notifying messages today is under the limit (3 by default). Otherwise the message posts without it, and the log entry gets `notify_held`.
 - `start_task` runs in Ask (draft mode), unless the channel's `proactive_tasks` is `channel_default`.
-- The tools that widen access or change settings are `policy_denied`: `connect_service`, `add_skill`, `request_access`, `set_channel_tags`, `set_channel_connector`, `set_channel_skill`, `set_worker_tags`, `update_connection`, `update_skill`, `disconnect`, `remove_skill`, `install_tool`, `add_account`, `start_sign_in`, `create_channel`, `update_channel`, `archive_channel`, `set_default_model`, `update_this_channel` and the routine tools.
+- The tools that widen access or change settings are `policy_denied`: `connect_service`, `add_skill`, `request_access`, `set_channel_tags`, `set_permissions`, `set_channel_connector`, `set_channel_skill`, `set_worker_tags`, `update_connection`, `update_skill`, `disconnect`, `remove_skill`, `install_tool`, `add_account`, `start_sign_in`, `create_channel`, `update_channel`, `archive_channel`, `set_default_model`, `update_this_channel`, `set_user_name`, `add_worker`, `start_guide`, `finish_guide` and the routine tools.
 - A turn whose only events are `research` may use only the read tools, `memory_write` under `research/`, `ask_decision` with `offer` (at most 3 offers a day), `run_connector_tool` for read tools, and `no_reply_needed`. Every other tool fails with "The research pass is read-only. Make an offer with ask_decision instead."
 
 A stale task is a task in Needs input for 24 hours or in Ready for review for 72 hours. It gets one `stale_task` event per status entry.
@@ -679,16 +736,25 @@ A client that does not know these fields shows the preview, which ends with a no
 | Workers | `worker.list`, `worker.pairing_code`, `worker.rename`, `worker.set_tags` (with `worker_id` and `tags`), `worker.set_policy` (with `worker_id` and optional `max_approval_mode`, `allowed_roots` and `allow_shell`; a missing field keeps its value, and an empty `allowed_roots` means no limit; `worker_offline` when the worker is offline, and the user tries again when it is online), `worker.set_paused`, `worker.revoke`, `worker.refresh_inventory`, `worker.tools_check` (with `worker_id`), `worker.tool_install` (with `worker_id` and `tool`) |
 | Accounts | `account.create` (with `worker_id`, `harness`, `label`, optional `acp`, `env`; the result has `account_id`), `account.update` (with `worker_id`, `account_id`, optional `label`, `env_set`, `env_remove`), `account.remove` and `account.sign_out` (with `worker_id` and `account_id`), `acp_registry.list` (the result has `agents`, each with `id`, `name`, `description`, `version`, `icon_url` and `supported`) |
 | Sign-in | `sign_in.start` (with `worker_id`, `account_id` and `method`; the result has `sign_in`), `sign_in.submit_code` (with `sign_in_id` and `code`), `sign_in.cancel` (with `sign_in_id`) |
-| Preferences | `preferences.set_favorite_model` (with `account_label`, `model` and `favorite`; the result has `preferences`), `preferences.set_fallback_path` (with `path`: `other_accounts` and `steps`; the result has `preferences`) |
+| Preferences | `preferences.set_favorite_model` (with `account_label`, `model` and `favorite`; the result has `preferences`), `preferences.set_fallback_path` (with `path`: `other_accounts` and `steps`; the result has `preferences`), `preferences.set_setup_later` (with `later`; the result has `preferences`), `preferences.set_user_name` (with `name`: at most 80 characters, empty clears it; the result has `preferences`) |
+| Guided start | `guide.try_again` (no fields). After a failed first turn, it queues the `first_sign_in` event again. It does nothing unless the guide is `running`, the assistant has not spoken, no turn is open and no wake waits |
 | Proactivity | `proactivity.get`, `proactivity.set` (with optional `paused`, `quiet_hours` (`start` and `end`, `HH:MM`), `time_zone` (IANA), `time_zone_if_unset` (true: set the zone only when the hub has none; a client sends this at start), `notify_cap_per_day` (0 to 20)), `proactivity.snooze` (with `choice`: `off`, `two_hours`, `until_tomorrow` or `week`). Each result has `settings`. `proactivity.log` (with optional `channel_id`, `kind`, `before` (an entry number) and `limit` (default 100, at most 500); the result has `wakes`, newest first, and `has_more`). `proactivity.cancel_follow_ups` (with optional `channel_id`; the result has `canceled`). `message.rate` (with `message_id` and `rating`: `useful`, `too_noisy` or `null`; only a message with a `proactive` mark; Too noisy wakes the coordinator with a `proactive_feedback` event) |
 | Composio | `composio.set_key` (with `api_key`), `composio.remove_key`, `composio.status`. Each result has `status`: `key_present`, `key_hint` (the last 4 characters), `plan`, `usage` (`used`, `limit`, `resets_at`), `error` and `checked_at`. Never the key. `usage.used` is the number of tool calls that this hub sent to Composio in the current calendar month (UTC), counted from the audit log, and `resets_at` is the start of the next month. `limit` and `plan` stay empty, because Composio gives them only to a dashboard login, not to a project key. `error` is set when Composio refuses the key (a call met `401` or `403`, or the hourly check did), and it says what to do: copy the project key again and add it in Settings > Connectors. `composio.status` checks the key again when the last check is older than 10 minutes |
+| Monid | `monid.set_key` (with `api_key` and optional `settings`), `monid.remove_key`, `monid.status` and `monid.update_settings` (with the whole new `settings`: `use_in`, `approval`, `routines`, `proactive`, `limits`). Each of these four answers with `status`, never the key. `monid.search` (with `query`; the result has `tools`: `provider`, `provider_name`, `endpoint`, `name`, `rate`), `monid.call` (with `id`; the result has `call` with its full input and output), `monid.calls` (with `channel_id` and optional `limit`, at most 100; the result has `calls`) and `monid.stop` (with `id`; asks Monid to stop a run). `channel.set_monid` (with `channel_id` and `access`) and `channel.end_access` (with `channel_id` and `grant_id`) change what one channel may do. See ADR 0016 and ADR 0017 |
+| API endpoints and the command check | `endpoint.save` (with optional `id`, `name`, `base_url` and optional `api_key`; the result has `preferences`), `endpoint.remove` (with `id`) and `endpoint.test` (with optional `id`, `base_url` and optional `api_key`). `command_check.test` takes no fields. Both tests answer with `ok`, `message` and optional `details`. `preferences.set_command_check` (with `setting`) sets the source of the command check. The key of an endpoint stays on the hub: a client sees its last four characters |
 | Connector catalog | `connector_catalog.search` (with optional `search`, `category`, `cursor`, `limit`; the result has `services` and `next_cursor`), `connector_catalog.categories`, `connector_catalog.service` (with `service`; the result has `service` and its `tools`) |
-| Connections | `connection.connect` (with `service`, `name`, optional `use_in`, `approvals`, `auth_scheme`, `credentials`, `approval_id`; the result is a connect attempt: `connection`, `redirect_url` and `expires_at`), `connection.update` (with `connection_id`, optional `name`, `use_in`, `approvals`), `connection.disconnect`, `connection.reconnect` (with `connection_id`, optional `credentials`), `connection.calls` (with `connection_id`, optional `before`, `limit`; the result has `calls`, newest first, and `has_more`) |
+| Connections | `connection.connect` (with `service`, `name`, optional `use_in`, `approvals`, `auth_scheme`, `credentials`, `approval_id`; the result is a connect attempt: `connection`, `redirect_url` and `expires_at`), `connection.update` (with `connection_id`, optional `name`, `use_in`, `approvals`, `tool_exceptions`, `assistant_owned`), `connection.disconnect`, `connection.reconnect` (with `connection_id`, optional `credentials`), `connection.calls` (with `connection_id`, optional `before`, `limit`; the result has `calls`, newest first, and `has_more`) |
 | Channel exceptions | `channel.set_connection_enabled` (with `channel_id`, `connection_id`, `enabled`), `channel.set_skill_enabled` (with `channel_id`, `skill_id`, `enabled`). The result has `channel` |
 | Skills | `skill_directory.search` (with optional `search`, `source`, `cursor`, `limit`; the result has `entries`, `next_cursor` and `unavailable`), `skill_directory.sources`, `skill_directory.add_source` (with `url`), `skill_directory.remove_source` (with `id`), `skill.preview` (with `source`), `skill.install` (with `source`, optional `use_in`, `enabled`, `approval_id`; the result has `skill`), `skill.update` (with `skill_id`, optional `enabled`, `use_in`, `accept_new_version`), `skill.remove`, `skill.files` (with `skill_id`, optional `version`: `installed` or `pending`), `skill.read_file` (with `skill_id`, `path`, optional `version`) |
 | Clients | `client.pairing_code`, `client.list` (every client with `os` and `paired_by`, and `online`: the clients that are connected now), `client.revoke`, `client.push_register` |
-| Hub | `hub.status` (the result has `status`: `hub_url`, `hub_version`, `protocol_versions`, `data_dir`, `storage` and `backup`), `hub.backup` (starts a backup and answers at once with `progress`; `conflict` while one runs), `hub.backup_settings` (with optional `schedule`, `folder`, `keep`; a field that is left out does not change, so an empty body only reads; the result has `settings`) |
+| Hub | `hub.status` (the result has `status`: `hub_url`, `hub_version`, `protocol_versions`, `install`, `data_dir`, `storage` and `backup`), `hub.backup` (starts a backup and answers at once with `progress`; `conflict` while one runs), `hub.backup_settings` (with optional `schedule`, `folder`, `keep`; a field that is left out does not change, so an empty body only reads; the result has `settings`) |
+| Visuals | `visual.render` (with `message_id`, `width`, `scale` and `style`; the result has `image` and `height`, see [Visuals](#visuals)) |
 | Auth | `auth.http_token` |
+| Reach | `hub.reach_status` (the result has `reach`), `hub.reach_set` (`{method, on}` with `method` `tailscale` or `this_network`; the result has `reach`) |
+
+`reach` has `can_change`, `tailscale`, `this_network` and `pairing` (`hub_url`, and `tls_sha256` for This network). Only a hub of the install kind `local` and a development hub may change its reach. Any other hub answers `hub.reach_set` with `can_change: false` and its state, and changes nothing. The root user or the owner of a server uses `consort hub reach status`, `consort hub reach tailscale` and `consort hub reach off [--only tailscale|this-network]`, which change the same store.
+
+`tailscale` has `state`, one of: `not_installed`, `not_connected`, `https_off` (`action_url`, optional `detail`), `needs_permission` (`command`, `detail`), `available` (`name`, `address`, `port_in_use`), `no_free_port` (`name`), `on` (`address`, `port_in_use`), `removed` (`address`: the entry went away and the address stays on the list until the user decides) and `failed` (`detail`). `this_network` has `state`: `off`, `on` (`address`, `tls_sha256`) or `failed` (`address`, `detail`). A client reads a state that it does not know as unknown. The hub changes only its own Serve entry, on the first free port of 443 and 8443, and never runs `tailscale serve reset`.
 
 `hub.status` reports `storage` in bytes: `database_bytes` (`hub.db` with its `-wal` and `-shm` files), `blobs_bytes` (blobs that no skill uses), `skills_bytes` (the blobs of stored skill versions) and `free_bytes` (the free space on the disk of the data folder, left out when the hub cannot read it). `backup` has `settings`, `last` (the last backup that finished or failed, with `file_name`, `path`, `size_bytes`, `trigger`, `started_at`, `finished_at` and `error` when it failed) and `running` (`trigger`, `started_at`, `bytes_done` and `bytes_total`) while a backup runs. A client asks `hub.status` again every second while `running` is set. `hub.backup_settings` refuses a time that is not `HH:MM`, a time zone that the hub does not know, a `keep` outside 1 to 100, a folder that is not an absolute path, and a folder that the hub cannot make or write to, with `invalid`. See [data-model.md](data-model.md#backups) for the archive.
 

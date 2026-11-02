@@ -60,7 +60,7 @@ fn select_field(
 }
 
 /// A segmented choice whose options can hold anything.
-fn choice_bar(t: &Tokens) -> Div {
+pub(crate) fn choice_bar(t: &Tokens) -> Div {
     div()
         .flex()
         .gap(t.space.xxs)
@@ -69,7 +69,7 @@ fn choice_bar(t: &Tokens) -> Div {
         .rounded(t.radius.md)
 }
 
-fn choice(
+pub(crate) fn choice(
     id: impl Into<SharedString>,
     active: bool,
     content: impl IntoElement,
@@ -100,7 +100,7 @@ fn choice(
 }
 
 /// A section title of the channel settings.
-fn section(title: &str, t: &Tokens) -> Div {
+pub(crate) fn section(title: &str, t: &Tokens) -> Div {
     text(title.to_owned(), t.text.title, t.colors.text_primary)
 }
 
@@ -174,6 +174,7 @@ impl ConsortApp {
             Dialog::NewChannel => Some(self.new_channel_parts(t, window, cx)),
             Dialog::NewTask => Some(self.new_task_parts(t, window, cx)),
             Dialog::ChannelSettings(id) => self.channel_settings_parts(id, t, window, cx),
+            Dialog::Permissions(id) => self.permissions_parts(id, t, window, cx),
             Dialog::RenameGroup(id) => Some(self.rename_group_parts(id, t, window, cx)),
             Dialog::ConfirmDeleteGroup(id) => self.delete_group_parts(id, t, cx),
             Dialog::ConfirmDeleteTask(id) => self.delete_task_parts(id, t, cx),
@@ -1381,33 +1382,72 @@ impl ConsortApp {
         }
         let (ext_line, ext_off) = consort_client::convo::extensions_summary(&self.state, id);
         let ext_id = id.to_owned();
-        let extensions = div()
-            .flex()
-            .items_center()
-            .gap(t.space.md)
-            .p(t.space.md)
-            .rounded(t.radius.md)
-            .bg(c.surface_card)
-            .child(
+        let permissions_id = id.to_owned();
+        let access_row =
+            |title: &str, detail_lines: Vec<String>, button: gpui_kit::Stateful<Div>| {
                 div()
                     .flex()
-                    .flex_col()
-                    .flex_1()
-                    .min_w_0()
-                    .child(text(ext_line, t.text.ui, c.text_secondary))
-                    .children(ext_off.map(|l| text(l, t.text.ui, c.text_secondary))),
-            )
-            .child(
+                    .items_center()
+                    .gap(t.space.md)
+                    .py(t.space.md)
+                    .px(t.space.lg)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_w_0()
+                            .child(text(title.to_owned(), t.text.ui_strong, c.text_primary))
+                            .children(
+                                detail_lines
+                                    .into_iter()
+                                    .map(|l| text(l, detail(t), c.text_tertiary)),
+                            ),
+                    )
+                    .child(div().flex_none().child(button))
+            };
+        let access = div()
+            .debug_selector(|| "settings-access".into())
+            .flex()
+            .flex_col()
+            .rounded(t.radius.md)
+            .bg(c.surface_card)
+            .child(access_row(
+                "Permissions",
+                vec![crate::permissions::access_detail(&self.state, id)],
                 button(
-                    "settings-extensions",
-                    "Edit connectors and skills",
+                    "settings-permissions",
+                    "Edit permissions",
                     ButtonKind::Secondary,
                     t,
                 )
+                .debug_selector(|| "settings-permissions".into())
                 .on_click(cx.listener(move |this, _, window, cx| {
                     this.close_dialog(window, cx);
-                    this.open_channel_connectors(ext_id.clone(), window, cx)
+                    this.open_dialog(Dialog::Permissions(permissions_id.clone()), window, cx)
                 })),
+            ))
+            .child(
+                div()
+                    .border_t(t.border_width)
+                    .border_color(c.border_subtle)
+                    .child(access_row(
+                        "Connectors and skills",
+                        std::iter::once(ext_line).chain(ext_off).collect(),
+                        button(
+                            "settings-extensions",
+                            "Edit connectors",
+                            ButtonKind::Secondary,
+                            t,
+                        )
+                        .debug_selector(|| "settings-extensions".into())
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                this.close_dialog(window, cx);
+                                this.open_channel_connectors(ext_id.clone(), window, cx)
+                            },
+                        )),
+                    )),
             );
         let work = div()
             .flex()
@@ -1444,8 +1484,8 @@ impl ConsortApp {
                     .flex_col()
                     .gap(t.space.sm)
                     .pt(t.space.sm)
-                    .child(section("Connectors and skills", t))
-                    .child(extensions),
+                    .child(section("Access", t))
+                    .child(access),
             );
 
         let body = div()
@@ -1708,12 +1748,14 @@ impl ConsortApp {
                     ))
                 })
         };
+        // An update that waits for the hub has no Restart here. The sidebar
+        // sends the user to the hub.
         let ready = matches!(
             view.state,
             consort_client::update::UpdateState::Ready { .. }
-        );
+        ) && view.hold().is_none();
         let update_title = match &view.state {
-            consort_client::update::UpdateState::Ready { version, .. } => {
+            consort_client::update::UpdateState::Ready { version, .. } if ready => {
                 format!("Version {version} is ready")
             }
             _ => view.summary(),

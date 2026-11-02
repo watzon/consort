@@ -24,8 +24,8 @@ use crate::model::{
     AcpAccountSpec, ApprovalDetails, ApprovalMode, BlobRef, CommandCheckOutcome,
     ConnectorContextEntry, FileRef, Inventory, Isolation, ModelOptions, RequestOption, SecretEnv,
     SessionItem, SessionRole, SessionState, Sha256Hash, SignInMethod, SignInState, SkillBundle,
-    SkillBundleRef, SkillContextEntry, ToolId, TurnErrorKind, Usage, ValidationError,
-    render_connectors_block, render_skills_block,
+    SkillBundleRef, SkillContextEntry, ToolId, TurnErrorKind, Usage, ValidationError, VisualImage,
+    VisualStyle, render_connectors_block, render_skills_block,
 };
 use crate::time::Timestamp;
 use crate::tools::{ToolCallResult, ToolDefinition};
@@ -677,6 +677,22 @@ pub struct CommandCheckRun {
     pub prompt: String,
 }
 
+/// `visual.render`: the hub asks the session host for an image of a visual.
+/// The session host downloads the page, adds the bootstrap with the style,
+/// renders it, uploads the PNG and answers with a `VisualImage`. The error
+/// `unavailable` means that the browser is installing: try again later.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VisualRenderCommand {
+    /// The prepared page.
+    pub page: BlobRef,
+    /// The width in CSS pixels.
+    pub width: u32,
+    /// Device pixels per CSS pixel.
+    pub scale: u8,
+    /// The theme of the client.
+    pub style: VisualStyle,
+}
+
 /// The result of [`CommandCheckRun`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandCheckReply {
@@ -972,6 +988,8 @@ message_family! {
         ToolsInstall("tools.install", ToolsInstall => Empty),
         /// Run the command check with a model of an account.
         CommandCheckRun("command_check.run", CommandCheckRun => CommandCheckReply),
+        /// Render an image of a visual.
+        VisualRender("visual.render", VisualRenderCommand => VisualImage),
     }
 }
 
@@ -997,7 +1015,8 @@ impl HubToSessionHost {
             | Self::SignInCancel(_)
             | Self::ToolsCheck(_)
             | Self::ToolsInstall(_)
-            | Self::CommandCheckRun(_) => None,
+            | Self::CommandCheckRun(_)
+            | Self::VisualRender(_) => None,
         }
     }
 }
@@ -1270,6 +1289,7 @@ mod tests {
                 policy: WorkerPolicy::default(),
                 load: Default::default(),
                 tools: vec![],
+                update: None,
             }
             .with_hash()
             .into(),
@@ -1345,6 +1365,7 @@ mod tests {
                 service_name: "Gmail".into(),
                 identity: Some("chris@work.example".into()),
                 needs_sign_in: false,
+                assistant_owned: false,
             }],
             skills: vec![SkillBundleRef {
                 skill_id: "skl_00000000-0000-0000-0000-000000000005".parse().unwrap(),
@@ -1684,6 +1705,18 @@ They are installed as skills. Use one when the task fits it."
                 model: "haiku".into(),
                 system: "policy".into(),
                 prompt: "ls".into(),
+            }
+            .into(),
+            VisualRenderCommand {
+                page: BlobRef {
+                    sha256: "a".repeat(64).parse().unwrap(),
+                    name: "Tokens by week.html".into(),
+                    mime: "text/html".into(),
+                    size: 2_048,
+                },
+                width: 720,
+                scale: 2,
+                style: VisualStyle::default(),
             }
             .into(),
         ];

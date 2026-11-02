@@ -25,10 +25,36 @@ pub fn waiting_for_channel(state: &ViewState, channel_id: &str) -> Option<Waitin
         return None;
     }
     Some(match &state.connection {
+        Connection::Offline { reason, .. } if state.tailnet_notice.is_some() => {
+            let notice = state.tailnet_notice.as_ref();
+            Waiting {
+                title: notice.map_or("Cannot reach the hub", |n| n.title),
+                reason: Some(reason.trim().to_owned()).filter(|r| !r.is_empty()),
+                next: notice.map_or("Consort tries again by itself.", |n| n.body),
+                can_retry: true,
+            }
+        }
         Connection::Offline { reason, .. } => Waiting {
             title: "Cannot reach the hub",
             reason: Some(reason.trim().to_owned()).filter(|r| !r.is_empty()),
             next: "Check that the hub runs. Consort tries again by itself.",
+            can_retry: true,
+        },
+        Connection::Incompatible {
+            too_old,
+            hub,
+            app_version,
+            ..
+        } => Waiting {
+            title: match too_old {
+                consort_client::versions::TooOld::Hub => "The hub needs an update",
+                consort_client::versions::TooOld::ThisSide => "This app needs an update",
+            },
+            reason: Some(
+                consort_client::versions::incompatible_view(*too_old, hub.as_ref(), app_version)
+                    .body,
+            ),
+            next: "Consort tries again by itself.",
             can_retry: true,
         },
         // The link is up and the first snapshot has not come yet, or the app
@@ -94,6 +120,24 @@ mod tests {
                 .reason
                 .is_none()
         );
+    }
+
+    #[test]
+    fn a_hub_on_the_tailnet_says_to_open_tailscale() {
+        let mut with_notice = state(
+            Connection::Offline {
+                retry_in_ms: 1,
+                reason: "x".into(),
+            },
+            &[],
+        );
+        with_notice.tailnet_notice = consort_client::reach::tailnet_notice(
+            "https://m.tail1.ts.net",
+            &with_notice.connection,
+        );
+        let waiting = waiting_for_channel(&with_notice, "").expect("waits");
+        assert_eq!(waiting.title, "This device cannot reach your tailnet");
+        assert!(waiting.next.contains("Open Tailscale"));
     }
 
     #[test]

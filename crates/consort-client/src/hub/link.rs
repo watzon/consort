@@ -17,7 +17,7 @@ use consort_proto::{
         FeedChange, FeedEntry, FeedSkipped, MessageList, MessageListResult, SnapshotScope,
         SyncSnapshot, SyncSubscribe,
     },
-    error::{ErrorBody, ErrorCode},
+    error::{ErrorBody, ErrorCode, HubVersions},
     frame::{EventFrame, Frame, FrameError, Request, SUPPORTED_PROTOCOL_VERSIONS},
     ids::{ChannelId, FrameId, MessageId},
     model::Message,
@@ -44,6 +44,9 @@ pub(super) enum SessionEnd {
     Refused(String),
     /// The link dropped or failed. Try again later.
     Lost(String),
+    /// The hub and this app have no common protocol version. The pairing is
+    /// good, so nothing is forgotten. Try again now and then.
+    Incompatible(Option<HubVersions>),
 }
 
 type Ws =
@@ -174,6 +177,7 @@ async fn handshake_call<R: Request>(
 fn refused_or_lost(err: ErrorBody) -> SessionEnd {
     match err.code {
         ErrorCode::Unauthorized => SessionEnd::Refused(err.message),
+        ErrorCode::ProtocolMismatch => SessionEnd::Incompatible(err.hub_versions),
         _ => SessionEnd::Lost(err.message),
     }
 }
@@ -257,17 +261,50 @@ impl ThreadPager {
     }
 }
 
+/// A connection that did not open. The link tries again, because a hub can come
+/// back. A certificate problem says what to do.
+fn connection_failed(err: &tokio_tungstenite::tungstenite::Error, hub_url: &str) -> SessionEnd {
+    match consort_tls::certificate_problem(err) {
+        Some(consort_tls::CertificateProblem::NotThePin) => lost(format!(
+            "The hub at {hub_url} shows another certificate than the one this app paired with. Someone may be in the way, or the hub has a new certificate. If the hub is new, pair this app again"
+        )),
+        Some(consort_tls::CertificateProblem::Untrusted) => lost(format!(
+            "The hub at {hub_url} has a certificate that no authority signed. Check the hub, or pair this app again with its code"
+        )),
+        None => lost(format!("The connection failed: {err}")),
+    }
+}
+
 /// Opens the WebSocket. Plain `http` to a host name (`hub.local`,
 /// `localhost`) passes the URL rule by its spelling only. For such a name,
 /// the client looks it up, refuses it when it points to a public address,
 /// connects to the addresses it checked, and checks the peer address again
 /// on the open connection. Nothing is sent before these checks. Any other
 /// hub URL connects as it is.
-async fn open(hub_url: &str, ws_url: String) -> Result<Ws, SessionEnd> {
+///
+/// With a pin (a hub on This network), the client accepts that certificate and
+/// no other.
+async fn open(
+    hub_url: &str,
+    ws_url: String,
+    pin: Option<&consort_proto::model::Sha256Hash>,
+) -> Result<Ws, SessionEnd> {
+    if let Some(pin) = pin {
+        let config = consort_tls::pinned_client_config(pin).map_err(|e| lost(e.to_string()))?;
+        let connector = tokio_tungstenite::Connector::Rustls(Arc::new(config));
+        let (ws, _) =
+            tokio_tungstenite::connect_async_tls_with_config(ws_url, None, false, Some(connector))
+                .await
+                .map_err(|e| connection_failed(&e, hub_url))?;
+        return Ok(ws);
+    }
+    // Two crates can bring a crypto provider. With no default, rustls panics
+    // on the first connection that has no provider of its own.
+    consort_tls::use_default_provider();
     let Some((host, port)) = plain_http_name(hub_url) else {
         let (ws, _) = tokio_tungstenite::connect_async(ws_url)
             .await
-            .map_err(|e| lost(format!("The connection failed: {e}")))?;
+            .map_err(|e| connection_failed(&e, hub_url))?;
         return Ok(ws);
     };
     let addrs = resolve_private(&host, port, hub_url)
@@ -310,14 +347,21 @@ async fn session(
     // link stops and writes nothing more into the cache.
     let generation = shared.generation();
     let url = ws_url(&identity.config.hub_url).map_err(|e| lost(e.to_string()))?;
-    let mut ws = tokio::time::timeout(limits.connect, open(&identity.config.hub_url, url))
-        .await
-        .map_err(|_| {
-            lost(format!(
-                "The hub did not answer in {}.",
-                seconds(limits.connect)
-            ))
-        })??;
+    let mut ws = tokio::time::timeout(
+        limits.connect,
+        open(
+            &identity.config.hub_url,
+            url,
+            identity.config.tls_sha256.as_ref(),
+        ),
+    )
+    .await
+    .map_err(|_| {
+        lost(format!(
+            "The hub did not answer in {}.",
+            seconds(limits.connect)
+        ))
+    })??;
     if shared.generation() != generation {
         return Err(lost(OWNER_CHANGED));
     }
@@ -355,6 +399,16 @@ async fn session(
     let hello = handshake_call(&mut ws, &hello, limits.handshake)
         .await?
         .map_err(refused_or_lost)?;
+    shared.set_hub_versions(Some(HubVersions {
+        // A hub from before the list has only the version that it picked.
+        protocol_versions: if hello.protocol_versions.is_empty() {
+            vec![hello.protocol_version]
+        } else {
+            hello.protocol_versions.clone()
+        },
+        hub_version: hello.hub_version.clone(),
+        install: None,
+    }));
 
     initial_sync(
         shared,
@@ -381,6 +435,7 @@ async fn session(
         kind: &'static str,
         reply: Reply,
         deadline: Instant,
+        limit: Duration,
     }
     let mut waiting: HashMap<FrameId, Waiting> = HashMap::new();
     let tick_every = (limits.idle.min(limits.call) / 10)
@@ -432,7 +487,8 @@ async fn session(
                         waiting.insert(outgoing.id, Waiting {
                             kind: outgoing.kind,
                             reply: outgoing.reply,
-                            deadline: Instant::now() + limits.call,
+                            deadline: Instant::now() + outgoing.limit,
+                            limit: outgoing.limit,
                         });
                     }
                     Err(end) => {
@@ -473,14 +529,16 @@ async fn session(
                     .map(|(id, _)| id.clone())
                     .collect();
                 if !expired.is_empty() {
+                    let mut waited = limits.call;
                     for id in expired {
                         if let Some(w) = waiting.remove(&id) {
                             tracing::warn!(request = w.kind, "the hub did not answer in time");
+                            waited = w.limit;
                             let _ = w.reply.send(Err(Failure::TimedOut));
                         }
                     }
                     // A link that eats requests is not working. Start again.
-                    break Err(lost(format!("The hub did not answer a request in {}.", seconds(limits.call))));
+                    break Err(lost(format!("The hub did not answer a request in {}.", seconds(waited))));
                 }
             }
         }
@@ -934,6 +992,9 @@ pub(crate) async fn run_link(shared: Arc<Shared>) {
             reconnect.reset();
             continue;
         };
+        if let Ok(mut cache) = shared.cache.lock() {
+            cache.admin.own_url.clone_from(&identity.config.hub_url);
+        }
         if reconnect.is_fresh() {
             shared.set_connection(Connection::Connecting);
         }
@@ -967,6 +1028,23 @@ pub(crate) async fn run_link(shared: Arc<Shared>) {
                     *id = None;
                 }
                 reconnect.reset();
+                continue;
+            }
+            Err(SessionEnd::Incompatible(hub)) => {
+                if hub.is_some() {
+                    shared.set_hub_versions(hub.clone());
+                }
+                let delay = crate::versions::INCOMPATIBLE_RETRY;
+                shared.set_connection(Connection::Incompatible {
+                    too_old: crate::versions::too_old(hub.as_ref()),
+                    hub,
+                    app_version: env!("CARGO_PKG_VERSION").to_owned(),
+                    retry_in_ms: delay.as_millis() as u64,
+                });
+                tokio::select! {
+                    _ = sleep_counting_sleep(delay) => {}
+                    _ = shared.wake.notified() => { reconnect.reset(); }
+                }
                 continue;
             }
             Err(SessionEnd::Lost(reason)) => reason,

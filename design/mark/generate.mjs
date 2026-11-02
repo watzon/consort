@@ -106,6 +106,16 @@ for (const [dir, pal, sharp] of sets) {
   }
 }
 
+// The dabs of the setup mark, one file each, in the idle pose with the paint
+// edges and no filter. The app tints each one with a theme color, so a dab that
+// is not lit yet takes `surface.selected`.
+const DABS = ['gold', 'verd', 'lapis'];
+mkdirSync(join(OUT, 'dabs'), { recursive: true });
+pose('idle', 0).forEach((p, i) => {
+  const path = `<path d="${dab(p.x, p.y, p.r, 0, i, 0.1)}" fill="#000"/>`;
+  writeFileSync(join(OUT, 'dabs', `${DABS[i]}.svg`), svg('width="58" height="58" viewBox="21 17 58 58"', path));
+});
+
 // Logo and app icon (idle pose, filtered).
 mkdirSync(LOGO, { recursive: true });
 const TILE = { dark: '#1B2623', light: '#E9F2ED' };

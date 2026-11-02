@@ -351,6 +351,49 @@ pub fn faded_scroll_rows(
     t: &Tokens,
     cx: &mut Context<ConsortApp>,
 ) -> Div {
+    faded_frame(id, handle, height, false, rows, ground, clear, t, cx)
+}
+
+/// [`faded_scroll`] that is as high as its content, up to `height`. It
+/// scrolls with fades when the content is higher.
+#[allow(clippy::too_many_arguments)]
+pub fn faded_scroll_up_to(
+    id: &'static str,
+    handle: &ScrollHandle,
+    height: Pixels,
+    content: impl IntoElement,
+    ground: Hsla,
+    clear: Hsla,
+    t: &Tokens,
+    cx: &mut Context<ConsortApp>,
+) -> Div {
+    faded_frame(
+        id,
+        handle,
+        height,
+        true,
+        vec![content.into_any_element()],
+        ground,
+        clear,
+        t,
+        cx,
+    )
+}
+
+/// The shared body of the faded lists. With `fit` the list is as high as
+/// its content, up to `height`. Without it, it is `height` high.
+#[allow(clippy::too_many_arguments)]
+fn faded_frame(
+    id: &'static str,
+    handle: &ScrollHandle,
+    height: Pixels,
+    fit: bool,
+    rows: Vec<gpui_kit::AnyElement>,
+    ground: Hsla,
+    clear: Hsla,
+    t: &Tokens,
+    cx: &mut Context<ConsortApp>,
+) -> Div {
     let offset = handle.offset();
     let max = handle.max_offset();
     let above = offset.y < -Pixels::from(0.5);
@@ -358,13 +401,14 @@ pub fn faded_scroll_rows(
     let fade = t.space.xl;
     div()
         .relative()
-        .h(height)
-        .flex_none()
+        .when(!fit, |d| d.h(height).flex_none())
+        .when(fit, |d| d.max_h(height))
         .overflow_hidden()
         .child(
             div()
                 .id(id)
-                .size_full()
+                .when(!fit, |d| d.size_full())
+                .when(fit, |d| d.max_h(height))
                 .overflow_y_scroll()
                 .track_scroll(handle)
                 // The fades follow the scroll position.

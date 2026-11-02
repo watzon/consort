@@ -316,7 +316,10 @@ fn tool_rank(tool: &str) -> (u8, String) {
 /// the adapter that Claude Code needs. The state of a helper shows on the row
 /// of the provider that needs it (see [`fold_helpers`]).
 pub(crate) fn is_helper_tool(tool: &str) -> bool {
-    matches!(tool, ToolId::NODE | ToolId::CLAUDE_AGENT_ACP)
+    matches!(
+        tool,
+        ToolId::NODE | ToolId::CLAUDE_AGENT_ACP | ToolId::CHROME_HEADLESS_SHELL
+    )
 }
 
 /// The helper tools that a provider's tool needs, each with the words for it
@@ -677,6 +680,7 @@ fn approval_detail(details: &ApprovalDetails) -> (Option<String>, Option<String>
             )),
         ),
         ApprovalDetails::SignIn(card) => (None, Some(format!("Account: {}", card.account_label))),
+        ApprovalDetails::AddWorker(_) => (None, None),
         ApprovalDetails::AccessRequest(card) => {
             let mut lines = vec![card.title.clone()];
             if let Some(reason) = &card.reason {
@@ -851,6 +855,7 @@ fn refused_view(f: &crate::cache::SendFailure) -> RefusedView {
 ///   notice that no message of the user started (a failed routine run) has
 ///   none, and the card has no Try again.
 fn channel_error_card(
+    guide_running: bool,
     messages: &[&model::Message],
     index: usize,
     body: &str,
@@ -861,6 +866,9 @@ fn channel_error_card(
     let is_user_text =
         |m: &&&model::Message| m.author == Author::User && m.kind == MessageKind::Text;
     let quiet = messages[index + 1..].iter().any(|m| is_user_text(&m));
+    let spoke = messages[..index]
+        .iter()
+        .any(|m| m.author == Author::Assistant && m.kind == MessageKind::Text);
     let try_again = messages[..index]
         .iter()
         .rev()
@@ -868,7 +876,9 @@ fn channel_error_card(
         .map(|m| TryAgainTarget::ResendMessage {
             channel_id: m.channel_id.to_string(),
             body: m.body.clone(),
-        });
+        })
+        // The first turn of the guided start has no message to send again.
+        .or((guide_running && !spoke).then_some(TryAgainTarget::Greeting));
     Some(error_card(&failed, try_again, quiet, now))
 }
 
@@ -1017,16 +1027,15 @@ fn channel_activities(cache: &Cache, state: &ViewState) -> Vec<crate::activity::
     state
         .channels
         .iter()
-        .map(|c| crate::activity::ChannelActivity {
-            channel_id: c.id.clone(),
-            activity: crate::activity::channel_activity(&crate::activity::Inputs {
+        .map(|c| {
+            crate::activity::ChannelActivity::of(&crate::activity::Inputs {
                 channel_id: &c.id,
                 tutti: c.kind == ChannelKind::Tutti,
                 tasks: &tasks,
                 sessions: &sessions,
                 timeline: state.timeline(&c.id),
                 channel_name: &name,
-            }),
+            })
         })
         .collect()
 }
@@ -1217,8 +1226,17 @@ fn channel_file_views(cache: &Cache, now: i64) -> Vec<crate::files::ChannelFileV
         .collect()
 }
 
-pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i64) -> ViewState {
+pub fn view_state(cache: &Cache, connection: Connection, guess: UserView, now: i64) -> ViewState {
     let online = connection == Connection::Online;
+    // The name on the hub wins. This client's guess is only for a hub that has
+    // none.
+    let user = cache
+        .preferences
+        .user_name
+        .as_deref()
+        .filter(|name| !name.trim().is_empty())
+        .map_or(guess, UserView::from_name);
+    let tailnet_notice = crate::reach::tailnet_notice(&cache.admin.own_url, &connection);
     let artifacts = artifact_tasks(cache);
     let workers_by_id: BTreeMap<String, &model::Worker> =
         cache.workers.iter().map(|(k, v)| (k.clone(), v)).collect();
@@ -1311,6 +1329,7 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                 disabled_skills: c.disabled_skills.iter().map(|id| id.to_string()).collect(),
                 default_approval_mode: approval_mode(c.default_approval_mode),
                 allowed_local_mcp_servers: c.allowed_local_mcp_servers.clone(),
+                command_rules: c.command_rules.clone(),
                 memory_enabled: c.memory_enabled,
                 monid: crate::monid::MonidAccessView::from_proto(&c.monid),
                 access_grants: c
@@ -1587,10 +1606,27 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                     .then(|| memory_saved(&m.body))
                     .flatten();
                 let error = (kind == "turn_failed")
-                    .then(|| channel_error_card(&messages, index, &m.body, now))
+                    .then(|| {
+                        let guide_running = cache.preferences.guide == model::GuideState::Running
+                            && cache
+                                .channels
+                                .get(&m.channel_id.to_string())
+                                .is_some_and(|c| c.kind == PK::Tutti);
+                        channel_error_card(guide_running, &messages, index, &m.body, now)
+                    })
                     .flatten();
                 let draft = (kind == crate::drafts::DRAFT_KIND)
                     .then(|| crate::drafts::parse_shown_draft(&m.id.to_string(), &m.body))
+                    .flatten();
+                let visual = (kind == model::VISUAL_NOTICE)
+                    .then(|| {
+                        crate::visual::visual_view(
+                            &m.id.to_string(),
+                            &m.body,
+                            &format::time_label(at),
+                            &attachment_views(&m.attachments, &artifacts, cache),
+                        )
+                    })
                     .flatten();
                 let fallback = crate::fallback::parse_notice(&kind, &m.body, now).map(|mut f| {
                     // "Go back now" shows on the newest move, once the limit
@@ -1621,6 +1657,7 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                     draft,
                     fallback,
                     monid,
+                    visual,
                 }));
             } else {
                 items.push(TimelineItem::Message(MessageView {
@@ -1739,6 +1776,17 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                     let draft = (kind == crate::drafts::DRAFT_KIND)
                         .then(|| crate::drafts::parse_shown_draft(&m.id.to_string(), &m.body))
                         .flatten();
+                    let visual = (kind == model::VISUAL_NOTICE)
+                        .then(|| {
+                            crate::visual::visual_view(
+                                &m.id.to_string(),
+                                &m.body,
+                                &format::time_label(m.created_at.as_millis()),
+                                &attachment_views(&m.attachments, &artifacts, cache),
+                            )
+                        })
+                        .flatten()
+                        .map(Box::new);
                     let fallback = crate::fallback::parse_notice(&kind, &m.body, now).map(Box::new);
                     Some(PostBody::Notice {
                         kind,
@@ -1747,13 +1795,22 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                         draft,
                         fallback,
                         monid,
+                        visual,
                     })
                 }
                 _ => Some(PostBody::Text(m.body.clone())),
             };
             if let Some(body) = body {
+                // The page of a visual is a part of the notice, not a file.
+                let page_only = matches!(
+                    &body,
+                    PostBody::Notice {
+                        visual: Some(_),
+                        ..
+                    }
+                );
                 let mut bodies = vec![body];
-                if !m.attachments.is_empty() {
+                if !m.attachments.is_empty() && !page_only {
                     bodies.push(PostBody::Attachments(attachment_views(
                         &m.attachments,
                         &artifacts,
@@ -2021,6 +2078,12 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
                 os: os(w.os),
                 online,
                 paused: w.paused,
+                version: w.version.clone(),
+                update: w
+                    .inventory
+                    .as_ref()
+                    .and_then(|i| i.update.as_ref())
+                    .and_then(crate::versions::worker_update_view),
                 local_mcp_servers: w
                     .inventory
                     .iter()
@@ -2150,7 +2213,10 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
             .collect(),
     };
 
+    let hub_setup = crate::setup::hub_facts(cache);
     let mut state = ViewState {
+        hub_setup,
+        tailnet_notice,
         connection,
         saved_data: None,
         user,
@@ -2262,6 +2328,8 @@ pub fn view_state(cache: &Cache, connection: Connection, user: UserView, now: i6
         convo: crate::convo::ConvoView::default(),
         proactivity: crate::proactivity::proactivity_view(cache, now),
         voice: crate::voice::voice_view(cache),
+        hub_versions: None,
+        hub_url: String::new(),
     };
     crate::proactivity::decorate_timelines(cache, &mut state.timelines);
     state.activity = channel_activities(cache, &state);
@@ -2529,6 +2597,7 @@ mod tests {
             memory_enabled: true,
             disabled_connections: Vec::new(),
             disabled_skills: Vec::new(),
+            command_rules: Vec::new(),
             archived_at: None,
             created_at: Timestamp::from_millis(NOW - 100_000),
             updated_at: Timestamp::from_millis(NOW - 100_000),
@@ -2572,6 +2641,149 @@ mod tests {
             proactive: None,
             suggestions: Vec::new(),
             source_message_id: None,
+        }
+    }
+
+    mod setup_facts {
+        use super::*;
+        use crate::setup::{History, hub_facts};
+
+        fn new_hub() -> (Cache, ChannelId) {
+            let tutti = ChannelId::new();
+            let mut cache = Cache {
+                loaded: true,
+                ..Cache::default()
+            };
+            cache.channels.insert(
+                tutti.to_string(),
+                channel(tutti, ChannelKind::Tutti, "Tutti", None),
+            );
+            cache.channels_loaded.insert(tutti.to_string());
+            (cache, tutti)
+        }
+
+        fn host(auth: consort_proto::model::AuthState) -> consort_proto::model::Worker {
+            use consort_proto::model::{MachineKind, Os, WorkerPolicy, WorkerState};
+            let inventory = consort_proto::model::Inventory {
+                boundary: None,
+                hash: String::new(),
+                hostname: "hub".into(),
+                os: Os::Linux,
+                arch: "x64".into(),
+                tags: vec![],
+                accounts: vec![consort_proto::model::HarnessAccount {
+                    account_id: consort_proto::ids::AccountId::new(),
+                    blocked_reason: None,
+                    harness: "claude".into(),
+                    label: "Claude".into(),
+                    harness_version: None,
+                    auth_state: auth,
+                    auth_detail: None,
+                    models: vec![],
+                    capabilities: Default::default(),
+                    enabled: true,
+                    profile: true,
+                    secret_names: vec![],
+                    email: None,
+                    plan: None,
+                    sign_in_methods: vec![],
+                }],
+                local_mcp_servers: vec![],
+                checkouts: vec![],
+                policy: WorkerPolicy::default(),
+                load: Default::default(),
+                tools: vec![],
+                update: None,
+            };
+            consort_proto::model::Worker {
+                kind: MachineKind::SessionHost,
+                id: consort_proto::ids::WorkerId::new(),
+                name: "hub".into(),
+                hostname: "hub".into(),
+                os: Os::Linux,
+                arch: "x64".into(),
+                public_key: consort_proto::auth::PublicKey::from_bytes([1; 32]),
+                version: "0.1.0".into(),
+                protocol_version: 1,
+                tags: vec![],
+                paused: false,
+                state: WorkerState::Online,
+                last_seen_at: None,
+                inventory: Some(inventory),
+                paired_at: Timestamp::from_millis(NOW),
+                revoked_at: None,
+            }
+        }
+
+        #[test]
+        fn a_new_hub_has_no_history_and_no_account() {
+            let (cache, _) = new_hub();
+            let facts = hub_facts(&cache);
+            assert_eq!(facts.history, History::None);
+            assert!(facts.loaded && !facts.signed_in && !facts.later);
+        }
+
+        #[test]
+        fn a_message_in_tutti_is_history() {
+            let (mut cache, tutti) = new_hub();
+            let id = MessageId::new();
+            cache.messages.insert(
+                id.to_string(),
+                message(id, tutti, Author::Assistant, MessageKind::Text, None, NOW),
+            );
+            assert_eq!(hub_facts(&cache).history, History::Some);
+        }
+
+        #[test]
+        fn another_channel_is_history() {
+            let (mut cache, _) = new_hub();
+            let other = ChannelId::new();
+            cache.channels.insert(
+                other.to_string(),
+                channel(other, ChannelKind::Standard, "sayso", None),
+            );
+            assert_eq!(hub_facts(&cache).history, History::Some);
+        }
+
+        #[test]
+        fn a_tutti_that_has_not_loaded_says_nothing() {
+            let (mut cache, _) = new_hub();
+            cache.channels_loaded.clear();
+            assert_eq!(hub_facts(&cache).history, History::Unknown);
+        }
+
+        #[test]
+        fn the_preference_says_do_this_later() {
+            let (mut cache, _) = new_hub();
+            cache.preferences.setup_later = true;
+            assert!(hub_facts(&cache).later);
+        }
+
+        #[test]
+        fn only_a_signed_in_account_counts() {
+            use consort_proto::model::AuthState as A;
+            let (mut cache, _) = new_hub();
+            let out = host(A::SignedOut);
+            cache.workers.insert(out.id.to_string(), out.clone());
+            assert!(!hub_facts(&cache).signed_in);
+            let signed = host(A::SignedIn);
+            cache.workers.insert(out.id.to_string(), signed);
+            assert!(hub_facts(&cache).signed_in);
+        }
+
+        #[test]
+        fn an_online_host_with_no_inventory_is_pending() {
+            use consort_proto::model::AuthState as A;
+            let (mut cache, _) = new_hub();
+            let mut waiting = host(A::SignedOut);
+            waiting.inventory = None;
+            cache
+                .workers
+                .insert(waiting.id.to_string(), waiting.clone());
+            assert!(hub_facts(&cache).inventory_pending);
+            waiting.state = consort_proto::model::WorkerState::Offline;
+            cache.workers.insert(waiting.id.to_string(), waiting);
+            assert!(!hub_facts(&cache).inventory_pending, "it can stay away");
         }
     }
 
@@ -4248,6 +4460,64 @@ mod tests {
     }
 
     #[test]
+    fn the_name_on_the_hub_wins_over_the_guess_of_this_client() {
+        let mut w = world();
+        let guess = UserView::from_name("watzon");
+        let shown = |cache: &Cache| view_state(cache, Connection::Online, guess.clone(), NOW).user;
+        assert_eq!(shown(&w.cache).name, "watzon", "no name: the guess shows");
+        w.cache.preferences.user_name = Some("   ".into());
+        assert_eq!(shown(&w.cache).name, "watzon", "a blank name is no name");
+        w.cache.preferences.user_name = Some("Chris Watson".into());
+        let user = shown(&w.cache);
+        assert_eq!(user.name, "Chris Watson");
+        assert_eq!(user.initials, "CW");
+    }
+
+    #[test]
+    fn a_failed_first_turn_of_the_guide_can_try_again_in_tutti_only() {
+        let mut w = world();
+        let tutti = w
+            .cache
+            .channels
+            .values()
+            .find(|c| c.kind == PK::Tutti)
+            .map(|c| c.id)
+            .expect("Tutti");
+        let mut failed = notice(&w, None, &rate_limit_body(), NOW - 10_000);
+        failed.channel_id = tutti;
+        w.cache.messages.insert(failed.id.to_string(), failed);
+        w.cache.preferences.guide = model::GuideState::Running;
+        let state = view(&w.cache);
+        let card = state
+            .timeline(&tutti.to_string())
+            .expect("the timeline")
+            .items
+            .iter()
+            .find_map(|i| match i {
+                TimelineItem::Notice(n) => n.error.clone(),
+                _ => None,
+            })
+            .expect("a card");
+        assert_eq!(
+            card.try_again,
+            Some(crate::turn_errors::TryAgainTarget::Greeting)
+        );
+        w.cache.preferences.guide = model::GuideState::Closed;
+        let state = view(&w.cache);
+        let card = state
+            .timeline(&tutti.to_string())
+            .expect("the timeline")
+            .items
+            .iter()
+            .find_map(|i| match i {
+                TimelineItem::Notice(n) => n.error.clone(),
+                _ => None,
+            })
+            .expect("a card");
+        assert_eq!(card.try_again, None, "the guide is over");
+    }
+
+    #[test]
     fn an_old_turn_failed_notice_reads_as_an_unknown_error() {
         use crate::turn_errors::{ErrorAction, TurnErrorKindView};
         let mut w = world();
@@ -4361,6 +4631,169 @@ mod tests {
         assert!(!draft.edited);
     }
 
+    /// A `visual` notice with its page, in the channel or in a task thread.
+    fn visual_notice(w: &World, root: Option<MessageId>, at: i64) -> Message {
+        let body = model::VisualNotice::new(
+            "Tokens by week",
+            Some(300),
+            vec![
+                model::VisualHeight {
+                    width: 320,
+                    height: 420,
+                },
+                model::VisualHeight {
+                    width: 720,
+                    height: 300,
+                },
+            ],
+        )
+        .to_body();
+        let mut m = notice(w, root, &body, at);
+        m.attachments = vec![model::BlobRef {
+            sha256: "b".repeat(64).parse().expect("a hash"),
+            name: "Tokens by week.html".into(),
+            mime: "text/html".into(),
+            size: 2_048,
+        }];
+        m
+    }
+
+    fn timeline_notice(state: &ViewState, w: &World, id: &MessageId) -> NoticeView {
+        state
+            .timeline(&w.sayso.to_string())
+            .expect("timeline")
+            .items
+            .iter()
+            .find_map(|i| match i {
+                TimelineItem::Notice(n) if n.message_id == id.to_string() => Some(n.clone()),
+                _ => None,
+            })
+            .expect("the notice")
+    }
+
+    #[test]
+    fn a_visual_notice_is_a_visual_in_the_timeline() {
+        let mut w = world();
+        let shown = visual_notice(&w, None, NOW - 10_000);
+        let id = shown.id;
+        let sha = shown.attachments[0].sha256.to_string();
+        w.cache.messages.insert(id.to_string(), shown);
+        let n = timeline_notice(&view(&w.cache), &w, &id);
+        assert_eq!(n.kind, "visual");
+        assert_eq!(n.text, "Tokens by week");
+        let visual = n.visual.expect("a visual");
+        assert_eq!(visual.message_id, id.to_string());
+        assert_eq!(visual.title, "Tokens by week");
+        assert_eq!(visual.time_label, n.time_label);
+        assert_eq!(visual.notice.height_at(520), 360);
+        assert_eq!(visual.page.mime, "text/html");
+        assert_eq!(visual.page.sha256, sha);
+        assert_eq!(visual.page.name, "Tokens by week.html");
+        assert_eq!(visual.page.size, 2_048);
+        assert_eq!(visual.page.local_path, None);
+        assert!(!visual.page.image);
+
+        // Once the page is in the local cache, the view has its path.
+        w.cache
+            .local_blobs
+            .insert(sha, "/cache/blobs/page.html".into());
+        let n = timeline_notice(&view(&w.cache), &w, &id);
+        assert_eq!(
+            n.visual.expect("a visual").page.local_path.as_deref(),
+            Some("/cache/blobs/page.html")
+        );
+    }
+
+    #[test]
+    fn a_visual_notice_with_no_page_is_a_plain_notice() {
+        let mut w = world();
+        let mut shown = visual_notice(&w, None, NOW - 10_000);
+        shown.attachments.clear();
+        let id = shown.id;
+        w.cache.messages.insert(id.to_string(), shown);
+        let n = timeline_notice(&view(&w.cache), &w, &id);
+        assert_eq!(n.visual, None);
+        assert_eq!(n.kind, "visual");
+        assert_eq!(n.text, "Tokens by week");
+    }
+
+    #[test]
+    fn other_notices_are_not_visuals() {
+        let mut w = world();
+        let mut failed = notice(
+            &w,
+            None,
+            r#"{"kind":"turn_failed","text":"The turn failed. Try again."}"#,
+            NOW - 20_000,
+        );
+        // A file on any other notice is not a page.
+        failed.attachments = visual_notice(&w, None, 0).attachments;
+        let draft = notice(
+            &w,
+            None,
+            r#"{"kind":"draft","text":"Draft: Claim form","title":"Claim form","body":"Dear Dr. Meyer,"}"#,
+            NOW - 10_000,
+        );
+        let (failed_id, draft_id) = (failed.id, draft.id);
+        w.cache.messages.insert(failed_id.to_string(), failed);
+        w.cache.messages.insert(draft_id.to_string(), draft);
+        let state = view(&w.cache);
+        let failed = timeline_notice(&state, &w, &failed_id);
+        assert_eq!(failed.kind, "turn_failed");
+        assert_eq!(failed.visual, None);
+        let draft = timeline_notice(&state, &w, &draft_id);
+        assert!(draft.draft.is_some());
+        assert_eq!(draft.visual, None);
+    }
+
+    #[test]
+    fn a_visual_notice_in_a_task_thread_has_the_same_view() {
+        let mut w = world();
+        let shown = visual_notice(&w, Some(w.card), NOW - 10_000);
+        let id = shown.id;
+        w.cache.messages.insert(id.to_string(), shown);
+        let state = view(&w.cache);
+        let thread = state.thread(&w.task.to_string()).expect("thread");
+        let post = thread
+            .posts
+            .iter()
+            .find(|p| p.id == id.to_string())
+            .expect("the post");
+        let PostBody::Notice { kind, visual, .. } = &post.bodies[0] else {
+            panic!("a notice: {:?}", post.bodies);
+        };
+        assert_eq!(kind, "visual");
+        let visual = visual.as_deref().expect("a visual");
+        assert_eq!(visual.message_id, id.to_string());
+        assert_eq!(visual.title, "Tokens by week");
+        assert_eq!(visual.notice.table_height(720), Some(300));
+        assert_eq!(visual.page.mime, "text/html");
+        // The page is a part of the notice, not an attachment row.
+        assert_eq!(post.bodies.len(), 1, "{:?}", post.bodies);
+    }
+
+    #[test]
+    fn a_visual_notice_with_no_page_in_a_thread_is_a_plain_notice() {
+        let mut w = world();
+        let mut shown = visual_notice(&w, Some(w.card), NOW - 10_000);
+        shown.attachments.clear();
+        let id = shown.id;
+        w.cache.messages.insert(id.to_string(), shown);
+        let state = view(&w.cache);
+        let post = state
+            .thread(&w.task.to_string())
+            .expect("thread")
+            .posts
+            .iter()
+            .find(|p| p.id == id.to_string())
+            .expect("the post");
+        assert!(matches!(
+            &post.bodies[..],
+            [PostBody::Notice { kind, text, visual: None, .. }]
+                if kind == "visual" && text == "Tokens by week"
+        ));
+    }
+
     #[test]
     fn a_notice_in_a_thread_is_a_notice_post() {
         let mut w = world();
@@ -4384,6 +4817,7 @@ mod tests {
                 error: None,
                 fallback: None,
                 monid: None,
+                visual: None,
             }]
         );
     }
@@ -4908,6 +5342,7 @@ mod tests {
                     policy: WorkerPolicy::default(),
                     load: Default::default(),
                     tools: vec![],
+                    update: None,
                 }),
                 paired_at: Timestamp::from_millis(NOW),
                 revoked_at: None,

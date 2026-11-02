@@ -65,6 +65,8 @@ The mode setting is System, Light or Dark. Each client stores its own theme and 
 | `status.failed` | The Failed status, errors and destructive actions |
 | `status.scheduled` | The Scheduled status |
 | `syntax.*` | Code blocks only |
+| `chart.1` to `chart.6` | The fills and strokes of a chart in a visual. They are the pigments of the Three voices mark (lapis, verdigris, gold, cobalt violet and madder), then slate for "Other". Gold is not first, because the accent means "your turn". Never on `surface.card` |
+| `chart.ink` | Text on a chart fill, such as a number in a bar |
 
 GPUI Kit uses the word "accent" for the hover and selection color of menus and lists. In the mapping, the kit's `accent.background` is our `surface.selected`. Our accent is the kit's `primary`.
 
@@ -90,8 +92,27 @@ GPUI Kit uses the word "accent" for the hover and selection color of menus and l
 | `status.done` | `#80C7A8` | `#237356` |
 | `status.failed` | `#F1735A` | `#C1351E` |
 | `status.scheduled` | `#B2A0D6` | `#6D5398` |
+| `chart.1` | `#77B4ED` | `#2F74C0` |
+| `chart.2` | `#80C7A8` | `#2E8466` |
+| `chart.3` | `#E7BE62` | `#B08419` |
+| `chart.4` | `#B2A0D6` | `#7559A6` |
+| `chart.5` | `#E3929C` | `#B9506A` |
+| `chart.6` | `#8E9A94` | `#7A8781` |
+| `chart.ink` | `#131E1A` | `#FFFFFF` |
 
 The names come from the materials of a consort: spruce for the surfaces, lead white for the dark-mode text, brass for the accent, and Renaissance pigments for the statuses (azurite, verdigris, vermilion and folium). The values were set in OKLCH and converted to sRGB.
+
+### Velvet values
+
+Velvet has the same chart pigments as Spruce, except slate and the ink. The other roles are in `design/themes/velvet.json`.
+
+| Role | Dark | Light |
+|---|---|---|
+| `chart.1` to `chart.5` | The values of Spruce | The values of Spruce |
+| `chart.6` | `#968E97` | `#857B85` |
+| `chart.ink` | `#1F181F` | `#FFFFFF` |
+
+A theme file with no `chart` group loads. It gets the chart roles of Spruce in the same mode.
 
 ### Derived colors
 
@@ -118,8 +139,10 @@ The theme loader measures WCAG contrast ratios for each mode. A theme that fails
 | `accent.on_fill` | `accent.fill` | 4.5 |
 | Every `syntax.*` role | `surface.card` | 4.5 |
 | `accent.text` | `surface.canvas`, `surface.selected` | 3.0 |
+| `chart.1` to `chart.6` | `surface.canvas` (a graphic on the page background, WCAG 1.4.11) | 3.0 |
+| `chart.ink` | `chart.1` to `chart.6` (bold numbers in a bar) | 3.0 |
 
-Spruce and Velvet pass every rule in both modes. The lowest text ratio is 4.51, for Spruce light.
+Spruce and Velvet pass every rule in both modes. The lowest text ratio is 4.51, for Spruce light. The lowest chart ratio is 3.29, for `chart.3` on the canvas in light mode. Gold on `surface.card` in light mode is 2.98, so a chart never sits on a card fill.
 
 ### Task status
 
@@ -238,6 +261,7 @@ These sizes are in `component.chat` of `structure.json`, except the three in `la
 | Token | Size (px) | Use |
 |---|---|---|
 | `layout.bubble_max_width` | 560 | The widest bubble or card in the timeline |
+| `layout.setup_column`, `layout.setup_top` | 448, 136 | The column of a setup screen, and the space above its mark |
 | `layout.content_top`, `layout.fade_bottom` | 92, 32 | The space above the first item at rest, and the bottom fade of the timeline |
 | `bubble_radius`, `bubble_tail` | 16, 4 | Bubble and card corners, and the small corner |
 | `bubble_pad_x`, `bubble_pad_y` | 14, 10 | The padding of a bubble |
@@ -273,7 +297,22 @@ The sizes are in `component.files` of `structure.json`. The values come from the
 - **Drop.** Files dragged anywhere over the chat attach to the composer. The composer is the only visual target: it grows, gets a dashed `accent.text` border and an `accent.fill` fill at `opacity.drop_fill`, and shows the upload icon on a `tint_accent` disc, "Drop to attach 3 files" and "Up to 256 MB each". Text that you typed stays visible.
 - **Bubbles.** Your pictures are `image_tile_w` by `image_tile_h` (228 by 168 px) tiles, two in a row, above your text. Your files are `file_bubble_you` (280 px) file bubbles on `accent.surface`. The assistant's files follow its text as `file_bubble` (360 px) bubbles on `surface.card`. An artifact names its task with the status glyph, and its size. On hover a file bubble shows Save and Open.
 - **Documents.** A click on a `.md`, `.markdown` or `.txt` file card (a bubble or a Files row) opens the document in the right panel (see [The document panel](#the-document-panel)). Other types open in the app of the system. The card of the open document has `surface.selected`, and a click on it closes the panel.
-- **Light box.** A click on a picture opens it large on `lightbox` (black at `derive.lightbox_alpha`), with its name and details, Save, Open, close, Previous and Next, and "1 of 2". The arrow keys step, and Escape closes it.
+- **Light box.** One component for pictures and visuals (Paper G4, G5), on `lightbox` (black at `derive.lightbox_alpha`). The top bar (`lightbox_bar`) has the name, the details and the caption, and icon buttons with tooltips: Save, Open and Close for a picture; Save image, Open in browser and Close for a visual. A picture shows at most `lightbox_image_w` by `lightbox_image_h`, with Previous and Next (`lightbox_nav`) and "1 of 2". The arrow keys step. A click outside the picture or the sheet of a visual closes the light box, as Escape and Close do. A click on the picture, the sheet, an arrow or a button does not. A visual opens alone, with no arrows and no count. See [Visuals](#visuals).
+
+### Visuals
+
+A visual is an HTML page that the assistant shows as a timeline item of its own (CONTEXT.md). The values come from Paper section 15, G1 to G5. The plan is [VISUALS-PLAN.md](VISUALS-PLAN.md).
+
+- **The item.** A visual has no bubble and no card. It lies on the canvas at the full width of the timeline column (or of the task thread), in three parts, `xs` + `xxs` (6 px) apart:
+  - the title line: the `visual` icon at `icon.dense` in `text.tertiary`, and the title in Label size and `text.secondary`, `xs` from the left. The title is chrome, so it is not selectable;
+  - the page area, with `lg` corners;
+  - the footer line (`chat.footer_line`). On hover it shows Open full screen, Copy image and Save image (`chat.footer_button` buttons with tooltips) and the time, as on a message. The line keeps its height without the hover, so nothing moves.
+- **Height.** The page area takes the height that the live page reports at this width. Else it takes the height of the image, scaled to the width. Else it takes the height table of the notice, and then the height that the assistant gave. Until the page or the image is ready, the item keeps that height, so the timeline does not jump.
+- **Loading.** "Loading the visual" in Label size at the regular weight and `text.tertiary`, under the three dabs of the mark, which shimmer on the mark clock. The area is `surface.card` at `opacity.loading_fill`. It shows while there is no image and no live page.
+- **Failed.** "The visual did not load" on `surface.card` with a `status.failed` border at `opacity.error_border`, the `failed` icon, what happened (selectable), and Try again. When the page did not come: "The hub did not send the page. Check that the hub is online, then try again." Else the error of the image says what to do. An error that passes by itself (no session host online, the browser for visuals is installing, no connection) tries again by itself after 2, 4, 8, 16 and then 30 s. The item shows the failure after three tries, or at once for any other error. Try again asks at once.
+- **Live or image.** The app decides in each frame, as `ui/visual_cover.rs` says. A visual is live (macOS only) while all of its page area is between the top tint and the bottom fade, nothing is over it and the window is active. It shows its image while a menu, a picker, a dialog, a notice, the drawer or the light box is over it, while a part of it is under the tint or the fade, or while it is taller than the clear part. Off screen it draws nothing, and its live page is hidden; the page goes away 30 s later. At most four live pages exist. The app asks for the image as soon as the item is on screen, at the width of the item and the scale of the window, in the active theme. A change of theme or mode loads the live pages again and asks for new images. Windows and Linux always show the image.
+- **Menu (G2).** A right click on the item, or on its live page: Open full screen, Open in browser, a separator, Copy image, Save image, Save as HTML. The light box has no Open full screen. Text that the user selected in a live page gets the menu of selected text. Open in browser and Save as HTML write the page with the theme of the app and no script of the app. Save image and Save as HTML ask where with the save dialog.
+- **Full screen (G5).** The light box shows the visual live on a sheet: `surface.canvas`, a `border.subtle` border, `xl` corners, `lg` padding, at most `files.lightbox_sheet_w` (1072 px) wide. The page takes the width of the sheet and its own height. A page taller than the window scrolls inside the sheet. The sheet starts below the reach of the tooltips of the top buttons, because a live page draws over anything in its bounds. While the light box shows a visual, its item in the timeline shows the image.
 
 ### The Channel panel
 
@@ -312,6 +351,9 @@ Settings > Workers and Settings > Providers use these sizes from `component` in 
 | `agent_list_max` | 152 | The ACP registry list shows three rows, then scrolls |
 | `sign_in_tile`, `sign_in_logo` | 40, 22 | The logo tile before the title of the sign-in step |
 | `step_marker` | 22 | The round marker of a numbered step in a sign-in flow |
+| `setup_mark` | 84 | The mark on a setup screen |
+| `setup_gap` | 28 | The space between the parts of a setup screen |
+| `setup_control`, `setup_field` | 36, 40 | A button and a field on a setup screen |
 
 The model picker uses these sizes from `component`:
 
@@ -430,6 +472,18 @@ An approval has two views (`ui/approvals.rs`).
 - **While it waits** it is a card at the bubble width (`layout.bubble_max_width`) with the `accent.text` border. The first row has the fermata glyph, the title (what the action is) and "Needs you" in `accent.text`. Under it are the folder, when the agent can choose it, and the command or target once, in the mono style in a box on `surface.raised`. A command stops at 5 lines with "Show all" (then "Show less"). All text wraps inside the box, so a long address with no spaces breaks at the edge. The buttons are one row of equal widths: Allow once (primary, with a border in its own color so it is as high as the others), Allow for this task and Deny. A label over 20 characters does not fit that row: it gets its own row under the others, at full width, and wraps inside its button. A card with no task choice has two buttons. The wide choice shows the label of the harness when it gave one.
 - **After the answer** it is a line of `chat.answered_line` (36 px) in a box on `surface.card` with a `border.subtle` border and `lg` corners: a glyph, the action cut to one line in the mono style, the answer ("Allowed once", "Allowed for this task", "Denied", "Closed, no answer") and a chevron. A click opens the box in place, with the full command, the folder and "You chose: ..." when the harness gave a label. Nothing else in the timeline moves. The open state is for one approval in one place.
 - **Hub cards** keep their own body while they wait and while their outcome moves. After that they use the same line.
+
+### Access and permissions
+
+ADR 0020 has the model. The design is in Paper.
+
+- **The Access section** of the channel settings has one card with two rows, split by a `border.subtle` line. Permissions has a detail line such as "4 command rules, 1 tool exception" and the button Edit permissions. The count has the rules that apply in the channel, with the rules of Tutti that the channel does not override, and the exceptions of the connections that the channel has. Connectors and skills has its summary and the button Edit connectors. Each button closes the settings and opens its own view.
+- **The Permissions dialog** has the shell of the channel settings: the channel icon, "<channel> permissions", one line, the close button, two columns with a line between them, and Cancel and Save changes. Every edit is a draft until Save changes. Each column is as high as its content, and scrolls with fades when the window is too low.
+- **Commands** (left) has the button Add a rule and these groups: "Runs without asking", "Always asks, also in Full access" and "From Tutti, in every channel". An empty group has no heading. Tutti has no third group, and the third group has no rule that the channel overrides. A row has the pattern in the mono style (selectable), what it does, and a quiet line "Except a, b. Added by the assistant.". A row has a "..." button and a right-click menu: Edit and Remove, or Override here for a rule from Tutti. With no rule, a box says "No rules yet" and points to the assistant, with Add a rule.
+- **Connections** (right) has one card for each connection of the channel. The header has the name, and at the right "The assistant's account" in `accent.text`, or "Also in <channels>". The rows Read, Change and Delete each have a select. Under a line, each tool exception has its name, a select with only Run without asking and Ask every time, an x button and a right-click menu with Remove. Add an exception opens a list of the tools with a search. An account of the assistant says that it sends without asking when its rule says so, and that it does not use the voice of the user.
+- **The rule dialog** (Add a rule, Edit rule) opens over the Permissions dialog. It has Command and Except in the mono style, When it matches as two segments (Runs without asking, Always asks), and What it does. Its error shows in the dialog. Escape closes only this dialog.
+- **The permissions card** in the chat has the title, "Needs you", each group with a bold heading, rows in two columns (a fixed column for the subject, mono for a command, and the words), the note of a group in the quiet style, and the risk in `status.failed`. Allow and Deny follow. After the answer it is one line: "Permissions of <place>: N changes" and Allowed or Denied.
+- **On the connection page** the row "This account belongs to the assistant" has a switch. While it is on, the risk shows under the switch in `status.failed`.
 
 ### Drafts
 
@@ -571,7 +625,7 @@ The logo is the Three voices mark: three dabs of pigment, one for each voice of 
 - **Frames.** GPUI cannot run an SVG noise filter at every frame, so `design/mark/generate.mjs` renders every frame ahead of time into `assets/mark/`: idle (3 frames: one pose, three edges), working (12 poses, each with its hand-drawn edge), needs you (24 frames), and done (1 frame). Each set is in dark pigments (`dark/`) and light pigments (`light/`). GPUI's image renderer (resvg) draws the paint filter and the blends.
 - **Small sizes.** At 16 to 20 px, use the sharp frames (`dark-sharp/`, `light-sharp/`), which have no paint edges.
 - **States.** Idle keeps one pose and its edges shimmer at 4 fps, so the mark looks alive at rest. Working: the voices circle each other. Needs you: gold comes forward and beats twice a second. Done: the voices close into a chord for `motion.done_hold_ms` (1.5 s) after work ends, then the mark goes back to idle or to needs you.
-- **Where.** The mark is the logo on onboarding and on the start-up error, the Tutti row in the sidebar (sharp, `component.sidebar.row_icon`, 18 px; it plays the working or needs-you frames while that is the state of Tutti, and shows the first idle frame at rest) and in the switcher (16 px, still), and the title bar on Windows and Linux. The app icons in `design/logo/` are the idle mark on `surface.card`.
+- **Where.** The mark is the logo on onboarding and on the start-up error, the Tutti row in the sidebar (sharp, `component.sidebar.row_icon`, 18 px; it plays the working or needs-you frames only while Tutti itself works or needs you, and shows the first idle frame at rest. Work in another channel does not move it) and in the switcher (16 px, still), and the title bar on Windows and Linux. The app icons in `design/logo/` are the idle mark on `surface.card`.
 - **Wordmark.** "consort" in lowercase, Atkinson Hyperlegible Next 600, to the right of the mark. The mark is about 1.2 times the font size high.
 
 ## Text in the UI

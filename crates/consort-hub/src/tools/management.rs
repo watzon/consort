@@ -16,18 +16,19 @@ use consort_proto::client_api::{
 };
 use consort_proto::ids::{ApprovalId, ChannelId, GroupId, RepoId};
 use consort_proto::model::{
-    Approval, ApprovalDetails, Channel, ConnectServiceCard, Connection, ManagementCard,
-    ModelSelection, SignInCard, SignInMethod, Skill, ToolId, UseIn, normalize_tags,
-    validate_connection_name,
+    Approval, ApprovalDetails, ApprovalRule, Channel, CommandRule, CommandRuleResult,
+    ConnectServiceCard, Connection, ManagementCard, ModelSelection, PermissionGroup, PermissionRow,
+    PermissionsCard, SignInCard, SignInMethod, Skill, ToolApprovals, ToolException, ToolId,
+    ToolKind, UseIn, normalize_tags, tool_display_name, validate_connection_name,
 };
 use consort_proto::tools::{
     AddAccountArgs, ArchiveChannelArgs, ConnectServiceArgs, CreateChannelArgs, DisconnectArgs,
     HubTool, HubToolCall, InstallToolArgs, ListConnectionsResult, ListInstalledSkillsResult,
     ManagementResult, RemoveSkillArgs, RequestAccessArgs, RequestableConnection,
     SearchConnectorCatalogArgs, SearchConnectorCatalogResult, SetChannelConnectorArgs,
-    SetChannelSkillArgs, SetChannelTagsArgs, SetDefaultModelArgs, SetWorkerTagsArgs,
-    StartSignInArgs, ToolAudience, UpdateChannelArgs, UpdateConnectionArgs, UpdateSkillArgs,
-    UpdateThisChannelArgs,
+    SetChannelSkillArgs, SetChannelTagsArgs, SetDefaultModelArgs, SetPermissionsArgs,
+    SetWorkerTagsArgs, StartSignInArgs, ToolAudience, UpdateChannelArgs, UpdateConnectionArgs,
+    UpdateSkillArgs, UpdateThisChannelArgs,
 };
 use serde::Serialize;
 use serde_json::Value;
@@ -97,6 +98,11 @@ pub(crate) fn widen_to(use_in: &UseIn, channel: &Channel, channels: &[Channel]) 
     }
 }
 
+/// Whether two patterns are the same, whatever their spaces are.
+fn same_pattern(a: &str, b: &str) -> bool {
+    a.split_whitespace().eq(b.split_whitespace())
+}
+
 impl Hub {
     /// Posts a management approval card and answers `waiting_for_user`.
     async fn ask_first<A: Serialize>(
@@ -107,12 +113,27 @@ impl Hub {
         change: String,
         effect: String,
     ) -> Result<ManagementResult> {
+        self.ask_first_card(ctx, tool, args, change, effect, None)
+            .await
+    }
+
+    /// [`Self::ask_first`], with the rows of a permissions change.
+    async fn ask_first_card<A: Serialize>(
+        &self,
+        ctx: &ToolCtx,
+        tool: HubTool,
+        args: &A,
+        change: String,
+        effect: String,
+        permissions: Option<PermissionsCard>,
+    ) -> Result<ManagementResult> {
         let id = ApprovalId::new();
         let card = ManagementCard {
             tool: tool.name().to_owned(),
             change: change.clone(),
             effect,
             arguments: serde_json::to_value(args)?,
+            permissions,
         };
         self.post_hub_card(
             ctx,
@@ -124,7 +145,8 @@ impl Hub {
         Ok(ManagementResult::waiting_for_user(
             id,
             format!(
-                "The user must allow this first: {change} The answer comes as a card_answered event."
+                "The user must allow this first: {change}. The answer comes as a card_answered event.",
+                change = change.trim_end_matches('.')
             ),
         ))
     }
@@ -325,6 +347,7 @@ impl Hub {
             C::Disconnect(a) => self.m_disconnect(ctx, a, approved).await,
             C::UpdateSkill(a) => self.m_update_skill(ctx, a, approved).await,
             C::RemoveSkill(a) => self.m_remove_skill(ctx, a, approved).await,
+            C::SetPermissions(a) => self.m_set_permissions(ctx, a, approved).await,
             C::UpdateThisChannel(a) => self.m_update_this_channel(ctx, a, approved).await,
             C::SetChannelTags(a) => self.m_set_channel_tags(ctx, a, approved).await,
             C::SetChannelConnector(a) => self.m_set_channel_connector(ctx, a, approved).await,
@@ -468,6 +491,16 @@ impl Hub {
             )
             .await?
             .channel;
+        let (notice_channel, text) = (
+            ctx.channel.id,
+            format!("Created the channel {}", channel.name),
+        );
+        self.store
+            .write(move |tx| {
+                tx.post_notice(notice_channel, None, None, "channel_made", &text)
+                    .map(|_| ())
+            })
+            .await?;
         let mut result = self
             .applied(
                 ctx,
@@ -512,6 +545,7 @@ impl Hub {
                     repo_ids,
                     default_isolation: None,
                     default_approval_mode: None,
+                    command_rules: None,
                     allowed_local_mcp_servers: None,
                     memory_enabled: None,
                     tags,
@@ -884,7 +918,6 @@ impl Hub {
         ctx: &ToolCtx,
         a: ConnectServiceArgs,
     ) -> Result<ManagementResult> {
-        self.connectors.client()?;
         if let Err(err) = validate_connection_name(&a.name) {
             return Ok(ManagementResult::refused(format!("The name {err}.")));
         }
@@ -896,27 +929,38 @@ impl Hub {
             )
             .await?;
         let slug = a.service.trim().to_ascii_lowercase();
-        let service = self
-            .search_services(Some(&slug), None)
-            .await?
-            .into_iter()
-            .find(|s| s.slug == slug)
-            .ok_or_else(|| {
-                HubError::not_found(format!(
-                    "The catalog has no service {slug}. Call search_connector_catalog to find its slug."
-                ))
-            })?;
+        // With no Composio key the catalog cannot answer yet. The card asks
+        // for the key, and the hub checks the slug when the user continues.
+        let (service_slug, service_name, logo_url) = if self.connectors.client().is_ok() {
+            let service = self
+                .search_services(Some(&slug), None)
+                .await?
+                .into_iter()
+                .find(|s| s.slug == slug)
+                .ok_or_else(|| {
+                    HubError::not_found(format!(
+                        "The catalog has no service {slug}. Call search_connector_catalog to find its slug."
+                    ))
+                })?;
+            (service.slug, service.name, service.logo_url)
+        } else {
+            (slug, a.name.trim().to_owned(), None)
+        };
         let card = ConnectServiceCard {
-            service: service.slug.clone(),
-            service_name: service.name.clone(),
-            logo_url: service.logo_url.clone(),
+            service: service_slug,
+            service_name: service_name.clone(),
+            logo_url,
             name: a.name.trim().to_owned(),
             use_in,
             approvals: a.approvals.unwrap_or_default(),
             connection_id: None,
         };
         let id = ApprovalId::new();
-        let summary = format!("Connect {} as {}", service.name, card.name);
+        let summary = if service_name == card.name {
+            format!("Connect {service_name}")
+        } else {
+            format!("Connect {service_name} as {}", card.name)
+        };
         self.post_hub_card(
             ctx,
             id,
@@ -927,8 +971,7 @@ impl Hub {
         Ok(ManagementResult::waiting_for_user(
             id,
             format!(
-                "The user continues on the connect card and signs in to {} in the browser. The answer comes as a card_answered event.",
-                service.name
+                "The user continues on the connect card and signs in to {service_name} in the browser. The answer comes as a card_answered event."
             ),
         ))
     }
@@ -979,7 +1022,7 @@ impl Hub {
                 .await;
         }
         let updated = self
-            .update_connection_fields(connection.id, a.name, use_in, a.approvals)
+            .update_connection_fields(connection.id, a.name, use_in, a.approvals, None, None)
             .await?;
         let mut result = self
             .applied(
@@ -1113,6 +1156,154 @@ impl Hub {
     }
 
     // A channel's own tools ------------------------------------------------------------
+
+    /// `set_permissions`. See ADR 0019. A coordinator changes its own
+    /// channel. Tutti changes any channel, and its own rules apply everywhere.
+    async fn m_set_permissions(
+        &self,
+        ctx: &ToolCtx,
+        a: SetPermissionsArgs,
+        approved: bool,
+    ) -> Result<ManagementResult> {
+        let is_tutti = ctx.channel.kind == consort_proto::model::ChannelKind::Tutti;
+        let channel = match a.channel {
+            Some(id) if id != ctx.channel.id => {
+                if !is_tutti {
+                    return Ok(ManagementResult::refused(
+                        "A channel's assistant can change only the permissions of its own channel.",
+                    ));
+                }
+                self.store
+                    .read(move |conn| conversation::channel_or_404(conn, id))
+                    .await?
+            }
+            _ => ctx.channel.clone(),
+        };
+        let mut rules = channel.command_rules.clone();
+        rules.retain(|rule| !a.remove.iter().any(|p| same_pattern(p, &rule.pattern)));
+        let mut added = Vec::with_capacity(a.add.len());
+        for input in a.add.clone() {
+            let rule = match input.into_rule(consort_proto::model::CommandRuleSource::Assistant) {
+                Ok(rule) => rule,
+                Err(e) => return Ok(ManagementResult::refused(e.0)),
+            };
+            rules.retain(|r| r.pattern != rule.pattern);
+            added.push(rule.clone());
+            rules.push(rule);
+        }
+        if let Err(e) = consort_proto::model::validate_command_rules(&rules) {
+            return Ok(ManagementResult::refused(e.0));
+        }
+        let commands_change = rules != channel.command_rules;
+
+        let mut planned = Vec::with_capacity(a.connections.len());
+        for change in &a.connections {
+            let connection = if is_tutti {
+                self.find_connection(&change.connection).await?
+            } else {
+                self.connection_in_set(ctx, &change.connection).await?.0
+            };
+            let mut exceptions = connection.tool_exceptions.clone();
+            exceptions.retain(|e| {
+                !change
+                    .remove_exceptions
+                    .iter()
+                    .any(|r| r.eq_ignore_ascii_case(&e.tool))
+            });
+            for exception in &change.add_exceptions {
+                if self
+                    .connector_tool(&connection, &exception.tool)
+                    .await
+                    .is_err()
+                {
+                    return Ok(ManagementResult::refused(format!(
+                        "{} has no tool {}. Use list_connector_tools to find the slug.",
+                        connection.name, exception.tool
+                    )));
+                }
+                exceptions.retain(|e| !e.tool.eq_ignore_ascii_case(&exception.tool));
+                exceptions.push(exception.clone());
+            }
+            if let Err(e) = consort_proto::model::validate_tool_exceptions(&exceptions) {
+                return Ok(ManagementResult::refused(e.to_string()));
+            }
+            let approvals = change.approvals.filter(|new| *new != connection.approvals);
+            let owned = change
+                .assistant_owned
+                .filter(|new| *new != connection.assistant_owned);
+            let exceptions = (exceptions != connection.tool_exceptions).then_some(exceptions);
+            if approvals.is_some() || owned.is_some() || exceptions.is_some() {
+                planned.push(PlannedConnection {
+                    connection,
+                    approvals,
+                    exceptions,
+                    owned,
+                });
+            }
+        }
+
+        if !commands_change && planned.is_empty() {
+            return Ok(ManagementResult::applied(
+                "The channel has these permissions already.",
+            ));
+        }
+        let is_tutti_target = channel.kind == consort_proto::model::ChannelKind::Tutti;
+        let place = if is_tutti_target {
+            "every channel".to_owned()
+        } else {
+            channel.name.clone()
+        };
+        // A connection change reaches every channel of the connection, so
+        // it asks in both directions. Only a stricter command rule of this
+        // channel runs at once.
+        let widens = crate::command_rules::widens(&channel.command_rules, &rules);
+        if !approved && (widens || !planned.is_empty()) {
+            let channels = self.all_channels().await?;
+            let card = permissions_card(&channel, &channels, &a.remove, &added, &planned);
+            let effect = card
+                .groups
+                .iter()
+                .flat_map(|g| g.rows.iter())
+                .map(|r| format!("{}: {}", r.subject, r.text))
+                .collect::<Vec<_>>()
+                .join("\n");
+            return self
+                .ask_first_card(
+                    ctx,
+                    HubTool::SetPermissions,
+                    &a,
+                    format!("Change what {place} can do"),
+                    effect,
+                    Some(card),
+                )
+                .await;
+        }
+        for plan in planned {
+            self.update_connection_fields(
+                plan.connection.id,
+                None,
+                None,
+                plan.approvals,
+                plan.exceptions,
+                plan.owned,
+            )
+            .await?;
+        }
+        if commands_change {
+            let mut update = ChannelUpdate::new(channel.id);
+            update.command_rules = Some(rules);
+            self.channel_update(&Caller::Hub, update).await?;
+        }
+        let mut result = self
+            .applied(
+                ctx,
+                approved,
+                format!("The assistant changed the permissions of {place}."),
+            )
+            .await?;
+        result.channel_id = Some(channel.id);
+        Ok(result)
+    }
 
     async fn m_update_this_channel(
         &self,
@@ -1295,7 +1486,7 @@ impl Hub {
                         .await;
                 }
                 let updated = self
-                    .update_connection_fields(connection.id, None, Some(wider), None)
+                    .update_connection_fields(connection.id, None, Some(wider), None, None, None)
                     .await?;
                 let mut result = ManagementResult::applied(format!(
                     "{} is available in {} now.",
@@ -1347,4 +1538,145 @@ impl Hub {
             )),
         }
     }
+}
+
+/// One connection change of `set_permissions`, after its checks.
+struct PlannedConnection {
+    connection: Connection,
+    approvals: Option<ToolApprovals>,
+    exceptions: Option<Vec<ToolException>>,
+    owned: Option<bool>,
+}
+
+/// The text of an approval rule on a card.
+fn rule_text(rule: ApprovalRule) -> &'static str {
+    match rule {
+        ApprovalRule::RunWithoutAsking => "Run without asking.",
+        ApprovalRule::AskOncePerTask => "Ask once per task.",
+        ApprovalRule::AskEveryTime => "Ask every time.",
+    }
+}
+
+/// The groups of a `set_permissions` card.
+fn permissions_card(
+    channel: &Channel,
+    channels: &[Channel],
+    removed: &[String],
+    added: &[CommandRule],
+    planned: &[PlannedConnection],
+) -> PermissionsCard {
+    let mut groups = Vec::new();
+    let mut rows = Vec::new();
+    for rule in added {
+        let text = match rule.result {
+            CommandRuleResult::Ask => "Always asks.".to_owned(),
+            CommandRuleResult::Allow if rule.except.is_empty() => "Runs without asking.".to_owned(),
+            CommandRuleResult::Allow => {
+                format!("Runs without asking. Not with {}.", rule.except.join(", "))
+            }
+        };
+        rows.push(PermissionRow {
+            subject: rule.pattern.clone(),
+            code: true,
+            text,
+        });
+    }
+    for pattern in removed {
+        let old = channel
+            .command_rules
+            .iter()
+            .find(|r| same_pattern(pattern, &r.pattern));
+        let Some(old) = old.filter(|o| !added.iter().any(|r| r.pattern == o.pattern)) else {
+            continue;
+        };
+        let text = match old.result {
+            CommandRuleResult::Ask => "Stops asking. The approval mode decides again.",
+            CommandRuleResult::Allow => "The approval mode decides again.",
+        };
+        rows.push(PermissionRow {
+            subject: old.pattern.clone(),
+            code: true,
+            text: text.to_owned(),
+        });
+    }
+    if !rows.is_empty() {
+        groups.push(PermissionGroup {
+            heading: "Commands".to_owned(),
+            rows,
+            note: None,
+        });
+    }
+    let mut warning = None;
+    for plan in planned {
+        let c = &plan.connection;
+        let mut rows = Vec::new();
+        if let Some(new) = plan.approvals {
+            for (kind, label) in [
+                (ToolKind::Read, "Tools that read"),
+                (ToolKind::Change, "Tools that change"),
+                (ToolKind::Delete, "Tools that delete"),
+            ] {
+                if new.rule_for(kind) != c.approvals.rule_for(kind) {
+                    rows.push(PermissionRow {
+                        subject: label.to_owned(),
+                        code: false,
+                        text: rule_text(new.rule_for(kind)).to_owned(),
+                    });
+                }
+            }
+        }
+        if let Some(new) = &plan.exceptions {
+            for exception in new.iter().filter(|e| !c.tool_exceptions.contains(e)) {
+                rows.push(PermissionRow {
+                    subject: tool_display_name(&c.service, &exception.tool),
+                    code: false,
+                    text: rule_text(exception.rule).to_owned(),
+                });
+            }
+            for old in c
+                .tool_exceptions
+                .iter()
+                .filter(|o| !new.iter().any(|e| e.tool.eq_ignore_ascii_case(&o.tool)))
+            {
+                rows.push(PermissionRow {
+                    subject: tool_display_name(&c.service, &old.tool),
+                    code: false,
+                    text: "Follows the rule of its kind.".to_owned(),
+                });
+            }
+        }
+        if let Some(owned) = plan.owned {
+            let text = if owned {
+                warning = Some(format!(
+                    "What {} reads can tell the assistant what to do. It could send channel files to anyone, and nothing asks you first.",
+                    c.name
+                ));
+                "Belongs to the assistant. What it sends does not use your voice, and routines follow these rules."
+            } else {
+                "Belongs to you. What it sends can use your voice, and routines ask first."
+            };
+            rows.push(PermissionRow {
+                subject: "This account".to_owned(),
+                code: false,
+                text: text.to_owned(),
+            });
+        }
+        let others: Vec<&str> = channels
+            .iter()
+            .filter(|o| o.archived_at.is_none() && o.id != channel.id && c.is_available_in(o))
+            .map(|o| o.name.as_str())
+            .collect();
+        let note = (!others.is_empty()).then(|| {
+            format!(
+                "This connection also works in {}. The change applies there too.",
+                others.join(", ")
+            )
+        });
+        groups.push(PermissionGroup {
+            heading: format!("{} connection", c.name),
+            rows,
+            note,
+        });
+    }
+    PermissionsCard { groups, warning }
 }

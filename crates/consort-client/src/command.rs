@@ -105,6 +105,8 @@ pub enum CommandOutput {
     MemoryNote(crate::memory::MemoryNoteView),
     /// The versions of a memory note, newest first, with their text.
     MemoryHistory(Vec<crate::memory::MemoryNoteView>),
+    /// The image of a visual, in the local blob cache.
+    VisualImage(crate::visual::VisualImageFile),
 }
 
 /// The fields of a new connection, from the Connect dialog.
@@ -130,6 +132,9 @@ pub struct ConnectionChanges {
     pub name: Option<String>,
     pub use_in: Option<UseInView>,
     pub approvals: Option<ToolApprovalsView>,
+    /// The whole list of tool exceptions.
+    pub tool_exceptions: Option<Vec<crate::connectors::ToolExceptionView>>,
+    pub assistant_owned: Option<bool>,
 }
 
 /// Changes to a skill. A `None` field stays as it is.
@@ -186,6 +191,8 @@ pub struct ChannelChanges {
     pub default_approval_mode: Option<crate::view::ApprovalMode>,
     /// The local MCP servers that a task from the assistant may use.
     pub allowed_local_mcp_servers: Option<Vec<String>>,
+    /// The command rules of the channel: the whole list.
+    pub command_rules: Option<Vec<consort_proto::model::CommandRule>>,
     /// Channel memory on or off.
     pub memory_enabled: Option<bool>,
     /// The proactivity level of the channel. `Some(None)` goes back to the
@@ -202,6 +209,13 @@ pub enum Command {
     Pair {
         hub_url: String,
         code: String,
+    },
+    /// The hub on this computer moved to another port, because its port was
+    /// taken at a start. It is the same hub, so the identity stays. Only a client
+    /// paired with `from` changes.
+    MoveHub {
+        from: String,
+        to: String,
     },
     /// Forgets the hub: removes the identity, the outbox and the saved
     /// data from this computer, and stops the link. The app asks for a
@@ -343,6 +357,19 @@ pub enum Command {
         task_id: String,
         selection: crate::view::SelectionView,
     },
+    /// Asks for an image of a visual at a width, a scale and a theme. The
+    /// output is [`CommandOutput::VisualImage`]. The client keeps the images
+    /// it got in this run: the same ask is answered with no request, and
+    /// two asks at once share one request. The hub may need up to 60
+    /// seconds to draw it, so this command waits longer than the others.
+    RenderVisual {
+        message_id: String,
+        /// The width in CSS pixels, 160 to 2,400.
+        width: u32,
+        /// Device pixels per CSS pixel, 1 to 3.
+        scale: u8,
+        style: consort_proto::model::VisualStyle,
+    },
     /// Saves the user's change to a draft card that `show_draft` posted.
     /// `None` keeps the title or the body as it is.
     EditDraft {
@@ -410,6 +437,16 @@ pub enum Command {
         other_accounts: bool,
         steps: Vec<SelectionView>,
     },
+    /// Keeps the choice Do this later of the setup on the hub.
+    SetSetupLater {
+        later: bool,
+    },
+    /// Keeps the name of the user on the hub. Empty clears it.
+    SetUserName {
+        name: String,
+    },
+    /// Starts a failed first turn of the guided start again.
+    GuideTryAgain,
     /// Replaces the source of the command check.
     SetCommandCheck {
         choice: crate::command_check::CommandCheckChoice,
@@ -723,6 +760,13 @@ pub enum Command {
     /// Asks the hub for its status. While a backup runs, the client asks
     /// again every second until it ends.
     LoadHubStatus,
+    /// Asks the hub how other devices reach it.
+    LoadReach,
+    /// Turns a way to reach the hub on or off.
+    SetReach {
+        method: crate::reach::ReachMethod,
+        on: bool,
+    },
     /// Starts a backup on the hub now.
     BackUpNow,
     /// Changes some backup settings. A schedule change sends this

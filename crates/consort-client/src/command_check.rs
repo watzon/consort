@@ -163,6 +163,10 @@ pub struct CheckDetailView {
 pub fn check_detail(outcome: &CommandCheckOutcome) -> CheckDetailView {
     let source = &outcome.source;
     let check = match outcome.verdict {
+        CommandCheckVerdict::Allowed if outcome.command_rule.is_some() => {
+            let what = outcome.command_rule.as_deref().unwrap_or_default();
+            format!("Allowed by a command rule: {what}.")
+        }
         CommandCheckVerdict::Allowed => format!("Allowed by the command check, {source}."),
         CommandCheckVerdict::Blocked => format!("Blocked by the command check, {source}."),
         CommandCheckVerdict::Asked => format!("The command check could not decide, {source}."),
@@ -401,6 +405,7 @@ mod tests {
     #[test]
     fn details_name_the_source_and_the_rule() {
         let detail = check_detail(&CommandCheckOutcome {
+            command_rule: None,
             verdict: CommandCheckVerdict::Blocked,
             source: "jev on OpenRouter".to_owned(),
             reason: None,
@@ -443,5 +448,18 @@ mod tests {
         assert_eq!(setting.kind, CommandCheckKind::Chat);
         assert_eq!(setting.decision.expect("kept").confidence_limit, 80);
         assert_eq!(setting.account_model.expect("kept").model, "haiku");
+    }
+
+    #[test]
+    fn details_name_the_command_rule_that_allowed_it() {
+        let detail = check_detail(&CommandCheckOutcome {
+            command_rule: Some("Push to a branch".to_owned()),
+            verdict: CommandCheckVerdict::Allowed,
+            source: String::new(),
+            reason: None,
+            rule: None,
+            error: None,
+        });
+        assert_eq!(detail.check, "Allowed by a command rule: Push to a branch.");
     }
 }

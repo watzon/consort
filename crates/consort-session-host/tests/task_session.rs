@@ -21,12 +21,56 @@ use consort_proto::session_host_link::{
 };
 use consort_session_host::bridge::McpHttpClient;
 use consort_session_host::config::HostToml;
+use consort_session_host::visual::{RenderError, Rendered, VisualEngine};
 use consort_session_host::{Harnesses, HostConfig};
 use consort_testkit::{FakeHarness, FakeRecord, FakeScript, FakeStep};
 use serde_json::{Value, json};
 
+/// A renderer with no browser. It keeps the documents that it gets.
+#[derive(Default)]
+struct FakeVisual {
+    documents: std::sync::Mutex<Vec<String>>,
+}
+
+/// The PNG that [`FakeVisual`] draws.
+const DRAWN_PNG: &[u8] = &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 1, 2, 3, 4];
+
+#[async_trait::async_trait]
+impl VisualEngine for FakeVisual {
+    async fn render(
+        &self,
+        document: String,
+        _width: u32,
+        _scale: u8,
+        _mode: consort_proto::model::VisualMode,
+        _max_height: u32,
+    ) -> Result<Rendered, RenderError> {
+        self.documents.lock().unwrap().push(document);
+        Ok(Rendered {
+            png: DRAWN_PNG.to_vec(),
+            height: 420,
+            console: vec![],
+            omitted: 0,
+        })
+    }
+
+    async fn measure(
+        &self,
+        document: String,
+        widths: &[u32],
+        _mode: consort_proto::model::VisualMode,
+    ) -> Result<Vec<consort_proto::model::VisualHeight>, RenderError> {
+        self.documents.lock().unwrap().push(document);
+        Ok(widths
+            .iter()
+            .map(|&width| consort_proto::model::VisualHeight { width, height: 420 })
+            .collect())
+    }
+}
+
 struct Fixture {
     hub: FakeHub,
+    visual: Arc<FakeVisual>,
     record: Arc<std::sync::Mutex<FakeRecord>>,
     account_id: AccountId,
     _dir: tempfile::TempDir,
@@ -54,7 +98,8 @@ async fn fixture() -> Fixture {
     let record = fake.record();
     let mut harnesses: Harnesses = HashMap::new();
     harnesses.insert(HarnessKind::ClaudeCode, Arc::new(fake) as Arc<dyn Harness>);
-    let host = consort_session_host::run_with(
+    let visual = Arc::new(FakeVisual::default());
+    let host = consort_session_host::run_with_visual(
         HostConfig {
             ws_path: consort_proto::auth::SESSION_HOST_WS_PATH,
             config_dir: dir.path().to_path_buf(),
@@ -62,6 +107,7 @@ async fn fixture() -> Fixture {
             check_tool_updates: false,
         },
         harnesses,
+        visual.clone(),
     )
     .await
     .unwrap();
@@ -69,6 +115,7 @@ async fn fixture() -> Fixture {
     hub.wait_connected().await;
     Fixture {
         hub,
+        visual,
         record,
         account_id,
         dir: dir.path().to_path_buf(),
@@ -355,4 +402,214 @@ async fn publish_artifact_uploads_from_the_worker() {
     assert_eq!(calls[0].arguments["blob_sha256"], sha);
     assert_eq!(calls[0].arguments["size"], 12);
     assert_eq!(calls[0].arguments["mime"], "text/markdown");
+}
+
+fn sha256_of(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+#[tokio::test]
+async fn show_visual_of_a_task_reads_its_image_through_the_worker() {
+    use consort_proto::tools::HubTool;
+    let fixture = fixture().await;
+    fixture.hub.state.extra_tools.lock().unwrap().extend([
+        HubTool::PreviewVisual.definition(),
+        HubTool::ShowVisual.definition(),
+    ]);
+    let session_id = SessionId::new();
+    fixture
+        .hub
+        .command(
+            "cmd-1",
+            start(session_id, TaskId::new(), fixture.account_id).into(),
+        )
+        .await;
+    // The worker uploads the image, and the hub serves it.
+    let image: &[u8] = b"GIF89a\x01\x00\x01\x00\x00\x00\x00;";
+    let image_sha = sha256_of(image);
+    fixture
+        .hub
+        .state
+        .blob_bodies
+        .lock()
+        .unwrap()
+        .insert(image_sha.clone(), image.to_vec());
+    fixture
+        .hub
+        .state
+        .exec_results
+        .lock()
+        .unwrap()
+        .push_back(ExecOpResult {
+            result: json!({"sha256": image_sha, "size": image.len()}),
+            replayed_from_journal: false,
+            is_error: false,
+        });
+    let client = mcp_client(&fixture).await;
+    // The workspace root is `C:\work\task` on a Windows worker, where case
+    // does not count.
+    let result = call(
+        &client,
+        "show_visual",
+        json!({
+            "html": "<h2>Dots</h2><img src=\"c:/Work/Task/img/dot.gif\">",
+            "title": "Dots",
+        }),
+    )
+    .await;
+    assert_eq!(result["isError"], false, "{result}");
+
+    let execs = fixture.hub.state.execs.lock().unwrap().clone();
+    assert_eq!(execs.len(), 1);
+    assert_eq!(execs[0].tool, "blob_put");
+    assert_eq!(execs[0].arguments["path"], "img/dot.gif");
+    assert!(
+        fixture
+            .hub
+            .state
+            .blob_gets
+            .lock()
+            .unwrap()
+            .contains(&format!("/v1/blobs/{image_sha}"))
+    );
+
+    let calls = fixture.hub.state.tool_calls.lock().unwrap().clone();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].name, "show_visual");
+    assert_eq!(calls[0].arguments["html"], "");
+    assert_eq!(calls[0].arguments["title"], "Dots");
+    assert_eq!(calls[0].arguments["page"]["mime"], "text/html");
+    assert_eq!(calls[0].arguments["page"]["name"], "Dots.html");
+    let heights = calls[0].arguments["heights"].as_array().unwrap();
+    assert_eq!(heights.len(), 10);
+    assert_eq!(heights[0], json!({"width": 320, "height": 420}));
+
+    // The uploaded page has the image in it.
+    let page_sha = calls[0].arguments["page"]["sha256"].as_str().unwrap();
+    let page = fixture
+        .hub
+        .state
+        .put_bodies
+        .lock()
+        .unwrap()
+        .get(page_sha)
+        .cloned()
+        .expect("the page was uploaded");
+    let page = String::from_utf8(page).unwrap();
+    assert!(page.contains("<img src=\"data:image/gif;base64,"), "{page}");
+    assert!(!page.contains("dot.gif"), "{page}");
+    assert_eq!(calls[0].arguments["page"]["size"], page.len());
+    assert_eq!(sha256_of(page.as_bytes()), page_sha);
+    // The renderer measured the same page.
+    let documents = fixture.visual.documents.lock().unwrap().clone();
+    assert_eq!(documents.len(), 1);
+    assert!(documents[0].contains(&page));
+
+    // An image outside the workspace reaches neither the worker nor the hub.
+    let outside = call(
+        &client,
+        "show_visual",
+        json!({"html": "<img src=\"C:\\Users\\ana\\secret.png\">", "title": "X"}),
+    )
+    .await;
+    assert_eq!(outside["isError"], true, "{outside}");
+    let text = outside["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("outside your workspace"), "{text}");
+    assert_eq!(fixture.hub.state.execs.lock().unwrap().len(), 1);
+    assert_eq!(fixture.hub.state.tool_calls.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn visual_render_from_the_hub_uploads_the_image() {
+    use consort_proto::model::{BlobRef, VisualImage, VisualMode, VisualStyle};
+    use consort_proto::session_host_link::{HubToSessionHost, VisualRenderCommand};
+    let fixture = fixture().await;
+    let page = b"<p>Tokens by week</p>";
+    let page_sha = sha256_of(page);
+    fixture
+        .hub
+        .state
+        .blob_bodies
+        .lock()
+        .unwrap()
+        .insert(page_sha.clone(), page.to_vec());
+    let command = VisualRenderCommand {
+        page: BlobRef {
+            sha256: page_sha.parse().unwrap(),
+            name: "Tokens by week.html".into(),
+            mime: "text/html".into(),
+            size: page.len() as u64,
+        },
+        width: 720,
+        scale: 2,
+        style: VisualStyle {
+            mode: VisualMode::Light,
+            variables: vec![],
+        },
+    };
+    let response = fixture
+        .hub
+        .command("render-1", HubToSessionHost::VisualRender(command))
+        .await;
+    let body = response.result.expect("visual.render succeeds");
+    let image: VisualImage = serde_json::from_value(body).unwrap();
+    assert_eq!(image.height, 420);
+    assert_eq!(image.image.mime, "image/png");
+    assert_eq!(image.image.name, "visual.png");
+    assert_eq!(image.image.size, DRAWN_PNG.len() as u64);
+    let png_sha = sha256_of(DRAWN_PNG);
+    assert_eq!(image.image.sha256.to_string(), png_sha);
+    assert_eq!(
+        fixture
+            .hub
+            .state
+            .put_bodies
+            .lock()
+            .unwrap()
+            .get(&png_sha)
+            .cloned(),
+        Some(DRAWN_PNG.to_vec())
+    );
+    assert!(
+        fixture
+            .hub
+            .state
+            .blob_gets
+            .lock()
+            .unwrap()
+            .contains(&format!("/v1/blobs/{page_sha}"))
+    );
+    let documents = fixture.visual.documents.lock().unwrap().clone();
+    assert_eq!(documents.len(), 1);
+    assert!(documents[0].contains("color-scheme:light"));
+    assert!(documents[0].contains("<p>Tokens by week</p>"));
+
+    // A width that the hub should have refused gets `invalid`.
+    let mut wide = VisualRenderCommand {
+        page: BlobRef {
+            sha256: page_sha.parse().unwrap(),
+            name: "x.html".into(),
+            mime: "text/html".into(),
+            size: page.len() as u64,
+        },
+        width: 5_000,
+        scale: 1,
+        style: VisualStyle::default(),
+    };
+    let response = fixture
+        .hub
+        .command("render-2", HubToSessionHost::VisualRender(wide.clone()))
+        .await;
+    let err = response.result.expect_err("a width out of range fails");
+    assert_eq!(err.code, consort_proto::error::ErrorCode::Invalid);
+    wide.width = 320;
+    let ok = fixture
+        .hub
+        .command("render-3", HubToSessionHost::VisualRender(wide))
+        .await;
+    assert!(ok.result.is_ok(), "{ok:?}");
 }

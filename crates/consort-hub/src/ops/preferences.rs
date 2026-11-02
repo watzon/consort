@@ -2,7 +2,7 @@
 
 use consort_proto::client_api::{
     PreferencesResult, PreferencesSetCommandCheck, PreferencesSetFallbackPath,
-    PreferencesSetFavoriteModel,
+    PreferencesSetFavoriteModel, PreferencesSetSetupLater,
 };
 use consort_proto::model::{FAVORITE_FIELD_MAX_CHARS, FAVORITE_MODELS_MAX};
 
@@ -33,6 +33,27 @@ impl Hub {
                 let mut preferences = preferences::preferences(tx.db())?;
                 if preferences.command_check != request.setting {
                     preferences.command_check = request.setting;
+                    tx.save_preferences(&preferences)?;
+                }
+                Ok(preferences)
+            })
+            .await?;
+        Ok(PreferencesResult { preferences })
+    }
+
+    /// Keeps the choice Do this later of the setup. A request that changes
+    /// nothing writes nothing.
+    pub(crate) async fn preferences_set_setup_later(
+        &self,
+        _caller: &Caller,
+        request: PreferencesSetSetupLater,
+    ) -> Result<PreferencesResult> {
+        let preferences = self
+            .store
+            .write(move |tx| {
+                let mut preferences = preferences::preferences(tx.db())?;
+                if preferences.setup_later != request.later {
+                    preferences.setup_later = request.later;
                     tx.save_preferences(&preferences)?;
                 }
                 Ok(preferences)
@@ -138,6 +159,23 @@ mod tests {
             },
             favorite,
         }
+    }
+
+    #[tokio::test]
+    async fn do_this_later_stays_on_the_hub_and_sends_one_feed_entry() {
+        let (hub, _dir) = test_hub().await;
+        let later = PreferencesSetSetupLater { later: true };
+        let first = hub
+            .preferences_set_setup_later(&Caller::Hub, later.clone())
+            .await
+            .unwrap();
+        assert!(first.preferences.setup_later);
+        hub.preferences_set_setup_later(&Caller::Hub, later)
+            .await
+            .unwrap();
+        let upserts = upserts_after(&hub, 0).await;
+        assert_eq!(upserts.len(), 1, "a repeat writes nothing");
+        assert!(upserts[0].setup_later);
     }
 
     /// The preferences upserts in the feed after `seq`.

@@ -519,6 +519,7 @@ pub fn reading_items(step: &str) -> Vec<TimelineItem> {
             fallback: None,
             error: None,
             monid: None,
+            visual: None,
         }),
         TimelineItem::Message(greeting),
     ];
@@ -625,6 +626,7 @@ pub fn screen_state(screen: &str) -> Option<ViewState> {
                         state: crate::activity::MarkState::Working,
                         line: Some("Writing in reading".into()),
                     },
+                    own_state: crate::activity::MarkState::Working,
                 });
             }
             Some(state)

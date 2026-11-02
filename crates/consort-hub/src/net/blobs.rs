@@ -71,18 +71,17 @@ impl Hub {
             .peer_public_key(consort_proto::auth::PeerId::Worker(worker))
             .await?
             .ok_or_else(denied)?;
-        let payload = http_signing_payload(
-            method.as_str(),
-            &self.settings.origin,
-            uri.path(),
-            Timestamp::from_millis(timestamp),
-            worker,
-        );
-        if verify_signature(&key, &payload, &signature) {
-            Ok(())
-        } else {
-            Err(denied())
-        }
+        let valid = self.accepted_origins().await.iter().any(|origin| {
+            let payload = http_signing_payload(
+                method.as_str(),
+                origin,
+                uri.path(),
+                Timestamp::from_millis(timestamp),
+                worker,
+            );
+            verify_signature(&key, &payload, &signature)
+        });
+        if valid { Ok(()) } else { Err(denied()) }
     }
 
     fn blob_file(&self, hash: &Sha256Hash) -> PathBuf {

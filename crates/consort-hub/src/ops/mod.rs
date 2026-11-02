@@ -15,4 +15,5 @@ pub(crate) mod registry;
 mod routines;
 mod sync;
 mod tasks;
+pub(crate) mod visuals;
 pub(crate) mod waiting;

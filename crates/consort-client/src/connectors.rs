@@ -234,9 +234,23 @@ pub struct ConnectionView {
     pub identity: Option<String>,
     pub use_in: UseInView,
     pub approvals: ToolApprovalsView,
+    /// Tools with their own rule.
+    pub tool_exceptions: Vec<ToolExceptionView>,
+    /// The account belongs to the assistant.
+    pub assistant_owned: bool,
     pub status: ConnectionStatusView,
     /// Unix milliseconds.
     pub created_at: i64,
+}
+
+/// One tool of a connection with its own approval rule.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolExceptionView {
+    /// The Composio slug.
+    pub tool: String,
+    /// The name for the user, such as "Merge a pull request".
+    pub name: String,
+    pub rule: ApprovalRuleView,
 }
 
 /// Whether a load from the hub has run, and how it went.
@@ -503,6 +517,40 @@ pub struct ManagementCardView {
     pub tool: String,
     pub change: String,
     pub effect: String,
+    /// The rows of a permissions change.
+    pub permissions: Option<PermissionsCardView>,
+}
+
+/// The rows of a permissions card.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PermissionsCardView {
+    pub groups: Vec<PermissionGroupView>,
+    /// The risk that the user must read.
+    pub warning: Option<String>,
+}
+
+impl PermissionsCardView {
+    /// The number of changes, for the answered line.
+    pub fn change_count(&self) -> usize {
+        self.groups.iter().map(|g| g.rows.len()).sum()
+    }
+}
+
+/// One group of a permissions card.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PermissionGroupView {
+    pub heading: String,
+    pub rows: Vec<PermissionRowView>,
+    pub note: Option<String>,
+}
+
+/// One row of a permissions card.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PermissionRowView {
+    pub subject: String,
+    /// The subject is a command pattern.
+    pub code: bool,
+    pub text: String,
 }
 
 /// The connect card.
@@ -547,6 +595,16 @@ pub struct InstallCardView {
     pub skill_id: Option<String>,
 }
 
+/// The worker card. The code is not here: this app makes it, and it stays on
+/// this client (`ViewState::worker_pairing`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AddWorkerCardView {
+    /// A worker on this computer. Otherwise the card shows each system.
+    pub this_computer: bool,
+    /// The worker that came online.
+    pub worker_name: Option<String>,
+}
+
 /// A card that the hub made itself. It is answered with `approval.answer`,
 /// like any approval.
 #[derive(Clone, Debug, PartialEq)]
@@ -554,6 +612,7 @@ pub enum HubCardView {
     Connector(Box<ConnectorCardView>),
     Management(ManagementCardView),
     ConnectService(ConnectCardView),
+    AddWorker(AddWorkerCardView),
     SignIn(SignInCardView),
     SkillInstall(InstallCardView),
     Monid(Box<crate::monid::MonidCardView>),
@@ -700,7 +759,7 @@ pub fn use_in_match_note(use_in: &UseInView, channels: &[ChannelView]) -> String
 }
 
 /// The approval rules in one sentence, kinds with the same rule together:
-/// "Read runs without asking; changes and deletes ask you."
+/// "Read runs without asking. Changes and deletes ask you."
 pub fn approvals_sentence(approvals: &ToolApprovalsView) -> String {
     let mut groups: Vec<(ApprovalRuleView, Vec<ToolKindView>)> = Vec::new();
     for kind in ToolKindView::ALL {
@@ -719,12 +778,17 @@ pub fn approvals_sentence(approvals: &ToolApprovalsView) -> String {
             format!("{} {}", join_and(&nouns), rule.verb(plural))
         })
         .collect();
-    let mut sentence = clauses.join("; ");
-    if let Some(first) = sentence.get(0..1) {
-        sentence = first.to_uppercase() + &sentence[1..];
-    }
-    sentence.push('.');
-    sentence
+    clauses
+        .iter()
+        .map(|clause| {
+            let mut letters = clause.chars();
+            match letters.next() {
+                Some(first) => format!("{}{}.", first.to_uppercase(), letters.as_str()),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Why a connector card asks, such as "Create and change tools ask every
@@ -1019,6 +1083,7 @@ pub fn connectors_context(state: &ViewState, channel_id: &str) -> String {
             service_name: c.service_name.clone(),
             identity: c.identity.clone(),
             needs_sign_in: c.status.needs_sign_in(),
+            assistant_owned: c.assistant_owned,
         })
         .collect();
     consort_proto::model::render_connectors_block(&entries)
@@ -1215,19 +1280,19 @@ mod tests {
     fn the_approvals_read_as_one_sentence() {
         assert_eq!(
             approvals_sentence(&ToolApprovalsView::default()),
-            "Read runs without asking; changes and deletes ask you."
+            "Read runs without asking. Changes and deletes ask you."
         );
         let loose = ToolApprovalsView::default()
             .with(ToolKindView::Change, ApprovalRuleView::RunWithoutAsking);
         assert_eq!(
             approvals_sentence(&loose),
-            "Read and changes run without asking; deletes ask you."
+            "Read and changes run without asking. Deletes ask you."
         );
         let once = ToolApprovalsView::default()
             .with(ToolKindView::Delete, ApprovalRuleView::AskOncePerTask);
         assert_eq!(
             approvals_sentence(&once),
-            "Read runs without asking; changes ask you; deletes ask you once per task."
+            "Read runs without asking. Changes ask you. Deletes ask you once per task."
         );
         assert_eq!(
             rule_note(ToolKindView::Change, ApprovalRuleView::AskEveryTime),

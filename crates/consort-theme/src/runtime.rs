@@ -67,13 +67,7 @@ pub struct ThemeLibrary {
 
 impl Global for ThemeLibrary {}
 
-/// The built-in themes: Spruce (the default) and Velvet.
-pub fn builtin_theme_sources() -> [&'static str; 2] {
-    [
-        include_str!("../../../design/themes/spruce.json"),
-        include_str!("../../../design/themes/velvet.json"),
-    ]
-}
+pub use crate::builtin::builtin_theme_sources;
 
 /// The user themes folder: `<config dir>/consort/themes`.
 pub fn user_themes_dir() -> Option<PathBuf> {

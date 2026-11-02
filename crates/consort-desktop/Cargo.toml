@@ -12,21 +12,27 @@ path = "src/main.rs"
 
 [dependencies]
 consort-client.workspace = true
+consort-proto.workspace = true
 consort-dictation.workspace = true
 crossbeam-channel = "0.5"
 directories.workspace = true
-consort-theme.workspace = true
+consort-theme = { workspace = true, features = ["gpui"] }
+consort-visual.workspace = true
 gpui-kit.workspace = true
 # The same Markdown parser that the GPUI text view uses (gpui-base 0.8.1). The
 # link policy reads the reference definitions from it.
 markdown.workspace = true
 qrcode.workspace = true
+tracing-subscriber.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2.workspace = true
 objc2-foundation.workspace = true
 objc2-app-kit.workspace = true
 mac-usernotifications.workspace = true
+# The live page of a visual (docs/VISUALS-PLAN.md).
+gpui-webview.workspace = true
+lb-wry.workspace = true
 
 [dev-dependencies]
 # Headless windows and key presses for the view tests.

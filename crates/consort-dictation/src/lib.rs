@@ -16,7 +16,8 @@ pub use models::{
     ModelNeed, Purpose, cleanup_choices, cleanup_name, format_size, plan_models, speech_languages,
 };
 pub use sayso_sdk::cleanup::{Runtime, RuntimeCleaner};
-pub use sayso_sdk::{CaptureMicrophone, Device, EngineSource, ModelInfo, devices, permission};
+pub use sayso_sdk::embedded::{CaptureMicrophone, Device, EngineSource, ModelInfo, devices};
+pub use sayso_sdk::permission;
 pub use settings::{
     DEFAULT_SHORTCUT, Engine, KeyStore, Settings, SettingsStore, StopAfter, StoreError,
 };

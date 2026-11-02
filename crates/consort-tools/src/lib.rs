@@ -2,8 +2,8 @@
 //!
 //! A managed tool is a CLI or runtime that the worker installs in
 //! `<consort home>/tools/<tool>/<version>/`: Node, Claude Code, the Claude
-//! agent ACP adapter, Codex, OpenCode, Gemini CLI and agents from the ACP
-//! registry.
+//! agent ACP adapter, Codex, OpenCode, Gemini CLI, the preview browser
+//! (`chrome-headless-shell`) and agents from the ACP registry.
 //!
 //! The crate has two layers:
 //!
@@ -30,4 +30,4 @@ pub use platform::{Arch, Libc, Os, Platform};
 pub use tool::{Installed, LaunchSpec, ParseToolIdError, ToolId, ToolState, ToolStatus};
 
 #[cfg(feature = "install")]
-pub use install::{Sources, ToolStore, ToolStoreOptions};
+pub use install::{ChromeFile, ChromePin, Sources, ToolStore, ToolStoreOptions};

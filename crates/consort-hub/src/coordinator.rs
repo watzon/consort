@@ -334,7 +334,8 @@ fn main_text(event: &mut WakeEvent) -> Option<&mut String> {
         | WakeEvent::StaleTask { .. }
         | WakeEvent::Research { .. }
         | WakeEvent::ProactiveFeedback { .. }
-        | WakeEvent::ChannelCreated { .. } => None,
+        | WakeEvent::ChannelCreated { .. }
+        | WakeEvent::FirstSignIn { .. } => None,
     }
 }
 
@@ -384,7 +385,7 @@ fn cut_event(event: &WakeEvent, room: usize) -> WakeEvent {
 /// prompt that it started with, also through a restart of the hub, so a new
 /// build would otherwise run with the rules of the old one.
 fn prompt_fingerprint(channel: &Channel, tutti: &Channel, extensions_key: &str) -> String {
-    fingerprint_with_base(prompts::COORDINATOR_BASE, channel, tutti, extensions_key)
+    fingerprint_with_base(&prompts::coordinator_base(), channel, tutti, extensions_key)
 }
 
 fn fingerprint_with_base(
@@ -452,6 +453,8 @@ struct Inputs {
     /// The voice part of the prompt, when the session can draft or send in
     /// the user's voice.
     voice: Option<String>,
+    /// The guide of the first conversation, while it runs in Tutti.
+    guide: Option<&'static str>,
 }
 
 /// Ends the open coordinator session of a channel inside a transaction, so
@@ -523,9 +526,10 @@ impl Hub {
             &inputs.channel,
             &inputs.tutti,
             &format!(
-                "{}{}",
+                "{}{}{}",
                 inputs.extensions_key,
-                inputs.voice.as_deref().unwrap_or_default()
+                inputs.voice.as_deref().unwrap_or_default(),
+                inputs.guide.unwrap_or_default()
             ),
         );
         let mut inputs = inputs;
@@ -671,6 +675,9 @@ impl Hub {
         );
         if let Some(voice) = &inputs.voice {
             system_prompt.push_str(voice);
+        }
+        if let Some(guide) = inputs.guide {
+            system_prompt.push_str(guide);
         }
         // The first turn also holds the context pack, and the command holds
         // the system prompt, so the events get the room that is left.
@@ -905,7 +912,11 @@ impl Hub {
                     conn,
                     consort_proto::time::Timestamp::now(),
                 )?;
-                let path = crate::store::preferences::preferences(conn)?.fallback_path;
+                let preferences = crate::store::preferences::preferences(conn)?;
+                let guide = (channel.is_tutti()
+                    && preferences.guide == consort_proto::model::GuideState::Running)
+                    .then_some(prompts::GUIDE);
+                let path = preferences.fallback_path;
                 Ok(Some(Inputs {
                     channel,
                     tutti,
@@ -920,6 +931,7 @@ impl Hub {
                     context,
                     extensions_key,
                     voice: None,
+                    guide,
                 }))
             })
             .await?
@@ -1486,7 +1498,7 @@ mod tests {
         );
         assert_eq!(
             prompt_fingerprint(&tutti, &tutti, "key"),
-            fingerprint_with_base(prompts::COORDINATOR_BASE, &tutti, &tutti, "key")
+            fingerprint_with_base(&prompts::coordinator_base(), &tutti, &tutti, "key")
         );
     }
 }

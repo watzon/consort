@@ -6,6 +6,13 @@
 #   scripts/bundle-macos.sh --binary target/debug/consort-desktop --no-archive
 #   scripts/bundle-macos.sh --dmg                also make a dmg
 #   scripts/bundle-macos.sh --bundle-id dev.consort.desktop.dev
+#   scripts/bundle-macos.sh --cli target/debug/consort
+#
+# The app carries the `consort` program in Contents/Helpers/consort, because the
+# app installs it for a hub on this computer. Contents/MacOS/consort would
+# overwrite Contents/MacOS/Consort on a normal Mac disk, where case does not
+# count. Without --cli, the script builds the program for a release build, and
+# uses the file beside --binary for a build that names one.
 #
 # Output goes to dist/ (change it with --out):
 #   Consort.app
@@ -41,6 +48,7 @@ MIN_MACOS="12.0"
 
 target=""
 binary=""
+cli=""
 out="dist"
 archive=1
 dmg=0
@@ -49,6 +57,7 @@ while [ "$#" -gt 0 ]; do
   case "$1" in
     --target) target="$2"; shift 2 ;;
     --binary) binary="$2"; shift 2 ;;
+    --cli) cli="$2"; shift 2 ;;
     --out) out="$2"; shift 2 ;;
     --bundle-id) BUNDLE_ID="$2"; shift 2 ;;
     --no-archive) archive=0; shift ;;
@@ -77,10 +86,13 @@ esac
 
 if [ -z "$binary" ]; then
   # The deployment target makes the binary agree with LSMinimumSystemVersion.
-  MACOSX_DEPLOYMENT_TARGET="$MIN_MACOS" cargo build --release --locked -p consort-desktop --target "$target"
+  MACOSX_DEPLOYMENT_TARGET="$MIN_MACOS" cargo build --release --locked -p consort-desktop -p consort-cli --target "$target"
   binary="target/${target}/release/consort-desktop"
+  [ -n "$cli" ] || cli="target/${target}/release/consort"
 fi
 [ -f "$binary" ] || { echo "bundle-macos: no program at $binary" >&2; exit 1; }
+[ -n "$cli" ] || cli="$(dirname "$binary")/consort"
+[ -f "$cli" ] || { echo "bundle-macos: no consort program at $cli. Build it with cargo build -p consort-cli, or name it with --cli" >&2; exit 1; }
 
 icon="design/logo/icons/Consort.icns"
 [ -f "$icon" ] || scripts/make-icons.sh
@@ -141,6 +153,10 @@ licenses="${app}/Contents/Resources/licenses"
 mkdir -p "$licenses"
 cp docs/dictation-licenses.md "$licenses/dictation-licenses.md"
 helpers=()
+mkdir -p "${app}/Contents/Helpers"
+cp "$cli" "${app}/Contents/Helpers/consort"
+chmod 755 "${app}/Contents/Helpers/consort"
+helpers+=("${app}/Contents/Helpers/consort")
 if [ -n "${CONSORT_SPEECH_ENGINE:-}" ]; then
   engine_dir="${app}/Contents/Helpers/sayso-engine"
   mkdir -p "$engine_dir"

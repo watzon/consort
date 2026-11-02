@@ -13,9 +13,18 @@ pub const TUTTI: &str = "Tutti";
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ViewState {
     pub connection: Connection,
+    /// The link is down and the hub address is on Tailscale.
+    pub tailnet_notice: Option<crate::reach::TailnetNotice>,
     /// Set while the hub cannot be reached and the screen shows saved data.
     /// See [`crate::offline`].
     pub saved_data: Option<crate::offline::SavedData>,
+    /// The versions of the hub, from the last time it answered in this run.
+    /// The updater reads them to hold an update that cannot talk to this hub.
+    pub hub_versions: Option<consort_proto::error::HubVersions>,
+    /// What the setup gate reads about the hub. See [`crate::setup`].
+    pub hub_setup: crate::setup::HubFacts,
+    /// The address of the paired hub. Empty when no hub is paired.
+    pub hub_url: String,
     pub user: UserView,
     pub sidebar: SidebarView,
     /// Every channel, Tutti first.
@@ -173,6 +182,16 @@ impl ViewState {
             .iter()
             .find(|a| a.channel_id == channel_id)
             .map(|a| a.activity.clone())
+            .unwrap_or_default()
+    }
+
+    /// The mark state from the work of this channel alone. Idle when nothing
+    /// is known.
+    pub fn own_mark(&self, channel_id: &str) -> crate::activity::MarkState {
+        self.activity
+            .iter()
+            .find(|a| a.channel_id == channel_id)
+            .map(|a| a.own_state)
             .unwrap_or_default()
     }
 
@@ -430,14 +449,60 @@ pub enum Connection {
     Refused {
         reason: String,
     },
+    /// The hub and this app have no common protocol version. The pairing is
+    /// good: the saved data and the outbox stay, and the client tries again
+    /// after `retry_in_ms`, until one side is updated.
+    Incompatible {
+        /// The side that must update.
+        too_old: consort_proto::frame::TooOld,
+        /// What the hub said about itself. A hub from before that field says
+        /// nothing.
+        hub: Option<consort_proto::error::HubVersions>,
+        /// The version of this app.
+        app_version: String,
+        retry_in_ms: u64,
+    },
     /// Mock data, with no hub.
     Demo,
+}
+
+impl Connection {
+    /// The app is paired and the hub cannot serve it now. Messages wait in
+    /// the outbox.
+    pub fn is_hub_down(&self) -> bool {
+        matches!(
+            self,
+            Connection::Offline { .. } | Connection::Incompatible { .. }
+        )
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct UserView {
     pub name: String,
     pub initials: String,
+}
+
+impl UserView {
+    /// The view of a name. The initials are the first letter of the first two
+    /// words, or the first two letters of one word.
+    pub fn from_name(name: &str) -> Self {
+        let name = name.trim();
+        let mut words = name.split_whitespace();
+        let first = words.next().unwrap_or_default();
+        let initials: String = match words.next() {
+            Some(second) => first
+                .chars()
+                .take(1)
+                .chain(second.chars().take(1))
+                .collect(),
+            None => first.chars().take(2).collect(),
+        };
+        Self {
+            name: name.to_owned(),
+            initials: initials.to_uppercase(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -569,6 +634,8 @@ impl Isolation {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ChannelView {
+    /// What the channel lets a command do. See ADR 0019.
+    pub command_rules: Vec<consort_proto::model::CommandRule>,
     pub id: String,
     pub kind: ChannelKind,
     pub name: String,
@@ -691,6 +758,9 @@ pub struct NoticeView {
     pub fallback: Option<crate::fallback::FallbackNoticeView>,
     /// For a `monid_call` notice: the row of the call.
     pub monid: Option<Box<crate::monid::MonidCallRowView>>,
+    /// For a `visual` notice that has its page: the visual. A `visual`
+    /// notice with no page has `None`, and shows as a plain notice.
+    pub visual: Option<crate::visual::VisualView>,
 }
 
 /// The memory saved line: the assistant saved a memory note. The timeline
@@ -1111,6 +1181,10 @@ pub enum PostBody {
         fallback: Option<Box<crate::fallback::FallbackNoticeView>>,
         /// For a `monid_call` notice.
         monid: Option<Box<crate::monid::MonidCallRowView>>,
+        /// For a `visual` notice that has its page. The same view as
+        /// `NoticeView::visual`. The post has no attachment row for the
+        /// page.
+        visual: Option<Box<crate::visual::VisualView>>,
     },
     /// The files attached to the post.
     Attachments(Vec<crate::files::AttachmentView>),
@@ -1673,6 +1747,10 @@ pub struct WorkerView {
     pub list_detail: String,
     /// The status line in the Settings detail.
     pub status_line: String,
+    /// The version of the program that the worker runs.
+    pub version: String,
+    /// Where the update of the worker is, when one runs.
+    pub update: Option<crate::versions::WorkerUpdateView>,
     /// The user tags, set in a client.
     pub tags: Vec<String>,
     /// The tags that the worker found itself, such as `macos` or `ram-32gb`.
@@ -1756,8 +1834,14 @@ pub fn provider_sections(host: &WorkerView) -> Vec<ProviderSection> {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PairingCodeView {
     pub code: String,
+    /// The address that a new worker can use.
     pub hub_url: String,
+    /// The pin of a hub on This network. The install command holds it.
+    pub tls_sha256: Option<consort_proto::model::Sha256Hash>,
     pub expires_at: i64,
+    /// The hub has only an address on its own computer, so a worker on another
+    /// computer cannot use this code.
+    pub loopback_only: bool,
 }
 
 #[cfg(test)]
@@ -1818,5 +1902,18 @@ mod provider_section_tests {
         assert_eq!(names, ["Claude Code", "Codex", "Amp"]);
         assert_eq!(sections[0].accounts.len(), 1);
         assert!(sections[2].tool.is_none());
+    }
+}
+
+#[cfg(test)]
+mod first_conversation_tests {
+    use super::UserView;
+
+    #[test]
+    fn the_initials_come_from_two_words_or_from_one() {
+        assert_eq!(UserView::from_name("Chris Watson").initials, "CW");
+        assert_eq!(UserView::from_name("Chris").initials, "CH");
+        assert_eq!(UserView::from_name("  Ada  ").name, "Ada");
+        assert_eq!(UserView::from_name("").initials, "");
     }
 }

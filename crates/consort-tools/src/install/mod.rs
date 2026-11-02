@@ -16,6 +16,7 @@
 //! ones.
 
 mod archive;
+mod chrome;
 mod http;
 mod signature;
 mod sources;
@@ -35,6 +36,7 @@ use crate::config::{CLAUDE_DISABLE_AUTOUPDATER, OPENCODE_DISABLE_AUTOUPDATE};
 use crate::registry::{BinaryTarget, PackageDistribution, Registry};
 use crate::{Installed, LaunchSpec, Platform, ToolError, ToolId, ToolState, ToolStatus};
 
+pub use chrome::{ChromeFile, ChromePin};
 pub use sources::Sources;
 
 use http::Http;
@@ -66,11 +68,15 @@ pub struct ToolStoreOptions {
     pub npm_program: Option<PathBuf>,
     /// The armored OpenPGP public key that signs the Claude Code manifest.
     pub claude_signing_key: String,
+    /// The pinned version, sizes and hashes of the preview browser. Tests
+    /// replace it with the files of a local server.
+    pub chrome: ChromePin,
 }
 
 impl ToolStoreOptions {
     /// The options for this machine: the detected platform, the public
-    /// sources and the embedded Claude Code key.
+    /// sources, the embedded Claude Code key and the pinned preview
+    /// browser.
     pub fn detect() -> Result<Self, ToolError> {
         let platform = Platform::current().ok_or_else(|| ToolError::UnknownPlatform {
             os: std::env::consts::OS.to_owned(),
@@ -81,6 +87,7 @@ impl ToolStoreOptions {
             sources: Sources::default(),
             npm_program: None,
             claude_signing_key: signature::CLAUDE_CODE_KEY.to_owned(),
+            chrome: ChromePin::pinned(),
         })
     }
 }
@@ -284,6 +291,8 @@ impl ToolStore {
             ToolId::Codex => self.codex_latest().await?,
             ToolId::OpenCode => self.opencode_latest().await?,
             ToolId::GeminiCli => self.npm_latest(GEMINI_CLI_PACKAGE).await?,
+            // The pinned version. An update check makes no request for it.
+            ToolId::ChromeHeadlessShell => self.chrome_latest(),
             ToolId::Acp(id) => {
                 let registry = self.registry().await?;
                 let agent = registry
@@ -403,6 +412,7 @@ impl ToolStore {
                     .await
             }
             ToolId::Codex => self.stage_codex(version, scratch).await,
+            ToolId::ChromeHeadlessShell => self.stage_chrome_headless_shell(version, scratch).await,
             ToolId::OpenCode => {
                 let registry = self.registry().await?;
                 let agent = registry.agent(OPENCODE_REGISTRY_ID).ok_or_else(|| {
@@ -653,6 +663,9 @@ impl ToolStore {
                     &dir.join("node_modules/@google/gemini-cli/bundle/gemini.js"),
                 ));
                 spec.args.push("--acp".to_owned());
+            }
+            ToolId::ChromeHeadlessShell => {
+                spec.program = dir.join(chrome::program_name(platform));
             }
             ToolId::OpenCode | ToolId::Acp(_) => {
                 let record = read_launch_record(dir)?;

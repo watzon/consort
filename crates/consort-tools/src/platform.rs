@@ -150,6 +150,22 @@ impl Platform {
         format!("codex-package-{}.tar.gz", self.codex_triple())
     }
 
+    /// The platform name of the Chrome for Testing builds, such as
+    /// `mac-arm64`, `linux64` or `win64`, or `None` when there is no build.
+    ///
+    /// The Linux builds link glibc, so musl Linux has none. Windows on Arm
+    /// uses the x64 build, which Windows runs in emulation.
+    pub fn chrome_platform(&self) -> Option<&'static str> {
+        match (self.os, self.arch, self.libc) {
+            (Os::Macos, Arch::Arm64, _) => Some("mac-arm64"),
+            (Os::Macos, Arch::X64, _) => Some("mac-x64"),
+            (Os::Linux, Arch::X64, Libc::System) => Some("linux64"),
+            (Os::Linux, Arch::Arm64, Libc::System) => Some("linux-arm64"),
+            (Os::Linux, _, Libc::Musl) => None,
+            (Os::Windows, _, _) => Some("win64"),
+        }
+    }
+
     /// The platform key of an ACP registry `binary` distribution, such as
     /// `darwin-aarch64`. The registry has no musl keys, so musl Linux uses
     /// the same key as glibc Linux.
@@ -293,6 +309,25 @@ mod tests {
             assert_eq!(platform.codex_asset(), row.3, "{platform}");
             assert_eq!(platform.registry_key(), row.4, "{platform}");
             assert_eq!(platform.exe_suffix(), row.5, "{platform}");
+        }
+    }
+
+    #[test]
+    fn chrome_platforms() {
+        let expected = [
+            ("macos-arm64", Some("mac-arm64")),
+            ("macos-x64", Some("mac-x64")),
+            ("linux-x64", Some("linux64")),
+            ("linux-arm64", Some("linux-arm64")),
+            ("linux-x64-musl", None),
+            ("linux-arm64-musl", None),
+            ("windows-x64", Some("win64")),
+            ("windows-arm64", Some("win64")),
+        ];
+        assert_eq!(expected.len(), Platform::ALL.len());
+        for (platform, (name, chrome)) in Platform::ALL.iter().zip(expected) {
+            assert_eq!(platform.to_string(), name);
+            assert_eq!(platform.chrome_platform(), chrome, "{platform}");
         }
     }
 

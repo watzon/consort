@@ -504,6 +504,10 @@ impl ConsortApp {
                     div(),
                 ),
             },
+            Dialog::RestartWithTasks
+            | Dialog::LocalRemove
+            | Dialog::LocalMove
+            | Dialog::LocalConnectOther => self.local_dialog(dialog, t, cx),
             Dialog::Routine(_) => self.routine_dialog(t, window, cx),
             Dialog::ConfirmDeleteRoutine(id) => self.confirm_delete_routine_dialog(id, t, cx),
             Dialog::NewNote(_) | Dialog::RenameNote(..) | Dialog::ConfirmDeleteNote(..) => {
@@ -521,6 +525,7 @@ impl ConsortApp {
             Dialog::NewChannel
             | Dialog::NewTask
             | Dialog::ChannelSettings(_)
+            | Dialog::Permissions(_)
             | Dialog::RenameGroup(_)
             | Dialog::ConfirmDeleteGroup(_)
             | Dialog::ConfirmDeleteTask(_)

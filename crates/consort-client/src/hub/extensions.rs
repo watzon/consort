@@ -372,6 +372,15 @@ pub(super) async fn run(
                     name,
                     use_in: changes.use_in.as_ref().map(use_in_proto).transpose()?,
                     approvals: changes.approvals.as_ref().map(approvals_proto),
+                    tool_exceptions: changes.tool_exceptions.map(|list| {
+                        list.into_iter()
+                            .map(|e| consort_proto::model::ToolException {
+                                tool: e.tool,
+                                rule: rule_proto(e.rule),
+                            })
+                            .collect()
+                    }),
+                    assistant_owned: changes.assistant_owned,
                 })
                 .await?;
             if let Ok(mut cache) = shared.cache.lock() {

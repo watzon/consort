@@ -372,7 +372,7 @@ fn the_light_box_opens_steps_and_closes(cx: &mut TestAppContext) {
     assert!(has(cx, "lightbox-image") && has(cx, "lightbox-count"));
     app.read_with(cx, |app, _| {
         let lb = app.lightbox.as_ref().expect("open");
-        assert_eq!((lb.index, lb.images.len()), (0, 2));
+        assert_eq!((lb.index, lb.items.len()), (0, 2));
     });
     let next = bounds(cx, "lightbox-next");
     cx.simulate_click(next.center(), Modifiers::default());

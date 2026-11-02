@@ -3,9 +3,10 @@
 use crate::*;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use sayso_sdk::cleanup::{CleanError, Cleaner, CleanupRequest, CleanupResponse};
-use sayso_sdk::{
-    DownloadProgress, EngineError, EngineEvent, EngineModels, MicFeed, Microphone, ModelId,
-    ModelInfo, ModelState, Role, Segment, SpeechEngine, SpeechPart, Turn,
+use sayso_sdk::embedded::{
+    AudioFeed, CapturedAudio, DownloadProgress, EngineError, EngineEvent, EngineModels, FeedItem,
+    Microphone, ModelId, ModelInfo, ModelState, OpenError, Role, Segment, SpeechEngine, SpeechPart,
+    Turn,
 };
 use std::path::Path;
 use std::sync::Arc;
@@ -170,18 +171,19 @@ impl EngineModels for Fake {
 /// A microphone that plays the audio of a test.
 #[derive(Default)]
 struct Mic {
-    frames: Mutex<Option<Sender<Vec<f32>>>>,
+    frames: Mutex<Option<Sender<FeedItem>>>,
 }
 
 struct MicHandle(Arc<Mic>);
 
 impl Microphone for MicHandle {
-    fn open(&self) -> Result<MicFeed, String> {
-        let (tx, frames) = unbounded();
+    fn open(&self) -> Result<AudioFeed, OpenError> {
+        let (tx, items) = unbounded();
         *self.0.frames.lock().unwrap() = Some(tx);
-        Ok(MicFeed {
-            frames,
+        Ok(AudioFeed {
+            items,
             lease: Box::new(Lease(self.0.clone())),
+            excludes: Vec::new(),
         })
     }
 }
@@ -201,7 +203,8 @@ impl Mic {
         let guard = self.frames.lock().unwrap();
         let tx = guard.as_ref().expect("the microphone is open");
         for chunk in samples.chunks(320) {
-            tx.send(chunk.to_vec()).unwrap();
+            tx.send(FeedItem::Audio(CapturedAudio::untimed(chunk.to_vec())))
+                .unwrap();
         }
     }
 }

@@ -1,24 +1,34 @@
-//! The first-launch screen: connect to a hub with its URL and a setup code.
+//! S1 (Paper `S65-0`): connect to a hub with its address and a setup code. A
+//! client that the hub refused pairs again here. A pasted pairing link holds the
+//! code too.
 
 use consort_client::Connection;
-use consort_theme::{Tokens, TypeExt as _};
+use consort_client::setup::Dabs;
+use consort_theme::Tokens;
 use gpui_kit::{
-    AnyElement, Context, Focusable as _, InteractiveElement, IntoElement, ParentElement,
-    SharedString, StatefulInteractiveElement as _, Styled, Window, div,
-    prelude::FluentBuilder as _,
+    AnyElement, Context, Focusable as _, InteractiveElement as _, ParentElement, SharedString,
+    StatefulInteractiveElement as _, Styled, Window, div, prelude::FluentBuilder as _,
 };
 
 use crate::{
-    app::{ConsortApp, Field},
-    ui::window_controls::DragArea as _,
+    app::{ConsortApp, Field, Page},
     ui::{
-        dialogs::input_box,
-        parts::{ButtonKind, button, detail, error_box, text},
+        parts::{ButtonKind, detail, error_box, text},
+        setup::{SetupStep, failure_card, link_button, setup_button, setup_frame, setup_heading},
     },
 };
 
 impl ConsortApp {
+    /// Shows why a pairing failed, with the words of the design.
+    pub fn show_pair_error(&mut self, err: &consort_client::ClientError, cx: &mut Context<Self>) {
+        let (title, detail) = consort_client::setup::pair_failure(err);
+        self.onboarding.error_title = title;
+        self.onboarding.error = Some(detail);
+        cx.notify();
+    }
+
     pub fn connect(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.onboarding.error_title = None;
         let url = self.field(Field::HubUrl, cx);
         let code = self.field(Field::SetupCode, cx);
         if url.is_empty() {
@@ -27,7 +37,8 @@ impl ConsortApp {
             cx.notify();
             return;
         }
-        if code.is_empty() {
+        // A pasted pairing link holds the code too.
+        if code.is_empty() && !consort_client::reach::is_invite_text(&url) {
             self.onboarding.error = Some(
                 "Enter the setup code. The hub prints it when it starts for the first time.".into(),
             );
@@ -43,8 +54,11 @@ impl ConsortApp {
             let _ = this.update(cx, |this, cx| {
                 this.onboarding.busy = false;
                 match result {
-                    Ok(()) => this.page = crate::app::Page::Main,
-                    Err(err) => this.onboarding.error = Some(err.to_string()),
+                    Ok(()) => {
+                        this.page = crate::app::Page::Main;
+                        this.follow_setup(cx);
+                    }
+                    Err(err) => this.show_pair_error(&err, cx),
                 }
                 cx.notify();
             });
@@ -90,98 +104,112 @@ impl ConsortApp {
                 "Connecting",
             )
         };
-        let field = |label: &str, input, hint: &str| {
+        let label = |value: &'static str| text(value, t.text.label, c.text_secondary);
+        let field = |input: &gpui_kit::Entity<gpui_kit::component::input::InputState>, focused| {
             div()
                 .flex()
-                .flex_col()
-                .gap(t.space.xs + t.space.xxs)
-                .child(text(label.to_owned(), t.text.label, c.text_secondary))
-                .child(input)
-                .child(text(hint.to_owned(), detail(t), c.text_tertiary))
+                .items_center()
+                .h(t.component.setup_field)
+                .px(t.space.md)
+                .bg(c.surface_card)
+                .border(t.border_width)
+                .border_color(if focused {
+                    c.accent_text
+                } else {
+                    c.border_strong
+                })
+                .rounded(t.radius.lg)
+                .font_family(t.font_mono.clone())
+                .child(crate::ui::parts::input(input, t.text.ui).flex_1().min_w_0())
         };
+        let block = |d: gpui_kit::Div| d.flex().flex_col().gap(t.space.xs + t.space.xxs);
         let form = div()
             .flex()
             .flex_col()
-            .gap(t.space.xl)
-            .w(t.layout.panel_width + t.space.page)
+            .child(setup_heading(title, intro, t))
             .child(
-                div()
-                    .flex()
-                    .items_center()
-                    // The wordmark: the mark is 1.2 times the font size high,
-                    // with a gap of 0.35 times the font size.
-                    .gap(t.component.brand_gap)
-                    .child(crate::ui::mark::still_mark(t.component.brand_mark, t))
-                    .child(
-                        div()
-                            .text_size(t.text.heading.size)
-                            .font_weight(t.text.heading.weight)
-                            .text_color(c.text_primary)
-                            .child("consort"),
-                    ),
+                block(div().pt(t.space.xxl))
+                    .child(label("Hub address"))
+                    .child(field(&self.inputs.hub_url, url_focused)),
             )
             .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(t.space.sm)
-                    .child(text(title, t.text.display, c.text_primary))
-                    .child(text(intro, t.text.body, c.text_secondary)),
+                block(div().pt(t.space.lg))
+                    .child(label("Setup code"))
+                    .child(field(&self.inputs.setup_code, code_focused))
+                    .child(text(
+                        "The hub prints this code when it starts for the first time. Another paired app can also make one.",
+                        detail(t),
+                        c.text_tertiary,
+                    )),
             )
-            .child(field(
-                "Hub URL",
-                input_box(&self.inputs.hub_url, url_focused, t),
-                "The address of the server that runs consort hub.",
-            ))
-            .child(field(
-                "Setup code",
-                input_box(&self.inputs.setup_code, code_focused, t),
-                "The hub prints this code when it starts for the first time. A paired app can also make one.",
-            ))
             .when_some(self.onboarding.error.clone(), |d, err| {
                 // The error is selectable, so the user can copy it.
-                d.child(error_box(
-                    SharedString::from(format!("onboarding-error-{err}")),
-                    err,
-                    t,
-                ))
+                let id = SharedString::from(format!("onboarding-error-{err}"));
+                let error = match self.onboarding.error_title.clone() {
+                    Some(title) => failure_card("onboarding-error-title", title, err, None, t),
+                    None => error_box(id, err, t),
+                };
+                d.child(div().pt(t.space.lg).child(error))
             })
             .child(
-                div().flex().child(
-                    button("connect", if busy { action_busy } else { action }, ButtonKind::Primary, t)
-                        .px(t.space.xl)
-                        .when(busy, |b| b.opacity(t.opacity.busy))
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            if !this.onboarding.busy {
-                                this.connect(window, cx)
-                            }
-                        })),
-                ),
-            );
-        div()
-            .id("onboarding")
-            .size_full()
-            .flex()
-            .flex_col()
-            .bg(c.surface_canvas)
-            .child(
                 div()
-                    .h(t.space.xxl + t.space.md)
-                    .w_full()
-                    .flex_none()
-                    .drag_area(),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
                     .flex()
+                    .flex_wrap()
                     .items_center()
-                    .justify_center()
-                    .pb(t.space.page)
-                    .type_style(t.text.ui)
-                    .child(form),
-            )
-            .into_any_element()
+                    .justify_between()
+                    .gap(t.space.sm)
+                    .pt(t.component.setup_gap)
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap(t.space.sm)
+                            .child(
+                                setup_button(
+                                    "connect",
+                                    if busy { action_busy } else { action },
+                                    ButtonKind::Primary,
+                                    t,
+                                )
+                                .when(busy, |b| b.opacity(t.opacity.busy))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    if !this.onboarding.busy {
+                                        this.connect(window, cx)
+                                    }
+                                })),
+                            )
+                            // Back is not drawn in Paper. The plan asks for it.
+                            .when(!refused, |d| {
+                                d.child(
+                                    setup_button(
+                                        "connect-back",
+                                        "Back",
+                                        ButtonKind::Secondary,
+                                        t,
+                                    )
+                                    .debug_selector(|| "connect-back".into())
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.onboarding.error = None;
+                                        this.onboarding.error_title = None;
+                                        this.setup.step = SetupStep::Start;
+                                        this.page = Page::Setup;
+                                        cx.notify();
+                                    })),
+                                )
+                            }),
+                    )
+                    .when(!refused, |d| {
+                        d.child(
+                            link_button("connect-no-hub", "I do not have a hub yet", t)
+                                .debug_selector(|| "connect-no-hub".into())
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.setup.step = SetupStep::Server;
+                                    this.page = Page::Setup;
+                                    cx.notify();
+                                })),
+                        )
+                    }),
+            );
+        setup_frame("onboarding", "onboarding", Dabs::Hub, form, t)
     }
 }

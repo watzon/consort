@@ -8,8 +8,10 @@
 #   consort (the CLI: hub, worker and the rest) for macOS arm64 and x86_64,
 #     Linux x86_64 and arm64, and Windows x86_64
 #   the desktop app: Consort.app (zip and dmg) for macOS, a zip for Windows,
-#     a tarball for Linux x86_64
-# It writes SHA256SUMS for every file and attaches all of them to the release.
+#     a tarball for Linux x86_64. Each one carries the consort program, for a
+#     hub on the same computer.
+# It writes release.json (the version and its protocol versions), and
+# SHA256SUMS for every file, and attaches all of them to the release.
 # The install scripts (scripts/install/) and the app updater read these names
 # and the checksum file, so change names in one place only after you change
 # them there.
@@ -166,12 +168,13 @@ jobs:
           key: desktop-windows
       - name: Build
         shell: bash
-        run: cargo build --release --locked -p consort-desktop
+        run: cargo build --release --locked -p consort-desktop -p consort-cli
       - name: Package
         shell: bash
         run: |
           mkdir -p out stage/Consort
           cp target/release/consort-desktop.exe stage/Consort/
+          cp target/release/consort.exe stage/Consort/
           cp design/logo/icons/app-icon-256.png stage/Consort/consort.png
           (cd stage && 7z a "../out/Consort-desktop-windows-x86_64.zip" Consort)
       - uses: actions/upload-artifact@v4
@@ -195,11 +198,12 @@ jobs:
         with:
           key: desktop-linux
       - name: Build
-        run: cargo build --release --locked -p consort-desktop
+        run: cargo build --release --locked -p consort-desktop -p consort-cli
       - name: Package
         run: |
           mkdir -p out stage/Consort
           cp target/release/consort-desktop stage/Consort/
+          cp target/release/consort stage/Consort/
           cp packaging/linux/consort.desktop stage/Consort/
           cp design/logo/icons/app-icon-256.png stage/Consort/consort.png
           tar -czf out/Consort-desktop-linux-x86_64.tar.gz -C stage Consort
@@ -222,6 +226,15 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
+      # The updater reads this file to hold an update that cannot talk to the
+      # connected hub. The program of this release writes it, so that the
+      # protocol versions cannot differ from the code.
+      - name: Write release.json
+        run: |
+          mkdir -p release-info
+          tar -xzf artifacts/consort-linux-x86_64.tar.gz -C release-info
+          "$(find release-info -type f -name consort | head -n 1)" release-info > artifacts/release.json
+          cat artifacts/release.json
       - name: Write the checksums
         working-directory: artifacts
         run: |

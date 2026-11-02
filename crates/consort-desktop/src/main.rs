@@ -28,6 +28,8 @@ mod convo;
 #[cfg(test)]
 mod convo_tests;
 mod countdown;
+#[cfg(test)]
+mod cover_tests;
 mod dictation;
 #[cfg(test)]
 mod dictation_tests;
@@ -47,6 +49,8 @@ mod fallback;
 mod fallback_tests;
 #[cfg(test)]
 mod files_tests;
+#[cfg(test)]
+mod first_run_tests;
 mod fonts;
 #[cfg(test)]
 mod icon_picker_tests;
@@ -58,6 +62,11 @@ mod knowledge_tests;
 mod layout;
 #[cfg(test)]
 mod layout_tests;
+#[cfg(test)]
+mod lightbox_tests;
+#[cfg(test)]
+mod local_hub_tests;
+mod logging;
 mod monid;
 #[cfg(test)]
 mod monid_tests;
@@ -69,17 +78,29 @@ mod notices_tests;
 mod notify_platform;
 #[cfg(test)]
 mod offline_tests;
+mod permissions;
+#[cfg(test)]
+mod permissions_tests;
 #[cfg(test)]
 mod phase5_tests;
 mod proactivity;
 #[cfg(test)]
 mod proactivity_tests;
+#[cfg(test)]
+mod reach_tests;
 mod read_marker;
+#[cfg(test)]
+mod setup_tests;
 #[cfg(test)]
 mod tasks_tests;
 #[cfg(test)]
 mod test_support;
 mod ui;
+#[cfg(test)]
+mod versions_tests;
+mod visual;
+#[cfg(test)]
+mod visual_tests;
 mod voice;
 #[cfg(test)]
 mod voice_tests;
@@ -117,8 +138,15 @@ actions!(consort, [Quit]);
 /// settings-routines, memory, memory-conflict, settings-memory,
 /// memory-history, memory-deleted, routines-empty, memory-empty,
 /// schedule-interval, schedule-once, schedule-once-past and
-/// schedule-cron. The old names `everything` and
-/// `everything-manages` still work. `--light` and `--dark` set
+/// schedule-cron. Versions: hub-too-old, app-too-old, update-held,
+/// hub-update, pair-too-old and workers-updating. Reach: reach-off, reach-on,
+/// reach-states, reach-unreachable, pair-client-loopback and
+/// add-worker-loopback. A hub on this computer: local-install, local-windows,
+/// local-bubblewrap, local-failed, local-found, local-stopped, hub-local,
+/// hub-local-remove, hub-local-move, hub-local-connect and restart-tasks. The
+/// setup: every name in `consort_client::mock_local::SETUP_SCREENS`. The
+/// old names `everything`
+/// and `everything-manages` still work. `--light` and `--dark` set
 /// the mode, and `--theme <name>` the theme.
 #[derive(Clone, Debug, Default)]
 pub struct Args {
@@ -160,6 +188,7 @@ fn parse_args() -> Args {
 }
 
 fn main() {
+    logging::init();
     let args = parse_args();
     let mock = args.mock;
     let client = if mock
@@ -231,6 +260,38 @@ fn main() {
             .and_then(consort_client::mock_voice::screen_state)
     {
         // The phase 4c screens: write in my voice.
+        Client::mock_with(state)
+    } else if mock
+        && let Some(state) = args
+            .screen
+            .as_deref()
+            .and_then(consort_client::mock_reach::screen_state)
+    {
+        // The reach screens: how other devices get to the hub.
+        Client::mock_with(state)
+    } else if mock
+        && let Some(state) = args
+            .screen
+            .as_deref()
+            .and_then(consort_client::mock_first::screen_state)
+    {
+        // The first conversation in Tutti.
+        Client::mock_with(state)
+    } else if mock
+        && let Some(state) = args
+            .screen
+            .as_deref()
+            .and_then(consort_client::mock_versions::screen_state)
+    {
+        // The version screens: a hub or an app that is too old.
+        Client::mock_with(state)
+    } else if mock
+        && let Some(state) = args
+            .screen
+            .as_deref()
+            .and_then(consort_client::mock_local::screen_state)
+    {
+        // A hub on this computer: its install, its settings and its restart.
         Client::mock_with(state)
     } else if mock {
         Client::mock()

@@ -21,6 +21,12 @@ workspace = true
 
 [dependencies]
 consort-proto = { workspace = true }
+consort-tls = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+rcgen = { workspace = true }
+tower-service = { workspace = true }
+gethostname = { workspace = true }
 # Default features off: the registry types only, with no installer.
 consort-tools = { workspace = true }
 serde = { workspace = true }
@@ -54,6 +60,8 @@ tempfile = { workspace = true }
 rustix = { workspace = true }
 
 [dev-dependencies]
+consort-client = { workspace = true }
+consort-link = { workspace = true }
 consort-harness = { workspace = true }
 consort-session-host = { workspace = true }
 consort-testkit = { workspace = true }

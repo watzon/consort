@@ -589,6 +589,8 @@ impl ConsortApp {
             cx,
         );
 
+        // The fades of the list: the bottom one starts `sm` below the list.
+        let (top_fade, bottom_fade) = (t.space.xl, t.space.xxl - t.space.sm);
         let fade = |top: bool| {
             let (from, to, angle) = (
                 c.surface_sidebar,
@@ -696,6 +698,19 @@ impl ConsortApp {
                     .flex_1()
                     .min_w_0()
                     .min_h_0()
+                    // The clear part of the thread for the cover rule of
+                    // visuals: below the top fade and above the bottom
+                    // fade. It comes before the list, so it prepaints first.
+                    .child(self.visuals.frame.area_probe(
+                        crate::visual::Place::Thread,
+                        move |viewport| {
+                            crate::ui::visual_cover::TimelineArea::new(
+                                viewport,
+                                top_fade,
+                                Some(bottom_fade),
+                            )
+                        },
+                    ))
                     .child(posts)
                     .child(fade(true))
                     .child(fade(false)),
@@ -916,7 +931,7 @@ impl ConsortApp {
         &mut self,
         post: &ThreadPost,
         t: &Tokens,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let c = &t.colors;
@@ -1009,6 +1024,21 @@ impl ConsortApp {
                         cx,
                     ))
                     .into_any_element(),
+                // A visual, as it is in the timeline.
+                PostBody::Notice {
+                    visual: Some(visual),
+                    ..
+                } => div()
+                    .flex()
+                    .w_full()
+                    .child(self.render_visual_item(
+                        visual,
+                        crate::visual::Place::Thread,
+                        t,
+                        window,
+                        cx,
+                    ))
+                    .into_any_element(),
                 // A paid call, as it is in the timeline.
                 PostBody::Notice {
                     monid: Some(row), ..
@@ -1077,11 +1107,7 @@ impl ConsortApp {
         }
         if post.pending {
             col = col.child(text(
-                crate::ui::timeline::pending_text(matches!(
-                    self.state.connection,
-                    consort_client::Connection::Offline { .. }
-                ))
-                .to_owned(),
+                crate::ui::timeline::pending_text(self.state.connection.is_hub_down()).to_owned(),
                 t.text.caption,
                 c.text_tertiary,
             ));

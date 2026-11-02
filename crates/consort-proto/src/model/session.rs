@@ -207,6 +207,10 @@ pub struct CommandCheckOutcome {
     /// The error, when the check failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// What a command rule does, when a rule allowed the action and the
+    /// check did not run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_rule: Option<String>,
 }
 
 /// The payload of a `command` item.

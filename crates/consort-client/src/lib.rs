@@ -29,6 +29,7 @@ pub mod files;
 pub mod format;
 pub mod hub;
 pub mod limits;
+pub mod local_hub;
 pub mod memory;
 pub mod mock;
 pub mod mock_admin;
@@ -37,10 +38,15 @@ mod mock_backend_ext;
 pub mod mock_convo;
 pub mod mock_extensions;
 pub mod mock_files;
+pub mod mock_first;
+pub mod mock_local;
 pub mod mock_monid;
 pub mod mock_offline;
 pub mod mock_proactivity;
+pub mod mock_reach;
 pub mod mock_routines;
+pub mod mock_versions;
+pub mod mock_visual;
 pub mod mock_voice;
 pub mod monid;
 pub mod notify;
@@ -49,9 +55,11 @@ pub mod persist;
 pub mod picker;
 pub mod plan;
 pub mod proactivity;
+pub mod reach;
 pub mod reduce;
 pub mod reduce_convo;
 pub mod routines;
+pub mod setup;
 pub mod skills;
 pub mod store;
 pub mod task_model;
@@ -60,7 +68,9 @@ mod test_entities;
 pub mod turn_errors;
 pub mod update;
 pub mod uploads;
+pub mod versions;
 pub mod view;
+pub mod visual;
 pub mod voice;
 
 use std::sync::Arc;
@@ -77,7 +87,7 @@ pub use command_check::{
     CommandCheckChoice, CommandCheckView, EndpointView, TestResultView,
 };
 pub use connectors::*;
-pub use consort_proto::model::DEFAULT_CONFIDENCE_LIMIT;
+pub use consort_proto::model::{DEFAULT_CONFIDENCE_LIMIT, GuideState};
 pub use consort_proto::session_host_link::MONID_PROMPT_BLOCK;
 pub use drafts::{DraftOutcomeView, ShownDraftView, draft_title};
 pub use error::ClientError;
@@ -97,6 +107,7 @@ pub use store::Drafts;
 pub use turn_errors::{ErrorAction, ErrorCardView, TryAgainTarget, TurnErrorKindView, TurnFailed};
 pub use uploads::{UploadStatus, UploadTarget, UploadView};
 pub use view::*;
+pub use visual::{VisualImageFile, VisualView};
 
 pub(crate) type Reply = oneshot::Sender<Result<CommandOutput, ClientError>>;
 
@@ -586,6 +597,42 @@ impl Client {
         .await
     }
 
+    /// Asks for an image of a visual at `width` CSS pixels, at `scale` device
+    /// pixels per CSS pixel, in the theme of `style`. The file is in the
+    /// local blob cache. The client keeps the images it got in this run: the
+    /// same ask is answered at once, and two asks at once share one request.
+    ///
+    /// The hub may need up to 60 seconds to draw a visual that it has not
+    /// drawn before.
+    ///
+    /// - [`ClientError::Unavailable`]: no session host is online, or its
+    ///   browser is still installing. Try again later.
+    /// - `ClientError::Hub` with the code `not_found`: the message has no
+    ///   visual, or the app cannot read it.
+    pub async fn render_visual(
+        &self,
+        message_id: String,
+        width: u32,
+        scale: u8,
+        style: consort_proto::model::VisualStyle,
+    ) -> Result<VisualImageFile, ClientError> {
+        visual::check_render(width, scale, &style)?;
+        match self
+            .run_for(Command::RenderVisual {
+                message_id,
+                width,
+                scale,
+                style,
+            })
+            .await?
+        {
+            CommandOutput::VisualImage(file) => Ok(file),
+            _ => Err(ClientError::Other(
+                "Consort could not find the image of the visual. Try again".into(),
+            )),
+        }
+    }
+
     /// The Try again button of an error card.
     ///
     /// - A task retries: the hub starts a new session from the brief.
@@ -599,6 +646,7 @@ impl Client {
             TryAgainTarget::ResendMessage { channel_id, body } => {
                 self.send_message(channel_id, body).await
             }
+            TryAgainTarget::Greeting => self.run(Command::GuideTryAgain).await,
         }
     }
 
@@ -681,6 +729,18 @@ impl Client {
     /// Removes an API endpoint.
     pub async fn remove_endpoint(&self, id: String) -> Result<(), ClientError> {
         self.run(Command::RemoveEndpoint { id }).await
+    }
+
+    /// Keeps the choice Do this later of the setup on the hub, for every
+    /// client of this user.
+    pub async fn set_setup_later(&self, later: bool) -> Result<(), ClientError> {
+        self.run(Command::SetSetupLater { later }).await
+    }
+
+    /// Keeps the name of the user on the hub, for every client. Empty clears
+    /// it.
+    pub async fn set_user_name(&self, name: String) -> Result<(), ClientError> {
+        self.run(Command::SetUserName { name }).await
     }
 
     /// Replaces the fallback path: the built-in row and the steps, in

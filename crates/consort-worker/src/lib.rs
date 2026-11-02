@@ -19,11 +19,13 @@ pub mod limits;
 pub mod local_mcp;
 pub mod paths;
 pub mod process;
+pub mod self_update;
 pub mod tags;
 pub mod tools;
 pub mod workspace;
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -47,6 +49,10 @@ use crate::journal::Journal;
 use crate::limits::Limits;
 use crate::paths::PathRules;
 use crate::process::Processes;
+use crate::self_update::{SelfUpdate, Updater};
+
+/// The folder of a download of a new worker program, in the worker folder.
+const UPDATE_DIR: &str = "cache/update";
 
 /// Takes the exclusive lock on the lock file of a config folder. The lock
 /// lasts as long as the returned file is open.
@@ -75,11 +81,27 @@ pub fn lock_config_dir(dir: &Path) -> Result<std::fs::File, WorkerError> {
 pub struct WorkerConfig {
     /// The folder of the worker.
     pub config_dir: PathBuf,
+    /// How the worker replaces its program when it follows the hub. `None`
+    /// keeps the program, and the worker reports that it cannot update.
+    pub self_update: Option<SelfUpdate>,
 }
 
 /// Pairs this machine as a worker. Returns its ID.
 pub async fn pair(
     hub_url: &str,
+    code: &str,
+    config_dir: &Path,
+    name: Option<String>,
+    tags: Vec<String>,
+) -> Result<WorkerId, WorkerError> {
+    pair_pinned(hub_url, None, code, config_dir, name, tags).await
+}
+
+/// [`pair`] for a hub on This network: the worker keeps the pin, and from then
+/// on it accepts only that certificate for this hub.
+pub async fn pair_pinned(
+    hub_url: &str,
+    tls_sha256: Option<consort_proto::model::Sha256Hash>,
     code: &str,
     config_dir: &Path,
     name: Option<String>,
@@ -98,10 +120,16 @@ pub async fn pair(
         os: Os::from_std_os(std::env::consts::OS).unwrap_or(Os::Linux),
         arch: std::env::consts::ARCH.to_owned(),
         name: name.clone(),
+        protocol_versions: consort_proto::frame::SUPPORTED_PROTOCOL_VERSIONS.to_vec(),
     };
-    let worker_id = http::pair_machine(hub_url, PAIR_WORKER_PATH, &request).await?;
+    let hub = http::HubRef {
+        url: hub_url,
+        tls_sha256: tls_sha256.as_ref(),
+    };
+    let worker_id = http::pair_machine(hub, PAIR_WORKER_PATH, &request).await?;
     let mut toml = WorkerToml::load(config_dir)?;
     toml.hub_url = Some(http::base_url(hub_url));
+    toml.tls_sha256 = tls_sha256;
     toml.worker_id = Some(worker_id);
     if name.is_some() {
         toml.name = name;
@@ -158,6 +186,15 @@ impl WorkerHandle {
         .unwrap_or(false)
     }
 
+    /// Waits until the worker has a new program and no work runs. The caller
+    /// then shuts down this worker and starts the program again.
+    pub async fn restart_requested(&self) {
+        let mut restart = self.core.updater.restart_requested();
+        if restart.wait_for(|asked| *asked).await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
+
     /// Stops the worker. The processes go on, and the next run finds them.
     pub async fn shutdown(self) -> Result<(), WorkerError> {
         let _ = self.shutdown.send(true);
@@ -176,7 +213,7 @@ impl WorkerHandle {
 
 /// Runs the worker until [`WorkerHandle::shutdown`].
 pub async fn run(config: WorkerConfig) -> Result<WorkerHandle, WorkerError> {
-    let dir = config.config_dir;
+    let dir = config.config_dir.clone();
     let toml = WorkerToml::load(&dir)?;
     let (Some(hub_url), Some(worker_id)) = (toml.hub_url.clone(), toml.worker_id) else {
         return Err(WorkerError::NotPaired);
@@ -214,6 +251,8 @@ pub async fn run(config: WorkerConfig) -> Result<WorkerHandle, WorkerError> {
         channel_copies: tokio::sync::Mutex::default(),
         toml: toml.clone(),
         limits: limits.clone(),
+        updater: Arc::new(Updater::new(config.self_update, dir.join(UPDATE_DIR))),
+        in_flight: AtomicUsize::new(0),
     });
     let exec = Arc::new(Exec::new(
         journal,

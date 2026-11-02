@@ -5,8 +5,9 @@
 //! routines in SQLite, serves clients and workers over HTTP and WebSocket,
 //! and asks workers to run sessions.
 //!
-//! TLS is not part of the hub yet. Run it behind a reverse proxy or on a
-//! tailnet.
+//! The main listener has no TLS. Run it behind a reverse proxy or on a tailnet
+//! (see [`reach`]). This network adds a second listener with a self-signed
+//! certificate and a pin.
 //!
 //! The public API is [`serve`], [`create_setup_code`], [`HubConfig`],
 //! [`HubHandle`], [`HubError`], and the [`admin`] commands that list and
@@ -19,6 +20,7 @@ mod api;
 mod approval_engine;
 mod backup;
 mod command_check;
+mod command_rules;
 mod connectors;
 mod coordinator;
 mod error;
@@ -33,6 +35,7 @@ mod ops;
 mod placement;
 mod proactivity;
 mod prompts;
+pub mod reach;
 mod schedule;
 mod scheduler;
 mod skills;
@@ -46,6 +49,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use consort_proto::auth::PAIRING_CODE_TTL_MS;
+use consort_proto::release::InstallKind;
 use consort_proto::time::Timestamp;
 use tokio::task::JoinHandle;
 
@@ -66,6 +70,17 @@ pub struct HubConfig {
     /// `https://hub.example.com`. Peers sign its origin when they connect, so
     /// it must match what they use. The default is `http://{listen}`.
     pub public_url: Option<String>,
+    /// How the hub was installed. `hub.status` reports it, and the app shows
+    /// the update command for it. The `consort` program reads it from
+    /// [`InstallKind::ENV_VAR`].
+    pub install_kind: InstallKind,
+    /// A development hub may change its reach, as a hub of the kind
+    /// [`InstallKind::Local`] may. Any other hub only reports it.
+    pub dev: bool,
+    /// The first sign-in wakes the assistant for its greeting (Paper T1). A
+    /// test that connects a fake session host with a signed-in account turns
+    /// this off, so its first coordinator turn is its own.
+    pub first_greeting: bool,
 }
 
 /// A running hub.
@@ -116,8 +131,26 @@ pub fn create_session_host_code(data_dir: &Path) -> Result<String> {
 /// Starts a hub. It returns when the hub listens.
 ///
 /// While no client is paired, the hub makes a setup code and logs it at info
-/// level. [`HubHandle::setup_code`] returns it too.
+/// level. [`HubHandle::setup_code`] returns it too. A hub of the kind
+/// [`InstallKind::Local`] makes none: its log stays free of codes, and the app
+/// gets a code from `consort local setup-code`.
 pub async fn serve(config: HubConfig) -> Result<HubHandle> {
+    serve_inner(config, None).await
+}
+
+/// Starts a hub that uses this program in place of the `tailscale` program.
+/// Tests use it, so that a test never touches the tailnet of the computer.
+pub async fn serve_with_tailscale(
+    config: HubConfig,
+    program: std::sync::Arc<dyn reach::TailscaleProgram>,
+) -> Result<HubHandle> {
+    serve_inner(config, Some(program)).await
+}
+
+async fn serve_inner(
+    config: HubConfig,
+    program: Option<std::sync::Arc<dyn reach::TailscaleProgram>>,
+) -> Result<HubHandle> {
     let listener = tokio::net::TcpListener::bind(config.listen)
         .await
         .map_err(|err| {
@@ -151,12 +184,26 @@ pub async fn serve(config: HubConfig) -> Result<HubHandle> {
             config.data_dir.display()
         ))
     })?;
-    let hub = Hub::open(&config.data_dir, public_url.clone()).await?;
+    let hub = Hub::open(
+        &config.data_dir,
+        public_url.clone(),
+        config.install_kind,
+        config.first_greeting,
+    )
+    .await?;
+    if let Some(program) = program {
+        hub.reach.set_program(program);
+    }
+    hub.start_reach(
+        local_addr,
+        reach::may_change(config.install_kind, config.dev),
+    )
+    .await?;
 
     let has_client = hub.store.read(machine::active_client_count).await? > 0;
     if has_client {
         hub.setup.mark_paired();
-    } else {
+    } else if config.install_kind != InstallKind::Local {
         let (code, expires_at) = hub
             .new_pairing_code(PairingKind::Client, Origin::HubMachine)
             .await?;
@@ -184,6 +231,7 @@ pub async fn serve(config: HubConfig) -> Result<HubHandle> {
         spawn_skill_update_check(&hub),
         backup::spawn_scheduler(&hub),
         proactivity::spawn(&hub),
+        reach::spawn(&hub),
     ];
     if let Err(err) = hub.make_proactive_defaults().await {
         tracing::warn!(error = %err, "could not make the proactive routines");
@@ -399,6 +447,17 @@ impl HubHandle {
         self.hub.setup.current()
     }
 
+    /// Makes a setup code for a client, and holds it for [`Self::setup_code`].
+    /// A local hub makes none at its start. The code does not go in a log.
+    pub async fn new_setup_code(&self) -> Result<String> {
+        let (code, expires_at) = self
+            .hub
+            .new_pairing_code(PairingKind::Client, Origin::HubMachine)
+            .await?;
+        self.hub.setup.set(code.to_string(), expires_at);
+        Ok(code.to_string())
+    }
+
     /// Makes a single-use worker pairing code that is valid for 10 minutes.
     pub async fn new_worker_pairing_code(&self) -> Result<String> {
         let (code, _) = self
@@ -418,9 +477,35 @@ impl HubHandle {
         Ok(code.to_string())
     }
 
+    /// Whether this worker or session host has a live link to the hub now.
+    pub fn peer_online(&self, id: consort_proto::ids::WorkerId) -> bool {
+        self.hub.links.is_online(id)
+    }
+
+    /// Uses another host in the address of This network, in place of
+    /// `<hostname>.local`. Tests pass an address on this machine.
+    pub fn set_network_host(&self, host: &str) {
+        self.hub.reach.set_network_host(host);
+    }
+
+    /// The state of each way to reach the hub, as `hub.reach_status` reports.
+    pub async fn reach_status(&self) -> Result<consort_proto::client_api::ReachInfo> {
+        self.hub.reach_info().await
+    }
+
+    /// Turns a way to reach the hub on or off, as `hub.reach_set` does.
+    pub async fn set_reach(
+        &self,
+        method: consort_proto::client_api::ReachMethod,
+        on: bool,
+    ) -> Result<consort_proto::client_api::ReachInfo> {
+        self.hub.set_reach(method, on).await
+    }
+
     /// Stops the hub. Open connections close.
     pub async fn shutdown(self) -> Result<()> {
         self.hub.shutdown.cancel();
+        self.hub.reach.stop_listener().await;
         let stopped = tokio::time::timeout(Duration::from_secs(10), async {
             let served = self.server.await;
             for task in self.background {

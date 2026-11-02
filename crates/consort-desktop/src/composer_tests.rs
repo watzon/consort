@@ -415,3 +415,58 @@ fn a_right_click_in_the_message_box_opens_its_menu(cx: &mut TestAppContext) {
     });
     assert_eq!(labels, ["Cut", "Copy", "Paste", "Select all"]);
 }
+
+/// A send forgets the saved draft of its channel. A save of the drafts that
+/// ran while the user paused before Enter holds the sent text, and the box
+/// showed that text again at the next start of the app.
+#[gpui::test]
+fn a_send_forgets_the_saved_draft_of_its_channel(cx: &mut TestAppContext) {
+    let (handle, app) = open(consort_client::mock::view_state(), cx);
+    let cx = &mut VisualTestContext::from_window(handle, cx);
+    let channel = app.read_with(cx, |app, _| app.channel_id.clone());
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            app.inputs
+                .composer
+                .update(cx, |input, cx| input.set_value("Ship it today", window, cx));
+            // The save that ran before Enter.
+            app.drafts.set_channel(&channel, "Ship it today");
+            app.send_message(window, cx);
+        })
+    });
+    until(cx, &app, "the box is empty after the send", |app| {
+        app.drafts.channel(&channel).is_empty()
+    });
+    app.read_with(cx, |app, cx| {
+        assert_eq!(app.inputs.composer.read(cx).value().to_string(), "");
+    });
+}
+
+/// Text that the user typed while the message went out stays, and so does
+/// its saved draft.
+#[gpui::test]
+fn a_send_keeps_a_draft_that_differs_from_the_sent_text(cx: &mut TestAppContext) {
+    let (handle, app) = open(consort_client::mock::view_state(), cx);
+    let cx = &mut VisualTestContext::from_window(handle, cx);
+    let channel = app.read_with(cx, |app, _| app.channel_id.clone());
+    cx.update(|window, cx| {
+        app.update(cx, |app, cx| {
+            app.inputs
+                .composer
+                .update(cx, |input, cx| input.set_value("First line", window, cx));
+            app.send_message(window, cx);
+            app.inputs
+                .composer
+                .update(cx, |input, cx| input.set_value("Second line", window, cx));
+            app.drafts.set_channel(&channel, "Second line");
+        })
+    });
+    settle(cx, 300);
+    app.read_with(cx, |app, cx| {
+        assert_eq!(
+            app.inputs.composer.read(cx).value().to_string(),
+            "Second line"
+        );
+        assert_eq!(app.drafts.channel(&channel), "Second line");
+    });
+}

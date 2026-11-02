@@ -3,6 +3,7 @@
 //! account, and step 3 signs in. The account is made when the user leaves
 //! step 2. "Sign in" and "Sign in again" on an account row open step 3.
 
+use consort_client::setup::PROVIDERS;
 use consort_client::{
     AcpSpec, HarnessAccountView, NewAccount, ProviderLogo, RegistryLoad, SecretEnv, SignInChoice,
     SignInStep, profile_slug,
@@ -25,35 +26,6 @@ use crate::{
         settings::segmented,
     },
 };
-
-/// The built-in providers: the harness, the name, the line under it and
-/// the logo.
-const PROVIDERS: [(&str, &str, &str, ProviderLogo); 4] = [
-    (
-        "claude",
-        "Claude Code",
-        "Claude plan or Anthropic API key",
-        ProviderLogo::ClaudeCode,
-    ),
-    (
-        "codex",
-        "Codex",
-        "ChatGPT plan or OpenAI API key",
-        ProviderLogo::Codex,
-    ),
-    (
-        "opencode",
-        "OpenCode",
-        "API keys for Fireworks, OpenRouter and more",
-        ProviderLogo::OpenCode,
-    ),
-    (
-        "gemini",
-        "Gemini CLI",
-        "Gemini API key or Vertex AI",
-        ProviderLogo::GeminiCli,
-    ),
-];
 
 /// What the dialog builds: the title, the line under it, the width, the
 /// body, the footer and the logo tile before the title.
@@ -130,8 +102,8 @@ impl ConsortApp {
 
     /// The provider of an account that exists.
     fn pick_of(&self, account: &HarnessAccountView) -> ProviderPick {
-        if let Some((harness, ..)) = PROVIDERS.iter().find(|p| p.0 == account.harness) {
-            return ProviderPick::Builtin(harness);
+        if let Some(provider) = PROVIDERS.iter().find(|p| p.harness == account.harness) {
+            return ProviderPick::Builtin(provider.harness);
         }
         match account.harness.strip_prefix("acp:") {
             Some(id) => ProviderPick::Registry {
@@ -143,12 +115,12 @@ impl ConsortApp {
     }
 
     /// The name and the logo of the chosen provider.
-    fn chosen_provider(&self) -> (String, ProviderLogo) {
+    pub(crate) fn chosen_provider(&self) -> (String, ProviderLogo) {
         match &self.add_account.provider {
             Some(ProviderPick::Builtin(harness)) => PROVIDERS
                 .iter()
-                .find(|p| p.0 == *harness)
-                .map(|p| (p.1.to_owned(), p.3.clone()))
+                .find(|p| p.harness == *harness)
+                .map(|p| (p.name.to_owned(), p.logo.clone()))
                 .unwrap_or_default(),
             Some(ProviderPick::Registry { id, name }) => {
                 (name.clone(), self.state.acp_registry.logo(id))
@@ -159,7 +131,7 @@ impl ConsortApp {
     }
 
     /// The account that the dialog signs in, once the worker reports it.
-    fn dialog_account(&self) -> Option<HarnessAccountView> {
+    pub(crate) fn dialog_account(&self) -> Option<HarnessAccountView> {
         let form = &self.add_account;
         self.state
             .worker(&form.worker_id)
@@ -194,7 +166,16 @@ impl ConsortApp {
             // starts the sign-in when it does.
             return;
         };
+        if self
+            .sign_in_tool()
+            .is_some_and(|tool| tool.state == consort_client::ToolState::Installing)
+        {
+            // The tool installs first. The render starts the sign-in when
+            // that ends.
+            return;
+        }
         self.add_account.auto_started = true;
+        self.add_account.code_sent = false;
         self.end_add_account(cx);
         self.dialog_error = None;
         let Some(method) = account
@@ -237,6 +218,39 @@ impl ConsortApp {
         })
         .detach();
         cx.notify();
+    }
+
+    /// True when a sign-in can start by itself. A sign-in installs a missing
+    /// tool on the session host, so a missing tool does not hold it. An install
+    /// that runs holds it until the end. A failed install waits for the user.
+    fn sign_in_tool_ready(&self) -> bool {
+        self.sign_in_tool().is_none_or(|tool| {
+            !matches!(
+                tool.state,
+                consort_client::ToolState::Installing | consort_client::ToolState::Failed
+            )
+        })
+    }
+
+    /// Starts the sign-in once, when the worker has reported the account and
+    /// its tool is ready. The dialog and the sign-in screen both call this.
+    pub(crate) fn auto_start_sign_in(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.dialog_account().is_some()
+            && !self.add_account.auto_started
+            && self.add_account.sign_in_id.is_none()
+            && self.sign_in_tool_ready()
+        {
+            self.add_account.auto_started = true;
+            cx.defer_in(window, |this, window, cx| {
+                this.start_sign_in_method(window, cx)
+            });
+        }
+    }
+
+    /// The step of the running sign-in of the form.
+    pub(crate) fn running_sign_in_step(&self) -> Option<SignInStep> {
+        let id = self.add_account.sign_in_id.as_ref()?;
+        self.state.sign_in(id).map(|s| s.step.clone())
     }
 
     /// Next on step 1 and step 2. Leaving step 2 makes the account.
@@ -319,7 +333,7 @@ impl ConsortApp {
 
     /// Makes the account, then moves to step 3 and starts the sign-in. The
     /// dialog stays busy while the hub answers, so a second click waits.
-    fn create_account_and_sign_in(
+    pub(crate) fn create_account_and_sign_in(
         &mut self,
         account: NewAccount,
         window: &mut Window,
@@ -333,7 +347,8 @@ impl ConsortApp {
             let result = client.create_account(account).await;
             let _ = this.update_in(cx, |this, window, cx| {
                 this.in_flight.finish("add-account");
-                if !matches!(this.dialog, Some(Dialog::AddAccount(_))) {
+                let on_screen = this.setup.step == crate::ui::setup::SetupStep::SignIn;
+                if !on_screen && !matches!(this.dialog, Some(Dialog::AddAccount(_))) {
                     if let Err(err) = &result {
                         this.show_error(err.to_string(), cx);
                     }
@@ -557,7 +572,13 @@ impl ConsortApp {
         let mut grid = div().flex().flex_col().gap(t.space.sm);
         for pair in PROVIDERS.chunks(2) {
             let mut row = div().flex().gap(t.space.sm);
-            for (harness, name, line, logo) in pair {
+            for provider in pair {
+                let (harness, name, line, logo) = (
+                    provider.harness,
+                    provider.name,
+                    provider.line,
+                    &provider.logo,
+                );
                 let selected = chosen == Some(ProviderPick::Builtin(harness));
                 let pick = ProviderPick::Builtin(harness);
                 row = row.child(
@@ -598,11 +619,11 @@ impl ConsortApp {
                                         t.component.provider_logo,
                                         c.text_primary,
                                     ))
-                                    .child(text(*name, t.text.ui_strong, c.text_primary)),
+                                    .child(text(name, t.text.ui_strong, c.text_primary)),
                             )
                             .when(selected, |d| d.child(chosen_mark(t))),
                     )
-                    .child(text(*line, detail(t), c.text_tertiary))
+                    .child(text(line, detail(t), c.text_tertiary))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.add_account.provider = Some(pick.clone());
                         this.dialog_error = None;
@@ -1050,22 +1071,12 @@ impl ConsortApp {
             .as_ref()
             .map(|a| a.label.clone())
             .unwrap_or_else(|| self.field_text(&self.inputs.account_name, cx));
-        // The worker reported the account after the dialog made it: start
-        // the sign-in now.
-        if account.is_some()
-            && !self.add_account.auto_started
-            && self.add_account.sign_in_id.is_none()
-        {
-            self.add_account.auto_started = true;
-            cx.defer_in(window, |this, window, cx| {
-                this.start_sign_in_method(window, cx)
-            });
-        }
-        let methods = account
+        // The worker reported the account after the dialog made it, or its
+        // tool is ready now: start the sign-in.
+        self.auto_start_sign_in(window, cx);
+        let method = account
             .as_ref()
-            .map(|a| a.sign_in_methods.clone())
-            .unwrap_or_default();
-        let method = methods.get(self.add_account.method).cloned();
+            .and_then(|a| a.sign_in_methods.get(self.add_account.method).cloned());
         let lead = div()
             .flex()
             .flex_none()
@@ -1090,29 +1101,7 @@ impl ConsortApp {
         if let Some(block) = self.install_block(&provider, t, cx) {
             body = body.child(block);
         }
-        if methods.len() > 1 {
-            let options: Vec<(usize, String)> = methods
-                .iter()
-                .enumerate()
-                .map(|(i, m)| (i, m.label()))
-                .collect();
-            let options: Vec<(usize, &str)> =
-                options.iter().map(|(i, l)| (*i, l.as_str())).collect();
-            let tabs = segmented(
-                "sign-in-method",
-                &options,
-                self.add_account.method,
-                t,
-                cx,
-                |_| t.text.ui,
-                |this, value, window, cx| {
-                    if this.add_account.method != value {
-                        this.add_account.method = value;
-                        this.add_account.key_saved = false;
-                        this.start_sign_in_method(window, cx);
-                    }
-                },
-            );
+        if let Some(tabs) = self.method_tabs(t, cx) {
             body = body.child(crate::ui::dialogs::field_block(
                 "Sign in with",
                 tabs,
@@ -1120,25 +1109,8 @@ impl ConsortApp {
                 t,
             ));
         }
-        let sign_in = self
-            .add_account
-            .sign_in_id
-            .as_ref()
-            .and_then(|id| self.state.sign_in(id))
-            .cloned();
-        let step = sign_in.as_ref().map(|s| s.step.clone());
-        let flow = self.flow_card(
-            worker,
-            &provider,
-            &label,
-            method.as_ref(),
-            step.as_ref(),
-            account.is_some(),
-            t,
-            window,
-            cx,
-        );
-        body = body.child(flow);
+        let step = self.running_sign_in_step();
+        body = body.child(self.sign_in_flow_card(t, window, cx));
         let done = self.add_account.key_saved
             || matches!(step, Some(SignInStep::Succeeded { .. }))
             || matches!(method, Some(SignInChoice::Terminal { .. }));
@@ -1195,6 +1167,70 @@ impl ConsortApp {
             body,
             actions,
             Some(lead),
+        )
+    }
+
+    /// The tabs of the ways to sign in, when the account has more than one.
+    /// The dialog and the sign-in screen share them.
+    pub(crate) fn method_tabs(&mut self, t: &Tokens, cx: &mut Context<Self>) -> Option<Div> {
+        let methods = self.dialog_account()?.sign_in_methods;
+        if methods.len() < 2 {
+            return None;
+        }
+        let options: Vec<(usize, String)> = methods
+            .iter()
+            .enumerate()
+            .map(|(i, m)| (i, m.label()))
+            .collect();
+        let options: Vec<(usize, &str)> = options.iter().map(|(i, l)| (*i, l.as_str())).collect();
+        Some(segmented(
+            "sign-in-method",
+            &options,
+            self.add_account.method,
+            t,
+            cx,
+            |_| t.text.ui,
+            |this, value, window, cx| {
+                if this.add_account.method != value {
+                    this.add_account.method = value;
+                    this.add_account.key_saved = false;
+                    this.start_sign_in_method(window, cx);
+                }
+            },
+        ))
+    }
+
+    /// The flow of the chosen method. The dialog and the sign-in screen share
+    /// it.
+    pub(crate) fn sign_in_flow_card(
+        &mut self,
+        t: &Tokens,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let account = self.dialog_account();
+        let provider = match &account {
+            Some(a) => a.provider.clone(),
+            None => self.chosen_provider().0,
+        };
+        let label = account
+            .as_ref()
+            .map(|a| a.label.clone())
+            .unwrap_or_else(|| self.field_text(&self.inputs.account_name, cx));
+        let method = account
+            .as_ref()
+            .and_then(|a| a.sign_in_methods.get(self.add_account.method).cloned());
+        let step = self.running_sign_in_step();
+        self.flow_card(
+            "the hub machine",
+            &provider,
+            &label,
+            method.as_ref(),
+            step.as_ref(),
+            account.is_some(),
+            t,
+            window,
+            cx,
         )
     }
 
@@ -1328,7 +1364,14 @@ impl ConsortApp {
                 card.child(flow_step(
                     Marker::Number("1"),
                     format!("Run this command on {worker}"),
-                    Some(format!("{provider} signs in only in a terminal. Run the command on {worker}, then close this dialog. The account row shows when the login works.")),
+                    Some(format!(
+                        "{provider} signs in only in a terminal. Run the command on {worker}. {}",
+                        if self.dialog.is_none() {
+                            "This screen goes on by itself when the login works."
+                        } else {
+                            "Then close this dialog. The account row shows when the login works."
+                        }
+                    )),
                     Some(block.into_any_element()),
                     t,
                 ))
@@ -1388,14 +1431,21 @@ impl ConsortApp {
                     })),
                 )
         };
+        let goes_on = if self.dialog.is_none() {
+            "This screen goes on by itself."
+        } else {
+            "The dialog goes on by itself."
+        };
         let retry = |cx: &mut Context<Self>| {
             button("sign-in-retry", "Try again", ButtonKind::Secondary, t)
                 .on_click(cx.listener(|this, _, window, cx| this.start_sign_in_method(window, cx)))
         };
         match step {
-            None | Some(SignInStep::Starting) => {
-                card.child(waiting_row(format!("Starting the sign-in on {worker}"), t, cx))
-            }
+            None | Some(SignInStep::Starting) => card.child(waiting_row(
+                format!("Starting the sign-in on {worker}"),
+                t,
+                cx,
+            )),
             Some(SignInStep::NeedsCode { url }) => {
                 let focused = self.is_focused(&self.inputs.sign_in_code, window, cx);
                 let send: crate::app::DialogConfirm = std::rc::Rc::new(
@@ -1407,18 +1457,30 @@ impl ConsortApp {
                 let row = div()
                     .flex()
                     .gap(t.space.sm)
-                    .child(code_field(&self.inputs.sign_in_code, focused, t).flex_1().min_w_0())
+                    .child(
+                        code_field(&self.inputs.sign_in_code, focused, t)
+                            .flex_1()
+                            .min_w_0(),
+                    )
                     .child(
                         button("send-code", "Send code", ButtonKind::Primary, t)
                             .px(t.space.md + t.space.xxs)
-                            .when(self.in_flight.is_running("send-code"), |b| b.opacity(t.opacity.busy))
-                            .on_click(cx.listener(move |this, _, window, cx| send(this, window, cx))),
+                            .when(self.in_flight.is_running("send-code"), |b| {
+                                b.opacity(t.opacity.busy)
+                            })
+                            .on_click(
+                                cx.listener(move |this, _, window, cx| send(this, window, cx)),
+                            ),
                     );
-                let page = provider.split(' ').next().unwrap_or(provider).to_owned();
+                let page = consort_client::setup::provider_short_name(provider).to_owned();
                 card.child(flow_step(
                     Marker::Done,
                     format!("Open {page}'s sign-in page"),
-                    Some(format!("The hub machine started the sign-in of {provider} for this account. Sign in with the login that {label} stands for.")),
+                    Some(if self.dialog.is_none() {
+                        format!("The hub machine started the sign-in of {provider}. Sign in with the {page} account that you want the assistant to use.")
+                    } else {
+                        format!("The hub machine started the sign-in of {provider} for this account. Sign in with the login that {label} stands for.")
+                    }),
                     Some(open_buttons(url, "Copy link", url.clone(), cx).into_any_element()),
                     t,
                 ))
@@ -1446,12 +1508,17 @@ impl ConsortApp {
                             .text_size(t.text.display.size)
                             .line_height(t.text.display.line)
                             .text_color(c.text_primary)
-                            .child(gpui_kit::base::SelectableText::new("device-code", user_code.clone())),
+                            .child(gpui_kit::base::SelectableText::new(
+                                "device-code",
+                                user_code.clone(),
+                            )),
                     );
                 card.child(flow_step(
                     Marker::Number("1"),
                     "Enter this code on the sign-in page".to_owned(),
-                    Some(format!("{provider} on {worker} waits until you sign in. The dialog goes on by itself.")),
+                    Some(format!(
+                        "{provider} on {worker} waits until you sign in. {goes_on}"
+                    )),
                     Some(
                         div()
                             .flex()
@@ -1467,13 +1534,17 @@ impl ConsortApp {
             Some(SignInStep::OpenUrl { url }) => card.child(flow_step(
                 Marker::Number("1"),
                 "Open the sign-in page".to_owned(),
-                Some(format!("Sign in on the page. {provider} on {worker} waits, and the dialog goes on by itself.")),
+                Some(format!(
+                    "Sign in on the page. {provider} on {worker} waits. {goes_on}"
+                )),
                 Some(open_buttons(url, "Copy link", url.clone(), cx).into_any_element()),
                 t,
             )),
-            Some(SignInStep::Verifying) => {
-                card.child(waiting_row(format!("Checking the sign-in on {worker}"), t, cx))
-            }
+            Some(SignInStep::Verifying) => card.child(waiting_row(
+                format!("Checking the sign-in on {worker}"),
+                t,
+                cx,
+            )),
             Some(SignInStep::Succeeded { detail: who }) => card.child(flow_step(
                 Marker::Done,
                 match who {
@@ -1523,6 +1594,7 @@ impl ConsortApp {
             return;
         }
         self.dialog_error = None;
+        self.add_account.code_sent = true;
         let client = self.client.clone();
         cx.spawn(async move |this, cx| {
             let result = client.submit_sign_in_code(id, code).await;

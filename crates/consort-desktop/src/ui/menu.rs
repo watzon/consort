@@ -123,8 +123,12 @@ pub enum MenuAction {
     DeleteFile(String, String),
     /// A routine or memory item, or a select of their dialogs.
     Knowledge(crate::knowledge::KnowledgeAction),
+    /// A control or a menu item of the Permissions dialog.
+    Permissions(crate::permissions::PermissionsAction),
     /// A Monid call row, a Monid tool row, or a button of a Monid card.
     Monid(crate::monid::MonidAction),
+    /// A visual in the timeline, a task thread or the light box.
+    Visual(crate::visual::VisualAction),
 }
 
 /// The menu of an attachment in a message or a thread post: Open, Save, and
@@ -294,7 +298,8 @@ pub fn account_menu(worker_id: &str, account_id: &str, can_sign_out: bool) -> Ve
 }
 
 /// The menu of a channel row: Rename, Instructions, Model, Worker tags,
-/// Connectors and skills, Change icon, Move to group, Archive and Delete.
+/// Permissions, Connectors and skills, Change icon, Move to group, Archive
+/// and Delete.
 pub fn channel_menu(channel_id: &str) -> Vec<MenuItem> {
     let id = channel_id.to_owned();
     vec![
@@ -302,6 +307,10 @@ pub fn channel_menu(channel_id: &str) -> Vec<MenuItem> {
         MenuItem::new("Instructions", MenuAction::ChannelInstructions(id.clone())),
         MenuItem::new("Model", MenuAction::ChannelModel(id.clone())),
         MenuItem::new("Worker tags", MenuAction::ChannelTags(id.clone())),
+        MenuItem::new(
+            "Permissions",
+            MenuAction::Permissions(crate::permissions::PermissionsAction::Open(id.clone())),
+        ),
         MenuItem::new(
             "Connectors and skills",
             MenuAction::ChannelExtensions(id.clone()),
@@ -829,6 +838,7 @@ mod tests {
                 "Instructions",
                 "Model",
                 "Worker tags",
+                "Permissions",
                 "Connectors and skills",
                 "Change icon",
                 "Move to group",

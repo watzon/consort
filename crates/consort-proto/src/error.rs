@@ -10,6 +10,8 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::release::InstallKind;
+
 /// The error codes in protocol.md.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ErrorCode {
@@ -71,6 +73,10 @@ pub enum ErrorCode {
     /// The skill does not follow the Agent Skills format or breaks a limit.
     /// The message names the file or the limit.
     SkillInvalid,
+    /// A service that the action needs is not ready yet, for example the
+    /// preview browser while it installs. Try again later. The message says
+    /// when.
+    Unavailable,
     /// A code that this version does not know. A newer peer sent it. Treat it
     /// like [`ErrorCode::Internal`] and show the message.
     Unknown,
@@ -78,7 +84,7 @@ pub enum ErrorCode {
 
 impl ErrorCode {
     /// Every known code, in the order of protocol.md.
-    pub const ALL: [ErrorCode; 25] = [
+    pub const ALL: [ErrorCode; 26] = [
         Self::Unauthorized,
         Self::ProtocolMismatch,
         Self::Invalid,
@@ -104,6 +110,7 @@ impl ErrorCode {
         Self::NeedsUser,
         Self::SkillBlocked,
         Self::SkillInvalid,
+        Self::Unavailable,
     ];
 
     /// The wire string, for example `worker_offline`.
@@ -134,6 +141,7 @@ impl ErrorCode {
             Self::NeedsUser => "needs_user",
             Self::SkillBlocked => "skill_blocked",
             Self::SkillInvalid => "skill_invalid",
+            Self::Unavailable => "unavailable",
             Self::Unknown => "unknown",
         }
     }
@@ -149,7 +157,8 @@ impl ErrorCode {
             Self::WorkerOffline
             | Self::NoMatchingAccount
             | Self::ComposioNotConfigured
-            | Self::MonidNotConfigured => 503,
+            | Self::MonidNotConfigured
+            | Self::Unavailable => 503,
             Self::SignInFailed
             | Self::ToolInstallFailed
             | Self::ComposioError
@@ -192,6 +201,19 @@ impl<'de> Deserialize<'de> for ErrorCode {
     }
 }
 
+/// The versions of a hub. A `protocol_mismatch` error has them, and so does
+/// each failed pairing, so that the peer can say which side is too old.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HubVersions {
+    /// The software version of the hub.
+    pub hub_version: String,
+    /// The protocol versions that the hub speaks, oldest first.
+    pub protocol_versions: Vec<u32>,
+    /// How the hub was installed. Only a peer that signed in gets this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install: Option<InstallKind>,
+}
+
 /// The `error` object of an error response.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 #[error("{code}: {message}")]
@@ -201,6 +223,10 @@ pub struct ErrorBody {
     /// A sentence for logs and for the user. For `invalid`, it names the
     /// field. For `policy_denied`, it names the rule.
     pub message: String,
+    /// The versions of the hub, on a `protocol_mismatch` error and a failed
+    /// pairing. An older hub leaves this out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hub_versions: Option<HubVersions>,
 }
 
 impl ErrorBody {
@@ -209,7 +235,15 @@ impl ErrorBody {
         Self {
             code,
             message: message.into(),
+            hub_versions: None,
         }
+    }
+
+    /// The same error with the versions of the hub.
+    #[must_use]
+    pub fn with_hub_versions(mut self, versions: HubVersions) -> Self {
+        self.hub_versions = Some(versions);
+        self
     }
 
     /// An `invalid` error.
@@ -290,6 +324,50 @@ mod tests {
             serde_json::json!({"code": "worker_offline", "message": "bigboi is offline."})
         );
         assert_eq!(body.to_string(), "worker_offline: bigboi is offline.");
+    }
+
+    #[test]
+    fn a_mismatch_error_carries_the_versions_of_the_hub() {
+        let body = ErrorBody::new(ErrorCode::ProtocolMismatch, "No common version.")
+            .with_hub_versions(HubVersions {
+                hub_version: "0.6.2".into(),
+                protocol_versions: vec![1, 2],
+                install: Some(InstallKind::Service),
+            });
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "code": "protocol_mismatch",
+                "message": "No common version.",
+                "hub_versions": {
+                    "hub_version": "0.6.2",
+                    "protocol_versions": [1, 2],
+                    "install": "service",
+                },
+            })
+        );
+        assert_eq!(serde_json::from_value::<ErrorBody>(json).unwrap(), body);
+    }
+
+    /// The contract: an older peer reads the new field as absent, and a
+    /// newer peer reads the error of an older hub.
+    #[test]
+    fn an_error_with_or_without_versions_reads_on_both_sides() {
+        let old: ErrorBody = serde_json::from_value(serde_json::json!({
+            "code": "protocol_mismatch", "message": "Update the app."
+        }))
+        .unwrap();
+        assert_eq!(old.hub_versions, None);
+        let newer: ErrorBody = serde_json::from_value(serde_json::json!({
+            "code": "protocol_mismatch", "message": "x", "something_new": 1,
+            "hub_versions": {"hub_version": "9.0.0", "protocol_versions": [9],
+                             "install": "nix", "other": true},
+        }))
+        .unwrap();
+        let versions = newer.hub_versions.unwrap();
+        assert_eq!(versions.protocol_versions, vec![9]);
+        assert_eq!(versions.install, Some(InstallKind::Manual));
     }
 
     #[test]

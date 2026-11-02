@@ -19,10 +19,14 @@ unwrap_used = "warn"
 [workspace.dependencies]
 # Internal crates
 consort-proto = { path = "crates/consort-proto" }
-consort-theme = { path = "crates/consort-theme" }
+# The theme files, roles and fonts build without GPUI. The desktop turns on
+# the `gpui` feature for the GPUI Kit theme and the tokens.
+consort-theme = { path = "crates/consort-theme", default-features = false }
+consort-visual = { path = "crates/consort-visual" }
 consort-harness = { path = "crates/consort-harness" }
 consort-session-host = { path = "crates/consort-session-host" }
 consort-link = { path = "crates/consort-link" }
+consort-tls = { path = "crates/consort-tls" }
 consort-worker = { path = "crates/consort-worker" }
 consort-hub = { path = "crates/consort-hub" }
 consort-client = { path = "crates/consort-client" }
@@ -57,7 +61,21 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 tokio-tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+# TLS for This network: a pin on the client side, a listener and a self-signed
+# certificate on the hub. They use the same crypto provider as reqwest.
+rustls = { version = "=0.23.46", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+tokio-rustls = { version = "=0.26.6", default-features = false, features = ["aws_lc_rs", "tls12"] }
+rcgen = { version = "=0.14.10", default-features = false, features = ["aws_lc_rs"] }
+# The trait that a connection on the TLS listener needs to give its peer address.
+tower-service = "0.3"
 url = "2"
+# Visuals: the fonts and images in a page, and the PNG of `preview_visual`.
+base64 = "=0.22.1"
+# Visuals: the live page in the timeline and the light box, on macOS only
+# (docs/VISUALS-PLAN.md). gpui-webview 0.8.1 follows gpui-kit 0.8.1, and its
+# `unsafe` stays inside it. lb-wry names the builder that it takes.
+gpui-webview = "=0.8.1"
+lb-wry = "=0.53.3"
 
 # The unified diff of an ACP file change, for the task item view (phase 4).
 # It is already in the tree; pinned to that version.

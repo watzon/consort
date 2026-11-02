@@ -1,6 +1,7 @@
-//! The per-user service that starts the worker at login and restarts it when
-//! it fails: a launchd agent on macOS, a systemd user unit on Linux and a
-//! Task Scheduler task on Windows.
+//! The per-user services that start at login and restart after a failure: a
+//! launchd agent on macOS, a systemd user unit on Linux and a Task Scheduler
+//! task on Windows. A [`ServiceSpec`] says which one: the worker, or the local
+//! hub, which has no Windows service.
 //!
 //! The code has two layers. The first layer makes a [`Plan`] from plain
 //! strings: the files to write, with their text, and the commands to run. It
@@ -22,6 +23,48 @@ pub const SYSTEMD_UNIT: &str = "consort-worker.service";
 pub const TASK_NAME: &str = "Consort worker";
 /// The name of the log file on every system.
 pub const LOG_FILE_NAME: &str = "worker.log";
+
+/// Which service a plan is for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServiceSpec {
+    /// The launchd label, and the base name of the plist.
+    pub label: String,
+    /// The systemd user unit.
+    pub unit: String,
+    /// The name of the Task Scheduler task.
+    pub task: String,
+    /// The description of the systemd unit.
+    pub description: String,
+    /// The name of the service in messages: "worker" or "hub".
+    pub noun: String,
+    /// The log file. `None` uses [`LOG_FILE_NAME`] in the log folder of the
+    /// system.
+    pub log_file: Option<String>,
+    /// The arguments of the program. `None` runs the worker.
+    pub args: Option<Vec<String>>,
+    /// More variables for the service, after `PATH`.
+    pub env: Vec<(String, String)>,
+    /// The folder of the private copy of the definition, which the service
+    /// loads from. `None` loads from the folder of the service manager.
+    pub private_definition: Option<String>,
+}
+
+impl ServiceSpec {
+    /// The worker service.
+    pub fn worker() -> Self {
+        Self {
+            label: LAUNCHD_LABEL.to_owned(),
+            unit: SYSTEMD_UNIT.to_owned(),
+            task: TASK_NAME.to_owned(),
+            description: "Consort worker".to_owned(),
+            noun: "worker".to_owned(),
+            log_file: None,
+            args: None,
+            env: Vec::new(),
+            private_definition: None,
+        }
+    }
+}
 
 /// The systems that have a service.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -201,6 +244,8 @@ pub struct Plan {
     pub commands: Vec<PlannedCommand>,
     /// The log file that the service writes.
     pub log_file: String,
+    /// The name of the service in messages.
+    pub noun: String,
 }
 
 /// The paths of one install.
@@ -212,13 +257,27 @@ struct Paths {
     dirs: Vec<String>,
 }
 
-fn paths(platform: Platform, env: &ServiceEnv) -> Result<Paths> {
+fn paths(spec: &ServiceSpec, platform: Platform, env: &ServiceEnv) -> Result<Paths> {
+    let mut p = system_paths(spec, platform, env)?;
+    if let Some(log_file) = &spec.log_file {
+        p.log_file.clone_from(log_file);
+        if let Some(parent) = Path::new(log_file).parent() {
+            p.dirs.truncate(1);
+            p.dirs.push(parent.to_string_lossy().into_owned());
+        }
+    }
+    Ok(p)
+}
+
+fn system_paths(spec: &ServiceSpec, platform: Platform, env: &ServiceEnv) -> Result<Paths> {
+    let label = &spec.label;
+    let unit = &spec.unit;
     Ok(match platform {
         Platform::MacOs => {
             let log_dir = format!("{}/Library/Logs/Consort", env.home);
             let agents = format!("{}/Library/LaunchAgents", env.home);
             Paths {
-                definition: format!("{agents}/{LAUNCHD_LABEL}.plist"),
+                definition: format!("{agents}/{label}.plist"),
                 log_file: format!("{log_dir}/{LOG_FILE_NAME}"),
                 dirs: vec![agents, log_dir],
             }
@@ -235,7 +294,7 @@ fn paths(platform: Platform, env: &ServiceEnv) -> Result<Paths> {
             let units = format!("{config}/systemd/user");
             let log_dir = format!("{state}/consort");
             Paths {
-                definition: format!("{units}/{SYSTEMD_UNIT}"),
+                definition: format!("{units}/{unit}"),
                 log_file: format!("{log_dir}/{LOG_FILE_NAME}"),
                 dirs: vec![units, log_dir],
             }
@@ -255,8 +314,11 @@ fn paths(platform: Platform, env: &ServiceEnv) -> Result<Paths> {
     })
 }
 
-/// The arguments of `consort worker run` for the service.
-fn run_args(env: &ServiceEnv, log_file: &str) -> Vec<String> {
+/// The arguments of the program for the service.
+fn run_args(spec: &ServiceSpec, env: &ServiceEnv, log_file: &str) -> Vec<String> {
+    if let Some(args) = &spec.args {
+        return args.clone();
+    }
     let mut args = vec!["worker".to_owned(), "run".to_owned()];
     if let Some(dir) = &env.config_dir {
         args.push("--config-dir".to_owned());
@@ -274,19 +336,26 @@ fn xml_escape(text: &str) -> String {
         .replace('"', "&quot;")
 }
 
-/// The text of the launchd plist.
+/// The text of the launchd plist of the worker.
+#[cfg(test)]
 pub fn launchd_plist(env: &ServiceEnv, log_file: &str) -> String {
+    launchd_plist_for(&ServiceSpec::worker(), env, log_file)
+}
+
+/// The text of the launchd plist.
+fn launchd_plist_for(spec: &ServiceSpec, env: &ServiceEnv, log_file: &str) -> String {
     let mut out = String::new();
     out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
     out.push_str("<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n");
     out.push_str("<plist version=\"1.0\">\n<dict>\n");
     let _ = writeln!(
         out,
-        "  <key>Label</key>\n  <string>{LAUNCHD_LABEL}</string>"
+        "  <key>Label</key>\n  <string>{}</string>",
+        xml_escape(&spec.label)
     );
     out.push_str("  <key>ProgramArguments</key>\n  <array>\n");
     let _ = writeln!(out, "    <string>{}</string>", xml_escape(&env.exe));
-    for arg in run_args(env, log_file) {
+    for arg in run_args(spec, env, log_file) {
         let _ = writeln!(out, "    <string>{}</string>", xml_escape(&arg));
     }
     out.push_str("  </array>\n");
@@ -296,12 +365,18 @@ pub fn launchd_plist(env: &ServiceEnv, log_file: &str) -> String {
     out.push_str("  <key>KeepAlive</key>\n  <dict>\n    <key>SuccessfulExit</key>\n    <false/>\n  </dict>\n");
     out.push_str("  <key>ThrottleInterval</key>\n  <integer>30</integer>\n");
     out.push_str("  <key>ProcessType</key>\n  <string>Background</string>\n");
-    if let Some(path) = &env.path {
-        let _ = writeln!(
-            out,
-            "  <key>EnvironmentVariables</key>\n  <dict>\n    <key>PATH</key>\n    <string>{}</string>\n  </dict>",
-            xml_escape(path)
-        );
+    let vars = service_vars(spec, env);
+    if !vars.is_empty() {
+        out.push_str("  <key>EnvironmentVariables</key>\n  <dict>\n");
+        for (name, value) in &vars {
+            let _ = writeln!(
+                out,
+                "    <key>{}</key>\n    <string>{}</string>",
+                xml_escape(name),
+                xml_escape(value)
+            );
+        }
+        out.push_str("  </dict>\n");
     }
     let _ = writeln!(
         out,
@@ -310,6 +385,16 @@ pub fn launchd_plist(env: &ServiceEnv, log_file: &str) -> String {
     );
     out.push_str("</dict>\n</plist>\n");
     out
+}
+
+/// The variables of the service: `PATH`, then the variables of the spec.
+fn service_vars(spec: &ServiceSpec, env: &ServiceEnv) -> Vec<(String, String)> {
+    let mut vars = Vec::new();
+    if let Some(path) = &env.path {
+        vars.push(("PATH".to_owned(), path.clone()));
+    }
+    vars.extend(spec.env.iter().cloned());
+    vars
 }
 
 /// A word in a systemd `Exec` line. systemd splits the line at spaces, so a
@@ -326,22 +411,27 @@ fn systemd_word(word: &str) -> String {
 }
 
 /// The text of the systemd user unit.
-pub fn systemd_unit(env: &ServiceEnv, log_file: &str) -> String {
+pub fn systemd_unit_for(spec: &ServiceSpec, env: &ServiceEnv, log_file: &str) -> String {
     let mut exec = systemd_word(&env.exe);
-    for arg in run_args(env, log_file) {
+    for arg in run_args(spec, env, log_file) {
         exec.push(' ');
         exec.push_str(&systemd_word(&arg));
     }
     let mut out = String::new();
-    out.push_str("[Unit]\nDescription=Consort worker\nAfter=network-online.target\nWants=network-online.target\n\n");
+    let _ = writeln!(out, "[Unit]\nDescription={}", spec.description);
+    out.push_str("After=network-online.target\nWants=network-online.target\n\n");
     out.push_str("[Service]\nType=simple\n");
     let _ = writeln!(out, "ExecStart={exec}");
     // Restart after a crash or an exit with an error, not after a clean stop.
     out.push_str("Restart=on-failure\nRestartSec=10\n");
     // SIGTERM goes to the worker only. The worker stops its harnesses itself.
     out.push_str("KillMode=mixed\nTimeoutStopSec=30\n");
-    if let Some(path) = &env.path {
-        let _ = writeln!(out, "Environment={}", systemd_word(&format!("PATH={path}")));
+    for (name, value) in service_vars(spec, env) {
+        let _ = writeln!(
+            out,
+            "Environment={}",
+            systemd_word(&format!("{name}={value}"))
+        );
     }
     let _ = writeln!(out, "StandardOutput=append:{log_file}");
     let _ = writeln!(out, "StandardError=append:{log_file}");
@@ -354,13 +444,14 @@ fn powershell_quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', "''"))
 }
 
-/// The task definition for `schtasks /Create /XML`.
+/// The task definition of the worker for `schtasks /Create /XML`.
 pub fn task_xml(env: &ServiceEnv, log_file: &str) -> String {
+    let spec = ServiceSpec::worker();
     // A console program shows a window when it starts at logon. PowerShell
     // with a hidden window starts it without one and passes the exit code
     // on, so a failed worker still counts as a failure for the restart rule.
     let mut command = format!("& {}", powershell_quote(&env.exe));
-    for arg in run_args(env, log_file) {
+    for arg in run_args(&spec, env, log_file) {
         command.push(' ');
         command.push_str(&powershell_quote(&arg));
     }
@@ -413,105 +504,142 @@ pub fn task_xml(env: &ServiceEnv, log_file: &str) -> String {
 
 /// The plan for `consort worker install`.
 pub fn plan_install(platform: Platform, env: &ServiceEnv) -> Result<Plan> {
-    let p = paths(platform, env)?;
+    plan_install_for(&ServiceSpec::worker(), platform, env)
+}
+
+/// The plan that installs and starts a service.
+pub fn plan_install_for(spec: &ServiceSpec, platform: Platform, env: &ServiceEnv) -> Result<Plan> {
+    let p = paths(spec, platform, env)?;
     let (text, encoding) = match platform {
-        Platform::MacOs => (launchd_plist(env, &p.log_file), Encoding::Utf8),
-        Platform::Linux => (systemd_unit(env, &p.log_file), Encoding::Utf8),
+        Platform::MacOs => (launchd_plist_for(spec, env, &p.log_file), Encoding::Utf8),
+        Platform::Linux => (systemd_unit_for(spec, env, &p.log_file), Encoding::Utf8),
         Platform::Windows => (task_xml(env, &p.log_file), Encoding::Utf16Le),
     };
+    let label = &spec.label;
+    let unit = &spec.unit;
+    let task = &spec.task;
+    let mut files = vec![PlannedFile {
+        path: p.definition.clone(),
+        text: text.clone(),
+        encoding,
+    }];
+    let mut load_from = p.definition.clone();
+    if let (Platform::MacOs, Some(private)) = (platform, &spec.private_definition) {
+        files.push(PlannedFile {
+            path: private.clone(),
+            text,
+            encoding,
+        });
+        load_from.clone_from(private);
+    }
     let commands = match platform {
         Platform::MacOs => {
             let domain = launchd_domain(env)?;
             vec![
                 // A second install replaces the first one.
-                PlannedCommand::new(
-                    "launchctl",
-                    &["bootout", &format!("{domain}/{LAUNCHD_LABEL}")],
-                )
-                .may_fail(),
-                PlannedCommand::new("launchctl", &["bootstrap", &domain, &p.definition]),
+                PlannedCommand::new("launchctl", &["bootout", &format!("{domain}/{label}")])
+                    .may_fail(),
+                PlannedCommand::new("launchctl", &["bootstrap", &domain, &load_from]),
             ]
         }
         Platform::Linux => vec![
             PlannedCommand::new("systemctl", &["--user", "daemon-reload"]),
-            PlannedCommand::new("systemctl", &["--user", "enable", SYSTEMD_UNIT]),
-            PlannedCommand::new("systemctl", &["--user", "restart", SYSTEMD_UNIT]),
+            PlannedCommand::new("systemctl", &["--user", "enable", unit]),
+            PlannedCommand::new("systemctl", &["--user", "restart", unit]),
         ],
         Platform::Windows => vec![
             PlannedCommand::new(
                 "schtasks",
-                &["/Create", "/TN", TASK_NAME, "/XML", &p.definition, "/F"],
+                &["/Create", "/TN", task, "/XML", &p.definition, "/F"],
             ),
-            PlannedCommand::new("schtasks", &["/Run", "/TN", TASK_NAME]),
+            PlannedCommand::new("schtasks", &["/Run", "/TN", task]),
         ],
     };
     Ok(Plan {
         platform,
         dirs: p.dirs,
-        files: vec![PlannedFile {
-            path: p.definition,
-            text,
-            encoding,
-        }],
+        files,
         remove: Vec::new(),
         commands,
         log_file: p.log_file,
+        noun: spec.noun.clone(),
     })
 }
 
 /// The plan for `consort worker uninstall`. It keeps the log file and the
 /// worker folder.
 pub fn plan_uninstall(platform: Platform, env: &ServiceEnv) -> Result<Plan> {
-    let p = paths(platform, env)?;
+    plan_uninstall_for(&ServiceSpec::worker(), platform, env)
+}
+
+/// The plan that stops a service and removes it.
+pub fn plan_uninstall_for(
+    spec: &ServiceSpec,
+    platform: Platform,
+    env: &ServiceEnv,
+) -> Result<Plan> {
+    let p = paths(spec, platform, env)?;
+    let label = &spec.label;
+    let unit = &spec.unit;
+    let task = &spec.task;
     let commands = match platform {
         Platform::MacOs => {
             let domain = launchd_domain(env)?;
             vec![
-                PlannedCommand::new(
-                    "launchctl",
-                    &["bootout", &format!("{domain}/{LAUNCHD_LABEL}")],
-                )
-                .may_fail(),
+                PlannedCommand::new("launchctl", &["bootout", &format!("{domain}/{label}")])
+                    .may_fail(),
             ]
         }
         Platform::Linux => vec![
-            PlannedCommand::new("systemctl", &["--user", "disable", "--now", SYSTEMD_UNIT])
-                .may_fail(),
+            PlannedCommand::new("systemctl", &["--user", "disable", "--now", unit]).may_fail(),
             PlannedCommand::new("systemctl", &["--user", "daemon-reload"]).may_fail(),
         ],
         Platform::Windows => vec![
-            PlannedCommand::new("schtasks", &["/End", "/TN", TASK_NAME]).may_fail(),
-            PlannedCommand::new("schtasks", &["/Delete", "/TN", TASK_NAME, "/F"]).may_fail(),
+            PlannedCommand::new("schtasks", &["/End", "/TN", task]).may_fail(),
+            PlannedCommand::new("schtasks", &["/Delete", "/TN", task, "/F"]).may_fail(),
         ],
     };
+    let mut remove = vec![p.definition];
+    if let (Platform::MacOs, Some(private)) = (platform, &spec.private_definition) {
+        remove.push(private.clone());
+    }
     Ok(Plan {
         platform,
         dirs: Vec::new(),
         files: Vec::new(),
-        remove: vec![p.definition],
+        remove,
         commands,
         log_file: p.log_file,
+        noun: spec.noun.clone(),
     })
 }
 
 /// The commands that show the state of the service.
 pub fn plan_status(platform: Platform, env: &ServiceEnv) -> Result<Plan> {
-    let p = paths(platform, env)?;
+    plan_status_for(&ServiceSpec::worker(), platform, env)
+}
+
+/// The commands that show the state of a service.
+pub fn plan_status_for(spec: &ServiceSpec, platform: Platform, env: &ServiceEnv) -> Result<Plan> {
+    let p = paths(spec, platform, env)?;
+    let label = &spec.label;
+    let unit = &spec.unit;
+    let task = &spec.task;
     let commands = match platform {
         Platform::MacOs => {
             let domain = launchd_domain(env)?;
             vec![PlannedCommand::new(
                 "launchctl",
-                &["print", &format!("{domain}/{LAUNCHD_LABEL}")],
+                &["print", &format!("{domain}/{label}")],
             )]
         }
         Platform::Linux => vec![
-            PlannedCommand::new("systemctl", &["--user", "is-active", SYSTEMD_UNIT]),
-            PlannedCommand::new("systemctl", &["--user", "is-enabled", SYSTEMD_UNIT]),
+            PlannedCommand::new("systemctl", &["--user", "is-active", unit]),
+            PlannedCommand::new("systemctl", &["--user", "is-enabled", unit]),
         ],
         Platform::Windows => vec![PlannedCommand::new(
             "schtasks",
-            &["/Query", "/TN", TASK_NAME, "/FO", "LIST", "/V"],
+            &["/Query", "/TN", task, "/FO", "LIST", "/V"],
         )],
     };
     Ok(Plan {
@@ -521,7 +649,77 @@ pub fn plan_status(platform: Platform, env: &ServiceEnv) -> Result<Plan> {
         remove: Vec::new(),
         commands,
         log_file: p.log_file,
+        noun: spec.noun.clone(),
     })
+}
+
+/// The commands that start a service that is installed. macOS loads the private
+/// copy of the definition first, which fails when the service is loaded
+/// already, and then starts the service.
+pub fn start_commands(
+    spec: &ServiceSpec,
+    platform: Platform,
+    env: &ServiceEnv,
+) -> Result<Vec<PlannedCommand>> {
+    let p = paths(spec, platform, env)?;
+    Ok(match platform {
+        Platform::MacOs => {
+            let domain = launchd_domain(env)?;
+            let load_from = spec.private_definition.as_ref().unwrap_or(&p.definition);
+            vec![
+                PlannedCommand::new("launchctl", &["bootstrap", &domain, load_from]).may_fail(),
+                PlannedCommand::new(
+                    "launchctl",
+                    &["kickstart", &format!("{domain}/{}", spec.label)],
+                ),
+            ]
+        }
+        Platform::Linux => vec![PlannedCommand::new(
+            "systemctl",
+            &["--user", "start", &spec.unit],
+        )],
+        Platform::Windows => vec![PlannedCommand::new(
+            "schtasks",
+            &["/Run", "/TN", &spec.task],
+        )],
+    })
+}
+
+/// The commands that stop a service. It stays installed. launchd forgets a
+/// service that stops, so [`start_commands`] loads it again.
+pub fn stop_commands(
+    spec: &ServiceSpec,
+    platform: Platform,
+    env: &ServiceEnv,
+) -> Result<Vec<PlannedCommand>> {
+    Ok(match platform {
+        Platform::MacOs => {
+            let domain = launchd_domain(env)?;
+            vec![
+                PlannedCommand::new(
+                    "launchctl",
+                    &["bootout", &format!("{domain}/{}", spec.label)],
+                )
+                .may_fail(),
+            ]
+        }
+        Platform::Linux => {
+            vec![PlannedCommand::new("systemctl", &["--user", "stop", &spec.unit]).may_fail()]
+        }
+        Platform::Windows => {
+            vec![PlannedCommand::new("schtasks", &["/End", "/TN", &spec.task]).may_fail()]
+        }
+    })
+}
+
+/// The commands on Linux that turn the start at login on or off. A running
+/// service keeps running. On macOS the file in `~/Library/LaunchAgents` is the
+/// switch, and no command is needed.
+pub fn login_commands(spec: &ServiceSpec, on: bool) -> Vec<PlannedCommand> {
+    vec![PlannedCommand::new(
+        "systemctl",
+        &["--user", if on { "enable" } else { "disable" }, &spec.unit],
+    )]
 }
 
 fn launchd_domain(env: &ServiceEnv) -> Result<String> {
@@ -533,7 +731,16 @@ fn launchd_domain(env: &ServiceEnv) -> Result<String> {
 
 /// The path of the definition file, to see whether the service is installed.
 pub fn definition_path(platform: Platform, env: &ServiceEnv) -> Result<String> {
-    Ok(paths(platform, env)?.definition)
+    definition_path_for(&ServiceSpec::worker(), platform, env)
+}
+
+/// The path of the definition file of a service.
+pub fn definition_path_for(
+    spec: &ServiceSpec,
+    platform: Platform,
+    env: &ServiceEnv,
+) -> Result<String> {
+    Ok(paths(spec, platform, env)?.definition)
 }
 
 /// The text of a dry run: what the install would write and run.
@@ -571,7 +778,11 @@ pub fn describe(plan: &Plan, verb: &str) -> String {
             );
         }
     }
-    let _ = writeln!(out, "\nThe worker writes its log to {}", plan.log_file);
+    let _ = writeln!(
+        out,
+        "\nThe {} writes its log to {}",
+        plan.noun, plan.log_file
+    );
     out
 }
 

@@ -47,6 +47,8 @@ check "passes the hub, the name and the tags" "worker install --hub https://hub.
 check "passes the code in the environment" "code=ABCD-EFGH" "$out"
 check "adds the folder to the PATH of the shell" "export PATH=\"$root/bin:\$PATH\"" "$(cat "$root/home/.zshrc")"
 
+out="$(run --hub https://mac.local:7601 --code ABCD-EFGH --tls-sha256 abc123 2>&1)"
+check "passes the pin of the certificate" "worker install --hub https://mac.local:7601 --tls-sha256 abc123" "$out"
 run --hub https://hub.example.com --code ABCD-EFGH >/dev/null 2>&1
 check "adds the PATH line once" "1" "$(grep -c 'Added by the Consort installer' "$root/home/.zshrc")"
 

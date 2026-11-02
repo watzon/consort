@@ -283,6 +283,15 @@ pub enum WakeEvent {
         /// What to write.
         request: String,
     },
+    /// The first account of this hub signed in, and Tutti has no messages.
+    /// Greet and offer the guide. The hub sends this one time.
+    FirstSignIn {
+        /// The name of the account.
+        account: String,
+        /// The proactivity log entry. Not shown to the model.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        log: u64,
+    },
     /// The user made this channel. Greet and offer the guided start.
     ChannelCreated {
         /// The channel name.
@@ -419,6 +428,7 @@ impl WakeEvent {
             Self::Research { .. } => "research",
             Self::ProactiveFeedback { .. } => "proactive_feedback",
             Self::ChannelCreated { .. } => "channel_created",
+            Self::FirstSignIn { .. } => "first_sign_in",
             Self::VoiceEdits { .. } => "voice_edits",
             Self::VoiceFeedback { .. } => "voice_feedback",
             Self::VoiceSample { .. } => "voice_sample",
@@ -438,7 +448,10 @@ impl WakeEvent {
             Self::StaleTask { .. } => ProactiveKind::StaleTask,
             Self::Research { .. } => ProactiveKind::Research,
             Self::ProactiveFeedback { .. } => ProactiveKind::Feedback,
-            Self::ChannelCreated { .. } => ProactiveKind::ChannelCreated,
+            // The guided start of Tutti has the same rules and the same log
+            // kind as the guided start of a new channel. A client of an older
+            // version can read this kind.
+            Self::ChannelCreated { .. } | Self::FirstSignIn { .. } => ProactiveKind::ChannelCreated,
             _ => return None,
         })
     }
@@ -469,7 +482,8 @@ impl WakeEvent {
             | Self::StaleTask { log, .. }
             | Self::Research { log, .. }
             | Self::ProactiveFeedback { log, .. }
-            | Self::ChannelCreated { log, .. } => (*log != 0).then_some(*log),
+            | Self::ChannelCreated { log, .. }
+            | Self::FirstSignIn { log, .. } => (*log != 0).then_some(*log),
             _ => None,
         }
     }
@@ -680,6 +694,9 @@ impl WakeEvent {
                 ],
                 None,
             ),
+            Self::FirstSignIn { account, .. } => {
+                element(out, name, &[("account", Some(account.clone()))], None);
+            }
             Self::ChannelCreated {
                 name: channel_name,
                 kind,

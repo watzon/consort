@@ -44,9 +44,11 @@ pub mod migrations;
 pub mod monid;
 pub mod preferences;
 pub mod proactivity;
+pub mod reach;
 pub mod routines;
 pub mod sign_ins;
 pub mod skills;
+pub mod visuals;
 pub mod voice;
 pub mod work;
 

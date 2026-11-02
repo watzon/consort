@@ -2127,12 +2127,58 @@ fn only_claude_code_is_proven_for_the_boundary() {
 
 #[tokio::test]
 async fn the_start_watchdog_stops_a_hung_cli() {
+    let mut tries = 0;
     let result: Result<(), HarnessError> = start_watchdog(
         Duration::from_millis(10),
-        std::future::pending::<Result<(), HarnessError>>(),
+        2,
+        consort_proto::ids::SessionId::new(),
+        |_| {
+            tries += 1;
+            std::future::pending::<Result<(), HarnessError>>()
+        },
     )
     .await;
     assert!(matches!(result, Err(HarnessError::Timeout(_))));
+    assert_eq!(tries, 2);
+}
+
+#[tokio::test]
+async fn the_start_watchdog_starts_a_hung_cli_again() {
+    let mut tries = 0;
+    let result = start_watchdog(
+        Duration::from_millis(10),
+        2,
+        consort_proto::ids::SessionId::new(),
+        |_| {
+            tries += 1;
+            let n = tries;
+            async move {
+                if n == 1 {
+                    std::future::pending::<()>().await;
+                }
+                Ok::<_, HarnessError>(n)
+            }
+        },
+    )
+    .await;
+    assert_eq!(result.unwrap(), 2);
+}
+
+#[tokio::test]
+async fn the_start_watchdog_does_not_try_again_after_an_error() {
+    let mut tries = 0;
+    let result: Result<(), HarnessError> = start_watchdog(
+        Duration::from_millis(10),
+        2,
+        consort_proto::ids::SessionId::new(),
+        |_| {
+            tries += 1;
+            async { Err(HarnessError::Spawn("no CLI".to_owned())) }
+        },
+    )
+    .await;
+    assert!(matches!(result, Err(HarnessError::Spawn(_))));
+    assert_eq!(tries, 1);
 }
 
 /// A workspace folder that is one git repo.

@@ -21,6 +21,7 @@ mod outbox;
 mod proactivity;
 mod save;
 mod url;
+mod visual;
 mod voice;
 
 use std::{
@@ -29,12 +30,15 @@ use std::{
 };
 
 use consort_proto::{
-    auth::{PAIR_CLIENT_PATH, PairClientRequest, PairClientResponse, PairingCode, PublicKey},
+    auth::{
+        PAIR_CLIENT_PATH, PairClientRequest, PairClientResponse, PairingCode, PairingInvite,
+        PublicKey,
+    },
     client_api::TaskGet,
     error::{ErrorBody, ErrorCode},
     frame::{Frame, Request},
     ids::{FrameId, TaskId},
-    model::ClientKind,
+    model::{ClientKind, Sha256Hash},
 };
 use ed25519_dalek::SigningKey;
 use serde_json::Value;
@@ -121,11 +125,11 @@ impl ClientOptions {
             .next()
             .map(|c| c.to_uppercase().collect::<String>() + chars.as_str())
             .unwrap_or_default();
-        let initials = name.chars().take(2).collect::<String>().to_uppercase();
         ClientOptions {
             name: host,
             kind: ClientKind::Desktop,
-            user: UserView { name, initials },
+            // Only a guess: the name on the hub replaces it in `view_state`.
+            user: UserView::from_name(&name),
             timeouts: Timeouts::default(),
         }
     }
@@ -150,7 +154,14 @@ struct Outgoing {
     frame: Frame,
     id: FrameId,
     reply: Reply,
+    /// How long the link waits for the answer before it ends.
+    limit: Duration,
 }
+
+/// How long the client waits for `visual.render`. The hub waits up to 60
+/// seconds for the session host, so the client waits longer. A shorter
+/// `Timeouts::call` does not shorten it.
+const RENDER_LIMIT: Duration = Duration::from_secs(75);
 
 pub(crate) struct Shared {
     store: Option<Store>,
@@ -158,6 +169,8 @@ pub(crate) struct Shared {
     cache: Mutex<Cache>,
     identity: Mutex<Option<Identity>>,
     connection: Mutex<Connection>,
+    /// The versions of the hub, from the last time it answered.
+    hub_versions: Mutex<Option<consort_proto::error::HubVersions>>,
     pairing: Mutex<Option<PairingCodeView>>,
     link: Mutex<Option<mpsc::UnboundedSender<Outgoing>>>,
     publish: watch::Sender<Arc<ViewState>>,
@@ -199,6 +212,8 @@ pub(crate) struct Shared {
     /// not saved while one runs, so the saved feed position never moves past
     /// a change whose data has not arrived.
     recovering: std::sync::atomic::AtomicUsize,
+    /// The images of visuals that this run asked for.
+    visual_images: Mutex<crate::visual::VisualImages>,
 }
 
 impl Shared {
@@ -274,6 +289,7 @@ impl Shared {
             cache: Mutex::new(cache),
             identity: Mutex::new(identity),
             connection: Mutex::new(connection),
+            hub_versions: Mutex::new(None),
             pairing: Mutex::new(None),
             link: Mutex::new(None),
             publish,
@@ -292,12 +308,26 @@ impl Shared {
             fresh_at: std::sync::atomic::AtomicI64::new(fresh_at),
             generation: std::sync::atomic::AtomicU64::new(0),
             recovering: std::sync::atomic::AtomicUsize::new(0),
+            visual_images: Mutex::new(crate::visual::VisualImages::default()),
         });
         shared.publish_now();
         Ok(shared)
     }
 
+    fn set_hub_versions(&self, versions: Option<consort_proto::error::HubVersions>) {
+        if let Ok(mut held) = self.hub_versions.lock() {
+            *held = versions;
+        }
+    }
+
     fn set_connection(&self, connection: Connection) {
+        // The app no longer belongs to the hub that it knew.
+        if matches!(
+            connection,
+            Connection::NotPaired | Connection::Refused { .. }
+        ) {
+            self.set_hub_versions(None);
+        }
         if let Ok(mut c) = self.connection.lock() {
             *c = connection;
         }
@@ -339,6 +369,13 @@ impl Shared {
             crate::offline::saved_data(&connection, has_data, self.fresh_at(), now),
         );
         state.worker_pairing = pairing;
+        state.hub_versions = self.hub_versions.lock().ok().and_then(|v| v.clone());
+        state.hub_url = self
+            .identity
+            .lock()
+            .ok()
+            .and_then(|i| i.as_ref().map(|i| i.config.hub_url.clone()))
+            .unwrap_or_default();
         if let Ok(uploads) = self.uploads.lock() {
             state.uploads = uploads.views();
         }
@@ -417,6 +454,10 @@ impl Shared {
         if let Ok(mut link) = self.link.lock() {
             *link = None;
         }
+        // The images belong to the old hub.
+        if let Ok(mut images) = self.visual_images.lock() {
+            images.forget_ready();
+        }
     }
 
     /// Ends the live link, so the client connects again and loads the data
@@ -436,6 +477,16 @@ impl Shared {
 
     /// Sends one request on the live link and waits for its response.
     async fn call<R: Request>(&self, body: R) -> Result<R::Response, ClientError> {
+        self.call_within(body, self.options.timeouts.call).await
+    }
+
+    /// Like [`Shared::call`], but the link waits `limit` for the answer. For
+    /// a request that the hub answers slowly, such as `visual.render`.
+    async fn call_within<R: Request>(
+        &self,
+        body: R,
+        limit: Duration,
+    ) -> Result<R::Response, ClientError> {
         // An answer from the old hub after a Pair is not used.
         let generation = self.generation();
         let id = FrameId::generate();
@@ -454,11 +505,12 @@ impl Shared {
                 frame,
                 id,
                 reply,
+                limit,
             })
             .map_err(|_| ClientError::NotConnected)?;
         // The link checks the deadline of each request. This longer limit
         // only guards against a link that stopped checking.
-        let backstop = self.options.timeouts.call * 2;
+        let backstop = limit * 2;
         let value = match tokio::time::timeout(backstop, rx).await {
             Err(_) | Ok(Ok(Err(Failure::TimedOut))) => return Err(ClientError::TimedOut),
             Ok(Err(_)) | Ok(Ok(Err(Failure::Dropped))) => return Err(ClientError::NotConnected),
@@ -580,8 +632,7 @@ pub async fn pair(
     code: &str,
     options: &ClientOptions,
 ) -> Result<Identity, ClientError> {
-    let hub_url = normalize_hub_url(hub_url)?;
-    let code: PairingCode = code.parse().map_err(|_| ClientError::BadCode)?;
+    let (hub_url, code, tls_sha256) = pair_target(hub_url, code)?;
     let mut secret = [0u8; 32];
     rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut secret);
     let key = SigningKey::from_bytes(&secret);
@@ -591,12 +642,18 @@ pub async fn pair(
         name: options.name.clone(),
         kind: options.kind,
         os: consort_proto::model::Os::from_std_os(std::env::consts::OS),
+        protocol_versions: consort_proto::frame::SUPPORTED_PROTOCOL_VERSIONS.to_vec(),
     };
     let mut builder = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
         // A redirect could send the pairing code to another address. The
         // hub answers the pairing itself.
         .redirect(reqwest::redirect::Policy::none());
+    if let Some(pin) = &tls_sha256 {
+        let config = consort_tls::pinned_client_config(pin)
+            .map_err(|e| ClientError::Other(e.to_string()))?;
+        builder = builder.tls_backend_preconfigured(config);
+    }
     // Plain `http` to a name (`hub.local`, `localhost`) passes the URL rule by
     // its spelling. Look the name up, refuse it when it points to a public
     // address, and connect to the addresses that were checked.
@@ -612,9 +669,7 @@ pub async fn pair(
         .json(&body)
         .send()
         .await
-        .map_err(|_| ClientError::Unreachable {
-            url: hub_url.clone(),
-        })?;
+        .map_err(|err| send_error(&err, &hub_url))?;
     let status = response.status();
     if status.is_redirection() {
         return Err(ClientError::Other(format!(
@@ -634,6 +689,11 @@ pub async fn pair(
         }
         return Err(match serde_json::from_str::<ErrorEnvelope>(&text) {
             Ok(env) => match env.error.code {
+                ErrorCode::ProtocolMismatch => {
+                    let (title, detail) =
+                        crate::versions::pair_error(env.error.hub_versions.as_ref());
+                    ClientError::Incompatible { title, detail }
+                }
                 ErrorCode::Unauthorized | ErrorCode::NotFound | ErrorCode::Invalid => {
                     ClientError::BadCode
                 }
@@ -652,14 +712,96 @@ pub async fn pair(
             hub_url,
             client_id: paired.client_id,
             name: options.name.clone(),
+            tls_sha256,
         },
         key,
     })
 }
 
+/// What the user gave: the address and code of an invite (a pasted pairing link
+/// or the text of a QR code) or a typed address and code. An invite is in the
+/// address field or in the code field.
+fn pair_target(
+    hub_url: &str,
+    code: &str,
+) -> Result<(String, PairingCode, Option<Sha256Hash>), ClientError> {
+    let invite = match PairingInvite::parse_text(hub_url) {
+        Ok(None) => PairingInvite::parse_text(code),
+        other => other,
+    }
+    .map_err(|err| {
+        ClientError::Other(format!("{err}. Make a new code on the hub, then try again"))
+    })?;
+    let Some(invite) = invite else {
+        let hub_url = normalize_hub_url(hub_url)?;
+        let code = code.parse().map_err(|_| ClientError::BadCode)?;
+        return Ok((hub_url, code, None));
+    };
+    let hub_url = normalize_hub_url(&invite.hub_url)?;
+    // A pin is only for `https`. A pin with plain `http` would look safe, and
+    // would check nothing.
+    if invite.tls_sha256.is_some() && !hub_url.starts_with("https://") {
+        return Err(ClientError::InvalidUrl(format!(
+            "{hub_url} has a certificate key but does not use https"
+        )));
+    }
+    Ok((hub_url, invite.code, invite.tls_sha256))
+}
+
+/// Why a pairing request did not reach the hub.
+fn send_error(err: &reqwest::Error, hub_url: &str) -> ClientError {
+    let url = hub_url.to_owned();
+    match consort_tls::certificate_problem(err) {
+        Some(consort_tls::CertificateProblem::NotThePin) => ClientError::PinMismatch { url },
+        Some(consort_tls::CertificateProblem::Untrusted) => ClientError::UntrustedHub { url },
+        None => ClientError::Unreachable { url },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const LINK: &str = "consort://pair?hub=https%3A%2F%2Fmac.local%3A7601&code=ABCD-EFGH&tls_sha256=0707070707070707070707070707070707070707070707070707070707070707";
+
+    #[test]
+    fn a_pasted_link_gives_the_address_the_code_and_the_pin() {
+        for (url, code) in [(LINK, ""), ("", LINK), (LINK, "ZZZZ-ZZZZ")] {
+            let (hub_url, code, pin) = pair_target(url, code).unwrap();
+            assert_eq!(hub_url, "https://mac.local:7601");
+            assert_eq!(code.to_string(), "ABCD-EFGH");
+            assert_eq!(pin, Some(Sha256Hash::from_bytes([7; 32])));
+        }
+    }
+
+    #[test]
+    fn a_typed_address_has_no_pin() {
+        let (hub_url, _, pin) = pair_target("https://hub.example.com/", "ABCD-EFGH").unwrap();
+        assert_eq!(hub_url, "https://hub.example.com");
+        assert_eq!(pin, None);
+        assert!(matches!(
+            pair_target("https://hub.example.com", "nope"),
+            Err(ClientError::BadCode)
+        ));
+    }
+
+    #[test]
+    fn a_pin_with_plain_http_is_refused() {
+        let text = format!(
+            r#"{{"hub_url":"http://192.168.1.5:7600","code":"ABCD-EFGH","tls_sha256":"{}"}}"#,
+            "07".repeat(32)
+        );
+        assert!(matches!(
+            pair_target(&text, ""),
+            Err(ClientError::InvalidUrl(_))
+        ));
+    }
+
+    #[test]
+    fn a_damaged_link_says_so() {
+        let err = pair_target("consort://pair?code=ABCD-EFGH", "").unwrap_err();
+        assert!(err.to_string().contains("no hub address"), "{err}");
+    }
 
     #[test]
     fn the_clock_tick_lands_just_after_a_full_minute() {

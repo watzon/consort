@@ -166,6 +166,49 @@ pub fn replace_macos_app(archive: &Path, app: &Path, verify: bool) -> Result<(),
     Ok(())
 }
 
+/// Takes the `consort` program out of a staged app file, for the hub on this
+/// computer. `Ok(None)` when the release does not carry one.
+pub fn extract_program(archive: &Path, work: &Path) -> Result<Option<PathBuf>, UpdateError> {
+    let unpacked = work.join("unpacked");
+    let _ = std::fs::remove_dir_all(&unpacked);
+    std::fs::create_dir_all(&unpacked).map_err(|e| {
+        install_error(format!(
+            "Consort could not make {}: {e}",
+            unpacked.display()
+        ))
+    })?;
+    let name = archive
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let inner = if name.ends_with(".zip") && cfg!(target_os = "macos") {
+        run(
+            "ditto",
+            &[
+                "-x".as_ref(),
+                "-k".as_ref(),
+                archive.as_os_str(),
+                unpacked.as_os_str(),
+            ],
+        )?;
+        unpacked.join("Consort.app/Contents/Helpers/consort")
+    } else if name.ends_with(".tar.gz") {
+        run(
+            "tar",
+            &[
+                "-xzf".as_ref(),
+                archive.as_os_str(),
+                "-C".as_ref(),
+                unpacked.as_os_str(),
+            ],
+        )?;
+        unpacked.join("Consort/consort")
+    } else {
+        return Ok(None);
+    };
+    Ok(inner.is_file().then_some(inner))
+}
+
 /// The program and arguments that start the app again, one second after
 /// this process asks. The shell gets the path as an argument, so no quoting
 /// can go wrong.
@@ -333,6 +376,83 @@ pub fn install_and_relaunch(
                 spawn_detached(command)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod program_tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn the_program_comes_out_of_a_linux_tarball() {
+        let dir = tempfile::tempdir().unwrap();
+        let stage = dir.path().join("stage/Consort");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::write(stage.join("consort"), b"program").unwrap();
+        let archive = dir.path().join("Consort-desktop-linux-x86_64.tar.gz");
+        let status = Command::new("tar")
+            .arg("-czf")
+            .arg(&archive)
+            .arg("-C")
+            .arg(dir.path().join("stage"))
+            .arg("Consort")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let found = extract_program(&archive, &dir.path().join("work"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(std::fs::read(found).unwrap(), b"program");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_release_with_no_program_gives_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let stage = dir.path().join("stage/Consort");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::write(stage.join("consort-desktop"), b"app").unwrap();
+        let archive = dir.path().join("Consort-desktop-linux-x86_64.tar.gz");
+        assert!(
+            Command::new("tar")
+                .arg("-czf")
+                .arg(&archive)
+                .arg("-C")
+                .arg(dir.path().join("stage"))
+                .arg("Consort")
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            extract_program(&archive, &dir.path().join("work"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_program_comes_out_of_a_macos_zip() {
+        let dir = tempfile::tempdir().unwrap();
+        let helpers = dir.path().join("stage/Consort.app/Contents/Helpers");
+        std::fs::create_dir_all(&helpers).unwrap();
+        std::fs::write(helpers.join("consort"), b"program").unwrap();
+        let archive = dir.path().join("Consort-macos-arm64.zip");
+        assert!(
+            Command::new("ditto")
+                .args(["-c", "-k", "--keepParent"])
+                .arg(dir.path().join("stage/Consort.app"))
+                .arg(&archive)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let found = extract_program(&archive, &dir.path().join("work"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(std::fs::read(found).unwrap(), b"program");
     }
 }
 

@@ -36,6 +36,7 @@ use crate::hub::{Caller, Hub};
 use crate::store::{Tx, conversation, proactivity as store, routines as routine_store};
 
 pub(crate) mod gate;
+pub(crate) mod guide;
 pub(crate) mod routines;
 mod stale;
 pub(crate) mod summary;

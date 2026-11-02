@@ -72,6 +72,10 @@ async fn status_shows_the_address_versions_folder_and_storage() {
     assert_eq!(status.hub_url, hub.url);
     assert_eq!(status.hub_version, env!("CARGO_PKG_VERSION"));
     assert_eq!(status.protocol_versions, vec![1]);
+    assert_eq!(
+        status.install,
+        Some(consort_proto::release::InstallKind::Service)
+    );
     assert_eq!(status.data_dir, hub.dir.path().display().to_string());
     assert!(status.storage.database_bytes > 0);
     assert_eq!(status.storage.blobs_bytes, b"a channel file".len() as u64);

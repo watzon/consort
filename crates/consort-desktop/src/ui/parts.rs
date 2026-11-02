@@ -257,7 +257,24 @@ pub fn error_box(id: impl Into<ElementId>, message: impl Into<SharedString>, t: 
 
 /// A text that ends with an ellipsis when it does not fit.
 pub fn line(content: impl Into<SharedString>, style: Type, color: Hsla) -> Div {
-    text(content, style, color).min_w_0().truncate()
+    text(one_line(content.into()), style, color)
+        .min_w_0()
+        .truncate()
+}
+
+/// Puts text with line breaks, such as a command with a heredoc, on one line.
+/// A truncated line can paint more lines than the height that it asked for,
+/// and then they draw over the rows below it.
+fn one_line(content: SharedString) -> SharedString {
+    if content.contains(['\n', '\r']) {
+        content
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .into()
+    } else {
+        content
+    }
 }
 
 /// The kinds of text button.
@@ -644,6 +661,17 @@ pub fn panel_tabs(tabs: Div, t: &Tokens) -> Div {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_line_with_line_breaks_stays_on_one_line() {
+        let one_line = |text: &'static str| super::one_line(text.into()).to_string();
+        assert_eq!(
+            one_line("cat > a.py <<'EOF'\n  import sys\r\nEOF"),
+            "cat > a.py <<'EOF' import sys EOF"
+        );
+        // Text with no line break keeps its spaces.
+        assert_eq!(one_line("a  b"), "a  b");
+    }
 
     #[test]
     fn scheduled_work_uses_the_routine_icon_and_not_the_clock() {

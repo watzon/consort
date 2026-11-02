@@ -14,14 +14,16 @@ use consort_proto::auth::{
     PAIRING_CODE_TTL_MS, PairClientRequest, PairClientResponse, PairWorkerRequest,
     PairWorkerResponse, PairingCode,
 };
-use consort_proto::error::{ErrorBody, ErrorCode, HttpErrorBody};
+use consort_proto::error::{ErrorBody, ErrorCode, HttpErrorBody, HubVersions};
+use consort_proto::frame::{SUPPORTED_PROTOCOL_VERSIONS, negotiate_version};
 use consort_proto::ids::{ClientId, WorkerId};
 use consort_proto::model::{Client, MachineKind, Worker, WorkerState};
 use consort_proto::time::Timestamp;
 use serde::de::DeserializeOwned;
 
 use crate::error::{HubError, Result};
-use crate::hub::Hub;
+use crate::hub::{HUB_VERSION, Hub};
+use crate::net::ws::protocol_mismatch_error;
 use crate::store::machine::{self, Origin, PairingKind};
 use crate::util::random_pairing_code;
 
@@ -115,20 +117,40 @@ fn http_error(error: ErrorBody) -> Response {
     (status, Json(HttpErrorBody { error })).into_response()
 }
 
+/// A failed pairing, with the hub version and its protocol versions. The peer
+/// has not signed in, so the error leaves out how the hub was installed.
+fn pairing_error(error: ErrorBody) -> Response {
+    http_error(error.with_hub_versions(HubVersions {
+        hub_version: HUB_VERSION.to_owned(),
+        protocol_versions: SUPPORTED_PROTOCOL_VERSIONS.to_vec(),
+        install: None,
+    }))
+}
+
+/// Refuses a peer that speaks no protocol version of this hub, before the
+/// hub looks at its code. So the code still works after the update. An older
+/// peer sends no list, and the hub does not check it.
+fn refuse_protocol(theirs: &[u32]) -> Option<Response> {
+    if theirs.is_empty() || negotiate_version(SUPPORTED_PROTOCOL_VERSIONS, theirs).is_some() {
+        return None;
+    }
+    Some(pairing_error(protocol_mismatch_error()))
+}
+
 pub(crate) fn error_response(err: &HubError) -> Response {
     http_error(err.to_error_body())
 }
 
 fn parse_body<T: DeserializeOwned>(body: &Bytes) -> std::result::Result<T, Box<Response>> {
     serde_json::from_slice(body).map_err(|e| {
-        Box::new(http_error(ErrorBody::invalid(format!(
+        Box::new(pairing_error(ErrorBody::invalid(format!(
             "The request body is not valid: {e}. Check the fields and try again."
         ))))
     })
 }
 
 fn too_many() -> Response {
-    http_error(ErrorBody::new(
+    pairing_error(ErrorBody::new(
         ErrorCode::PolicyDenied,
         "Too many pairing attempts. Wait a minute, then try again.",
     ))
@@ -158,9 +180,12 @@ pub(crate) async fn pair_worker(
         Ok(request) => request,
         Err(response) => return *response,
     };
+    if let Some(refused) = refuse_protocol(&request.protocol_versions) {
+        return refused;
+    }
     match hub.pair_worker(request).await {
         Ok(response) => Json(response).into_response(),
-        Err(err) => error_response(&err),
+        Err(err) => pairing_error(err.to_error_body()),
     }
 }
 
@@ -176,9 +201,12 @@ pub(crate) async fn pair_session_host(
         Ok(request) => request,
         Err(response) => return *response,
     };
+    if let Some(refused) = refuse_protocol(&request.protocol_versions) {
+        return refused;
+    }
     match hub.pair_machine(request, MachineKind::SessionHost).await {
         Ok(response) => Json(response).into_response(),
-        Err(err) => error_response(&err),
+        Err(err) => pairing_error(err.to_error_body()),
     }
 }
 
@@ -194,9 +222,12 @@ pub(crate) async fn pair_client(
         Ok(request) => request,
         Err(response) => return *response,
     };
+    if let Some(refused) = refuse_protocol(&request.protocol_versions) {
+        return refused;
+    }
     match hub.pair_client(request).await {
         Ok(response) => Json(response).into_response(),
-        Err(err) => error_response(&err),
+        Err(err) => pairing_error(err.to_error_body()),
     }
 }
 
@@ -413,6 +444,7 @@ mod tests {
                 name: "Guess".to_owned(),
                 kind: consort_proto::model::ClientKind::Desktop,
                 os: None,
+                protocol_versions: Vec::new(),
             })
             .await;
         assert_eq!(result.unwrap_err().code(), ErrorCode::Unauthorized);

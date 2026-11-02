@@ -1,6 +1,6 @@
 //! The errors of the link to the hub.
 
-use consort_proto::error::ErrorCode;
+use consort_proto::error::{ErrorCode, HubVersions};
 
 /// The errors of the link to the hub.
 #[derive(Debug, thiserror::Error)]
@@ -28,6 +28,14 @@ pub enum LinkError {
         /// The message.
         message: String,
     },
+    /// The hub and this machine have no common protocol version.
+    #[error("the hub and this machine speak no common protocol version: {message}")]
+    ProtocolMismatch {
+        /// The message of the hub.
+        message: String,
+        /// The versions of the hub. An older hub leaves them out.
+        hub_versions: Option<HubVersions>,
+    },
     /// The hub could not be reached.
     #[error("could not reach the hub: {0}")]
     Network(String),
@@ -37,6 +45,21 @@ pub enum LinkError {
     /// A frame is larger than the 1 MiB frame limit.
     #[error("the frame is too large to send: {0}")]
     TooLarge(String),
+}
+
+impl From<consort_proto::error::ErrorBody> for LinkError {
+    fn from(body: consort_proto::error::ErrorBody) -> Self {
+        match body.code {
+            ErrorCode::ProtocolMismatch => Self::ProtocolMismatch {
+                message: body.message,
+                hub_versions: body.hub_versions,
+            },
+            code => Self::Hub {
+                code,
+                message: body.message,
+            },
+        }
+    }
 }
 
 impl LinkError {

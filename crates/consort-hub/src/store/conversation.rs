@@ -369,6 +369,7 @@ impl Tx<'_> {
         let db = self.db();
         for sql in [
             "DELETE FROM search_idx WHERE channel_id = ?1",
+            "DELETE FROM visual_images WHERE message_id IN (SELECT id FROM messages WHERE channel_id = ?1)",
             "DELETE FROM messages WHERE channel_id = ?1",
             "DELETE FROM read_markers WHERE channel_id = ?1",
             "DELETE FROM session_items WHERE session_id IN (SELECT id FROM sessions WHERE channel_id = ?1)",
@@ -513,9 +514,11 @@ impl Tx<'_> {
         self.emit(EntityPayload::Message(message.clone()))
     }
 
-    /// Deletes a message row. The feed gets a delete.
+    /// Deletes a message row and the cached images of a visual. The feed
+    /// gets a delete.
     pub fn purge_message(&mut self, message: &Message) -> Result<()> {
         let key = message.id.to_string();
+        self.delete_visual_images(message.id)?;
         self.db()
             .execute("DELETE FROM messages WHERE id = ?1", [&key])?;
         self.unindex_search("message", &key)?;

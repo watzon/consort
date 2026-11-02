@@ -27,6 +27,7 @@ The first build, started 2026-10-29 while the user was away. It builds the deskt
 | D | Up to three review cycles with independent reviewer agents | Lead | Done, three cycles |
 | E | [HUB-PLAN.md](HUB-PLAN.md): the hub machine owns accounts and agents, worker limits in the app | Agent | Built. Claude Code is on. A real model on Linux and a token refresh did not run, so step 4 of the plan is not done. See [E2E.md](E2E.md) |
 | F | Monid and access requests (ADR 0016, 0017) | Lead and agent | Built: hub, client and app. One real paid run went through the hub client. A full real turn through a session has not run |
+| G | [ONBOARDING-PLAN.md](ONBOARDING-PLAN.md): first run | Agent | Phases 1 to 6 built, not committed. No real model has run the guide of phase 5. `hub.sh` has never run on a real server. The Mac keychain limit is deferred (ADR 0018) |
 
 Agents use their own build folder to avoid lock waits: `CARGO_TARGET_DIR=target/<crate-or-agent>`. Agents do not run git. The lead commits at each integration point.
 

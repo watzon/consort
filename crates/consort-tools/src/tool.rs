@@ -10,7 +10,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 /// One managed tool.
 ///
 /// The string form is `node`, `claude-code`, `claude-agent-acp`, `codex`,
-/// `opencode`, `gemini-cli` or `acp:<registry id>`.
+/// `opencode`, `gemini-cli`, `chrome-headless-shell` or `acp:<registry id>`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum ToolId {
     /// Node.js 24 LTS. The npm based tools run on it.
@@ -25,13 +25,16 @@ pub enum ToolId {
     OpenCode,
     /// Gemini CLI, launched with `--acp`.
     GeminiCli,
+    /// The preview browser: `chrome-headless-shell` from Chrome for Testing.
+    /// The session host renders visuals with it. It is not a provider.
+    ChromeHeadlessShell,
     /// An agent from the ACP registry. The value is the registry id.
     Acp(String),
 }
 
 impl ToolId {
     /// The tools that Consort knows by name, in display order.
-    pub fn builtin() -> [ToolId; 6] {
+    pub fn builtin() -> [ToolId; 7] {
         [
             ToolId::Node,
             ToolId::ClaudeCode,
@@ -39,6 +42,7 @@ impl ToolId {
             ToolId::Codex,
             ToolId::OpenCode,
             ToolId::GeminiCli,
+            ToolId::ChromeHeadlessShell,
         ]
     }
 
@@ -63,6 +67,8 @@ impl ToolId {
             ToolId::Codex => "Codex",
             ToolId::OpenCode => "OpenCode",
             ToolId::GeminiCli => "Gemini CLI",
+            // The user does not need to know that it is Chrome.
+            ToolId::ChromeHeadlessShell => "Preview browser",
             ToolId::Acp(id) => id,
         }
     }
@@ -109,6 +115,7 @@ impl fmt::Display for ToolId {
             ToolId::Codex => f.write_str("codex"),
             ToolId::OpenCode => f.write_str("opencode"),
             ToolId::GeminiCli => f.write_str("gemini-cli"),
+            ToolId::ChromeHeadlessShell => f.write_str("chrome-headless-shell"),
             ToolId::Acp(id) => write!(f, "acp:{id}"),
         }
     }
@@ -130,6 +137,7 @@ impl FromStr for ToolId {
             "codex" => Ok(ToolId::Codex),
             "opencode" => Ok(ToolId::OpenCode),
             "gemini-cli" => Ok(ToolId::GeminiCli),
+            "chrome-headless-shell" => Ok(ToolId::ChromeHeadlessShell),
             other => match other.strip_prefix("acp:") {
                 Some(id) if valid_registry_id(id) => Ok(ToolId::Acp(id.to_owned())),
                 _ => Err(ParseToolIdError(other.to_owned())),
@@ -211,6 +219,7 @@ mod tests {
             (ToolId::Codex, "codex"),
             (ToolId::OpenCode, "opencode"),
             (ToolId::GeminiCli, "gemini-cli"),
+            (ToolId::ChromeHeadlessShell, "chrome-headless-shell"),
             (ToolId::Acp("goose".into()), "acp:goose"),
         ];
         for (tool, text) in cases {
@@ -250,6 +259,15 @@ mod tests {
         assert_eq!(ToolId::from_dir_name("acp-"), None);
         assert_eq!(ToolId::from_dir_name(".tmp-1"), None);
         assert_eq!(ToolId::from_dir_name("state.json"), None);
+    }
+
+    #[test]
+    fn the_preview_browser_is_a_built_in_tool_with_no_dependencies() {
+        let tool = ToolId::ChromeHeadlessShell;
+        assert_eq!(ToolId::builtin().last(), Some(&tool));
+        assert_eq!(tool.display_name(), "Preview browser");
+        assert_eq!(tool.dir_name(), "chrome-headless-shell");
+        assert!(tool.dependencies().is_empty());
     }
 
     #[test]

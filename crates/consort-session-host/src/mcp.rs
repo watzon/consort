@@ -5,7 +5,9 @@
 //! harness gets the token. The worker is the MCP server: it gets the tool
 //! list from the hub with `tool.list` and forwards each call as `tool.call`.
 //! For `publish_artifact`, the worker uploads the file first and adds the
-//! blob hash to the call.
+//! blob hash to the call. The visual tools are in [`visual`]: the session
+//! host answers `preview_visual` itself, and prepares `show_visual` before
+//! it forwards the call.
 
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -21,7 +23,9 @@ use consort_proto::execution_link::ExecTool;
 use consort_proto::ids::SessionId;
 use consort_proto::model::Sha256Hash;
 use consort_proto::session_host_link::ToolCall;
-use consort_proto::tools::{PublishArtifactArgs, ToolCallResult, ToolContent, ToolDefinition};
+use consort_proto::tools::{
+    HubTool, PublishArtifactArgs, ToolCallResult, ToolContent, ToolDefinition,
+};
 use rand::RngCore;
 use rmcp::ErrorData as McpError;
 use rmcp::RoleServer;
@@ -41,6 +45,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::HostError;
 use crate::exec_tools::ExecTools;
+use crate::visual::VisualEngine;
+
+pub mod visual;
+
+pub use visual::WorkerRoot;
 
 /// The most bytes that `publish_artifact` uploads (64 MiB).
 pub const MAX_ARTIFACT_BYTES: u64 = 64 * 1024 * 1024;
@@ -61,6 +70,13 @@ pub trait ToolBackend: Send + Sync {
     async fn call_tool(&self, call: ToolCall) -> Result<ToolCallResult, ErrorBody>;
     /// Uploads a blob to the hub.
     async fn upload_blob(&self, sha256: &Sha256Hash, bytes: Vec<u8>) -> Result<(), ErrorBody>;
+    /// Downloads a blob from the hub, at most `max_bytes`. The caller
+    /// checks the hash.
+    async fn download_blob(
+        &self,
+        sha256: &Sha256Hash,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>, ErrorBody>;
 }
 
 /// A running MCP endpoint.
@@ -132,13 +148,33 @@ async fn require_bearer(
     }
 }
 
+/// What a session gives its endpoint.
+pub struct McpSession {
+    /// The session.
+    pub session_id: SessionId,
+    /// The folder of the session on this machine. A coordinator reads its
+    /// files here.
+    pub workspace: PathBuf,
+    /// The hub tools.
+    pub backend: Arc<dyn ToolBackend>,
+    /// The tools that run on a worker. A coordinator has none.
+    pub exec: Option<Arc<ExecTools>>,
+    /// The workspace root on the worker, for a task session.
+    pub worker_root: Option<WorkerRoot>,
+    /// The renderer of visuals.
+    pub visual: Arc<dyn VisualEngine>,
+}
+
 /// Starts the endpoint of a session.
-pub async fn start(
-    session_id: SessionId,
-    workspace: PathBuf,
-    backend: Arc<dyn ToolBackend>,
-    exec: Option<Arc<ExecTools>>,
-) -> Result<McpEndpoint, HostError> {
+pub async fn start(session: McpSession) -> Result<McpEndpoint, HostError> {
+    let McpSession {
+        session_id,
+        workspace,
+        backend,
+        exec,
+        worker_root,
+        visual,
+    } = session;
     let token = random_token();
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
@@ -153,6 +189,8 @@ pub async fn start(
         workspace,
         backend,
         exec,
+        worker_root,
+        visual,
         tools: tools.clone(),
         calls: Arc::new(AtomicU64::new(0)),
     };
@@ -192,6 +230,9 @@ struct HubToolsServer {
     backend: Arc<dyn ToolBackend>,
     /// The tools that run on a worker. A coordinator has none.
     exec: Option<Arc<ExecTools>>,
+    /// The workspace root on the worker. A coordinator has none.
+    worker_root: Option<WorkerRoot>,
+    visual: Arc<dyn VisualEngine>,
     tools: ToolCache,
     calls: Arc<AtomicU64>,
 }
@@ -210,6 +251,7 @@ fn to_mcp_result(result: ToolCallResult) -> CallToolResult {
         .into_iter()
         .map(|c| match c {
             ToolContent::Text { text } => ContentBlock::text(text),
+            ToolContent::Image { data, mime_type } => ContentBlock::image(data, mime_type),
         })
         .collect();
     let mut out = if result.is_error {
@@ -346,13 +388,19 @@ impl HubToolsServer {
         if let (Some(exec), Some(tool)) = (&self.exec, ExecTool::from_name(&name)) {
             return exec.call(tool, arguments, tool_use_id).await;
         }
-        let arguments = if name == "publish_artifact" {
-            match self.publish_arguments(arguments).await {
-                Ok(a) => a,
-                Err(e) => return ToolCallResult::error(&e),
-            }
+        if name == HubTool::PreviewVisual.name() {
+            return self.preview_visual(arguments).await;
+        }
+        let prepared = if name == HubTool::PublishArtifact.name() {
+            self.publish_arguments(arguments).await
+        } else if name == HubTool::ShowVisual.name() {
+            self.show_visual_arguments(arguments).await
         } else {
-            arguments
+            Ok(arguments)
+        };
+        let arguments = match prepared {
+            Ok(a) => a,
+            Err(e) => return ToolCallResult::error(&e),
         };
         let call_id = format!(
             "{}-{}",

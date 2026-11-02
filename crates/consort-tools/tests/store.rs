@@ -8,7 +8,7 @@ mod common;
 use std::sync::Arc;
 
 use common::*;
-use consort_tools::{ToolError, ToolId, ToolState, ToolStatus};
+use consort_tools::{Arch, Libc, Os, Platform, ToolError, ToolId, ToolState, ToolStatus};
 
 fn status_of(statuses: &[ToolStatus], tool: &ToolId) -> ToolStatus {
     statuses
@@ -281,6 +281,7 @@ async fn launch_specs_for_every_tool() {
     server.put_registry();
     server.put_npm_latest("@agentclientprotocol/claude-agent-acp", "0.99.0");
     server.put_npm_latest("@google/gemini-cli", "0.66.0");
+    server.put_chrome();
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().join("tools");
     let log = temp.path().join("npm.log");
@@ -295,6 +296,7 @@ async fn launch_specs_for_every_tool() {
         ToolId::GeminiCli,
         ToolId::Codex,
         ToolId::OpenCode,
+        ToolId::ChromeHeadlessShell,
         ToolId::Acp("fake-npx".into()),
         ToolId::Acp("rawbin".into()),
     ] {
@@ -367,6 +369,15 @@ async fn launch_specs_for_every_tool() {
         ]
     );
 
+    let chrome = store.launch(&ToolId::ChromeHeadlessShell).unwrap();
+    assert_eq!(
+        chrome.program,
+        root.join(format!(
+            "chrome-headless-shell/{CHROME_VERSION}/chrome-headless-shell"
+        ))
+    );
+    assert!(chrome.args.is_empty() && chrome.env.is_empty());
+
     let npx = store.launch(&ToolId::Acp("fake-npx".into())).unwrap();
     assert_eq!(npx.program, node);
     assert_eq!(
@@ -433,4 +444,208 @@ async fn a_failed_npm_install_leaves_nothing() {
     assert!(store.installed(&ToolId::Node).is_some());
     let status = status_of(&store.status(), &tool);
     assert_eq!(status.state, ToolState::Failed);
+}
+
+// The preview browser ---------------------------------------------------------
+
+fn chrome_zip_path() -> String {
+    format!("/chrome/{CHROME_VERSION}/mac-arm64/{CHROME_ZIP}")
+}
+
+#[tokio::test]
+async fn the_preview_browser_installs_and_launches() {
+    let server = Server::start().await;
+    server.put_chrome();
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("tools");
+    let store = store(&server, &root, None);
+    let tool = ToolId::ChromeHeadlessShell;
+
+    let installed = store.install(&tool, None).await.unwrap();
+    assert_eq!(installed.version, CHROME_VERSION);
+    assert_eq!(
+        installed.dir,
+        root.join(format!("chrome-headless-shell/{CHROME_VERSION}"))
+    );
+    // The top folder of the zip is gone. The other files stay in place.
+    assert_eq!(
+        names(&installed.dir),
+        ["chrome-headless-shell", "icudtl.dat", "locales"]
+    );
+    assert!(installed.dir.join("locales/en-US.pak").is_file());
+    assert_eq!(
+        names(&root.join("chrome-headless-shell")),
+        [CHROME_VERSION, "current"]
+    );
+    assert_eq!(store.installed(&tool), Some(installed.clone()));
+
+    let spec = store.launch(&tool).unwrap();
+    assert_eq!(spec.program, installed.dir.join("chrome-headless-shell"));
+    assert!(spec.program.is_file());
+    assert!(spec.args.is_empty());
+    assert!(spec.env.is_empty());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode();
+        // The zip had no execute bits. The program is executable anyway.
+        assert_eq!(mode(&spec.program) & 0o111, 0o111);
+        assert_eq!(mode(&installed.dir.join("icudtl.dat")) & 0o111, 0);
+    }
+    assert_eq!(status_of(&store.status(), &tool).state, ToolState::Ready);
+    assert_eq!(server.hits(&chrome_zip_path()), 1);
+}
+
+#[tokio::test]
+async fn a_changed_preview_browser_zip_is_refused_and_leaves_nothing() {
+    let server = Server::start().await;
+    // Same size, one byte changed. The pin has the hash of the real zip.
+    let mut changed = chrome_zip();
+    let last = changed.len() - 1;
+    changed[last] ^= 1;
+    server.put(&chrome_zip_path(), changed);
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("tools");
+    let store = store(&server, &root, None);
+    let tool = ToolId::ChromeHeadlessShell;
+
+    let result = store.install(&tool, None).await;
+    assert!(
+        matches!(result, Err(ToolError::ChecksumMismatch { .. })),
+        "{result:?}"
+    );
+    assert!(!root.join("chrome-headless-shell").exists());
+    assert_eq!(store.installed(&tool), None);
+    let status = status_of(&store.status(), &tool);
+    assert_eq!(status.state, ToolState::Failed);
+    assert!(status.detail.unwrap().contains("checksum mismatch"));
+}
+
+#[tokio::test]
+async fn a_preview_browser_zip_of_the_wrong_size_is_refused_and_leaves_nothing() {
+    let size = chrome_zip().len() as u64;
+    // The pin is one byte shorter, so the download stops when it has more.
+    // The pin is one byte longer, so the file ends too early.
+    for (pinned, name) in [(size - 1, "too long"), (size + 1, "too short")] {
+        let server = Server::start().await;
+        server.put_chrome();
+        let mut pin = chrome_pin();
+        pin.files[0].bytes = pinned;
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("tools");
+        let store = store_with(&server, &root, None, test_platform(), pin);
+
+        let result = store.install(&ToolId::ChromeHeadlessShell, None).await;
+        match result {
+            Err(ToolError::SizeMismatch {
+                expected, actual, ..
+            }) => {
+                assert_eq!(expected, pinned, "{name}");
+                assert_eq!(actual, size, "{name}");
+            }
+            other => panic!("{name}: {other:?}"),
+        }
+        assert!(!root.join("chrome-headless-shell").exists(), "{name}");
+        let status = status_of(&store.status(), &ToolId::ChromeHeadlessShell);
+        assert_eq!(status.state, ToolState::Failed, "{name}");
+        assert!(status.detail.unwrap().contains("wrong size"), "{name}");
+    }
+}
+
+#[tokio::test]
+async fn the_preview_browser_has_no_build_for_musl_linux_or_a_platform_without_a_pin() {
+    let server = Server::start().await;
+    server.put_chrome();
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("tools");
+    let tool = ToolId::ChromeHeadlessShell;
+
+    let musl = Platform::new(Os::Linux, Arch::X64, Libc::Musl);
+    let store = store_with(&server, &root, None, musl, chrome_pin());
+    let result = store.install(&tool, None).await;
+    assert!(
+        matches!(result, Err(ToolError::UnsupportedPlatform { .. })),
+        "{result:?}"
+    );
+
+    let mut no_files = chrome_pin();
+    no_files.files.clear();
+    let store = store_with(&server, &root, None, test_platform(), no_files);
+    let result = store.install(&tool, None).await;
+    assert!(
+        matches!(result, Err(ToolError::UnsupportedPlatform { .. })),
+        "{result:?}"
+    );
+    assert_eq!(server.hits(&chrome_zip_path()), 0);
+    assert!(!root.join("chrome-headless-shell").exists());
+}
+
+#[tokio::test]
+async fn only_the_pinned_preview_browser_version_installs() {
+    let server = Server::start().await;
+    server.put_chrome();
+    server.put_chrome_at("155.0.0.1");
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("tools");
+    let store = store(&server, &root, None);
+
+    let result = store
+        .install(&ToolId::ChromeHeadlessShell, Some("155.0.0.1"))
+        .await;
+    assert!(
+        matches!(result, Err(ToolError::Unsupported { .. })),
+        "{result:?}"
+    );
+    assert_eq!(
+        server.hits(&format!("/chrome/155.0.0.1/mac-arm64/{CHROME_ZIP}")),
+        0
+    );
+    assert!(!root.join("chrome-headless-shell").exists());
+}
+
+#[tokio::test]
+async fn the_preview_browser_latest_is_the_pin_and_an_update_check_makes_no_request() {
+    // The server has no file at all. A request would answer 404.
+    let server = Server::start().await;
+    let temp = tempfile::tempdir().unwrap();
+    let store = store(&server, temp.path(), None);
+    let tool = ToolId::ChromeHeadlessShell;
+
+    assert_eq!(store.latest(&tool).await.unwrap(), CHROME_VERSION);
+    let chrome = status_of(&store.check_updates().await, &tool);
+    assert_eq!(chrome.state, ToolState::Missing);
+    assert_eq!(chrome.latest.as_deref(), Some(CHROME_VERSION));
+    assert_eq!(chrome.detail, None, "the check asked the network");
+}
+
+#[tokio::test]
+async fn a_new_pin_makes_the_installed_preview_browser_an_update() {
+    let server = Server::start().await;
+    server.put_chrome_at("9.9.9.0");
+    server.put_chrome();
+    let temp = tempfile::tempdir().unwrap();
+    let tool = ToolId::ChromeHeadlessShell;
+
+    let old = store_with(
+        &server,
+        temp.path(),
+        None,
+        test_platform(),
+        chrome_pin_at("9.9.9.0"),
+    );
+    old.install(&tool, None).await.unwrap();
+    let status = status_of(&old.check_updates().await, &tool);
+    assert_eq!(status.state, ToolState::Ready);
+
+    // A new release of Consort pins a newer version.
+    let new = store(&server, temp.path(), None);
+    let status = status_of(&new.check_updates().await, &tool);
+    assert_eq!(status.state, ToolState::UpdateAvailable);
+    assert_eq!(status.version.as_deref(), Some("9.9.9.0"));
+    assert_eq!(status.latest.as_deref(), Some(CHROME_VERSION));
+
+    new.install(&tool, None).await.unwrap();
+    let status = status_of(&new.status(), &tool);
+    assert_eq!(status.state, ToolState::Ready);
+    assert_eq!(status.version.as_deref(), Some(CHROME_VERSION));
 }

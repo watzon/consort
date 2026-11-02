@@ -24,9 +24,9 @@ The system copies the user-facing shape of Claude Duet: one assistant, a Tutti c
                    |  routines, placement,       |
                    |  hub tools, push            |
                    |  +-----------------------+  |
-                   |  | Worker on the hub     |  |
-                   |  | (coordinators run     |  |
-                   |  | here by default)      |  |
+                   |  | Session host          |  |
+                   |  | (accounts, CLIs and   |  |
+                   |  | coordinators run here)|  |
                    |  +-----------------------+  |
                    +-----------------------------+
                       ^           ^           ^
@@ -40,10 +40,11 @@ The system copies the user-facing shape of Claude Duet: one assistant, a Tutti c
 There are three roles:
 
 - **The hub** stores everything and decides what runs where. It runs on a VPS, off the home network, so it stays up and stays reachable from a phone when the home network is down. The hub runs no model itself.
-- **A worker** runs sessions. It owns the harness logins, the repo checkouts, the shell and the access to its local network. Every worker dials out to the hub, so a worker needs no open ports and can sit behind NAT.
+- **The session host** runs on the hub machine. It owns the harness CLIs, the accounts and the sign-ins, and it runs every session, coordinators included, in a boundary. It is a separate process with its own credentials. See ADR 0015.
+- **A worker** is a machine where work runs. It owns the repo checkouts, the shell and the access to its local network. It has no account and no CLI. Every worker dials out to the hub, so a worker needs no open ports and can sit behind NAT.
 - **A client** shows the conversation and sends the user's input. Clients talk only to the hub.
 
-The hub machine can also run a worker, the way a Kubernetes control-plane node can also run workloads. That worker is where coordinators run by default, so the assistant keeps answering when every home machine is offline.
+The hub machine can also run a worker, the way a Kubernetes control-plane node can also run workloads. Coordinators need no worker: they run in the session host, so the assistant keeps answering when every home machine is offline. The hub, the session host and a worker can run on the user's own Mac or Linux computer, in one service (see "A hub on this computer" below and ADR 0018).
 
 ## How a message becomes work
 
@@ -94,6 +95,12 @@ A coordinator does no shell, web or file work: it starts a task for that. The pr
 The Tutti coordinator has three more tools: `list_channels`, `read_channel` and `message_channel`. With those, it can answer questions about any channel, and it can steer a channel by posting a message in that channel. It also has the management tools for channels, workers, accounts, connections and skills (see [Connectors, skills and management](#connectors-skills-and-management)). It writes only global memory. Channel coordinators read global memory and write only their own channel memory. That split comes straight from Duet: the main chat sees everything but owns only the facts about the user.
 
 Memory changes move up one level at a time. A task that learns something, such as "never push to main", calls `suggest_memory`. Its channel coordinator gets the suggestion in its next turn and decides whether to write a channel memory note. A channel coordinator that learns a fact about the user suggests it to the Tutti coordinator in the same way. So the assistant keeps one memory with one owner for each scope, and every note has a coordinator that chose to keep it.
+
+### The first conversation
+
+The hub starts the first conversation. When the first account signs in on a hub with no history, the hub stores `first_greeting` in `meta`, sets the guide state to `running`, posts the notice "You signed in to Claude. The assistant can answer now." and queues a `first_sign_in` wake in Tutti, in one write. The wake uses the usual proactive gate and turn. While the guide runs, the prompt of Tutti holds `prompts/guide.md`. The change of prompt starts a new coordinator session when the guide starts and when it ends, so the rules are gone after the end. A prompt holds rules. Only tools change state: `set_user_name`, `memory_write`, `connect_service`, `add_worker`, `create_channel` and `finish_guide`.
+
+The assistant never holds a secret of setup. A worker card has no code: the client makes the code and shows the command. A connect card has no key: the client sends the key with `composio.set_key`. The CLI caps the WebSocket library at the `info` log level, because at its trace level this library logs whole frames.
 
 ### Why the coordinator speaks through tools
 
@@ -201,6 +208,10 @@ Consort, not the provider of each harness, is the source of the assistant's conn
 - **Management.** The Tutti coordinator manages everything, and a channel's coordinator manages its own channel. The hub enforces the risk rule: a narrow or stricter change runs at once, and a change that deletes, widens access, loosens approvals, turns on scripts or changes tags waits for the user. The assistant never handles a secret.
 - **Provider extras.** What a provider syncs to an account, such as claude.ai connectors, is always off, as far as the provider lets the session host turn it off. There is no setting. Connectors and skills come from Consort only (ADR 0011).
 
+## Visuals
+
+A visual is an HTML page that the assistant shows in the timeline. The session host has the only renderer: one headless `chrome-headless-shell`, which it starts on the first use and stops after 5 minutes with no work. It answers `preview_visual` itself and sends nothing to the hub. It prepares the page of `show_visual` before the hub posts it: the page check, the local images from the workspace (on the worker for a task), the upload and the height table. It draws the image of a visual when the hub sends `visual.render` for a client. The page reaches the network only through a SOCKS5 proxy in the session host that refuses private addresses. The browser keeps its sandbox. Only the operator can turn it off, with `CONSORT_VISUAL_NO_SANDBOX=1`. The managed browser installs on the first use, and `CONSORT_VISUAL_CHROME` names another browser. See [VISUALS-PLAN.md](VISUALS-PLAN.md#renderer-session-host).
+
 ## Placement
 
 Placement makes two separate choices. The model selection chooses one harness account in the session host. The placement request chooses the execution worker where the tools of the task run. The second choice follows these steps in order:
@@ -276,30 +287,34 @@ The mobile app is Expo or native Swift and Kotlin. We choose later, after a spik
 
 ## Code layout
 
-One Cargo workspace:
+One Cargo workspace. `CLAUDE.md` has the table with the dependency rules.
 
 | Crate | Contents |
 |---|---|
-| `proto` | Wire types for the client API, the worker link and the hub tools. No I/O |
-| `harness` | The `Harness` and `HarnessSession` traits and the adapters, one feature per adapter |
-| `link` | The dial-out link that the session host and the worker share: pairing, keys, spool, reconnect |
-| `session-host` | The session host: accounts and their profile folders, sign-in flows, managed CLIs, sessions in a boundary, the MCP endpoint and the tool surface |
-| `worker` | The execution worker: journal, processes, files, workspaces, inventory |
-| `tools` | Managed tools: downloads, checks, install layout and launch specs. No hub I/O |
-| `hub` | The hub server: HTTP and WebSocket (axum), SQLite store, feed, scheduler, coordinator queues, placement, hub tools, push |
-| `client-core` | The shared client logic |
-| `client-ffi` | UniFFI bindings over `client-core`, for mobile |
-| `desktop` | The GPUI app |
-| `testkit` | A fake harness, a fake worker and contract tests |
-| `app` | The command-line program with `hub`, `worker`, `pair` and `mcp-bridge` subcommands |
+| `consort-proto` | Wire types for the client API, the worker link and the hub tools, and the release, local-hub and log rules. No I/O |
+| `consort-theme` | Theme files, contrast checks, and the GPUI Kit theme |
+| `consort-tls` | The certificate pin: the verifier and the hash that a hub on This network and its peers share |
+| `consort-harness` | The `Harness` and `HarnessSession` traits and the adapters, one feature per adapter |
+| `consort-tools` | Managed tools: downloads, checks, install layout and launch specs. No hub I/O |
+| `consort-link` | The dial-out link that the session host and the worker share: pairing, keys, spool, reconnect, and the program swap for an update |
+| `consort-session-host` | The session host: accounts and their profile folders, sign-in flows, managed CLIs, sessions in a boundary, the MCP endpoint and the tool surface |
+| `consort-worker` | The execution worker: journal, processes, files, workspaces, inventory |
+| `consort-hub` | The hub server: HTTP and WebSocket (axum), SQLite store, feed, scheduler, coordinator queues, placement, hub tools, reach |
+| `consort-dictation` | One live dictation on the Sayso SDK. No GPUI and no hub I/O |
+| `consort-client` | The shared client logic: connection, cache, view state, the local hub module, the setup gate |
+| `consort-desktop` | The GPUI app |
+| `consort-testkit` | A fake harness, a fake worker and contract tests |
+| `consort-cli` | The `consort` program with `hub`, `worker`, `session-host`, `local`, `dev` and `mcp-bridge` subcommands |
 
-The binary name `app` is a placeholder until the product has a name.
+A UniFFI crate over `consort-client` for mobile (`client-ffi`) does not exist yet.
 
 ## Deployment
 
-**Hub.** One binary and one data folder (`hub.db` and `blobs/`). It listens on a local address and does not serve HTTPS itself: a reverse proxy such as Caddy does, with automatic certificates (decision: a documented proxy is enough, no built-in ACME). It runs as a hardened systemd service (`deploy/hub/consort-hub.service`) or as a container (`Dockerfile`, `deploy/hub/docker-compose.yml`). To run a worker on the same machine, install it as a user service with `consort worker install`. The steps are in [deploy.md](deploy.md). Settings > Hub backs the hub up: Back up now, or a daily or weekly schedule that the hub runs itself. A backup is one tar archive in a folder on the hub machine, with a consistent copy of `hub.db` from SQLite's online backup, the keys and every blob (see [data-model.md](data-model.md#backups)). The hub keeps the last N archives.
+**Hub.** One binary and one data folder (`hub.db` and `blobs/`). It listens on a local address and does not serve HTTPS itself. Tailscale Serve gives it an address on the tailnet (`consort hub reach tailscale`), or a reverse proxy such as Caddy serves it with automatic certificates (decision: a documented proxy is enough, no built-in ACME). `scripts/install/hub.sh` installs the hub and the session host on a Linux server with one command and picks one of these two ways. It runs as a hardened systemd service (`deploy/hub/consort-hub.service`) or as a container (`Dockerfile`, `deploy/hub/docker-compose.yml`). To run a worker on the same machine, install it as a user service with `consort worker install`. The steps are in [deploy.md](deploy.md). Settings > Hub backs the hub up: Back up now, or a daily or weekly schedule that the hub runs itself. A backup is one tar archive in a folder on the hub machine, with a consistent copy of `hub.db` from SQLite's online backup, the keys and every blob (see [data-model.md](data-model.md#backups)). The hub keeps the last N archives.
 
 To restore, stop the hub and run `consort hub restore <backup> --data <data folder>` on the hub machine. It refuses to run while a hub uses the folder, refuses a file that is not a Consort backup (or that a newer hub made), and refuses a folder that is not empty unless you add `--force`. With `--force`, the database, the blobs, the keys and the backup settings that were in the folder move to `before-restore-<time>/` in it first, so nothing is lost. The restore checks every blob hash and runs SQLite's integrity check before it changes the folder. Then start the hub as before. The clients and workers that were paired when the backup was made connect again with their keys.
+
+**A hub on this computer.** `consort local` runs the hub, the session host as its child, and a worker in one per-user service, with no admin rights, under the Consort folder. The hub listens on a free loopback port, and `local/state.json` holds the address. `hub.status` reports the install kind `local`. On this path the session host and the worker run as the same user, so the boundary is the only thing between an agent and the files of the user. Windows has no local path. `consort_client::local_hub` finds the program in the app, runs the commands and sees a hub that stopped. The desktop app calls it. See [install.md](install.md#a-hub-on-this-computer).
 
 **Session host.** It runs on the hub machine, as its own user, with its own unit (`deploy/session-host/consort-session-host.service`) or its own image (`deploy/session-host/Dockerfile`). The hardened hub unit stays as it is, because bubblewrap cannot run under it. Harness logins and managed tools live in its folder. In Docker, bubblewrap needs the narrow seccomp profile in `deploy/session-host/seccomp.json`. `scripts/dev.sh` starts it as a child of `consort dev`, and on a Mac it uses `sandbox-exec`, with a warning in Settings > Hub.
 
@@ -318,14 +333,15 @@ To restore, stop the hub and run `consort hub restore <backup> --data <data fold
 The hub can tell any worker to run a harness, and a harness can run commands. So the hub is the most valuable target in the system. The hub controls the workers, and a stolen hub compromises them. That is accepted, as a stolen laptop with SSH keys is (see the owner's decision below). The design limits what else a stolen hub gives away:
 
 - **Model credentials stay in the session host.** Subscription logins stay in each account's profile folder in the session host, in the harness's own files or keychain entry, and Consort never reads them. An API key goes once from the app through the hub to the session host, which writes it to `env.json` in the profile folder. The hub process never stores or logs it. The code that the user pastes during a Claude sign-in goes the same way to the stdin of `claude auth login`, and nobody stores it. See ADR 0015. A key of an API endpoint for the command check is different: the hub keeps it in its database, because the hub calls the endpoint.
-- **A session runs in a boundary.** Bubblewrap on Linux, `sandbox-exec` on a Mac in development, and a network proxy per session that allows only the hosts of that provider. With no boundary, no session starts. Each session has its own MCP token.
+- **A session runs in a boundary.** Bubblewrap on Linux, `sandbox-exec` on a Mac (the UI calls it a development sandbox, and the keychain limit is open, see ADR 0018), and a network proxy per session that allows only the hosts of that provider. With no boundary, no session starts. Each session has its own MCP token.
 - **Connector keys stay on the hub.** The Composio key is encrypted at rest on the hub and never leaves it. Credentials for a connector with no browser step go from the app through the hub to Composio once, and Consort does not store them. The assistant never handles a key or a sign-in: a card sends the user to the app or the browser. The hub keeps a hash of each connector call's arguments, never the arguments. See ADR 0011.
 - **The hub controls the workers (owner's decision, 2026-10-31).** The user changes the limits of a worker in the app: the highest approval mode, the folders and shell access. Nobody edits a file on the worker. The hub forwards the change with no signature, so a stolen hub can raise the limits. The worker saves the limits in `worker.db`, applies them at once and refuses a shell command or a folder outside them, because that is where the work runs. The approval engine on the hub applies the highest approval mode.
+- **Reach is not sign-in.** Being on the tailnet, or on the same network, lets a device find the hub. It does not pair the device: a new device still needs a setup code. The hub does not trust a request because it comes from loopback, and Tailscale Serve makes all tailnet traffic look like loopback. A hub on This network uses a self-signed certificate that the device pins from its pairing code. The hub never turns on Funnel. See ADR 0018.
 - **Keys, not passwords.** Workers and clients prove their identity with Ed25519 keys made during pairing. Pairing codes are single use and expire after 10 minutes. The user can revoke any worker or client.
 - **Local tokens stay local.** The bearer token for a session's MCP endpoint exists only in the session host, and the endpoint listens only on 127.0.0.1.
 - **Push stays small.** Push payloads hold IDs and titles, not message text, unless the user turns on previews.
 
-Anthropic's terms allow a user to sign in to the unmodified Claude Code binary with their own plan. Workers do exactly that, on the user's own machines, and the user starts the sign-in from the app. Before a public release, ask Anthropic to confirm that a hub that starts those sessions remotely is acceptable.
+Anthropic's terms allow a user to sign in to the unmodified Claude Code binary with their own plan. The session host does exactly that, on the hub machine, and the user starts the sign-in from the app. Before a public release, ask Anthropic to confirm that a hub that starts those sessions remotely is acceptable.
 
 ## Open questions to test first
 

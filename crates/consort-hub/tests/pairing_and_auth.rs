@@ -5,14 +5,18 @@
 
 use crate::common::*;
 use consort_proto::auth::{
-    AuthResponse, CLIENT_WS_PATH, ClientHello, PairClientResponse, PairingCode, PeerId, Signature,
-    WORKER_WS_PATH, auth_signing_payload,
+    AuthResponse, CLIENT_WS_PATH, ClientHello, PAIR_CLIENT_PATH, PairClientRequest,
+    PairClientResponse, PairWorkerResponse, PairingCode, PeerId, Signature, WORKER_WS_PATH,
+    WorkerHello, auth_signing_payload,
 };
 use consort_proto::client_api::{ClientRevoke, SnapshotScope, WorkerList, WorkerListResult};
 use consort_proto::error::ErrorCode;
-use consort_proto::frame::Frame;
+use consort_proto::frame::{Frame, SUPPORTED_PROTOCOL_VERSIONS};
 use consort_proto::ids::ClientId;
+use consort_proto::model::ClientKind;
+use consort_proto::release::InstallKind;
 use ed25519_dalek::Signer;
+use std::time::Duration;
 
 #[tokio::test]
 async fn health_check_answers() {
@@ -212,7 +216,133 @@ async fn no_common_protocol_version_closes_with_protocol_mismatch() {
         .await
         .unwrap_err();
     assert_eq!(error.code, ErrorCode::ProtocolMismatch);
+    // The error says what the hub is, and how it was installed: the peer has
+    // signed in.
+    let versions = error.hub_versions.expect("the versions of the hub");
+    assert_eq!(versions.hub_version, env!("CARGO_PKG_VERSION"));
+    assert_eq!(versions.protocol_versions, SUPPORTED_PROTOCOL_VERSIONS);
+    assert_eq!(versions.install, Some(InstallKind::Service));
     assert!(peer.closed(WAIT).await);
+    hub.handle.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_failed_pairing_carries_the_versions_of_the_hub_and_not_how_it_was_installed() {
+    let hub = TestHub::start().await;
+    let code = hub.handle.setup_code().unwrap();
+    let (status, _) = pair_client_http(&hub, &code, &new_key()).await;
+    assert_eq!(status, 200);
+    // The code works one time, so this try fails.
+    let (status, body) = pair_client_http(&hub, &code, &new_key()).await;
+    assert_eq!(status, 401, "{body}");
+    assert_eq!(body["error"]["code"], "unauthorized");
+    let versions = &body["error"]["hub_versions"];
+    assert_eq!(versions["hub_version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(
+        versions["protocol_versions"],
+        serde_json::json!(SUPPORTED_PROTOCOL_VERSIONS)
+    );
+    assert!(versions.get("install").is_none(), "{versions}");
+    hub.handle.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_pairing_with_no_common_protocol_version_is_refused_and_the_code_still_works() {
+    let hub = TestHub::start().await;
+    let code = hub.handle.setup_code().unwrap();
+    let (status, body) = http_post(
+        &hub,
+        PAIR_CLIENT_PATH,
+        &PairClientRequest {
+            code: parse_code(&code),
+            public_key: public_key(&new_key()),
+            name: "Newer client".to_owned(),
+            kind: ClientKind::Desktop,
+            os: None,
+            protocol_versions: vec![99],
+        },
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(body["error"]["code"], "protocol_mismatch");
+    assert_eq!(
+        body["error"]["hub_versions"]["hub_version"],
+        env!("CARGO_PKG_VERSION")
+    );
+    // The peer that sends no list is from before this field, and passes.
+    let (status, body) = pair_client_http(&hub, &code, &new_key()).await;
+    assert_eq!(status, 200, "{body}");
+    hub.handle.shutdown().await.unwrap();
+}
+
+/// Connects a worker that reports `version`, and returns the first command
+/// of the hub, if one comes.
+async fn first_command_for_a_worker_at(
+    hub: &TestHub,
+    version: &str,
+) -> Option<consort_proto::frame::RequestFrame> {
+    let code = hub.handle.new_worker_pairing_code().await.unwrap();
+    let key = new_key();
+    let (status, body) = pair_worker_http(hub, &code, &key).await;
+    assert_eq!(status, 200, "{body}");
+    let paired: PairWorkerResponse = serde_json::from_value(body).unwrap();
+    let mut peer = Peer::connect(&hub.ws_url(WORKER_WS_PATH)).await;
+    authenticate(
+        &mut peer,
+        &hub.origin(),
+        PeerId::Worker(paired.worker_id),
+        &key,
+    )
+    .await
+    .unwrap();
+    peer.call_raw(
+        "hello",
+        serde_json::to_value(WorkerHello {
+            worker_id: paired.worker_id,
+            version: version.to_owned(),
+            protocol_versions: SUPPORTED_PROTOCOL_VERSIONS.to_vec(),
+            sessions: Vec::new(),
+        })
+        .unwrap(),
+    )
+    .await
+    .unwrap();
+    while let Some(frame) = peer.next_frame(Duration::from_millis(500)).await {
+        if let Frame::Request(request) = frame
+            && request.kind == "worker.update"
+        {
+            return Some(request);
+        }
+    }
+    None
+}
+
+#[tokio::test]
+async fn the_hub_names_its_version_to_an_older_worker_only() {
+    let hub = TestHub::start().await;
+    let request = first_command_for_a_worker_at(&hub, "0.0.1")
+        .await
+        .expect("an older worker gets the command");
+    assert_eq!(request.body["version"], env!("CARGO_PKG_VERSION"));
+    // Only a version: the hub sends no address and no program.
+    assert_eq!(request.body.as_object().unwrap().len(), 1);
+
+    assert!(
+        first_command_for_a_worker_at(&hub, env!("CARGO_PKG_VERSION"))
+            .await
+            .is_none(),
+        "a worker at the same version gets no command"
+    );
+    assert!(
+        first_command_for_a_worker_at(&hub, "999.0.0")
+            .await
+            .is_none(),
+        "a newer worker gets no command: nothing moves to an older version"
+    );
+    assert!(
+        first_command_for_a_worker_at(&hub, "test").await.is_none(),
+        "a version that is not a version gets no command"
+    );
     hub.handle.shutdown().await.unwrap();
 }
 

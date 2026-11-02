@@ -178,6 +178,8 @@ fn ready(state: UpdateState) -> Updates {
         auto: true,
         current: version("0.1.0"),
         installable: true,
+        release_protocols: None,
+        hub: None,
     })
 }
 

@@ -720,6 +720,8 @@ async fn with_the_voice_on_every_send_asks_and_a_draft_keeps_the_rule() {
                 change: consort_proto::model::ApprovalRule::RunWithoutAsking,
                 delete: consort_proto::model::ApprovalRule::AskEveryTime,
             }),
+            tool_exceptions: None,
+            assistant_owned: None,
         })
         .await
         .unwrap();

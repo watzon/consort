@@ -16,6 +16,14 @@ _Avoid_: agent, bot, Claude, hearthbot
 An app that the user uses to talk to the assistant, such as the desktop app or the mobile app.
 _Avoid_: frontend, device, UI
 
+**Setup gate**:
+The rule that picks what a client opens: where the hub runs, the first sign-in, or Tutti. It reads the state of the hub and this computer, and saves no step.
+_Avoid_: wizard, onboarding state
+
+**Guided start**:
+The short conversation in Tutti after the first sign-in. The assistant asks four questions, one at a time: who the user is, which services they use, where work runs, and what they work on. The user can skip it.
+_Avoid_: onboarding, tour, tutorial
+
 ## Machines
 
 **Hub**:
@@ -30,6 +38,10 @@ _Avoid_: node, device, host, environment, computer, runner
 The one-time step that makes the hub trust a new worker or client.
 _Avoid_: registration, linking, enrollment
 
+**Setup code**:
+The code that pairs a client with a hub. It works once and expires after 10 minutes. The hub machine makes it with `consort hub setup-code`, and a paired client makes one with Add a device. A worker has its own code from Add worker.
+_Avoid_: password, token, invite
+
 **Worker policy**:
 The limits of a worker: the highest approval mode, the allowed folders and shell access. The user sets them in the app, and the worker keeps them and enforces them.
 _Avoid_: permissions, ACL, sandbox
@@ -37,6 +49,18 @@ _Avoid_: permissions, ACL, sandbox
 **Local MCP server**:
 An MCP server that a worker can reach on its own network but the hub cannot.
 _Avoid_: LAN server, private connector
+
+**Reach**:
+How devices other than the computer of the hub get to it: Tailscale or This network. A way is on or off, and the hub keeps each way that is on.
+_Avoid_: exposure, public access
+
+**This network**:
+The way to reach the hub on the local network, with TLS and a self-signed certificate on a second port.
+_Avoid_: LAN mode
+
+**Pin**:
+The SHA-256 of the certificate of a hub on This network. A device gets it in a pairing code or link, and accepts no other certificate.
+_Avoid_: fingerprint, thumbprint
 
 **Tag**:
 A short name on a worker, such as `work` or `gpu`, made of 1 to 32 lowercase letters, digits and `-`. The user sets user tags in the app. The worker reports detected tags, such as `macos`, `arm64`, `ram-32gb`, `cpu-12` or `gpu-apple`. A channel's tags are requirements: all work from the channel runs only on workers that have every tag of the channel.
@@ -172,6 +196,17 @@ _Avoid_: engine, runtime, CLI
 The UI word for a harness that Consort can install and run: Claude Code, Codex, OpenCode, Gemini CLI, an agent from the ACP registry, or a custom ACP command. The UI shows each provider with its logo.
 _Avoid_: provider for a model company (say model provider), vendor, engine
 
+**Local hub**:
+A hub that runs on the user's own Mac or Linux computer, in one per-user service with its session host and a worker. It updates with the app.
+_Avoid_: embedded hub, desktop hub
+
+**Consort folder**:
+The folder of a local hub: `~/Library/Application Support/Consort` on macOS, and the XDG data folder on Linux.
+_Avoid_: install folder
+
+**Install kind**:
+How a hub was installed: `local`, `service`, `docker` or `manual`. `hub.status` reports it, and Settings > Hub shows the right update command for it.
+
 **Session host**:
 The process on the hub machine that holds the harness CLIs, the accounts and the sign-ins, and runs each session in a boundary. It is not the hub: it has its own credentials and, on Linux, its own user. The UI says "the hub machine".
 _Avoid_: hub worker, local worker
@@ -181,8 +216,11 @@ A machine where work runs: commands, files and checkouts. It has no account and 
 _Avoid_: runner, agent machine
 
 **Boundary**:
-The OS limits around a session: bubblewrap on Linux, `sandbox-exec` on a Mac in development, and a network proxy for each session. With no boundary, no session starts.
+The OS limits around a session: bubblewrap on Linux, `sandbox-exec` on a Mac (the UI calls it a development sandbox, see ADR 0018), and a network proxy for each session. With no boundary, no session starts.
 _Avoid_: jail, sandbox (in code; the UI may say "development sandbox" for a Mac)
+
+**Command rule**:
+A rule on a channel for shell commands: a pattern such as `git push`, and a result, Allow or Ask. An assistant proposes rules when the user asks, and a less strict change waits for the user. The rules of Tutti apply in every channel. See ADR 0019.
 
 **Command check**:
 In Auto mode, the model that decides whether a shell command or an unknown tool can run without asking the user. It allows, blocks or asks. The code calls it the classifier or `command_check`. It is not a lock: worker policy and the boundary still hold.
@@ -304,6 +342,10 @@ _Avoid_: library, attachments, drive
 A file that a task publishes as a result of its work.
 _Avoid_: output, deliverable, attachment
 
+**Visual**:
+An HTML page that the assistant shows in the timeline as an item of its own, such as a chart, a diagram or a mockup. It is live while nothing covers it, and an image of the same page when something does.
+_Avoid_: HTML render, widget, canvas, artifact
+
 **Hub tools**:
 The tools that the hub gives every session so it can post messages, start tasks, ask decisions and use memory.
 _Avoid_: MCP tools, assistant tools, built-ins
@@ -325,6 +367,15 @@ _Avoid_: connected account, link, credential
 **Tool kind**:
 What a connector tool does: read, change (create or update) or delete. It picks the approval rule: run without asking, ask once per task, or ask every time.
 _Avoid_: permission level, scope
+
+**Tool exception**:
+One tool of a connection with its own rule, which wins over the rule of its tool kind. An example is "Merge a pull request" that asks every time while other tools that change run without asking. See ADR 0020.
+
+**Permissions**:
+What an assistant can do in a channel without asking: the command rules of the channel, and the rules of its connections. The user edits them in the channel settings, or tells the assistant, which proposes them on one card.
+
+**The assistant's account**:
+A connection that belongs to the assistant, not to the user. What it sends does not use the user's voice, and routines follow the rules of the connection. The code calls it `assistant_owned`. See ADR 0020.
 
 **Monid**:
 A catalog of paid tools with one wallet. The hub uses it with a key that only the hub holds. Monid has no accounts to connect, so it is not a connector.

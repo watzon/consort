@@ -5,12 +5,16 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use crate::common::*;
+use consort_proto::client_api::{ChannelUpdate, DecisionAnswerRequest};
 use consort_proto::error::{ErrorBody, ErrorCode};
 use consort_proto::execution_link::{
     ExecOp, ExecOpResult, ExecTool, HubToExecution, WorkspaceInspection, WorkspacePrepare,
 };
 use consort_proto::frame::{Frame, FrameId, RequestFrame};
-use consort_proto::model::{ApprovalMode, CommandCheckVerdict, Os};
+use consort_proto::model::{
+    ApprovalMode, CommandCheckVerdict, CommandRuleInput, CommandRuleResult, CommandRuleSource,
+    DecisionAnswer, Os,
+};
 use consort_proto::session_host_link::{
     CommandCheckReply, ToolAuthorize, ToolDecision, ToolExec, WorkspaceOpen, WorkspaceSpec,
 };
@@ -269,6 +273,174 @@ async fn authorize_with_check(
             _ => {}
         }
     }
+}
+
+/// Sends `tool.authorize`, allows the action, and gives the text that the
+/// command check read.
+async fn check_prompt(world: &mut World, request: &ToolAuthorize) -> String {
+    let id = FrameId::generate();
+    let peer = &mut world.worker.peer;
+    peer.send(&Frame::Request(RequestFrame {
+        id: id.clone(),
+        kind: "tool.authorize".to_owned(),
+        body: serde_json::to_value(request).unwrap(),
+    }))
+    .await;
+    let mut prompt = None;
+    loop {
+        match peer.next_frame(WAIT).await.expect("an answer from the hub") {
+            Frame::Response(response) if response.re == id => {
+                return prompt.expect("the hub runs the check");
+            }
+            Frame::Request(hub_request) if hub_request.kind == "command_check.run" => {
+                prompt = hub_request.body["prompt"].as_str().map(str::to_owned);
+                let frame = hub_request
+                    .respond_ok(&CommandCheckReply {
+                        text: "ALLOW".to_owned(),
+                    })
+                    .unwrap();
+                peer.send(&frame).await;
+            }
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_command_check_reads_the_answer_to_a_decision() {
+    let mut world = World::start().await;
+    let (_, start) = world.start_task("Fix it.").await;
+    let result = world
+        .worker
+        .tool_json(
+            start.session_id,
+            "ask_decision",
+            json!({
+                "question": "Push the commits?",
+                "options": [
+                    {"label": "Push both", "consequence": "I run git push to the PR branch."},
+                    {"label": "Do not push", "consequence": "Nothing goes to GitHub."}
+                ]
+            }),
+        )
+        .await;
+    let decision_id = serde_json::from_value(result["decision_id"].clone()).unwrap();
+    let request = ToolAuthorize {
+        session_id: start.session_id,
+        tool: "process_start".to_owned(),
+        arguments: json!({"command": "git push origin HEAD:branch"}),
+        mode: ApprovalMode::Auto,
+    };
+    // A question with no answer is no wish of the user.
+    let prompt = check_prompt(&mut world, &request).await;
+    assert!(!prompt.contains("Push both"), "{prompt}");
+
+    world
+        .client
+        .request(DecisionAnswerRequest {
+            decision_id,
+            answer: DecisionAnswer {
+                option_index: Some(0),
+                text: None,
+            },
+        })
+        .await
+        .unwrap();
+    let prompt = check_prompt(&mut world, &request).await;
+    assert!(prompt.contains("The user answered a question"), "{prompt}");
+    assert!(prompt.contains("Chosen option: \"Push both\""), "{prompt}");
+    assert!(prompt.contains("Push the commits?"), "{prompt}");
+    // Only the chosen option counts.
+    assert!(!prompt.contains("Do not push"), "{prompt}");
+    world.hub.handle.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_command_rule_comes_before_the_approval_mode() {
+    let mut world = World::start().await;
+    let (_, start) = world.start_task("Fix it.").await;
+    let mut update = ChannelUpdate::new(world.tutti);
+    update.command_rules = Some(vec![
+        CommandRuleInput {
+            pattern: "git push".to_owned(),
+            except: vec!["--force".to_owned()],
+            result: CommandRuleResult::Allow,
+            description: "Push to a branch".to_owned(),
+        }
+        .into_rule(CommandRuleSource::User)
+        .unwrap(),
+        CommandRuleInput {
+            pattern: "gh pr merge".to_owned(),
+            except: Vec::new(),
+            result: CommandRuleResult::Ask,
+            description: "Merge a PR".to_owned(),
+        }
+        .into_rule(CommandRuleSource::User)
+        .unwrap(),
+    ]);
+    world.client.request(update).await.unwrap();
+    let request = |command: &str, tool: &str, field: &str, mode| ToolAuthorize {
+        session_id: start.session_id,
+        tool: tool.to_owned(),
+        arguments: json!({field: command, "process_id": "p"}),
+        mode,
+    };
+    let shell = |command: &str, mode| request(command, "process_start", "command", mode);
+
+    // Auto with no command check run: the rule decides.
+    assert!(matches!(
+        authorize(&mut world, &shell("git push origin a", ApprovalMode::Auto)).await,
+        ToolDecision::Allow { check: Some(c) } if c.command_rule.is_some()
+    ));
+    // A rule that allows also holds in the modes that would ask.
+    assert!(matches!(
+        authorize(&mut world, &shell("git push", ApprovalMode::Ask)).await,
+        ToolDecision::Allow { check: Some(c) } if c.command_rule.is_some()
+    ));
+    // A rule that asks holds in every mode, also in Full access. The task of
+    // this test runs in Auto, so the mode of the request cannot hide it.
+    for mode in [ApprovalMode::Auto, ApprovalMode::FullAccess] {
+        let decision = authorize(&mut world, &shell("gh pr merge 62", mode)).await;
+        let ToolDecision::Ask { note, .. } = decision else {
+            panic!("expected a question, got {decision:?}");
+        };
+        assert!(note.unwrap().contains("Merge a PR"));
+    }
+    // Text to a running shell can ask, and it can never allow.
+    assert!(matches!(
+        authorize(
+            &mut world,
+            &request(
+                "gh pr merge\n",
+                "process_write_stdin",
+                "text",
+                ApprovalMode::Auto
+            )
+        )
+        .await,
+        ToolDecision::Ask { note: Some(_), .. }
+    ));
+    let decision = authorize_with_check(
+        &mut world,
+        &request(
+            "git push\n",
+            "process_write_stdin",
+            "text",
+            ApprovalMode::Auto,
+        ),
+        &[Ok("ALLOW")],
+    )
+    .await;
+    assert!(matches!(decision, ToolDecision::Allow { check: Some(_) }));
+    // A command that no rule covers still goes to the check, which reads the
+    // rules.
+    let prompt = check_prompt(&mut world, &shell("git push --force", ApprovalMode::Auto)).await;
+    assert!(
+        prompt.contains("The user set these command rules"),
+        "{prompt}"
+    );
+    assert!(prompt.contains("Ask `gh pr merge`"), "{prompt}");
+    world.hub.handle.shutdown().await.unwrap();
 }
 
 #[tokio::test]

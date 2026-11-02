@@ -212,6 +212,26 @@ impl Hub {
         Ok(arguments)
     }
 
+    /// The command rules that count in a channel. See ADR 0019.
+    pub(crate) async fn command_rules_of(
+        &self,
+        channel_id: consort_proto::ids::ChannelId,
+    ) -> Result<Vec<consort_proto::model::CommandRule>> {
+        self.store
+            .read(move |conn| {
+                let tutti = crate::store::conversation::tutti_channel(conn)?;
+                if tutti.id == channel_id {
+                    return Ok(tutti.command_rules);
+                }
+                let channel = crate::store::conversation::channel_or_404(conn, channel_id)?;
+                Ok(crate::command_rules::effective_rules(
+                    &tutti.command_rules,
+                    &channel.command_rules,
+                ))
+            })
+            .await
+    }
+
     /// `tool.authorize`: the approval engine.
     pub(crate) async fn tool_authorize(
         &self,
@@ -256,6 +276,44 @@ impl Hub {
                 check: None,
             });
         }
+        // The command rules come before the approval mode, so an Ask rule
+        // holds in Full access too. A worker whose policy holds its sessions
+        // below Auto keeps asking: a rule cannot give more than the worker.
+        if let Some(command) = shell_text(tool, &request.arguments) {
+            let rules = self.command_rules_of(session.channel_id).await?;
+            match crate::command_rules::evaluate(command, &rules) {
+                crate::command_rules::RuleOutcome::Ask(rule) => {
+                    return Ok(ToolDecision::Ask {
+                        note: Some(format!(
+                            "A command rule asks about this: {}",
+                            rule.description
+                        )),
+                        blocked: Vec::new(),
+                        check: None,
+                    });
+                }
+                // Text to a running process can be anything, so only `Ask`
+                // reads it.
+                crate::command_rules::RuleOutcome::Allow(rule)
+                    if tool == ExecTool::ProcessStart
+                        && policy.as_ref().is_none_or(|p| {
+                            p.max_approval_mode >= consort_proto::model::ApprovalMode::Auto
+                        }) =>
+                {
+                    return Ok(ToolDecision::Allow {
+                        check: Some(consort_proto::model::CommandCheckOutcome {
+                            verdict: consort_proto::model::CommandCheckVerdict::Allowed,
+                            source: String::new(),
+                            reason: None,
+                            rule: None,
+                            error: None,
+                            command_rule: Some(rule.description.clone()),
+                        }),
+                    });
+                }
+                _ => {}
+            }
+        }
         match rule_for(class, mode) {
             Rule::Allow => Ok(ToolDecision::Allow { check: None }),
             Rule::Ask => Ok(ToolDecision::Ask {
@@ -269,4 +327,14 @@ impl Hub {
             }
         }
     }
+}
+
+/// The shell text of a tool call that runs one.
+fn shell_text(tool: ExecTool, arguments: &Value) -> Option<&str> {
+    let field = match tool {
+        ExecTool::ProcessStart => "command",
+        ExecTool::ProcessWriteStdin => "text",
+        _ => return None,
+    };
+    arguments.get(field).and_then(Value::as_str)
 }

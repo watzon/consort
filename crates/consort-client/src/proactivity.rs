@@ -354,6 +354,7 @@ fn add_made_line(timeline: &mut TimelineView, channel: &Channel) {
         fallback: None,
         error: None,
         monid: None,
+        visual: None,
     });
     // After the day line of the first day, before every message.
     let at_index = timeline

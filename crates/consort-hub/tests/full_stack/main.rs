@@ -98,6 +98,7 @@ impl Stack {
             .unwrap();
         let worker = consort_worker::run(WorkerConfig {
             config_dir: self.worker_dir.path().to_path_buf(),
+            self_update: None,
         })
         .await
         .unwrap();
@@ -284,6 +285,7 @@ async fn the_app_changes_the_limits_of_a_worker_and_the_worker_keeps_them() {
     stack.worker.take().unwrap().shutdown().await.unwrap();
     let worker = consort_worker::run(WorkerConfig {
         config_dir: stack.worker_dir.path().to_path_buf(),
+        self_update: None,
     })
     .await
     .unwrap();
@@ -391,6 +393,9 @@ async fn a_command_goes_on_through_a_restart_of_the_hub() {
         data_dir: dir.path().to_path_buf(),
         listen: addr,
         public_url: None,
+        install_kind: consort_proto::release::InstallKind::Manual,
+        dev: false,
+        first_greeting: false,
     })
     .await
     .unwrap();

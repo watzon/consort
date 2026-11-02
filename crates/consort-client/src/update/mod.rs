@@ -10,10 +10,9 @@
 //! The desktop app never talks to the network: it holds an [`Updates`]
 //! handle and reads its [`UpdateView`].
 
-use std::cmp::Ordering;
-use std::collections::HashMap;
 use std::path::PathBuf;
 
+use consort_proto::error::HubVersions;
 use serde::{Deserialize, Serialize};
 
 pub mod apply;
@@ -21,15 +20,12 @@ pub mod net;
 
 pub use net::{UpdateConfig, Updates};
 
-/// The GitHub repository that holds the releases, as `owner/name`. This is
-/// the one place in Rust code that names it. The install scripts and the
-/// install commands in the app use it too. Change it here when the
-/// repository moves, and in the two install scripts.
-pub const RELEASES_REPO: &str = "watzon/consort";
-
-/// The file with the SHA-256 of every release file. One line for each file:
-/// the hash, two spaces, the name.
-pub const CHECKSUMS_ASSET: &str = "SHA256SUMS";
+// The repository, the versions and the checksum file are in `consort-proto`,
+// because the worker and `consort hub update` read them too.
+pub use consort_proto::release::{
+    CHECKSUMS_ASSET, RELEASE_MANIFEST_ASSET, RELEASES_REPO, ReleaseManifest, Version,
+    parse_checksums,
+};
 
 /// How often the app looks for a new release.
 pub const CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
@@ -44,107 +40,42 @@ pub fn install_script_url(os: crate::Os) -> String {
     format!("https://raw.githubusercontent.com/{RELEASES_REPO}/main/scripts/install/{file}")
 }
 
+/// The address of the raw script that installs a hub on a Linux server.
+pub fn hub_install_script_url() -> String {
+    format!("https://raw.githubusercontent.com/{RELEASES_REPO}/main/scripts/install/hub.sh")
+}
+
+/// The command that installs a hub on a server. It prints a setup code.
+pub fn hub_install_command() -> String {
+    format!("curl -fsSL {} | bash", hub_install_script_url())
+}
+
+/// The page that explains how to run a hub on a server.
+pub fn server_guide_url() -> String {
+    format!("https://github.com/{RELEASES_REPO}/blob/main/docs/deploy.md")
+}
+
 /// The command that downloads the worker, installs it and pairs it with a
 /// hub, for the system `os`.
-pub fn worker_install_command(os: crate::Os, hub_url: &str, code: &str) -> String {
+pub fn worker_install_command(
+    os: crate::Os,
+    hub_url: &str,
+    code: &str,
+    tls_sha256: Option<&consort_proto::model::Sha256Hash>,
+) -> String {
     let url = install_script_url(os);
     match os {
         crate::Os::Windows => {
-            format!("& ([scriptblock]::Create((irm {url}))) -Hub {hub_url} -Code {code}")
+            let pin = tls_sha256
+                .map(|pin| format!(" -TlsSha256 {pin}"))
+                .unwrap_or_default();
+            format!("& ([scriptblock]::Create((irm {url}))) -Hub {hub_url} -Code {code}{pin}")
         }
         crate::Os::MacOs | crate::Os::Linux => {
-            format!("curl -fsSL {url} | bash -s -- --hub {hub_url} --code {code}")
-        }
-    }
-}
-
-/// A release version: `major.minor.patch`, with an optional pre-release
-/// part. A leading `v` is allowed.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct Version {
-    pub major: u64,
-    pub minor: u64,
-    pub patch: u64,
-    pub pre: Option<String>,
-}
-
-impl Version {
-    pub fn parse(text: &str) -> Option<Version> {
-        let text = text.trim();
-        let text = text.strip_prefix('v').unwrap_or(text);
-        let text = text.split('+').next().unwrap_or(text);
-        let (core, pre) = match text.split_once('-') {
-            Some((core, pre)) if !pre.is_empty() => (core, Some(pre.to_owned())),
-            Some(_) => return None,
-            None => (text, None),
-        };
-        let mut parts = core.split('.');
-        let major = parts.next()?.parse().ok()?;
-        let minor = parts.next()?.parse().ok()?;
-        let patch = parts.next()?.parse().ok()?;
-        if parts.next().is_some() {
-            return None;
-        }
-        Some(Version {
-            major,
-            minor,
-            patch,
-            pre,
-        })
-    }
-}
-
-impl std::fmt::Display for Version {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)?;
-        if let Some(pre) = &self.pre {
-            write!(f, "-{pre}")?;
-        }
-        Ok(())
-    }
-}
-
-impl PartialOrd for Version {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for Version {
-    fn cmp(&self, other: &Self) -> Ordering {
-        (self.major, self.minor, self.patch)
-            .cmp(&(other.major, other.minor, other.patch))
-            .then_with(|| match (&self.pre, &other.pre) {
-                (None, None) => Ordering::Equal,
-                // A release is newer than its pre-releases.
-                (None, Some(_)) => Ordering::Greater,
-                (Some(_), None) => Ordering::Less,
-                (Some(a), Some(b)) => compare_pre(a, b),
-            })
-    }
-}
-
-/// Compares two pre-release parts, such as `rc.2` and `rc.10`, part by
-/// part. A number is lower than a word.
-fn compare_pre(a: &str, b: &str) -> Ordering {
-    let mut left = a.split('.');
-    let mut right = b.split('.');
-    loop {
-        match (left.next(), right.next()) {
-            (None, None) => return Ordering::Equal,
-            (None, Some(_)) => return Ordering::Less,
-            (Some(_), None) => return Ordering::Greater,
-            (Some(x), Some(y)) => {
-                let order = match (x.parse::<u64>(), y.parse::<u64>()) {
-                    (Ok(x), Ok(y)) => x.cmp(&y),
-                    (Ok(_), Err(_)) => Ordering::Less,
-                    (Err(_), Ok(_)) => Ordering::Greater,
-                    (Err(_), Err(_)) => x.cmp(y),
-                };
-                if order != Ordering::Equal {
-                    return order;
-                }
-            }
+            let pin = tls_sha256
+                .map(|pin| format!(" --tls-sha256 {pin}"))
+                .unwrap_or_default();
+            format!("curl -fsSL {url} | bash -s -- --hub {hub_url} --code {code}{pin}")
         }
     }
 }
@@ -252,6 +183,8 @@ pub struct Candidate {
     pub version: Version,
     pub asset: Asset,
     pub checksums: Asset,
+    /// The `release.json` of the release. An older release has none.
+    pub manifest: Option<Asset>,
 }
 
 /// Chooses the update for `current`, or `None` when the app is up to date or
@@ -279,28 +212,17 @@ pub fn choose_update(
         .iter()
         .find(|a| a.name == CHECKSUMS_ASSET)?
         .clone();
+    let manifest = release
+        .assets
+        .iter()
+        .find(|a| a.name == RELEASE_MANIFEST_ASSET)
+        .cloned();
     Some(Candidate {
         version,
         asset,
         checksums,
+        manifest,
     })
-}
-
-/// Reads a checksum file: the lowercase hash for each file name. A line
-/// with a `*` before the name (binary mode) works too. Other lines are
-/// skipped.
-pub fn parse_checksums(text: &str) -> HashMap<String, String> {
-    let mut sums = HashMap::new();
-    for line in text.lines() {
-        let Some((hash, name)) = line.trim().split_once(char::is_whitespace) else {
-            continue;
-        };
-        let name = name.trim().trim_start_matches('*');
-        if hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()) && !name.is_empty() {
-            sums.insert(name.to_owned(), hash.to_ascii_lowercase());
-        }
-    }
-    sums
 }
 
 /// Where the update process is.
@@ -417,11 +339,74 @@ pub struct UpdateView {
     /// This copy of the app can replace itself. A build that runs from a
     /// cargo `target` folder cannot.
     pub installable: bool,
+    /// The protocol versions of the newest release, from its `release.json`.
+    /// `None` for a release without that file: it holds nothing back.
+    pub release_protocols: Option<Vec<u32>>,
+    /// The versions of the connected hub. `None` until a hub answers.
+    pub hub: Option<HubVersions>,
+}
+
+/// An update that is ready and waits for the hub.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UpdateHold {
+    pub version: Version,
+    pub hub_version: String,
+}
+
+impl UpdateHold {
+    /// The first line of the notice.
+    pub fn title(&self) -> String {
+        format!("Update {} waits for your hub", self.version)
+    }
+
+    /// The rest of the notice.
+    pub fn body(&self) -> String {
+        format!(
+            "This version cannot talk to hub {}. Update the hub first, and this app restarts when you are ready.",
+            self.hub_version
+        )
+    }
 }
 
 impl UpdateView {
-    /// The sentence for the sidebar notice, when an update is ready.
+    /// The update that is ready, when it cannot talk to the hub because the
+    /// hub is too old. Installing it would cut this app off from the hub. A
+    /// hub that is newer than the release holds nothing: the update does no
+    /// harm there.
+    pub fn hold(&self) -> Option<UpdateHold> {
+        let version = self.state.ready_version()?;
+        let release = self.release_protocols.as_ref()?;
+        let hub = self.hub.as_ref()?;
+        // A hub on this computer updates with the app, so they stay together.
+        if hub.install == Some(consort_proto::release::InstallKind::Local) {
+            return None;
+        }
+        if consort_proto::frame::negotiate_version(release, &hub.protocol_versions).is_some() {
+            return None;
+        }
+        let too_old = consort_proto::frame::who_is_too_old(release, Some(&hub.protocol_versions));
+        (too_old == consort_proto::frame::TooOld::Hub).then(|| UpdateHold {
+            version: version.clone(),
+            hub_version: hub.hub_version.clone(),
+        })
+    }
+
+    /// The newest version that the updater knows of.
+    pub fn latest(&self) -> Option<&Version> {
+        match &self.state {
+            UpdateState::Available { version }
+            | UpdateState::Downloading { version }
+            | UpdateState::Ready { version, .. } => Some(version),
+            _ => None,
+        }
+    }
+
+    /// The sentence for the sidebar notice, when an update is ready and no
+    /// hold is on it.
     pub fn notice(&self) -> Option<&'static str> {
+        if self.hold().is_some() {
+            return None;
+        }
         self.state
             .ready_version()
             .map(|_| "Update ready. Restart to install.")
@@ -438,6 +423,9 @@ impl UpdateView {
             }
             UpdateState::Downloading { version } => {
                 format!("Downloading version {version}.")
+            }
+            UpdateState::Ready { .. } if self.hold().is_some() => {
+                self.hold().map(|hold| hold.title()).unwrap_or_default()
             }
             UpdateState::Ready { version, .. } => {
                 format!("Version {version} is ready. Restart to install.")
@@ -471,34 +459,6 @@ mod tests {
 
     fn v(text: &str) -> Version {
         Version::parse(text).unwrap()
-    }
-
-    #[test]
-    fn versions_parse_and_print() {
-        assert_eq!(v("0.7.1").to_string(), "0.7.1");
-        assert_eq!(v("v1.2.3").to_string(), "1.2.3");
-        assert_eq!(v("1.2.3-rc.1+build5").to_string(), "1.2.3-rc.1");
-        for bad in ["", "1", "1.2", "1.2.3.4", "a.b.c", "1.2.3-", "v"] {
-            assert_eq!(Version::parse(bad), None, "{bad}");
-        }
-    }
-
-    #[test]
-    fn versions_compare_by_number_not_by_text() {
-        assert!(v("0.10.0") > v("0.9.9"));
-        assert!(v("1.0.0") > v("0.99.99"));
-        assert!(v("0.2.1") > v("0.2.0"));
-        assert_eq!(v("1.0.0"), v("v1.0.0"));
-    }
-
-    #[test]
-    fn a_release_is_newer_than_its_pre_releases() {
-        assert!(v("1.0.0") > v("1.0.0-rc.1"));
-        assert!(v("1.0.0-rc.2") > v("1.0.0-rc.1"));
-        assert!(v("1.0.0-rc.10") > v("1.0.0-rc.2"));
-        assert!(v("1.0.0-rc.1") > v("1.0.0-beta.9"));
-        assert!(v("1.0.0-1") < v("1.0.0-alpha"));
-        assert!(v("1.0.0-rc") < v("1.0.0-rc.1"));
     }
 
     #[test]
@@ -729,6 +689,8 @@ mod tests {
             auto: true,
             current: v("0.1.0"),
             installable: true,
+            release_protocols: None,
+            hub: None,
         };
         assert_eq!(view(UpdateState::Idle).notice(), None);
         assert_eq!(
@@ -763,21 +725,122 @@ mod tests {
     }
 
     #[test]
+    fn the_hub_command_is_the_one_in_the_design() {
+        assert_eq!(
+            hub_install_command(),
+            "curl -fsSL https://raw.githubusercontent.com/watzon/consort/main/scripts/install/hub.sh | bash"
+        );
+        assert!(server_guide_url().ends_with("/docs/deploy.md"));
+    }
+
+    #[test]
+    fn the_install_commands_carry_the_pin_of_a_hub_on_this_network() {
+        let pin = consort_proto::model::Sha256Hash::from_bytes([7; 32]);
+        let hex = "07".repeat(32);
+        let mac = worker_install_command(crate::Os::MacOs, "https://m.local:7601", "A", Some(&pin));
+        assert!(mac.ends_with(&format!(
+            "--hub https://m.local:7601 --code A --tls-sha256 {hex}"
+        )));
+        let win =
+            worker_install_command(crate::Os::Windows, "https://m.local:7601", "A", Some(&pin));
+        assert!(win.ends_with(&format!(
+            "-Hub https://m.local:7601 -Code A -TlsSha256 {hex}"
+        )));
+    }
+
+    #[test]
     fn the_install_commands_name_the_script_and_the_code() {
-        let mac = worker_install_command(crate::Os::MacOs, "https://hub.example.com", "KQ7M-4XPD");
+        let mac = worker_install_command(
+            crate::Os::MacOs,
+            "https://hub.example.com",
+            "KQ7M-4XPD",
+            None,
+        );
         assert_eq!(
             mac,
             "curl -fsSL https://raw.githubusercontent.com/watzon/consort/main/scripts/install/worker.sh | bash -s -- --hub https://hub.example.com --code KQ7M-4XPD"
         );
         assert_eq!(
-            worker_install_command(crate::Os::Linux, "https://h", "A"),
+            worker_install_command(crate::Os::Linux, "https://h", "A", None),
             "curl -fsSL https://raw.githubusercontent.com/watzon/consort/main/scripts/install/worker.sh | bash -s -- --hub https://h --code A"
         );
-        let win =
-            worker_install_command(crate::Os::Windows, "https://hub.example.com", "KQ7M-4XPD");
+        let win = worker_install_command(
+            crate::Os::Windows,
+            "https://hub.example.com",
+            "KQ7M-4XPD",
+            None,
+        );
         assert_eq!(
             win,
             "& ([scriptblock]::Create((irm https://raw.githubusercontent.com/watzon/consort/main/scripts/install/worker.ps1))) -Hub https://hub.example.com -Code KQ7M-4XPD"
         );
+    }
+
+    #[test]
+    fn a_hub_on_this_computer_never_holds_an_update() {
+        let mut view = held_view(Some(&[2]), Some(&[1]));
+        assert!(view.hold().is_some());
+        if let Some(hub) = view.hub.as_mut() {
+            hub.install = Some(consort_proto::release::InstallKind::Local);
+        }
+        assert_eq!(view.hold(), None);
+    }
+
+    fn held_view(release: Option<&[u32]>, hub: Option<&[u32]>) -> UpdateView {
+        UpdateView {
+            state: UpdateState::Ready {
+                version: v("0.8.0"),
+                archive: PathBuf::new(),
+            },
+            auto: true,
+            current: v("0.7.0"),
+            installable: true,
+            release_protocols: release.map(<[u32]>::to_vec),
+            hub: hub.map(|protocols| HubVersions {
+                hub_version: "0.6.2".into(),
+                protocol_versions: protocols.to_vec(),
+                install: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn an_update_that_cannot_talk_to_the_hub_is_held() {
+        let held = held_view(Some(&[2, 3]), Some(&[1]));
+        let hold = held.hold().unwrap();
+        assert_eq!(hold.title(), "Update 0.8.0 waits for your hub");
+        assert!(hold.body().contains("hub 0.6.2"));
+        assert_eq!(held.notice(), None);
+        assert_eq!(held.summary(), "Update 0.8.0 waits for your hub");
+    }
+
+    #[test]
+    fn an_update_is_not_held_when_it_fits_or_nothing_is_known() {
+        for view in [
+            held_view(Some(&[1, 2]), Some(&[1])),
+            // A release from before `release.json`.
+            held_view(None, Some(&[1])),
+            // No hub answered in this run.
+            held_view(Some(&[2]), None),
+            // A hub that is newer than the release: the update does no harm.
+            held_view(Some(&[1]), Some(&[3])),
+        ] {
+            assert_eq!(view.hold(), None, "{view:?}");
+            assert!(view.notice().is_some(), "{view:?}");
+        }
+    }
+
+    #[test]
+    fn the_release_manifest_goes_with_the_candidate_when_the_release_has_one() {
+        let platform = Platform::from_std("macos", "aarch64").unwrap();
+        let with = release(
+            "v0.8.0",
+            &["Consort-macos-arm64.zip", "SHA256SUMS", "release.json"],
+        );
+        let candidate = choose_update(&v("0.7.0"), &with, platform).unwrap();
+        assert_eq!(candidate.manifest.unwrap().name, "release.json");
+        let without = release("v0.8.0", &["Consort-macos-arm64.zip", "SHA256SUMS"]);
+        let candidate = choose_update(&v("0.7.0"), &without, platform).unwrap();
+        assert_eq!(candidate.manifest, None);
     }
 }

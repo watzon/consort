@@ -2,6 +2,8 @@
 //! shown without a hub (`consort-desktop --mock`). The mock also answers
 //! commands, so buttons do what they will do against a real hub.
 
+use consort_proto::model::{CommandRule, CommandRuleResult, CommandRuleSource};
+
 use crate::{
     approval_text::ApprovalKind,
     connectors::CatalogView,
@@ -41,6 +43,23 @@ fn text(s: &str) -> String {
     s.to_owned()
 }
 
+/// A command rule of the mock content.
+fn rule(
+    pattern: &str,
+    except: &[&str],
+    result: CommandRuleResult,
+    description: &str,
+    source: CommandRuleSource,
+) -> CommandRule {
+    CommandRule {
+        pattern: pattern.into(),
+        except: except.iter().map(|e| (*e).to_owned()).collect(),
+        result,
+        description: description.into(),
+        source,
+    }
+}
+
 fn channel(id: &str, name: &str, purpose: &str, icon: &str, group: Option<&str>) -> ChannelView {
     ChannelView {
         id: id.into(),
@@ -74,6 +93,7 @@ fn channel(id: &str, name: &str, purpose: &str, icon: &str, group: Option<&str>)
         disabled_skills: Vec::new(),
         default_approval_mode: ApprovalMode::AutoEdits,
         allowed_local_mcp_servers: Vec::new(),
+        command_rules: Vec::new(),
         memory_enabled: true,
         monid: Default::default(),
         access_grants: Vec::new(),
@@ -602,6 +622,8 @@ fn worker(
     WorkerView {
         is_session_host: false,
         boundary: None,
+        version: "0.4.1".into(),
+        update: None,
         id: id.into(),
         name: name.into(),
         os,
@@ -1509,12 +1531,48 @@ pub fn view_state() -> ViewState {
         {
             channel.tags = vec![text("work")];
         }
+        if channel.id == SAYSO {
+            channel.command_rules = vec![
+                rule(
+                    "git push",
+                    &["--force", "-f", "--delete", "main"],
+                    CommandRuleResult::Allow,
+                    "Push to a branch",
+                    CommandRuleSource::Assistant,
+                ),
+                rule(
+                    "gh pr create",
+                    &[],
+                    CommandRuleResult::Allow,
+                    "Open a PR",
+                    CommandRuleSource::Assistant,
+                ),
+                rule(
+                    "gh pr merge",
+                    &[],
+                    CommandRuleResult::Ask,
+                    "Merge a PR",
+                    CommandRuleSource::Assistant,
+                ),
+            ];
+        }
+        if channel.kind == ChannelKind::Tutti {
+            channel.command_rules = vec![rule(
+                "rm -rf",
+                &[],
+                CommandRuleResult::Ask,
+                "Delete a folder and all of its files",
+                CommandRuleSource::User,
+            )];
+        }
         if channel.id == crate::mock_extensions::ACME {
             channel.disabled_connections = vec![text(crate::mock_extensions::CON_GMAIL_PERSONAL)];
             channel.disabled_skills = vec![text(crate::mock_extensions::SKL_RUST)];
         }
     }
     let mut state = ViewState {
+        hub_setup: crate::setup::HubFacts::default(),
+        tailnet_notice: None,
         endpoints: vec![
             crate::command_check::EndpointView {
                 id: "end_1".into(),
@@ -1541,6 +1599,8 @@ pub fn view_state() -> ViewState {
             ..Default::default()
         },
         connection: Connection::Demo,
+        hub_versions: None,
+        hub_url: String::new(),
         saved_data: None,
         user: UserView {
             name: text("Chris"),
@@ -1604,6 +1664,7 @@ pub fn view_state() -> ViewState {
         voice: crate::mock_voice::off_view(),
     };
     crate::mock_monid::decorate(&mut state);
+    crate::mock_visual::decorate(&mut state);
     stamp_times(&mut state.timelines);
     crate::mock_convo::decorate(&mut state);
     if let Some(account) = state
@@ -1813,13 +1874,18 @@ fn activity() -> Vec<crate::activity::ChannelActivity> {
             state,
             line: line.map(text),
         },
+        own_state: state,
     };
     vec![
-        entry(
-            TUTTI_ID,
-            MarkState::Working,
-            Some("Running a command in sayso"),
-        ),
+        // The work is in sayso, so the sidebar row of Tutti rests.
+        ChannelActivity {
+            own_state: MarkState::Idle,
+            ..entry(
+                TUTTI_ID,
+                MarkState::Working,
+                Some("Running a command in sayso"),
+            )
+        },
         entry(SAYSO, MarkState::NeedsYou, None),
         entry(LUCY, MarkState::NeedsYou, None),
         entry(HOMELAB, MarkState::Working, Some("Running a command")),

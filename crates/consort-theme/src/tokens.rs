@@ -283,6 +283,10 @@ pub struct Layout {
     /// The gap between the top of the window and the stack in the compact
     /// layout.
     pub notice_compact_top: Pixels,
+    /// The column of the setup screens, at most this wide.
+    pub setup_column: Pixels,
+    /// The space above the mark on a setup screen.
+    pub setup_top: Pixels,
 }
 
 /// One stop of the top tint: a distance from the top, and the opacity of
@@ -325,6 +329,8 @@ pub struct Opacity {
     pub queued: f32,
     pub tint: f32,
     pub dictation_border: f32,
+    /// The placeholder of a visual while it loads.
+    pub loading_fill: f32,
 }
 
 /// Sizes of single components, from `structure.json`.
@@ -380,6 +386,14 @@ pub struct Components {
     pub notes_min_height: Pixels,
     pub brand_mark: Pixels,
     pub brand_gap: Pixels,
+    /// The mark at the top of a setup screen.
+    pub setup_mark: Pixels,
+    /// The gap between the blocks of a setup screen.
+    pub setup_gap: Pixels,
+    /// The height of a button on a setup screen.
+    pub setup_control: Pixels,
+    /// The height of a field on a setup screen.
+    pub setup_field: Pixels,
     /// The width of the focus ring.
     pub focus_ring: Pixels,
     pub admin: Admin,
@@ -586,6 +600,7 @@ pub struct Files {
     pub lightbox_nav: Pixels,
     pub lightbox_image_w: Pixels,
     pub lightbox_image_h: Pixels,
+    pub lightbox_sheet_w: Pixels,
     pub row_pad_y: Pixels,
     pub size_col: Pixels,
     pub date_col: Pixels,
@@ -729,6 +744,10 @@ impl Components {
             notes_min_height: px(c.notes_min_height),
             brand_mark: px(c.brand_mark),
             brand_gap: px(c.brand_gap),
+            setup_mark: px(c.setup_mark),
+            setup_gap: px(c.setup_gap),
+            setup_control: px(c.setup_control),
+            setup_field: px(c.setup_field),
             focus_ring: px(c.focus_ring),
             admin: {
                 let a = &c.admin;
@@ -789,6 +808,7 @@ impl Components {
                 lightbox_nav: px(f.lightbox_nav),
                 lightbox_image_w: px(f.lightbox_image_w),
                 lightbox_image_h: px(f.lightbox_image_h),
+                lightbox_sheet_w: px(f.lightbox_sheet_w),
                 row_pad_y: px(f.row_pad_y),
                 size_col: px(f.size_col),
                 date_col: px(f.date_col),
@@ -1126,6 +1146,8 @@ impl Tokens {
                 notice_width: px(s.layout.notice_width),
                 notice_bottom: px(s.layout.notice_bottom),
                 notice_compact_top: px(s.layout.notice_compact_top),
+                setup_column: px(s.layout.setup_column),
+                setup_top: px(s.layout.setup_top),
             },
             opacity: Opacity {
                 answered_dim: s.opacity.answered_dim,
@@ -1142,6 +1164,7 @@ impl Tokens {
                 queued: s.opacity.queued,
                 tint: s.opacity.tint,
                 dictation_border: s.opacity.dictation_border,
+                loading_fill: s.opacity.loading_fill,
             },
             component: Components::new(&s.component, scale),
             icon: Icons {
@@ -1283,6 +1306,12 @@ mod tests {
         assert_eq!(t.component.notes_min_height, px(192.0));
         assert_eq!(t.component.brand_mark, px(26.0));
         assert_eq!(t.component.brand_gap, px(8.0));
+        assert_eq!(t.layout.setup_column, px(448.0));
+        assert_eq!(t.layout.setup_top, px(136.0));
+        assert_eq!(t.component.setup_mark, px(84.0));
+        assert_eq!(t.component.setup_gap, px(28.0));
+        assert_eq!(t.component.setup_control, px(36.0));
+        assert_eq!(t.component.setup_field, px(40.0));
         assert_eq!(t.component.focus_ring, px(2.0));
         assert_eq!(t.component.theme_preview.sidebar_item, px(20.0));
         assert_eq!(t.component.theme_preview.button_radius, px(2.0));

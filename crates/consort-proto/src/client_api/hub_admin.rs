@@ -43,6 +43,178 @@ pub struct HubInfo {
     pub storage: HubStorage,
     /// The backup settings, the last backup and the backup that runs now.
     pub backup: BackupInfo,
+    /// How the hub was installed. `None` from an older hub.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install: Option<crate::release::InstallKind>,
+}
+
+/// A way for other devices to reach the hub.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReachMethod {
+    /// An address on the tailnet, through Tailscale Serve.
+    Tailscale,
+    /// A TLS port on the local network, with a pinned certificate.
+    ThisNetwork,
+}
+
+impl ReachMethod {
+    /// The name in the store and on the command line.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Tailscale => "tailscale",
+            Self::ThisNetwork => "this_network",
+        }
+    }
+
+    /// The method for a name from [`Self::as_str`].
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "tailscale" => Some(Self::Tailscale),
+            "this_network" => Some(Self::ThisNetwork),
+            _ => None,
+        }
+    }
+}
+
+/// `hub.reach_status`: how other devices can reach the hub. The hub checks
+/// Tailscale each time.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HubReachStatus {}
+
+/// The response to `hub.reach_status`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HubReachStatusResult {
+    /// The state of each way.
+    pub reach: ReachInfo,
+}
+
+/// `hub.reach_set`: turns a way on or off. A hub that may not change its reach
+/// (see [`ReachInfo::can_change`]) changes nothing and answers with its state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HubReachSet {
+    /// The way.
+    pub method: ReachMethod,
+    /// On or off.
+    pub on: bool,
+}
+
+/// The response to `hub.reach_set`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HubReachSetResult {
+    /// The state after the change.
+    pub reach: ReachInfo,
+}
+
+/// What Settings > Hub shows about reach.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReachInfo {
+    /// The hub may change its reach. Only a hub on the user's computer and a
+    /// development hub may. Any other hub reports its state, and its owner
+    /// uses `consort hub reach` on the server.
+    pub can_change: bool,
+    /// The state of Tailscale.
+    pub tailscale: TailscaleState,
+    /// The state of This network.
+    pub this_network: NetworkState,
+    /// The address that a new device or worker uses.
+    pub pairing: PairingAddress,
+}
+
+/// The address of the hub for a new device or worker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairingAddress {
+    /// The hub URL.
+    pub hub_url: String,
+    /// The pin of the certificate, for a hub on This network.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_sha256: Option<crate::model::Sha256Hash>,
+}
+
+/// The state of Tailscale on the hub machine.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum TailscaleState {
+    /// The hub finds no `tailscale` program.
+    NotInstalled,
+    /// Tailscale is stopped, or nobody signed in.
+    NotConnected,
+    /// The tailnet has no HTTPS certificates. An admin must turn them on, one
+    /// time.
+    HttpsOff {
+        /// The link that Tailscale gives, or the page of the admin console.
+        action_url: String,
+        /// The output of the program, when it ran.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+    /// The user of the hub may not change Tailscale yet.
+    NeedsPermission {
+        /// The command to run one time.
+        command: String,
+        /// The output of the program.
+        detail: String,
+    },
+    /// Ready to turn on.
+    Available {
+        /// The name of this machine on the tailnet.
+        name: String,
+        /// The address that the hub will get.
+        address: String,
+        /// Another service uses port 443, so the address uses port 8443.
+        port_in_use: bool,
+    },
+    /// Other services use both ports. Consort leaves them alone.
+    NoFreePort {
+        /// The name of this machine on the tailnet.
+        name: String,
+    },
+    /// The hub answers on the tailnet.
+    On {
+        /// The address on the tailnet.
+        address: String,
+        /// Another service uses port 443, so the address uses port 8443.
+        port_in_use: bool,
+    },
+    /// The store says that this reach is on, but its Serve entry is gone. The
+    /// address stays valid until the user decides.
+    Removed {
+        /// The address that went away.
+        address: String,
+    },
+    /// A check or a change failed in a way that the hub does not know.
+    Failed {
+        /// The output of the program.
+        detail: String,
+    },
+    /// A value from a newer hub.
+    #[serde(other)]
+    Unknown,
+}
+
+/// The state of This network.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum NetworkState {
+    /// The hub has no second port open.
+    Off,
+    /// The hub answers on the local network.
+    On {
+        /// The address, `https://<host>.local:<port>`.
+        address: String,
+        /// The SHA-256 of the certificate.
+        tls_sha256: crate::model::Sha256Hash,
+    },
+    /// This network is on, but its port could not open.
+    Failed {
+        /// The address that the store holds.
+        address: String,
+        /// What went wrong.
+        detail: String,
+    },
+    /// A value from a newer hub.
+    #[serde(other)]
+    Unknown,
 }
 
 /// The space that Consort uses on the hub disk, by kind, in bytes.

@@ -468,6 +468,7 @@ fn a_shown_draft_in_a_thread_panel_stays_inside_it(cx: &mut TestAppContext) {
             draft: Some(shown_draft("m_thread_shown")),
             fallback: None,
             monid: None,
+            visual: None,
         }],
         pending: false,
         source_message_id: None,

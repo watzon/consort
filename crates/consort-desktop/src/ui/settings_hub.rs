@@ -28,18 +28,29 @@ impl ConsortApp {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let c = &t.colors;
+        if self.admin.reach_open {
+            return self.render_reach(t, cx);
+        }
         let hub = self.state.admin.hub.clone();
         if hub.address.is_empty() {
             return page("hub-page", t)
                 .child(column(t).child(self.hub_loading(&hub, t, cx)))
                 .into_any_element();
         }
-        let line = div()
-            .flex()
-            .items_center()
-            .gap(t.space.sm)
-            .child(status_dot(Some(hub.online).filter(|o| *o), t))
-            .child(text(hub.summary.clone(), t.text.ui, c.text_secondary));
+        let is_local = hub.install == Some(consort_client::local_hub::InstallKind::Local);
+        let line = if is_local {
+            Self::local_hub_line(&hub, t)
+        } else {
+            div()
+                .flex()
+                .items_center()
+                .gap(t.space.sm)
+                .child(status_dot(Some(hub.online).filter(|o| *o), t))
+                .child(text(hub.summary.clone(), t.text.ui, c.text_secondary))
+        };
+        // A hub on this computer has W4 at the top. The address, the storage
+        // and the backups stay under it.
+        let local_rows = is_local.then(|| self.local_hub_section(t, cx));
         page("hub-page", t)
             .child(
                 column(t)
@@ -50,6 +61,8 @@ impl ConsortApp {
                                 .debug_selector(|| "hub-boundary-warning".into()),
                         )
                     })
+                    .children(self.hub_update_card(&hub, t, cx))
+                    .children(local_rows)
                     .child(self.hub_connection(&hub, t, cx))
                     .child(hub_storage(&hub, t))
                     .child(self.hub_backup(&hub, t, window, cx)),
@@ -130,6 +143,25 @@ impl ConsortApp {
                                 cx,
                             )),
                     )
+                    .child(
+                        row(false, t)
+                            .child(row_label("Reach", t))
+                            .child(
+                                text(
+                                    self.state.admin.reach.summary.clone(),
+                                    t.text.ui,
+                                    c.text_primary,
+                                )
+                                .flex_1()
+                                .min_w_0(),
+                            )
+                            .child(
+                                button("hub-reach", "Manage", ButtonKind::Secondary, t)
+                                    .flex_none()
+                                    .debug_selector(|| "hub-reach".to_owned())
+                                    .on_click(cx.listener(|this, _, _, cx| this.open_reach(cx))),
+                            ),
+                    )
                     .child(row(false, t).child(row_label("Version", t)).child(version))
                     .child(
                         row(true, t).child(row_label("Data folder", t)).child(
@@ -159,6 +191,7 @@ impl ConsortApp {
         let backup = &hub.backup;
         let busy = backup.busy;
         let back_up = button("back-up-now", "Back up now", ButtonKind::Secondary, t)
+            .debug_selector(|| "back-up-now".to_owned())
             .when(busy, |b| b.opacity(t.opacity.busy).cursor_default())
             .when(!busy, |b| {
                 b.on_click(cx.listener(|this, _, _, cx| this.back_up_now(cx)))

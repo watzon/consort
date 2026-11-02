@@ -11,8 +11,12 @@
 use std::time::{Duration, Instant};
 
 use consort_client::activity::MarkState;
+use consort_client::setup::Dabs;
 use consort_theme::Tokens;
-use gpui_kit::{AnyElement, IntoElement, Pixels, SharedString, Styled, img};
+use gpui_kit::{
+    AnyElement, InteractiveElement as _, IntoElement, ParentElement as _, Pixels, SharedString,
+    Styled, div, img, svg,
+};
 
 /// What the mark shows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -104,6 +108,36 @@ pub fn still_mark(size: Pixels, t: &Tokens) -> AnyElement {
         .size(size)
         .flex_none()
         .into_any_element()
+}
+
+/// The mark as the progress of the setup: a dab is dark until its stage starts.
+/// Each dab is one file from `design/mark`, tinted with a theme color.
+pub fn setup_mark(dabs: Dabs, size: Pixels, t: &Tokens) -> AnyElement {
+    let c = &t.colors;
+    let dark = c.surface_selected;
+    let layer = |file: &'static str, lit: bool, color| {
+        svg()
+            .path(dab_path(file))
+            .absolute()
+            .top_0()
+            .left_0()
+            .size(size)
+            .text_color(if lit { color } else { dark })
+    };
+    div()
+        .debug_selector(|| "setup-mark".into())
+        .relative()
+        .flex_none()
+        .size(size)
+        .child(layer("gold", dabs.assistant(), c.accent_fill))
+        .child(layer("verd", dabs.account(), c.status_done))
+        .child(layer("lapis", dabs.hub(), c.status_working))
+        .into_any_element()
+}
+
+/// The asset path of one dab.
+fn dab_path(file: &str) -> SharedString {
+    format!("mark/dabs/{file}.svg").into()
 }
 
 /// The frame of the mark in a sidebar row at a clock tick: the sharp frames
@@ -265,6 +299,23 @@ mod tests {
             row(MarkState::Working, 5, true),
             "mark/dark-sharp/working-00.svg"
         );
+    }
+
+    #[test]
+    fn the_dabs_of_the_setup_mark_are_in_the_binary_with_the_paper_geometry() {
+        use gpui_kit::AssetSource as _;
+        let assets = crate::assets::Assets;
+        for (file, start) in [("gold", "M66.42"), ("verd", "M66.58"), ("lapis", "M29.06")] {
+            let bytes = assets
+                .load(&dab_path(file))
+                .ok()
+                .flatten()
+                .expect("the dab is in the binary");
+            let text = String::from_utf8(bytes.to_vec()).expect("SVG text");
+            assert!(text.contains(r#"viewBox="21 17 58 58""#), "{file}");
+            assert!(text.contains(&format!(r#"d="{start}"#)), "{file}");
+            assert!(render(&text).chunks(4).any(|p| p[3] > 0), "{file} draws");
+        }
     }
 
     #[test]

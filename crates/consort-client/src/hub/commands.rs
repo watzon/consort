@@ -7,12 +7,12 @@ use consort_proto::{
         AccountCreate, AccountRemove, AccountSignOut, AccountUpdate, AcpRegistryList,
         ChannelArchive, ChannelCreate, ChannelDelete, ChannelGoBack, ChannelMove, ChannelUpdate,
         CommandCheckTest, DecisionAnswerRequest, EndpointRemove, EndpointSave, EndpointTest,
-        GroupCreate, GroupUpdate, MessageDelete, MessageEdit, MessageList,
+        GroupCreate, GroupUpdate, GuideTryAgain, MessageDelete, MessageEdit, MessageList,
         PreferencesSetCommandCheck, PreferencesSetFallbackPath, PreferencesSetFavoriteModel,
-        ReadMark, SignInCancel, SignInStart, SignInSubmitCode, TaskArchive, TaskInterrupt,
-        TaskReopen, TaskResolve, TaskRetry, TestResult, WorkerPairingCode, WorkerRename,
-        WorkerRevoke, WorkerSetPaused, WorkerSetPolicy, WorkerSetTags, WorkerToolInstall,
-        WorkerToolsCheck,
+        PreferencesSetSetupLater, PreferencesSetUserName, ReadMark, SignInCancel, SignInStart,
+        SignInSubmitCode, TaskArchive, TaskInterrupt, TaskReopen, TaskResolve, TaskRetry,
+        TestResult, WorkerPairingCode, WorkerRename, WorkerRevoke, WorkerSetPaused,
+        WorkerSetPolicy, WorkerSetTags, WorkerToolInstall, WorkerToolsCheck,
     },
     ids::{ChannelId, GroupId},
     model::{
@@ -172,6 +172,10 @@ pub(crate) fn channel_update(
     if let Some(servers) = changes.allowed_local_mcp_servers {
         patch["allowed_local_mcp_servers"] = servers.into();
     }
+    if let Some(rules) = changes.command_rules {
+        patch["command_rules"] =
+            serde_json::to_value(rules).map_err(|e| ClientError::Other(e.to_string()))?;
+    }
     if let Some(memory) = changes.memory_enabled {
         patch["memory_enabled"] = memory.into();
     }
@@ -231,6 +235,23 @@ async fn run(shared: Arc<Shared>, command: Command) -> Result<CommandOutput, Cli
             shared.defer_waiters();
             shared.set_connection(Connection::Connecting);
             shared.wake.notify_one();
+        }
+        Command::MoveHub { from, to } => {
+            let moved = shared.identity.lock().ok().and_then(|mut slot| {
+                let identity = slot.as_mut()?;
+                (identity.config.hub_url == from).then(|| {
+                    identity.config.hub_url.clone_from(&to);
+                    identity.clone()
+                })
+            });
+            if let Some(identity) = moved {
+                if let Some(store) = &shared.store {
+                    store.save(&identity)?;
+                }
+                shared.restart_link();
+                shared.wake.notify_one();
+                shared.publish_now();
+            }
         }
         Command::Unpair => {
             shared.new_owner(|cache| {
@@ -618,6 +639,15 @@ async fn run(shared: Arc<Shared>, command: Command) -> Result<CommandOutput, Cli
                 .call(task_model_update(parse(&task_id, "task")?, &selection))
                 .await?;
         }
+        Command::RenderVisual {
+            message_id,
+            width,
+            scale,
+            style,
+        } => {
+            let file = shared.visual_image(message_id, width, scale, style).await?;
+            return Ok(CommandOutput::VisualImage(file));
+        }
         Command::EditDraft {
             message_id,
             title,
@@ -651,12 +681,9 @@ async fn run(shared: Arc<Shared>, command: Command) -> Result<CommandOutput, Cli
                 .await?;
         }
         Command::Reconnect => {
-            // Only an offline link waits on a timer. A permit left over from
-            // a call while the link is up would skip the next wait.
-            let offline = shared
-                .connection
-                .lock()
-                .is_ok_and(|c| matches!(*c, Connection::Offline { .. }));
+            // Only a link that is down waits on a timer. A permit left over
+            // from a call while the link is up would skip the next wait.
+            let offline = shared.connection.lock().is_ok_and(|c| c.is_hub_down());
             if offline {
                 shared.wake.notify_one();
             }
@@ -749,14 +776,19 @@ async fn run(shared: Arc<Shared>, command: Command) -> Result<CommandOutput, Cli
         }
         Command::WorkerPairingCode => {
             let result = shared.call(WorkerPairingCode {}).await?;
-            let hub_url = shared
-                .identity()
-                .map(|i| i.config.hub_url)
-                .unwrap_or_default();
+            // An older hub does not say where a worker can reach it.
+            let hub_url = result.hub_url.unwrap_or_else(|| {
+                shared
+                    .identity()
+                    .map(|i| i.config.hub_url)
+                    .unwrap_or_default()
+            });
             if let Ok(mut p) = shared.pairing.lock() {
                 *p = Some(PairingCodeView {
                     code: result.code.to_string(),
+                    loopback_only: crate::reach::is_loopback_url(&hub_url),
                     hub_url,
+                    tls_sha256: result.tls_sha256,
                     expires_at: result.expires_at.as_millis(),
                 });
             }
@@ -832,6 +864,15 @@ async fn run(shared: Arc<Shared>, command: Command) -> Result<CommandOutput, Cli
                     },
                 })
                 .await?;
+        }
+        Command::SetSetupLater { later } => {
+            shared.call(PreferencesSetSetupLater { later }).await?;
+        }
+        Command::SetUserName { name } => {
+            shared.call(PreferencesSetUserName { name }).await?;
+        }
+        Command::GuideTryAgain => {
+            shared.call(GuideTryAgain {}).await?;
         }
         Command::SetCommandCheck { choice } => {
             shared
@@ -1052,6 +1093,8 @@ async fn run(shared: Arc<Shared>, command: Command) -> Result<CommandOutput, Cli
         | Command::LoadClients
         | Command::RevokeClient { .. }
         | Command::ClientPairingCode
+        | Command::LoadReach
+        | Command::SetReach { .. }
         | Command::CancelClientPairing) => return super::admin::run(&shared, command).await,
         // Settings > Proactivity.
         command @ (Command::LoadProactivityLog

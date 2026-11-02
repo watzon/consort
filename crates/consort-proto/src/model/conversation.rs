@@ -97,6 +97,10 @@ pub struct Channel {
     /// Skills that this channel turned off (channel exceptions).
     #[serde(default)]
     pub disabled_skills: Vec<SkillId>,
+    /// What a shell command can do here without the usual approval, and what
+    /// always asks. The rules of Tutti apply in every channel. See ADR 0019.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub command_rules: Vec<super::CommandRule>,
     /// When the channel was archived.
     pub archived_at: Option<Timestamp>,
     /// When the channel was created.

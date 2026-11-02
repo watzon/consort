@@ -220,6 +220,68 @@ impl ToolApprovals {
     }
 }
 
+/// One tool of a connection with its own approval rule. It wins over the
+/// rule of the tool's kind, so that "ask before a merge" does not also ask
+/// before a pull request.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+pub struct ToolException {
+    /// The Composio tool slug, for example `GITHUB_MERGE_A_PULL_REQUEST`.
+    pub tool: String,
+    /// `run_without_asking` or `ask_every_time`. An allow "once per task"
+    /// counts for a whole tool kind, so an exception cannot use it.
+    pub rule: ApprovalRule,
+}
+
+/// The most exceptions of one connection.
+pub const TOOL_EXCEPTIONS_MAX: usize = 100;
+
+/// Checks the exceptions of one connection: the limit, the rules, and one
+/// exception for a tool. A slug compares with no regard to case.
+pub fn validate_tool_exceptions(exceptions: &[ToolException]) -> Result<(), ValidationError> {
+    if exceptions.len() > TOOL_EXCEPTIONS_MAX {
+        return Err(ValidationError::new(
+            "tool_exceptions",
+            format!("can have {TOOL_EXCEPTIONS_MAX} items at most"),
+        ));
+    }
+    for (i, exception) in exceptions.iter().enumerate() {
+        if exception.tool.trim().is_empty() {
+            return Err(ValidationError::new("tool_exceptions", "has an empty tool"));
+        }
+        if exception.rule == ApprovalRule::AskOncePerTask {
+            return Err(ValidationError::new(
+                "tool_exceptions",
+                "can only run without asking or ask every time",
+            ));
+        }
+        if exceptions[..i]
+            .iter()
+            .any(|e| e.tool.eq_ignore_ascii_case(&exception.tool))
+        {
+            return Err(ValidationError::new(
+                "tool_exceptions",
+                format!("has two items for {}", exception.tool),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The name of a tool for the user: the slug with no service prefix, as a
+/// sentence. `GITHUB_MERGE_A_PULL_REQUEST` of `github` gives "Merge a pull
+/// request".
+pub fn tool_display_name(service: &str, slug: &str) -> String {
+    let prefix = format!("{}_", service.to_uppercase());
+    let upper = slug.to_uppercase();
+    let rest = upper.strip_prefix(&prefix).unwrap_or(&upper);
+    let words = rest.replace('_', " ").to_lowercase();
+    let mut chars = words.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
 /// Where a connection is. Serialized with a `kind` field.
 ///
 /// A new connection starts in `connecting`. The hub polls Composio until the
@@ -282,6 +344,14 @@ pub struct Connection {
     pub use_in: UseIn,
     /// The approval rule for each tool kind.
     pub approvals: ToolApprovals,
+    /// Tools with their own rule, which wins over the rule of their kind.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_exceptions: Vec<ToolException>,
+    /// The account belongs to the assistant, not to the user. What it
+    /// sends is not in the user's name, so the voice does not apply, and
+    /// routines follow the approval rules of the connection. See ADR 0020.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub assistant_owned: bool,
     /// Where it is.
     pub status: ConnectionStatus,
     /// When a tool of it last ran.
@@ -294,6 +364,14 @@ pub struct Connection {
 }
 
 impl Connection {
+    /// The rule for one tool: its exception, or else the rule of its kind.
+    pub fn rule_for_tool(&self, slug: &str, kind: ToolKind) -> ApprovalRule {
+        self.tool_exceptions
+            .iter()
+            .find(|e| e.tool.eq_ignore_ascii_case(slug))
+            .map_or_else(|| self.approvals.rule_for(kind), |e| e.rule)
+    }
+
     /// Whether a session in `channel` can use this connection: its scope
     /// matches and the channel did not turn it off.
     pub fn is_available_in(&self, channel: &Channel) -> bool {
@@ -632,6 +710,9 @@ pub struct ConnectorContextEntry {
     /// True when the connection needs a new sign-in.
     #[serde(default)]
     pub needs_sign_in: bool,
+    /// True when the account belongs to the assistant.
+    #[serde(default)]
+    pub assistant_owned: bool,
 }
 
 impl From<&Connection> for ConnectorContextEntry {
@@ -641,6 +722,7 @@ impl From<&Connection> for ConnectorContextEntry {
             service_name: c.service_name.clone(),
             identity: c.identity.clone(),
             needs_sign_in: matches!(c.status, ConnectionStatus::NeedsSignIn { .. }),
+            assistant_owned: c.assistant_owned,
         }
     }
 }
@@ -655,6 +737,11 @@ impl fmt::Display for ConnectorContextEntry {
         )?;
         if let Some(identity) = self.identity.as_deref().filter(|i| !i.trim().is_empty()) {
             write!(f, ", {}", one_line(identity))?;
+        }
+        if self.assistant_owned {
+            f.write_str(
+                " (your own account: what you send goes out in your name, not the user's)",
+            )?;
         }
         if self.needs_sign_in {
             f.write_str(" (needs a new sign-in: ask the user to reconnect it)")?;
@@ -761,6 +848,7 @@ mod tests {
             tags: tags.iter().map(|t| (*t).to_owned()).collect(),
             disabled_connections: vec![],
             disabled_skills: vec![],
+            command_rules: Vec::new(),
             archived_at: None,
             created_at: Timestamp::from_millis(0),
             updated_at: Timestamp::from_millis(0),
@@ -786,6 +874,8 @@ mod tests {
                 tags: vec!["work".into()],
             },
             approvals: ToolApprovals::default(),
+            tool_exceptions: Vec::new(),
+            assistant_owned: false,
             status: ConnectionStatus::Active,
             last_used_at: None,
             created_at: Timestamp::from_millis(1),
@@ -1115,6 +1205,7 @@ mod tests {
             service_name: "GitHub".into(),
             identity: None,
             needs_sign_in: true,
+            assistant_owned: false,
         };
         let block = render_connectors_block(&[
             ConnectorContextEntry::from(&connection()),

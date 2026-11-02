@@ -615,6 +615,7 @@ impl ConsortApp {
                     div()
                         .flex()
                         .flex_col()
+                        .flex_1()
                         .min_w_0()
                         .child(line(worker.name.clone(), t.text.ui, c.text_primary))
                         .child(line(
@@ -625,8 +626,26 @@ impl ConsortApp {
                             } else {
                                 c.text_tertiary
                             },
-                        )),
+                        ))
+                        .when_some(worker.update.clone(), |d, update| {
+                            let selector = format!("worker-update-{}", worker.id);
+                            d.child(
+                                line(
+                                    update.line.clone(),
+                                    detail(t),
+                                    crate::ui::versions::worker_update_color(&update, t),
+                                )
+                                .debug_selector(move || selector),
+                            )
+                        }),
                 )
+                .when(!worker.version.is_empty(), |d| {
+                    d.child(
+                        text(worker.version.clone(), detail(t), c.text_tertiary)
+                            .flex_none()
+                            .whitespace_nowrap(),
+                    )
+                })
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.settings_worker = Some(id.clone());
                     cx.notify();
@@ -933,6 +952,28 @@ impl ConsortApp {
                                             .min_w_0(),
                                     ),
                             )
+                            .when_some(
+                                w.update
+                                    .as_ref()
+                                    .and_then(|u| u.detail.clone().map(|d| (d, u.tone))),
+                                |col, (message, tone)| {
+                                    // An error detail. The user can copy it.
+                                    if tone == consort_client::versions::WorkerUpdateTone::Failed {
+                                        col.child(crate::ui::parts::error_box(
+                                            "worker-update-error",
+                                            message,
+                                            t,
+                                        ))
+                                    } else {
+                                        col.child(selectable(
+                                            "worker-update-detail",
+                                            message,
+                                            t.text.ui,
+                                            c.text_secondary,
+                                        ))
+                                    }
+                                },
+                            )
                             .child(tags),
                     )
                     .child(section_block(
@@ -981,6 +1022,9 @@ impl ConsortApp {
                 self.convo.settings.proactivity = level;
             }
             cx.notify();
+            return;
+        }
+        if self.pick_permissions_select(select, option, cx) {
             return;
         }
         if self.pick_proactivity_select(select, option, cx) {

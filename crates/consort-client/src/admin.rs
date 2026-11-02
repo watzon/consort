@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use chrono::{Datelike, Local, TimeZone};
 pub use consort_proto::client_api::{BackupFrequency, Weekday};
 use consort_proto::client_api::{BackupRecord, HubInfo};
-use consort_proto::model::{Client, ClientKind, Os, PairedBy};
+use consort_proto::model::{Client, ClientKind, Os, PairedBy, Sha256Hash};
 
 use crate::connectors::LoadState;
 use crate::format;
@@ -54,6 +54,10 @@ pub struct AdminCache {
     /// This app's client ID.
     pub self_id: Option<String>,
     pub pairing: Option<PairingCache>,
+    /// Reach from other devices.
+    pub reach: crate::reach::ReachCache,
+    /// The address of this app. Reach does not change it.
+    pub own_url: String,
     /// A loop asks `hub.status` every second while a backup runs.
     pub polling: bool,
 }
@@ -63,6 +67,8 @@ pub struct AdminCache {
 pub struct PairingCache {
     pub code: String,
     pub hub_url: String,
+    /// The pin of a hub on This network.
+    pub tls_sha256: Option<Sha256Hash>,
     pub expires_at: i64,
 }
 
@@ -73,6 +79,8 @@ pub struct AdminView {
     pub clients: ClientsView,
     /// The Pair a new app dialog.
     pub pairing: Option<ClientPairingView>,
+    /// Settings > Hub > Reach from other devices.
+    pub reach: crate::reach::ReachView,
     /// What needs the user, for notifications and the Dock badge.
     pub attention: crate::notify::AttentionView,
 }
@@ -88,6 +96,8 @@ pub struct HubStatusView {
     pub summary: String,
     pub address: String,
     pub hub_version: String,
+    /// How the hub was installed. A hub from before that field says nothing.
+    pub install: Option<consort_proto::release::InstallKind>,
     /// The newest protocol that the hub speaks, as text.
     pub protocol: String,
     /// "This app also speaks protocol 1."
@@ -201,6 +211,11 @@ pub struct ClientPairingView {
     pub expires_at: i64,
     /// What the QR code holds: the hub address and the code as JSON.
     pub qr_text: String,
+    /// The pin of a hub on This network.
+    pub tls_sha256: Option<Sha256Hash>,
+    /// The hub has only an address on its own computer, so a device cannot use
+    /// this code. The dialog sends the user to Reach from other devices.
+    pub loopback_only: bool,
     /// The name of the app that paired with this code, once it did.
     pub paired: Option<String>,
 }
@@ -424,6 +439,7 @@ pub fn hub_view(cache: &AdminCache, online: bool, now: i64) -> HubStatusView {
         summary,
         address: info.hub_url.clone(),
         hub_version: info.hub_version.clone(),
+        install: info.install,
         protocol: protocol.to_string(),
         protocol_line,
         data_dir: info.data_dir.clone(),
@@ -578,11 +594,14 @@ pub fn clients_view(cache: &AdminCache, now: i64) -> ClientsView {
 }
 
 /// The QR code text: the hub address and the code, as `PairingInvite`.
-pub fn qr_text(hub_url: &str, code: &str) -> String {
+pub fn qr_text(hub_url: &str, code: &str, tls_sha256: Option<&Sha256Hash>) -> String {
     // Built by hand, so the field order is the same in every build.
     let quote = |s: &str| serde_json::Value::from(s).to_string();
+    let pin = tls_sha256
+        .map(|pin| format!(",\"tls_sha256\":{}", quote(&pin.to_string())))
+        .unwrap_or_default();
     format!(
-        "{{\"hub_url\":{},\"code\":{}}}",
+        "{{\"hub_url\":{},\"code\":{}{pin}}}",
         quote(hub_url),
         quote(code)
     )
@@ -608,7 +627,9 @@ pub fn pairing_view(cache: &AdminCache) -> Option<ClientPairingView> {
         code: pairing.code.clone(),
         hub_url: pairing.hub_url.clone(),
         expires_at: pairing.expires_at,
-        qr_text: qr_text(&pairing.hub_url, &pairing.code),
+        qr_text: qr_text(&pairing.hub_url, &pairing.code, pairing.tls_sha256.as_ref()),
+        tls_sha256: pairing.tls_sha256.clone(),
+        loopback_only: crate::reach::is_loopback_url(&pairing.hub_url),
         paired,
     })
 }
@@ -619,6 +640,7 @@ pub(crate) fn admin_view(cache: &crate::cache::Cache, online: bool, now: i64) ->
         hub: hub_view(&cache.admin, online, now),
         clients: clients_view(&cache.admin, now),
         pairing: pairing_view(&cache.admin),
+        reach: crate::reach::reach_view(&cache.admin.reach, &cache.admin.own_url),
         attention: crate::notify::attention(cache),
     }
 }
@@ -672,6 +694,7 @@ mod tests {
                 last,
                 running,
             },
+            install: None,
         }
     }
 
@@ -857,6 +880,36 @@ mod tests {
     }
 
     #[test]
+    fn the_qr_text_holds_a_pin_only_when_there_is_one() {
+        assert_eq!(
+            qr_text("https://h", "KQ7M-4XPD", None),
+            r#"{"hub_url":"https://h","code":"KQ7M-4XPD"}"#
+        );
+        let pin = Sha256Hash::from_bytes([7; 32]);
+        let text = qr_text("https://h", "KQ7M-4XPD", Some(&pin));
+        let invite: consort_proto::auth::PairingInvite = serde_json::from_str(&text).unwrap();
+        assert_eq!(invite.tls_sha256, Some(pin));
+    }
+
+    #[test]
+    fn a_code_for_a_loopback_address_sends_the_user_to_reach() {
+        let mut cache = AdminCache {
+            pairing: Some(PairingCache {
+                code: "KQ7M-4XPD".into(),
+                hub_url: "http://127.0.0.1:7600".into(),
+                tls_sha256: None,
+                expires_at: PAIRING_CODE_MS,
+            }),
+            ..AdminCache::default()
+        };
+        assert!(pairing_view(&cache).unwrap().loopback_only);
+        if let Some(pairing) = &mut cache.pairing {
+            pairing.hub_url = "https://m.tail1234.ts.net".into();
+        }
+        assert!(!pairing_view(&cache).unwrap().loopback_only);
+    }
+
+    #[test]
     fn the_pairing_dialog_sees_the_app_that_used_its_code() {
         let now = local_ms(12, 0);
         let me = client("MacBook Pro", None, local_ms(1, 0), None);
@@ -865,6 +918,7 @@ mod tests {
             pairing: Some(PairingCache {
                 code: "KQ7M-4XPD".into(),
                 hub_url: "https://hub.example.com".into(),
+                tls_sha256: None,
                 expires_at: now + PAIRING_CODE_MS,
             }),
             ..AdminCache::default()

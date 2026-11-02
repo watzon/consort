@@ -45,8 +45,9 @@ impl Shared {
     /// The transfer for the paired hub, with the local blob cache.
     fn transfer(&self) -> Result<BlobTransfer, ClientError> {
         let identity = self.identity().ok_or(ClientError::NotConnected)?;
-        Ok(BlobTransfer::new(
+        Ok(BlobTransfer::pinned(
             &identity.config.hub_url,
+            identity.config.tls_sha256.as_ref(),
             Some(self.blob_cache_dir()),
         )?)
     }

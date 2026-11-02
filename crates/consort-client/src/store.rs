@@ -19,6 +19,10 @@ pub struct ClientConfig {
     pub client_id: ClientId,
     /// The name the hub knows this client by.
     pub name: String,
+    /// The SHA-256 of the certificate of a hub on This network. With it, this
+    /// client accepts that certificate and no other for `hub_url`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_sha256: Option<consort_proto::model::Sha256Hash>,
 }
 
 /// The files of one client: `client.json` and `client.key`.
@@ -438,6 +442,7 @@ fn decode_key(hex: &str) -> Option<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use consort_proto::model::Sha256Hash;
 
     fn identity() -> Identity {
         Identity {
@@ -445,6 +450,7 @@ mod tests {
                 hub_url: "http://127.0.0.1:7600".into(),
                 client_id: "cli_00000000-0000-0000-0000-000000000001".parse().unwrap(),
                 name: "Test".into(),
+                tls_sha256: None,
             },
             key: SigningKey::from_bytes(&[7u8; 32]),
         }
@@ -465,6 +471,21 @@ mod tests {
         assert_eq!(store.load_notification_settings(), changed);
         std::fs::write(dir.path().join("notifications.json"), "{ nope").unwrap();
         assert_eq!(store.load_notification_settings(), defaults);
+    }
+
+    #[test]
+    fn the_pin_is_saved_with_the_identity_and_an_old_file_has_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::new(dir.path());
+        let mut pinned = identity();
+        pinned.config.tls_sha256 = Some(Sha256Hash::from_bytes([7; 32]));
+        store.save(&pinned).unwrap();
+        let loaded = store.load().unwrap().unwrap();
+        assert_eq!(loaded.config.tls_sha256, pinned.config.tls_sha256);
+
+        // A file from before the pin.
+        store.save(&identity()).unwrap();
+        assert_eq!(store.load().unwrap().unwrap().config.tls_sha256, None);
     }
 
     #[test]

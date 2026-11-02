@@ -11,12 +11,12 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use consort_dictation::{Deps, Dictation, Phase, Preflight, Request, Settings, StopAfter, Update};
-use sayso_sdk::{MicFeed, Microphone};
+use sayso_sdk::embedded::{AudioFeed, CapturedAudio, FeedItem, Microphone, OpenError};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-struct Clip(Vec<f32>, Mutex<Option<crossbeam_channel::Sender<Vec<f32>>>>);
+struct Clip(Vec<f32>, Mutex<Option<crossbeam_channel::Sender<FeedItem>>>);
 
 struct ClipHandle(Arc<Clip>);
 
@@ -29,12 +29,13 @@ impl Drop for Lease {
 }
 
 impl Microphone for ClipHandle {
-    fn open(&self) -> Result<MicFeed, String> {
-        let (tx, frames) = crossbeam_channel::unbounded();
+    fn open(&self) -> Result<AudioFeed, OpenError> {
+        let (tx, items) = crossbeam_channel::unbounded();
         *self.0.1.lock().unwrap() = Some(tx);
-        Ok(MicFeed {
-            frames,
+        Ok(AudioFeed {
+            items,
             lease: Box::new(Lease(self.0.clone())),
+            excludes: Vec::new(),
         })
     }
 }
@@ -131,7 +132,7 @@ fn a_clip_becomes_clean_text() {
         let silence = vec![0.0; 16_000];
         for chunk in player.0.chunks(320).chain(silence.chunks(320)) {
             if let Some(tx) = player.1.lock().unwrap().as_ref() {
-                let _ = tx.send(chunk.to_vec());
+                let _ = tx.send(FeedItem::Audio(CapturedAudio::untimed(chunk.to_vec())));
             }
             std::thread::sleep(Duration::from_millis(20));
         }

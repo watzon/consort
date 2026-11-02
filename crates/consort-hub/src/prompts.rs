@@ -10,6 +10,35 @@ use crate::util::truncate_chars;
 
 pub(crate) const COORDINATOR_BASE: &str = include_str!("../prompts/coordinator.md");
 const TASK_BASE: &str = include_str!("../prompts/task.md");
+/// The section "Visuals" of both prompts: when to show a visual, how to
+/// preview it, and the chart kit. It lives with the kit that it describes.
+pub(crate) const VISUALS: &str = include_str!("../../consort-visual/kit/prompt.md");
+/// The guided start in Tutti. It joins the prompt only while the guide runs.
+pub(crate) const GUIDE: &str = include_str!("../prompts/guide.md");
+
+/// A base prompt with the Visuals section before the section that starts
+/// with `before`. When the base has no such section, the Visuals section
+/// goes at the end.
+fn with_visuals(base: &str, before: &str) -> String {
+    let visuals = VISUALS.trim();
+    match base.find(before) {
+        Some(at) => format!("{}\n{visuals}\n\n{}", &base[..at], &base[at + 1..]),
+        None => format!("{}\n\n{visuals}\n", base.trim_end()),
+    }
+}
+
+/// The base prompt of a coordinator, with the Visuals section before its
+/// section "Limits". The prompt fingerprint hashes it, so a change of the
+/// section starts new sessions.
+pub(crate) fn coordinator_base() -> String {
+    with_visuals(COORDINATOR_BASE, "\n# Limits\n")
+}
+
+/// The base prompt of a task session, with the Visuals section before its
+/// section "Style".
+fn task_base() -> String {
+    with_visuals(TASK_BASE, "\n# Style\n")
+}
 
 const MAX_INDEX_NOTES: usize = 150;
 const INDEX_LINE_CHARS: usize = 100;
@@ -92,7 +121,7 @@ pub(crate) fn coordinator_system_prompt(
     global_index: &str,
     channel_index: &str,
 ) -> String {
-    let mut out = COORDINATOR_BASE.trim_end().to_owned();
+    let mut out = coordinator_base().trim_end().to_owned();
     out.push('\n');
     out.push_str(&channel_section(channel, global_index, channel_index));
     out.push_str(&proactivity_section(channel));
@@ -125,7 +154,7 @@ pub(crate) fn task_system_prompt(
     global_index: &str,
     channel_index: &str,
 ) -> String {
-    let mut out = TASK_BASE.trim_end().to_owned();
+    let mut out = task_base().trim_end().to_owned();
     out.push('\n');
     out.push_str(&channel_section(channel, global_index, channel_index));
     let _ = writeln!(
@@ -307,6 +336,7 @@ mod tests {
             memory_enabled: true,
             disabled_connections: Vec::new(),
             disabled_skills: Vec::new(),
+            command_rules: Vec::new(),
             archived_at: None,
             created_at: Timestamp::EPOCH,
             updated_at: Timestamp::EPOCH,
@@ -432,7 +462,7 @@ mod tests {
             assert!(section.contains(needle), "missing {needle:?} in {section}");
         }
         // The events list names the proactive events.
-        assert!(prompt.contains("`check_in`, `brief`, `follow_up`, `stale_task`, `research`, `proactive_feedback` and `channel_created`"));
+        assert!(prompt.contains("`check_in`, `brief`, `follow_up`, `stale_task`, `research`, `proactive_feedback`, `channel_created` and `first_sign_in`"));
         // The channel part names the level and what it means.
         assert!(prompt.contains("Proactivity level: Quiet."), "{prompt}");
         let mut eager = channel();
@@ -661,6 +691,31 @@ mod tests {
         }
     }
 
+    /// The section "Visuals" comes from the kit crate. Both prompts have it
+    /// once, before their last section, and it follows the writing rules.
+    #[test]
+    fn both_prompts_have_the_visuals_section() {
+        let visuals = VISUALS.trim();
+        assert!(!visuals.is_empty());
+        assert!(visuals.contains("Visuals"), "{visuals}");
+        let coordinator = coordinator_system_prompt(&channel(), "", "");
+        let task = task_system_prompt(&channel(), &task_for_prompt(), "", "");
+        for (prompt, last) in [(&coordinator, "\n# Limits\n"), (&task, "\n# Style\n")] {
+            assert_eq!(prompt.matches(visuals).count(), 1, "{prompt}");
+            let at = prompt.find(visuals).unwrap();
+            assert!(at < prompt.find(last).unwrap(), "{prompt}");
+        }
+        assert!(coordinator_base().contains(visuals));
+        assert!(!VISUALS.contains('\u{2014}') && !VISUALS.contains('\u{2013}'));
+    }
+
+    #[test]
+    fn the_visuals_section_goes_at_the_end_of_a_base_with_no_such_section() {
+        let text = with_visuals("# One\n\nText.\n", "\n# Missing\n");
+        assert!(text.starts_with("# One\n\nText.\n\n"));
+        assert!(text.trim_end().ends_with(VISUALS.trim()));
+    }
+
     fn thread_message(author: Author, body: &str) -> Message {
         Message {
             id: MessageId::new(),
@@ -745,5 +800,49 @@ mod tests {
             turn.len()
         );
         assert!(turn.matches("<message ").count() < TASK_CONTEXT_MAX_CHARS / 100);
+    }
+
+    #[test]
+    fn the_guide_holds_its_rules_and_stays_out_of_the_plain_prompt() {
+        for rule in [
+            "The first message that the user types takes priority",
+            "Ask one question at a time",
+            "set_user_name",
+            "`memory_write`, in the note `about-you.md`",
+            "connect_service",
+            "Call `list_workers` first. If a worker is online, skip this question",
+            "add_worker",
+            "create_channel",
+            "The close follows in the same turn",
+            "I send a short brief each morning",
+            "Be quieter",
+            "`finish_guide` with `later`",
+            "`finish_guide` with `declined`",
+            "`finish_guide` with `closed`",
+            "Never ask for a password or a key in the chat",
+        ] {
+            assert!(GUIDE.contains(rule), "the guide lost the rule: {rule}");
+        }
+        assert!(!GUIDE.contains('\u{2014}'), "no em dash");
+        let plain = coordinator_system_prompt(&channel(), "", "");
+        assert!(!plain.contains("The guided start"));
+        assert!(!plain.contains("set up? I ask four short questions"));
+    }
+
+    #[test]
+    fn every_suggestion_of_the_guide_fits_the_tool_limit() {
+        for label in [
+            "Yes",
+            "Not now",
+            "No, I look around myself",
+            "I will type it",
+            "This computer",
+            "Another machine",
+            "What is in my mail today?",
+            "Be quieter",
+        ] {
+            assert!(GUIDE.contains(label), "{label}");
+            assert!(label.chars().count() <= 40, "{label}");
+        }
     }
 }

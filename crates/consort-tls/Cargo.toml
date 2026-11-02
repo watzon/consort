@@ -1,0 +1,16 @@
+[package]
+name = "consort-tls"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "The TLS pin of This network: a certificate verifier that accepts one SHA-256, shared by the client and the machine link."
+
+[lints]
+workspace = true
+
+[dependencies]
+consort-proto = { workspace = true }
+rustls = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }

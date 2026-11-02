@@ -7,19 +7,20 @@ This page lists the entities that the hub, the workers and the clients store, wi
 | Role | Store | Contents |
 |---|---|---|
 | Hub | `hub.db` (SQLite, WAL mode) | Every entity on this page except the worker-local state |
-| Hub | `blobs/` | Attachments, channel files, artifacts, skill files and skill uploads, named by SHA-256 |
+| Hub | `blobs/` | Attachments, channel files, artifacts, skill files and skill uploads, the pages of visuals and their images, named by SHA-256 |
 | Hub | `hub-secret.key` | The 256-bit key that encrypts `composio.key` (mode 0600). The hub makes it the first time it stores a Composio key. 32 random bytes, no header. Without it the Composio key cannot be read, so a backup keeps it with `composio.key` |
 | Hub | `composio.key` | The Composio project key, encrypted at rest (mode 0600). The file is the 4 bytes `CSK1`, a 12-byte nonce and the AES-256-GCM ciphertext with its tag. The associated data is `consort composio.key v1`. A copy of `hub.db` or of this file alone does not give the key. See ADR 0011 |
 | Hub | `logos/` | The logo cache: one file for each service logo, named by the SHA-256 of its origin address in hex, and a `<key>.url` file with that address for a logo that a connection uses. Not in `hub.db` and not in a backup, because the hub fetches a logo again when it is gone. See [Logo cache](#logo-cache) |
 | Hub | `tmp/` | Temporary folders of skill fetches (`skill-fetch-*`). The hub removes them when a fetch ends and when it starts |
 | Hub | FTS5 tables in `hub.db` | Search index over messages, memory notes and task titles |
+| Hub | `reach-tls.key`, `reach-tls.crt` | The private key (mode 0600) and the self-signed certificate of This network, in DER. The hub makes them the first time This network turns on, and keeps them, so a pin stays good. See [Reach](#reach) |
 | Hub | `backup.json` | The backup settings (schedule, folder, how many to keep) and the last backup result, written through a temp file and a rename (mode 0600). Not in `hub.db`, so it needs no schema migration. See [Backups](#backups) |
 | Hub | `hub.lock` | A lock that a running hub holds, so a second hub and `consort hub restore` cannot use the folder at the same time |
 | Hub | `backups/` (default) | The backup archives, `consort-<date>-<time>.tar`. The folder is a setting and can be anywhere on the hub machine |
 | Client | `notifications.json` | The notification switches of this client (Settings > Notifications). They do not go to the hub |
 | Session host | `session-host.toml` | Hub URL, harness accounts |
 | Session host | `sessions/<task or session ID>/` | The folder where the CLI of a session runs. A task keeps its folder, so a new session can resume its transcript |
-| Worker | `worker.toml` | Hub URL and worker ID from pairing, local MCP servers, checkouts |
+| Worker | `worker.toml` | Hub URL, the optional pin `tls_sha256` of a hub on This network, and worker ID from pairing, local MCP servers, checkouts |
 | Worker | `worker.db` (SQLite) | The journal, processes, workspaces and the worker policy |
 | Worker | `workspaces/` | Worktrees and clones that the worker made for tasks |
 | Session host | `<consort home>/profiles/<name>/` | The profile folder of each account, named after the account name when the session host made it (`profile_dir` in `session-host.toml`): the harness's own config and login, and `env.json` with the secret variables (mode 0600 on Unix) |
@@ -122,6 +123,7 @@ Turn IDs, harness request IDs and native references are opaque strings that the 
 | `monid` | object | What this channel may do with Monid: `disabled`, its own `approval`, `only_allowed`, `allowed` and `blocked`. The default changes nothing (ADR 0016) |
 | `access_grants` | list of objects | Temporary access that the user gave: `id`, `target`, `task_id`, `expires_at`, `granted_at` (ADR 0017) |
 | `disabled_skills` | list of skill IDs | Channel exceptions: skills that the channel turned off. Empty by default |
+| `command_rules` | list of rules | Shell commands that run without asking or always ask, each with `pattern`, `except`, `result`, `description` and `source`. Tutti's rules apply in every channel. Empty by default. See ADR 0019 |
 | `proactivity` | `off`, `quiet`, `normal` or `eager`, optional | The proactivity level. Empty means the default: `normal` for Tutti, `quiet` for other channels |
 | `proactive_tasks` | `drafts` or `channel_default` | What a task that a proactive turn starts may do. `drafts` (the default) runs it in Ask |
 | `archived_at` | timestamp, optional | |
@@ -177,6 +179,21 @@ The hub has one user, so a message that is read on one client is read on all of 
 | `channel_id` | ID | |
 | `thread_root_id` | ID, optional | Empty for the timeline |
 | `last_read_message_id` | ID | |
+
+### Visual image
+
+Schema version 20 adds the table `visual_images`, the image cache of `visual.render`. The PNG is a blob in `blobs/`. The table is in `hub.db` and in a backup.
+
+| Column | Type | Notes |
+|---|---|---|
+| `key` | text, primary key | The SHA-256 of a text that names the page hash, the width, the scale, the mode and the variables of the style, in order. It does not name the message, so two messages with the same page share an image |
+| `message_id` | ID | The message of the visual. The index `visual_images_message` is on this column |
+| `image_sha256` | hash | The blob of the PNG |
+| `size` | integer | The size of the PNG in bytes |
+| `height` | integer | The height of the page in CSS pixels. The PNG is this height times the scale |
+| `created_at` | timestamp | The oldest rows of a message go first when it has more than 32 |
+
+The rows of a message go when the hub deletes the message: when a task is deleted (its thread), and when a channel is deleted. A row whose blob is gone is ignored, and the hub draws the image again. The hub never deletes a blob, so the page and the images stay while the message exists.
 
 ## Work entities
 
@@ -321,6 +338,7 @@ A hub card is an approval that the hub makes itself, not a harness. Its `request
 | `management` | Management approval card | `tool`, `change`, `effect` (for example "GitHub Work becomes available in 4 more channels"), `arguments` | Allow: the hub makes the change | Don't |
 | `connect_service` | Connect card | `service`, `service_name`, `logo_url`, `name`, `use_in`, `approvals`, and `connection_id` after the user continued | Continue in browser | Not now |
 | `sign_in` | Sign-in card | `worker_id`, `account_id`, `account_label`, `harness`, `method`, and `sign_in_id` after the user started | Sign in | Not now |
+| `add_worker` | Worker card | `this_computer`, and `worker_id` and `worker_name` after a worker came online. It never holds a code | Done (the hub closes the card itself) | Not now |
 | `skill_install` | Install card | `name`, `description`, `source`, `commit`, `license`, `scripts`, `audits`, `use_in`, `blocked_reason`, and `skill_id` after the user added it | Add | Not now |
 
 A hub card in a task makes the task Needs input, as any approval does. When a card that a coordinator posted closes, the hub wakes the coordinator with a `card_answered` event (see [protocol.md](protocol.md#coordinator-turn-input)).
@@ -534,6 +552,8 @@ One connected account of one Composio service. A feed entity with no channel (`c
 | `identity` | text, optional | The account's email address or login, when the service tells |
 | `use_in` | object | `kind`: `every_channel`, `tags` with `tags` (a channel needs all of them), or `channels` with `channel_ids` |
 | `approvals` | object | `read`, `change` and `delete`, each `run_without_asking`, `ask_once_per_task` or `ask_every_time`. The defaults are run without asking, ask every time and ask every time |
+| `tool_exceptions` | list | Tools with their own rule, each `tool` (a slug) and `rule` (`run_without_asking` or `ask_every_time`). An exception wins over the rule of the tool kind (ADR 0020) |
+| `assistant_owned` | bool | The account belongs to the assistant: no voice, and proactive turns and draft tasks follow the rules of the connection (ADR 0020) |
 | `status` | object | `kind`: `connecting` with `redirect_url` and `expires_at`, `active`, `needs_sign_in` with `message`, or `failed` with `message` |
 | `last_used_at` | timestamp, optional | |
 | `created_at`, `updated_at` | timestamp | |
@@ -711,6 +731,8 @@ A connector card ([Hub cards](#hub-cards)) of a draft or send tool has `outgoing
 
 A card from `show_draft` is not an approval. It is a message of the kind `notice` with the JSON body `{"kind": "draft", "text", "title", "to"?, "body", "original_body"?}`. `original_body` is the first text of the assistant, kept after the user edits the card (see [protocol.md](protocol.md#drafts-that-the-user-sends)).
 
+A visual from `show_visual` is a message of the kind `notice` with the JSON body `{"kind": "visual", "text", "title", "height", "heights"}`, and one attachment, the prepared page (`text/html`, named after the title). `text` is the title, for a client that has no visuals. `height` is the height that the assistant gave, clamped to 80 to 2000 pixels. `heights` is the height table, a list of `{width, height}` sorted by width, empty when the session host had no browser. The page is a part of the message, not a channel file. A task session posts the visual in its task thread, and a coordinator posts it in its channel. The images of a visual are in the table `visual_images` (see [Visual image](#visual-image)). See [protocol.md](protocol.md#visuals).
+
 A notice with `kind` `turn_failed` can also have `error_kind` (`rate_limit`, `provider_outage`, `expired_sign_in`, `worker_restarted` or `unknown`), `resets_at` (Unix milliseconds), `account`, `raw` and `path`. `path` lists what the fallback path tried and skipped (the same lines as a move notice) and is set when no step could answer. Notices from before these fields exist read as `unknown`.
 
 The notice kinds `assistant_unavailable` and `assistant_signed_out` are not posted any more: that state is live, in `coordinator_blocked` on the channel. A database from an older hub can still hold rows of these two kinds. A client does not show them.
@@ -721,12 +743,20 @@ Every copy of a draft goes after 90 days. The maintenance purge deletes old `dra
 
 ## Preferences
 
+Schema version 19 adds no table. It sets `first_greeting` in `meta` to `skipped` on a hub that has a message, a task or a channel that is not Tutti. The hub later sets the key to `fired` or `skipped` (see `first_sign_in` in [protocol.md](protocol.md)).
+
 The user's preferences are one record that every client shares. The hub stores it as JSON in the `meta` table, under the key `preferences`, so it needs no table of its own. A hub that has no record yet has empty preferences.
 
 | Field | Type | Notes |
 |---|---|---|
 | `favorite_models` | list of `{account_label, model}` | The favorite models of the model picker, in the order that the user starred them. At most 200. Each field has at most 200 characters |
 | `fallback_path` | object | The one global fallback path: `other_accounts` (boolean, true by default) and `steps` (a list of model selections: account label, model and options, at most 10, no account and model twice). The first choice is the model of the channel and is not stored. See "The fallback path" in architecture.md |
+| `command_check` | object | The source of the command check: `kind` (`account`, `decision` or `chat`) and the choice of each kind, so a change of kind loses nothing. A decision model has a confidence limit in percent (80 by default) |
+| `endpoints` | list of `{id, name, base_url, key_last_four}` | The API endpoints that the user added. The key stays on the hub, and a client sees only its last four characters |
+| `setup_later` | boolean | The user chose Do this later in setup. False by default, and left out when false |
+| `user_name` | text, optional | The name of the user, at most 80 characters. Set by `set_user_name` or `preferences.set_user_name`. A client shows it, and shows the name of its computer user only when this is empty |
+| `guide` | `not_started`, `running`, `closed` or `stopped` | Where the guided start in Tutti is. `running` puts the guide in the prompt of Tutti. A name from a newer hub reads as another state |
+| `guide_offered_again` | boolean | The hub has made its one more offer, so a second "Not now" makes none |
 
 A favorite whose account is not signed in, or whose account no longer offers the model, stays in the list. The clients do not show it until the account or the model comes back. The feed `entity_id` of the record is `preferences`, and its entries have no channel.
 
@@ -738,12 +768,26 @@ A backup is one tar archive in the backup folder on the hub machine. The hub nam
 |---|---|
 | `consort-backup.json` | The manifest, always first: `kind` (`consort-hub-backup`), `format` (1), `hub_version`, `schema_version` (`user_version` of `hub.db`), `created_at` and the number of blobs |
 | `hub.db` | A consistent copy from SQLite's online backup API, made in one step while the hub runs |
-| `hub-secret.key`, `composio.key`, `backup.json` | When they exist. Without `hub-secret.key` the Composio key cannot be read |
+| `hub-secret.key`, `composio.key`, `backup.json`, `reach-tls.key`, `reach-tls.crt` | When they exist. Without `hub-secret.key` the Composio key cannot be read. Without the TLS files, the hub makes a new certificate and each device on This network must pair again |
 | `blobs/<sha256>` | Every blob, skill files included. A blob never changes after it is written, so a plain copy is consistent |
 
 The hub writes the archive as a hidden `.partial` file and renames it when it is complete, so a half archive never has an archive name. After a backup that worked, it deletes the oldest archives with the archive name so that `keep` stay. The order is the `created_at` of each manifest, or the time in the name read as UTC when the manifest cannot be read, so an older hub's names in local time cannot make it delete the newest archive. Other files in the folder stay. The copy of the database that the backup makes in the folder before it goes into the archive is created with mode 0600 on Unix.
 
 `backup.json` holds `settings` (`schedule` with `frequency` `off`, `daily` or `weekly`, `time` as `HH:MM`, `weekday` and an IANA `time_zone`; `folder`; `keep`, 1 to 100, default 7), `schedule_changed_at`, `last` (the last backup that finished or failed) and `last_slot` (the schedule slot of the last scheduled backup). A missing or damaged file reads as the defaults: no schedule, `<data>/backups`, keep 7.
+
+## Reach
+
+Hub migration 18 adds `hub_reach`, with one row for each way to reach the hub that is on. A row goes away when the way turns off.
+
+| Field | Type | Notes |
+|---|---|---|
+| `method` | text, primary key | `tailscale` or `this_network` |
+| `address` | text | The address that peers use. It is an accepted origin while the row exists |
+| `port` | integer | The Serve port (443 or 8443), or the TLS port. The TLS port is the main port plus one, or a port that the system picks when that one is taken |
+| `target` | text, optional | What the Serve entry proxies to. An entry is the entry of this hub only when its root proxy is this target |
+| `turned_on_at` | timestamp | |
+
+The meta key `reach.hub_target` keeps the local address of the running hub, for `consort hub reach tailscale`. There is no list of origins in the settings: the accepted origins are the public URL and the `address` of each row. A Serve entry that went away shows as `removed`, and its row stays until the user decides. The hub listens on the TLS port only while the `this_network` row exists, and it checks this every 10 seconds, so a change on the command line counts.
 
 ## Feed
 

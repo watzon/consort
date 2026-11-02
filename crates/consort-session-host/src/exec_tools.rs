@@ -862,6 +862,7 @@ mod tests {
             reason: None,
             rule: None,
             error: None,
+            command_rule: None,
         }
     }
 

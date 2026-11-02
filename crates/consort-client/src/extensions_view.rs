@@ -163,6 +163,16 @@ pub fn connection_view(c: &model::Connection, cache: &Cache) -> ConnectionView {
         identity: c.identity.clone(),
         use_in: use_in_view(&c.use_in),
         approvals: approvals_view(&c.approvals),
+        tool_exceptions: c
+            .tool_exceptions
+            .iter()
+            .map(|x| ToolExceptionView {
+                tool: x.tool.clone(),
+                name: consort_proto::model::tool_display_name(&c.service, &x.tool),
+                rule: rule_view(x.rule),
+            })
+            .collect(),
+        assistant_owned: c.assistant_owned,
         status: status_view(&c.status),
         created_at: c.created_at.as_millis(),
     }
@@ -452,6 +462,26 @@ pub fn hub_card(
             tool: card.tool.clone(),
             change: card.change.clone(),
             effect: card.effect.clone(),
+            permissions: card.permissions.as_ref().map(|p| PermissionsCardView {
+                groups: p
+                    .groups
+                    .iter()
+                    .map(|g| PermissionGroupView {
+                        heading: g.heading.clone(),
+                        rows: g
+                            .rows
+                            .iter()
+                            .map(|r| PermissionRowView {
+                                subject: r.subject.clone(),
+                                code: r.code,
+                                text: r.text.clone(),
+                            })
+                            .collect(),
+                        note: g.note.clone(),
+                    })
+                    .collect(),
+                warning: p.warning.clone(),
+            }),
         }),
         ApprovalDetails::ConnectService(card) => HubCardView::ConnectService(ConnectCardView {
             service: card.service.clone(),
@@ -461,6 +491,10 @@ pub fn hub_card(
             use_in: use_in_view(&card.use_in),
             approvals: approvals_view(&card.approvals),
             connection_id: card.connection_id.map(|c| c.to_string()),
+        }),
+        ApprovalDetails::AddWorker(card) => HubCardView::AddWorker(AddWorkerCardView {
+            this_computer: card.this_computer,
+            worker_name: card.worker_name.clone(),
         }),
         ApprovalDetails::SignIn(card) => {
             let (provider, logo) = provider_of(&card.harness);

@@ -271,6 +271,7 @@ fn the_writing_bubble_shows_while_the_reply_is_owed() {
             state: crate::activity::MarkState::Working,
             line: Some("Writing".into()),
         },
+        own_state: crate::activity::MarkState::Working,
     });
     assert!(is_writing(&state, &id.to_string()));
     // The user's message reached the hub: the bubble shows.
@@ -338,6 +339,7 @@ fn notice_post(quiet: bool) -> crate::view::ThreadPost {
             draft: None,
             fallback: None,
             monid: None,
+            visual: None,
         }],
         pending: false,
         source_message_id: None,

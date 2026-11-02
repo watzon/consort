@@ -84,6 +84,8 @@ pub(crate) async fn dispatch(hub: &Hub, caller: Caller, request: ClientRequest) 
         R::HubStatus(r) => to_value(&hub.hub_status(caller, r).await?),
         R::HubBackup(r) => to_value(&hub.hub_backup(caller, r).await?),
         R::HubBackupSettings(r) => to_value(&hub.hub_backup_settings(caller, r).await?),
+        R::HubReachStatus(r) => to_value(&hub.hub_reach_status(caller, r).await?),
+        R::HubReachSet(r) => to_value(&hub.hub_reach_set(caller, r).await?),
         R::ProactivityGet(r) => to_value(&hub.proactivity_get(caller, r).await?),
         R::ProactivitySet(r) => to_value(&hub.proactivity_set(caller, r).await?),
         R::ProactivitySnooze(r) => to_value(&hub.proactivity_snooze(caller, r).await?),
@@ -116,6 +118,11 @@ pub(crate) async fn dispatch(hub: &Hub, caller: Caller, request: ClientRequest) 
         R::PreferencesSetFavoriteModel(r) => {
             to_value(&hub.preferences_set_favorite_model(caller, r).await?)
         }
+        R::PreferencesSetSetupLater(r) => {
+            to_value(&hub.preferences_set_setup_later(caller, r).await?)
+        }
+        R::PreferencesSetUserName(r) => to_value(&hub.preferences_set_user_name(caller, r).await?),
+        R::GuideTryAgain(r) => to_value(&hub.guide_try_again(caller, r).await?),
         R::PreferencesSetCommandCheck(r) => {
             to_value(&hub.preferences_set_command_check(caller, r).await?)
         }
@@ -164,6 +171,7 @@ pub(crate) async fn dispatch(hub: &Hub, caller: Caller, request: ClientRequest) 
         }
         R::SkillPreview(r) => to_value(&hub.skill_preview(caller, r).await?),
         R::SkillInstall(r) => to_value(&hub.skill_install(caller, r).await?),
+        R::VisualRender(r) => to_value(&hub.visual_render(caller, r).await?),
         R::Hello(_) | R::SyncSnapshot(_) | R::SyncSubscribe(_) | R::AuthHttpToken(_) => Err(
             HubError::invalid("This request belongs to the connection and cannot be routed."),
         ),

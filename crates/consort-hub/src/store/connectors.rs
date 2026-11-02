@@ -341,6 +341,8 @@ mod tests {
             identity: None,
             use_in: UseIn::EveryChannel,
             approvals: ToolApprovals::default(),
+            tool_exceptions: Vec::new(),
+            assistant_owned: false,
             status: ConnectionStatus::Active,
             last_used_at: None,
             created_at: Timestamp::from_millis(1),

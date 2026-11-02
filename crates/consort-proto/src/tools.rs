@@ -31,6 +31,7 @@ mod connectors;
 mod management;
 mod monid;
 mod proactivity;
+mod visual;
 mod voice;
 
 pub use connectors::{
@@ -40,13 +41,14 @@ pub use connectors::{
     RunConnectorToolArgs, RunConnectorToolResult,
 };
 pub use management::{
-    AddAccountArgs, AddSkillArgs, ArchiveChannelArgs, ChangeStatus, ConnectServiceArgs,
-    CreateChannelArgs, DisconnectArgs, InstallToolArgs, ListConnectionsResult,
-    ListInstalledSkillsResult, ManagementResult, MonidAccessArgs, RemoveSkillArgs,
-    RequestAccessArgs, RequestAccessResult, RequestableConnection, SearchConnectorCatalogArgs,
-    SearchConnectorCatalogResult, SearchSkillsArgs, SearchSkillsResult, SetChannelConnectorArgs,
-    SetChannelSkillArgs, SetChannelTagsArgs, SetDefaultModelArgs, SetWorkerTagsArgs,
-    StartSignInArgs, UpdateChannelArgs, UpdateConnectionArgs, UpdateSkillArgs,
+    AddAccountArgs, AddSkillArgs, AddWorkerArgs, ArchiveChannelArgs, ChangeStatus,
+    ConnectServiceArgs, CreateChannelArgs, DisconnectArgs, FinishGuideArgs, GuideOutcome,
+    InstallToolArgs, ListConnectionsResult, ListInstalledSkillsResult, ManagementResult,
+    MonidAccessArgs, RemoveSkillArgs, RequestAccessArgs, RequestAccessResult,
+    RequestableConnection, SearchConnectorCatalogArgs, SearchConnectorCatalogResult,
+    SearchSkillsArgs, SearchSkillsResult, SetChannelConnectorArgs, SetChannelSkillArgs,
+    SetChannelTagsArgs, SetDefaultModelArgs, SetPermissionsArgs, SetUserNameArgs,
+    SetWorkerTagsArgs, StartSignInArgs, UpdateChannelArgs, UpdateConnectionArgs, UpdateSkillArgs,
     UpdateThisChannelArgs,
 };
 pub use monid::{
@@ -57,6 +59,10 @@ pub use monid::{
 pub use proactivity::{
     CancelFollowUpArgs, FollowUpLaterArgs, FollowUpResult, NoReplyNeededArgs, SetProactivityArgs,
     SetProactivityResult,
+};
+pub use visual::{
+    PREVIEW_VISUAL_INSTALLING, PreviewVisualArgs, PreviewVisualResult, SHOW_VISUAL_SHOWN,
+    ShowVisualArgs, ShowVisualResult, VisualConsoleMessage,
 };
 pub use voice::{
     ProposeVoiceRuleArgs, SHOW_DRAFT_BODY_MAX_BYTES, SHOW_DRAFT_TITLE_MAX_CHARS,
@@ -126,6 +132,14 @@ pub enum ToolContent {
     Text {
         /// The text.
         text: String,
+    },
+    /// An image. Only the session host makes one, for `preview_visual`, so
+    /// it never crosses the link to an older hub.
+    Image {
+        /// The image bytes in base64.
+        data: String,
+        /// The media type, such as `image/png`.
+        mime_type: String,
     },
 }
 
@@ -762,6 +776,14 @@ hub_tools! {
     /// `show_draft`.
     ShowDraft("show_draft", ShowDraftArgs, EVERY_SESSION,
         "Show the user a text that they send themself, in a card with Edit and Copy. Use it when no connection can send the text: a claim form, a phone call, a letter. The card does not wait and does not stop your turn. When a connection can send the text, use run_connector_tool, not this. Never write text in the user's name as a plain chat message. After the card, write one short message about it, or none."),
+    /// `preview_visual`. The session host answers it: it renders the page
+    /// and posts nothing.
+    PreviewVisual("preview_visual", PreviewVisualArgs, EVERY_SESSION,
+        "Render an HTML page as the user will see it in a visual, and get a PNG, the content height and the console output. Nothing is posted. Call it before show_visual, look at the image, and fix what is wrong. The page gets the theme variables, the app fonts and the Ink chart kit, as in show_visual."),
+    /// `show_visual`. The session host prepares the page, then the hub posts
+    /// it.
+    ShowVisual("show_visual", ShowVisualArgs, EVERY_SESSION,
+        "Show an HTML page in the conversation as a visual: a chart, a diagram, a table or a mockup. Answer a trend or a comparison with a chart. Preview it with preview_visual first. The page fills the width of the conversation and grows to fit its content, so never size it with vh units. Images by absolute path in your workspace are put in the page. The page can use the network. A task session posts the visual in its task thread. After it, do not describe the visual or repeat its data."),
     /// `voice_guide`. The hub lists it only while "Write in my voice" is
     /// on.
     VoiceGuide("voice_guide", VoiceGuideArgs, EVERY_SESSION,
@@ -854,10 +876,13 @@ hub_tools! {
         "List the installed skills with their scope, whether they are on, whether they have scripts, and whether a new version waits for review. In a channel, it lists the ones that this channel can use, and says which ones this channel turned off."),
     /// `connect_service`.
     ConnectService("connect_service", ConnectServiceArgs, COORDINATORS,
-        "Post a connect card for a service. The user checks the settings and continues in the browser. You never handle a password or a key. In a channel, the default scope is the channels with this channel's tags, or this channel alone."),
+        "Post a connect card for a service. The user checks the settings and continues in the browser. When the hub has no Composio key yet, the card asks the user for it, and the catalog cannot check the slug: use the plain slug, such as `gmail`. You never handle a password or a key. In a channel, the default scope is the channels with this channel's tags, or this channel alone."),
     /// `add_skill`.
     AddSkill("add_skill", AddSkillArgs, COORDINATORS,
         "Post an install card for a skill from a git URL, owner/repo, or a search_skills entry. The card shows its license, scripts and audits, and the user adds it or not."),
+    /// `set_user_name`.
+    SetUserName("set_user_name", SetUserNameArgs, COORDINATORS,
+        "Keep what the user wants to be called. The app shows this name in every client. Use it when the user tells you their name."),
     /// `suggest_memory`.
     SuggestMemory("suggest_memory", SuggestMemoryArgs, CHANNEL_COORDINATOR_AND_TASK,
         "Suggest a note for memory. A task sends it to the channel coordinator. A channel coordinator sends it to the Tutti coordinator as a global memory suggestion. The coordinator that gets it decides whether to keep it."),
@@ -901,6 +926,15 @@ hub_tools! {
     /// `start_sign_in`.
     StartSignIn("start_sign_in", StartSignInArgs, TUTTI_ONLY,
         "Post a sign-in card for an account that is signed out. The user signs in on the card."),
+    /// `add_worker`.
+    AddWorker("add_worker", AddWorkerArgs, TUTTI_ONLY,
+        "Post a worker card. The app makes a pairing code and shows the install command on the card. You never see the code. The hub closes the card and tells you with a card_answered event when a worker is online, or when the user says Not now."),
+    /// `start_guide`.
+    StartGuide("start_guide", NoArgs, TUTTI_ONLY,
+        "Start the guided setup when the user asks for it, for example \"help me set up\", or says yes to your last offer. The result holds the rules of the guide."),
+    /// `finish_guide`.
+    FinishGuide("finish_guide", FinishGuideArgs, TUTTI_ONLY,
+        "End the guided setup. `closed`: you posted the close. `later`: the user said \"Not now\", and the hub makes one more offer tomorrow. `declined`: the user does not want it, and no offer comes."),
     /// `search_connector_catalog`.
     SearchConnectorCatalog("search_connector_catalog", SearchConnectorCatalogArgs, TUTTI_ONLY,
         "Search the connector catalog for services to connect, such as Gmail or GitHub."),
@@ -919,6 +953,9 @@ hub_tools! {
     /// `remove_skill`.
     RemoveSkill("remove_skill", RemoveSkillArgs, TUTTI_ONLY,
         "Remove a skill. This asks the user first."),
+    /// `set_permissions`.
+    SetPermissions("set_permissions", SetPermissionsArgs, COORDINATORS,
+        "Change what the assistant can do without asking: which shell commands run or always ask, and the approval rules, tool exceptions and owner of connections. Use this when the user says what you may do, such as \"PR anything, just ask for merges\". Cover both the shell commands and the connector tools, so a limit holds both ways. Command rules that make a channel stricter run at once. Any other change asks the user first. Tell the user that only the rules of the remote service, such as branch protection, are a real lock."),
     // A channel's coordinator, for its own channel only.
     /// `update_this_channel`.
     UpdateThisChannel("update_this_channel", UpdateThisChannelArgs, CHANNEL_COORDINATOR_ONLY,
@@ -1490,6 +1527,49 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn the_visual_tools_hide_the_fields_of_the_session_host() {
+        for tool in [HubTool::PreviewVisual, HubTool::ShowVisual] {
+            for audience in ToolAudience::ALL {
+                assert!(tool.audiences().contains(&audience), "{audience:?}");
+            }
+        }
+        let schema = HubTool::ShowVisual.input_schema();
+        let properties = schema["properties"].as_object().unwrap();
+        assert!(properties.contains_key("html"));
+        assert!(properties.contains_key("title"));
+        assert!(properties.contains_key("height"));
+        assert!(!properties.contains_key("page"));
+        assert!(!properties.contains_key("heights"));
+        let preview = HubTool::PreviewVisual.input_schema().to_string();
+        assert!(
+            preview.contains(r#""dark""#) && preview.contains(r#""light""#),
+            "{preview}"
+        );
+        let call = HubToolCall::parse(
+            "show_visual",
+            json!({"html": "<p>Hi</p>", "title": "Hello", "heights": [{"width": 320, "height": 90}]}),
+        )
+        .unwrap();
+        let HubToolCall::ShowVisual(args) = call else {
+            panic!("expected show_visual");
+        };
+        assert_eq!(args.heights.unwrap()[0].height, 90);
+        assert_eq!(args.page, None);
+    }
+
+    #[test]
+    fn an_image_block_is_tagged_image() {
+        let block = ToolContent::Image {
+            data: "iVBORw0KGgo=".into(),
+            mime_type: "image/png".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&block).unwrap(),
+            json!({"type": "image", "data": "iVBORw0KGgo=", "mime_type": "image/png"})
+        );
+    }
+
+    #[test]
     fn the_tutti_audience_reads_the_old_name_and_writes_the_new_one() {
         let old: ToolAudience = serde_json::from_value(json!("everything_coordinator")).unwrap();
         let new: ToolAudience = serde_json::from_value(json!("tutti_coordinator")).unwrap();
@@ -1520,6 +1600,8 @@ mod tests {
             "ask_decision",
             "search",
             "show_draft",
+            "preview_visual",
+            "show_visual",
         ];
         let coordinator = [
             "post_message",
@@ -1560,10 +1642,12 @@ mod tests {
             "voice_guide",
         ];
         let coordinator_extensions = [
+            "set_permissions",
             "list_connections",
             "list_installed_skills",
             "connect_service",
             "add_skill",
+            "set_user_name",
         ];
         let tutti_only = [
             "voice_sample",
@@ -1579,6 +1663,9 @@ mod tests {
             "install_tool",
             "add_account",
             "start_sign_in",
+            "add_worker",
+            "start_guide",
+            "finish_guide",
             "search_connector_catalog",
             "update_connection",
             "disconnect",
@@ -2061,6 +2148,10 @@ mod tests {
                 json!({"skill": "pdf-forms", "enabled": true, "accept_new_version": true}),
             ),
             ("remove_skill", json!({"skill": "pdf-forms"})),
+            (
+                "set_permissions",
+                json!({"add": [{"pattern": "gh pr merge", "result": "ask", "description": "Merge a PR"}]}),
+            ),
             ("update_this_channel", json!({"purpose": "Ship Sayso"})),
             ("set_channel_tags", json!({"tags": ["work"]})),
             (

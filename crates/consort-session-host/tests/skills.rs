@@ -111,6 +111,7 @@ fn extensions(skills: Vec<SkillBundleRef>) -> SessionExtensions {
             service_name: "Gmail".into(),
             identity: Some("me@example.com".into()),
             needs_sign_in: false,
+            assistant_owned: false,
         }],
         skill_context: skills
             .iter()

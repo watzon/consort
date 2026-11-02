@@ -17,6 +17,9 @@ async fn start(data_dir: &Path) -> consort_hub::HubHandle {
         data_dir: data_dir.to_path_buf(),
         listen: "127.0.0.1:0".parse().unwrap(),
         public_url: None,
+        install_kind: consort_proto::release::InstallKind::Manual,
+        dev: false,
+        first_greeting: false,
     })
     .await
     .unwrap()

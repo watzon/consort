@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use consort_proto::client_api::{
     BackupSchedule, ClientList, ClientPairingCode, ClientRevoke, HubBackup, HubBackupSettings,
-    HubStatus,
+    HubReachSet, HubReachStatus, HubStatus,
 };
 
 use super::Shared;
@@ -235,6 +235,7 @@ pub(super) async fn run(
                 cache.admin.pairing = Some(PairingCache {
                     code: result.code.to_string(),
                     hub_url: result.hub_url,
+                    tls_sha256: result.tls_sha256,
                     expires_at: result.expires_at.as_millis(),
                 });
             }
@@ -245,6 +246,61 @@ pub(super) async fn run(
                 cache.admin.pairing = None;
             }
             shared.publish();
+        }
+        Command::LoadReach => {
+            let own_url = shared
+                .identity()
+                .map(|i| i.config.hub_url)
+                .unwrap_or_default();
+            if let Ok(mut cache) = shared.cache.lock() {
+                cache.admin.own_url = own_url;
+                if cache.admin.reach.info.is_none() {
+                    cache.admin.reach.load = LoadState::Loading;
+                }
+            }
+            shared.publish();
+            let result = shared.call(HubReachStatus {}).await.map_err(older_hub);
+            if let Ok(mut cache) = shared.cache.lock() {
+                let reach = &mut cache.admin.reach;
+                match &result {
+                    Ok(answer) => {
+                        reach.info = Some(answer.reach.clone());
+                        reach.load = LoadState::Loaded;
+                    }
+                    // A later check repeats this, so the old state stays while
+                    // there is one.
+                    Err(err) if reach.info.is_none() => {
+                        reach.load = LoadState::Failed(err.to_string());
+                    }
+                    Err(_) => {}
+                }
+            }
+            shared.publish();
+            result?;
+        }
+        Command::SetReach { method, on } => {
+            if let Ok(mut cache) = shared.cache.lock() {
+                cache.admin.reach.busy = Some(method);
+                cache.admin.reach.error = None;
+            }
+            shared.publish();
+            let result = shared
+                .call(HubReachSet { method, on })
+                .await
+                .map_err(older_hub);
+            if let Ok(mut cache) = shared.cache.lock() {
+                let reach = &mut cache.admin.reach;
+                reach.busy = None;
+                match &result {
+                    Ok(answer) => {
+                        reach.info = Some(answer.reach.clone());
+                        reach.load = LoadState::Loaded;
+                    }
+                    Err(err) => reach.error = Some(err.to_string()),
+                }
+            }
+            shared.publish();
+            result?;
         }
         other => {
             return Err(ClientError::Other(format!(

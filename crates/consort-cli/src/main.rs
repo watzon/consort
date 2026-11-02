@@ -11,6 +11,8 @@ use clap::{Args, Parser, Subcommand};
 use consort_session_host::HostConfig;
 use consort_session_host::config::HostToml;
 
+mod hub_update;
+mod local;
 mod service;
 mod service_cmd;
 
@@ -43,6 +45,12 @@ enum Command {
         #[command(subcommand)]
         command: SessionHostCommand,
     },
+    /// Run a hub, a session host and a worker on this computer, in one service
+    /// for your user. The app runs these commands.
+    Local {
+        #[command(subcommand)]
+        command: local::LocalCommand,
+    },
     /// Run a hub and a worker in one process, for development. The worker
     /// keeps its profile folders and managed tools in <data>/home, unless
     /// CONSORT_HOME is set.
@@ -67,6 +75,10 @@ enum Command {
         #[arg(long)]
         url: String,
     },
+    /// Prints the `release.json` of this program. The release workflow runs
+    /// this.
+    #[command(name = "release-info", hide = true)]
+    ReleaseInfo,
 }
 
 #[derive(Args)]
@@ -115,6 +127,29 @@ enum HubCommand {
         #[command(subcommand)]
         command: PairedCommand,
     },
+    /// Show or change how other devices reach this hub, on the hub machine.
+    ///
+    /// Run it as the owner of the hub, or as root on a server. It works while
+    /// the hub runs, and the hub needs no restart. A hub on a server cannot
+    /// change Tailscale itself, so this command does.
+    Reach {
+        #[command(subcommand)]
+        command: ReachCommand,
+        /// The data folder of the hub.
+        #[arg(long, global = true)]
+        data: Option<PathBuf>,
+    },
+    /// Replace this program with a release, after a check of its SHA-256.
+    ///
+    /// Back up first. Run it as root with systemd, and it also restarts the
+    /// services. Otherwise it says what to restart. A container gets a new
+    /// image in place of this command.
+    Update {
+        /// The version to install, such as 0.8.0. The default is the latest
+        /// release. An older version is refused.
+        #[arg(long)]
+        version: Option<String>,
+    },
     /// Restore a backup into a data folder. Stop the hub first.
     ///
     /// The backup is a consort-<date>.tar file from the backup folder that
@@ -156,6 +191,28 @@ enum PairedCommand {
 }
 
 #[derive(Subcommand)]
+enum ReachCommand {
+    /// Show the state of Tailscale and This network.
+    Status,
+    /// Give the hub an address on the tailnet with `tailscale serve`. It uses
+    /// the first free port of 443 and 8443, and it leaves other entries alone.
+    Tailscale,
+    /// Turn off a way to reach the hub. The default is every way. Its address
+    /// stops working at once.
+    Off {
+        /// Only this way.
+        #[arg(long, value_enum)]
+        only: Option<ReachOffScope>,
+    },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum ReachOffScope {
+    Tailscale,
+    ThisNetwork,
+}
+
+#[derive(Subcommand)]
 enum WorkerCommand {
     /// Pair this machine with a hub.
     Pair {
@@ -166,6 +223,10 @@ enum WorkerCommand {
         /// Other users of this machine can see a code on the command line.
         #[arg(long, env = "CONSORT_PAIRING_CODE", hide_env_values = true)]
         code: Option<String>,
+        /// The SHA-256 of the certificate of a hub on This network. The worker
+        /// accepts this certificate and no other for this hub.
+        #[arg(long = "tls-sha256")]
+        tls_sha256: Option<consort_proto::model::Sha256Hash>,
         /// The worker name. The default is the host name.
         #[arg(long)]
         name: Option<String>,
@@ -249,9 +310,24 @@ struct DevArgs {
 /// The size above which a log file moves aside when the worker starts.
 const LOG_LIMIT: u64 = 10 * 1024 * 1024;
 
+/// The log filter. At its trace level, the WebSocket library logs whole frames,
+/// and a frame can hold a key that a client sends to the hub. So this library
+/// never logs below `info`, whatever `RUST_LOG` says.
+fn log_filter(
+    from_env: std::result::Result<
+        tracing_subscriber::EnvFilter,
+        tracing_subscriber::filter::FromEnvError,
+    >,
+) -> Result<tracing_subscriber::EnvFilter> {
+    let mut filter = from_env.unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    for directive in consort_proto::logs::WEBSOCKET_LOG_CAP {
+        filter = filter.add_directive(directive.parse()?);
+    }
+    Ok(filter)
+}
+
 fn init_logging(log_file: Option<&Path>) -> Result<()> {
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    let filter = log_filter(tracing_subscriber::EnvFilter::try_from_default_env())?;
     if let Some(path) = log_file {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -559,6 +635,48 @@ fn run_paired(clients: bool, command: PairedCommand, fallback: Option<PathBuf>) 
     Ok(())
 }
 
+/// How this program was installed. The systemd unit, the Dockerfile and the
+/// service of a local hub set the variable.
+fn this_install_kind() -> consort_proto::release::InstallKind {
+    use consort_proto::release::InstallKind;
+    InstallKind::from_env_value(std::env::var(InstallKind::ENV_VAR).ok().as_deref())
+}
+
+async fn run_hub_update(named: Option<String>) -> Result<()> {
+    let current = consort_proto::release::Version::parse(env!("CARGO_PKG_VERSION"))
+        .context("this program has no version that can be read")?;
+    let asset = consort_proto::release::program_asset(std::env::consts::OS, std::env::consts::ARCH)
+        .with_context(|| {
+            format!(
+                "no release has a program for {} on {}. Build Consort from source",
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            )
+        })?;
+    let exe = std::env::current_exe().context("could not find this program")?;
+    let host = consort_link::update::GithubHost::new(&format!("consort-hub/{current}"))?;
+    let lines = hub_update::update(
+        hub_update::Target {
+            named,
+            current,
+            install: this_install_kind(),
+            exe,
+            asset,
+            work: hub_update::work_folder(),
+        },
+        hub_update::Seams {
+            host: &host,
+            swap: &consort_link::update::RenameSwap,
+            services: &hub_update::Systemd,
+        },
+    )
+    .await?;
+    for line in lines {
+        println!("{line}");
+    }
+    Ok(())
+}
+
 async fn run_hub(args: HubArgs) -> Result<()> {
     match args.command {
         Some(HubCommand::SetupCode { data }) => {
@@ -579,6 +697,26 @@ async fn run_hub(args: HubArgs) -> Result<()> {
         }
         Some(HubCommand::Client { command }) => return run_paired(true, command, args.data),
         Some(HubCommand::Worker { command }) => return run_paired(false, command, args.data),
+        Some(HubCommand::Update { version }) => return run_hub_update(version).await,
+        Some(HubCommand::Reach { command, data }) => {
+            let data = hub_data(data, args.data)?;
+            let lines = match command {
+                ReachCommand::Status => consort_hub::reach::cli::status(&data).await,
+                ReachCommand::Tailscale => consort_hub::reach::cli::turn_on_tailscale(&data).await,
+                ReachCommand::Off { only } => {
+                    use consort_proto::client_api::ReachMethod;
+                    let scope = only.map(|only| match only {
+                        ReachOffScope::Tailscale => ReachMethod::Tailscale,
+                        ReachOffScope::ThisNetwork => ReachMethod::ThisNetwork,
+                    });
+                    consort_hub::reach::cli::off(&data, scope).await
+                }
+            }?;
+            for line in lines {
+                println!("{line}");
+            }
+            return Ok(());
+        }
         Some(HubCommand::Restore {
             backup,
             data,
@@ -600,6 +738,9 @@ async fn run_hub(args: HubArgs) -> Result<()> {
         data_dir: data.clone(),
         listen: args.listen,
         public_url: args.public_url,
+        install_kind: this_install_kind(),
+        dev: false,
+        first_greeting: true,
     })
     .await
     .context("could not start the hub")?;
@@ -619,15 +760,44 @@ async fn run_hub(args: HubArgs) -> Result<()> {
     Ok(())
 }
 
+/// The exit code that says "start me again". The service plans restart a
+/// worker that ends with an error.
+const EXIT_RESTART: i32 = 75;
+
+/// Starts the new program in place of this one. It uses the path from before
+/// the swap: on Linux, the running program now has another name.
+fn restart_program(exe: &Path) -> ! {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        let err = std::process::Command::new(exe)
+            .args(std::env::args_os().skip(1))
+            .exec();
+        tracing::error!(error = %err, "could not start the new program");
+    }
+    #[cfg(not(unix))]
+    let _ = exe;
+    std::process::exit(EXIT_RESTART);
+}
+
 async fn run_worker(config_dir: PathBuf) -> Result<()> {
+    let self_update = consort_worker::self_update::SelfUpdate::for_this_program();
+    let exe = self_update.as_ref().map(|update| update.exe.clone());
     let worker = consort_worker::run(consort_worker::WorkerConfig {
         config_dir: config_dir.clone(),
+        self_update,
     })
     .await
     .with_context(|| format!("could not start the worker in {}", config_dir.display()))?;
     println!("Worker {} runs. Press Ctrl-C to stop.", worker.worker_id());
-    wait_for_stop().await;
+    let restart = tokio::select! {
+        () = wait_for_stop() => false,
+        () = worker.restart_requested() => true,
+    };
     worker.shutdown().await?;
+    if restart && let Some(exe) = exe {
+        restart_program(&exe);
+    }
     Ok(())
 }
 
@@ -758,6 +928,9 @@ async fn run_dev(args: DevArgs) -> Result<()> {
         data_dir: args.data.clone(),
         listen: args.listen,
         public_url: None,
+        install_kind: consort_proto::release::InstallKind::Manual,
+        dev: true,
+        first_greeting: true,
     })
     .await
     .context("could not start the hub")?;
@@ -769,6 +942,8 @@ async fn run_dev(args: DevArgs) -> Result<()> {
     pair_dev_worker(&hub, &worker_dir).await?;
     let worker = consort_worker::run(consort_worker::WorkerConfig {
         config_dir: worker_dir.clone(),
+        // A development worker keeps its program.
+        self_update: None,
     })
     .await?;
     if !worker.wait_connected(Duration::from_secs(10)).await {
@@ -802,6 +977,28 @@ async fn run_dev(args: DevArgs) -> Result<()> {
     Ok(())
 }
 
+async fn run_local(command: local::LocalCommand) -> Result<()> {
+    use local::LocalCommand as C;
+    match command {
+        C::Install { dry_run, progress } => local::install(dry_run, progress),
+        C::Status => local::status(),
+        C::Uninstall {
+            delete_data,
+            dry_run,
+        } => local::uninstall(delete_data, dry_run).await,
+        C::Run { .. } => local::run().await,
+        C::SetupCode => local::setup_code(),
+        C::Check => {
+            println!("{}", serde_json::to_string_pretty(&local::check())?);
+            Ok(())
+        }
+        C::Start => local::start(),
+        C::Stop => local::stop(),
+        C::Login { state } => local::login(state),
+        C::Upgrade { program } => local::upgrade(&program),
+    }
+}
+
 async fn run_bridge(url: &str) -> Result<()> {
     let Ok(token) = std::env::var(consort_session_host::bridge::TOKEN_VAR) else {
         bail!(
@@ -823,6 +1020,7 @@ async fn main() -> Result<()> {
         | Command::SessionHost {
             command: SessionHostCommand::Run { log_file, .. },
         } => log_file.as_deref(),
+        Command::Local { command } => local::log_file_of(command),
         _ => None,
     };
     init_logging(log_file)?;
@@ -832,6 +1030,7 @@ async fn main() -> Result<()> {
             WorkerCommand::Pair {
                 hub_url,
                 code,
+                tls_sha256,
                 name,
                 tags,
                 config_dir,
@@ -841,7 +1040,8 @@ async fn main() -> Result<()> {
                     eprintln!("Warning: {warning}");
                 }
                 let code = pairing_code(code, &mut std::io::stdin().lock())?;
-                let id = consort_worker::pair(&hub_url, &code, &dir, name, tags).await?;
+                let id = consort_worker::pair_pinned(&hub_url, tls_sha256, &code, &dir, name, tags)
+                    .await?;
                 println!(
                     "Paired as worker {id}. The configuration is in {}.",
                     dir.display()
@@ -887,10 +1087,17 @@ async fn main() -> Result<()> {
                 ..
             } => run_session_host(config_dir, consort_home).await,
         },
+        Command::Local { command } => run_local(command).await,
         Command::Dev(args) => run_dev(args).await,
         #[cfg(unix)]
         Command::BoundaryRun { bridges, command } => run_boundary(&bridges, &command).await,
         Command::McpBridge { url } => run_bridge(&url).await,
+        Command::ReleaseInfo => {
+            let manifest =
+                consort_proto::release::ReleaseManifest::of_this_build(env!("CARGO_PKG_VERSION"));
+            println!("{}", serde_json::to_string_pretty(&manifest)?);
+            Ok(())
+        }
     }
 }
 
@@ -917,7 +1124,36 @@ mod tests {
     use super::*;
     use clap::CommandFactory;
 
+    #[test]
+    fn the_log_filter_never_lets_the_websocket_library_log_frames() {
+        let filter = log_filter(Ok(tracing_subscriber::EnvFilter::new("trace"))).unwrap();
+        let text = filter.to_string();
+        assert!(text.contains("tungstenite=info"), "{text}");
+        assert!(text.contains("tokio_tungstenite=info"), "{text}");
+    }
+
     #[cfg(unix)]
+    #[test]
+    fn hub_update_takes_a_named_version_or_none() {
+        let cli = Cli::try_parse_from(["consort", "hub", "update", "--version", "0.8.0"]).unwrap();
+        let Command::Hub(HubArgs {
+            command: Some(HubCommand::Update { version }),
+            ..
+        }) = cli.command
+        else {
+            panic!("not hub update");
+        };
+        assert_eq!(version.as_deref(), Some("0.8.0"));
+        let cli = Cli::try_parse_from(["consort", "hub", "update"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Hub(HubArgs {
+                command: Some(HubCommand::Update { version: None }),
+                ..
+            })
+        ));
+    }
+
     #[test]
     fn the_boundary_helper_takes_its_bridges_and_its_command() {
         let cli = Cli::try_parse_from([
@@ -1057,6 +1293,45 @@ mod tests {
             panic!("expected worker run")
         };
         assert_eq!(log_file, Some(PathBuf::from("/tmp/w.log")));
+    }
+
+    #[test]
+    fn the_local_commands_parse() {
+        let cli = Cli::try_parse_from(["consort", "local", "install", "--dry-run"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Local {
+                command: local::LocalCommand::Install {
+                    dry_run: true,
+                    progress: false
+                }
+            }
+        ));
+        let cli = Cli::try_parse_from(["consort", "local", "uninstall", "--delete-data"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Local {
+                command: local::LocalCommand::Uninstall {
+                    delete_data: true,
+                    dry_run: false
+                }
+            }
+        ));
+        for args in [
+            vec!["status"],
+            vec!["setup-code"],
+            vec!["check"],
+            vec!["start"],
+            vec!["stop"],
+            vec!["login", "off"],
+            vec!["run", "--log-file", "/tmp/l.log"],
+            vec!["upgrade", "--program", "/tmp/consort"],
+        ] {
+            let mut line = vec!["consort", "local"];
+            line.extend(args.iter());
+            assert!(Cli::try_parse_from(&line).is_ok(), "{line:?}");
+        }
+        assert!(Cli::try_parse_from(["consort", "local", "upgrade"]).is_err());
     }
 
     #[test]

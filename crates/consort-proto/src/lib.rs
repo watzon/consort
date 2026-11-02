@@ -19,6 +19,11 @@
 //!   limits that frames and message bodies share (with [`frame::json_len`],
 //!   the way to measure them).
 //! - [`model`] has every entity in data-model.md.
+//! - [`release`] has the repository of the releases, [`release::Version`], the
+//!   names of the release files, `release.json` and [`release::InstallKind`].
+//! - [`local`] has the folder layout, the state file and the JSON of a hub on
+//!   the computer of the user.
+//! - [`logs`] has the log rule that keeps the WebSocket libraries at `info`.
 //! - [`status`] has the task status machine, the Tasks panel tabs and the
 //!   "your turn" groups.
 //! - [`auth`] has the pairing bodies, pairing codes, `auth.challenge`,
@@ -55,7 +60,10 @@ pub mod execution_link;
 pub mod frame;
 mod hex;
 pub mod ids;
+pub mod local;
+pub mod logs;
 pub mod model;
+pub mod release;
 pub mod session_host_link;
 pub mod status;
 pub mod time;

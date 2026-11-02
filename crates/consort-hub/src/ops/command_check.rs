@@ -21,7 +21,7 @@ use serde_json::Value;
 
 use crate::command_check::{
     CHECK_TIMEOUT, ChatModel, CheckError, CheckRequest, CheckSource, DecisionSource, ModelSource,
-    TextModel, failure_note, run_check,
+    TextModel, decision_message, failure_note, run_check,
 };
 use crate::error::{HubError, Result};
 use crate::hub::{Caller, Hub};
@@ -186,9 +186,9 @@ impl Hub {
             .unwrap_or_default())
     }
 
-    /// The user messages of a session, oldest first: the brief of the task
-    /// and the user's posts in its thread. Assistant text and tool output are
-    /// not part of this.
+    /// The user messages of a session, oldest first: the brief of the task,
+    /// the user's posts in its thread, and the user's answers to its
+    /// decisions. Assistant text and tool output are not part of this.
     async fn check_user_messages(&self, session: &Session) -> Result<Vec<String>> {
         let Some(task_id) = session.task_id else {
             return Ok(Vec::new());
@@ -199,12 +199,22 @@ impl Hub {
                 let Some(task) = work::task(conn, task_id)? else {
                     return Ok(Vec::new());
                 };
-                let mut out = vec![format!("{}\n{}", task.title, task.brief)];
-                for reply in conversation::thread_replies(conn, task.card_message_id)? {
-                    if reply.author == consort_proto::model::Author::User {
-                        out.push(reply.body);
+                let mut said: Vec<_> = conversation::thread_replies(conn, task.card_message_id)?
+                    .into_iter()
+                    .filter(|reply| reply.author == consort_proto::model::Author::User)
+                    .map(|reply| (reply.created_at, reply.body))
+                    .collect();
+                for decision in work::answered_decisions_of_task(conn, task_id)? {
+                    if let (Some(at), Some(message)) =
+                        (decision.answered_at, decision_message(&decision))
+                    {
+                        said.push((at, message));
                     }
                 }
+                // The sort is stable, so a tie keeps the post first.
+                said.sort_by_key(|(at, _)| *at);
+                let mut out = vec![format!("{}\n{}", task.title, task.brief)];
+                out.extend(said.into_iter().map(|(_, message)| message));
                 Ok(out)
             })
             .await?;
@@ -215,6 +225,17 @@ impl Hub {
             if message.chars().count() > MAX_MESSAGE_CHARS {
                 *message = message.chars().take(MAX_MESSAGE_CHARS).collect();
             }
+        }
+        let rules = self.command_rules_of(session.channel_id).await?;
+        if !rules.is_empty() {
+            let lines: Vec<String> = rules.iter().map(|rule| rule.summary()).collect();
+            messages.insert(
+                1.min(messages.len()),
+                format!(
+                    "The user set these command rules for this channel:\n{}",
+                    lines.join("\n")
+                ),
+            );
         }
         Ok(messages)
     }

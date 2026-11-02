@@ -1,0 +1,330 @@
+<!doctype html>
+<html lang="en" data-mode="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Ink gallery</title>
+<!--
+  Every Ink template with sample data from the designs (Paper G1, G5, G6, G7, G8).
+  Open this file in a browser. The buttons switch the mode and the width.
+  The page can start in a state: gallery.html#light,360 (mode, then width).
+  The variables below are the plan's page style, set to Spruce.
+  Point at a chart, or focus it with Tab and use the arrow keys, to see its readout.
+  stress.html has the same templates with much more data.
+-->
+<style>
+@font-face{font-family:"Atkinson Hyperlegible Next";font-weight:400;src:url("../../../design/fonts/AtkinsonHyperlegibleNext-Regular.ttf")}
+@font-face{font-family:"Atkinson Hyperlegible Next";font-weight:400;font-style:italic;src:url("../../../design/fonts/AtkinsonHyperlegibleNext-Italic.ttf")}
+@font-face{font-family:"Atkinson Hyperlegible Next";font-weight:500;src:url("../../../design/fonts/AtkinsonHyperlegibleNext-Medium.ttf")}
+@font-face{font-family:"Atkinson Hyperlegible Next";font-weight:600;src:url("../../../design/fonts/AtkinsonHyperlegibleNext-SemiBold.ttf")}
+@font-face{font-family:"Atkinson Hyperlegible Next";font-weight:700;src:url("../../../design/fonts/AtkinsonHyperlegibleNext-Bold.ttf")}
+@font-face{font-family:"Atkinson Hyperlegible Mono";font-weight:400;src:url("../../../design/fonts/AtkinsonHyperlegibleMono-Regular.ttf")}
+@font-face{font-family:"Atkinson Hyperlegible Mono";font-weight:500;src:url("../../../design/fonts/AtkinsonHyperlegibleMono-Medium.ttf")}
+@font-face{font-family:"Atkinson Hyperlegible Mono";font-weight:600;src:url("../../../design/fonts/AtkinsonHyperlegibleMono-SemiBold.ttf")}
+
+/* Spruce dark */
+html{
+  --background:#131E1A;--foreground:#F0EBDF;--muted:#1B2623;--muted-foreground:#B3BAB1;--subtle-foreground:#868F89;
+  --card:#1B2623;--card-foreground:#F0EBDF;--popover:#222E2A;--popover-foreground:#F0EBDF;
+  --border:#27322E;--input:#384440;--primary:#E7BE62;--primary-foreground:#2B2005;--accent:#3E3519;--accent-foreground:#EAC673;--ring:#EAC673;
+  --destructive:#F1735A;--success:#80C7A8;--warning:#77B4ED;--info:#B2A0D6;
+  --chart-1:#77B4ED;--chart-2:#80C7A8;--chart-3:#E7BE62;--chart-4:#B2A0D6;--chart-5:#E3929C;--chart-6:#8E9A94;--chart-ink:#131E1A;
+  --radius-md:6px;--radius-lg:10px;
+  --font-sans:"Atkinson Hyperlegible Next",system-ui,sans-serif;--font-mono:"Atkinson Hyperlegible Mono",ui-monospace,monospace;
+}
+/* Spruce light */
+html[data-mode="light"]{
+  --background:#F8FCF8;--foreground:#192622;--muted:#E9F2ED;--muted-foreground:#46534F;--subtle-foreground:#64706C;
+  --card:#E9F2ED;--card-foreground:#192622;--popover:#FFFFFF;--popover-foreground:#192622;
+  --border:#D8E1DD;--input:#C2CCC7;--primary:#E1B856;--primary-foreground:#2B2005;--accent:#F2E8C7;--accent-foreground:#93640B;--ring:#93640B;
+  --destructive:#C1351E;--success:#237356;--warning:#1364B0;--info:#6D5398;
+  --chart-1:#2F74C0;--chart-2:#2E8466;--chart-3:#B08419;--chart-4:#7559A6;--chart-5:#B9506A;--chart-6:#7A8781;--chart-ink:#FFFFFF;
+}
+/* The base sheet of the bootstrap */
+html{padding:8px;background:var(--background);color:var(--foreground);font:14px/1.5 var(--font-sans);-webkit-font-smoothing:antialiased}
+body{margin:0}
+/* Gallery only */
+#bar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:24px}
+#bar button{font:13px/20px var(--font-sans);color:var(--muted-foreground);background:var(--card);border:1px solid var(--border);border-radius:var(--radius-md);padding:4px 12px;cursor:pointer}
+#bar button[aria-pressed="true"]{color:var(--foreground);border-color:var(--input)}
+#bar span{color:var(--subtle-foreground);font-size:12px;margin-right:4px}
+#page{margin:0 auto;display:flex;flex-direction:column;gap:48px}
+section h3{margin:0;font:600 13px/20px var(--font-sans);color:var(--foreground)}
+section p{margin:0 0 16px;font:12px/16px var(--font-sans);color:var(--subtle-foreground)}
+</style>
+</head>
+<body>
+<div id="bar">
+  <span>Mode</span><button data-mode="dark">Spruce dark</button><button data-mode="light">Spruce light</button>
+  <span>Width</span><button data-w="360">360</button><button data-w="720">720</button><button data-w="0">Full</button>
+</div>
+<div id="page"></div>
+<script src="ink.js"></script>
+<script>
+(function () {
+  const rnd = Ink.pen.rng;
+  const T = [];
+  const add = (id, title, desc, fn) => T.push({id, title, desc, fn});
+
+  // Paper G1 and G5: the line chart of the timeline and the light box.
+  function diskSeries() {
+    const r = rnd(4);
+    const v = [];
+    let x = 4.38;
+    for (let d = 0; d < 30; d++) {
+      x += 0.012 + r() * 0.03;
+      if (d === 13) x += 0.86;
+      v.push(+x.toFixed(2));
+    }
+    v[29] = 6.21;
+    return v;
+  }
+  add('line', 'Line, one series (G1, G5)', 'The hover readout shows when you point at the chart. A note points at the jump.', (t) =>
+    Ink.line(t, {
+      labels: Array.from({length: 30}, (_, i) => 'Oct ' + (i + 1)),
+      values: diskSeries(), unit: 'TB', min: 4, max: 7,
+      notes: [{at: 13, text: 'Camera archive moved'}],
+    }));
+  add('lines', 'Lines, several series', 'Each line has its name at its end, so there is no legend to read. Past six lines, a legend takes their place.', (t) =>
+    Ink.line(t, {
+      labels: ['Sep 8', 'Sep 15', 'Sep 22', 'Sep 29', 'Oct 6', 'Oct 13', 'Oct 20', 'Oct 27'], unit: 's',
+      series: [
+        {name: 'Opus 5.5', values: [28, 26, 27, 24, 22, 23, 21, 19]},
+        {name: 'Sonnet 5.5', values: [14, 15, 13, 13, 12, 12, 11, 11]},
+        {name: 'Haiku 5.5', values: [6, 6, 5, 6, 5, 5, 4, 4]},
+      ],
+    }));
+  add('bars', 'Bars (G6)', 'Compare a few things. The value sits on each bar. A missing value is a dashed stub with its reason.', (t) =>
+    Ink.bars(t, {unit: 'GB', data: [['hub', 42], ['homelab', 118], ['bigboi', 76], ['MacBook Pro', 31], ['truenas', null, 'Offline']]}));
+  add('donut', 'Donut (G6)', 'One brushstroke from the top, largest part first. Where two parts meet, the paints mix. Five parts at most.', (t) =>
+    Ink.donut(t, {
+      data: [['sayso', 912000], ['homelab', 576000], ['miss-lucy-tg', 432000], ['Tutti', 264000], ['house-lights', 216000]],
+      center: '2.4M', centerLabel: 'tokens in October',
+    }));
+
+  add('ranked', 'Ranked bars (G7)', 'The top of a list, largest first. Names sit at the left and read in full. The value sits at the end of each bar.', (t) =>
+    Ink.ranked(t, {data: [['sayso', 34], ['homelab', 21], ['miss-lucy-tg', 12], ['house-lights', 7], ['mac-ext4', 3]]}));
+  add('stacked', 'Stacked bars (G7)', 'The parts of each total. Three parts at most, with the legend above. The largest part sits at the bottom.', (t) =>
+    Ink.stacked(t, {
+      labels: ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'],
+      series: [
+        {name: 'Done', color: 2, values: [5, 7, 4, 8, 6, 2, 1]},
+        {name: 'Needs you', color: 3, values: [1, 0, 2, 1, 0, 0, 1]},
+        {name: 'Failed', color: 5, values: [0, 1, 0, 1, 0, 0, 0]},
+      ],
+    }));
+  add('grouped', 'Grouped bars (G7)', 'Two or three things side by side in each group. The newest is lapis and sits at the right of its group.', (t) =>
+    Ink.grouped(t, {
+      labels: ['hub', 'homelab', 'bigboi', 'MacBook Pro'],
+      series: [{name: 'Last week', values: [12, 30, 18, 9]}, {name: 'This week', values: [15, 41, 14, 13]}],
+    }));
+  add('histogram', 'Histogram (G7)', 'How values spread. Equal bins that touch, and one marked line for the median or a limit.', (t) =>
+    Ink.histogram(t, {counts: [42, 118, 96, 61, 30, 18, 12, 9, 6, 4, 3, 2], start: 0, width: 5, unit: 's', mark: {at: 12, text: 'Half take under 12 s'}}));
+  add('waterfall', 'Waterfall (G7)', 'How a total became another. Totals in lapis, rises in verdigris, falls in madder, and a pencil line carries the running total.', (t) =>
+    Ink.waterfall(t, {unit: '$', data: [['Budget', 60, 'total'], ['Scrapes', -18.4], ['Enrichment', -12.3], ['Search', -7.1], ['Refund', 3], ['Left', null, 'total']]}));
+
+  add('treemap', 'Treemap (G7)', 'What fills a whole when there are many parts. Area is the size. Text on a pigment uses --chart-ink.', (t) =>
+    Ink.treemap(t, {unit: 'TB', data: [['Camera archive', 2.4], ['Media', 1.6], ['Backups', 1.1], ['Photos', 0.6], ['VMs', 0.3], ['Other', 0.2]]}));
+  add('scatter', 'Scatter (G7)', 'How two numbers move together. Each dab is one thing. A pencil line shows the trend, and a gold dab with a note marks the one to look at.', (t) => {
+    const r = rnd(9);
+    const g = () => { let a = 0; for (let i = 0; i < 6; i++) a += r(); return (a - 3) * 0.8165; };
+    const pts = [];
+    for (let k = 0; k < 38; k++) {
+      const m = Math.pow(r(), 1.15) * 150 + 4;
+      pts.push([+m.toFixed(1), Math.max(6, Math.round(m * 1.15 + g() * 18 + 12))]);
+    }
+    pts.push([190, 362]);
+    Ink.scatter(t, {points: pts, xUnit: ' min', unit: 'K', notes: [{at: pts.length - 1, text: 'Sayso Windows build, 3 h 10 min'}]});
+  });
+  add('slope', 'Slope (G7)', 'Before and after for a few things. One line in lapis carries the story, and the rest stay in slate.', (t) =>
+    Ink.slope(t, {labels: ['September', 'October'], data: [['homelab', 26, 21], ['miss-lucy-tg', 10, 12], ['house-lights', 14, 7], ['mac-ext4', 5, 3], ['sayso', 18, 34]]}));
+  add('boxplot', 'Box plot (G7)', 'How a few groups spread. The box holds the middle half, the thick line is the median, and dabs past the whiskers are outliers.', (t) =>
+    Ink.boxplot(t, {unit: 's', data: [
+      {name: 'Opus 5.5', stats: [6, 14, 19, 27, 44], outliers: [52, 58]},
+      {name: 'Sonnet 5.5', stats: [3, 8, 11, 15, 24], outliers: [31]},
+      {name: 'Haiku 5.5', stats: [1, 3, 4, 6, 9], outliers: [14, 17]},
+    ]}));
+  add('funnel', 'Funnel (G7)', 'How many go on at each step. The count sits in the bar, and the share of the step above sits beside it.', (t) =>
+    Ink.funnel(t, {data: [['Captured', 48], ['Planned', 30], ['Started', 21], ['Shipped', 12]]}));
+
+  add('sankey', 'Sankey (G7)', 'Where an amount went. Sources at the left in their pigments, and each ribbon keeps the color of its source.', (t) =>
+    Ink.sankey(t, {unit: 'tokens', links: [['Claude Work', 'sayso', 0.5e6], ['Claude Work', 'homelab', 0.476e6], ['Claude Work', 'Tutti', 0.264e6], ['Claude Work', 'house-lights', 0.16e6], ['Codex', 'sayso', 0.412e6], ['Codex', 'homelab', 0.1e6], ['Codex', 'miss-lucy-tg', 0.432e6], ['Codex', 'house-lights', 0.056e6]]}));
+  add('goal', 'Goal (G7)', 'How far along against a target or a limit. A painted track, the progress in its pigment, and a madder tick for a limit.', (t) =>
+    Ink.goal(t, {data: [
+      {label: 'Monid spend', value: 41.2, target: 60, unit: '$'},
+      {label: 'Tasks this week', value: 23, target: 30, color: 2},
+      {label: 'Disk on homelab', value: 6.2, target: 8, unit: 'TB', limit: 7, limitLabel: 'Warn at 7 TB'},
+    ]}));
+  add('calendar', 'Calendar (G7)', 'How often, day by day. One dab per day, and its size is the count, so the page needs one pigment only.', (t) => {
+    const r = rnd(14), data = {};
+    const start = Date.UTC(2026, 5, 29);
+    for (let w = 0; w < 18; w++)
+      for (let d = 0; d < 7; d++) {
+        const base = ((d < 5 ? 3.4 : 0.7) + (d === 3 ? 1.6 : 0)) * (0.55 + 0.9 * (w / 18));
+        let g = 0;
+        for (let i = 0; i < 6; i++) g += r();
+        const v = Math.max(0, Math.round(base + (g - 3) * 1.6 * 1.9 / 1.4));
+        const day = new Date(start + (w * 7 + d) * 864e5);
+        if (day.getTime() > Date.UTC(2026, 9, 31)) continue;
+        if (v) data[day.toISOString().slice(0, 10)] = v;
+      }
+    Ink.calendar(t, {data, from: '2026-07-01', to: '2026-10-31', note: '246 tasks since July. Thursdays are the busiest.'});
+  });
+  add('week', 'Week (G7)', 'A schedule. Days across, hours down, events in the pigment of their calendar. A gold dab marks a clash.', (t) =>
+    Ink.week(t, {
+      days: ['Mon 3', 'Tue 4', 'Wed 5', 'Thu 6', 'Fri 7'], from: 8, to: 17,
+      note: 'Friday: the dentist overlaps the stand-up.',
+      events: [
+        {day: 0, start: 9, end: 9.5, title: 'Stand-up', color: 6}, {day: 1, start: 9, end: 9.5, title: 'Stand-up', color: 6},
+        {day: 2, start: 9, end: 9.5, title: 'Stand-up', color: 6}, {day: 3, start: 9, end: 9.5, title: 'Stand-up', color: 6},
+        {day: 4, start: 8.5, end: 9.5, title: 'Dentist', color: 5}, {day: 4, start: 9, end: 9.5, title: 'Stand-up', color: 6},
+        {day: 0, start: 13, end: 16, title: 'Windows build, focus time', color: 1}, {day: 1, start: 11, end: 11.5, title: 'Vendor call', color: 3},
+        {day: 2, start: 14, end: 15, title: 'Sayso release review', color: 1}, {day: 3, start: 12, end: 13, title: 'Lunch with Sam', color: 2},
+      ],
+    }));
+  add('timeline', 'Timeline (G7)', 'A plan against the calendar. Done in verdigris, now in lapis, next as a dashed outline, a gold dab for a date that matters, and a line for today.', (t) =>
+    Ink.timeline(t, {
+      from: '2026-10-24', to: '2026-11-15', today: '2026-11-01',
+      rows: [
+        {label: 'Update the docs', start: '2026-10-24', end: '2026-10-29', state: 'done'},
+        {label: 'Fix the Windows engine', start: '2026-10-27', end: '2026-11-03', state: 'now'},
+        {label: 'Sign the macOS build', start: '2026-11-03', end: '2026-11-06', state: 'next'},
+        {label: 'Beta for testers', start: '2026-11-06', end: '2026-11-11', state: 'next'},
+        {label: 'Release 1.4', start: '2026-11-12', state: 'milestone'},
+      ],
+    }));
+  add('sequence', 'Sequence (G7)', 'Messages between parts, top to bottom. Calls are solid, answers are dashed, and each part keeps its own pencil lifeline.', (t) =>
+    Ink.sequence(t, {
+      parts: ['You', 'Hub', 'Session host', 'Calendar'],
+      messages: [['You', 'Hub', 'Remind me at 5 PM'], ['Hub', 'Session host', 'turn'], ['Session host', 'Calendar', 'create event'], ['Calendar', 'Session host', 'event ID', 'reply'], ['Session host', 'Hub', 'post_message'], ['Hub', 'You', 'Done. 5 PM today.', 'reply']],
+    }));
+  add('tree', 'Tree (G7)', 'Parts within parts, left to right. Each branch keeps one pigment, and a leaf can carry one short detail.', (t) =>
+    Ink.tree(t, {name: 'homelab', children: [
+      {name: 'Storage', children: [{name: 'truenas', detail: 'Offline since 9:40 AM'}, {name: 'Backups', detail: 'Nightly, 2:00 AM'}]},
+      {name: 'Media', children: [{name: 'Jellyfin', detail: '3 streams today'}, {name: 'Immich', detail: '41,302 photos'}]},
+      {name: 'Network', children: [{name: 'Tailscale', detail: '6 devices'}, {name: 'Pi-hole', detail: '18% blocked'}]},
+    ]}));
+  add('flow', 'Flow (G6)', 'Steps left to right, with inked boxes and arrows. One path can stand out in lapis. It runs down the page when it is narrow.', (t) =>
+    Ink.flow(t, {
+      steps: [['You', 'this Mac'], ['Hub', 'VPS'], ['Session host', 'hub machine'], ['Worker', 'homelab']],
+      arrows: ['message', 'turn', 'tool call'], back: 'the answer comes back to the chat', highlight: 3,
+    }));
+  add('numbers', 'Numbers (G6)', 'Two to four tiles. A box with its own ground gets 16 px padding and the theme radius.', (t) =>
+    Ink.numbers(t, {tiles: [
+      {label: 'Tasks done this week', value: '23', delta: '4 more', spark: [14, 17, 15, 19, 18, 21, 23]},
+      {label: 'Waiting on you', value: '2', text: 'One approval and one decision, both in sayso.'},
+      {label: 'Monid spend in October', value: '$41.20', of: 'of $60', meter: [41.2, 60]},
+    ]}));
+  add('table', 'Table (G6)', 'Rows on the canvas with no lines between them. One inked rule under the head. Numbers and IDs in mono, a dab for a state.', (t) =>
+    Ink.table(t, {
+      columns: ['PR', 'Title', 'Channel', 'State', {name: 'Age', align: 'right', tone: 2}],
+      rows: [
+        ['#62', 'Fix the Windows engine build', 'sayso', {text: 'Ready to merge', color: 2}, '2 days'],
+        ['#58', 'Tighten the spam rules', 'miss-lucy-tg', {text: 'Changes asked', color: 5}, '4 days'],
+        ['#71', 'Move backups to homelab', 'homelab', {text: 'Draft', color: 6}, '1 day'],
+      ],
+    }));
+  add('spark', 'Sparkline and underline', 'A small line with a dab at its end, and a hand-drawn rule.', (t) => {
+    const el = document.querySelector(t);
+    el.innerHTML = '<div id="sp1"></div><p style="margin:16px 0 8px">Rule on an empty element</p><div id="ul1"></div><p style="margin:16px 0 0">An <span id="ul2">underlined phrase</span> inside a sentence.</p>';
+    Ink.spark('#sp1', {values: [14, 17, 15, 19, 18, 21, 23]});
+    Ink.underline('#ul1');
+    Ink.underline('#ul2', {color: 3});
+  });
+
+  add('pen', 'Pen (custom drawings)', 'Ink.pen returns path strings in the same hand-drawn style, for a drawing that no template fits.', (t) => {
+    const P = Ink.pen, c = Ink.pen.color;
+    document.querySelector(t).innerHTML = `<svg viewBox="0 0 320 90" style="width:100%;max-width:420px"><path d="${P.rect(4, 22, 90, 46, {r: 10, seed: 3})}" fill="var(--card)" stroke="${c(1)}" stroke-width="1.5"/><path d="${P.arrow(100, 45, 190, 45, {seed: 5})}" fill="none" stroke="var(--subtle-foreground)" stroke-width="1.5" stroke-linecap="round"/><path d="${P.dab(236, 45, 22, {seed: 9})}" fill="${c(3)}"/><path d="${P.line([[20, 82], [300, 82]], {seed: 2})}" fill="none" stroke="var(--input)" stroke-width="1.2" stroke-linecap="round"/></svg>`;
+  });
+  // Paper G8: heat maps. The fields come from the design's generator as grid strings: one step index for each cell.
+  const G8 = {
+    colmax: {cols: 57, rows: 36, steps: "4445556766777677665(4)4544233323(6)43(5)44344455445454455566677887787788877665544433343(4)433343(4)454(6)54(5)557(4)878879898887876554543(4)43(11)4334534434(4)5(4)6878(4)9(7)87876655544343444324334334(4)334434(6)566778799989(4)89867645644343(10)43(4)4(5)34(6)5456(4)889(4)8889877676554(4)3(6)43343(5)443434334445445(4)67(4)8(7)7(4)654543443(5)43(8)44434(4)334(4)344556(4)787888776766554453443(10)43(4)43434434(4)34(6)655676(4)76665654454(6)3(4)44333424343(4)4(4)34(4)3445(7)656(4)5(6)443(10)44544433434(4)34445455543443444565566554455454(6)3(4)4455665344333424445(4)65554334445444554454454(4)343(7)457778764443334333556(4)543343334433454445434443443323334447787645344323344466776653234(4)3433343(4)43(4)23(8)4457776443(4)23334566676553243334343(7)2432233232323343446554333223332345567665534343343(4)4323(6)23(6)223(5)44333223232344455675655333433323(5)2233232232223322323222332232233323345446665543424343332223332322232(12)3232(7)12233345455444343(5)43323232312(5)1232112212(4)1(4)212332343344655654(4)23(4)223323312322211121(6)2(5)11212(5)33433446775454(5)3332(6)312(4)1(14)2012112(4)33344556776444343323(4)2(8)1(4)2101(7)2(5)12223224(5)545655544543433322232223121(6)001(5)21(4)21223(7)4545(6)454443334332332212212101001(4)001(8)23423434544455445(5)344323331312221(4)021101(4)010121223(6)4343454(5)6665(4)4433222121221(6)01010-2101121223334343354(8)6(7)54332(6)112121(4)201(9)2233244434443563544567877656443321212211212101(7)21112(4)323434(4)55454(4)67887765443332(4)122011010101(4)22122232343(4)454(4)5454578788766543332(5)111212111001(4)212(6)334433443544454578989875543(4)12212021202121121121232233343(4)445444544456788776654423(4)2121121(6)212112223233434343454454(6)667(4)554443332(4)12(4)112(11)323(5)433345443445446(4)565444343232(9)12(5)33223323(4)434343444343444355664545443(5)2232233123321221222323(6)43334(4)34344544554(5)343323323322233212332322232332233233343(5)433444"},
+    slice: {cols: 57, rows: 36, steps: "0(5)---0(4)-0-10(5)-(7)0-0-(8)0--0-00---0-00-010001000--000--0001100--0(6)-(5)0---0-0-(5)0---0(5)100-0(4)-110011200100100-000-00-0-(6)00-00--0-(5)000-0(7)-00-0200121(4)21(4)000-0-(4)0-0-00-(6)000-000100-0-1001-1(6)20121(4)2210(4)10100---0-00-000--0---1--0(8)-101011012(6)112111010100-0--000--0(4)-0-00-00-00-000-0110001012202(6)0210-0(12)-(6)000---0--001-010(4)1(4)01(4)2121221(5)000--0-00-0-00---1--000-(5)0(6)-0(8)101(12)000-10-(4)0(4)-0-00-0-0(7)10(10)-11011010111010(4)--1---00010(6)-0100-101000110(5)-0010-0(10)--000-000---00-001000-00-01-00011201000--0---010(6)-1101-00--0-0(4)--012(4)-(6)010-001110011000-00-00-0(5)--000-001--00---10245521100-0-0(5)121010100--00-(6)10--0-0--0-0-0-0--10-13432000--0-0001(4)001010-0-0-00-10-0-0-0-0-(4)00---0--0001(4)0100-0-0(4)1(6)000-00--000-00-0010--000-000--1010-00-000-0--0-000-0100010100-00100--0(4)-1000-(4)0-0---0--0-(5)00--0(7)1(4)0--00--0(5)-(4)0100-0-00---00--00-000--0-0-0(9)1100-000-0110-0---000--0-0-00--00-0-00-0-0(5)--000-0-10-0001-1001--0--00-010--0-0(4)-(5)0--100-000-0---0-0(6)---0-01-0-0--1-00--0-(4)0-0-00--0-(4)00-0---00010--0-(5)0(5)-0-000-00--00-010--0(4)-0-0-10-(4)0-0(6)--000-0--100-0101010(4)--0(4)-00-0--0(4)-00-0-00---0---0--00-0-10-000-0-1-0(4)10(7)-0-(4)000--000--00---0(4)-000---0--0--0-010-0(4)1--0--000-0100-000--00-0-00-(4)0(4)-0-(5)0-0-0(6)-0(6)1-000-10-0-0---0-(6)0-(5)0--00---0-0(5)--10(7)10(5)-0(5)-0-(5)00---0-1--0---0-00-(5)0(4)-(5)0(5)11-10-00-000---0-0--000-0(4)1-0-0--0-(4)0-0-00-0-0-000-011000101--1-0(5)10(4)1--000---0-000-(5)0-(4)1--00-000-01010001-0100-0--01--0(7)--0-00---0-(7)0---0(5)1000100110(4)10-0(8)--0-(6)0-(4)00-(5)00--0--00-(4)0-0010121(6)0(4)-0-0-0-0(5)--0---0-0-(6)0--0---0-11-0-101100211100-0-(5)000100-00-0--00-0---0-0-0-0---0--0001-0011000110(5)-00-01--0---0(4)-0--0--00-(4)00-(6)00---001-0001011010(4)10-00-0(4)---0--0-0---0-(6)0-0--000-0001001-110--0--0(4)-(4)00-000-0-(5)0-(14)0-00-1001110"},
+    section: {cols: 80, rows: 48, steps: "-(135)000-(76)0(4)120(4)-(70)00110(5)-(68)0(6)1(4)010-(58)0(5)-00---0(5)110010-0(4)-(48)0-0(5)-0-0(5)-0(4)10111-00-10011-000-(5)000-(31)0--0-0-0(5)-000--0(5)1221100--000--0010001-01-(4)0-(26)0-0010(4)1-011-(6)0-0-01022100-0(5)-0110(4)-01-0-(24)0(4)1001000---00-0-000-0(5)1022121000-000-0-100-00-000-0001---0-0-(9)0010001001011-1000-00-0-0-0-(4)01011221(4)0(4)10(6)-00-0(4)-010---0-0-00-00-0001-0(4)-0(4)101001-10(7)-000-001233211010(5)-000100011101000-(5)0-(4)1--0(4)-0(7)10011010-0(10)-00-01122312101010(7)1011000110(5)--0--0--000--0(4)1010010(4)1(4)0(4)-0(4)--00-0001333221001001201110(6)10(6)--0-00-(9)0(8)1001100101000-0-0-0(4)--01112(4)010001100011001011210(8)-0---0--0--000--11010001010011000-0(4)-0-0002023(4)1211010110010110010111011-100-0--00-0-0--001(4)0101001(6)0(4)101-000-100133343211-01100110010010121(5)0(5)-00---000-0(7)10111010(6)10001-0--0110123444321121010221201(6)21(5)000-(8)0110010001101(4)01101110(4)110100-1(4)234(4)2221110101101110-1221(4)210(7)-0-0-110011011101101110110110110001-10012234544321101(5)0101(4)2121200110(4)-0(7)10(5)101(4)2001(4)00101100101(6)2244545421101101001121(5)21121(4)010(4)110(5)1101(4)21101(8)0110110021(5)2345(4)32221110110101011232121212110(5)10-0(5)1011211210(4)2121(4)021(4)21(4)21345(4)432202101001001(4)2(4)121201101100111011001101112110121(4)00111211211212323466553321210(5)1(4)21122112(4)1(4)011101(6)01112121110211221121(8)212123446765432211101010011210112(4)11101(12)212013122211021210021(8)212(4)566656432221(5)211011121221(5)21221(4)2(4)1211122112221(5)231122112(4)1131324457775533212110110112121122232132(4)12(4)111232212(4)122101122211211211221212233446866434221100010121221112(5)1232(8)3232(6)332200111212(7)12232(6)3457776443312221(6)212(5)123222112(6)3123222323222321112(9)1322132213334667865432221(10)22212(10)3132(4)322332(4)3232112332(5)1112(6)3233456788653332221(8)2(5)33232212322333232323332323(4)21212432232(6)323323343567788643322201221102(5)113223(7)2333423(6)43(5)211343322332233232223(4)44778966533222111321(5)22332323(4)22423(7)434334243331222442332(7)3(5)245568998643422122211123212(5)3323323322534(4)3(5)4343433122444232233223323233434758898643323232(8)32223232332434445333443(9)432322543(4)233233442333444677997654332(6)32(4)322233233443334(9)334(6)3422324(4)3(5)23(9)44577988654433223332(4)32223332332443455543534432334455444333443343(5)424333444355789987343223233132223323(9)5455454454445443544543(5)464443(4)4(6)33344567899765343323(5)23222334223(5)45(4)65654544435454553332344544244434432334344567999865343332223(6)23(5)4433445(4)664544343443455543334434(5)54(4)34344344467999865543(7)22323(8)4445(4)65565545453334555454333555443443454434(6)567899776435443(4)23(12)4(4)5655756444323434455544333555454553534(6)344557999875543234343(4)224324434(5)566565(4)453(4)4455564433445554(6)54443(4)4456799986544333443(7)44334344434554665554(5)3344455444334454434(6)5544432445579998754335242243343(4)4443444345(4)65554(5)34344454432344565443434(6)343345679998753443(4)443434332434434(6)555454443323423554(5)3355544454(4)54535443466899988644344434443(4)434434(6)54(4)5443443323434(4)3(4)4(4)54554454(4)533444569899885534(4)35443443444"},
+  };
+  const dBZ = {steps: [10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60], unit: 'dBZ', notes: [[20, 'light rain'], [40, 'heavy rain'], [50, 'intense']]};
+  const where = (c) => `${Math.abs(c.x).toFixed(1)} nm ${c.x < 0 ? 'west' : 'east'}, ${Math.abs(c.y).toFixed(1)} nm ${c.y < 0 ? 'south' : 'north'} of PBI`;
+  add('heatmap', 'Heat map with a path (G8)', 'Lapis glazes in steps, faint to full. Two maps side by side share one key. The track is ink with a canvas halo: solid where it flew level, dashed where it fell. A gold dab marks the moment.', (t) =>
+    Ink.heatmap(t, {...dBZ,
+      x: {min: -35, max: 8, label: 'Nautical miles east and north of PBI'}, y: {min: -15, max: 12}, aspect: 'equal',
+      panels: [
+        {title: 'Strongest echo, storm top to ground', note: 'The strongest echo in each column of air.', grid: G8.colmax},
+        {title: "Echo at the jet's altitude", note: 'A slice at 34,449 ft.', grid: G8.slice},
+      ],
+      overlays: {
+        paths: [{points: [[-32,-13.6],[-13.6,0.9],[-12.4,1.65],[-10.8,2.02],[-8.9,2.0],[-6.0,1.68],[-3.2,1.35],[-1.4,0.85],[-0.55,-0.3],[-0.5,-1.7],[-0.9,-3.05]], dashFrom: 4}],
+        markers: [{at: [-32, -13.6], kind: 'start'}, {at: [-8.9, 2], kind: 'moment'}, {at: [0, 0], kind: 'place', label: 'PBI'}, {at: [-0.9, -3.05], kind: 'end'}],
+        notes: [{at: [-32, -13.6], lines: ['17:44, FL350']}, {at: [-8.9, 2], lines: ['17:47:51', 'Enters the core']}],
+      },
+      readout: (c) => [c.lines[0], c.note, where(c)],
+    }));
+  add('heatprofile', 'Heat map: profile under a path (G8)', 'The same kind of field, cut along the track: distance across, height up. It uses the key of the maps, so it has no key of its own. Small dots mark the times that the notes name.', (t) =>
+    Ink.heatmap(t, {...dBZ, key: false, grid: G8.section, aspect: 0.265,
+      x: {min: 0, max: 40, label: 'Nautical miles flown from 17:44:09. The dive coils up in the last 8 nm, so it looks steep here.'}, y: {min: 0, max: 48000, unit: 'ft'},
+      overlays: {
+        paths: [{points: [[0,35000],[8,35000],[16.2,35000],[22,34920],[25.5,34820],[28.2,35000],[30.1,35250],[34.3,31350],[36.6,27200],[38.2,21800],[39.0,16000],[39.5,8750]], dashFrom: 6}],
+        markers: [{at: [16.2, 35000]}, {at: [30.1, 35250]}, {at: [34.3, 31350]}, {at: [39.5, 8750]}, {at: [28.2, 35000], kind: 'moment'}],
+        notes: [
+          {at: [16.2, 35000], lines: ['17:46, level at FL350', 'In a thin anvil, about 15 dBZ']},
+          {at: [28.2, 35000], lines: ['17:47:51 enters the core', '25 to 35 dBZ at FL350'], side: 'left'},
+          {at: [30.1, 35250], lines: ['17:48:07 climbs to 35,250 ft', 'In the updraft'], side: 'right'},
+          {at: [34.3, 31350], lines: ['17:48:39 31,350 ft', 'Falling'], side: 'below'},
+          {at: [39.5, 8750], lines: ['17:49:23 8,750 ft', 'The last valid altitude'], side: 'left'},
+        ],
+      },
+    }));
+  add('heatmatrix', 'Heat map: matrix (G8)', 'Two kinds of thing across and down, such as day and hour. Each cell is a tile with a gap, and an empty cell is only an outline. Four steps of one pigment.', (t) =>
+    Ink.heatmap(t, {rows: ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'], columns: ['6 AM', '7 AM', '8 AM', '9 AM', '10 AM', '11 AM', '12 PM', '1 PM', '2 PM', '3 PM', '4 PM', '5 PM', '6 PM', '7 PM', '8 PM', '9 PM', '10 PM', '11 PM'],
+      grid: [[0,1,4,8,10,8,2,3,8,8,7,2,1,0,1,2,0,0],[0,2,4,8,13,8,5,4,7,12,8,3,3,1,0,3,1,1],[0,2,3,8,10,6,3,3,5,7,6,3,0,1,1,1,2,0],[0,1,4,8,14,8,5,6,7,12,8,4,0,0,0,3,0,1],[1,2,2,6,9,8,2,4,7,9,5,4,0,0,1,3,1,1],[0,0,0,1,2,3,4,4,0,0,2,0,0,1,3,3,0,0],[0,2,0,2,4,3,4,3,1,1,0,0,0,3,2,2,2,1]], steps: [1, 4, 8, 13, 16], color: 2, unit: 'messages', key: {low: 'Fewer', high: 'More'}, note: 'Messages each hour, last 4 weeks.'}));
+  add('heatdiv', 'Heat map: diverging (G8)', 'A change, below and above zero: madder for less, lapis for more, and an outline near zero. The value sits in the cell when the cells are wide enough.', (t) =>
+    Ink.heatmap(t, {rows: ['sayso', 'homelab', 'miss-lucy-tg', 'house-lights', 'Tutti'], columns: ['Sep 8', 'Sep 15', 'Sep 22', 'Sep 29', 'Oct 6', 'Oct 13', 'Oct 20', 'Oct 27'],
+      grid: [[12,18,31,44,38,22,9,-4],[-6,-3,2,-14,-22,-31,-12,3],[4,9,-2,-8,6,14,27,35],[-41,-28,-9,0,5,-3,-16,-24],[7,3,-1,2,11,19,16,8]], diverging: true, steps: [5, 15, 30, 50], unit: '%', key: {low: 'Fewer', high: 'More'}, note: 'Change from the week before.'}));
+
+  add('bad', 'Bad input', 'A bad spec draws a short message in the target and writes the reason to the console.', (t) => Ink.bars(t, {}));
+
+  // @@ENTRIES
+  const page = document.getElementById('page');
+  const hs = location.hash.slice(1).split(',');
+  const only = (hs.find((x) => x.startsWith('only:')) || '').slice(5).split('+').filter(Boolean);
+  if (only.length) T.splice(0, T.length, ...T.filter((o) => only.includes(o.id)));
+  T.forEach((o) => {
+    const s = document.createElement('section');
+    s.innerHTML = `<h3>${o.title}</h3><p>${o.desc}</p><div id="c-${o.id}"></div>`;
+    page.appendChild(s);
+  });
+  T.forEach((o) => o.fn('#c-' + o.id));
+
+  // Switches
+  const st = {mode: 'dark', w: 0};
+  const apply = () => {
+    document.documentElement.dataset.mode = st.mode;
+    page.style.maxWidth = st.w ? st.w - 16 + 'px' : 'none';
+    document.querySelectorAll('#bar button').forEach((b) => {
+      const on = b.dataset.mode ? b.dataset.mode === st.mode : +b.dataset.w === st.w;
+      b.setAttribute('aria-pressed', on);
+    });
+    history.replaceState(null, '', '#' + st.mode + (st.w ? ',' + st.w : '') + (only.length ? ',only:' + only.join('+') : ''));
+  };
+  document.getElementById('bar').addEventListener('click', (e) => {
+    const b = e.target.closest('button');
+    if (!b) return;
+    if (b.dataset.mode) st.mode = b.dataset.mode;
+    else st.w = +b.dataset.w;
+    apply();
+  });
+  hs.forEach((x) => {
+    if (x === 'light' || x === 'dark') st.mode = x;
+    else if (+x) st.w = +x;
+  });
+  apply();
+  // gallery.html#hover shows the readout of the first line chart, for a screenshot
+  if (hs.includes('hover')) setTimeout(() => {
+    const sv = document.querySelector('#c-line svg');
+    if (!sv) return;
+    const r = sv.getBoundingClientRect();
+    sv.dispatchEvent(new PointerEvent('pointermove', {clientX: r.left + r.width * 0.72, clientY: r.top + 60, bubbles: true}));
+  }, 600);
+})();
+</script>
+</body>
+</html>

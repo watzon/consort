@@ -6,8 +6,9 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 /// A managed tool. A string on the wire: `node`, `claude-code`,
-/// `claude-agent-acp`, `codex`, `opencode`, `gemini-cli`, or
-/// `acp:<registry id>` for an agent from the ACP registry.
+/// `claude-agent-acp`, `codex`, `opencode`, `gemini-cli`,
+/// `chrome-headless-shell`, or `acp:<registry id>` for an agent from the ACP
+/// registry.
 ///
 /// Any string reads, so a newer worker can report a tool that this version
 /// does not know. Use [`ToolId::is_known`] to check one.
@@ -28,16 +29,20 @@ impl ToolId {
     pub const OPENCODE: &'static str = "opencode";
     /// The Gemini CLI.
     pub const GEMINI_CLI: &'static str = "gemini-cli";
+    /// The preview browser (`chrome-headless-shell`). The session host
+    /// renders visuals with it. It is not a provider.
+    pub const CHROME_HEADLESS_SHELL: &'static str = "chrome-headless-shell";
     /// The prefix of an ACP registry agent.
     pub const ACP_PREFIX: &'static str = "acp:";
     /// Every built-in tool, without the ACP registry agents.
-    pub const BUILT_IN: [&'static str; 6] = [
+    pub const BUILT_IN: [&'static str; 7] = [
         Self::NODE,
         Self::CLAUDE_CODE,
         Self::CLAUDE_AGENT_ACP,
         Self::CODEX,
         Self::OPENCODE,
         Self::GEMINI_CLI,
+        Self::CHROME_HEADLESS_SHELL,
     ];
 
     /// Wraps a string. It is not checked.
@@ -78,6 +83,11 @@ impl ToolId {
     /// `gemini-cli`.
     pub fn gemini_cli() -> Self {
         Self::new(Self::GEMINI_CLI)
+    }
+
+    /// `chrome-headless-shell`.
+    pub fn chrome_headless_shell() -> Self {
+        Self::new(Self::CHROME_HEADLESS_SHELL)
     }
 
     /// The string value.
@@ -172,6 +182,15 @@ mod tests {
             assert!(ToolId::new(name).is_known(), "{name}");
         }
         assert!(ToolId::acp("goose").is_known());
+        assert_eq!(
+            ToolId::chrome_headless_shell().as_str(),
+            "chrome-headless-shell"
+        );
+        assert_eq!(
+            ToolId::BUILT_IN.last(),
+            Some(&ToolId::CHROME_HEADLESS_SHELL)
+        );
+        assert!(ToolId::chrome_headless_shell().is_known());
         assert!(!ToolId::new("acp:").is_known());
         assert!(!ToolId::new("pip").is_known());
         assert_eq!(

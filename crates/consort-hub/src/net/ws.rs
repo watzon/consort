@@ -14,7 +14,7 @@ use consort_proto::frame::{Empty, Frame, FrameError, MAX_FRAME_BYTES, RequestFra
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::hub::Hub;
+use crate::hub::{HUB_VERSION, Hub};
 use crate::util::random_bytes;
 
 /// The whole handshake, from the challenge to `hello`, must end in this
@@ -294,10 +294,16 @@ pub(crate) async fn handshake(
             }
         }
     };
-    let payload = auth_signing_payload(&hub.settings.origin, &nonce);
-    let valid = public_key
-        .as_ref()
-        .is_some_and(|key| verify_signature(key, &payload, &response.signature));
+    let origins = hub.accepted_origins().await;
+    let valid = public_key.as_ref().is_some_and(|key| {
+        origins.iter().any(|origin| {
+            verify_signature(
+                key,
+                &auth_signing_payload(origin, &nonce),
+                &response.signature,
+            )
+        })
+    });
     if !valid {
         // The same message for every failure, so a peer learns nothing about
         // which IDs exist.
@@ -363,15 +369,23 @@ pub(crate) async fn fail(
     close_with(socket, code, reason).await;
 }
 
-pub(crate) async fn fail_protocol(socket: &mut WebSocket, request: &RequestFrame) {
-    let error = ErrorBody::new(
+/// Closes a link that has no common protocol version. The peer signed in, so
+/// the error also says how the hub was installed.
+pub(crate) async fn fail_protocol(hub: &Hub, socket: &mut WebSocket, request: &RequestFrame) {
+    let error = protocol_mismatch_error().with_hub_versions(hub.versions());
+    fail(socket, request, error, 1002, "protocol_mismatch").await;
+}
+
+/// The error for a peer that speaks no protocol version of this hub. The text
+/// does not say who must update: the peer knows that from the versions.
+pub(crate) fn protocol_mismatch_error() -> ErrorBody {
+    ErrorBody::new(
         ErrorCode::ProtocolMismatch,
         format!(
-            "This hub supports protocol versions {:?}. Update the app.",
+            "This hub runs {HUB_VERSION} and speaks protocol versions {:?}. Update the older side, then connect again.",
             consort_proto::frame::SUPPORTED_PROTOCOL_VERSIONS
         ),
-    );
-    fail(socket, request, error, 1002, "protocol_mismatch").await;
+    )
 }
 
 pub(crate) const WS_MAX_FRAME: usize = MAX_FRAME_BYTES;

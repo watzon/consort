@@ -344,6 +344,44 @@ pub enum BoundaryInfo {
     Bubblewrap,
 }
 
+/// Where the update of a worker is, when the worker follows the version of
+/// the hub. An inventory with no status means that no update runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum WorkerUpdateStatus {
+    /// The worker downloads and checks the release.
+    Downloading {
+        /// The version that the worker follows.
+        version: String,
+    },
+    /// The release is ready. The worker restarts when its work ends.
+    WaitingForWork {
+        /// The version that the worker follows.
+        version: String,
+    },
+    /// The worker replaced its program and restarts now.
+    Restarting {
+        /// The version that the worker follows.
+        version: String,
+    },
+    /// The update failed. The worker tries again later.
+    Failed {
+        /// The version that the worker follows.
+        version: String,
+        /// What happened and what to do next.
+        message: String,
+    },
+    /// This worker cannot replace itself, because it runs from a build
+    /// folder or another program controls it.
+    NotAvailable {
+        /// The version that the worker should follow.
+        version: String,
+    },
+    /// A state from a newer worker.
+    #[serde(other)]
+    Unknown,
+}
+
 /// What a worker has: its tags, harness accounts, managed tools, local MCP
 /// servers, checkouts, policy and load. The worker sends a full inventory after `hello` and again
 /// when any part changes.
@@ -383,6 +421,10 @@ pub struct Inventory {
     /// The managed tools.
     #[serde(default)]
     pub tools: Vec<ToolStatus>,
+    /// Where the update of this worker is. `None` when no update runs, and
+    /// always on a session host, which updates with the hub.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update: Option<WorkerUpdateStatus>,
 }
 
 /// FNV-1a, 64 bit. A change detector, not a security hash.
@@ -612,6 +654,7 @@ mod tests {
                 state: ToolState::Ready,
                 detail: None,
             }],
+            update: None,
         }
     }
 

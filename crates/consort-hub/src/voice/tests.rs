@@ -414,6 +414,8 @@ fn the_brief_lists_only_the_chosen_sources_and_the_assistant_text() {
         identity: None,
         use_in: consort_proto::model::UseIn::EveryChannel,
         approvals: consort_proto::model::ToolApprovals::default(),
+        tool_exceptions: Vec::new(),
+        assistant_owned: false,
         status: consort_proto::model::ConnectionStatus::Active,
         last_used_at: None,
         created_at: Timestamp::now(),

@@ -8,10 +8,11 @@ use std::time::Duration;
 use async_trait::async_trait;
 use consort_proto::error::ErrorBody;
 use consort_proto::ids::SessionId;
-use consort_proto::model::Sha256Hash;
+use consort_proto::model::{Sha256Hash, VisualHeight, VisualMode};
 use consort_proto::session_host_link::ToolCall;
 use consort_proto::tools::{HubTool, ToolCallResult, ToolDefinition};
-use consort_session_host::mcp::{self, ToolBackend};
+use consort_session_host::mcp::{self, McpSession, ToolBackend};
+use consort_session_host::visual::{RenderError, Rendered, VisualEngine};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -32,20 +33,54 @@ impl ToolBackend for Backend {
     async fn upload_blob(&self, _sha256: &Sha256Hash, _bytes: Vec<u8>) -> Result<(), ErrorBody> {
         Ok(())
     }
+    async fn download_blob(&self, _sha256: &Sha256Hash, _max: u64) -> Result<Vec<u8>, ErrorBody> {
+        Ok(Vec::new())
+    }
+}
+
+/// The bridge tests call no visual tool.
+struct NoEngine;
+
+#[async_trait]
+impl VisualEngine for NoEngine {
+    async fn render(
+        &self,
+        _document: String,
+        _width: u32,
+        _scale: u8,
+        _mode: VisualMode,
+        _max_height: u32,
+    ) -> Result<Rendered, RenderError> {
+        Err(RenderError::Installing)
+    }
+    async fn measure(
+        &self,
+        _document: String,
+        _widths: &[u32],
+        _mode: VisualMode,
+    ) -> Result<Vec<VisualHeight>, RenderError> {
+        Err(RenderError::Installing)
+    }
+}
+
+async fn start(dir: &std::path::Path, backend: Arc<Backend>) -> mcp::McpEndpoint {
+    mcp::start(McpSession {
+        session_id: SessionId::new(),
+        workspace: dir.to_path_buf(),
+        backend,
+        exec: None,
+        worker_root: None,
+        visual: Arc::new(NoEngine),
+    })
+    .await
+    .unwrap()
 }
 
 #[tokio::test]
 async fn bridge_forwards_stdio_to_the_endpoint() {
     let dir = tempfile::tempdir().unwrap();
     let backend = Arc::new(Backend::default());
-    let endpoint = mcp::start(
-        SessionId::new(),
-        dir.path().to_path_buf(),
-        backend.clone(),
-        None,
-    )
-    .await
-    .unwrap();
+    let endpoint = start(dir.path(), backend.clone()).await;
 
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_consort"))
         .args(["mcp-bridge", "--url", &endpoint.url])
@@ -91,14 +126,7 @@ async fn bridge_forwards_stdio_to_the_endpoint() {
 async fn bridge_ignores_proxy_variables() {
     let dir = tempfile::tempdir().unwrap();
     let backend = Arc::new(Backend::default());
-    let endpoint = mcp::start(
-        SessionId::new(),
-        dir.path().to_path_buf(),
-        backend.clone(),
-        None,
-    )
-    .await
-    .unwrap();
+    let endpoint = start(dir.path(), backend.clone()).await;
     // A "proxy" that counts the requests that carry the session token.
     // It does not count every connection: other programs on a developer
     // machine sometimes connect to new local ports, and that made this

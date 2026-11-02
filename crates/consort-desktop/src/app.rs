@@ -56,7 +56,10 @@ const DRAFT_SAVE_DELAY: Duration = Duration::from_millis(1_500);
 pub enum Page {
     Main,
     Settings,
+    /// S1: Connect to your hub, and Pair this app again.
     Onboarding,
+    /// The other setup screens. The setup gate picks them.
+    Setup,
 }
 
 /// The side panel at the right of the timeline.
@@ -82,16 +85,6 @@ pub enum ChannelTab {
     Memory,
     /// The connectors and skills of the channel, with their switches.
     Connectors,
-}
-
-/// A picture opened large, with the other pictures of the same message or
-/// list to step through.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Lightbox {
-    pub images: Vec<consort_client::AttachmentView>,
-    pub index: usize,
-    /// Who sent it and when: "You sent it today at 7:40 PM."
-    pub caption: String,
 }
 
 /// Where files that the user drags over the window go.
@@ -212,7 +205,18 @@ pub enum Dialog {
     /// Phase 4: New task, the channel settings, a group's name and its
     /// delete, a task's delete, and About. See `crate::convo`.
     NewTask,
+    /// Tasks work on the hub on this computer, and an update must restart it.
+    RestartWithTasks,
+    /// Remove the hub from this computer: keep the data or not.
+    LocalRemove,
+    /// Move to a server: the backup and the steps.
+    LocalMove,
+    /// Leave this hub. It keeps running.
+    LocalConnectOther,
     ChannelSettings(String),
+    /// What the assistant can do in a channel without asking: the
+    /// command rules and the connections. See `crate::permissions`.
+    Permissions(String),
     RenameGroup(String),
     ConfirmDeleteGroup(String),
     ConfirmDeleteTask(String),
@@ -259,6 +263,8 @@ pub struct AddAccountForm {
     pub key_saved: bool,
     /// The dialog has started the sign-in of the account once, or tried to.
     pub auto_started: bool,
+    /// The user sent a code in this sign-in, so a failure means that code.
+    pub code_sent: bool,
 }
 
 /// The onboarding form state.
@@ -266,6 +272,8 @@ pub struct AddAccountForm {
 pub struct Onboarding {
     pub busy: bool,
     pub error: Option<String>,
+    /// The first line of the error, for a version error (Paper `TED-0`).
+    pub error_title: Option<String>,
 }
 
 /// Text inputs, made once and reused.
@@ -348,6 +356,12 @@ pub struct ConsortApp {
     pub add_worker_step: crate::ui::add_worker::AddWorkerStep,
     /// Updates of the app: the check, the download and the restart.
     pub updates: consort_client::update::Updates,
+    /// The hub on this computer, if any.
+    pub local: crate::ui::local_hub::LocalUi,
+    /// A dialog closes with no hub for this app: go to the first screen.
+    pub leaving_hub: bool,
+    /// The setup screens. The setup gate decides what opens.
+    pub setup: crate::ui::setup::SetupUi,
     pub decision_writing: Option<String>,
     pub activity_open: Vec<String>,
     pub last_thread: Option<String>,
@@ -367,7 +381,7 @@ pub struct ConsortApp {
     pub added_worker: Option<String>,
     /// The composer placeholder must follow a channel change made without a
     /// window.
-    placeholder_stale: bool,
+    pub(crate) placeholder_stale: bool,
     /// The commands that run now, so a second submit waits.
     pub in_flight: InFlight,
     /// What went wrong in the open dialog. The dialog shows it.
@@ -450,8 +464,8 @@ pub struct ConsortApp {
     /// Files are dragged over the window: where they would go, and how
     /// many there are.
     pub drop_hover: Option<(DropOver, usize)>,
-    /// The open light box.
-    pub lightbox: Option<Lightbox>,
+    /// The open light box (`ui/lightbox.rs`).
+    pub lightbox: Option<crate::ui::lightbox::Lightbox>,
     /// The folder chosen in the open Move dialog.
     pub move_to: String,
     /// A screen holds the drop state with no drag, for a screenshot.
@@ -472,6 +486,9 @@ pub struct ConsortApp {
     pub monid_inputs: crate::monid::MonidInputs,
     /// Settings > Voice and the draft cards. See `crate::voice`.
     pub voice: crate::voice::VoiceUi,
+    /// The visuals: their pages, images and live pages. See
+    /// `crate::visual`.
+    pub visuals: crate::visual::VisualUi,
     pub voice_inputs: crate::voice::VoiceInputs,
     pub focus: FocusHandle,
     styled_for: Option<(gpui_kit::SharedString, consort_theme::Mode)>,
@@ -680,14 +697,14 @@ impl ConsortApp {
         .detach();
 
         // A refused client shows onboarding, with the reason, even when the
-        // refusal came before the window opened.
-        let page = if demo
-            || (state.connection != Connection::NotPaired
-                && !matches!(state.connection, Connection::Refused { .. }))
-        {
+        // refusal came before the window opened. The gate decides the rest
+        // when the window opens.
+        let page = if demo {
             Page::Main
-        } else {
+        } else if matches!(state.connection, Connection::Refused { .. }) {
             Page::Onboarding
+        } else {
+            Page::Setup
         };
         let mut this = ConsortApp {
             client,
@@ -727,6 +744,9 @@ impl ConsortApp {
             add_worker_os: Os::Linux,
             add_worker_step: crate::ui::add_worker::AddWorkerStep::default(),
             updates: crate::ui::update_notice::start_updates(demo),
+            local: crate::ui::local_hub::LocalUi::start(demo),
+            setup: crate::ui::setup::SetupUi::default(),
+            leaving_hub: false,
             decision_writing: None,
             activity_open: Vec::new(),
             last_thread: None,
@@ -789,6 +809,7 @@ impl ConsortApp {
             monid_ui: crate::monid::MonidUi::default(),
             monid_inputs,
             voice: crate::voice::VoiceUi::default(),
+            visuals: crate::visual::VisualUi::default(),
             voice_inputs,
             focus: cx.focus_handle(),
             styled_for: None,
@@ -814,7 +835,9 @@ impl ConsortApp {
         this.update_placeholder(window, cx);
         this.sync_draft_inputs(window, cx);
         this.follow_connection(cx);
+        this.follow_setup(cx);
         this.follow_updates(cx);
+        this.follow_local(window, cx);
         this.mark_read(cx);
         // Reaching the top of the timeline loads older messages. Reaching the
         // bottom marks the channel read.
@@ -908,17 +931,16 @@ impl ConsortApp {
     }
 
     pub(crate) fn apply_state(&mut self, state: Arc<ViewState>, cx: &mut Context<Self>) {
-        let was_paired = self.state.connection != Connection::NotPaired;
         self.state = state;
+        // An update that cannot talk to this hub waits.
+        self.updates.set_hub(self.state.hub_versions.clone());
         if self.state.channel(&self.channel_id).is_none()
             && let Some(tutti) = self.state.tutti()
         {
             self.channel_id = tutti.id.clone();
         }
-        if !self.demo && !was_paired && self.state.connection != Connection::NotPaired {
-            self.page = Page::Main;
-        }
         self.follow_connection(cx);
+        self.follow_setup(cx);
         if let Panel::Thread(task_id) = &self.panel
             && self.state.thread(task_id).is_none()
             && self.state.task(task_id).is_none()
@@ -1093,6 +1115,7 @@ impl ConsortApp {
         if let Connection::Refused { reason } = &self.state.connection {
             self.page = Page::Onboarding;
             self.onboarding.error = Some(reason.clone());
+            self.onboarding.error_title = None;
         }
         self.offline =
             countdown::follow(self.offline.take(), &self.state.connection, Instant::now());
@@ -1277,6 +1300,9 @@ impl ConsortApp {
     /// The composer's placeholder: "Message <channel>", and "Message Tutti"
     /// in the main channel.
     pub fn composer_placeholder(&self) -> String {
+        if self.no_account_in_tutti() {
+            return "Sign in to a provider to message the assistant".to_owned();
+        }
         let name = self
             .state
             .channel(&self.channel_id)
@@ -1293,6 +1319,17 @@ impl ConsortApp {
         self.inputs.composer.update(cx, |input, cx| {
             input.set_placeholder(placeholder, window, cx);
         });
+    }
+
+    /// Gives the mock its hub on this computer, for `--screen`.
+    fn show_local_screen(&mut self, screen: &str, cx: &mut Context<Self>) {
+        if let Some(view) = consort_client::mock_local::screen_view(screen) {
+            self.local = crate::ui::local_hub::LocalUi::with(
+                consort_client::local_hub::LocalHub::fixed(view),
+            );
+            self.local.seen_swap = self.local.hub.view().swap;
+            cx.notify();
+        }
     }
 
     /// Opens one of the designed screens by name, for `--screen`.
@@ -1594,7 +1631,7 @@ impl ConsortApp {
                 // downloaded and checked.
                 self.updates = Updates::fixed(crate::ui::update_notice::ready_view());
             }
-            "add-worker" | "add-worker-install" | "worker-added" => {
+            "add-worker" | "add-worker-install" | "add-worker-loopback" | "worker-added" => {
                 self.open_settings(SettingsSection::Workers, cx);
                 // The designs show Windows, chosen in step 1.
                 self.add_worker_os = Os::Windows;
@@ -1658,7 +1695,13 @@ impl ConsortApp {
                             .into_iter()
                             .filter(|a| a.image)
                             .collect();
-                        self.open_lightbox(images, 0, "You sent it today at 7:40 PM.".into(), cx);
+                        self.open_lightbox(
+                            images,
+                            0,
+                            "You sent it today at 7:40 PM.".into(),
+                            window,
+                            cx,
+                        );
                     }
                     "files" | "files-menu" | "files-drop" => {
                         self.panel = Panel::Channel;
@@ -1727,6 +1770,71 @@ impl ConsortApp {
                 }
             }
             "onboarding" => self.page = Page::Onboarding,
+            screen if screen.starts_with("setup-") => self.open_setup_screen(screen, window, cx),
+            "first-t8" | "first-signed-out" => {
+                self.setup.gate = consort_client::setup::Gate::NoAccount;
+                self.placeholder_stale = true;
+            }
+            "first-permission" => {
+                self.admin.permission = crate::notify_platform::Permission::NotAsked;
+            }
+            "first-failed" => {}
+            "local-install" | "local-windows" | "local-bubblewrap" | "local-failed"
+            | "local-found" => {
+                self.show_local_screen(screen, cx);
+                self.page = Page::Setup;
+                self.setup.gate = if screen == "local-found" {
+                    consort_client::setup::Gate::LocalFound
+                } else {
+                    consort_client::setup::Gate::Where
+                };
+            }
+            "local-stopped" => self.show_local_screen(screen, cx),
+            "hub-local" => {
+                self.show_local_screen(screen, cx);
+                self.open_settings(SettingsSection::Hub, cx);
+            }
+            "hub-local-remove" | "hub-local-move" | "hub-local-connect" => {
+                self.show_local_screen(screen, cx);
+                self.open_settings(SettingsSection::Hub, cx);
+                let dialog = match screen {
+                    "hub-local-remove" => Dialog::LocalRemove,
+                    "hub-local-move" => Dialog::LocalMove,
+                    _ => Dialog::LocalConnectOther,
+                };
+                self.open_dialog(dialog, window, cx);
+            }
+            "restart-tasks" => {
+                self.show_local_screen(screen, cx);
+                self.open_dialog(Dialog::RestartWithTasks, window, cx);
+            }
+            "pair-too-old" => {
+                self.page = Page::Onboarding;
+                let (title, detail) = consort_client::versions::pair_error(Some(
+                    &consort_client::versions::HubVersions {
+                        hub_version: "0.6.2".into(),
+                        protocol_versions: Vec::new(),
+                        install: None,
+                    },
+                ));
+                self.onboarding.error_title = Some(title);
+                self.onboarding.error = Some(detail);
+            }
+            "update-held" | "app-too-old" => {
+                self.updates = Updates::fixed(crate::ui::versions::screen_view(
+                    self.updates.view(),
+                    screen,
+                ));
+                self.updates.set_hub(self.state.hub_versions.clone());
+            }
+            "hub-update" => {
+                self.updates = Updates::fixed(crate::ui::versions::screen_view(
+                    self.updates.view(),
+                    screen,
+                ));
+                self.open_settings(SettingsSection::Hub, cx);
+            }
+            "workers-updating" => self.open_settings(SettingsSection::Workers, cx),
             "edit" => {
                 let mine = self.state.timeline(&self.channel_id).and_then(|t| {
                     t.items.iter().rev().find_map(|i| match i {
@@ -1849,6 +1957,9 @@ impl ConsortApp {
         self.update_placeholder(window, cx);
         self.track_unloaded(cx);
         self.mark_read(cx);
+        if !self.demo {
+            self.follow_first_run(cx);
+        }
         cx.notify();
     }
 
@@ -1977,8 +2088,8 @@ impl ConsortApp {
         .detach();
     }
 
-    /// Forgets the draft of a channel or a thread whose text went out while
-    /// another one was open. The text is in the hub now.
+    /// Forgets the saved draft of a channel or a thread when it holds the
+    /// text that went out. The text is in the hub now.
     fn forget_sent_draft(&mut self, channel: Option<&str>, thread: Option<&str>, sent: &str) {
         if let Some(channel) = channel
             && self.drafts.channel(channel).trim() == sent.trim()
@@ -2024,6 +2135,12 @@ impl ConsortApp {
             }
         } else if self.page == Page::Onboarding && !self.onboarding.busy {
             self.connect(window, cx);
+        } else if self.page == Page::Setup {
+            // The sign-in screen has the fields of the dialog.
+            let confirm = self.dialog_confirm.borrow().clone();
+            if let Some(confirm) = confirm {
+                confirm(self, window, cx);
+            }
         }
     }
 
@@ -2043,6 +2160,7 @@ impl ConsortApp {
             Connection::Connecting | Connection::Offline { .. }
         ) || self.dialog == Some(Dialog::AddWorker)
             || matches!(self.dialog, Some(Dialog::AddAccount(_)))
+            || self.page == Page::Setup
             || self
                 .state
                 .session_host
@@ -2272,6 +2390,7 @@ impl ConsortApp {
             }
             Dialog::NewTask
             | Dialog::ChannelSettings(_)
+            | Dialog::Permissions(_)
             | Dialog::RenameGroup(_)
             | Dialog::ConfirmDeleteGroup(_)
             | Dialog::ConfirmDeleteTask(_)
@@ -2367,6 +2486,10 @@ impl ConsortApp {
                 self.move_to = consort_client::files::split_path(path).0.to_owned();
             }
             Dialog::ConfirmDeleteFile(..) | Dialog::ChooseChannelFiles(_) => {}
+            Dialog::RestartWithTasks
+            | Dialog::LocalRemove
+            | Dialog::LocalMove
+            | Dialog::LocalConnectOther => {}
             Dialog::PairClient => self.start_client_pairing(cx),
             Dialog::Routine(_)
             | Dialog::ConfirmDeleteRoutine(_)
@@ -2476,6 +2599,22 @@ impl ConsortApp {
         if self.dialog == Some(Dialog::PairClient) {
             self.end_client_pairing(cx);
         }
+        if self.dialog == Some(Dialog::RestartWithTasks)
+            && matches!(
+                self.local.hub.view().swap,
+                consort_client::local_hub::SwapState::NeedsChoice { .. }
+            )
+        {
+            let hub = self.local.hub.clone();
+            self.local.restart_after_swap = false;
+            crate::ui::update_notice::allow_restart();
+            self.spawn_command(cx, async move { hub.cancel_swap().await });
+        }
+        if self.leaving_hub {
+            self.leaving_hub = false;
+            self.page = Page::Setup;
+            self.setup.gate = consort_client::setup::Gate::Neutral;
+        }
         if self.dialog == Some(Dialog::AddWorker) {
             let client = self.client.clone();
             self.spawn_command(cx, async move {
@@ -2520,6 +2659,7 @@ impl ConsortApp {
                     Err(err) => {
                         // A failed command makes no channel to open.
                         this.open_created = None;
+                        this.leaving_hub = false;
                         if still_open {
                             this.dialog_error = Some(err.to_string());
                         } else {
@@ -2642,7 +2782,13 @@ impl ConsortApp {
 
     /// Empties a message box after its text went out, if the box still holds
     /// what was sent. Text that the user typed meanwhile stays.
+    ///
+    /// Clearing a box sends no change event, so the drafts on disk would keep
+    /// the sent text: a save that ran while the user paused before Enter
+    /// wrote it there. So the saved drafts forget the sent text here too, and
+    /// the next start shows an empty box.
     pub(crate) fn clear_draft_if_sent<M: gpui_kit::component::input::InputModeKind>(
+        &mut self,
         input: &Entity<gpui_kit::base::input::InputBaseState<M>>,
         sent: &str,
         window: &mut Window,
@@ -2651,6 +2797,10 @@ impl ConsortApp {
         let now = input.read(cx).value().to_string();
         if drafts::can_clear_after_send(sent, &now) {
             input.update(cx, |input, cx| input.set_value("", window, cx));
+            let channel = self.composer_for.clone();
+            let thread = self.reply_for.clone();
+            self.forget_sent_draft(Some(&channel), thread.as_deref(), sent);
+            self.save_drafts_soon(cx);
         }
     }
 
@@ -2687,7 +2837,7 @@ impl ConsortApp {
             Kept::Draft("Your message is still in the box."),
             move |this, window, cx| {
                 if this.composer_for == sent_to {
-                    Self::clear_draft_if_sent(&input, &sent, window, cx);
+                    this.clear_draft_if_sent(&input, &sent, window, cx);
                 } else {
                     // The user went to another channel meanwhile. The draft
                     // of the channel they left is in the drafts.
@@ -2725,7 +2875,7 @@ impl ConsortApp {
             Kept::Draft("Your reply is still in the box."),
             move |this, window, cx| {
                 if this.reply_for.as_deref() == Some(sent_to.as_str()) {
-                    Self::clear_draft_if_sent(&input, &sent, window, cx);
+                    this.clear_draft_if_sent(&input, &sent, window, cx);
                 } else {
                     this.forget_sent_draft(None, Some(&sent_to), &sent);
                     this.save_drafts_soon(cx);
@@ -2820,7 +2970,7 @@ impl ConsortApp {
                     this.decision_writing = None;
                 }
                 if let Some(sent) = sent {
-                    Self::clear_draft_if_sent(&input, &sent, window, cx);
+                    this.clear_draft_if_sent(&input, &sent, window, cx);
                 }
             },
             window,
@@ -3099,8 +3249,10 @@ impl ConsortApp {
             MenuAction::DeleteFile(channel_id, path) => {
                 self.open_dialog(Dialog::ConfirmDeleteFile(channel_id, path), window, cx)
             }
+            MenuAction::Permissions(action) => self.run_permissions_action(action, window, cx),
             MenuAction::Knowledge(action) => self.run_knowledge_menu(action, window, cx),
             MenuAction::Monid(action) => self.run_monid_action(action, window, cx),
+            MenuAction::Visual(action) => self.run_visual_action(action, window, cx),
         }
         cx.notify();
     }
@@ -3143,6 +3295,62 @@ impl ConsortApp {
             && self.tag_entry == self.settings_worker
     }
 
+    /// Whether something is open over the timeline: a menu, a picker, a
+    /// popover, a dialog, the light box, the switcher, a notice, the
+    /// drawer, a panel over the whole window, the drop state of files, or a
+    /// page other than the main one. While it is, a visual shows its image
+    /// and not its live page, because the native webview of the page would
+    /// draw over the overlay (`ui/visual_cover.rs`). GPUI tooltips are not
+    /// in this list: the app does not know when one shows.
+    pub fn covers_timeline(&self, t: &Tokens) -> bool {
+        self.covers() || self.layout_frame(t).panel_over
+    }
+
+    /// Whether something is open over a task thread: the same overlays as
+    /// for the timeline, but a panel over the whole window is the thread
+    /// itself.
+    pub fn covers_thread(&self) -> bool {
+        self.covers()
+    }
+
+    /// Whether something is open over the light box: a menu, a picker, the
+    /// switcher or a notice. Dialogs and panels are under it.
+    pub fn covers_lightbox(&self) -> bool {
+        self.menu.is_some()
+            || self.picker.is_some()
+            || self.effort_menu.is_some()
+            || self.convo.emoji_picker.is_some()
+            || self.switcher.is_some()
+            || self.notices.visible().next().is_some()
+            || self.dictation.notice.is_some()
+    }
+
+    /// The overlays over the timeline and a task thread.
+    fn covers(&self) -> bool {
+        let menus = self.menu.is_some()
+            || self.picker.is_some()
+            || self.effort_menu.is_some()
+            || self.convo.emoji_picker.is_some()
+            || self.ext.use_in_picker.is_some();
+        let dialogs = self.dialog.is_some()
+            || self.convo.icon_picker.is_some()
+            || self.convo.permissions.rule.is_some()
+            || self.convo.permissions.picker.is_some()
+            || self
+                .knowledge
+                .routine_dialog
+                .as_ref()
+                .is_some_and(|d| d.zone_open);
+        let layers = self.switcher.is_some()
+            || self.lightbox.is_some()
+            || self.notices.visible().next().is_some()
+            || self.dictation.notice.is_some()
+            || self.layout.drawer_open
+            || self.drop_hover.is_some()
+            || self.hold_drop;
+        self.page != Page::Main || menus || dialogs || layers
+    }
+
     /// Closes the Add tag field, with its text and its error.
     pub fn close_tag_entry(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.tag_entry = None;
@@ -3172,6 +3380,10 @@ impl ConsortApp {
             return;
         }
         if self.use_in_picker_key(key, cx) {
+            cx.stop_propagation();
+            return;
+        }
+        if self.permissions_key(key, window, cx) {
             cx.stop_propagation();
             return;
         }
@@ -3348,6 +3560,7 @@ impl Render for ConsortApp {
         let t = Self::tokens(cx);
         self.style_inputs(&t, cx);
         cx.global::<FrameClock>().begin_frame();
+        self.begin_visual_frame(&t, window, cx);
         self.follow_mark(cx);
         self.apply_window_badge(window);
         self.dialog_confirm.replace(None);
@@ -3359,6 +3572,15 @@ impl Render for ConsortApp {
         self.inputs
             .composer
             .update(cx, |input, cx| input.set_disabled(waiting, cx));
+        {
+            use gpui_kit::Focusable as _;
+            self.ext.key_field_focused = self
+                .ext_inputs
+                .composio_key
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window);
+        }
         if self.placeholder_stale {
             self.placeholder_stale = false;
             self.update_placeholder(window, cx);
@@ -3373,6 +3595,7 @@ impl Render for ConsortApp {
         }
         let body = match self.page {
             Page::Onboarding => self.render_onboarding(&t, window, cx),
+            Page::Setup => self.render_setup(&t, window, cx),
             Page::Settings => self.render_settings(&t, window, cx),
             Page::Main => self.render_main(&t, window, cx),
         };
@@ -3423,6 +3646,10 @@ impl Render for ConsortApp {
                     // All icons opens over the dialog that opened it.
                     .children(self.render_icon_picker(&t, window, cx))
                     .children(self.render_use_in_picker(&t, window, cx))
+                    // The rule dialog and the tool picker open over the
+                    // Permissions dialog.
+                    .children(self.render_rule_dialog(&t, window, cx))
+                    .children(self.render_exception_picker(&t, window, cx))
                     .when(self.lightbox.is_some(), |layer| {
                         layer.child(self.render_lightbox(&t, window, cx))
                     })
@@ -3447,6 +3674,9 @@ impl Render for ConsortApp {
                     |this: &mut Self, _, cx| this.close_menu(cx),
                 ))
             })
+            // Last: it hides each live page that no item showed in this
+            // frame.
+            .child(self.visuals.frame.sweep())
     }
 }
 

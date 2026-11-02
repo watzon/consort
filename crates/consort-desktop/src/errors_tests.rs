@@ -325,6 +325,7 @@ fn error_post(card: ErrorCardView) -> ThreadPost {
             draft: None,
             fallback: None,
             monid: None,
+            visual: None,
         }],
         pending: false,
         source_message_id: None,

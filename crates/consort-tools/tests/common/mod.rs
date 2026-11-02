@@ -11,7 +11,9 @@ use axum::Router;
 use axum::extract::State;
 use axum::http::{StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
-use consort_tools::{Arch, Libc, Os, Platform, Sources, ToolStore, ToolStoreOptions};
+use consort_tools::{
+    Arch, ChromeFile, ChromePin, Libc, Os, Platform, Sources, ToolStore, ToolStoreOptions,
+};
 use sha2::{Digest, Sha256};
 
 pub const TEST_KEY: &str = include_str!("../fixtures/test-signing-key.asc");
@@ -22,6 +24,10 @@ pub const FAKE_CLAUDE: &[u8] = b"#!/bin/sh\necho fake claude 9.9.1\n";
 
 pub const NODE_VERSION: &str = "24.1.0";
 pub const CLAUDE_VERSION: &str = "9.9.1";
+/// The version in the test pin of the preview browser.
+pub const CHROME_VERSION: &str = "9.9.9.1";
+/// The file name of the fake preview browser zip on the test platform.
+pub const CHROME_ZIP: &str = "chrome-headless-shell-mac-arm64.zip";
 
 #[derive(Clone, Default)]
 struct Files {
@@ -88,6 +94,7 @@ impl Server {
             codex_latest_release: self.url("/github/latest"),
             codex_downloads: self.url("/github/download"),
             acp_registry: self.url("/acp/registry.json"),
+            chrome_for_testing: self.url("/chrome"),
             opencode_version: self.url("/opencode/version"),
         }
     }
@@ -166,6 +173,19 @@ impl Server {
         self.put(
             &format!("/npm/{}/latest", package.replace('/', "%2f")),
             format!(r#"{{"name":"{package}","version":"{version}"}}"#),
+        );
+    }
+
+    /// The fake preview browser zip, at the path that the store asks for.
+    pub fn put_chrome(&self) {
+        self.put_chrome_at(CHROME_VERSION);
+    }
+
+    /// The fake preview browser zip as another version.
+    pub fn put_chrome_at(&self, version: &str) {
+        self.put(
+            &format!("/chrome/{version}/mac-arm64/{CHROME_ZIP}"),
+            chrome_zip(),
         );
     }
 
@@ -311,6 +331,49 @@ pub fn node_archive() -> Vec<u8> {
     ])
 }
 
+/// A fake preview browser zip with the layout of Chrome for Testing: one
+/// top folder. The files have no mode bits for execution, as in a zip that
+/// Windows made, so the store must make the program executable.
+pub fn chrome_zip() -> Vec<u8> {
+    static ZIP: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    ZIP.get_or_init(|| {
+        let top = "chrome-headless-shell-mac-arm64";
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default().unix_permissions(0o644);
+        for (name, body) in [
+            (
+                "chrome-headless-shell",
+                &b"#!/bin/sh\necho fake chrome\n"[..],
+            ),
+            ("icudtl.dat", b"icu"),
+            ("locales/en-US.pak", b"pak"),
+        ] {
+            zip.start_file(format!("{top}/{name}"), options).unwrap();
+            zip.write_all(body).unwrap();
+        }
+        zip.finish().unwrap().into_inner()
+    })
+    .clone()
+}
+
+/// The pin of the fake zip on the test platform.
+pub fn chrome_pin() -> ChromePin {
+    chrome_pin_at(CHROME_VERSION)
+}
+
+/// The pin of the fake zip as another version.
+pub fn chrome_pin_at(version: &str) -> ChromePin {
+    let zip = chrome_zip();
+    ChromePin {
+        version: version.to_owned(),
+        files: vec![ChromeFile {
+            platform: "mac-arm64".to_owned(),
+            bytes: zip.len() as u64,
+            sha256: sha256_hex(&zip),
+        }],
+    }
+}
+
 pub fn sha256_hex(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
@@ -321,11 +384,23 @@ pub fn test_platform() -> Platform {
 }
 
 pub fn store(server: &Server, root: &Path, npm: Option<PathBuf>) -> ToolStore {
+    store_with(server, root, npm, test_platform(), chrome_pin())
+}
+
+/// A store with its own platform and preview browser pin.
+pub fn store_with(
+    server: &Server,
+    root: &Path,
+    npm: Option<PathBuf>,
+    platform: Platform,
+    chrome: ChromePin,
+) -> ToolStore {
     let options = ToolStoreOptions {
-        platform: test_platform(),
+        platform,
         sources: server.sources(),
         npm_program: npm,
         claude_signing_key: TEST_KEY.to_owned(),
+        chrome,
     };
     ToolStore::with_options(root.to_owned(), options).unwrap()
 }

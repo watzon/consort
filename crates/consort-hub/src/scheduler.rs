@@ -600,6 +600,7 @@ pub(crate) mod testing {
             memory_enabled: true,
             disabled_connections: Vec::new(),
             disabled_skills: Vec::new(),
+            command_rules: Vec::new(),
             archived_at: archived.then_some(now),
             created_at: now,
             updated_at: now,

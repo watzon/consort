@@ -547,6 +547,43 @@ impl ConsortApp {
                 t,
             ));
         }
+        let owned = connection.assistant_owned;
+        let owner_id = connection.id.clone();
+        let owner = rows_frame(t).child(setting_row(
+            "This account belongs to the assistant",
+            div()
+                .flex()
+                .flex_col()
+                .gap(t.space.xs)
+                .child(hint(
+                    "Its emails do not use your voice. Routines follow the rules of this connection.",
+                    t,
+                ))
+                .when(owned, |d| {
+                    d.child(
+                        text(
+                            "What it reads can tell the assistant what to do. It could send channel files to anyone, and nothing asks you first.",
+                            detail(t),
+                            c.status_failed,
+                        )
+                        .debug_selector(|| "connection-owned-risk".into()),
+                    )
+                }),
+            crate::ui::settings::switch("connection-assistant-owned", owned, t)
+                .debug_selector(|| "connection-assistant-owned".into())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.update_connection(
+                        owner_id.clone(),
+                        consort_client::ConnectionChanges {
+                            assistant_owned: Some(!owned),
+                            ..Default::default()
+                        },
+                        cx,
+                    );
+                })),
+            true,
+            t,
+        ));
         let example = example_channel(&connection.use_in, &state.channels);
         let sees = match example {
             Some(channel) => {
@@ -602,6 +639,12 @@ impl ConsortApp {
                         "Approvals",
                         "Composio marks each tool as reading, changing or deleting. Consort asks you by that mark.",
                         approvals,
+                        t,
+                    ))
+                    .child(page_section(
+                        "Owner",
+                        "An account of your own stays yours. An account that you made for the assistant can send with no card.",
+                        owner,
                         t,
                     ))
                     .child(sees),

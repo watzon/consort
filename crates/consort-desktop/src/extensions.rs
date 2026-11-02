@@ -149,7 +149,7 @@ impl ExtInputs {
             connect_name: field("Gmail Work", window, cx),
             composio_key: cx.new(|cx| {
                 InputState::new(window, cx)
-                    .placeholder("Paste the project key")
+                    .placeholder("Paste the key")
                     .masked(true)
             }),
             connection_name: field("Name", window, cx),
@@ -197,6 +197,14 @@ pub struct ExtState {
     /// Connect cards that the user continued: the app opens the sign-in page
     /// once the hub has made the connection.
     pub browser_cards: Vec<String>,
+    /// The worker card that has its pairing code.
+    pub worker_card: Option<String>,
+    /// Why the worker card has no code.
+    pub worker_card_error: Option<String>,
+    /// The app asked the hub whether it has a Composio key, for a connect card.
+    pub key_asked: bool,
+    /// The key field has the focus. A card has no window when it draws.
+    pub key_field_focused: bool,
     /// The connections whose sign-in page the app opened.
     pub opened: Vec<String>,
     pub sign_in_card: Option<SignInCardWait>,
@@ -1096,6 +1104,57 @@ impl ConsortApp {
         } else {
             self.open_sign_in(card.worker_id, card.account_id, window, cx);
         }
+    }
+
+    /// Continue in browser on a connect card with no key on the hub: the hub
+    /// stores the key first. A key that fails stays in the field, and the card
+    /// shows the error.
+    pub fn continue_connect_card_with_key(
+        &mut self,
+        approval_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.blocked_by_hub(cx) {
+            return;
+        }
+        let key = self
+            .ext_inputs
+            .composio_key
+            .read(cx)
+            .value()
+            .trim()
+            .to_owned();
+        if key.is_empty() {
+            self.key_error = Some("Paste your Composio project key.".into());
+            cx.notify();
+            return;
+        }
+        if !self.in_flight.begin("composio-key") {
+            return;
+        }
+        self.key_error = None;
+        let client = self.client.clone();
+        let input = self.ext_inputs.composio_key.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = client
+                .run(Command::SetComposioKey {
+                    api_key: consort_client::SecretText(key),
+                })
+                .await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.in_flight.finish("composio-key");
+                match result {
+                    Ok(()) => {
+                        input.update(cx, |input, cx| input.set_value("", window, cx));
+                        this.continue_connect_card(approval_id, cx);
+                    }
+                    Err(err) => this.key_error = Some(err.to_string()),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Saves the Composio key from the key field.

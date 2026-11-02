@@ -820,6 +820,7 @@ impl ConsortApp {
                 };
                 (same, tutti.unwrap_or_default())
             }
+            None if self.no_account_in_tutti() => ("No account".to_owned(), String::new()),
             None => ("Choose a model".to_owned(), String::new()),
         };
         let account = if style == TriggerStyle::ChipShort {
@@ -1000,6 +1001,7 @@ impl ConsortApp {
                     (s.model_name, s.account_label, logo)
                 }
             }
+            None if self.no_account_in_tutti() => ("No account".to_owned(), String::new(), false),
             None => ("Choose a model".to_owned(), String::new(), false),
         }
     }

@@ -44,6 +44,16 @@ pub struct AdminState {
     pub permission: Permission,
     /// The countdown of the pairing dialog redraws every second.
     pairing_ticker: bool,
+    /// Reach from other devices shows in place of Settings > Hub.
+    pub reach_open: bool,
+    /// The list of all states of that page, for `--screen reach-states`.
+    pub reach_gallery: bool,
+    /// The route that Add a device shows when two ways are on.
+    pub reach_route: Option<consort_client::reach::ReachMethod>,
+    /// The page checks with the hub while it is open.
+    reach_ticker: bool,
+    /// The page asked for a code and has no answer yet.
+    reach_code_asked: bool,
 }
 
 impl AdminState {
@@ -81,6 +91,11 @@ impl AdminState {
             badge: None,
             permission,
             pairing_ticker: false,
+            reach_open: false,
+            reach_gallery: false,
+            reach_route: None,
+            reach_ticker: false,
+            reach_code_asked: false,
         };
         (state, vec![subscription])
     }
@@ -177,10 +192,14 @@ pub fn backup_pick(select: &str, option: &str) -> Option<BackupChanges> {
 impl ConsortApp {
     /// Loads what a phase 3 page shows when it opens.
     pub fn enter_admin_section(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
+        // A choice in the Settings list shows that page, not a page inside it.
+        self.admin.reach_open = false;
+        self.admin.reach_gallery = false;
         let client = self.client.clone();
         match section {
             SettingsSection::Hub => {
                 self.admin.folder_editing = false;
+                self.load_reach(cx);
                 self.spawn_command(cx, async move { client.run(Command::LoadHubStatus).await });
             }
             SettingsSection::Clients => {
@@ -491,6 +510,121 @@ impl ConsortApp {
         );
     }
 
+    /// Asks the hub how other devices reach it. The page shows a failure, so
+    /// there is no notice for it.
+    pub fn load_reach(&mut self, cx: &mut Context<Self>) {
+        let client = self.client.clone();
+        cx.spawn(async move |_, _| {
+            let _ = client.run(Command::LoadReach).await;
+        })
+        .detach();
+    }
+
+    /// Turns a way on or off. The page shows a failure.
+    pub fn set_reach(
+        &mut self,
+        method: consort_client::reach::ReachMethod,
+        on: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let client = self.client.clone();
+        cx.spawn(async move |_, _| {
+            let _ = client.run(Command::SetReach { method, on }).await;
+        })
+        .detach();
+    }
+
+    /// True while Reach from other devices is on screen.
+    fn reach_on_screen(&self) -> bool {
+        self.admin.reach_open
+            && self.page == Page::Settings
+            && self.settings_section == SettingsSection::Hub
+    }
+
+    /// Asks for a code when a way is on and the page has none.
+    fn ensure_reach_code(&mut self, cx: &mut Context<Self>) {
+        if self.state.admin.reach.routes.is_empty()
+            || self.state.admin.pairing.is_some()
+            || self.admin.reach_code_asked
+        {
+            return;
+        }
+        self.admin.reach_code_asked = true;
+        let client = self.client.clone();
+        cx.spawn(async move |this, cx| {
+            let result = client.run(Command::ClientPairingCode).await;
+            let _ = this.update(cx, |this, cx| {
+                this.admin.reach_code_asked = false;
+                if let Err(err) = result {
+                    this.show_error(err.to_string(), cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Opens Reach from other devices. While it is open, the page checks with
+    /// the hub every five seconds, so it finds Tailscale by itself. The hub
+    /// does the same for its own state.
+    pub fn open_reach(&mut self, cx: &mut Context<Self>) {
+        self.admin.reach_open = true;
+        self.load_reach(cx);
+        self.ensure_reach_code(cx);
+        cx.notify();
+        if self.admin.reach_ticker {
+            return;
+        }
+        self.admin.reach_ticker = true;
+        cx.spawn(async move |this, cx| {
+            let mut seconds = 0u32;
+            loop {
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+                seconds = seconds.wrapping_add(1);
+                let open = this
+                    .update(cx, |this, cx| {
+                        let open = this.reach_on_screen();
+                        if open {
+                            this.ensure_reach_code(cx);
+                            if seconds.is_multiple_of(5) {
+                                this.load_reach(cx);
+                            }
+                            cx.notify();
+                        } else {
+                            this.leave_reach(cx);
+                        }
+                        open
+                    })
+                    .unwrap_or(false);
+                if !open {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// The page closed: the code is forgotten.
+    fn leave_reach(&mut self, cx: &mut Context<Self>) {
+        self.admin.reach_open = false;
+        self.admin.reach_gallery = false;
+        self.admin.reach_ticker = false;
+        // The Pair a new app dialog keeps its own code.
+        if self.dialog != Some(Dialog::PairClient) && self.state.admin.pairing.is_some() {
+            self.end_client_pairing(cx);
+        }
+    }
+
+    /// Back to Hub.
+    pub fn close_reach(&mut self, cx: &mut Context<Self>) {
+        self.admin.reach_open = false;
+        self.admin.reach_gallery = false;
+        // The ticker sees this at its next second. The code goes now.
+        if self.dialog != Some(Dialog::PairClient) && self.state.admin.pairing.is_some() {
+            self.end_client_pairing(cx);
+        }
+        cx.notify();
+    }
+
     /// The screens of phase 3, for `--screen`. Returns false for another
     /// name.
     pub fn open_admin_screen(
@@ -501,6 +635,15 @@ impl ConsortApp {
     ) -> bool {
         match screen {
             "hub" => self.open_settings(SettingsSection::Hub, cx),
+            "reach-off" | "reach-on" | "reach-states" => {
+                self.open_settings(SettingsSection::Hub, cx);
+                self.open_reach(cx);
+                self.admin.reach_gallery = screen == "reach-states";
+            }
+            "pair-client-loopback" => {
+                self.open_settings(SettingsSection::Clients, cx);
+                self.open_dialog(Dialog::PairClient, window, cx);
+            }
             "models" => self.open_settings(SettingsSection::Models, cx),
             "clients" => self.open_settings(SettingsSection::Clients, cx),
             "clients-revoke" => {

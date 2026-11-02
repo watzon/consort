@@ -1,6 +1,6 @@
 # Consort
 
-Consort is a personal AI assistant: one hub on a server, workers on the user's machines, and clients. Read [CONTEXT.md](CONTEXT.md) for the terms and use them in code, comments and UI text. The design lives in `docs/`:
+Consort is a personal AI assistant: one hub (on a server, or on the user's own computer), workers on the user's machines, and clients. Read [CONTEXT.md](CONTEXT.md) for the terms and use them in code, comments and UI text. The design lives in `docs/`:
 
 - [docs/architecture.md](docs/architecture.md), [docs/protocol.md](docs/protocol.md), [docs/data-model.md](docs/data-model.md), [docs/harness-adapters.md](docs/harness-adapters.md), [docs/design-system.md](docs/design-system.md)
 - [docs/adr/](docs/adr/) for decisions that are hard to reverse
@@ -13,26 +13,29 @@ If the code and a doc disagree, fix the one that is wrong in the same change, an
 
 | Crate | Owns |
 |---|---|
-| `consort-proto` | Wire types for the client API, the worker link and the hub tools. No I/O |
-| `consort-theme` | Theme files, contrast checks, and the GPUI Kit theme that the app uses |
+| `consort-proto` | Wire types for the client API, the worker link and the hub tools, and the release names and log rule that all programs share. No I/O |
+| `consort-theme` | Theme files, contrast checks, the chart roles, the fonts, and the GPUI Kit theme that the app uses. GPUI is behind the `gpui` feature (on by default), so the roles and the fonts build without it |
+| `consort-visual` | The page contract of a visual: the page check, local images, the bootstrap, the theme variables, the ink kit. No I/O |
 | `consort-harness` | The `Harness` and `HarnessSession` traits and the adapters (ACP first) |
+| `consort-tls` | The pin of a self-signed hub: the certificate hash and the TLS verifier that the client and the link share |
+| `consort-tools` | Managed tools: downloads, checks, install layout, launch specs and the ACP registry types |
 | `consort-link` | The dial-out link that the session host and the worker share: pairing, keys, spool, reconnect |
 | `consort-session-host` | The session host on the hub machine: accounts, sign-ins, managed CLIs, sessions in a boundary, the MCP endpoint, the tool surface |
 | `consort-worker` | The execution worker: journal, processes, files, workspaces, inventory. It has no account and no CLI |
 | `consort-hub` | The hub server: SQLite store, feed, pairing, coordinator queue, placement, hub tools, routines |
 | `consort-dictation` | One live dictation on the Sayso SDK: states, the three parts of the text, models, settings of this computer. No GPUI and no hub I/O |
-| `consort-client` | Client logic shared by the desktop app and, later, mobile: connection, cache, view state |
+| `consort-client` | Client logic shared by the desktop app and, later, mobile: connection, cache, view state, the setup gate, the local hub module |
 | `consort-desktop` | The GPUI desktop app |
-| `consort-cli` | The `consort` binary: `hub`, `worker`, `dev` and `mcp-bridge` subcommands |
+| `consort-cli` | The `consort` binary: `hub`, `worker`, `session-host`, `local`, `dev` and `mcp-bridge` subcommands |
 | `consort-testkit` | A fake harness, a fake worker and helpers for integration tests |
 
-Dependency direction: `proto` and `theme` depend on no other Consort crate. `client` never depends on GPUI. `desktop` never talks to the network; it calls `client` and `dictation`. `hub` never runs a model; it asks the session host, a separate process on the hub machine. `worker` never holds an account or a CLI. A session host and a worker have separate routes and credentials.
+Dependency direction: `proto` and `theme` depend on no other Consort crate, `tls` depends only on `proto`, and `visual` depends only on `proto` and `theme` (without GPUI). `client` never depends on GPUI. `desktop` never talks to the network; it calls `client` and `dictation` (and reads constants from `proto`, such as the log rule). `hub` never runs a model; it asks the session host, a separate process on the hub machine. `worker` never holds an account or a CLI. A session host and a worker have separate routes and credentials.
 
 ## Run the app
 
 `scripts/dev.sh` builds the debug binaries, starts a dev hub with its worker, and starts the desktop app. Quitting the app stops the hub. The first run prints a setup code to type in the app. The comment at the top of the script lists its settings. `scripts/dev.sh --mock` starts only the app, with the designs' content and no hub.
 
-Installs, releases and app updates are in [docs/install.md](docs/install.md). Running a hub on a server is in [docs/deploy.md](docs/deploy.md). `scripts/bundle-macos.sh` builds `Consort.app`.
+A hub can also run on the computer of the app: `consort local` (the app runs it) puts the hub, the session host and a worker in one per-user service. Installs, releases, `consort local` and app updates are in [docs/install.md](docs/install.md). Running a hub on a server (`scripts/install/hub.sh` or by hand) is in [docs/deploy.md](docs/deploy.md). `scripts/install/test-worker.sh` and `scripts/install/test-hub.sh` test the install scripts with no root and no network. `scripts/bundle-macos.sh` builds `Consort.app`.
 
 ## Rust rules
 
@@ -54,9 +57,11 @@ These come from the user's experience with GPUI. Follow them in every view.
    - A message: the six quick emoji and More above the items, then Copy text, Copy as Markdown, Reply in thread, Quote in reply. Your own message also has Edit and Delete. A reply in a thread has no Reply in thread.
    - A code or command block: Copy code.
    - A task card or task row: Open thread, Resolve (Ready for review only) or Not done (resolved only), Retry (failed, or Ready for review or Resolved whose session ended), Stop (working only), Archive (failed or resolved only), Copy task ID, Delete.
-   - A channel row: Rename, Instructions, Model, Worker tags, Connectors and skills, Change icon, Move to group, Archive, Delete. Rename, Instructions, Model and Worker tags open the channel settings dialog. Connectors and skills opens the Connectors tab of the Channel panel. Change icon opens the All icons dialog.
+   - A channel row: Rename, Instructions, Model, Worker tags, Permissions, Connectors and skills, Change icon, Move to group, Archive, Delete. Rename, Instructions, Model and Worker tags open the channel settings dialog. Permissions opens the Permissions dialog. Connectors and skills opens the Connectors tab of the Channel panel. Change icon opens the All icons dialog.
    - The "+" of the Tutti row (a left click) and the Tutti row (a right click): New channel, New group.
    - A group row (its "..." button, a left click, or a right click on the row): New channel, Rename, Delete group.
+   - A command rule row (Permissions dialog): Edit, Remove. A rule from Tutti has only Override here.
+   - An exception row (Permissions dialog): Remove.
    - A connection row (Settings > Connectors): Reconnect, Activity, Copy handle, Disconnect.
    - A skill row (Settings > Skills): Turn off (Turn on when it is off), View files, Remove.
    - A skill source row (Settings > Skills): Remove. Only a source that the user added has it.
@@ -69,6 +74,7 @@ These come from the user's experience with GPUI. Follow them in every view.
    - The composer: Cut, Copy, Paste, Select all.
    - An attachment in a message or a thread post: Open, Save, Save to channel files. An artifact is in the channel files already, so it has no Save to channel files.
    - An attachment chip in the composer or the reply box: Try again (failed only), Remove.
+   - A visual (in the timeline, in a task thread and in the light box): Open full screen, Open in browser, Copy image, Save image, Save as HTML. The light box has no Open full screen. A right click on a live page opens the same menu, or the menu of selected text when the user selected text in the page.
    - A file row (Channel panel > Files): Open, Download, Rename, Move, Delete. A folder row and a task row of the artifacts have no menu.
    - The add button of the composer and the reply box (a left click): Upload from this computer, Choose from channel files.
    - A routine row and a routine opened in the panel or in Settings: Run now, Run history, Edit, Turn off (Turn on when it is off), Delete. A check-in has no Edit: the hub sets its prompt.

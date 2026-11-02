@@ -31,6 +31,7 @@ pub const SKL_BROWSER: &str = "skl_mock_browser";
 
 /// The approval IDs of the mock cards.
 pub const APR_SEND_EMAIL: &str = "apr_mock_send_email";
+pub const APR_PERMISSIONS: &str = "apr_mock_permissions";
 pub const APR_CONNECT_GITHUB: &str = "apr_mock_connect_github";
 pub const APR_SIGN_IN: &str = "apr_mock_sign_in";
 pub const APR_ACCESS: &str = "apr_mock_access";
@@ -89,6 +90,8 @@ fn connection(
         identity: Some(identity.into()).filter(|i: &String| !i.is_empty()),
         use_in,
         approvals: ToolApprovalsView::default(),
+        tool_exceptions: Vec::new(),
+        assistant_owned: false,
         status,
         created_at: at,
     }
@@ -96,7 +99,7 @@ fn connection(
 
 pub fn connections() -> Vec<ConnectionView> {
     let active = ConnectionStatusView::Active;
-    vec![
+    let mut list = vec![
         connection(
             CON_GMAIL_WORK,
             "Gmail Work",
@@ -153,7 +156,16 @@ pub fn connections() -> Vec<ConnectionView> {
             active,
             6,
         ),
-    ]
+    ];
+    // GitHub asks about a merge, whatever its rule for tools that change.
+    if let Some(github) = list.iter_mut().find(|c| c.id == CON_GITHUB) {
+        github.tool_exceptions = vec![ToolExceptionView {
+            tool: "GITHUB_MERGE_A_PULL_REQUEST".into(),
+            name: "Merge a pull request".into(),
+            rule: ApprovalRuleView::AskEveryTime,
+        }];
+    }
+    list
 }
 
 pub fn composio() -> ComposioView {
@@ -330,14 +342,21 @@ pub fn service_tools(service: &str) -> ServiceToolsView {
     };
     let upper = service.to_uppercase();
     let mut tools = Vec::new();
+
     for (kind, n, word) in [
         (ToolKindView::Read, read, "GET"),
         (ToolKindView::Change, change, "UPDATE"),
         (ToolKindView::Delete, delete, "DELETE"),
     ] {
         for i in 0..n {
+            // Two tools of GitHub have the names of the permissions designs.
+            let slug = match (service, kind, i) {
+                ("github", ToolKindView::Change, 0) => "GITHUB_CREATE_A_PULL_REQUEST".to_owned(),
+                ("github", ToolKindView::Change, 1) => "GITHUB_MERGE_A_PULL_REQUEST".to_owned(),
+                _ => format!("{upper}_{word}_{i}"),
+            };
             tools.push(ConnectorToolView {
-                slug: format!("{upper}_{word}_{i}"),
+                slug,
                 description: String::new(),
                 kind,
             });
@@ -673,6 +692,54 @@ pub fn acme_items() -> Vec<TimelineItem> {
 /// a second connect card are here too, so `--mock` shows every card kind.
 pub fn hiring_items() -> Vec<TimelineItem> {
     vec![
+        card_item(
+            "msg_hiring_permissions",
+            "3:11 PM",
+            card(
+                APR_PERMISSIONS,
+                None,
+                "Change what hiring can do",
+                HubCardView::Management(ManagementCardView {
+                    tool: "set_permissions".into(),
+                    change: "Change what hiring can do".into(),
+                    effect: "Three changes.".into(),
+                    permissions: Some(PermissionsCardView {
+                        groups: vec![
+                            PermissionGroupView {
+                                heading: "Commands".into(),
+                                rows: vec![
+                                    PermissionRowView {
+                                        subject: "git push".into(),
+                                        code: true,
+                                        text: "Runs without asking. Not with --force, -f or --delete, and not to main.".into(),
+                                    },
+                                    PermissionRowView {
+                                        subject: "gh pr merge".into(),
+                                        code: true,
+                                        text: "Always asks.".into(),
+                                    },
+                                ],
+                                note: None,
+                            },
+                            PermissionGroupView {
+                                heading: "GitHub connection".into(),
+                                rows: vec![PermissionRowView {
+                                    subject: "Merge a pull request".into(),
+                                    code: false,
+                                    text: "Asks every time.".into(),
+                                }],
+                                note: Some(
+                                    "This connection also works in sayso. The change applies there too."
+                                        .into(),
+                                ),
+                            },
+                        ],
+                        warning: None,
+                    }),
+                }),
+                ("Allow", "Deny"),
+            ),
+        ),
         message(
             "msg_hiring_ask",
             HIRING,
@@ -692,6 +759,7 @@ pub fn hiring_items() -> Vec<TimelineItem> {
                     change: "Use Notion in channels tagged personal or work".into(),
                     effect: "Notion becomes available in 3 more channels: acme, hiring and Tutti."
                         .into(),
+                    permissions: None,
                 }),
                 ("Allow", "Don't"),
             ),

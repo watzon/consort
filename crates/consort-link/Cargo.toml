@@ -11,13 +11,20 @@ workspace = true
 
 [dependencies]
 consort-proto = { workspace = true }
+consort-tls = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 futures-util = { workspace = true }
 tokio-tungstenite = { workspace = true }
 url = { workspace = true }
-reqwest = { workspace = true }
+reqwest = { workspace = true, features = ["stream"] }
+async-trait = { workspace = true }
+serde = { workspace = true }
+sha2 = { workspace = true }
+tar = { workspace = true }
+flate2 = { workspace = true }
+zip = { workspace = true }
 ed25519-dalek = { workspace = true }
 rand = { workspace = true }
 tracing = { workspace = true }

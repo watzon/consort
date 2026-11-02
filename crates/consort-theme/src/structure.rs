@@ -186,6 +186,10 @@ pub struct Layout {
     /// How far the stack sits under the top of the window in the compact
     /// layout, under the top bar.
     pub notice_compact_top: f32,
+    /// The column of the setup screens, at most this wide.
+    pub setup_column: f32,
+    /// The space above the mark on a setup screen.
+    pub setup_top: f32,
 }
 
 /// One stop of the top tint: a distance from the top in px, and the opacity
@@ -228,6 +232,9 @@ pub struct Opacity {
     pub queued: f32,
     pub tint: f32,
     pub dictation_border: f32,
+    /// The placeholder of a visual while it loads: `surface.card` at this
+    /// share.
+    pub loading_fill: f32,
 }
 
 /// Sizes of single components that no other token covers. Each one comes
@@ -338,6 +345,14 @@ pub struct Components {
     pub brand_mark: f32,
     /// The gap between the mark and the word in the logo.
     pub brand_gap: f32,
+    /// The mark at the top of a setup screen.
+    pub setup_mark: f32,
+    /// The gap between the blocks of a setup screen.
+    pub setup_gap: f32,
+    /// The height of a button on a setup screen.
+    pub setup_control: f32,
+    /// The height of a field on a setup screen.
+    pub setup_field: f32,
     /// The width of the focus ring that a control shows when the keyboard
     /// focuses it. The ring is `accent.text`.
     pub focus_ring: f32,
@@ -599,6 +614,8 @@ pub struct Files {
     /// The largest picture in the light box.
     pub lightbox_image_w: f32,
     pub lightbox_image_h: f32,
+    /// The widest sheet of a visual in the light box.
+    pub lightbox_sheet_w: f32,
     /// A row of the Files tab.
     pub row_pad_y: f32,
     /// The size and date columns of a row of the Files tab.

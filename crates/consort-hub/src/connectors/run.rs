@@ -176,7 +176,11 @@ struct CallRecord<'a> {
 impl Hub {
     /// Finds a connection of the session's effective set by its handle or
     /// ID. Returns it with its Composio account.
-    async fn connection_in_set(&self, ctx: &ToolCtx, key: &str) -> Result<(Connection, String)> {
+    pub(crate) async fn connection_in_set(
+        &self,
+        ctx: &ToolCtx,
+        key: &str,
+    ) -> Result<(Connection, String)> {
         let channel = ctx.channel.clone();
         let task_id = ctx.task.as_ref().map(|t| t.id);
         let key = key.trim().to_owned();
@@ -235,7 +239,7 @@ impl Hub {
         Ok((connection, account))
     }
 
-    async fn connector_tool(&self, connection: &Connection, slug: &str) -> Result<Tool> {
+    pub(crate) async fn connector_tool(&self, connection: &Connection, slug: &str) -> Result<Tool> {
         let tools = self.service_tools(&connection.service).await?;
         tools
             .into_iter()
@@ -278,7 +282,7 @@ impl Hub {
                     slug: t.slug.clone(),
                     description: crate::util::truncate_chars(t.description.trim(), 300),
                     kind,
-                    approval: connection.approvals.rule_for(kind),
+                    approval: connection.rule_for_tool(&t.slug, kind),
                 }
             })
             .collect();
@@ -310,7 +314,7 @@ impl Hub {
                 slug: tool.slug.clone(),
                 description: tool.description.clone(),
                 kind,
-                approval: connection.approvals.rule_for(kind),
+                approval: connection.rule_for_tool(&tool.slug, kind),
             },
             input_schema: tool.input_parameters,
         })?)
@@ -344,18 +348,25 @@ impl Hub {
         }
         // A draft or send tool: the voice, the disclosure line and the
         // commitment flags.
-        let voice = self
-            .voice_for_call(ctx, &tool.slug, kind, &mut arguments)
-            .await?;
+        // The assistant's own account sends in the assistant's name.
+        let voice = if connection.assistant_owned {
+            crate::voice::card::CardVoice::default()
+        } else {
+            self.voice_for_call(ctx, &tool.slug, kind, &mut arguments)
+                .await?
+        };
         let scope = CallScope::of(ctx);
-        let mut rule = connection.approvals.rule_for(kind);
+        let mut rule = connection.rule_for_tool(&tool.slug, kind);
         // A proactive turn and a draft task ask before each call that writes
         // or sends, whatever the connection allows and whatever the user
         // allowed before. So does a call with flags, and every send while
         // the voice is on: the card is the only place where the user sees
         // the text that goes out in their name. Such an answer saves no
         // allow for later calls.
+        // The assistant's own account follows its rules: the user chose
+        // that on a card that names the risk (ADR 0020).
         if (kind != consort_proto::model::ToolKind::Read
+            && !connection.assistant_owned
             && self.connector_calls_ask_each_time(ctx).await?)
             || voice.must_ask()
         {

@@ -170,6 +170,27 @@ pub async fn permission() -> Permission {
     Permission::System
 }
 
+/// Makes the system ask whether Consort may show notifications. Only macOS asks
+/// here. The other systems have no such question.
+pub async fn request_permission() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        if mac_usernotifications::check_bundle().is_err() {
+            return Ok(());
+        }
+        mac_usernotifications::request_auth()
+            .await
+            .map(|_| ())
+            .map_err(|_| {
+                "macOS did not answer the question about notifications. Open System Settings > Notifications to turn them on.".to_owned()
+            })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

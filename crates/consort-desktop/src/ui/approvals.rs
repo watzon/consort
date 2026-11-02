@@ -463,6 +463,13 @@ impl ConsortApp {
         // Closed: the action. Open: what the action was.
         let (headline, mono) = if open {
             (approval.title_done(), false)
+        } else if let Some(HubCardView::Management(card)) = hub
+            && let Some(permissions) = &card.permissions
+        {
+            (
+                crate::permissions::answered_headline(&card.change, permissions.change_count()),
+                false,
+            )
         } else {
             (approval.action_line(), true)
         };

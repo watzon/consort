@@ -46,6 +46,8 @@ pub enum ApprovalKind {
     Management,
     /// Connect a service (the connect card).
     ConnectService,
+    /// The worker card.
+    AddWorker,
     /// Sign in to a harness account (the sign-in card).
     SignIn,
     /// Install a skill (the install card).
@@ -69,6 +71,7 @@ impl ApprovalKind {
             Self::Connector => "connector",
             Self::Management => "management",
             Self::ConnectService => "connect_service",
+            Self::AddWorker => "add_worker",
             Self::SignIn => "sign_in",
             Self::SkillInstall => "skill_install",
             Self::Monid => "monid",
@@ -83,6 +86,7 @@ impl ApprovalKind {
             Self::Connector
                 | Self::Management
                 | Self::ConnectService
+                | Self::AddWorker
                 | Self::SignIn
                 | Self::SkillInstall
                 | Self::Monid
@@ -157,6 +161,10 @@ pub enum ApprovalDetails {
     /// The app can change them first ("Change settings") and then send
     /// `connection.connect` with this approval's ID.
     ConnectService(Box<ConnectServiceCard>),
+    /// The worker card. The app makes a pairing code and shows the command,
+    /// so the code never reaches the assistant. The hub closes the card when
+    /// a worker comes online. Not now drops it.
+    AddWorker(Box<AddWorkerCard>),
     /// The sign-in card. The app shows the account's sign-in flow inline,
     /// with the states of the sign-in dialog.
     SignIn(Box<SignInCard>),
@@ -273,6 +281,43 @@ pub struct ManagementCard {
     /// The arguments of the tool call, which the hub runs on Allow.
     #[serde(default)]
     pub arguments: Value,
+    /// The change as groups of rows, for a permissions change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<PermissionsCard>,
+}
+
+/// What a permissions change does, as the card shows it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionsCard {
+    /// The groups, such as "Commands" and "GitHub connection".
+    pub groups: Vec<PermissionGroup>,
+    /// The risk of the change, when it has one the user must read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+}
+
+/// One group of a permissions change.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionGroup {
+    /// The heading.
+    pub heading: String,
+    /// The rows.
+    pub rows: Vec<PermissionRow>,
+    /// A note under the rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// One row of a permissions change.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionRow {
+    /// What changes: a pattern, a tool kind or a tool.
+    pub subject: String,
+    /// True for a command pattern, which the card shows in the code font.
+    #[serde(default)]
+    pub code: bool,
+    /// What it does after the change.
+    pub text: String,
 }
 
 /// The connect card. Continue in browser connects with these settings.
@@ -296,6 +341,21 @@ pub struct ConnectServiceCard {
     /// The connection, after the user continued.
     #[serde(default)]
     pub connection_id: Option<ConnectionId>,
+}
+
+/// The worker card. It holds no pairing code.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AddWorkerCard {
+    /// The user wants a worker on the computer of this app. A card without
+    /// this shows the command for each system.
+    #[serde(default)]
+    pub this_computer: bool,
+    /// The worker that came online, after the hub closed the card.
+    #[serde(default)]
+    pub worker_id: Option<WorkerId>,
+    /// The name of that worker.
+    #[serde(default)]
+    pub worker_name: Option<String>,
 }
 
 /// The sign-in card. The app shows the account's sign-in flow inline,
@@ -363,6 +423,7 @@ impl ApprovalDetails {
             Self::Connector(_) => ApprovalKind::Connector,
             Self::Management(_) => ApprovalKind::Management,
             Self::ConnectService(_) => ApprovalKind::ConnectService,
+            Self::AddWorker(_) => ApprovalKind::AddWorker,
             Self::SignIn(_) => ApprovalKind::SignIn,
             Self::SkillInstall(_) => ApprovalKind::SkillInstall,
             Self::Monid(_) => ApprovalKind::Monid,
@@ -397,6 +458,9 @@ impl ApprovalDetails {
             },
             Self::Management(_) => ("Allow", "Don't"),
             Self::ConnectService(_) => ("Continue in browser", "Not now"),
+            // The user has no Done button. The hub answers when a worker is
+            // online.
+            Self::AddWorker(_) => ("Done", "Not now"),
             Self::SignIn(_) => ("Sign in", "Not now"),
             Self::SkillInstall(_) => ("Add", "Not now"),
             _ => return None,
@@ -945,6 +1009,7 @@ mod tests {
                 change: "Use GitHub Work in every channel".into(),
                 effect: "GitHub Work becomes available in 4 more channels".into(),
                 arguments: json!({"connection": "github_work", "use_in": {"kind": "every_channel"}}),
+                permissions: None,
             })),
             ApprovalDetails::ConnectService(Box::new(ConnectServiceCard {
                 service: "gmail".into(),

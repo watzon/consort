@@ -75,8 +75,13 @@ impl ToolCtx {
 pub struct Settings {
     /// The URL that peers use to reach the hub.
     pub public_url: String,
-    /// `scheme://host[:port]` of `public_url`. Peers sign it.
+    /// `scheme://host[:port]` of `public_url`. Peers sign it, or the address
+    /// of a reach that is on (see [`Hub::accepted_origins`]).
     pub origin: String,
+    /// How the hub was installed.
+    pub install_kind: consort_proto::release::InstallKind,
+    /// The first sign-in wakes the assistant for its greeting.
+    pub first_greeting: bool,
 }
 
 /// The first-start setup code, until a client pairs.
@@ -125,6 +130,8 @@ pub struct HubInner {
     pub skill_sources: crate::skills::SkillSources,
     pub backups: crate::backup::Backups,
     pub voice: crate::voice::VoiceState,
+    pub visual_renders: crate::ops::visuals::VisualRenders,
+    pub reach: crate::reach::ReachState,
     pub shutdown: CancellationToken,
 }
 
@@ -140,15 +147,34 @@ impl Deref for Hub {
 }
 
 impl Hub {
+    /// The versions of this hub, for a peer that signed in.
+    pub(crate) fn versions(&self) -> consort_proto::error::HubVersions {
+        consort_proto::error::HubVersions {
+            hub_version: HUB_VERSION.to_owned(),
+            protocol_versions: consort_proto::frame::SUPPORTED_PROTOCOL_VERSIONS.to_vec(),
+            install: Some(self.settings.install_kind),
+        }
+    }
+
     /// Opens the store and creates the Tutti channel when it is missing.
     /// It does not listen on a socket.
-    pub async fn open(data_dir: &Path, public_url: String) -> Result<Self> {
+    pub async fn open(
+        data_dir: &Path,
+        public_url: String,
+        install_kind: consort_proto::release::InstallKind,
+        first_greeting: bool,
+    ) -> Result<Self> {
         let store = Store::open(data_dir)?;
         let origin = consort_proto::auth::normalize_origin(&public_url)
             .map_err(|e| crate::error::HubError::Startup(e.to_string()))?;
         let hub = Self(Arc::new(HubInner {
             store,
-            settings: Settings { public_url, origin },
+            settings: Settings {
+                public_url,
+                origin,
+                install_kind,
+                first_greeting,
+            },
             setup: SetupState::default(),
             links: Links::default(),
             command_checks: crate::command_check::CheckCounters::default(),
@@ -162,6 +188,8 @@ impl Hub {
             skill_sources: crate::skills::SkillSources::open(data_dir),
             backups: crate::backup::Backups::open(data_dir),
             voice: crate::voice::VoiceState::default(),
+            visual_renders: crate::ops::visuals::VisualRenders::default(),
+            reach: crate::reach::ReachState::open(data_dir),
             shutdown: CancellationToken::new(),
         }));
         hub.bootstrap().await?;
@@ -196,6 +224,7 @@ impl Hub {
                         tags: Vec::new(),
                         disabled_connections: Vec::new(),
                         disabled_skills: Vec::new(),
+                        command_rules: Vec::new(),
                         archived_at: None,
                         created_at: now,
                         updated_at: now,
@@ -230,9 +259,14 @@ impl Hub {
 #[cfg(test)]
 pub(crate) async fn test_hub() -> (Hub, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
-    let hub = Hub::open(dir.path(), "http://127.0.0.1:7600".to_owned())
-        .await
-        .unwrap();
+    let hub = Hub::open(
+        dir.path(),
+        "http://127.0.0.1:7600".to_owned(),
+        consort_proto::release::InstallKind::Service,
+        false,
+    )
+    .await
+    .unwrap();
     // A test that needs the coordinator calls `test_hub_with_coordinators`.
     hub.coordinators.set_disabled(true);
     // Nothing starts on its own, so a new channel queues no greeting. The

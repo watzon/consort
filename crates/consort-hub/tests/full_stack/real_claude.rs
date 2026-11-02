@@ -408,6 +408,9 @@ async fn real_claude_goes_on_after_a_restart_of_the_hub() {
         data_dir: dir.path().to_path_buf(),
         listen: addr,
         public_url: None,
+        install_kind: consort_proto::release::InstallKind::Manual,
+        dev: false,
+        first_greeting: false,
     })
     .await
     .unwrap();

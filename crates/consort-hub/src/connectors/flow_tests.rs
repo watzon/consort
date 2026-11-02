@@ -608,6 +608,8 @@ async fn clear_errors_for_missing_connectors_keys_and_sign_ins() {
             channel_ids: vec![home],
         }),
         None,
+        None,
+        None,
     )
     .await
     .unwrap();
@@ -621,9 +623,16 @@ async fn clear_errors_for_missing_connectors_keys_and_sign_ins() {
         .await,
         "connector_not_available"
     );
-    hub.update_connection_fields(connection.id, None, Some(UseIn::EveryChannel), None)
-        .await
-        .unwrap();
+    hub.update_connection_fields(
+        connection.id,
+        None,
+        Some(UseIn::EveryChannel),
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
     // Composio says the sign-in expired.
     fake.set_status(None, "EXPIRED");
     assert_eq!(
@@ -1093,6 +1102,264 @@ async fn a_channel_assistant_manages_only_its_own_channel() {
     assert_eq!(tags["status"], "waiting_for_user");
 }
 
+/// A new channel, made by Tutti's assistant.
+async fn id_of_new_channel(hub: &Hub, tutti_id: ChannelId) -> consort_proto::model::Channel {
+    let session = coordinator_session(hub, tutti_id, "acp").await;
+    let made = call(
+        hub,
+        session,
+        "create_channel",
+        json!({"name": "Sayso", "purpose": "Ship the app"}),
+    )
+    .await;
+    let id: ChannelId = made["channel_id"].as_str().unwrap().parse().unwrap();
+    hub.store
+        .read(move |conn| conversation::channel_or_404(conn, id))
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn an_assistant_sets_command_rules_behind_an_approval() {
+    let (hub, _dir) = test_hub().await;
+    let tutti_id = tutti(&hub).await;
+    let made = id_of_new_channel(&hub, tutti_id).await;
+    let session = coordinator_session(&hub, made.id, "acp").await;
+    let rules = |id| {
+        let hub = hub.clone();
+        async move {
+            hub.store
+                .read(move |conn| conversation::channel_or_404(conn, id))
+                .await
+                .unwrap()
+                .command_rules
+        }
+    };
+
+    // "PR anything you want, just ask for merges": one card, and nothing
+    // changes until the user allows it.
+    let proposed = call(
+        &hub,
+        session,
+        "set_permissions",
+        json!({"add": [
+            {"pattern": "git push", "except": ["--force", "-f"], "result": "allow", "description": "Push to a branch"},
+            {"pattern": "gh pr create", "result": "allow", "description": "Open a PR"},
+            {"pattern": "gh pr merge", "result": "ask", "description": "Merge a PR"}
+        ]}),
+    )
+    .await;
+    assert_eq!(proposed["status"], "waiting_for_user");
+    assert!(rules(made.id).await.is_empty());
+    let card = pending_card(&hub).await;
+    let consort_proto::model::ApprovalDetails::Management(details) = &card.details else {
+        panic!("expected a management card");
+    };
+    // The card shows the exact patterns.
+    assert!(
+        details
+            .effect
+            .contains("git push: Runs without asking. Not with --force, -f.")
+    );
+    assert!(details.effect.contains("gh pr merge: Always asks."));
+    answer(&hub, card.id, "allow").await;
+    // The hub carries out an answered card in the background.
+    let after = wait_for(async || {
+        let now = rules(made.id).await;
+        (!now.is_empty()).then_some(now)
+    })
+    .await;
+    assert_eq!(after.len(), 3);
+    assert!(
+        after
+            .iter()
+            .all(|r| r.source == consort_proto::model::CommandRuleSource::Assistant)
+    );
+
+    // Stricter runs at once: no card.
+    let stricter = call(
+        &hub,
+        session,
+        "set_permissions",
+        json!({"add": [{"pattern": "gh pr close", "result": "ask", "description": "Close a PR"}], "remove": ["gh pr create"]}),
+    )
+    .await;
+    assert_eq!(stricter["status"], "applied");
+    assert_eq!(rules(made.id).await.len(), 3);
+    // Removing an Ask rule asks.
+    let wider = call(
+        &hub,
+        session,
+        "set_permissions",
+        json!({"remove": ["gh pr merge"]}),
+    )
+    .await;
+    assert_eq!(wider["status"], "waiting_for_user");
+
+    // A channel's assistant cannot reach another channel. Tutti can, and with
+    // no channel its rules apply everywhere.
+    let refused = call(
+        &hub,
+        session,
+        "set_permissions",
+        json!({"channel": tutti_id.to_string(), "add": [{"pattern": "git", "result": "allow", "description": "All of git"}]}),
+    )
+    .await;
+    assert_eq!(refused["status"], "refused");
+    let tutti_session = coordinator_session(&hub, tutti_id, "acp").await;
+    let everywhere = call(
+        &hub,
+        tutti_session,
+        "set_permissions",
+        json!({"add": [{"pattern": "rm -rf", "result": "ask", "description": "Delete a tree"}]}),
+    )
+    .await;
+    assert_eq!(everywhere["status"], "applied");
+    assert_eq!(hub.command_rules_of(made.id).await.unwrap().len(), 4);
+}
+
+#[tokio::test]
+async fn one_card_changes_commands_and_a_connection_and_an_exception_wins() {
+    let (hub, _dir, fake) = hub_with_fake().await;
+    let tutti_id = tutti(&hub).await;
+    let made = id_of_new_channel(&hub, tutti_id).await;
+    let connection = active_gmail(&hub, &fake, ToolApprovals::default()).await;
+    let session = coordinator_session(&hub, made.id, "acp").await;
+    let proposed = call(
+        &hub,
+        session,
+        "set_permissions",
+        json!({
+            "add": [{"pattern": "gh pr merge", "result": "ask", "description": "Merge a PR"}],
+            "connections": [{
+                "connection": "gmail_work",
+                "approvals": {"read": "run_without_asking", "change": "run_without_asking", "delete": "ask_every_time"},
+                "add_exceptions": [{"tool": "GMAIL_SEND_EMAIL", "rule": "ask_every_time"}]
+            }]
+        }),
+    )
+    .await;
+    assert_eq!(proposed["status"], "waiting_for_user");
+    let card = pending_card(&hub).await;
+    let consort_proto::model::ApprovalDetails::Management(details) = &card.details else {
+        panic!("expected a management card");
+    };
+    assert_eq!(details.change, "Change what Sayso can do");
+    let groups = &details.permissions.as_ref().unwrap().groups;
+    assert_eq!(groups[0].heading, "Commands");
+    assert_eq!(groups[1].heading, "Gmail Work connection");
+    assert_eq!(groups[1].rows[1].subject, "Send email");
+    // The note names the other channels of the connection.
+    assert!(groups[1].note.as_deref().unwrap().contains("Tutti"));
+    // Nothing changed before the answer.
+    assert!(stored(&hub, connection.id).await.tool_exceptions.is_empty());
+    answer(&hub, card.id, "allow").await;
+    let after = wait_for(async || {
+        let c = stored(&hub, connection.id).await;
+        (!c.tool_exceptions.is_empty()).then_some(c)
+    })
+    .await;
+    assert_eq!(after.approvals.change, ApprovalRule::RunWithoutAsking);
+    assert_eq!(hub.command_rules_of(made.id).await.unwrap().len(), 1);
+
+    // The tool kind runs, and the exception asks.
+    hub.connectors.set_timings(Timings {
+        approval_wait: std::time::Duration::from_millis(50),
+        ..fast()
+    });
+    let label = call(
+        &hub,
+        session,
+        "run_connector_tool",
+        json!({"connector": "gmail_work", "tool": "GMAIL_ADD_LABEL", "arguments": {}}),
+    )
+    .await;
+    assert_eq!(label["status"], "ran");
+    let send = call(
+        &hub,
+        session,
+        "run_connector_tool",
+        json!({"connector": "gmail_work", "tool": "GMAIL_SEND_EMAIL", "arguments": {"to": "a@example.com"}}),
+    )
+    .await;
+    assert_eq!(send["status"], "waiting_for_user");
+}
+
+#[tokio::test]
+async fn set_permissions_refuses_what_it_cannot_do() {
+    let (hub, _dir, fake) = hub_with_fake().await;
+    let tutti_id = tutti(&hub).await;
+    active_gmail(&hub, &fake, ToolApprovals::default()).await;
+    let session = coordinator_session(&hub, tutti_id, "acp").await;
+    for exception in [
+        json!({"tool": "GMAIL_NO_SUCH_TOOL", "rule": "ask_every_time"}),
+        // An allow once per task counts for a whole kind.
+        json!({"tool": "GMAIL_SEND_EMAIL", "rule": "ask_once_per_task"}),
+    ] {
+        let refused = call(
+            &hub,
+            session,
+            "set_permissions",
+            json!({"connections": [{"connection": "gmail_work", "add_exceptions": [exception]}]}),
+        )
+        .await;
+        assert_eq!(refused["status"], "refused");
+    }
+}
+
+#[tokio::test]
+async fn a_stricter_connection_change_also_asks() {
+    let (hub, _dir, fake) = hub_with_fake().await;
+    let tutti_id = tutti(&hub).await;
+    active_gmail(
+        &hub,
+        &fake,
+        ToolApprovals {
+            change: ApprovalRule::RunWithoutAsking,
+            ..ToolApprovals::default()
+        },
+    )
+    .await;
+    let session = coordinator_session(&hub, tutti_id, "acp").await;
+    let stricter = call(
+        &hub,
+        session,
+        "set_permissions",
+        json!({"connections": [{"connection": "gmail_work", "approvals": ToolApprovals::default()}]}),
+    )
+    .await;
+    assert_eq!(stricter["status"], "waiting_for_user");
+}
+
+#[tokio::test]
+async fn the_card_for_the_assistants_own_account_names_the_risk() {
+    let (hub, _dir, fake) = hub_with_fake().await;
+    let tutti_id = tutti(&hub).await;
+    active_gmail(&hub, &fake, ToolApprovals::default()).await;
+    let session = coordinator_session(&hub, tutti_id, "acp").await;
+    call(
+        &hub,
+        session,
+        "set_permissions",
+        json!({"connections": [{"connection": "gmail_work", "assistant_owned": true}]}),
+    )
+    .await;
+    let card = pending_card(&hub).await;
+    let consort_proto::model::ApprovalDetails::Management(details) = &card.details else {
+        panic!("expected a management card");
+    };
+    let warning = details.permissions.as_ref().unwrap().warning.as_deref();
+    assert!(warning.unwrap().contains("send channel files to anyone"));
+}
+
+#[tokio::test]
+async fn a_task_session_has_no_command_rule_tool() {
+    assert!(
+        !consort_proto::tools::HubTool::SetPermissions
+            .is_available_to(consort_proto::tools::ToolAudience::TaskSession)
+    );
+}
+
 #[tokio::test]
 async fn channel_tools_create_at_once_and_ask_before_tags_and_archive() {
     let (hub, _dir) = test_hub().await;
@@ -1360,6 +1627,7 @@ async fn worker_and_account_tools_ask_where_the_rule_says() {
             },
             load: WorkerLoad::default(),
             tools: Vec::new(),
+            update: None,
         }),
         paired_at: Timestamp::now(),
         revoked_at: None,

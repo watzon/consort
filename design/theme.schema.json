@@ -204,6 +204,43 @@
               "$ref": "#/$defs/color"
             }
           }
+        },
+        "chart": {
+          "description": "Fills for charts in a visual. Optional: a theme with no chart group gets the chart roles of Spruce in the same mode.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "1",
+            "2",
+            "3",
+            "4",
+            "5",
+            "6",
+            "ink"
+          ],
+          "properties": {
+            "1": {
+              "$ref": "#/$defs/color"
+            },
+            "2": {
+              "$ref": "#/$defs/color"
+            },
+            "3": {
+              "$ref": "#/$defs/color"
+            },
+            "4": {
+              "$ref": "#/$defs/color"
+            },
+            "5": {
+              "$ref": "#/$defs/color"
+            },
+            "6": {
+              "$ref": "#/$defs/color"
+            },
+            "ink": {
+              "$ref": "#/$defs/color"
+            }
+          }
         }
       }
     }

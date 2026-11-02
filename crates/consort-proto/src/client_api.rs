@@ -35,7 +35,7 @@ use crate::model::{
     PREFERENCES_ENTITY_ID, PROACTIVITY_ENTITY_ID, PlacementRequest, Preferences, ProactiveTasks,
     ProactiveWake, ProactivityLevel, ProactivitySettings, PushProvider, ReadMarker, Repo, Routine,
     RoutineAction, RoutineRun, RoutineSchedule, SecretEnv, SessionItem, Sha256Hash, SignIn,
-    SignInMethod, Skill, Task, ToolId, VOICE_ENTITY_ID, VoiceSettings, Worker,
+    SignInMethod, Skill, Task, ToolId, VOICE_ENTITY_ID, VisualImage, VoiceSettings, Worker,
     memory_note_entity_id,
 };
 use crate::session_host_link::ItemDetailResult;
@@ -47,6 +47,7 @@ mod hub_admin;
 mod monid;
 mod proactivity;
 mod skills;
+mod visual;
 mod voice;
 
 pub use connectors::{
@@ -61,8 +62,10 @@ pub use connectors::{
 pub use hub_admin::{
     BACKUP_KEEP_DEFAULT, BACKUP_KEEP_MAX, BACKUP_KEEP_MIN, BACKUP_TIME_DEFAULT, BackupFrequency,
     BackupInfo, BackupProgress, BackupRecord, BackupSchedule, BackupSettings, BackupTrigger,
-    HubBackup, HubBackupResult, HubBackupSettings, HubBackupSettingsResult, HubInfo, HubStatus,
-    HubStatusResult, HubStorage, Weekday, parse_time,
+    HubBackup, HubBackupResult, HubBackupSettings, HubBackupSettingsResult, HubInfo, HubReachSet,
+    HubReachSetResult, HubReachStatus, HubReachStatusResult, HubStatus, HubStatusResult,
+    HubStorage, NetworkState, PairingAddress, ReachInfo, ReachMethod, TailscaleState, Weekday,
+    parse_time,
 };
 pub use monid::{
     ChannelEndAccess, ChannelSetMonid, MONID_CALLS_PAGE_MAX, MonidCallGet, MonidCallList,
@@ -82,6 +85,7 @@ pub use skills::{
     SkillInstallSource, SkillPreview, SkillPreviewResult, SkillReadFile, SkillRemove, SkillResult,
     SkillUpdate, SkillVersion,
 };
+pub use visual::VisualRender;
 pub use voice::{
     ApprovalEdit, DraftEdit, VOICE_TRY_MAX_CHARS, VoiceFeedback, VoiceGet, VoiceLearn, VoiceReset,
     VoiceResult, VoiceSet, VoiceTry,
@@ -725,6 +729,9 @@ pub struct ChannelUpdate {
     /// The new tags. An empty list removes every tag.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tags: Option<Vec<String>>,
+    /// Every command rule of the channel after the change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_rules: Option<Vec<crate::model::CommandRule>>,
     /// The new proactivity level. `null` goes back to the default for the
     /// channel kind.
     #[serde(
@@ -758,6 +765,7 @@ impl ChannelUpdate {
             allowed_local_mcp_servers: None,
             memory_enabled: None,
             tags: None,
+            command_rules: None,
             proactivity: None,
             proactive_tasks: None,
         }
@@ -1473,6 +1481,13 @@ pub struct PairingCodeResult {
     pub code: PairingCode,
     /// When the code stops working, 10 minutes after it was made.
     pub expires_at: Timestamp,
+    /// The address that a new worker uses. An older hub leaves it out, and
+    /// then the client uses its own hub URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hub_url: Option<String>,
+    /// The pin of the certificate, for a hub on This network.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_sha256: Option<crate::model::Sha256Hash>,
 }
 
 /// `worker.rename`.
@@ -1700,12 +1715,16 @@ pub struct ClientPairingCode {}
 /// The response to `client.pairing_code`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientPairingCodeResult {
-    /// The hub's public URL.
+    /// The address that a new client uses: the address of a reach that is on,
+    /// else the hub's public URL.
     pub hub_url: String,
     /// The single-use code.
     pub code: PairingCode,
     /// When the code stops working.
     pub expires_at: Timestamp,
+    /// The pin of the certificate, for a hub on This network.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_sha256: Option<crate::model::Sha256Hash>,
 }
 
 /// `client.list`.
@@ -1808,6 +1827,28 @@ pub struct PreferencesSetFavoriteModel {
     /// True to add the star, false to take it away.
     pub favorite: bool,
 }
+
+/// `preferences.set_setup_later`: the user chose Do this later in the setup, or
+/// took that back. A retry is safe.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreferencesSetSetupLater {
+    /// True when the user chose Do this later.
+    pub later: bool,
+}
+
+/// `preferences.set_user_name`: the name of the user, for every client. An
+/// empty name clears it, and each client goes back to its own guess.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreferencesSetUserName {
+    /// The name.
+    pub name: String,
+}
+
+/// `guide.try_again`: start the first turn of the guided start again, after
+/// that turn failed. It does nothing when the assistant has spoken, or when a
+/// turn runs or waits.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuideTryAgain {}
 
 /// `preferences.set_fallback_path`: replace the fallback path. The request
 /// holds the whole path, so a reorder, an add and a remove are one request
@@ -1981,6 +2022,10 @@ message_family! {
         HubBackup("hub.backup", HubBackup => HubBackupResult),
         /// Read or change the backup settings.
         HubBackupSettings("hub.backup_settings", HubBackupSettings => HubBackupSettingsResult),
+        /// How other devices can reach the hub.
+        HubReachStatus("hub.reach_status", HubReachStatus => HubReachStatusResult),
+        /// Turn a way to reach the hub on or off.
+        HubReachSet("hub.reach_set", HubReachSet => HubReachSetResult),
         /// The proactivity settings.
         ProactivityGet("proactivity.get", ProactivityGet => ProactivityResult),
         /// Change the proactivity settings.
@@ -2009,10 +2054,17 @@ message_family! {
         ApprovalEdit("approval.edit", ApprovalEdit => ApprovalResult),
         /// Change the title or the text of a `show_draft` card.
         DraftEdit("draft.edit", DraftEdit => MessageResult),
+        /// An image of a visual at a width, a scale and a theme.
+        VisualRender("visual.render", VisualRender => VisualImage),
         /// Star a model, or take the star away.
         PreferencesSetFavoriteModel("preferences.set_favorite_model", PreferencesSetFavoriteModel => PreferencesResult),
         /// Set the source of the command check.
         PreferencesSetCommandCheck("preferences.set_command_check", PreferencesSetCommandCheck => PreferencesResult),
+        PreferencesSetSetupLater("preferences.set_setup_later", PreferencesSetSetupLater => PreferencesResult),
+        /// Set the name of the user.
+        PreferencesSetUserName("preferences.set_user_name", PreferencesSetUserName => PreferencesResult),
+        /// Start a failed first turn of the guided start again.
+        GuideTryAgain("guide.try_again", GuideTryAgain => Empty),
         /// Add or change an API endpoint.
         EndpointSave("endpoint.save", EndpointSave => PreferencesResult),
         /// Remove an API endpoint.
@@ -2598,6 +2650,12 @@ mod tests {
                 setting: CommandCheckSetting::default(),
             }
             .into(),
+            PreferencesSetSetupLater { later: true }.into(),
+            PreferencesSetUserName {
+                name: "Chris".to_owned(),
+            }
+            .into(),
+            GuideTryAgain {}.into(),
             EndpointSave {
                 id: None,
                 name: "OpenRouter".into(),
@@ -2953,6 +3011,12 @@ mod tests {
             SignInCancel { sign_in_id: sgn }.into(),
             AcpRegistryList {}.into(),
             ClientPairingCode {}.into(),
+            HubReachStatus {}.into(),
+            HubReachSet {
+                method: ReachMethod::Tailscale,
+                on: true,
+            }
+            .into(),
             ClientList {}.into(),
             ClientRevoke {
                 client_id: ClientId::new(),
@@ -3031,6 +3095,19 @@ mod tests {
                 body: Some("Dear Sir or Madam,".into()),
             }
             .into(),
+            VisualRender {
+                message_id: MessageId::new(),
+                width: 720,
+                scale: 2,
+                style: crate::model::VisualStyle {
+                    mode: crate::model::VisualMode::Light,
+                    variables: vec![crate::model::CssVariable {
+                        name: "--chart-1".into(),
+                        value: "#2F74C0".into(),
+                    }],
+                },
+            }
+            .into(),
             MessageRate {
                 message_id: MessageId::new(),
                 rating: Some(crate::model::ProactiveRating::TooNoisy),
@@ -3092,6 +3169,8 @@ mod tests {
                 name: Some("Gmail Office".into()),
                 use_in: Some(UseIn::EveryChannel),
                 approvals: None,
+                tool_exceptions: None,
+                assistant_owned: None,
             }
             .into(),
             ConnectionDisconnect {
@@ -3237,6 +3316,8 @@ mod tests {
             identity: Some("chris@work.example".into()),
             use_in: UseIn::EveryChannel,
             approvals: ToolApprovals::default(),
+            tool_exceptions: Vec::new(),
+            assistant_owned: false,
             status: ConnectionStatus::Connecting {
                 redirect_url: Some("https://connect.composio.dev/link/abc".into()),
                 expires_at: Timestamp::from_millis(600_000),
@@ -3589,6 +3670,8 @@ mod tests {
             "hub.status",
             "hub.backup",
             "hub.backup_settings",
+            "hub.reach_status",
+            "hub.reach_set",
             "proactivity.get",
             "proactivity.set",
             "proactivity.snooze",
@@ -3603,6 +3686,7 @@ mod tests {
             "voice.feedback",
             "approval.edit",
             "draft.edit",
+            "visual.render",
             "auth.http_token",
             "preferences.set_favorite_model",
             "preferences.set_fallback_path",
@@ -3692,6 +3776,7 @@ mod tests {
             tags: vec!["work".into()],
             disabled_connections: vec![],
             disabled_skills: vec![],
+            command_rules: Vec::new(),
             archived_at: None,
             created_at: Timestamp::from_millis(0),
             updated_at: Timestamp::from_millis(0),
@@ -3737,6 +3822,7 @@ mod tests {
             tags: vec!["work".into()],
             disabled_connections: vec![],
             disabled_skills: vec![],
+            command_rules: Vec::new(),
             archived_at: None,
             created_at: Timestamp::from_millis(0),
             updated_at: Timestamp::from_millis(0),
@@ -3958,6 +4044,10 @@ mod tests {
             endpoints: Vec::new(),
             fallback_path: FallbackPath::default(),
             favorite_models: vec![favorite],
+            setup_later: true,
+            user_name: Some("Chris".to_owned()),
+            guide: crate::model::GuideState::Running,
+            guide_offered_again: true,
         };
         let result = PreferencesResult {
             preferences: preferences.clone(),

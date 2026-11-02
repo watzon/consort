@@ -77,6 +77,9 @@ pub enum TryAgainTarget {
     /// a failure that a message of the user started: a failed routine run or
     /// check-in has no message to send.
     ResendMessage { channel_id: String, body: String },
+    /// The first turn of the guided start failed before the assistant spoke,
+    /// so there is no message to send. The hub queues the turn again.
+    Greeting,
 }
 
 /// The words and the actions for one failed turn.

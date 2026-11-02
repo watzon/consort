@@ -24,6 +24,16 @@ pub enum ToolError {
         actual: String,
     },
 
+    /// A downloaded file does not have the pinned size. When a server sends
+    /// more than `expected` bytes, the download stops, and `actual` is the
+    /// count at that point.
+    #[error("{name} has the wrong size: expected {expected} bytes, got {actual}")]
+    SizeMismatch {
+        name: String,
+        expected: u64,
+        actual: u64,
+    },
+
     /// The source publishes no checksum for a file, so Consort does not
     /// install it.
     #[error("no SHA-256 checksum is published for {name}")]

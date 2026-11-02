@@ -458,8 +458,8 @@ async fn pump(
 }
 
 /// The hub tools through the worker link.
-struct LinkTools {
-    core: Arc<Core>,
+pub(crate) struct LinkTools {
+    pub(crate) core: Arc<Core>,
 }
 
 fn offline_body(err: impl Into<HostError>) -> ErrorBody {
@@ -515,6 +515,22 @@ impl ToolBackend for LinkTools {
         .await
         .map_err(offline_body)
     }
+
+    async fn download_blob(
+        &self,
+        sha256: &Sha256Hash,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>, ErrorBody> {
+        consort_link::http::download_blob(
+            &self.core.hub_url,
+            self.core.worker_id,
+            &self.core.identity,
+            sha256,
+            max_bytes,
+        )
+        .await
+        .map_err(offline_body)
+    }
 }
 
 struct Runtime {
@@ -540,6 +556,9 @@ struct Runtime {
     workspace: Option<std::path::PathBuf>,
     /// The tools that run on the worker. A coordinator has none.
     exec: Option<Arc<ExecTools>>,
+    /// The workspace root on the worker, once the start or the resume has
+    /// opened it. A coordinator has none.
+    worker_root: Option<mcp::WorkerRoot>,
     /// The environment message of the worker. It goes before each turn,
     /// because the CLI tells the model about this machine.
     environment: Option<String>,
@@ -756,6 +775,7 @@ impl Runtime {
             }
         };
         self.environment = Some(inspection.environment_message());
+        self.worker_root = Some(mcp::WorkerRoot::of(&inspection));
         Ok(inspection.native_root)
     }
 
@@ -930,12 +950,14 @@ impl Runtime {
             .execution
             .as_ref()
             .map(|_| Arc::new(ExecTools::new(self.session_id, backend.clone())));
-        let endpoint = mcp::start(
-            self.session_id,
-            workspace_path.to_path_buf(),
+        let endpoint = mcp::start(mcp::McpSession {
+            session_id: self.session_id,
+            workspace: workspace_path.to_path_buf(),
             backend,
-            exec.clone(),
-        )
+            exec: exec.clone(),
+            worker_root: exec.as_ref().and(self.worker_root.clone()),
+            visual: core.visual.clone(),
+        })
         .await
         .map_err(|e| e.to_error_body())?;
         let mut servers = vec![McpServerSpec {
@@ -1464,7 +1486,8 @@ impl Runtime {
             | HubToSessionHost::SignInCode(_)
             | HubToSessionHost::SignInCancel(_)
             | HubToSessionHost::ToolsCheck(_)
-            | HubToSessionHost::ToolsInstall(_) => (Err(ErrorBody::internal()), false),
+            | HubToSessionHost::ToolsInstall(_)
+            | HubToSessionHost::VisualRender(_) => (Err(ErrorBody::internal()), false),
             // The command check is not a session command. An error here makes
             // the hub ask the user, so it never allows an action.
             HubToSessionHost::CommandCheckRun(_) => (
@@ -1541,6 +1564,7 @@ pub(crate) async fn run_session(
         skills: None,
         workspace: None,
         exec: None,
+        worker_root: None,
         environment: None,
         restart_note: None,
         channel_copy: ChannelCopy::default(),

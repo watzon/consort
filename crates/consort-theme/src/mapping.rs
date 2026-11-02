@@ -249,6 +249,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "gpui")]
     #[test]
     fn mapping_covers_every_gpui_kit_key() {
         use gpui_kit::component::ThemeConfigColors;
@@ -273,6 +274,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "gpui")]
     #[test]
     fn kit_theme_deserializes_into_gpui_kit() {
         use gpui_kit::component::ThemeConfig;
@@ -285,6 +287,30 @@ mod tests {
                     config.colors.background.as_deref(),
                     Some(format!("{}FF", theme.mode(mode).surface.canvas).as_str())
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn the_kit_chart_keys_use_the_chart_roles() {
+        let mapping: MappingFile = serde_json::from_str(MAPPING_JSON).expect("parses");
+        for n in 1..=5 {
+            let key = format!("chart.{n}");
+            assert_eq!(mapping.colors.get(&key), Some(&key), "{key}");
+        }
+        for theme in builtin_themes() {
+            for mode in [Mode::Dark, Mode::Light] {
+                let colors = theme.mode(mode);
+                let kit = kit_colors(colors, mode).expect("resolves");
+                for n in 1..=5 {
+                    let want = colors.role(&format!("chart.{n}")).expect("a role");
+                    assert_eq!(
+                        kit.get(&format!("chart.{n}")).and_then(|v| v.as_str()),
+                        Some(want.opaque().to_string().as_str()),
+                        "{} {mode} chart.{n}",
+                        theme.name
+                    );
+                }
             }
         }
     }

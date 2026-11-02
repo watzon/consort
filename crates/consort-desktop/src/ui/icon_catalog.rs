@@ -123,6 +123,7 @@ pub const CATEGORIES: [IconCategory; 6] = [
             e("star-filled", &["favorite", "important", "pinned"]),
             e("pin", &["keep", "place", "location", "map"]),
             e("image", &["picture", "photo", "art", "gallery"]),
+            e("visual", &["chart", "graph", "plot", "stats", "trend"]),
             e("tag", &["label", "price", "name"]),
             e("key", &["secret", "password", "access", "token"]),
             e("lock", &["private", "secure", "closed", "shield"]),
@@ -185,6 +186,7 @@ pub const CATEGORIES: [IconCategory; 6] = [
             e("settings", &["gear", "cog", "preferences", "config"]),
             e("log-out", &["sign out", "exit", "leave", "door"]),
             e("external-link", &["open", "new window", "outside"]),
+            e("maximize", &["full screen", "expand", "enlarge", "bigger"]),
         ],
     },
 ];
@@ -303,7 +305,7 @@ mod tests {
         let unique: BTreeSet<String> = listed.iter().map(|n| (*n).to_owned()).collect();
         assert_eq!(listed.len(), unique.len(), "an icon is listed twice");
         assert_eq!(unique, files);
-        assert_eq!(listed.len(), 87);
+        assert_eq!(listed.len(), 89);
     }
 
     #[test]

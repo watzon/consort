@@ -1,6 +1,7 @@
 //! Attachments: the chips of the composer and the reply box, the drop state,
-//! the add menu, paste, the pictures and files in bubbles and thread posts,
-//! and the light box. The sizes come from `component.files`.
+//! the add menu, paste, and the pictures and files in bubbles and thread
+//! posts. The light box is in `ui/lightbox.rs`. The sizes come from
+//! `component.files`.
 
 use std::path::PathBuf;
 
@@ -12,12 +13,12 @@ use consort_theme::{Tokens, TypeExt as _};
 use gpui_kit::{
     AnyElement, ClipboardEntry, Context, Div, ExternalPaths, ImageFormat, InteractiveElement,
     IntoElement, MouseButton, MouseDownEvent, ObjectFit, ParentElement, SharedString,
-    StatefulInteractiveElement as _, Styled, StyledImage as _, Window, div, img,
+    StatefulInteractiveElement as _, Styled, StyledImage as _, div, img,
     prelude::FluentBuilder as _,
 };
 
 use crate::{
-    app::{ConsortApp, DropOver, Lightbox},
+    app::{ConsortApp, DropOver},
     ui::{
         menu::{OpenMenu, add_menu, attachment_menu, upload_menu},
         parts::{ButtonKind, button, detail, focusable, icon, icon_button, line, text},
@@ -45,6 +46,14 @@ pub fn pasted_type(format: ImageFormat) -> (&'static str, &'static str) {
         ImageFormat::Tiff => ("image/tiff", "tiff"),
         _ => ("application/octet-stream", "bin"),
     }
+}
+
+/// The folder that a save dialog opens in: Downloads, else the temp folder.
+pub fn save_folder() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join("Downloads"))
+        .filter(|p| p.is_dir())
+        .unwrap_or_else(std::env::temp_dir)
 }
 
 /// The inputs of a paste: the pictures and the copied files on the
@@ -258,11 +267,7 @@ impl ConsortApp {
 
     /// Save: the system save dialog, then a copy of the file there.
     pub fn save_blob(&mut self, sha256: String, size: u64, name: String, cx: &mut Context<Self>) {
-        let folder = std::env::var_os("HOME")
-            .map(|home| PathBuf::from(home).join("Downloads"))
-            .filter(|p| p.is_dir())
-            .unwrap_or_else(std::env::temp_dir);
-        let chosen = cx.prompt_for_new_path(&folder, Some(&name));
+        let chosen = cx.prompt_for_new_path(&save_folder(), Some(&name));
         let client = self.client.clone();
         cx.spawn(async move |this, cx| {
             let Ok(Ok(Some(to))) = chosen.await else {
@@ -310,231 +315,6 @@ impl ConsortApp {
             });
         })
         .detach();
-    }
-
-    // The light box.
-
-    pub fn open_lightbox(
-        &mut self,
-        images: Vec<AttachmentView>,
-        index: usize,
-        caption: String,
-        cx: &mut Context<Self>,
-    ) {
-        if images.is_empty() {
-            return;
-        }
-        self.menu = None;
-        self.lightbox = Some(Lightbox {
-            index: index.min(images.len() - 1),
-            images,
-            caption,
-        });
-        cx.notify();
-    }
-
-    pub fn step_lightbox(&mut self, delta: isize) {
-        if let Some(lightbox) = self.lightbox.as_mut() {
-            let next = lightbox.index as isize + delta;
-            if next >= 0 && (next as usize) < lightbox.images.len() {
-                lightbox.index = next as usize;
-            }
-        }
-    }
-
-    /// The light box: one picture large, its name and details, Save, Open,
-    /// close, and Previous and Next.
-    pub fn render_lightbox(
-        &mut self,
-        t: &Tokens,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let c = &t.colors;
-        let f = t.component.files;
-        let Some(lightbox) = self.lightbox.clone() else {
-            return div().into_any_element();
-        };
-        let Some(image) = lightbox.images.get(lightbox.index).cloned() else {
-            return div().into_any_element();
-        };
-        if image.local_path.is_none() {
-            self.want_blob(&image.sha256, image.size, cx);
-        }
-        let count = lightbox.images.len();
-        let first = lightbox.index == 0;
-        let last = lightbox.index + 1 >= count;
-        let details = format!("{}. {}", image.detail, lightbox.caption)
-            .trim_end_matches(". ")
-            .to_owned();
-        let top_button = |id: &'static str, label: &'static str, icon_name: &'static str| {
-            crate::ui::parts::icon_text_button(id, icon_name, label, t)
-        };
-        let open = image.clone();
-        let save = image.clone();
-        let nav = |id: &'static str, icon_name: &'static str, disabled: bool| {
-            focusable(div().id(id), t)
-                .debug_selector(move || id.to_owned())
-                .size(f.lightbox_nav)
-                .flex_none()
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(t.radius.full)
-                .bg(c.surface_raised)
-                .when(disabled, |d| d.opacity(t.opacity.nav_disabled))
-                .when(!disabled, |d| {
-                    d.cursor_pointer().hover(|s| s.bg(c.hover_raised))
-                })
-                .child(icon(icon_name, t.icon.size, c.text_primary))
-        };
-        let picture = match image.local_path.clone() {
-            Some(path) => img(PathBuf::from(path))
-                .size_full()
-                .object_fit(ObjectFit::Contain)
-                .into_any_element(),
-            None => div()
-                .size_full()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(text("Loading the picture", t.text.ui, c.text_secondary))
-                .into_any_element(),
-        };
-        div()
-            .id("lightbox")
-            .debug_selector(|| "lightbox".into())
-            .absolute()
-            .top_0()
-            .left_0()
-            .size_full()
-            .occlude()
-            .flex()
-            .flex_col()
-            .bg(c.lightbox)
-            .child(
-                div()
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .gap(t.space.sm)
-                    .h(f.lightbox_bar)
-                    // On macOS the window buttons sit at the top left.
-                    .pl(if cfg!(target_os = "macos") {
-                        t.space.page * 2.0
-                    } else {
-                        t.space.xl
-                    })
-                    .pr(t.space.lg)
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .flex_1()
-                            .min_w_0()
-                            .child(line(image.name.clone(), t.text.ui_strong, c.text_primary))
-                            .child(
-                                div()
-                                    .debug_selector(|| "lightbox-details".into())
-                                    .child(line(details, detail(t), c.text_secondary)),
-                            ),
-                    )
-                    .child(
-                        top_button("lightbox-save", "Save", "download").on_click(cx.listener(
-                            move |this, _, _, cx| {
-                                this.save_blob(
-                                    save.sha256.clone(),
-                                    save.size,
-                                    save.name.clone(),
-                                    cx,
-                                )
-                            },
-                        )),
-                    )
-                    .child(
-                        top_button("lightbox-open", "Open", "external-link").on_click(cx.listener(
-                            move |this, _, _, cx| {
-                                this.open_blob(
-                                    open.sha256.clone(),
-                                    open.size,
-                                    open.name.clone(),
-                                    cx,
-                                )
-                            },
-                        )),
-                    )
-                    .child(
-                        icon_button(
-                            "lightbox-close",
-                            "x",
-                            t.component.chat.top_action,
-                            t.component.chat.top_action_icon,
-                            c.text_primary,
-                            c.hover_raised,
-                            t,
-                            cx,
-                        )
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.lightbox = None;
-                            cx.notify();
-                        })),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_1()
-                    .min_w_0()
-                    .min_h_0()
-                    .items_center()
-                    .justify_center()
-                    .gap(t.space.xl)
-                    .py(t.space.sm)
-                    .px(t.space.xl)
-                    .child(
-                        nav("lightbox-previous", "chevron-left", first).on_click(cx.listener(
-                            |this, _, _, cx| {
-                                this.step_lightbox(-1);
-                                cx.notify();
-                            },
-                        )),
-                    )
-                    .child(
-                        div()
-                            .id("lightbox-image")
-                            .debug_selector(|| "lightbox-image".into())
-                            .flex_1()
-                            .min_w_0()
-                            .h_full()
-                            .max_w(f.lightbox_image_w)
-                            .max_h(f.lightbox_image_h)
-                            .rounded(t.radius.lg)
-                            .overflow_hidden()
-                            .child(picture),
-                    )
-                    .child(
-                        nav("lightbox-next", "chevron-right", last).on_click(cx.listener(
-                            |this, _, _, cx| {
-                                this.step_lightbox(1);
-                                cx.notify();
-                            },
-                        )),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .justify_center()
-                    .h(f.lightbox_bar)
-                    .child(div().debug_selector(|| "lightbox-count".into()).child(text(
-                        format!("{} of {count}", lightbox.index + 1),
-                        detail(t),
-                        c.text_secondary,
-                    ))),
-            )
-            .into_any_element()
     }
 
     // Chips.
@@ -907,8 +687,8 @@ impl ConsortApp {
                         .child(icon("image", t.icon.toolbar, c.text_tertiary))
                         .into_any_element(),
                 })
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.open_lightbox(all.clone(), ix, caption.clone(), cx)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.open_lightbox(all.clone(), ix, caption.clone(), window, cx)
                 }))
                 .on_mouse_down(
                     MouseButton::Right,
@@ -1128,8 +908,10 @@ impl ConsortApp {
                         .min_w_0(),
                 )
                 .child(text(att.size_label.clone(), detail(t), c.text_tertiary).flex_none())
-                .on_click(cx.listener(move |this, _, _, cx| match image_index {
-                    Some(index) => this.open_lightbox(images.clone(), index, String::new(), cx),
+                .on_click(cx.listener(move |this, _, window, cx| match image_index {
+                    Some(index) => {
+                        this.open_lightbox(images.clone(), index, String::new(), window, cx)
+                    }
                     None => this.open_blob(
                         open_att.sha256.clone(),
                         open_att.size,

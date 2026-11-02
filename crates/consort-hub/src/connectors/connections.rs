@@ -10,7 +10,7 @@ use consort_proto::frame::Empty;
 use consort_proto::ids::{ApprovalId, ConnectionId};
 use consort_proto::model::{
     ApprovalDetails, ApprovalStatus, AuthSchemeKind, Connection, ConnectionStatus, SecretEnv,
-    ToolApprovals, UseIn, unique_connection_handle, validate_connection_name,
+    ToolApprovals, ToolException, UseIn, unique_connection_handle, validate_connection_name,
 };
 use consort_proto::time::Timestamp;
 
@@ -261,6 +261,8 @@ impl Hub {
                     identity: None,
                     use_in,
                     approvals: spec.approvals,
+                    tool_exceptions: Vec::new(),
+                    assistant_owned: false,
                     status: ConnectionStatus::Connecting {
                         redirect_url: None,
                         expires_at: now.plus_millis(timeout),
@@ -417,6 +419,8 @@ impl Hub {
                 request.name,
                 request.use_in,
                 request.approvals,
+                request.tool_exceptions,
+                request.assistant_owned,
             )
             .await?;
         Ok(ConnectionResult { connection })
@@ -430,7 +434,12 @@ impl Hub {
         name: Option<String>,
         use_in: Option<UseIn>,
         approvals: Option<ToolApprovals>,
+        tool_exceptions: Option<Vec<ToolException>>,
+        assistant_owned: Option<bool>,
     ) -> Result<Connection> {
+        if let Some(exceptions) = &tool_exceptions {
+            consort_proto::model::validate_tool_exceptions(exceptions)?;
+        }
         if let Some(name) = &name {
             validate_connection_name(name)?;
         }
@@ -461,6 +470,12 @@ impl Hub {
                 }
                 if let Some(approvals) = approvals {
                     connection.approvals = approvals;
+                }
+                if let Some(exceptions) = tool_exceptions {
+                    connection.tool_exceptions = exceptions;
+                }
+                if let Some(owned) = assistant_owned {
+                    connection.assistant_owned = owned;
                 }
                 if connection != before {
                     connection.updated_at = tx.now();

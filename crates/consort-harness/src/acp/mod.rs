@@ -1947,6 +1947,7 @@ async fn start(
     spec: SessionSpec,
     probe: bool,
     init: InitSlot,
+    stderr_slot: StderrSlot,
 ) -> Result<(AcpSession, EventReceiver, Ready), HarnessError> {
     let process_spec = agent_process_spec(kind, account, &spec, &resolve_program)?;
     let (process_spec, guard) = match &account.runtime.boundary {
@@ -1976,6 +1977,9 @@ async fn start(
         .take_stdout()
         .ok_or_else(|| HarnessError::Spawn("no stdout".to_owned()))?;
     let stderr = child.stderr_handle();
+    if let Ok(mut slot) = stderr_slot.lock() {
+        *slot = Some(stderr.clone());
+    }
     connect_with_init(kind, spec, stdin, stdout, Some(child), stderr, probe, init).await
 }
 
@@ -2224,7 +2228,14 @@ impl Harness for AcpHarness {
         // stops the agent.
         let result = tokio::time::timeout(
             PROBE_TIMEOUT,
-            start(self.kind, account, spec, true, init.clone()),
+            start(
+                self.kind,
+                account,
+                spec,
+                true,
+                init.clone(),
+                StderrSlot::default(),
+            ),
         )
         .await;
         let mut status = match result {
@@ -2286,10 +2297,21 @@ impl Harness for AcpHarness {
         account: &AccountConfig,
         spec: SessionSpec,
     ) -> Result<(Box<dyn HarnessSession>, EventReceiver), HarnessError> {
-        let opening = open_with_fallback(self.kind, spec, |spec| {
-            start(self.kind, account, spec, false, InitSlot::default())
-        });
-        let (session, events) = start_watchdog(START_WATCHDOG, opening).await?;
+        let session_id = spec.session_id;
+        let opening = |stderr: StderrSlot| {
+            open_with_fallback(self.kind, spec.clone(), move |spec| {
+                start(
+                    self.kind,
+                    account,
+                    spec,
+                    false,
+                    InitSlot::default(),
+                    stderr.clone(),
+                )
+            })
+        };
+        let (session, events) =
+            start_watchdog(START_WATCHDOG, START_TRIES, session_id, opening).await?;
         Ok((Box::new(session), events))
     }
 }
@@ -2384,18 +2406,52 @@ async fn claude_one_shot(
 /// of its parent for 28 minutes in the experiment, so the session host stops
 /// it. The process group ends when the future drops.
 const START_WATCHDOG: Duration = Duration::from_secs(120);
+/// How many times the session host starts a CLI that hangs in its start.
+/// Claude Code 2.1.309 once hung before it reached its MCP server, and a
+/// new process started at once. Only a hang gets a new try: an error
+/// would come again.
+const START_TRIES: u32 = 2;
 
-/// Runs the start of a session under `limit`.
-async fn start_watchdog<T>(
+/// Where `start` puts the stderr of the agent, so that the watchdog can read
+/// it after it stopped the start.
+type StderrSlot = std::sync::Arc<std::sync::Mutex<Option<StderrTail>>>;
+
+/// Runs the start of a session under `limit`, at most `tries` times. Each
+/// try gets a new stderr slot. When a try runs out of time, its future
+/// drops, which stops its process group, and the stderr of that try goes in
+/// the log.
+async fn start_watchdog<T, F, Fut>(
     limit: Duration,
-    opening: impl std::future::Future<Output = Result<T, HarnessError>>,
-) -> Result<T, HarnessError> {
-    tokio::time::timeout(limit, opening).await.map_err(|_| {
-        HarnessError::Timeout(format!(
+    tries: u32,
+    session: consort_proto::ids::SessionId,
+    mut opening: F,
+) -> Result<T, HarnessError>
+where
+    F: FnMut(StderrSlot) -> Fut,
+    Fut: std::future::Future<Output = Result<T, HarnessError>>,
+{
+    let mut tried = 0;
+    loop {
+        tried += 1;
+        let stderr = StderrSlot::default();
+        if let Ok(result) = tokio::time::timeout(limit, opening(stderr.clone())).await {
+            return result;
+        }
+        let tail = stderr
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(StderrTail::get))
+            .unwrap_or_default();
+        if tried < tries {
+            tracing::warn!(%session, try = tried, stderr = %tail, "the CLI did not start the session in {} seconds, so Consort stopped it and starts it again", limit.as_secs());
+            continue;
+        }
+        tracing::warn!(%session, try = tried, stderr = %tail, "the CLI did not start the session in {} seconds, so Consort stopped it", limit.as_secs());
+        return Err(HarnessError::Timeout(format!(
             "the CLI did not start the session in {} seconds, so Consort stopped it. Try again.",
             limit.as_secs()
-        ))
-    })?
+        )));
+    }
 }
 
 /// Opens a session with `start`. When Full access fails because Claude

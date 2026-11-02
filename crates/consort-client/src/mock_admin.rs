@@ -81,6 +81,7 @@ pub fn cache() -> AdminCache {
         hub_url: MOCK_HUB_URL.to_owned(),
         hub_version: "0.6.0".to_owned(),
         protocol_versions: consort_proto::frame::SUPPORTED_PROTOCOL_VERSIONS.to_vec(),
+        install: Some(consort_proto::release::InstallKind::Service),
         data_dir: "/var/lib/consort".to_owned(),
         storage: HubStorage {
             database_bytes: 312 * MB,
@@ -191,6 +192,7 @@ pub fn admin() -> AdminView {
         hub: hub_view(&cache, true, now),
         clients: clients_view(&cache, now),
         pairing: None,
+        reach: crate::mock_reach::off(),
         attention: attention(),
     }
 }
@@ -201,7 +203,9 @@ pub fn pairing() -> ClientPairingView {
         code: MOCK_PAIRING_CODE.to_owned(),
         hub_url: MOCK_HUB_URL.to_owned(),
         expires_at: format::now_ms() + 582_000,
-        qr_text: qr_text(MOCK_HUB_URL, MOCK_PAIRING_CODE),
+        qr_text: qr_text(MOCK_HUB_URL, MOCK_PAIRING_CODE, None),
+        tls_sha256: None,
+        loopback_only: false,
         paired: None,
     }
 }
@@ -294,6 +298,13 @@ pub(crate) fn apply(
             clients.rows.retain(|r| r.id != client_id);
             clients.error = None;
         }
+        // The loopback screens stay on the loopback address.
+        Command::ClientPairingCode
+            if state
+                .admin
+                .pairing
+                .as_ref()
+                .is_some_and(|p| p.loopback_only) => {}
         Command::ClientPairingCode => {
             state.admin.pairing = Some(ClientPairingView {
                 expires_at: format::now_ms() + PAIRING_CODE_MS,
@@ -301,6 +312,10 @@ pub(crate) fn apply(
             });
         }
         Command::CancelClientPairing => state.admin.pairing = None,
+        Command::LoadReach => {}
+        Command::SetReach { method, on } => {
+            state.admin.reach = crate::mock_reach::after_set(&state.admin.reach, method, on);
+        }
         other => {
             return Err(ClientError::Other(format!(
                 "The mock cannot run {other:?} here"

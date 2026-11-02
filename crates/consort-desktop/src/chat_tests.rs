@@ -84,6 +84,7 @@ fn with_tutti(mut state: ViewState, mark: MarkState) -> ViewState {
             state: mark,
             line: (mark == MarkState::Working).then(|| "Searching the web".into()),
         },
+        own_state: mark,
     });
     state
 }

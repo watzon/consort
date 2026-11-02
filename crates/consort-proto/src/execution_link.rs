@@ -198,6 +198,24 @@ pub struct PolicySet {
     pub allow_shell: Option<bool>,
 }
 
+/// `worker.update`: the hub names the version that this worker must follow.
+/// It never names a file or an address: the worker downloads that release
+/// from the fixed repository ([`crate::release::RELEASES_REPO`]) and checks
+/// it. The worker refuses a version that is not newer than its own.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerUpdate {
+    /// The version of the hub, such as `0.8.0`.
+    pub version: String,
+}
+
+/// The answer to [`WorkerUpdate`]. Later changes come in the inventory.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerUpdateAck {
+    /// Where the update is. `None` when the worker has nothing to do.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<crate::model::WorkerUpdateStatus>,
+}
+
 /// `inventory.refresh`, on the execution link.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecInventoryRefresh {}
@@ -243,6 +261,8 @@ message_family! {
         InventoryRefresh("inventory.refresh", ExecInventoryRefresh => Empty),
         /// Change the limits of the worker.
         PolicySet("policy.set", PolicySet => crate::model::WorkerPolicy),
+        /// Follow the version of the hub.
+        WorkerUpdate("worker.update", WorkerUpdate => WorkerUpdateAck),
     }
 }
 

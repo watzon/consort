@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::ids::{ApprovalId, ChannelId, ConnectionId, ConnectorCallId, SkillId};
 use crate::model::{
     AuthSchemeKind, ComposioStatus, Connection, ConnectorCall, ConnectorCategory, ConnectorService,
-    ConnectorToolSummary, Redacted, SecretEnv, ToolApprovals, UseIn,
+    ConnectorToolSummary, Redacted, SecretEnv, ToolApprovals, ToolException, UseIn,
 };
 use crate::time::Timestamp;
 
@@ -180,6 +180,12 @@ pub struct ConnectionUpdate {
     /// The new approval rules.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approvals: Option<ToolApprovals>,
+    /// The new exceptions: the whole list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_exceptions: Option<Vec<ToolException>>,
+    /// Whether the account belongs to the assistant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assistant_owned: Option<bool>,
 }
 
 /// The response to requests that return one connection.

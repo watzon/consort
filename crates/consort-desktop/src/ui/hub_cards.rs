@@ -16,6 +16,7 @@ use gpui_kit::{
 use crate::{
     app::ConsortApp,
     ui::{
+        dialogs::input_box,
         ext_parts::service_logo,
         hub_blocked::needs_hub,
         parts::{
@@ -41,6 +42,77 @@ fn is_paragraph(label: &str, value: &str) -> bool {
         || label.eq_ignore_ascii_case("message")
         || value.contains('\n')
         || value.chars().count() > 90
+}
+
+/// The rows of a permissions card: each group with its heading, its rows in
+/// two columns (the subject, then the words), its note, and the risk.
+fn permissions_rows(card: &consort_client::PermissionsCardView, key: &str, t: &Tokens) -> Div {
+    let c = &t.colors;
+    let mut body = div().flex().flex_col().gap(t.space.md);
+    for (g, group) in card.groups.iter().enumerate() {
+        let mut rows = div().flex().flex_col().gap(t.space.xs);
+        for (r, row) in group.rows.iter().enumerate() {
+            let id = SharedString::from(format!("{key}-perm-{g}-{r}"));
+            let subject = selectable(
+                SharedString::from(format!("{id}-subject")),
+                row.subject.clone(),
+                if row.code { t.text.mono } else { t.text.ui },
+                c.text_primary,
+            )
+            .when(row.code, |d| d.font_family(t.font_mono.clone()));
+            rows = rows.child(
+                div()
+                    .debug_selector({
+                        let id = id.to_string();
+                        move || id.clone()
+                    })
+                    .flex()
+                    .items_start()
+                    .gap(t.space.md)
+                    .child(
+                        div()
+                            .w(t.layout.speaker_gutter * 3.0)
+                            .flex_none()
+                            .child(subject),
+                    )
+                    .child(
+                        selectable(
+                            SharedString::from(format!("{id}-text")),
+                            row.text.clone(),
+                            t.text.ui,
+                            c.text_secondary,
+                        )
+                        .flex_1()
+                        .min_w_0(),
+                    ),
+            );
+        }
+        body = body.child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(t.space.sm)
+                .child(
+                    text(group.heading.clone(), t.text.label, c.text_secondary)
+                        .font_weight(t.text.ui_strong.weight),
+                )
+                .child(rows)
+                .children(
+                    group
+                        .note
+                        .clone()
+                        .map(|n| text(n, detail(t), c.text_tertiary)),
+                ),
+        );
+    }
+    body.children(card.warning.clone().map(|w| {
+        selectable(
+            SharedString::from(format!("{key}-perm-warning")),
+            w,
+            t.text.ui,
+            c.status_failed,
+        )
+    }))
 }
 
 impl ConsortApp {
@@ -209,6 +281,42 @@ impl ConsortApp {
                     );
                 }
             }
+            HubCardView::Management(card) if card.permissions.is_some() => {
+                let pending = matches!(
+                    approval.state,
+                    RequestState::Pending | RequestState::Sending
+                );
+                frame = frame
+                    .child(
+                        div()
+                            .flex()
+                            .items_baseline()
+                            .gap(t.space.sm)
+                            .child(
+                                selectable(
+                                    SharedString::from(format!("{key}-change")),
+                                    card.change.clone(),
+                                    t.text.ui_strong,
+                                    c.text_primary,
+                                )
+                                .flex_1()
+                                .min_w_0(),
+                            )
+                            .when(pending, |d| {
+                                d.child(
+                                    text("Needs you", detail(t), c.accent_text)
+                                        .flex_none()
+                                        .whitespace_nowrap(),
+                                )
+                            }),
+                    )
+                    .children(
+                        card.permissions
+                            .as_ref()
+                            .map(|p| permissions_rows(p, key, t)),
+                    )
+                    .child(self.card_outcome_or_buttons(approval, whole, key, t, cx));
+            }
             HubCardView::Management(card) => {
                 frame = frame
                     .child(
@@ -240,18 +348,20 @@ impl ConsortApp {
                     .child(self.card_outcome_or_buttons(approval, whole, key, t, cx));
             }
             HubCardView::ConnectService(connect) => {
-                let title = format!("Connect {} as {}", connect.service_name, connect.name);
+                let needs_key = pending && crate::ui::first_run::card_needs_key(&self.state);
+                let title = connect_title(&connect.service_name, &connect.name);
                 frame = frame.child(
                     div()
                         .flex()
                         .items_start()
                         .gap(t.space.md)
-                        .child(
-                            div()
-                                .h(t.text.ui.line)
-                                .flex()
-                                .items_center()
-                                .child(service_logo(&connect.logo, t.component.provider_logo, t)),
+                        .when(
+                            connect.logo.url.is_some() || connect.logo.image.is_some(),
+                            |row| {
+                                row.child(div().h(t.text.ui.line).flex().items_center().child(
+                                    service_logo(&connect.logo, t.component.provider_logo, t),
+                                ))
+                            },
                         )
                         .child(
                             div()
@@ -277,8 +387,11 @@ impl ConsortApp {
                                 )),
                         ),
                 );
+                if needs_key {
+                    frame = frame.child(self.card_key_field(key, t));
+                }
                 frame = frame.child(self.card_outcome_or_buttons(approval, whole, key, t, cx));
-                if pending {
+                if pending && !needs_key {
                     frame = frame.child(text(
                         format!(
                             "You sign in on {}'s own page. The assistant never sees your login.",
@@ -287,6 +400,22 @@ impl ConsortApp {
                         t.text.caption,
                         c.text_tertiary,
                     ));
+                }
+            }
+            HubCardView::AddWorker(worker) => {
+                if pending {
+                    frame = frame.child(self.render_worker_card(approval, worker, key, t, cx));
+                } else {
+                    frame = frame
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(t.space.sm)
+                                .child(glyph)
+                                .child(summary),
+                        )
+                        .child(self.card_outcome_or_buttons(approval, whole, key, t, cx));
                 }
             }
             HubCardView::SignIn(sign_in) => {
@@ -539,6 +668,11 @@ impl ConsortApp {
                     b.child(icon("external-link", t.icon.dense, c.accent_on_fill))
                 })
                 .on_click(cx.listener(move |this, _, window, cx| match &card {
+                    HubCardView::ConnectService(_)
+                        if crate::ui::first_run::card_needs_key(&this.state) =>
+                    {
+                        this.continue_connect_card_with_key(id.clone(), window, cx)
+                    }
                     HubCardView::ConnectService(_) => this.continue_connect_card(id.clone(), cx),
                     HubCardView::SignIn(_) => this.sign_in_from_card(id.clone(), window, cx),
                     _ => this.answer_approval(id.clone(), ApprovalChoice::AllowOnce, window, cx),
@@ -550,7 +684,21 @@ impl ConsortApp {
         if !blocked {
             row = row.child(allow);
         }
-        if matches!(card, HubCardView::ConnectService(_)) {
+        let needs_key = matches!(card, HubCardView::ConnectService(_))
+            && crate::ui::first_run::card_needs_key(&self.state);
+        if needs_key {
+            row = row.child(
+                button(
+                    SharedString::from(format!("{key}-get-key")),
+                    "Get a key",
+                    ButtonKind::Secondary,
+                    t,
+                )
+                .on_click(
+                    cx.listener(|_, _, _, cx| cx.open_url(crate::ui::first_run::COMPOSIO_KEY_PAGE)),
+                ),
+            );
+        } else if matches!(card, HubCardView::ConnectService(_)) {
             let id = id.clone();
             row = row.child(needs_hub(
                 button(
@@ -579,6 +727,31 @@ impl ConsortApp {
             offline,
             t,
         ))
+    }
+
+    /// The key field of the first connect card (Paper T3). The field holds the
+    /// key only until the hub stores it. The assistant never sees it.
+    fn card_key_field(&mut self, key: &str, t: &Tokens) -> Div {
+        let c = &t.colors;
+        div()
+            .debug_selector(|| "card-composio-key".into())
+            .flex()
+            .flex_col()
+            .gap(t.space.sm)
+            .child(text("Composio API key", t.text.label, c.text_secondary))
+            .child(input_box(
+                &self.ext_inputs.composio_key,
+                self.ext.key_field_focused,
+                t,
+            ))
+            .child(text(
+                "Consort connects services through Composio. You paste this key once. The hub encrypts it, and the assistant never sees it.",
+                t.text.caption,
+                c.text_tertiary,
+            ))
+            .children(self.key_error.clone().map(|err| {
+                error_box(SharedString::from(format!("{key}-key-error")), err, t)
+            }))
     }
 
     /// Whether the outcome of an answered card still moves: the browser sign-in
@@ -691,6 +864,11 @@ impl ConsortApp {
                 }
             }
             (HubCardView::ConnectService(_), false) => line("Not connected.".into()),
+            (HubCardView::AddWorker(card), true) => line(match &card.worker_name {
+                Some(name) => format!("{name} is online."),
+                None => "The worker is online.".into(),
+            }),
+            (HubCardView::AddWorker(_), false) => line("Not added.".into()),
             (HubCardView::SignIn(card), true) => {
                 let running = card
                     .sign_in_id
@@ -768,5 +946,15 @@ impl ConsortApp {
             (HubCardView::Monid(_), false) => line("You said no. The call did not run.".into()),
             (HubCardView::Access(card), _) => line(card.answered_line()),
         }
+    }
+}
+
+/// The title of a connect card. A connection with the name of its service
+/// needs no second name.
+pub fn connect_title(service: &str, name: &str) -> String {
+    if service == name {
+        format!("Connect {service}")
+    } else {
+        format!("Connect {service} as {name}")
     }
 }

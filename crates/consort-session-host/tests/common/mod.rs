@@ -46,7 +46,11 @@ pub struct HubState {
     pub inventories: Mutex<Vec<Inventory>>,
     pub hellos: Mutex<Vec<WorkerHello>>,
     pub blobs: Mutex<Vec<String>>,
+    /// The bodies of the uploads, by SHA-256.
+    pub put_bodies: Mutex<HashMap<String, Vec<u8>>>,
     pub tool_lists: Mutex<Vec<SessionId>>,
+    /// The tools that `tool.list` gives after the two default ones.
+    pub extra_tools: Mutex<Vec<consort_proto::tools::ToolDefinition>>,
     /// The skill bundles that the hub serves, by content hash.
     pub bundles: Mutex<HashMap<String, SkillBundle>>,
     /// The blob bodies that the hub serves, by SHA-256.
@@ -209,6 +213,11 @@ impl FakeHub {
             }
             ("PUT", p) if p.starts_with("/v1/blobs/") => {
                 self.state.blobs.lock().unwrap().push(p.to_owned());
+                self.state
+                    .put_bodies
+                    .lock()
+                    .unwrap()
+                    .insert(p.trim_start_matches("/v1/blobs/").to_owned(), body);
                 write_http(&mut stream, "200 OK", &json!({})).await;
             }
             _ => {
@@ -447,10 +456,11 @@ impl FakeHub {
                 }
                 SessionHostToHub::ToolList(list) => {
                     self.state.tool_lists.lock().unwrap().push(list.session_id);
-                    let tools = vec![
+                    let mut tools = vec![
                         HubTool::PostUpdate.definition(),
                         HubTool::SubmitForReview.definition(),
                     ];
+                    tools.extend(self.state.extra_tools.lock().unwrap().iter().cloned());
                     send(r.respond_ok(&ToolListResult { tools }).unwrap());
                 }
                 SessionHostToHub::ToolCall(call) => {

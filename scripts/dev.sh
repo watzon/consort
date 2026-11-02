@@ -31,6 +31,10 @@
 # this repo is used when they are built there. CONSORT_SPEECH_ENGINE and
 # SAYSO_CLEANUP_PATH name other programs.
 #
+# CONSORT_LOCAL_DIR and CONSORT_LOCAL_LABEL keep a hub that the dev app installs
+# on this computer in CONSORT_DEV_DIR/local-hub, under its own service name. A
+# dev app never touches the real local hub.
+#
 # On macOS the app runs from a small bundle in the build folder, because macOS
 # takes the Dock icon, the menu name and notifications from a bundle. It has
 # its own bundle ID, so it stays apart from an installed Consort.
@@ -46,6 +50,8 @@ esac
 
 dev_dir="${CONSORT_DEV_DIR:-$HOME/.consort-dev}"
 listen="${CONSORT_DEV_LISTEN:-127.0.0.1:7600}"
+export CONSORT_LOCAL_DIR="${CONSORT_LOCAL_DIR:-$dev_dir/local-hub}"
+export CONSORT_LOCAL_LABEL="${CONSORT_LOCAL_LABEL:-dev.consort.local-dev}"
 
 echo "==> building"
 cargo build -p consort-cli -p consort-desktop

@@ -227,6 +227,8 @@ pub struct ConvoState {
     /// The files of the open skill review: the path and its diff, once
     /// it loaded (or why it did not).
     pub skill_diff: Vec<(String, Option<SkillFileDiff>)>,
+    /// The Permissions dialog: its draft, its rule dialog and its picker.
+    pub permissions: crate::permissions::PermissionsState,
 }
 
 /// The text inputs of phase 4.
@@ -239,6 +241,12 @@ pub struct ConvoInputs {
     pub repo_url: Entity<InputState>,
     pub thread_reply: Entity<TextareaState>,
     pub icon_search: Entity<InputState>,
+    /// The fields of the rule dialog of the Permissions dialog.
+    pub rule_pattern: Entity<InputState>,
+    pub rule_except: Entity<InputState>,
+    pub rule_description: Entity<InputState>,
+    /// The search of the tool picker.
+    pub exception_search: Entity<InputState>,
 }
 
 impl ConvoInputs {
@@ -276,6 +284,10 @@ impl ConvoInputs {
                     .placeholder("Reply in thread")
             }),
             icon_search: field("Search icons", window, cx),
+            rule_pattern: field("git push", window, cx),
+            rule_except: field("--force, main", window, cx),
+            rule_description: field("Push to a branch", window, cx),
+            exception_search: field("Search tools", window, cx),
         };
         let mut subscriptions = Vec::new();
         subscriptions.push(cx.subscribe_in(
@@ -318,6 +330,33 @@ impl ConvoInputs {
                 }
             },
         ));
+        // Enter in a field of the rule dialog adds the rule.
+        for field in [
+            &inputs.rule_pattern,
+            &inputs.rule_except,
+            &inputs.rule_description,
+        ] {
+            subscriptions.push(cx.subscribe_in(
+                field,
+                window,
+                |this, _, event: &InputEvent, window, cx| {
+                    if let InputEvent::PressEnter { .. } = event {
+                        this.save_rule_dialog(window, cx);
+                    }
+                },
+            ));
+        }
+        // Typing in the search of the tool picker filters its list.
+        subscriptions.push(cx.subscribe_in(
+            &inputs.exception_search,
+            window,
+            |this, _, event: &InputEvent, _, cx| {
+                if let InputEvent::Change = event {
+                    this.convo.permissions.picker_scroll = gpui_kit::ScrollHandle::new();
+                    cx.notify();
+                }
+            },
+        ));
         for field in [
             &inputs.task_title,
             &inputs.settings_name,
@@ -351,6 +390,10 @@ impl ConvoInputs {
             &self.settings_purpose,
             &self.repo_url,
             &self.icon_search,
+            &self.rule_pattern,
+            &self.rule_except,
+            &self.rule_description,
+            &self.exception_search,
         ] {
             let style = style.clone();
             field.update(cx, |s, cx| {
@@ -372,7 +415,7 @@ impl ConvoInputs {
     }
 }
 
-fn set_input(
+pub(crate) fn set_input(
     input: &Entity<InputState>,
     value: &str,
     window: &mut Window,
@@ -551,6 +594,7 @@ impl ConsortApp {
                 );
                 set_input(&self.convo_inputs.repo_url, "", window, cx);
             }
+            Dialog::Permissions(id) => self.prepare_permissions_dialog(id),
             Dialog::SkillDiff(id) => self.load_skill_diff(id.clone(), cx),
             Dialog::About => {
                 let client = self.client.clone();
@@ -803,7 +847,7 @@ impl ConsortApp {
                     .await
             },
             crate::drafts::Kept::Draft("Your reply is still in the box."),
-            move |_, window, cx| Self::clear_draft_if_sent(&input, &sent, window, cx),
+            move |this, window, cx| this.clear_draft_if_sent(&input, &sent, window, cx),
             window,
             cx,
         );

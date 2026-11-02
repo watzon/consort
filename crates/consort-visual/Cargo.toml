@@ -1,0 +1,18 @@
+[package]
+name = "consort-visual"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "The page contract of a Consort visual: the check, the image references, the bootstrap and the height choice. No I/O."
+
+[lints]
+workspace = true
+
+[dependencies]
+consort-proto = { workspace = true }
+consort-theme = { workspace = true }
+base64 = { workspace = true }
+regex = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

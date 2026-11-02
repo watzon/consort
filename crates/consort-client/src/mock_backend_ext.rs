@@ -103,6 +103,8 @@ fn start_connection(
         identity: None,
         use_in,
         approvals,
+        tool_exceptions: Vec::new(),
+        assistant_owned: false,
         status: if browser {
             ConnectionStatusView::Connecting {
                 redirect_url: redirect_url.clone(),
@@ -415,6 +417,12 @@ pub(crate) fn apply(
                 .iter_mut()
                 .find(|c| c.id == connection_id)
                 .ok_or_else(|| not_found("connector"))?;
+            if let Some(exceptions) = changes.tool_exceptions {
+                connection.tool_exceptions = exceptions;
+            }
+            if let Some(owned) = changes.assistant_owned {
+                connection.assistant_owned = owned;
+            }
             if let (Some(name), Some(handle)) = (changes.name, handle) {
                 let name = name.trim().to_owned();
                 consort_proto::model::validate_connection_name(&name).map_err(|_| {

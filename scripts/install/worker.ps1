@@ -22,6 +22,10 @@ The hub URL. Required, unless -NoService is set.
 The pairing code from a client. Without it, the CONSORT_PAIRING_CODE
 variable or a prompt gives it.
 
+.PARAMETER TlsSha256
+The SHA-256 of the certificate of a hub on This network. The worker accepts
+this certificate and no other.
+
 .PARAMETER Name
 The worker name. The default is the host name.
 
@@ -44,6 +48,7 @@ folder and the folder URL of the release assets. The tests use them.
 param(
   [string]$Hub = '',
   [string]$Code = '',
+  [string]$TlsSha256 = '',
   [string]$Name = '',
   [string[]]$Tag = @(),
   [string]$Version = '',
@@ -162,6 +167,7 @@ if ($NoService) {
 }
 
 $install = @('worker', 'install', '--hub', $Hub)
+if ($TlsSha256) { $install += @('--tls-sha256', $TlsSha256) }
 if ($Name) { $install += @('--name', $Name) }
 foreach ($t in $Tag) { $install += @('--tag', $t) }
 # The code goes in the environment, so other users of this machine do not

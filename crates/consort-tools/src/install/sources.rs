@@ -42,6 +42,8 @@ pub struct Sources {
     pub codex_downloads: String,
     /// The ACP registry file.
     pub acp_registry: String,
+    /// The Chrome for Testing downloads, with `<version>/<platform>/` folders.
+    pub chrome_for_testing: String,
     /// The OpenCode version service. It is used only when the ACP registry
     /// cannot be read.
     pub opencode_version: String,
@@ -58,6 +60,8 @@ impl Default for Sources {
                 .to_owned(),
             codex_downloads: "https://github.com/openai/codex/releases/download".to_owned(),
             acp_registry: crate::registry::REGISTRY_URL.to_owned(),
+            chrome_for_testing: "https://storage.googleapis.com/chrome-for-testing-public"
+                .to_owned(),
             opencode_version: "https://opencode.ai/update/api/latest/cli/npm".to_owned(),
         }
     }
@@ -146,7 +150,7 @@ fn url_file_name(url: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
-async fn extract_blocking(
+pub(super) async fn extract_blocking(
     archive_path: &Path,
     kind: ArchiveKind,
     dest: &Path,

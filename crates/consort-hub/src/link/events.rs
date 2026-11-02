@@ -1856,6 +1856,7 @@ mod tests {
             change: "Use GitHub Work in every channel".into(),
             effect: "It reaches every channel".into(),
             arguments: serde_json::Value::Null,
+            permissions: None,
         }));
         let read = worker_approval_details(&forged, "Allow this?");
         assert_eq!(

@@ -57,10 +57,12 @@
     "fade_bottom": 32,
     "notice_width": 360,
     "notice_bottom": 124,
-    "notice_compact_top": 88
+    "notice_compact_top": 88,
+    "setup_column": 448,
+    "setup_top": 136
   },
   "opacity": { "answered_dim": 0.6, "busy": 0.7, "danger_hover": 0.9, "failed_border": 0.45,
-    "error_border": 0.4, "progress_track": 0.22, "drop_fill": 0.06, "nav_disabled": 0.4, "you_tile": 0.36, "offline_dim": 0.45, "offline_mark": 0.7, "queued": 0.75, "tint": 0.16, "dictation_border": 0.55 },
+    "error_border": 0.4, "progress_track": 0.22, "drop_fill": 0.06, "nav_disabled": 0.4, "you_tile": 0.36, "offline_dim": 0.45, "offline_mark": 0.7, "queued": 0.75, "tint": 0.16, "dictation_border": 0.55, "loading_fill": 0.55 },
   "component": {
     "settings_label": 160,
     "settings_segmented": 336,
@@ -112,6 +114,10 @@
     "notes_min_height": 192,
     "brand_mark": 26,
     "brand_gap": 8,
+    "setup_mark": 84,
+    "setup_gap": 28,
+    "setup_control": 36,
+    "setup_field": 40,
     "focus_ring": 2,
     "admin": {
       "storage_bar": 6, "legend_swatch": 8, "swatch_radius": 2, "legend_gap": 28,
@@ -148,6 +154,7 @@
       "lightbox_nav": 40,
       "lightbox_image_w": 920,
       "lightbox_image_h": 690,
+      "lightbox_sheet_w": 1072,
       "row_pad_y": 7,
       "size_col": 64,
       "date_col": 52,

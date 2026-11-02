@@ -153,4 +153,4 @@ v0.1.0 is the first public release. It is built for one user.
 
 ## License
 
-[MIT](LICENSE). The fonts are under the SIL Open Font License ([crates/consort-desktop/assets/fonts/OFL.txt](crates/consort-desktop/assets/fonts/OFL.txt)). The provider logos come from Lobe Icons and remain the marks of their owners ([NOTICE](crates/consort-desktop/assets/providers/NOTICE.md)).
+[MIT](LICENSE). The fonts are under the SIL Open Font License ([design/fonts/OFL.txt](design/fonts/OFL.txt)). The provider logos come from Lobe Icons and remain the marks of their owners ([NOTICE](crates/consort-desktop/assets/providers/NOTICE.md)).

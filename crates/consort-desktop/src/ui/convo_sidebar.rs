@@ -24,7 +24,10 @@ pub struct Tip(pub SharedString);
 impl Render for Tip {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = ConsortApp::tokens(cx);
+        let tip = self.0.clone();
         div()
+            // Tests find a tooltip by its text.
+            .debug_selector(move || format!("tip-{tip}"))
             .py(t.space.xs)
             .px(t.space.sm)
             .rounded(t.radius.md)

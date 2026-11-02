@@ -9,12 +9,15 @@ use axum::extract::{ConnectInfo, State, WebSocketUpgrade};
 use axum::response::Response;
 use consort_proto::auth::{PeerId, WorkerHello};
 use consort_proto::error::{ErrorBody, ErrorCode};
-use consort_proto::execution_link::{ExecInventory, ExecSkillBundleGet, ExecutionToHub};
+use consort_proto::execution_link::{
+    ExecInventory, ExecSkillBundleGet, ExecutionToHub, HubToExecution, WorkerUpdate,
+};
 use consort_proto::frame::{
     Empty, Frame, FrameId, RequestFrame, SUPPORTED_PROTOCOL_VERSIONS, negotiate_version,
 };
 use consort_proto::ids::WorkerId;
 use consort_proto::model::MachineKind;
+use consort_proto::release::version_to_follow;
 use consort_proto::session_host_link::{
     HubToSessionHost, OFFLINE_AFTER_SECS, SessionHostToHub, SessionStop, ToolCall, ToolList,
     ToolListResult,
@@ -25,7 +28,7 @@ use super::ws::{
     Outbox, PeerKind, WS_MAX_FRAME, fail, fail_protocol, handshake, send_frame, write_loop,
 };
 use crate::error::{HubError, Result};
-use crate::hub::Hub;
+use crate::hub::{HUB_VERSION, Hub};
 use crate::link::WorkerLink;
 
 pub(crate) async fn worker_ws(
@@ -50,6 +53,36 @@ pub(crate) async fn session_host_ws(
         .max_message_size(WS_MAX_FRAME)
         .max_frame_size(WS_MAX_FRAME)
         .on_upgrade(move |socket| run_worker(hub, socket, addr.ip(), MachineKind::SessionHost))
+}
+
+/// Sends `worker.update` to a worker that is older than this hub. The hub
+/// names only a version. A failure here is not a problem: the hub asks again
+/// at the next connection, and an older worker refuses a request that it does
+/// not know.
+fn ask_worker_to_follow(worker_id: WorkerId, worker_version: &str, link: &Arc<WorkerLink>) {
+    let Some(version) = version_to_follow(HUB_VERSION, worker_version) else {
+        return;
+    };
+    let command = HubToExecution::WorkerUpdate(WorkerUpdate {
+        version: version.to_string(),
+    });
+    let Ok(Frame::Request(request)) = Frame::family_request(FrameId::generate(), &command) else {
+        return;
+    };
+    let link = link.clone();
+    tokio::spawn(async move {
+        let answer = link
+            .call(
+                request.id,
+                request.kind,
+                request.body,
+                Duration::from_secs(60),
+            )
+            .await;
+        if !matches!(answer, Ok(Ok(_))) {
+            tracing::debug!(worker_id = %worker_id, "a worker did not take the update command");
+        }
+    });
 }
 
 async fn run_worker(hub: Hub, mut socket: WebSocket, peer_ip: IpAddr, route: MachineKind) {
@@ -88,9 +121,10 @@ async fn run_worker(hub: Hub, mut socket: WebSocket, peer_ip: IpAddr, route: Mac
     }
     let Some(version) = negotiate_version(SUPPORTED_PROTOCOL_VERSIONS, &hello.protocol_versions)
     else {
-        fail_protocol(&mut socket, &auth.hello).await;
+        fail_protocol(&hub, &mut socket, &auth.hello).await;
         return;
     };
+    let worker_version = hello.version.clone();
     let (result, stops) = match hub.worker_hello(worker_id, hello, version).await {
         Ok(pair) => pair,
         Err(err) => {
@@ -172,6 +206,11 @@ async fn run_worker(hub: Hub, mut socket: WebSocket, peer_ip: IpAddr, route: Mac
         });
     }
     hub.worker_came_online(worker_id);
+    // A worker follows the version of the hub. A session host does not: it
+    // is on the hub machine, and `consort hub update` replaces its program.
+    if route == MachineKind::Execution {
+        ask_worker_to_follow(worker_id, &worker_version, &link);
+    }
 
     let idle = Duration::from_secs(OFFLINE_AFTER_SECS);
     loop {

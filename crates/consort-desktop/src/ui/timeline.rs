@@ -372,6 +372,7 @@ impl ConsortApp {
                 format!("# {name}")
             }
         });
+        let no_account = self.no_account_in_tutti();
         let mark = div()
             .absolute()
             .top(chat.mark_top)
@@ -385,11 +386,14 @@ impl ConsortApp {
                 div()
                     .id("three-voices")
                     .debug_selector(|| "three-voices".into())
-                    .child(
+                    .child(if no_account {
+                        crate::ui::mark::setup_mark(consort_client::setup::Dabs::Hub, chat.mark, t)
+                    } else {
                         img(mark_frame(phase, frame, t.is_dark(), false))
                             .size(chat.mark)
-                            .when(saved.is_some(), |i| i.opacity(t.opacity.offline_mark)),
-                    ),
+                            .when(saved.is_some(), |i| i.opacity(t.opacity.offline_mark))
+                            .into_any_element()
+                    }),
             )
             .when_some(saved, |d, saved| {
                 d.child(
@@ -407,8 +411,19 @@ impl ConsortApp {
                         .border(t.border_width)
                         .border_color(c.border_subtle)
                         .child(
-                            text(saved.pill_text(), detail(t), c.text_secondary)
-                                .whitespace_nowrap(),
+                            text(
+                                if matches!(
+                                    state.connection,
+                                    consort_client::Connection::Incompatible { .. }
+                                ) {
+                                    saved.incompatible_pill_text()
+                                } else {
+                                    saved.pill_text()
+                                },
+                                detail(t),
+                                c.text_secondary,
+                            )
+                            .whitespace_nowrap(),
                         )
                         .child(
                             div()
@@ -606,6 +621,8 @@ impl ConsortApp {
             self.render_waiting_timeline(&waiting, t, cx)
         } else if empty && unloaded {
             self.render_unloaded_timeline(t).into_any_element()
+        } else if empty && self.no_account_in_tutti() {
+            crate::ui::setup::no_account_state(t, cx).into_any_element()
         } else if empty {
             self.render_empty_timeline(t).into_any_element()
         } else {
@@ -666,12 +683,23 @@ impl ConsortApp {
             .size_full()
             .into_any_element()
         };
+        // The clear part of the timeline for the cover rule of visuals. It
+        // comes before the list, so it prepaints before the items.
+        let area = {
+            let t = t.clone();
+            self.visuals
+                .frame
+                .area_probe(crate::visual::Place::Timeline, move |viewport| {
+                    crate::ui::visual_cover::TimelineArea::of_timeline(viewport, &t, at_end)
+                })
+        };
         div()
             .relative()
             .flex_1()
             .min_w_0()
             .min_h_0()
             .w_full()
+            .child(area)
             .child(body)
             // A channel with messages that did not load shows what it has, and
             // says that the rest is missing.
@@ -889,6 +917,17 @@ impl ConsortApp {
                 (
                     spacing(*s),
                     match notice {
+                        // A visual is a timeline item of its own.
+                        Some(n) if n.visual.is_some() => match &n.visual {
+                            Some(visual) => self.render_visual_item(
+                                visual,
+                                crate::visual::Place::Timeline,
+                                t,
+                                window,
+                                cx,
+                            ),
+                            None => div().into_any_element(),
+                        },
                         Some(n) => self.render_notice_line(&n, t, window, cx),
                         None => div().into_any_element(),
                     },
@@ -970,6 +1009,25 @@ impl ConsortApp {
             );
         }
         let c = &t.colors;
+        // A line of the assistant's own work (Paper T5), in its lane.
+        if notice.kind == "channel_made" {
+            return div()
+                .flex()
+                .items_center()
+                .gap(t.space.sm)
+                .child(crate::ui::parts::icon("check", t.icon.dense, c.status_done))
+                .child(
+                    selectable(
+                        SharedString::from(format!("notice-line-{}", notice.message_id)),
+                        notice.text.clone(),
+                        t.text.ui,
+                        c.text_secondary,
+                    )
+                    .flex_1()
+                    .min_w_0(),
+                )
+                .into_any_element();
+        }
         let copy = notice.text.clone();
         // The time shares the baseline of the first line of the text. The
         // two boxes start at the same top, and the time moves down by the
@@ -994,15 +1052,18 @@ impl ConsortApp {
                 .debug_selector(move || text_id),
             )
             // The line that starts a channel sits under its time separator.
-            .when(notice.kind != "channel_created", |d| {
-                d.child(
-                    div().flex_none().pt(lead).child(
-                        text(notice.time_label.clone(), t.text.caption, c.text_tertiary)
-                            .whitespace_nowrap()
-                            .debug_selector(move || time_id),
-                    ),
-                )
-            })
+            .when(
+                !matches!(notice.kind.as_str(), "channel_created" | "signed_in"),
+                |d| {
+                    d.child(
+                        div().flex_none().pt(lead).child(
+                            text(notice.time_label.clone(), t.text.caption, c.text_tertiary)
+                                .whitespace_nowrap()
+                                .debug_selector(move || time_id),
+                        ),
+                    )
+                },
+            )
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &MouseDownEvent, window, cx| {
@@ -1094,10 +1155,7 @@ impl ConsortApp {
             content = content.child(self.render_brief_items(&message, t, cx));
         }
         let tail = chat.bubble_tail;
-        let hub_down = matches!(
-            self.state.connection,
-            consort_client::Connection::Offline { .. }
-        );
+        let hub_down = self.state.connection.is_hub_down();
         let queued = message.pending && hub_down;
         let selector = format!("bubble-{key}");
         // While the thread of this message is open, its bubbles have the
@@ -1941,7 +1999,17 @@ impl ConsortApp {
         });
         // The hub state is unknown while the link is down, so the line of
         // the assistant shows only when the link line does not.
-        let above = above.or_else(|| self.render_assistant_status(t, cx));
+        // A hub or an app that is too old has its card here.
+        // A hub on the tailnet says what to do, in place of the link line.
+        // A hub on this computer that stopped has its own card and its own button.
+        let above = self
+            .local_stopped_card(t, cx)
+            .or_else(|| self.tailnet_card(t))
+            .or(above)
+            .or_else(|| self.incompatible_card(t, cx))
+            .or_else(|| self.no_account_card(t, cx))
+            .or_else(|| self.permission_offer_card(t, cx))
+            .or_else(|| self.render_assistant_status(t, cx));
         let column = self.chat_column_width(t);
         self.render_composer_box(
             crate::ui::composer::ComposerTarget::Channel,

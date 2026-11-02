@@ -108,6 +108,12 @@ impl Hub {
     pub(crate) fn worker_came_online(&self, worker_id: WorkerId) {
         self.pump_worker(worker_id);
         self.retry_waiting_work();
+        let hub = self.clone();
+        tokio::spawn(async move {
+            if let Err(err) = hub.close_worker_cards(worker_id).await {
+                tracing::warn!(error = %err, %worker_id, "could not close a worker card");
+            }
+        });
     }
 
     /// Placement runs again for tasks in Up next, and coordinators with
@@ -190,24 +196,34 @@ impl Hub {
         worker_id: WorkerId,
         inventory: Inventory,
     ) -> Result<()> {
-        let changed =
+        let greet = self.settings.first_greeting;
+        let (changed, greeted) =
             self.store
                 .write(move |tx| {
                     let mut worker = machine::worker_or_404(tx.db(), worker_id)?;
                     let same = worker.inventory.as_ref().is_some_and(|old| {
                         !inventory.hash.is_empty() && old.hash == inventory.hash
                     });
-                    if same {
-                        return Ok(false);
+                    if !same {
+                        worker.inventory = Some(inventory);
+                        worker.last_seen_at = Some(tx.now());
+                        tx.save_worker(&worker)?;
                     }
-                    worker.inventory = Some(inventory);
-                    worker.last_seen_at = Some(tx.now());
-                    tx.save_worker(&worker)?;
-                    Ok(true)
+                    // This also runs for an inventory that did not change: a
+                    // wake that Pause all held goes when the pause has ended.
+                    let greeted = if greet {
+                        crate::proactivity::guide::first_sign_in(tx)?
+                    } else {
+                        None
+                    };
+                    Ok((!same, greeted))
                 })
                 .await?;
         if changed {
             self.retry_waiting_work();
+        }
+        if let Some(channel) = greeted {
+            self.kick_coordinator(channel);
         }
         Ok(())
     }

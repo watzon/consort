@@ -4,7 +4,9 @@
 
 use crossbeam_channel::Receiver;
 use sayso_sdk::deepgram::{self, Deepgram, DeepgramFinal};
-use sayso_sdk::{EngineError, EngineEvent, ModelId, Segment, SpeechEngine, SpeechPart, Turn};
+use sayso_sdk::embedded::{
+    EngineError, EngineEvent, ModelId, Segment, SpeechEngine, SpeechPart, Turn,
+};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 /// Why Deepgram wrote nothing.

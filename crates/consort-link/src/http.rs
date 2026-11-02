@@ -9,8 +9,61 @@ use consort_proto::ids::WorkerId;
 use consort_proto::model::Sha256Hash;
 use consort_proto::time::Timestamp;
 
+use consort_tls::certificate_problem;
+
 use crate::LinkError;
 use crate::identity::Identity;
+
+/// How to reach a hub: its URL, and the pin of its certificate for a hub on
+/// This network. A hub URL alone is a hub with no pin.
+#[derive(Debug, Clone, Copy)]
+pub struct HubRef<'a> {
+    pub url: &'a str,
+    pub tls_sha256: Option<&'a Sha256Hash>,
+}
+
+impl<'a> From<&'a str> for HubRef<'a> {
+    fn from(url: &'a str) -> Self {
+        Self {
+            url,
+            tls_sha256: None,
+        }
+    }
+}
+
+impl<'a> From<&'a String> for HubRef<'a> {
+    fn from(url: &'a String) -> Self {
+        url.as_str().into()
+    }
+}
+
+/// Starts a client with the rules of this hub: with a pin, it accepts only the
+/// pinned certificate.
+fn builder_for(hub: HubRef<'_>) -> Result<reqwest::ClientBuilder, LinkError> {
+    let builder = reqwest::Client::builder();
+    let Some(pin) = hub.tls_sha256 else {
+        return Ok(builder);
+    };
+    let config =
+        consort_tls::pinned_client_config(pin).map_err(|e| LinkError::Network(e.to_string()))?;
+    Ok(builder.tls_backend_preconfigured(config))
+}
+
+/// The sentence for a certificate that this link does not accept, when the
+/// error has one.
+pub(crate) fn certificate_message(
+    err: &(dyn std::error::Error + 'static),
+    hub_url: &str,
+) -> Option<String> {
+    Some(match certificate_problem(err)? {
+        consort_tls::CertificateProblem::NotThePin => format!(
+            "the certificate of {hub_url} is not the one that this machine paired with. Someone may be in the way, or the hub has a new certificate. Check the hub, and pair this machine again if the hub is new"
+        ),
+        consort_tls::CertificateProblem::Untrusted => format!(
+            "{hub_url} has a certificate that no authority signed. Use the install command from the app, because it holds the key of the hub"
+        ),
+    })
+}
 
 /// The hub URL without a trailing slash.
 pub fn base_url(hub_url: &str) -> String {
@@ -87,8 +140,8 @@ impl HttpLimits {
     };
 }
 
-fn client(limits: HttpLimits) -> Result<reqwest::Client, LinkError> {
-    reqwest::Client::builder()
+fn client(hub: HubRef<'_>, limits: HttpLimits) -> Result<reqwest::Client, LinkError> {
+    builder_for(hub)?
         .timeout(limits.total)
         .build()
         .map_err(|e| LinkError::Network(e.to_string()))
@@ -97,6 +150,12 @@ fn client(limits: HttpLimits) -> Result<reqwest::Client, LinkError> {
 /// A failed call as the worker reports it. A time-out says how long the
 /// worker waited and what to check.
 fn network_error(err: &reqwest::Error, waited: std::time::Duration) -> LinkError {
+    if let Some(message) = err
+        .url()
+        .and_then(|url| certificate_message(err, url.origin().ascii_serialization().as_str()))
+    {
+        return LinkError::Network(message);
+    }
     if err.is_timeout() {
         let secs = waited.as_secs();
         let limit = if secs == 0 {
@@ -114,10 +173,7 @@ fn network_error(err: &reqwest::Error, waited: std::time::Duration) -> LinkError
 async fn hub_error(response: reqwest::Response) -> LinkError {
     let status = response.status();
     match response.json::<HttpErrorBody>().await {
-        Ok(body) => LinkError::Hub {
-            code: body.error.code,
-            message: body.error.message,
-        },
+        Ok(body) => body.error.into(),
         Err(_) => LinkError::Hub {
             code: ErrorCode::Internal,
             message: format!("HTTP {status}"),
@@ -127,14 +183,15 @@ async fn hub_error(response: reqwest::Response) -> LinkError {
 
 /// Pairs a machine at the pairing path of its kind: `/v1/pair/worker` or
 /// `/v1/pair/session-host`.
-pub async fn pair_machine(
-    hub_url: &str,
+pub async fn pair_machine<'a>(
+    hub: impl Into<HubRef<'a>>,
     path: &str,
     request: &PairWorkerRequest,
 ) -> Result<WorkerId, LinkError> {
-    let url = format!("{}{path}", http_base(hub_url));
+    let hub = hub.into();
+    let url = format!("{}{path}", http_base(hub.url));
     let limits = HttpLimits::DEFAULT;
-    let response = client(limits)?
+    let response = client(hub, limits)?
         .post(&url)
         .json(request)
         .send()
@@ -152,13 +209,15 @@ pub async fn pair_machine(
 
 /// Uploads a blob with `PUT /v1/blobs/{sha256}` and the worker signature
 /// headers.
-pub async fn upload_blob(
-    hub_url: &str,
+pub async fn upload_blob<'a>(
+    hub: impl Into<HubRef<'a>>,
     worker_id: WorkerId,
     identity: &Identity,
     sha256: &Sha256Hash,
     bytes: Vec<u8>,
 ) -> Result<(), LinkError> {
+    let hub = hub.into();
+    let hub_url = hub.url;
     let origin = normalize_origin(hub_url).map_err(|e| LinkError::Config(e.to_string()))?;
     let path = blob_path(sha256);
     let timestamp = Timestamp::now();
@@ -167,7 +226,7 @@ pub async fn upload_blob(
     ));
     let url = format!("{}{path}", http_base(hub_url));
     let limits = HttpLimits::DEFAULT;
-    let response = client(limits)?
+    let response = client(hub, limits)?
         .put(&url)
         .header(HEADER_WORKER_ID, worker_id.to_string())
         .header(HEADER_TIMESTAMP, timestamp.as_millis().to_string())
@@ -185,15 +244,15 @@ pub async fn upload_blob(
 /// Downloads a blob with `GET /v1/blobs/{sha256}` and the worker signature
 /// headers. The caller checks the bytes against the hash, and `max_bytes`
 /// stops a hub that sends more than the caller expects.
-pub async fn download_blob(
-    hub_url: &str,
+pub async fn download_blob<'a>(
+    hub: impl Into<HubRef<'a>>,
     worker_id: WorkerId,
     identity: &Identity,
     sha256: &Sha256Hash,
     max_bytes: u64,
 ) -> Result<Vec<u8>, LinkError> {
     download_blob_within(
-        hub_url,
+        hub,
         worker_id,
         identity,
         sha256,
@@ -204,14 +263,16 @@ pub async fn download_blob(
 }
 
 /// [`download_blob`] with other time limits, for tests.
-pub async fn download_blob_within(
-    hub_url: &str,
+pub async fn download_blob_within<'a>(
+    hub: impl Into<HubRef<'a>>,
     worker_id: WorkerId,
     identity: &Identity,
     sha256: &Sha256Hash,
     max_bytes: u64,
     limits: HttpLimits,
 ) -> Result<Vec<u8>, LinkError> {
+    let hub = hub.into();
+    let hub_url = hub.url;
     let origin = normalize_origin(hub_url).map_err(|e| LinkError::Config(e.to_string()))?;
     let path = blob_path(sha256);
     let timestamp = Timestamp::now();
@@ -219,7 +280,7 @@ pub async fn download_blob_within(
         "GET", &origin, &path, timestamp, worker_id,
     ));
     let url = format!("{}{path}", http_base(hub_url));
-    let response = client(limits)?
+    let response = client(hub, limits)?
         .get(&url)
         .header(HEADER_WORKER_ID, worker_id.to_string())
         .header(HEADER_TIMESTAMP, timestamp.as_millis().to_string())
@@ -257,8 +318,8 @@ pub async fn download_blob_within(
 /// memory. The download stops when the hub sends more than `max_bytes`. The
 /// caller checks the hash. A large blob may take long, so this client has no
 /// limit for the whole request, only for the connect and for each read.
-pub async fn download_blob_to_file(
-    hub_url: &str,
+pub async fn download_blob_to_file<'a>(
+    hub: impl Into<HubRef<'a>>,
     worker_id: WorkerId,
     identity: &Identity,
     sha256: &Sha256Hash,
@@ -266,7 +327,7 @@ pub async fn download_blob_to_file(
     dest: &std::path::Path,
 ) -> Result<u64, LinkError> {
     download_blob_to_file_within(
-        hub_url,
+        hub,
         worker_id,
         identity,
         sha256,
@@ -278,8 +339,8 @@ pub async fn download_blob_to_file(
 }
 
 /// [`download_blob_to_file`] with other time limits, for tests.
-pub async fn download_blob_to_file_within(
-    hub_url: &str,
+pub async fn download_blob_to_file_within<'a>(
+    hub: impl Into<HubRef<'a>>,
     worker_id: WorkerId,
     identity: &Identity,
     sha256: &Sha256Hash,
@@ -288,6 +349,8 @@ pub async fn download_blob_to_file_within(
     limits: HttpLimits,
 ) -> Result<u64, LinkError> {
     use tokio::io::AsyncWriteExt as _;
+    let hub = hub.into();
+    let hub_url = hub.url;
     let origin = normalize_origin(hub_url).map_err(|e| LinkError::Config(e.to_string()))?;
     let path = blob_path(sha256);
     let timestamp = Timestamp::now();
@@ -295,7 +358,7 @@ pub async fn download_blob_to_file_within(
         "GET", &origin, &path, timestamp, worker_id,
     ));
     let url = format!("{}{path}", http_base(hub_url));
-    let client = reqwest::Client::builder()
+    let client = builder_for(hub)?
         .connect_timeout(limits.connect)
         .read_timeout(limits.read)
         .build()

@@ -6,19 +6,27 @@
 # those settings. It has its own user, so it cannot read hub.db, and the hub
 # cannot read the profiles of the accounts.
 #
-# Install (see docs/deploy.md):
+# Install with scripts/install/hub.sh, or by hand (see docs/deploy.md):
 #   sudo apt install bubblewrap git
+#   sudo apt install <the libraries of the preview browser, in docs/deploy.md>
 #   sudo useradd --system --home-dir /var/lib/consort-session-host --shell /usr/sbin/nologin consort-session
 #   sudo install -m 0644 deploy/session-host/consort-session-host.service /etc/systemd/system/
-#   sudo -u consort-session consort session-host pair --hub http://127.0.0.1:7600 --code <code> \
-#     --config-dir /var/lib/consort-session-host/config --consort-home /var/lib/consort-session-host/home
+#   sudo -u consort consort hub session-host-code --data /var/lib/consort
+#   sudo -u consort-session consort session-host pair <public URL of the hub> --code <code> \
+#     --config-dir /var/lib/consort-session-host/config
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable --now consort-session-host
+#
+# Pair with the public URL of the hub (CONSORT_PUBLIC_URL), exactly. The session
+# host signs that address, and the hub accepts only its public URL and the
+# addresses of its reach.
 #
 # A session does not start when bubblewrap cannot run. On Ubuntu 24.04 and later,
 # AppArmor can stop bubblewrap from making a user namespace. Add a profile for
 # /usr/bin/bwrap with the `userns` rule, or set
-# kernel.apparmor_restrict_unprivileged_userns=0.
+# kernel.apparmor_restrict_unprivileged_userns=0. The preview browser that draws
+# the images of visuals needs the same: a profile with the `userns` rule for
+# /var/lib/consort-session-host/home/tools/chrome-headless-shell/*/chrome-headless-shell.
 [Unit]
 Description=Consort session host
 After=network-online.target consort-hub.service

@@ -510,6 +510,7 @@ mod tests {
                     policy: WorkerPolicy::default(),
                     load: WorkerLoad::default(),
                     tools: Vec::new(),
+                    update: None,
                 });
                 tx.save_worker(&worker)?;
                 // The task waits for a new session. Its waiting message has

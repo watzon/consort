@@ -1,6 +1,6 @@
 # The Consort hub as a hardened systemd service.
 #
-# Install (see docs/deploy.md):
+# Install with scripts/install/hub.sh, or by hand (see docs/deploy.md):
 #   sudo useradd --system --home-dir /var/lib/consort --shell /usr/sbin/nologin consort
 #   sudo install -m 0755 consort /usr/local/bin/consort
 #   sudo install -m 0644 deploy/hub/consort-hub.service /etc/systemd/system/
@@ -8,8 +8,14 @@
 #   sudo systemctl enable --now consort-hub
 #
 # The hub listens on 127.0.0.1 only. A reverse proxy (Caddy, see
-# deploy/hub/Caddyfile) serves HTTPS and passes WebSocket traffic to it.
-# Change the public URL below to the address of your proxy.
+# deploy/hub/Caddyfile) serves HTTPS and passes WebSocket traffic to it, or
+# Tailscale Serve does (`consort hub reach tailscale`).
+#
+# The public URL below is a placeholder. Set the real one in
+# /etc/consort/hub.env, which overrides it:
+#   CONSORT_PUBLIC_URL=https://hub.example.com
+# With Tailscale, use CONSORT_PUBLIC_URL=http://127.0.0.1:7600. The address on
+# the tailnet is a reach address, and the hub accepts it without a restart.
 [Unit]
 Description=Consort hub
 After=network-online.target
@@ -27,6 +33,9 @@ WorkingDirectory=/var/lib/consort
 Environment=CONSORT_HUB_DATA=/var/lib/consort
 Environment=CONSORT_HUB_LISTEN=127.0.0.1:7600
 Environment=CONSORT_PUBLIC_URL=https://hub.example.com
+# The hub reports this in hub.status. Settings > Hub uses it to show the update
+# command.
+Environment=CONSORT_INSTALL_KIND=service
 # Extra settings, such as RUST_LOG=debug. The file is optional.
 EnvironmentFile=-/etc/consort/hub.env
 ExecStart=/usr/local/bin/consort hub

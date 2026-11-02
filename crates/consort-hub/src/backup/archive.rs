@@ -23,7 +23,13 @@ pub(crate) const MANIFEST_KIND: &str = "consort-hub-backup";
 pub(crate) const FORMAT: u32 = 1;
 /// The files of the data folder, next to `hub.db` and `blobs/`, that a
 /// backup holds when they exist.
-pub(crate) const EXTRA_FILES: [&str; 3] = ["hub-secret.key", "composio.key", "backup.json"];
+pub(crate) const EXTRA_FILES: [&str; 5] = [
+    "hub-secret.key",
+    "composio.key",
+    "backup.json",
+    crate::reach::TLS_KEY_FILE,
+    crate::reach::TLS_CERT_FILE,
+];
 /// The start of every archive name.
 pub(crate) const NAME_PREFIX: &str = "consort-";
 

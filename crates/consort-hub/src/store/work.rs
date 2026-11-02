@@ -791,6 +791,15 @@ pub fn pending_decisions_of_task(conn: &Connection, task_id: TaskId) -> Result<V
     )
 }
 
+/// Answered decisions of one task, from any of its sessions.
+pub fn answered_decisions_of_task(conn: &Connection, task_id: TaskId) -> Result<Vec<Decision>> {
+    list_docs(
+        conn,
+        "SELECT data FROM decisions WHERE task_id = ?1 AND status = 'answered' ORDER BY rowid",
+        [task_id.to_string()],
+    )
+}
+
 impl Tx<'_> {
     pub fn save_approval(&mut self, approval: &Approval) -> Result<()> {
         self.db().execute(

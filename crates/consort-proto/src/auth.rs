@@ -21,7 +21,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::frame::{Empty, Message, Request};
 use crate::ids::{ClientId, SessionId, WorkerId};
-use crate::model::{ClientKind, Os, SessionState};
+use crate::model::{ClientKind, Os, SessionState, Sha256Hash};
 use crate::time::Timestamp;
 
 /// The WebSocket path for workers.
@@ -236,6 +236,11 @@ pub struct PairWorkerRequest {
     pub arch: String,
     /// The name from `worker.toml`. Empty means the hostname.
     pub name: Option<String>,
+    /// The protocol versions that the machine speaks. A hub with no common
+    /// version refuses before it uses the code. An older machine leaves this
+    /// out, and then the hub does not check.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub protocol_versions: Vec<u32>,
 }
 
 /// The `200` body of `POST /v1/pair/worker`.
@@ -260,6 +265,12 @@ pub struct PairClientRequest {
     /// The operating system of the client. An older client leaves it out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub os: Option<Os>,
+    /// The protocol versions that the client speaks. A hub with no common
+    /// version refuses before it uses the code, so the code still works after
+    /// an update. An older client leaves this out, and then the hub does not
+    /// check.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub protocol_versions: Vec<u32>,
 }
 
 /// The `200` body of `POST /v1/pair/client`.
@@ -276,6 +287,116 @@ pub struct PairingInvite {
     pub hub_url: String,
     /// A new pairing code.
     pub code: PairingCode,
+    /// The SHA-256 of the certificate of a hub on This network. The new peer
+    /// accepts this certificate and no other for this address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_sha256: Option<Sha256Hash>,
+}
+
+/// The start of a pairing link.
+pub const PAIRING_LINK_PREFIX: &str = "consort://pair?";
+
+/// The error when a text is not a pairing link or an invite.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{0}")]
+pub struct InviteError(pub &'static str);
+
+impl PairingInvite {
+    /// The pairing link: `consort://pair?hub=<url>&code=<code>`, with
+    /// `&tls_sha256=<hex>` when the hub has a pin. The address is percent
+    /// encoded.
+    pub fn to_link(&self) -> String {
+        let mut link = format!(
+            "{PAIRING_LINK_PREFIX}hub={}&code={}",
+            percent_encode(&self.hub_url),
+            percent_encode(&self.code.to_string())
+        );
+        if let Some(pin) = &self.tls_sha256 {
+            link.push_str("&tls_sha256=");
+            link.push_str(pin.as_str());
+        }
+        link
+    }
+
+    /// Reads a pairing link, or the JSON of a QR code. `Ok(None)` for a text
+    /// that is neither, such as an address that the user typed.
+    pub fn parse_text(text: &str) -> Result<Option<Self>, InviteError> {
+        let text = text.trim();
+        if text.starts_with('{') {
+            return serde_json::from_str(text)
+                .map(Some)
+                .map_err(|_| InviteError("This pairing code cannot be read"));
+        }
+        if !text.to_ascii_lowercase().starts_with("consort://") {
+            return Ok(None);
+        }
+        let Some(query) = text
+            .get(..PAIRING_LINK_PREFIX.len())
+            .filter(|start| start.eq_ignore_ascii_case(PAIRING_LINK_PREFIX))
+            .and_then(|_| text.get(PAIRING_LINK_PREFIX.len()..))
+        else {
+            return Err(InviteError("This pairing link cannot be read"));
+        };
+        let (mut hub_url, mut code, mut pin) = (None, None, None);
+        for pair in query.split('&') {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            let value =
+                percent_decode(value).ok_or(InviteError("This pairing link cannot be read"))?;
+            match key {
+                "hub" => hub_url = Some(value),
+                "code" => code = Some(value),
+                "tls_sha256" => pin = Some(value),
+                // A newer app can add a field.
+                _ => {}
+            }
+        }
+        let hub_url = hub_url
+            .filter(|url| normalize_origin(url).is_ok())
+            .ok_or(InviteError("This pairing link has no hub address"))?;
+        let code = code
+            .and_then(|code| code.parse().ok())
+            .ok_or(InviteError("This pairing link has no valid code"))?;
+        let tls_sha256 = pin
+            .map(|pin| pin.parse())
+            .transpose()
+            .map_err(|_| InviteError("This pairing link has a key that is not valid"))?;
+        Ok(Some(Self {
+            hub_url,
+            code,
+            tls_sha256,
+        }))
+    }
+}
+
+/// Encodes every byte but the letters, the digits and `-._~`.
+fn percent_encode(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for byte in text.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(char::from(byte));
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+/// Decodes `%XX`. `None` for a bad sequence or for text that is not UTF-8.
+fn percent_decode(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while let Some(&byte) = bytes.get(at) {
+        if byte == b'%' {
+            let hex = text.get(at + 1..at + 3)?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            at += 3;
+        } else {
+            out.push(byte);
+            at += 1;
+        }
+    }
+    String::from_utf8(out).ok()
 }
 
 /// The first frame on a link: an event from the hub.
@@ -357,9 +478,10 @@ pub struct OriginError(pub String);
 /// `https`. A default port (80 for http, 443 for https) is dropped. The path,
 /// query and fragment are dropped. A URL with user info is refused.
 ///
-/// The peer uses the hub URL from its own configuration. The hub uses its
-/// configured public URL. A peer that reaches the hub through another name
-/// fails to authenticate, which is the point of signing the origin.
+/// The peer uses the hub URL from its own configuration. The hub checks the
+/// signature against its public URL and the address of each reach that is on.
+/// A peer that reaches the hub through any other name fails to authenticate,
+/// which is the point of signing the origin.
 pub fn normalize_origin(url: &str) -> Result<String, OriginError> {
     let err = || OriginError(url.to_owned());
     let (scheme, rest) = url.trim().split_once("://").ok_or_else(err)?;
@@ -515,6 +637,10 @@ pub struct ClientHelloResult {
     /// loads a snapshot. `None` from an older hub.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hub_epoch: Option<String>,
+    /// The protocol versions that the hub speaks, oldest first. The updater
+    /// of the app compares them with a new release. Empty from an older hub.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub protocol_versions: Vec<u32>,
 }
 
 /// `auth.http_token`: ask for a bearer token for the blob endpoints.
@@ -560,6 +686,57 @@ mod tests {
         assert!("ABCD-EFGU".parse::<PairingCode>().is_err());
         assert!("ABCD-EFGé".parse::<PairingCode>().is_err());
         assert_eq!(serde_json::to_string(&code).unwrap(), "\"0123-WXYZ\"");
+    }
+
+    #[test]
+    fn a_pairing_link_holds_the_address_the_code_and_the_pin() {
+        let invite = PairingInvite {
+            hub_url: "https://macbook-pro.local:7601".to_owned(),
+            code: "ABCD-EFGH".parse().unwrap(),
+            tls_sha256: Some(Sha256Hash::from_bytes([7; 32])),
+        };
+        let link = invite.to_link();
+        assert!(link.starts_with("consort://pair?hub=https%3A%2F%2Fmacbook-pro.local%3A7601&code=ABCD-EFGH&tls_sha256=0707"), "{link}");
+        assert_eq!(
+            PairingInvite::parse_text(&link).unwrap(),
+            Some(invite.clone())
+        );
+
+        // With no pin, and with the JSON of a QR code.
+        let plain = PairingInvite {
+            tls_sha256: None,
+            ..invite
+        };
+        assert!(!plain.to_link().contains("tls_sha256"));
+        assert_eq!(
+            PairingInvite::parse_text(&plain.to_link()).unwrap(),
+            Some(plain.clone())
+        );
+        let json = serde_json::to_string(&plain).unwrap();
+        assert_eq!(
+            json,
+            r#"{"hub_url":"https://macbook-pro.local:7601","code":"ABCD-EFGH"}"#
+        );
+        assert_eq!(PairingInvite::parse_text(&json).unwrap(), Some(plain));
+    }
+
+    #[test]
+    fn a_typed_address_is_no_invite_and_a_bad_link_is_an_error() {
+        assert_eq!(
+            PairingInvite::parse_text("https://hub.example.com").unwrap(),
+            None
+        );
+        assert_eq!(PairingInvite::parse_text("hub.local:7601").unwrap(), None);
+        for bad in [
+            "consort://other?hub=x",
+            "consort://pair?code=ABCD-EFGH",
+            "consort://pair?hub=https%3A%2F%2Fh&code=nope",
+            "consort://pair?hub=https%3A%2F%2Fh&code=ABCD-EFGH&tls_sha256=short",
+            "consort://pair?hub=%ZZ&code=ABCD-EFGH",
+            "{not json",
+        ] {
+            assert!(PairingInvite::parse_text(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

@@ -253,6 +253,10 @@ impl Hub {
                     .await?;
                 Ok(None)
             }
+            ApprovalDetails::AddWorker(_) => Ok((!allowed).then(|| {
+                "The user chose not to add a worker now. A task cannot run until a worker is online."
+                    .to_owned()
+            })),
             ApprovalDetails::SignIn(card) => {
                 if !allowed {
                     return Ok(Some(format!(

@@ -91,6 +91,7 @@ async fn channel(hub: &Hub, name: &str, level: Option<ProactivityLevel>) -> Chan
         tags: Vec::new(),
         disabled_connections: Vec::new(),
         disabled_skills: Vec::new(),
+        command_rules: Vec::new(),
         archived_at: None,
         created_at: now,
         updated_at: now,

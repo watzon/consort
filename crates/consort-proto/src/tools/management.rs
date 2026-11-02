@@ -135,6 +135,42 @@ pub struct StartSignInArgs {
     pub method: Option<String>,
 }
 
+/// `add_worker`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct AddWorkerArgs {
+    /// True when the user wants a worker on the computer of this app. Leave
+    /// it out for another machine: the card shows the command for each
+    /// system.
+    #[serde(default)]
+    pub this_computer: bool,
+}
+
+/// `set_user_name`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SetUserNameArgs {
+    /// What the user wants to be called, for example "Chris".
+    pub name: String,
+}
+
+/// How the guide ended, in `finish_guide`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GuideOutcome {
+    /// You posted the close.
+    Closed,
+    /// The user said "Not now".
+    Later,
+    /// The user said "No, I look around myself".
+    Declined,
+}
+
+/// `finish_guide`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct FinishGuideArgs {
+    /// How the guide ended.
+    pub outcome: GuideOutcome,
+}
+
 /// `search_connector_catalog`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct SearchConnectorCatalogArgs {
@@ -234,6 +270,48 @@ pub struct UpdateSkillArgs {
 pub struct RemoveSkillArgs {
     /// The skill name or ID.
     pub skill: String,
+}
+
+/// A change to what a connection can do without asking.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ConnectionPermissions {
+    /// The connection handle or ID. A channel's assistant can change only
+    /// a connection of its channel.
+    pub connection: String,
+    /// The new approval rules of the tool kinds.
+    #[serde(default)]
+    pub approvals: Option<crate::model::ToolApprovals>,
+    /// Tools with their own rule. An item replaces the item for that tool.
+    /// Use `run_without_asking` or `ask_every_time`.
+    #[serde(default)]
+    pub add_exceptions: Vec<crate::model::ToolException>,
+    /// The slugs of the exceptions to remove.
+    #[serde(default)]
+    pub remove_exceptions: Vec<String>,
+    /// True only when the user says that this account belongs to you, the
+    /// assistant, and not to them.
+    #[serde(default)]
+    pub assistant_owned: Option<bool>,
+}
+
+/// `set_permissions`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SetPermissionsArgs {
+    /// Tutti only: the channel to change. Leave it out to change the rules
+    /// that apply in every channel. A channel's assistant changes only its
+    /// own channel.
+    #[serde(default)]
+    pub channel: Option<ChannelId>,
+    /// Rules to add. A rule replaces the rule with the same pattern.
+    #[serde(default)]
+    pub add: Vec<crate::model::CommandRuleInput>,
+    /// The patterns of the rules to remove.
+    #[serde(default)]
+    pub remove: Vec<String>,
+    /// Changes to connections. Each connection keeps one set of rules, so
+    /// a change applies in every channel that uses it.
+    #[serde(default)]
+    pub connections: Vec<ConnectionPermissions>,
 }
 
 /// `update_this_channel`. Fields that you leave out do not change.

@@ -535,7 +535,7 @@ mod tests {
     fn slots_follow_the_rows_of_each_category() {
         let groups = icon_catalog::search("");
         let slots = slots(&groups);
-        assert_eq!(slots.len(), 87);
+        assert_eq!(slots.len(), 89);
         // Work and code has 16 icons: a label, then rows of 11 and 5.
         assert_eq!(
             slots[0],
@@ -586,7 +586,7 @@ mod tests {
         assert_eq!(step(&s, 14, "up"), Some(Some(3)));
         // Up from the first row goes back to the search field.
         assert_eq!(step(&s, 4, "up"), Some(None));
-        assert_eq!(step(&s, 86, "right"), Some(Some(86)));
+        assert_eq!(step(&s, 88, "right"), Some(Some(88)));
         assert_eq!(step(&s, 0, "tab"), None);
     }
 }

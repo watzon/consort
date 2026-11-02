@@ -183,6 +183,12 @@ pub fn mac_profile(paths: &BoundaryPaths) -> String {
         "(allow ipc-posix-sem)",
         "(allow pseudo-tty)",
         r#"(allow mach-lookup (global-name "com.apple.system.opendirectoryd.libinfo") (global-name "com.apple.system.notification_center") (global-name "com.apple.logd") (global-name "com.apple.system.logger") (global-name "com.apple.diagnosticd") (global-name "com.apple.trustd.agent") (global-name "com.apple.SystemConfiguration.configd") (global-name "com.apple.FSEvents"))"#,
+        // A CLI that checks TLS certificates with the macOS Security framework
+        // needs the security server, also when its login is in a file. Without
+        // it, Codex 0.166.0 reaches chatgpt.com through the proxy, but each
+        // request fails ("workspace routing discovery failed"). It gives no
+        // keychain: the keychain folders stay closed below.
+        r#"(allow mach-lookup (global-name "com.apple.SecurityServer"))"#,
         // Without /private/var/db/timezone the CLI spins at full CPU.
         r#"(allow file-read* (subpath "/usr") (subpath "/bin") (subpath "/sbin") (subpath "/System") (subpath "/private/var/db/dyld") (subpath "/private/var/db/timezone") (subpath "/private/var/select") (subpath "/Library/Preferences/com.apple.security") (subpath "/private/etc") (subpath "/etc") (literal "/") (literal "/dev/null") (literal "/dev/zero") (literal "/dev/random") (literal "/dev/urandom") (literal "/dev/tty") (subpath "/dev/fd") (literal "/dev/dtracehelper"))"#,
         r#"(allow file-write* (literal "/dev/null") (literal "/dev/zero") (literal "/dev/tty") (subpath "/dev/fd") (literal "/dev/dtracehelper"))"#,
@@ -224,7 +230,7 @@ pub fn mac_profile(paths: &BoundaryPaths) -> String {
     if paths.keychain {
         // The login of Claude Code is in the keychain. These rules do not
         // separate keychain items per profile (see the warning in Settings > Hub).
-        lines.push(r#"(allow mach-lookup (global-name "com.apple.SecurityServer") (global-name "com.apple.securityd.xpc") (global-name "com.apple.security.agent") (global-name "com.apple.CoreServices.coreservicesd") (global-name "com.apple.lsd.mapdb"))"#.to_owned());
+        lines.push(r#"(allow mach-lookup (global-name "com.apple.securityd.xpc") (global-name "com.apple.security.agent") (global-name "com.apple.CoreServices.coreservicesd") (global-name "com.apple.lsd.mapdb"))"#.to_owned());
         let keychains = paths.home.join("Library/Keychains");
         let plist = paths
             .home
@@ -627,11 +633,31 @@ mod tests {
     fn a_cli_with_its_login_in_a_file_gets_no_keychain() {
         let with = mac_profile(&paths());
         assert!(with.contains("Library/Keychains"));
+        assert!(with.contains("com.apple.securityd.xpc"));
         let mut file_login = paths();
         file_login.keychain = false;
         let without = mac_profile(&file_login);
         assert!(!without.contains("Keychains"));
-        assert!(!without.contains("com.apple.SecurityServer"));
+        assert!(!without.contains("com.apple.securityd.xpc"));
+        assert!(!without.contains("com.apple.security.agent"));
+    }
+
+    /// Codex 0.166.0 checks the certificate of chatgpt.com with the Security
+    /// framework. Without the security server, every request fails in the
+    /// boundary although the proxy lets it through.
+    #[test]
+    fn every_cli_can_check_tls_certificates() {
+        for keychain in [true, false] {
+            let mut p = paths();
+            p.keychain = keychain;
+            let text = mac_profile(&p);
+            assert_eq!(
+                text.matches(r#"(global-name "com.apple.SecurityServer")"#)
+                    .count(),
+                1,
+                "keychain {keychain}: {text}"
+            );
+        }
     }
 
     #[test]

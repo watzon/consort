@@ -30,7 +30,8 @@ RUN apt-get update \
 COPY --from=build /src/consort/target/release/consort /usr/local/bin/consort
 USER consort
 ENV CONSORT_HUB_DATA=/data \
-    CONSORT_HUB_LISTEN=0.0.0.0:7600
+    CONSORT_HUB_LISTEN=0.0.0.0:7600 \
+    CONSORT_INSTALL_KIND=docker
 VOLUME /data
 EXPOSE 7600
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \

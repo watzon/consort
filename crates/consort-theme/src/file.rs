@@ -1,7 +1,7 @@
 //! Theme files: the serde types that mirror `design/theme.schema.json`, and
 //! the checks that a theme must pass before it loads.
 
-use std::path::PathBuf;
+use std::{path::PathBuf, sync::LazyLock};
 
 use serde::Deserialize;
 
@@ -21,12 +21,85 @@ pub struct ThemeFile {
     pub modes: Modes,
 }
 
+/// The two modes of a theme file. A mode with no `chart` group gets the
+/// chart roles of Spruce in the same mode.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields)]
+#[serde(from = "RawModes")]
 pub struct Modes {
     pub dark: ModeColors,
     pub light: ModeColors,
 }
+
+/// A mode as the file writes it: the `chart` group is optional.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawModeColors {
+    surface: Surface,
+    border: Border,
+    text: Text,
+    accent: Accent,
+    status: Status,
+    syntax: Syntax,
+    #[serde(default)]
+    chart: Option<Chart>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawModes {
+    dark: RawModeColors,
+    light: RawModeColors,
+}
+
+impl RawModeColors {
+    fn into_colors(self, fallback: Chart) -> ModeColors {
+        ModeColors {
+            surface: self.surface,
+            border: self.border,
+            text: self.text,
+            accent: self.accent,
+            status: self.status,
+            syntax: self.syntax,
+            chart: self.chart.unwrap_or(fallback),
+        }
+    }
+}
+
+impl From<RawModes> for Modes {
+    fn from(raw: RawModes) -> Self {
+        let (dark, light) = *SPRUCE_CHARTS;
+        Modes {
+            dark: raw.dark.into_colors(dark),
+            light: raw.light.into_colors(light),
+        }
+    }
+}
+
+/// The chart roles of Spruce, dark then light. A theme with no `chart`
+/// group uses them.
+static SPRUCE_CHARTS: LazyLock<(Chart, Chart)> = LazyLock::new(|| {
+    #[derive(Deserialize)]
+    struct Root {
+        modes: RawModes,
+    }
+    // Embedded at build time. The `spruce_has_chart_roles` test proves that
+    // the file parses and has both groups, so this cannot fail at run time.
+    #[allow(clippy::expect_used)]
+    let root: Root = serde_json::from_str(crate::builtin::builtin_theme_sources()[0])
+        .expect("design/themes/spruce.json parses");
+    #[allow(clippy::expect_used)]
+    let (dark, light) = (
+        root.modes
+            .dark
+            .chart
+            .expect("Spruce dark has a chart group"),
+        root.modes
+            .light
+            .chart
+            .expect("Spruce light has a chart group"),
+    );
+    (dark, light)
+});
 
 /// Light or dark: the two modes that every theme sets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -63,6 +136,7 @@ pub struct ModeColors {
     pub accent: Accent,
     pub status: Status,
     pub syntax: Syntax,
+    pub chart: Chart,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
@@ -121,8 +195,28 @@ pub struct Syntax {
     pub attribute: Rgb,
 }
 
+/// Fills for charts in a visual: six pigments and the ink for text on a
+/// pigment.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Chart {
+    #[serde(rename = "1")]
+    pub c1: Rgb,
+    #[serde(rename = "2")]
+    pub c2: Rgb,
+    #[serde(rename = "3")]
+    pub c3: Rgb,
+    #[serde(rename = "4")]
+    pub c4: Rgb,
+    #[serde(rename = "5")]
+    pub c5: Rgb,
+    #[serde(rename = "6")]
+    pub c6: Rgb,
+    pub ink: Rgb,
+}
+
 /// Every role path that a theme sets, in schema order.
-pub const ROLES: [&str; 25] = [
+pub const ROLES: [&str; 32] = [
     "surface.sidebar",
     "surface.canvas",
     "surface.card",
@@ -148,6 +242,13 @@ pub const ROLES: [&str; 25] = [
     "syntax.type",
     "syntax.tag",
     "syntax.attribute",
+    "chart.1",
+    "chart.2",
+    "chart.3",
+    "chart.4",
+    "chart.5",
+    "chart.6",
+    "chart.ink",
 ];
 
 impl ModeColors {
@@ -179,6 +280,13 @@ impl ModeColors {
             "syntax.type" => self.syntax.type_,
             "syntax.tag" => self.syntax.tag,
             "syntax.attribute" => self.syntax.attribute,
+            "chart.1" => self.chart.c1,
+            "chart.2" => self.chart.c2,
+            "chart.3" => self.chart.c3,
+            "chart.4" => self.chart.c4,
+            "chart.5" => self.chart.c5,
+            "chart.6" => self.chart.c6,
+            "chart.ink" => self.chart.ink,
             _ => return None,
         })
     }
@@ -299,6 +407,22 @@ pub const CONTRAST_RULES: &[(&[&str], &[&str], f64)] = &[
     (
         &["accent.text"],
         &["surface.canvas", "surface.selected"],
+        3.0,
+    ),
+    // A chart fill is a graphic on the page background (WCAG 1.4.11).
+    (
+        &[
+            "chart.1", "chart.2", "chart.3", "chart.4", "chart.5", "chart.6",
+        ],
+        &["surface.canvas"],
+        3.0,
+    ),
+    // The ink is bold text on a fill, such as a number in a bar.
+    (
+        &["chart.ink"],
+        &[
+            "chart.1", "chart.2", "chart.3", "chart.4", "chart.5", "chart.6",
+        ],
         3.0,
     ),
 ];

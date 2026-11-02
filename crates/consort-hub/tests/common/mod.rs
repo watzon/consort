@@ -72,6 +72,9 @@ impl TestHub {
             data_dir: dir.path().to_path_buf(),
             listen: format!("0.0.0.0:{port}").parse().unwrap(),
             public_url: Some(format!("http://{host}:{port}")),
+            install_kind: consort_proto::release::InstallKind::Service,
+            dev: false,
+            first_greeting: false,
         })
         .await
         .unwrap();
@@ -84,10 +87,18 @@ impl TestHub {
     }
 
     pub async fn start_in(dir: tempfile::TempDir) -> Self {
+        Self::start_with_greeting(dir, false).await
+    }
+
+    /// A hub as an install starts it: the first sign-in wakes the assistant.
+    pub async fn start_with_greeting(dir: tempfile::TempDir, first_greeting: bool) -> Self {
         let handle = serve(HubConfig {
             data_dir: dir.path().to_path_buf(),
             listen: "127.0.0.1:0".parse().unwrap(),
             public_url: None,
+            install_kind: consort_proto::release::InstallKind::Service,
+            dev: false,
+            first_greeting,
         })
         .await
         .unwrap();
@@ -149,6 +160,7 @@ pub async fn pair_client_http(hub: &TestHub, code: &str, key: &SigningKey) -> (u
             name: "Test client".to_owned(),
             kind: ClientKind::Desktop,
             os: Some(consort_proto::model::Os::Macos),
+            protocol_versions: Vec::new(),
         },
     )
     .await
@@ -166,6 +178,7 @@ pub async fn pair_session_host_http(hub: &TestHub, code: &str, key: &SigningKey)
             os: Os::Macos,
             arch: "aarch64".to_owned(),
             name: Some("Fake worker".to_owned()),
+            protocol_versions: Vec::new(),
         },
     )
     .await
@@ -182,6 +195,7 @@ pub async fn pair_worker_http(hub: &TestHub, code: &str, key: &SigningKey) -> (u
             os: Os::Macos,
             arch: "aarch64".to_owned(),
             name: Some("Fake worker".to_owned()),
+            protocol_versions: Vec::new(),
         },
     )
     .await
@@ -568,6 +582,7 @@ pub fn inventory(account_id: AccountId) -> Inventory {
         },
         load: WorkerLoad::default(),
         tools: Vec::new(),
+        update: None,
     }
     .with_hash()
 }
@@ -911,7 +926,11 @@ impl AwayWorker {
         let mut back =
             FakeWorker::connect(hub, self.worker_id, self.key, self.account_id, Vec::new()).await;
         back.exec_id = self.exec_id;
-        back.exec = self.exec;
+        // The old socket closed with the old hub when the test restarted it.
+        if let Some(ExecSide { key, .. }) = self.exec {
+            let peer = connect_exec(hub, self.exec_id, &key).await;
+            back.exec = Some(ExecSide { peer, key });
+        }
         back
     }
 }

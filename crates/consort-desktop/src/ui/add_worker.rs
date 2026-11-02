@@ -12,13 +12,18 @@
 use consort_client::{Os, PairingCodeView, WorkerView, update::worker_install_command};
 use consort_theme::{Tokens, TypeExt as _};
 use gpui_kit::{
-    AnyElement, ClipboardItem, Context, Div, InteractiveElement, IntoElement, ParentElement,
-    SharedString, StatefulInteractiveElement as _, Styled, div, prelude::FluentBuilder as _,
+    AnyElement, ClipboardItem, Context, Div, InteractiveElement, IntoElement, MouseButton,
+    MouseDownEvent, ParentElement, SharedString, StatefulInteractiveElement as _, Styled, div,
+    prelude::FluentBuilder as _,
 };
 
 use crate::{
     app::{ConsortApp, Dialog},
-    ui::parts::{ButtonKind, button, focusable, icon, selectable, status_glyph, text},
+    ui::{
+        menu::{MenuAction, MenuItem},
+        parts::{ButtonKind, button, focusable, icon, selectable, status_glyph, text},
+        timeline::open_context_menu,
+    },
 };
 
 /// The step that the user chose. Step 3 is not here: the dialog shows it
@@ -84,7 +89,12 @@ pub fn time_left(expires_at: i64, now: i64) -> String {
 /// The command for step 2, or `None` while the hub has made no code.
 pub fn install_command(os: Os, pairing: Option<&PairingCodeView>) -> Option<String> {
     let pairing = pairing.filter(|p| !p.code.is_empty() && !p.hub_url.is_empty())?;
-    Some(worker_install_command(os, &pairing.hub_url, &pairing.code))
+    Some(worker_install_command(
+        os,
+        &pairing.hub_url,
+        &pairing.code,
+        pairing.tls_sha256.as_ref(),
+    ))
 }
 
 /// The checklist of step 3. A worker holds no accounts and no harness tools.
@@ -256,9 +266,10 @@ impl ConsortApp {
     }
 
     /// The command box of step 2, with its Copy button.
-    fn command_box(&self, command: String, t: &Tokens, cx: &mut Context<Self>) -> Div {
+    pub(crate) fn command_box(&self, command: String, t: &Tokens, cx: &mut Context<Self>) -> Div {
         let c = &t.colors;
         let copy = command.clone();
+        let menu = command.clone();
         div()
             .flex()
             .items_start()
@@ -311,6 +322,18 @@ impl ConsortApp {
                     cx.write_to_clipboard(ClipboardItem::new_string(copy.clone()));
                     this.show_notice("Copied the command.".into(), cx);
                 })),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    open_context_menu(
+                        this,
+                        event,
+                        vec![MenuItem::new("Copy code", MenuAction::Copy(menu.clone()))],
+                        window,
+                        cx,
+                    )
+                }),
             )
     }
 
@@ -449,10 +472,14 @@ impl ConsortApp {
                 Some(command) => self.command_box(command, t, cx).into_any_element(),
                 None => text("Making a code", t.text.ui, c.text_secondary).into_any_element(),
             };
+            let loopback = pairing.as_ref().is_some_and(|p| p.loopback_only).then(|| {
+                self.loopback_notice(consort_client::reach::LOOPBACK_WORKER_NOTICE, t, cx)
+            });
             let body = div()
                 .flex()
                 .flex_col()
                 .gap(t.space.sm + t.space.xxs)
+                .children(loopback)
                 .child(text(
                     format!("Run this in {} on the machine", shell_name(os)),
                     t.text.ui_strong,
@@ -648,13 +675,13 @@ mod tests {
         let no_hub = PairingCodeView {
             code: "KQ7M-4XPD".into(),
             hub_url: String::new(),
-            expires_at: 0,
+            ..PairingCodeView::default()
         };
         assert_eq!(install_command(Os::Linux, Some(&no_hub)), None);
         let pairing = PairingCodeView {
             code: "KQ7M-4XPD".into(),
             hub_url: "https://hub.example.com".into(),
-            expires_at: 0,
+            ..PairingCodeView::default()
         };
         let linux = install_command(Os::Linux, Some(&pairing)).unwrap();
         assert!(linux.starts_with("curl -fsSL https://raw.githubusercontent.com/"));
@@ -666,6 +693,20 @@ mod tests {
             install_command(Os::MacOs, Some(&pairing)).unwrap(),
             linux,
             "macOS and Linux share the script"
+        );
+        let pinned = PairingCodeView {
+            tls_sha256: Some("07".repeat(32).parse().unwrap()),
+            ..pairing
+        };
+        assert!(
+            install_command(Os::Linux, Some(&pinned))
+                .unwrap()
+                .contains("--tls-sha256 0707")
+        );
+        assert!(
+            install_command(Os::Windows, Some(&pinned))
+                .unwrap()
+                .contains("-TlsSha256 0707")
         );
     }
 

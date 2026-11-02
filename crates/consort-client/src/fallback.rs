@@ -701,6 +701,7 @@ mod tests {
                 policy: WorkerPolicy::default(),
                 load: Default::default(),
                 tools: Vec::new(),
+                update: None,
             }),
             paired_at: consort_proto::time::Timestamp::from_millis(0),
             revoked_at: None,

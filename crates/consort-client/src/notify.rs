@@ -49,6 +49,9 @@ pub struct NotificationSettings {
     /// A message that the assistant posted on its own and marked to notify:
     /// it needs the user to act, or a deadline is close.
     pub attention: bool,
+    /// This client made its one offer of the system permission, at the close
+    /// of the guided start. The permission is for each client.
+    pub permission_offered: bool,
 }
 
 impl Default for NotificationSettings {
@@ -62,6 +65,7 @@ impl Default for NotificationSettings {
             show_text: false,
             dock_badge: true,
             attention: true,
+            permission_offered: false,
         }
     }
 }

@@ -299,6 +299,7 @@ impl Hub {
                     tags,
                     disabled_connections: Vec::new(),
                     disabled_skills: Vec::new(),
+                    command_rules: Vec::new(),
                     archived_at: None,
                     created_at: now,
                     updated_at: now,
@@ -385,6 +386,11 @@ impl Hub {
                 }
                 if let Some(tags) = request.tags {
                     channel.tags = normalize_tags(&tags)?;
+                }
+                if let Some(rules) = request.command_rules {
+                    consort_proto::model::validate_command_rules(&rules)
+                        .map_err(|e| HubError::invalid(e.0))?;
+                    channel.command_rules = rules;
                 }
                 if let Some(level) = request.proactivity {
                     channel.proactivity = level;

@@ -68,7 +68,8 @@ fn map_worker_error(error: ErrorBody, relay: Relay) -> ErrorBody {
         | ErrorCode::WorkerUnknown
         | ErrorCode::SignInFailed
         | ErrorCode::ToolInstallFailed
-        | ErrorCode::Unsupported => error,
+        | ErrorCode::Unsupported
+        | ErrorCode::Unavailable => error,
         ErrorCode::Unauthorized
         | ErrorCode::ProtocolMismatch
         | ErrorCode::StaleWrite

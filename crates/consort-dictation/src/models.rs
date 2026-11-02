@@ -3,7 +3,7 @@
 use crate::settings::{Engine, Settings};
 use sayso_sdk::cleanup;
 use sayso_sdk::deepgram;
-use sayso_sdk::{ModelInfo, Role, VadRun};
+use sayso_sdk::embedded::{ModelInfo, Role, VadRun};
 use std::path::Path;
 
 /// The final model of Consort. It hears 25 European languages.
@@ -120,7 +120,9 @@ pub fn plan_models(settings: &Settings, catalog: &[ModelInfo], cleanup_dir: &Pat
         local_final: local_final.filter(|m| m.on_disk()).map(|m| m.id.clone()),
         preview: preview.map(|m| m.id.clone()),
         vad: match vad {
-            Some(model) if model.on_disk() => VadRun::Model(sayso_sdk::ModelId::new(&model.id)),
+            Some(model) if model.on_disk() => {
+                VadRun::Model(sayso_sdk::embedded::ModelId::new(&model.id))
+            }
             // The silence limit also works with the basic detector.
             _ => VadRun::Basic,
         },

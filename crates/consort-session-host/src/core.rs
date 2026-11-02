@@ -92,6 +92,8 @@ pub(crate) struct Core {
     pub browser_sign_in: tokio::sync::Mutex<()>,
     /// The tags that the worker found about this machine.
     pub detected_tags: Vec<String>,
+    /// The renderer of visuals: one browser for the whole session host.
+    pub visual: Arc<dyn crate::visual::VisualEngine>,
 }
 
 /// The answer to a command for a session whose actor has ended.
@@ -566,6 +568,23 @@ impl Core {
                     core.finish_command(&id, result);
                 });
             }
+            // A render takes seconds, so it runs beside the link loop.
+            HubToSessionHost::VisualRender(command) => {
+                let core = self.clone();
+                tokio::spawn(async move {
+                    let blobs = crate::sessions::LinkTools { core: core.clone() };
+                    let result = crate::visual::command::render_command(
+                        core.visual.as_ref(),
+                        &blobs,
+                        command,
+                    )
+                    .await
+                    .and_then(|image| {
+                        serde_json::to_value(image).map_err(|_| ErrorBody::internal())
+                    });
+                    core.finish_command(&id, result);
+                });
+            }
             other => {
                 let Some(session_id) = other.session_id() else {
                     self.finish_command(&id, Err(ErrorBody::internal()));
@@ -951,6 +970,7 @@ impl Core {
                 active_sessions: active,
             },
             tools: self.tools.statuses(),
+            update: None,
         }
         .with_hash()
     }
@@ -1125,6 +1145,7 @@ pub(crate) mod tests {
             sign_ins: Mutex::new(HashMap::new()),
             browser_sign_in: tokio::sync::Mutex::new(()),
             detected_tags: vec!["macos".into(), "arm64".into()],
+            visual: Arc::new(crate::visual::testing::FakeEngine::new(240)),
         })
     }
 

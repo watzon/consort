@@ -68,7 +68,7 @@ impl ConsortApp {
         // open a channel with no ID, so it waits with the other channels.
         let waiting = self.waiting();
         if !sidebar.tutti.id.is_empty() {
-            let mark = state.activity(&sidebar.tutti.id).state;
+            let mark = state.own_mark(&sidebar.tutti.id);
             crate::ui::mark::load_row_frames(mark, t, window, cx);
         }
         let tutti = (!sidebar.tutti.id.is_empty())
@@ -192,6 +192,8 @@ impl ConsortApp {
                         // online.
                         if state.saved_data.is_some() {
                             consort_client::offline::STATUS_UNKNOWN.to_owned()
+                        } else if sidebar.workers_total == 0 {
+                            "None yet".to_owned()
                         } else {
                             format!(
                                 "{} of {} online",
@@ -303,6 +305,7 @@ impl ConsortApp {
             )
             .child(workers)
             .children(self.sign_in_notices(t, cx))
+            .children(self.update_hold_notice(t, cx))
             .children(self.update_notice(t, cx))
             .child(account)
             .into_any_element()
@@ -410,8 +413,9 @@ impl ConsortApp {
         let id = channel.id.clone();
         let menu_id = channel.id.clone();
         let leading = if tutti {
-            // The Three voices mark. It moves while something happens.
-            crate::ui::mark::row_mark(self.state.activity(&channel.id).state, sb.row_icon, t, cx)
+            // The Three voices mark. It moves while Tutti itself works or
+            // waits for the user, not for work in another channel.
+            crate::ui::mark::row_mark(self.state.own_mark(&channel.id), sb.row_icon, t, cx)
         } else {
             icon(&channel.icon, sb.row_icon, c.text_secondary).into_any_element()
         };

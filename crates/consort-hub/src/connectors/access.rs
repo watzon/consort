@@ -407,7 +407,7 @@ impl Hub {
                 .read(move |conn| con_store::connection_or_404(conn, id))
                 .await?;
             if let Some(wider) = use_in_after(&connection.use_in, &channel, &channels) {
-                self.update_connection_fields(id, None, Some(wider), None)
+                self.update_connection_fields(id, None, Some(wider), None, None, None)
                     .await?;
             }
         }

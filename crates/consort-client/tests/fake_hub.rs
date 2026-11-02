@@ -56,6 +56,8 @@ const CODE: &str = "ABCD-EFGH";
 
 #[path = "fake_hub_parts/phase4.rs"]
 mod phase4;
+#[path = "fake_hub_parts/visual.rs"]
+mod visual;
 #[path = "fake_hub_parts/voice.rs"]
 mod voice;
 
@@ -158,11 +160,16 @@ struct Hub {
     versions: Vec<consort_proto::model::MemoryNote>,
     /// Phase 4: see `fake_hub_parts/phase4.rs`.
     phase4: phase4::State,
+    visual: visual::State,
     voice: voice::State,
     /// The hub epoch that `hello` sends.
     hub_epoch: Option<String>,
     /// While set, each channel snapshot waits until this fires.
     hold_channel_snapshots: Option<Arc<tokio::sync::Notify>>,
+    /// While set, `hello` and a pairing fail with this error.
+    mismatch: Option<ErrorBody>,
+    /// How many times a client said `hello`.
+    hellos: usize,
 }
 
 fn note_hash(content: &str) -> consort_proto::model::Sha256Hash {
@@ -258,6 +265,7 @@ fn seed(hub: &mut Hub) {
         memory_enabled: true,
         disabled_connections: Vec::new(),
         disabled_skills: Vec::new(),
+        command_rules: Vec::new(),
         archived_at: None,
         created_at: ts(now - 10_000),
         updated_at: ts(now - 10_000),
@@ -701,6 +709,14 @@ async fn pair_client(
     State(hub): State<Shared>,
     Json(body): Json<PairClientRequest>,
 ) -> impl IntoResponse {
+    let mismatch = hub.lock().unwrap().mismatch.clone();
+    if let Some(mismatch) = mismatch {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": mismatch})),
+        )
+            .into_response();
+    }
     if body.code.canonical() != CODE.replace('-', "") {
         return (
             StatusCode::UNAUTHORIZED,
@@ -845,13 +861,23 @@ async fn session(hub: Shared, mut socket: WebSocket) {
                     let h = hub.lock().unwrap();
                     (h.seq, h.hub_epoch.clone())
                 };
-                req.respond_ok(&ClientHelloResult {
-                    protocol_version: 1,
-                    hub_version: "test".into(),
-                    feed_seq,
-                    hub_epoch,
-                })
-                .unwrap()
+                let mismatch = {
+                    let mut h = hub.lock().unwrap();
+                    h.hellos += 1;
+                    h.mismatch.clone()
+                };
+                if let Some(mismatch) = mismatch {
+                    req.respond_error(mismatch)
+                } else {
+                    req.respond_ok(&ClientHelloResult {
+                        protocol_version: 1,
+                        protocol_versions: vec![1],
+                        hub_version: "test".into(),
+                        feed_seq,
+                        hub_epoch,
+                    })
+                    .unwrap()
+                }
             }
             "sync.snapshot" => {
                 let body: SyncSnapshot = req.decode_as().unwrap();
@@ -1520,6 +1546,8 @@ async fn session(hub: Shared, mut socket: WebSocket) {
                     identity: None,
                     use_in: body.use_in.clone(),
                     approvals: body.approvals,
+                    tool_exceptions: Vec::new(),
+                    assistant_owned: false,
                     status: consort_proto::model::ConnectionStatus::Connecting {
                         redirect_url: Some("https://connect.composio.dev/link/abc".into()),
                         expires_at: ts(10_000_000),
@@ -1857,6 +1885,7 @@ async fn session(hub: Shared, mut socket: WebSocket) {
                             }),
                             running,
                         },
+                        install: None,
                     },
                 })
                 .unwrap()
@@ -1940,10 +1969,12 @@ async fn session(hub: Shared, mut socket: WebSocket) {
             "client.pairing_code" => req
                 .respond_ok(&api::ClientPairingCodeResult {
                     hub_url: "https://hub.example.com".into(),
+                    tls_sha256: None,
                     code: "KQ7M-4XPD".parse().unwrap(),
                     expires_at: Timestamp::now().plus_millis(600_000),
                 })
                 .unwrap(),
+            kind if visual::handles(kind) => visual::answer(&hub, &req).await,
             kind if voice::handles(kind) => voice::answer(&hub, &req),
             kind if phase4::handles(kind) => {
                 let (reply, events) = phase4::answer(&hub, &req);
@@ -2696,6 +2727,124 @@ async fn the_outbox_survives_a_restart_and_goes_out_in_order() {
         s.send_failures.is_empty()
     })
     .await;
+}
+
+fn mismatch_from(hub_version: &str, protocols: &[u32]) -> ErrorBody {
+    ErrorBody::new(ErrorCode::ProtocolMismatch, "No common protocol version.").with_hub_versions(
+        consort_proto::error::HubVersions {
+            hub_version: hub_version.to_owned(),
+            protocol_versions: protocols.to_vec(),
+            install: Some(consort_proto::release::InstallKind::Service),
+        },
+    )
+}
+
+/// A hub that does not speak the protocol of this app keeps the pairing, the
+/// saved data and the outbox. `SessionEnd::Refused` would forget all of them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_protocol_mismatch_keeps_the_pairing_the_saved_data_and_the_outbox() {
+    let (url, hub) = start_hub().await;
+    let dir = tempfile::tempdir().unwrap();
+    let first = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
+    let tutti = tutti_id(&first);
+    until_saved(dir.path(), &tutti).await;
+    drop(first);
+
+    hub.lock().unwrap().mismatch = Some(mismatch_from("0.6.2", &[0]));
+    let store = Store::new(dir.path());
+    let client = Client::start_with(Some(store.clone()), ClientOptions::desktop()).unwrap();
+    let state = wait_for(&client, "the incompatible state", |s| {
+        matches!(s.connection, Connection::Incompatible { .. })
+    })
+    .await;
+    let Connection::Incompatible {
+        too_old,
+        hub: Some(versions),
+        retry_in_ms,
+        ..
+    } = &state.connection
+    else {
+        panic!("{:?}", state.connection);
+    };
+    assert_eq!(*too_old, consort_proto::frame::TooOld::Hub);
+    assert_eq!(versions.hub_version, "0.6.2");
+    // It tries again slowly, in place of the usual backoff.
+    assert_eq!(*retry_in_ms, 60_000);
+    assert_eq!(hub.lock().unwrap().hellos, 2, "one first try, no second");
+    // The pairing and the saved data stay.
+    assert!(store.load().unwrap().is_some(), "the identity stays");
+    assert!(state.saved_data.is_some(), "the saved data stays");
+    assert!(state.tutti().is_some());
+    assert_eq!(state.hub_versions.as_ref(), Some(versions));
+    assert!(state.answers_blocked().is_some());
+
+    // A message waits in the outbox.
+    client
+        .send_message(tutti.clone(), "Keep me".into())
+        .await
+        .unwrap();
+    let file = std::fs::read_to_string(dir.path().join("outbox.json")).unwrap();
+    assert!(file.contains("Keep me"), "{file}");
+    assert!(hub.lock().unwrap().sent_bodies.is_empty());
+
+    // The hub is updated, and Try again connects at once. The message goes out.
+    hub.lock().unwrap().mismatch = None;
+    client.run(Command::Reconnect).await.unwrap();
+    wait_for(&client, "the sent message", |s| {
+        s.connection == Connection::Online
+            && bodies_of(s, &tutti)
+                .iter()
+                .any(|(body, pending)| body == "Keep me" && !pending)
+    })
+    .await;
+    assert_eq!(hub.lock().unwrap().sent_bodies, vec!["Keep me"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hub_that_is_newer_than_the_app_says_that_the_app_is_too_old() {
+    let (url, hub) = start_hub().await;
+    let dir = tempfile::tempdir().unwrap();
+    drop(paired_client(&url, dir.path(), ClientOptions::desktop()).await);
+    hub.lock().unwrap().mismatch = Some(mismatch_from("9.0.0", &[99]));
+    let client =
+        Client::start_with(Some(Store::new(dir.path())), ClientOptions::desktop()).unwrap();
+    wait_for(&client, "the incompatible state", |s| {
+        matches!(
+            s.connection,
+            Connection::Incompatible {
+                too_old: consort_proto::frame::TooOld::ThisSide,
+                ..
+            }
+        )
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn hello_tells_the_view_which_versions_the_hub_has() {
+    let (url, _hub) = start_hub().await;
+    let dir = tempfile::tempdir().unwrap();
+    let client = paired_client(&url, dir.path(), ClientOptions::desktop()).await;
+    let versions = client.state().hub_versions.clone().unwrap();
+    assert_eq!(versions.hub_version, "test");
+    assert_eq!(versions.protocol_versions, vec![1]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pairing_on_a_hub_that_is_too_old_says_so_and_saves_nothing() {
+    let (url, hub) = start_hub().await;
+    hub.lock().unwrap().mismatch = Some(mismatch_from("0.6.2", &[0]));
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::new(dir.path());
+    let client = Client::start_with(Some(store.clone()), ClientOptions::desktop()).unwrap();
+    let err = client.pair(url, CODE.into()).await.unwrap_err();
+    let consort_client::ClientError::Incompatible { title, detail } = err else {
+        panic!("{err:?}");
+    };
+    assert_eq!(title, "This hub is too old for this app");
+    assert!(detail.contains("0.6.2"), "{detail}");
+    assert!(detail.contains("The setup code still works."), "{detail}");
+    assert!(store.load().unwrap().is_none());
 }
 
 /// A queued message is written to disk at once.
@@ -6063,6 +6212,38 @@ async fn unpairing_removes_the_saved_data_with_the_identity() {
     tokio::time::sleep(Duration::from_millis(1_200)).await;
     assert!(!store.cache_path().exists());
     assert_eq!(client.state().connection, Connection::NotPaired);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hub_that_moved_port_keeps_the_identity_and_only_the_old_address_counts() {
+    let (url, _hub) = start_hub().await;
+    let dir = tempfile::tempdir().unwrap();
+    let client = paired_client(&url, dir.path(), options(quick())).await;
+    let store = Store::new(dir.path());
+    let before = store.load().unwrap().unwrap();
+
+    // A client on another hub stays where it is.
+    client
+        .run(Command::MoveHub {
+            from: "http://127.0.0.1:1".into(),
+            to: "http://127.0.0.1:2".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(store.load().unwrap().unwrap().config.hub_url, url);
+
+    let to = "http://127.0.0.1:2".to_owned();
+    client
+        .run(Command::MoveHub {
+            from: url.clone(),
+            to: to.clone(),
+        })
+        .await
+        .unwrap();
+    let after = store.load().unwrap().unwrap();
+    assert_eq!(after.config.hub_url, to);
+    assert_eq!(after.config.client_id, before.config.client_id);
+    wait_for(&client, "the new address", |s| s.hub_url == to).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -173,6 +173,7 @@ fn widens_access(tool: HubTool) -> bool {
             | T::AddSkill
             | T::RequestAccess
             | T::SetChannelTags
+            | T::SetPermissions
             | T::SetChannelConnector
             | T::SetChannelSkill
             | T::SetWorkerTags
@@ -191,6 +192,10 @@ fn widens_access(tool: HubTool) -> bool {
             | T::RoutineCreate
             | T::RoutineUpdate
             | T::RoutineDelete
+            | T::SetUserName
+            | T::AddWorker
+            | T::StartGuide
+            | T::FinishGuide
     )
 }
 
@@ -696,6 +701,32 @@ mod tests {
         }
     }
 
+    /// A page can use the network, and these turns read text that other
+    /// people or other sessions wrote. So they show no visual, and they
+    /// preview none. The refusals come from the lists of allowed tools.
+    #[test]
+    fn research_suggestion_and_voice_turns_refuse_the_visual_tools() {
+        use HubTool as T;
+        for tool in [T::ShowVisual, T::PreviewVisual] {
+            for (turn, refusal) in [
+                (TurnKind::Research, RESEARCH_REFUSAL),
+                (TurnKind::Suggestions, SUGGESTION_REFUSAL),
+                (TurnKind::Voice, VOICE_TURN_REFUSAL),
+            ] {
+                let err = check_tool(&turn, tool).unwrap_err();
+                assert_eq!(err.to_error_body().message, refusal, "{tool:?} {turn:?}");
+            }
+            // A turn of the user and a proactive turn may use them. A
+            // proactive turn posts under the rules of `post_message`.
+            assert!(check_tool(&TurnKind::Normal, tool).is_ok(), "{tool:?}");
+            let check_in = TurnKind::Proactive {
+                kind: ProactiveKind::CheckIn,
+                reason: None,
+            };
+            assert!(check_tool(&check_in, tool).is_ok(), "{tool:?}");
+        }
+    }
+
     #[tokio::test]
     async fn a_message_counts_only_as_an_event_of_the_open_turn_of_the_session() {
         let (hub, _dir) = crate::hub::test_hub().await;
@@ -752,5 +783,17 @@ mod tests {
         assert!(!check(&hub, current).await);
         save(&hub, Some(SessionId::new()), true, vec![event(current)]).await;
         assert!(!check(&hub, current).await);
+    }
+
+    #[test]
+    fn a_proactive_turn_cannot_use_the_tools_of_the_guide() {
+        for tool in [
+            HubTool::SetUserName,
+            HubTool::AddWorker,
+            HubTool::StartGuide,
+            HubTool::FinishGuide,
+        ] {
+            assert!(widens_access(tool), "{tool:?}");
+        }
     }
 }

@@ -32,6 +32,28 @@ impl ToolBackend for MockBackend {
             .push((sha256.clone(), bytes.len()));
         Ok(())
     }
+
+    async fn download_blob(&self, _: &Sha256Hash, _: u64) -> Result<Vec<u8>, ErrorBody> {
+        Err(ErrorBody::new(ErrorCode::NotFound, "no blobs here"))
+    }
+}
+
+/// The endpoint of a coordinator session with this backend.
+async fn start_coordinator(
+    session_id: SessionId,
+    workspace: &Path,
+    backend: Arc<dyn ToolBackend>,
+) -> McpEndpoint {
+    start(McpSession {
+        session_id,
+        workspace: workspace.to_path_buf(),
+        backend,
+        exec: None,
+        worker_root: None,
+        visual: Arc::new(crate::visual::testing::FakeEngine::new(100)),
+    })
+    .await
+    .unwrap()
 }
 
 fn initialize() -> Value {
@@ -55,9 +77,7 @@ async fn status(url: &str, token: Option<&str>) -> u16 {
 async fn missing_or_wrong_token_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let backend = Arc::new(MockBackend::default());
-    let endpoint = start(SessionId::new(), dir.path().to_path_buf(), backend, None)
-        .await
-        .unwrap();
+    let endpoint = start_coordinator(SessionId::new(), dir.path(), backend).await;
     assert!(endpoint.url.starts_with("http://127.0.0.1:"));
     assert_eq!(endpoint.token.len(), 64);
     assert_eq!(status(&endpoint.url, None).await, 401);
@@ -74,9 +94,7 @@ async fn lists_and_forwards_tools_and_uploads_artifacts() {
     std::fs::write(dir.path().join("report.md"), "# Report\n").unwrap();
     let backend = Arc::new(MockBackend::default());
     let session = SessionId::new();
-    let endpoint = start(session, dir.path().to_path_buf(), backend.clone(), None)
-        .await
-        .unwrap();
+    let endpoint = start_coordinator(session, dir.path(), backend.clone()).await;
     let client = McpHttpClient::new(&endpoint.url, &endpoint.token).unwrap();
     let init = client.post(&initialize()).await.unwrap();
     assert_eq!(init[0]["result"]["serverInfo"]["name"], "consort");

@@ -1005,6 +1005,7 @@ mod tests {
                 policy: WorkerPolicy::default(),
                 load: WorkerLoad::default(),
                 tools: Vec::new(),
+                update: None,
             }),
             paired_at: Timestamp::from_millis(0),
             revoked_at: None,

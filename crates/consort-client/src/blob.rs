@@ -127,6 +127,16 @@ impl BlobTransfer {
     /// `cache_dir` is the folder for downloaded files. With `None`, uploads
     /// work and downloads return [`BlobError::NoCache`].
     pub fn new(hub_url: &str, cache_dir: Option<PathBuf>) -> Result<BlobTransfer, BlobError> {
+        Self::pinned(hub_url, None, cache_dir)
+    }
+
+    /// As [`BlobTransfer::new`]. With a pin (a hub on This network), the
+    /// transfer accepts that certificate and no other.
+    pub fn pinned(
+        hub_url: &str,
+        tls_sha256: Option<&Sha256Hash>,
+        cache_dir: Option<PathBuf>,
+    ) -> Result<BlobTransfer, BlobError> {
         let base = crate::hub::normalize_hub_url(hub_url).map_err(|err| match err {
             ClientError::InvalidUrl(message) => BlobError::InvalidUrl { message },
             other => BlobError::InvalidUrl {
@@ -141,6 +151,13 @@ impl BlobTransfer {
             .read_timeout(Duration::from_secs(60))
             // A redirect could send the token to another address.
             .redirect(reqwest::redirect::Policy::none());
+        if let Some(pin) = tls_sha256 {
+            let config =
+                consort_tls::pinned_client_config(pin).map_err(|err| BlobError::Setup {
+                    message: err.to_string(),
+                })?;
+            builder = builder.tls_backend_preconfigured(config);
+        }
         // Plain `http` to a name (`hub.local`) passes the URL rule by its
         // spelling. Check where the name points each time it is looked up.
         let plain_http_name = Url::parse(&base)

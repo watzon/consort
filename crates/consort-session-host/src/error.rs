@@ -70,6 +70,10 @@ impl From<consort_link::LinkError> for HostError {
             L::Config(message) => Self::Config(message),
             L::Key(message) => Self::Key(message),
             L::Hub { code, message } => Self::Hub { code, message },
+            L::ProtocolMismatch { message, .. } => Self::Hub {
+                code: consort_proto::error::ErrorCode::ProtocolMismatch,
+                message,
+            },
             L::Network(message) => Self::Network(message),
             L::Offline => Self::Offline,
             L::TooLarge(message) => Self::TooLarge(message),

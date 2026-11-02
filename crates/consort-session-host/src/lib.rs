@@ -29,9 +29,10 @@ pub mod skills;
 pub mod store;
 pub mod tags;
 pub mod tools;
+pub mod visual;
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::Duration;
 
 use consort_proto::auth::{PairWorkerRequest, PairingCode};
@@ -153,6 +154,7 @@ pub async fn pair_at(
         os: Os::from_std_os(std::env::consts::OS).unwrap_or(Os::Linux),
         arch: std::env::consts::ARCH.to_owned(),
         name: name.clone(),
+        protocol_versions: consort_proto::frame::SUPPORTED_PROTOCOL_VERSIONS.to_vec(),
     };
     let worker_id = http::pair_machine(hub_url, pair_path, &request).await?;
     let mut toml = HostToml::load(config_dir)?;
@@ -250,6 +252,8 @@ impl HostHandle {
                 task.abort();
             }
         }
+        // No visual renders now, so the preview browser can go.
+        self.core.visual.stop().await;
         // Everything has stopped, so the next worker may use the folder.
         let lock = match self.core.lock.lock() {
             Ok(mut l) => l.take(),
@@ -268,6 +272,24 @@ pub async fn run(config: HostConfig) -> Result<HostHandle, HostError> {
 
 /// Runs the worker with the given harness adapters. Tests pass a fake.
 pub async fn run_with(config: HostConfig, harnesses: Harnesses) -> Result<HostHandle, HostError> {
+    start(config, harnesses, None).await
+}
+
+/// Runs the worker with the given harness adapters and renderer of
+/// visuals. Tests pass a fake renderer, so they need no browser.
+pub async fn run_with_visual(
+    config: HostConfig,
+    harnesses: Harnesses,
+    visual: Arc<dyn visual::VisualEngine>,
+) -> Result<HostHandle, HostError> {
+    start(config, harnesses, Some(visual)).await
+}
+
+async fn start(
+    config: HostConfig,
+    harnesses: Harnesses,
+    visual: Option<Arc<dyn visual::VisualEngine>>,
+) -> Result<HostHandle, HostError> {
     let dir = config.config_dir.clone();
     let toml = HostToml::load(&dir)?;
     let (Some(hub_url), Some(worker_id)) = (toml.hub_url.clone(), toml.worker_id) else {
@@ -334,7 +356,30 @@ pub async fn run_with(config: HostConfig, harnesses: Harnesses) -> Result<HostHa
                     .is_some_and(|s| s.starts_with("consort"))
             })
         });
-    let core = Arc::new(Core {
+    let tools = Arc::new(tools);
+    let settings = visual::setup::Settings::from_env();
+    // The renderer knows the core through a weak link: it records its
+    // browser processes in the store, and it tells the hub when the
+    // browser installs.
+    let core = Arc::new_cyclic(|weak: &Weak<Core>| Core {
+        visual: visual.unwrap_or_else(|| {
+            let watcher =
+                consort_harness::process::WatcherHandle(Arc::new(crate::core::GroupLog {
+                    core: weak.clone(),
+                }));
+            let weak = weak.clone();
+            let changed = Arc::new(move || {
+                if let Some(core) = weak.upgrade() {
+                    core.inventory_changed();
+                }
+            });
+            Arc::new(visual::setup::session_renderer(
+                tools.clone(),
+                settings,
+                Some(watcher),
+                changed,
+            ))
+        }),
         ws_path: config.ws_path,
         config_dir: dir.clone(),
         config: RwLock::new(toml),
@@ -355,7 +400,7 @@ pub async fn run_with(config: HostConfig, harnesses: Harnesses) -> Result<HostHa
         stopping: watch::channel(false).0,
         lock: Mutex::new(Some(lock)),
         consort_home,
-        tools: Arc::new(tools),
+        tools,
         sign_ins: Mutex::new(Default::default()),
         browser_sign_in: tokio::sync::Mutex::new(()),
         detected_tags,

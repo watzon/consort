@@ -130,6 +130,10 @@ pub struct WorkerToml {
     /// The hub URL, set by pairing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hub_url: Option<String>,
+    /// The SHA-256 of the certificate of a hub on This network, set by
+    /// pairing. The worker accepts this certificate and no other.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls_sha256: Option<consort_proto::model::Sha256Hash>,
     /// The worker ID, set by pairing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker_id: Option<WorkerId>,

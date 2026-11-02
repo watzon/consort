@@ -1,6 +1,7 @@
 //! The worker core: the link handler, hub request dispatch and the inventory.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -8,10 +9,10 @@ use consort_link::http;
 use consort_link::identity::Identity;
 use consort_link::link::{Link, LinkHandler};
 use consort_proto::auth::{Signature, WorkerHello, WorkerHelloResult};
-use consort_proto::error::{ErrorBody, ErrorCode};
+use consort_proto::error::{ErrorBody, ErrorCode, HubVersions};
 use consort_proto::execution_link::{
-    ExecInventory, ExecSkillBundleGet, HubToExecution, WorkspaceInspection, WorkspacePrepare,
-    WorkspaceSync, WorkspaceSyncResult,
+    ExecInventory, ExecSkillBundleGet, HubToExecution, WorkerUpdateAck, WorkspaceInspection,
+    WorkspacePrepare, WorkspaceSync, WorkspaceSyncResult,
 };
 use consort_proto::frame::{Empty, Frame, RequestFrame, SUPPORTED_PROTOCOL_VERSIONS};
 use consort_proto::ids::WorkerId;
@@ -26,6 +27,7 @@ use crate::config::{WORKSPACES_DIR, WorkerToml};
 use crate::exec::{Exec, HubFiles};
 use crate::journal::{Journal, StoredWorkspace};
 use crate::process::shell;
+use crate::self_update::{UpdateEvents, Updater};
 use crate::{tags, workspace};
 
 /// The folder of the skill cache, in the worker's config folder.
@@ -45,6 +47,41 @@ pub(crate) struct Core {
     pub detected_tags: Vec<String>,
     pub blob_cache: BlobCache,
     pub channel_copies: tokio::sync::Mutex<std::collections::HashMap<String, ChannelCopy>>,
+    pub updater: Arc<Updater>,
+    /// The requests of the hub that are being answered now.
+    pub in_flight: AtomicUsize,
+}
+
+/// The events of an update, with a weak link so that an update that waits does
+/// not keep a stopped worker alive.
+struct CoreEvents(std::sync::Weak<Core>);
+
+impl UpdateEvents for CoreEvents {
+    fn busy(&self) -> bool {
+        self.0.upgrade().is_some_and(|core| core.has_work())
+    }
+
+    fn changed(&self) {
+        if let Some(core) = self.0.upgrade() {
+            core.send_inventory();
+        }
+    }
+}
+
+/// Counts one request of the hub while it is being answered.
+struct InFlight(Arc<Core>);
+
+impl InFlight {
+    fn start(core: Arc<Core>) -> Self {
+        core.in_flight.fetch_add(1, Ordering::AcqRel);
+        Self(core)
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.in_flight.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 fn this_os() -> Os {
@@ -107,6 +144,30 @@ pub(crate) async fn inspect(workspace: &StoredWorkspace) -> WorkspaceInspection 
 }
 
 impl Core {
+    /// How to reach the hub: its URL and the pin of its certificate.
+    pub(crate) fn hub(&self) -> http::HubRef<'_> {
+        http::HubRef {
+            url: &self.hub_url,
+            tls_sha256: self.toml.tls_sha256.as_ref(),
+        }
+    }
+
+    /// True while a process runs or a request of the hub is being answered.
+    /// A journal that cannot be read counts as work: the restart can wait.
+    fn has_work(&self) -> bool {
+        self.in_flight.load(Ordering::Acquire) > 0
+            || self
+                .journal
+                .running_processes()
+                .map_or(true, |running| !running.is_empty())
+    }
+
+    /// Follows the version that the hub names.
+    fn follow(self: &Arc<Self>, version: &str) -> Option<consort_proto::model::WorkerUpdateStatus> {
+        let events = Arc::new(CoreEvents(Arc::downgrade(self)));
+        self.updater.clone().follow(version, events)
+    }
+
     fn exec(&self) -> Option<Arc<Exec>> {
         self.exec.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
@@ -135,6 +196,7 @@ impl Core {
             policy: self.limits.get().to_proto(),
             load: WorkerLoad::default(),
             tools: Vec::new(),
+            update: self.updater.status(),
         };
         inventory.hash = inventory.compute_hash();
         inventory
@@ -227,6 +289,7 @@ impl Core {
     /// Answers one hub request.
     fn dispatch(self: Arc<Self>, request: RequestFrame) {
         tokio::spawn(async move {
+            let _in_flight = InFlight::start(self.clone());
             let id = request.id.clone();
             let message: HubToExecution = match request.decode() {
                 Ok(message) => message,
@@ -295,6 +358,10 @@ impl Core {
                     self.send_inventory();
                     self.reply(id, Ok(Empty {}));
                 }
+                HubToExecution::WorkerUpdate(body) => {
+                    let status = self.follow(&body.version);
+                    self.reply(id, Ok(WorkerUpdateAck { status }));
+                }
             }
         });
     }
@@ -326,6 +393,10 @@ impl LinkHandler for Core {
         &self.hub_url
     }
 
+    fn tls_sha256(&self) -> Option<&consort_proto::model::Sha256Hash> {
+        self.toml.tls_sha256.as_ref()
+    }
+
     fn ws_path(&self) -> &str {
         consort_proto::auth::WORKER_WS_PATH
     }
@@ -350,6 +421,20 @@ impl LinkHandler for Core {
     fn command(self: Arc<Self>, request: RequestFrame) {
         self.dispatch(request);
     }
+
+    /// A hub that refuses this worker names its version in the error. A hub
+    /// from before that field names nothing, and the worker waits for a new
+    /// program by hand.
+    fn protocol_mismatch(self: Arc<Self>, hub: Option<&HubVersions>) {
+        match hub {
+            Some(hub) => {
+                self.follow(&hub.hub_version);
+            }
+            None => tracing::warn!(
+                "the hub speaks no common protocol version and does not name its version. Update the hub"
+            ),
+        }
+    }
 }
 
 /// Blobs through the signed blob routes.
@@ -364,7 +449,7 @@ impl BlobFetch for LinkBlobs {
         dest: &Path,
     ) -> Result<(), WorkerError> {
         http::download_blob_to_file(
-            &self.0.hub_url,
+            self.0.hub(),
             self.0.worker_id,
             &self.0.identity,
             sha256,
@@ -392,7 +477,7 @@ impl HubFiles for CoreHub {
     async fn blob_put(&self, bytes: Vec<u8>) -> Result<String, String> {
         let core = self.core()?;
         let hash = Sha256Hash::from_bytes(Sha256::digest(&bytes).into());
-        http::upload_blob(&core.hub_url, core.worker_id, &core.identity, &hash, bytes)
+        http::upload_blob(core.hub(), core.worker_id, &core.identity, &hash, bytes)
             .await
             .map_err(|e| e.to_string())?;
         Ok(hash.to_string())
@@ -444,7 +529,7 @@ impl HubFiles for CoreHub {
                 .join(format!(".tmp-{}", uuid::Uuid::now_v7().simple()));
             for file in &bundle.files {
                 let bytes = http::download_blob(
-                    &core.hub_url,
+                    core.hub(),
                     core.worker_id,
                     &core.identity,
                     &file.sha256,

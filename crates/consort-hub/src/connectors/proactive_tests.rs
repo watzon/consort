@@ -103,6 +103,70 @@ async fn a_proactive_turn_asks_before_each_send_even_when_the_connection_runs_wi
 }
 
 #[tokio::test]
+async fn the_assistants_own_account_follows_its_rules_in_a_proactive_turn() {
+    let (hub, _dir, fake) = hub_with_fake().await;
+    let connection = active_gmail(
+        &hub,
+        &fake,
+        ToolApprovals {
+            change: ApprovalRule::RunWithoutAsking,
+            ..ToolApprovals::default()
+        },
+    )
+    .await;
+    hub.update_connection_fields(connection.id, None, None, None, None, Some(true))
+        .await
+        .unwrap();
+    let session = coordinator_session(&hub, tutti(&hub).await, "acp").await;
+    open_check_in(&hub, session).await;
+    let sent = call(
+        &hub,
+        session,
+        "run_connector_tool",
+        json!({"connector": "gmail_work", "tool": "GMAIL_SEND_EMAIL", "arguments": {"to": "a@example.com"}}),
+    )
+    .await;
+    assert_eq!(sent["status"], "ran");
+    assert_eq!(fake.executions().len(), 1);
+}
+
+#[tokio::test]
+async fn the_voice_asks_for_the_users_account_and_not_for_the_assistants() {
+    let (hub, _dir, fake) = hub_with_fake().await;
+    hub.connectors.set_timings(Timings {
+        approval_wait: Duration::from_millis(50),
+        ..fast()
+    });
+    let connection = active_gmail(
+        &hub,
+        &fake,
+        ToolApprovals {
+            change: ApprovalRule::RunWithoutAsking,
+            ..ToolApprovals::default()
+        },
+    )
+    .await;
+    hub.store
+        .write(|tx| {
+            let mut settings = crate::store::voice::settings(tx.db())?;
+            settings.enabled = true;
+            tx.save_voice_settings(&settings)
+        })
+        .await
+        .unwrap();
+    let session = coordinator_session(&hub, tutti(&hub).await, "acp").await;
+    let send = json!({"connector": "gmail_work", "tool": "GMAIL_SEND_EMAIL", "arguments": {"to": "a@example.com"}});
+    let asked = call(&hub, session, "run_connector_tool", send.clone()).await;
+    assert_eq!(asked["status"], "waiting_for_user");
+    assert!(fake.executions().is_empty());
+    hub.update_connection_fields(connection.id, None, None, None, None, Some(true))
+        .await
+        .unwrap();
+    let sent = call(&hub, session, "run_connector_tool", send).await;
+    assert_eq!(sent["status"], "ran");
+}
+
+#[tokio::test]
 async fn a_proactive_turn_ignores_an_earlier_allow_of_its_session() {
     let (hub, _dir, fake) = hub_with_fake().await;
     hub.connectors.set_timings(Timings {

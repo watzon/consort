@@ -6,7 +6,8 @@
 //!
 //! - **Task status.** A task in Working means its session runs. Tutti shows
 //!   the tasks of every channel, because its assistant can read all of them.
-//!   Another channel shows its own tasks.
+//!   Another channel shows its own tasks. The Tutti row in the sidebar reads
+//!   only the work of Tutti ([`ChannelActivity::own_state`]).
 //! - **Session items** (`session_item` feed entries). The newest item of
 //!   each session, with its kind, its status and the channel of its feed
 //!   entry, is kept in the cache ([`SessionActivity`]). An item in progress
@@ -46,6 +47,25 @@ pub struct ActivityView {
 pub struct ChannelActivity {
     pub channel_id: String,
     pub activity: ActivityView,
+    /// The mark state from the work of this channel alone. It differs from
+    /// `activity.state` only in Tutti, whose activity also counts the tasks
+    /// of the other channels.
+    pub own_state: MarkState,
+}
+
+impl ChannelActivity {
+    /// The activity of one channel, with and without the other channels.
+    pub fn of(inputs: &Inputs<'_>) -> ChannelActivity {
+        ChannelActivity {
+            channel_id: inputs.channel_id.to_owned(),
+            activity: channel_activity(inputs),
+            own_state: channel_activity(&Inputs {
+                tutti: false,
+                ..*inputs
+            })
+            .state,
+        }
+    }
 }
 
 /// What kind of work a session item is, for the line.
@@ -310,6 +330,30 @@ mod tests {
         // In its own channel the line leaves out the channel.
         let a = run("c_sayso", false, &tasks, &sessions, None);
         assert_eq!(a.line.as_deref(), Some("Running a command"));
+    }
+
+    #[test]
+    fn the_own_state_of_tutti_leaves_out_the_other_channels() {
+        fn of_tutti(tasks: &[TaskWork<'_>]) -> ChannelActivity {
+            ChannelActivity::of(&Inputs {
+                channel_id: "c_tutti",
+                tutti: true,
+                tasks,
+                sessions: &[],
+                timeline: None,
+                channel_name: &names,
+            })
+        }
+        for status in [TaskStatus::Working, TaskStatus::NeedsInput] {
+            // A task in another channel moves the mark of the chat only.
+            let a = of_tutti(&[task("c_sayso", "sayso", status, None)]);
+            assert_ne!(a.activity.state, MarkState::Idle);
+            assert_eq!(a.own_state, MarkState::Idle);
+        }
+        // A task of Tutti itself counts for both.
+        let a = of_tutti(&[task("c_tutti", "Tutti", TaskStatus::Working, None)]);
+        assert_eq!(a.activity.state, MarkState::Working);
+        assert_eq!(a.own_state, MarkState::Working);
     }
 
     #[test]
